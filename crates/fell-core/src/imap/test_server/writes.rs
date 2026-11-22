@@ -20,8 +20,19 @@ pub(in crate::imap) struct WriteFixture {
     pub uidplus: bool,
     /// Answer every `UID MOVE` with this NO text.
     pub refuse: Option<String>,
+    /// Run the hook when the next `SELECT` arrives, then answer it with NO.
+    pub before_refusing_select: Option<Box<dyn FnOnce() + Send>>,
     /// Answer `UID SEARCH HEADER Message-ID` with NO.
     pub refuse_search: bool,
+    /// Return this many tagged-OK empty HEADER searches before finding the copy.
+    pub empty_header_searches: usize,
+    /// Override a selected write session's range search with this many UID hits.
+    pub range_search_hits: Option<usize>,
+    pub omit_message_id_header: Option<u32>,
+    pub close_on_login: bool,
+    pub refuse_append: bool,
+    /// Disconnect without committing the next APPEND.
+    pub lose_append_before_commit: bool,
     /// Drop the connection after this many `UID MOVE` replies.
     pub close_after_moves: Option<u32>,
     /// Apply the next command with this verb (`"MOVE"`), then drop the
@@ -59,12 +70,18 @@ pub(super) fn handle(
     out: &mut Counted,
 ) -> bool {
     let reply = match verb {
-        "SELECT" => select(
-            tag,
-            rest,
-            &state.lock().expect("state"),
-            writes.lock().expect("writes").nomodseq,
-        ),
+        "SELECT" => {
+            let (hook, nomodseq) = {
+                let mut writes = writes.lock().expect("writes");
+                (writes.before_refusing_select.take(), writes.nomodseq)
+            };
+            if let Some(hook) = hook {
+                hook();
+                format!("{tag} NO SELECT refused\r\n")
+            } else {
+                select(tag, rest, &state.lock().expect("state"), nomodseq)
+            }
+        }
         "STATUS" => status(tag, rest, &state.lock().expect("state")),
         "CREATE" => create_label(tag, rest, &mut state.lock().expect("state")),
         "UID" => {
@@ -77,16 +94,24 @@ pub(super) fn handle(
             let reply = if let Some(args) = strip_prefix_ignore(rest, "SEARCH HEADER Message-ID ") {
                 if writes.refuse_search {
                     format!("{tag} NO search not now\r\n")
+                } else if writes.empty_header_searches > 0 {
+                    writes.empty_header_searches -= 1;
+                    format!("* SEARCH\r\n{tag} OK SEARCH\r\n")
                 } else {
                     search_message_id(tag, args, &state)
                 }
+            } else if selected_write
+                && strip_prefix_ignore(rest, "SEARCH UID ").is_some()
+                && let Some(hits) = writes.range_search_hits
+            {
+                format!("* SEARCH{}\r\n{tag} OK SEARCH\r\n", " 1".repeat(hits))
             } else if let Some(args) = strip_prefix_ignore(rest, "FETCH ")
                 && args
                     .to_ascii_uppercase()
                     .contains("BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]")
                 && selected_write
             {
-                fetch_message_ids(tag, args, &state)
+                fetch_message_ids(tag, args, &state, writes.omit_message_id_header)
             } else if let Some(args) = strip_prefix_ignore(rest, "STORE ") {
                 if !selected_write {
                     format!("{tag} BAD STORE requires SELECT\r\n")
@@ -157,6 +182,57 @@ fn selected(state: &TestState) -> Option<String> {
     })
 }
 
+pub(super) fn append(
+    tag: &str,
+    rest: &str,
+    mut literals: Vec<Vec<u8>>,
+    state: &Mutex<TestState>,
+    writes: &Mutex<WriteFixture>,
+    out: &mut Counted,
+) {
+    let mut state = state.lock().expect("state");
+    let mut writes = writes.lock().expect("writes");
+    if std::mem::take(&mut writes.lose_append_before_commit) {
+        let _ = out.stream.shutdown(std::net::Shutdown::Both);
+        return;
+    }
+    let name = mailbox_name(rest);
+    let mailbox = state.mailboxes.iter_mut().find(|item| item.name == name);
+    let reply = match (writes.refuse_append, mailbox, literals.pop()) {
+        (true, _, _) => format!("{tag} NO Sent storage temporarily unavailable\r\n"),
+        (false, Some(mailbox), Some(raw)) => {
+            let uid = mailbox
+                .messages
+                .iter()
+                .map(|message| message.uid)
+                .max()
+                .unwrap_or(0)
+                + 1;
+            let flags = if rest.ends_with(" (\\Seen)") {
+                vec!["\\Seen".into()]
+            } else {
+                Vec::new()
+            };
+            mailbox.messages.push(FixtureMessage {
+                uid,
+                flags,
+                modseq: 1,
+                raw,
+                body_form: super::BodyForm::Literal,
+            });
+            if writes.lose_reply_to == Some("APPEND") {
+                writes.lose_reply_to = None;
+                let _ = out.stream.shutdown(std::net::Shutdown::Both);
+                return;
+            }
+            format!("{tag} OK APPEND done\r\n")
+        }
+        _ => format!("{tag} BAD invalid APPEND\r\n"),
+    };
+    let _ = out.write_all(reply.as_bytes());
+    let _ = out.flush();
+}
+
 fn select(tag: &str, rest: &str, state: &TestState, nomodseq: bool) -> String {
     let name = mailbox_name(rest);
     let Some(mailbox) = state.mailboxes.iter().find(|item| item.name == name) else {
@@ -164,6 +240,11 @@ fn select(tag: &str, rest: &str, state: &TestState, nomodseq: bool) -> String {
     };
     let highest = mailbox.messages.iter().map(|m| m.uid).max().unwrap_or(0);
     let next = mailbox.uidnext.unwrap_or(highest + 1);
+    let next = if mailbox.omit_uidnext {
+        String::new()
+    } else {
+        format!("* OK [UIDNEXT {next}] next\r\n")
+    };
     let revision = if !state.condstore {
         String::new()
     } else if nomodseq {
@@ -173,7 +254,7 @@ fn select(tag: &str, rest: &str, state: &TestState, nomodseq: bool) -> String {
         format!("* OK [HIGHESTMODSEQ {highest}] highest\r\n")
     };
     format!(
-        "* {} EXISTS\r\n* OK [UIDVALIDITY {}] UIDs valid\r\n* OK [UIDNEXT {next}] next\r\n\
+        "* {} EXISTS\r\n* OK [UIDVALIDITY {}] UIDs valid\r\n{next}\
          {revision}{tag} OK [READ-WRITE] SELECT completed\r\n",
         mailbox.messages.len(),
         mailbox.uidvalidity
@@ -301,15 +382,20 @@ fn status(tag: &str, rest: &str, state: &TestState) -> String {
     };
     let highest = mailbox.messages.iter().map(|m| m.uid).max().unwrap_or(0);
     let next = mailbox.uidnext.unwrap_or(highest + 1).max(highest + 1);
+    let next = if mailbox.omit_uidnext {
+        String::new()
+    } else {
+        format!(" UIDNEXT {next}")
+    };
     format!(
-        "* STATUS {name:?} (UIDVALIDITY {} UIDNEXT {next})\r\n{tag} OK STATUS completed\r\n",
+        "* STATUS {name:?} (UIDVALIDITY {}{next})\r\n{tag} OK STATUS completed\r\n",
         mailbox.uidvalidity
     )
 }
 
 /// `UID FETCH <set> (UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])` in the
 /// selected mailbox.
-fn fetch_message_ids(tag: &str, args: &str, state: &TestState) -> String {
+fn fetch_message_ids(tag: &str, args: &str, state: &TestState, omit_header: Option<u32>) -> String {
     let Some(name) = selected(state) else {
         return format!("{tag} BAD no mailbox selected\r\n");
     };
@@ -321,6 +407,10 @@ fn fetch_message_ids(tag: &str, args: &str, state: &TestState) -> String {
     let mut reply = String::new();
     for (index, message) in mailbox.messages.iter().enumerate() {
         if !uid_in_range(message.uid, set, highest) {
+            continue;
+        }
+        if omit_header == Some(message.uid) {
+            reply.push_str(&format!("* {} FETCH (UID {})\r\n", index + 1, message.uid));
             continue;
         }
         let header = String::from_utf8_lossy(&message_id_header(&message.raw)).into_owned();

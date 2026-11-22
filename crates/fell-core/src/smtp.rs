@@ -31,6 +31,8 @@ pub struct SmtpConfig {
     /// Bridge signs its local listener with its own certificate. Only allowed
     /// for a loopback host.
     pub accept_invalid_certs: bool,
+    /// Queue a server Sent copy after successful submission.
+    pub append_sent: bool,
 }
 
 impl SmtpConfig {
@@ -41,6 +43,7 @@ impl SmtpConfig {
             port: 1025,
             security: ImapSecurity::StartTls,
             accept_invalid_certs: true,
+            append_sent: false,
         }
     }
 }
@@ -207,7 +210,7 @@ fn uncertain(message: String) -> Error {
     ))
 }
 
-fn sender(mime: &[u8]) -> Result<String> {
+pub(crate) fn sender(mime: &[u8]) -> Result<String> {
     let text = std::str::from_utf8(header_block(mime))
         .map_err(|_| smtp_err("smtp: message headers are not UTF-8"))?;
     let mut from = None;
@@ -598,7 +601,7 @@ fn smtp_err(message: impl Into<String>) -> Error {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc;
@@ -648,6 +651,30 @@ Bcc: this is body text\r\n"
         )
     }
 
+    pub(crate) fn confirm_fixture_delivery(
+        login: &ImapConfig,
+        account: &AccountId,
+        mime: &[u8],
+    ) -> Result<SentMessage> {
+        let (port, captured, join) = serve(Wire::Clear, AfterData::Accept);
+        let mut pending = sample_pending();
+        pending.draft.account_id = account.clone();
+        pending.mime = mime.to_vec();
+        let confirmation = confirm(&pending);
+        let sent = confirm_send(
+            &backend(port, ImapSecurity::Plain).smtp,
+            login,
+            pending,
+            confirmation,
+        );
+        assert_eq!(
+            captured.recv_timeout(Duration::from_secs(5)).unwrap().data,
+            mime
+        );
+        join.join().unwrap();
+        sent
+    }
+
     fn backend(port: u16, security: ImapSecurity) -> BridgeBackend {
         BridgeBackend {
             account_id: AccountId("mailbox".into()),
@@ -665,6 +692,7 @@ Bcc: this is body text\r\n"
                 port,
                 security,
                 accept_invalid_certs: true,
+                append_sent: false,
             },
         }
     }

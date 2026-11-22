@@ -74,6 +74,7 @@ pub enum SyncEvent {
     WriteBackNotice {
         dropped: Vec<DroppedWrite>,
         flag_recovery_delayed: bool,
+        sent_append_delayed: bool,
     },
     /// Parts were stored for mail that had none (the backfill after a
     /// pass). An open thread may have HTML to show now.
@@ -347,11 +348,14 @@ fn run(
             if report.flags_changed && events.unbounded_send(SyncEvent::FlagsChanged).is_err() {
                 return;
             }
-            if (!report.dropped.is_empty() || report.flag_recovery_delayed)
+            if (!report.dropped.is_empty()
+                || report.flag_recovery_delayed
+                || report.sent_append_delayed)
                 && events
                     .unbounded_send(SyncEvent::WriteBackNotice {
                         dropped: report.dropped,
                         flag_recovery_delayed: report.flag_recovery_delayed,
+                        sent_append_delayed: report.sent_append_delayed,
                     })
                     .is_err()
             {

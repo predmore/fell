@@ -175,7 +175,10 @@ pub(crate) fn clear_flag(
     let column = match kind {
         OutboxKind::Seen => "unread",
         OutboxKind::Flagged => "starred",
-        OutboxKind::Move | OutboxKind::Keyword | OutboxKind::BridgeLabel => {
+        OutboxKind::Move
+        | OutboxKind::AppendSent
+        | OutboxKind::Keyword
+        | OutboxKind::BridgeLabel => {
             return Err(crate::Error::Action(
                 "write has no system flag intent".into(),
             ));

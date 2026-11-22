@@ -188,6 +188,11 @@ pub struct SyncProgress {
 pub trait MailBackend {
     fn kind(&self) -> BackendKind;
 
+    /// Whether the account queues an IMAP Sent copy after SMTP succeeds.
+    fn append_sent(&self) -> bool {
+        false
+    }
+
     fn fetch_changes(&self, cursor: Option<&SyncCursor>) -> Result<MailboxDelta>;
 
     /// Block until the server reports new mail, `max` passes, or `stop`
@@ -315,6 +320,10 @@ impl MailBackend for BridgeBackend {
         BackendKind::Bridge
     }
 
+    fn append_sent(&self) -> bool {
+        self.smtp.append_sent
+    }
+
     fn fetch_changes(&self, cursor: Option<&SyncCursor>) -> Result<MailboxDelta> {
         collect_imap(&self.account_id, &self.imap, cursor, false)
     }
@@ -391,6 +400,10 @@ pub struct ImapBackend {
 impl MailBackend for ImapBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::Imap
+    }
+
+    fn append_sent(&self) -> bool {
+        self.smtp.append_sent
     }
 
     fn fetch_changes(&self, cursor: Option<&SyncCursor>) -> Result<MailboxDelta> {

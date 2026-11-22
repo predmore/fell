@@ -10,6 +10,8 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use gpui::{Pixels, Size};
+
 use crate::keymap::KeyId;
 use crate::model::{Banner, FolderIntent, Overlay, PickerChoice, Session, Toast};
 use crate::motion::{self, Ghost, Glide, ListShift, Motion, Transition};
@@ -236,7 +238,15 @@ pub struct InboxMotion {
     /// that first draws them, so a late frame cannot eat it.
     arrival_pending: bool,
     /// Bodies settling into the open thread, by message id.
-    bodies: HashMap<String, Transition>,
+    bodies: HashMap<String, (Transition, bool)>,
+    /// Sent cards already laid out but hidden until the compose hand-off.
+    messages_pending: HashSet<String>,
+    /// The pending cards are painted at their starting opacity for this viewport.
+    arrival_frame: Option<((Size<Pixels>, f32), u64)>,
+    arrival_frame_id: u64,
+    /// The inbox's viewport before compose could tile over it.
+    uncovered_size: Option<Size<Pixels>>,
+    uncover_started: Option<Instant>,
     /// Where a glide a key interrupted was drawn, so the next glide starts
     /// there instead of snapping to the old target first.
     list_from: Option<f32>,
@@ -369,6 +379,11 @@ impl InboxMotion {
             card_to: None,
             card_glide: None,
             bodies: HashMap::new(),
+            messages_pending: HashSet::new(),
+            arrival_frame: None,
+            arrival_frame_id: 0,
+            uncovered_size: None,
+            uncover_started: None,
             quotes: DisclosureMotion::default(),
             recipients: DisclosureMotion::default(),
             last_unread: None,
@@ -559,6 +574,8 @@ impl InboxMotion {
         self.arrival = None;
         self.arrival_pending = true;
         self.bodies.clear();
+        self.messages_pending.clear();
+        self.arrival_frame = None;
     }
 
     /// Jump every transition to its end state: a key acts on what the
@@ -593,6 +610,8 @@ impl InboxMotion {
         self.arrival_pending = false;
         self.finish_empty_list_entry();
         self.bodies.clear();
+        self.messages_pending.clear();
+        self.arrival_frame = None;
         self.quotes.transitions.clear();
         self.recipients.transitions.clear();
         self.unread_out = None;
@@ -662,7 +681,7 @@ impl InboxMotion {
         running |= keep_with(&mut self.overlay_out, now);
         running |= keep(&mut self.focus, now);
         running |= keep(&mut self.arrival, now);
-        self.bodies.retain(|_, fade| fade.running(now));
+        self.bodies.retain(|_, (fade, _)| fade.running(now));
         running |= self.quotes.tick(now);
         running |= self.recipients.tick(now);
         running |= !self.bodies.is_empty();
@@ -1095,19 +1114,107 @@ impl InboxMotion {
     /// text, under a header already drawn: it settles in over [`motion::QUICK`].
     pub fn body_arrived(&mut self, id: &str, now: Instant) {
         if let Some(fade) = self.motion.start(motion::QUICK, now) {
-            self.bodies.insert(id.to_string(), fade);
+            self.bodies
+                .entry(id.to_string())
+                .and_modify(|(old, whole)| {
+                    if !*whole {
+                        *old = fade;
+                    }
+                })
+                .or_insert((fade, false));
         }
     }
 
-    /// Opacity of each body still settling in, by message id.
-    pub fn body_alphas(&self, now: Instant) -> HashMap<String, f32> {
-        self.bodies
+    /// Fade in the whole card when a newly sent reply joins the open thread.
+    pub fn message_arrived(&mut self, id: &str) {
+        self.messages_pending.insert(id.to_string());
+        self.arrival_frame = None;
+    }
+
+    pub fn has_pending_messages(&self) -> bool {
+        !self.messages_pending.is_empty()
+    }
+
+    /// Wait for the inbox geometry to return before exposing the sent card.
+    /// Compose can close before the compositor configures the expanded tile.
+    /// A changed desktop layout may settle at a different size.
+    pub fn waiting_for_uncover(
+        &mut self,
+        size: Size<Pixels>,
+        composing: bool,
+        now: Instant,
+    ) -> bool {
+        if composing || !self.has_pending_messages() {
+            self.uncover_started = None;
+            if !composing {
+                self.uncovered_size = Some(size);
+            }
+            return false;
+        }
+        self.uncovered_size.is_some_and(|previous| previous != size)
+            && now.duration_since(*self.uncover_started.get_or_insert(now)) < motion::FADE
+    }
+
+    /// Pin the first visible frame and return its token once per viewport.
+    pub fn stage_arriving_messages(
+        &mut self,
+        viewport: Option<(Size<Pixels>, f32)>,
+    ) -> Option<u64> {
+        let Some(viewport) = viewport.filter(|_| self.has_pending_messages()) else {
+            self.arrival_frame = None;
+            return None;
+        };
+        if self.arrival_frame.is_some_and(|(last, _)| last == viewport) {
+            return None;
+        }
+        self.arrival_frame_id = self.arrival_frame_id.wrapping_add(1);
+        self.arrival_frame = Some((viewport, self.arrival_frame_id));
+        Some(self.arrival_frame_id)
+    }
+
+    pub fn reveal_arriving_messages(
+        &mut self,
+        viewport: (Size<Pixels>, f32),
+        frame: u64,
+        now: Instant,
+    ) -> bool {
+        if self.arrival_frame != Some((viewport, frame)) {
+            return false;
+        }
+        self.arrival_frame = None;
+        if let Some(fade) = self.motion.start(motion::FADE, now) {
+            self.bodies
+                .extend(self.messages_pending.drain().map(|id| (id, (fade, true))));
+        } else {
+            self.messages_pending.clear();
+        }
+        true
+    }
+
+    /// Opacity for each body or card still settling in, by message id.
+    pub fn arrival_alphas(&self, now: Instant, whole_card: bool) -> HashMap<String, f32> {
+        let mut alphas: HashMap<_, _> = self
+            .bodies
             .iter()
-            .map(|(id, fade)| {
+            .filter(|(_, (_, whole))| *whole == whole_card)
+            .map(|(id, (fade, _))| {
                 let alpha = motion::lerp(motion::ARRIVE_FROM, 1.0, fade.progress(now));
                 (id.clone(), alpha)
             })
-            .collect()
+            .collect();
+        if whole_card {
+            let pending_alpha = match self.arrival_frame {
+                Some(_) if self.motion.enabled() => motion::ARRIVE_FROM,
+                Some(_) => 1.0,
+                None => 0.0,
+            };
+            alphas.extend(
+                self.messages_pending
+                    .iter()
+                    .map(|id| (id.clone(), pending_alpha)),
+            );
+        }
+        alphas
     }
 
     /// History and recipients can open together with `q` or separately by
@@ -1547,6 +1654,139 @@ mod tests {
     }
 
     #[test]
+    fn notice_replacement_keeps_the_texts_apart() {
+        let mut motion = InboxMotion::new(Motion::new(true));
+        let mut session = session();
+        let now = Instant::now();
+        session.show_toast("Reply · Avery Lane", false);
+        motion.observe(&session, (true, true), now);
+        let swap = later(now, 200);
+        session.show_toast("Sent “Field test notes”", false);
+        motion.observe(&session, (true, true), swap);
+
+        let first = motion.status(&session, swap);
+        assert_eq!(first.leaving.unwrap().0.text, "Reply · Avery Lane");
+        assert_eq!(first.notice.unwrap().1, 0.0);
+        assert_eq!(first.hints, 0.0);
+        let leaving = motion.status(&session, later(swap, 30));
+        assert!(leaving.leaving.unwrap().1 > 0.0);
+        assert_eq!(leaving.notice.unwrap().1, 0.0);
+        let arriving = motion.status(&session, later(swap, 100));
+        assert_eq!(arriving.leaving.unwrap().1, 0.0);
+        assert!((0.0..1.0).contains(&arriving.notice.unwrap().1));
+        assert_eq!(
+            notice_opacity(&motion, &session, later(swap, 140)),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn a_sent_notice_yields_before_the_retry_notice_fades_in() {
+        let mut motion = InboxMotion::new(Motion::new(true));
+        let mut session = session();
+        let now = Instant::now();
+        session.show_toast("Sent “Re: Field test notes”", false);
+        motion.observe(&session, (true, true), now);
+        let swapped = later(now, 180);
+        session.show_toast("Sent · retrying server copy", false);
+        motion.observe(&session, (true, true), swapped);
+        let exiting = motion.status(&session, later(swapped, 30));
+        assert!(exiting.leaving.unwrap().1 > 0.0);
+        assert_eq!(exiting.notice.unwrap().1, 0.0);
+        assert!(motion.tick(later(swapped, 60)));
+        let arriving = motion.status(&session, later(swapped, 100));
+        assert_eq!(arriving.leaving.unwrap().1, 0.0);
+        let (notice, opacity) = arriving.notice.unwrap();
+        assert!(!notice.alert);
+        assert!((0.0..1.0).contains(&opacity));
+        assert_eq!(
+            notice_opacity(&motion, &session, later(swapped, 140)),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn the_old_tile_stays_hidden_until_the_inbox_restores_its_size() {
+        let mut motion = InboxMotion::new(Motion::new(true));
+        let now = Instant::now();
+        let tiled = gpui::size(gpui::px(420.), gpui::px(780.));
+        let uncovered = gpui::size(gpui::px(840.), gpui::px(780.));
+        assert!(!motion.waiting_for_uncover(uncovered, false, now));
+        motion.message_arrived("reply");
+        assert!(!motion.waiting_for_uncover(tiled, true, now));
+        assert!(motion.waiting_for_uncover(tiled, false, now));
+        assert!(motion.waiting_for_uncover(tiled, false, later(now, 80)));
+        assert_eq!(motion.arrival_alphas(later(now, 80), true)["reply"], 0.0);
+        assert!(!motion.waiting_for_uncover(uncovered, false, later(now, 80)));
+
+        // A different arrangement of windows may give the inbox new bounds.
+        assert!(!motion.waiting_for_uncover(tiled, false, later(now, 120)));
+    }
+
+    #[test]
+    fn a_sent_card_stays_pinned_until_the_callback_for_its_resized_frame() {
+        let mut motion = InboxMotion::new(Motion::new(true));
+        let now = Instant::now();
+        let tiled = (gpui::size(gpui::px(600.), gpui::px(780.)), 1.0);
+        let uncovered = (gpui::size(gpui::px(1200.), gpui::px(780.)), 1.0);
+        motion.message_arrived("reply");
+        assert!(motion.stage_arriving_messages(None).is_none());
+        assert_eq!(motion.arrival_alphas(now, true)["reply"], 0.0);
+
+        let old_frame = motion.stage_arriving_messages(Some(tiled)).unwrap();
+        let resized_frame = motion.stage_arriving_messages(Some(uncovered)).unwrap();
+        assert!(motion.stage_arriving_messages(Some(uncovered)).is_none());
+        let presented = later(now, 500);
+        assert!(!motion.reveal_arriving_messages(uncovered, old_frame, presented));
+        assert!(!motion.tick(presented));
+        assert_eq!(
+            motion.arrival_alphas(presented, true)["reply"],
+            motion::ARRIVE_FROM
+        );
+
+        let callback = later(presented, 40);
+        assert!(motion.reveal_arriving_messages(uncovered, resized_frame, callback));
+        assert_eq!(
+            motion.arrival_alphas(callback, true)["reply"],
+            motion::ARRIVE_FROM
+        );
+        let halfway = later(callback, 60);
+        assert!(motion.tick(halfway));
+        assert!(
+            (motion::ARRIVE_FROM..1.0).contains(&motion.arrival_alphas(halfway, true)["reply"])
+        );
+        assert!(!motion.tick(later(callback, 120)));
+    }
+
+    #[test]
+    fn a_notice_that_comes_late_waits_for_the_last_one_to_leave() {
+        let mut motion = InboxMotion::new(Motion::new(true));
+        let mut session = session();
+        let now = Instant::now();
+        session.show_toast("Undone", false);
+        motion.observe(&session, (true, true), now);
+        motion.settle(now);
+        let key = later(now, 300);
+        session.clear_toast();
+        motion.observe(&session, (true, true), key);
+
+        let shown = later(key, 50);
+        let before = motion.status(&session, shown).leaving.unwrap().1;
+        session.show_toast("Archived · u", false);
+        motion.observe(&session, (true, true), shown);
+        let start = motion.status(&session, shown);
+        assert_eq!(start.leaving.unwrap().1, before);
+        assert_eq!(start.notice.unwrap().1, 0.0);
+        let incoming = motion.status(&session, later(shown, 100));
+        assert_eq!(incoming.leaving.unwrap().1, 0.0);
+        assert!((0.0..1.0).contains(&incoming.notice.unwrap().1));
+        assert_eq!(
+            notice_opacity(&motion, &session, later(shown, 140)),
+            Some(1.0)
+        );
+    }
+
+    #[test]
     fn the_same_notice_again_stays_up() {
         let mut motion = InboxMotion::new(Motion::new(true));
         let mut session = session();
@@ -1921,7 +2161,7 @@ mod tests {
         motion.body_arrived("a", now);
         session.quotes_open.insert("a".into());
         session.recipients_open.insert("a".into());
-        assert!(motion.body_alphas(now).is_empty());
+        assert!(motion.arrival_alphas(now, false).is_empty());
         let shown = motion.disclosures(&session, now);
         assert!(shown.quotes.is_empty() && shown.recipients.is_empty());
         assert!(!motion.tick(now));
@@ -1935,13 +2175,13 @@ mod tests {
         motion.body_arrived("a", now);
         session.quotes_open.insert("b".into());
         session.recipients_open.insert("b".into());
-        assert_eq!(motion.body_alphas(now)["a"], motion::ARRIVE_FROM);
+        assert_eq!(motion.arrival_alphas(now, false)["a"], motion::ARRIVE_FROM);
         let opening = motion.disclosures(&session, now);
         assert_eq!(opening.quotes["b"], 0.0);
         assert_eq!(opening.recipients["b"], 0.0);
 
         let mid = later(now, 40);
-        let alpha = motion.body_alphas(mid)["a"];
+        let alpha = motion.arrival_alphas(mid, false)["a"];
         assert!(alpha > motion::ARRIVE_FROM && alpha < 1.0, "{alpha}");
         assert!(motion.tick(mid));
         let shown = motion.disclosures(&session, mid);
@@ -1951,7 +2191,7 @@ mod tests {
         // The body is in after QUICK; both disclosures keep moving until SLIDE.
         let after = later(now, 90);
         assert!(motion.tick(after));
-        assert!(!motion.body_alphas(after).contains_key("a"));
+        assert!(!motion.arrival_alphas(after, false).contains_key("a"));
         assert!(motion.disclosures(&session, after).quotes["b"] > 0.9);
 
         let close = later(now, 130);

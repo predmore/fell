@@ -37,7 +37,7 @@ pub const MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 
 pub use account::{Account, AccountId, BackendKind};
 pub use account_config::{
-    AccountConfig, NotificationMode, PasswordSource, SyncFailureKind, classify_sync_error,
+    AccountConfig, NotificationMode, PasswordSource, SaveSent, SyncFailureKind, classify_sync_error,
 };
 pub use actions::{ActionKind, FlagChange, LabelChange, LocalAction};
 pub use agent::{
@@ -96,6 +96,8 @@ pub enum Error {
     SendUnconfirmed,
     #[error("{0}")]
     Backend(String),
+    #[error("imap: response line from {host} exceeds the {limit} byte limit")]
+    ImapLineLimit { host: String, limit: usize },
     #[error(transparent)]
     Keyring(#[from] credentials::KeyringError),
     #[error("{0}")]

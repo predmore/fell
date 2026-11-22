@@ -11,8 +11,8 @@ use crate::store::copies::CopyFlags;
 
 use super::super::ImapConfig;
 use super::{
-    Listed, Reply, Session, bracket_u32, fetch_modseq, number_after, parse_fetch, parse_flags,
-    quote_imap, search_uids,
+    Listed, Reply, Session, bracket_u32, fetch_modseq, imap_err, is_bye, number_after,
+    parse_fetch_with_section, parse_flags, quote_imap, search_uids, text_starts_with_tag,
 };
 
 /// How a write command failed.
@@ -133,8 +133,62 @@ impl WriteSession {
         self.session.list_selectable()
     }
 
+    /// APPEND the exact SMTP MIME to a quoted mailbox as a synchronizing literal.
+    pub(in crate::imap) fn append_seen(
+        &mut self,
+        quoted_mailbox: &str,
+        mime: &[u8],
+    ) -> Result<(), WriteError> {
+        let session = &mut self.session;
+        session.tag += 1;
+        let tag = format!("a{}", session.tag);
+        session
+            .write_all(
+                format!(
+                    "{tag} APPEND {quoted_mailbox} (\\Seen) {{{}}}\r\n",
+                    mime.len()
+                )
+                .as_bytes(),
+            )
+            .map_err(WriteError::Connection)?;
+        for _ in 0..super::untagged_limit() {
+            let (line, _) = session.read_logical().map_err(WriteError::Connection)?;
+            if line.starts_with('+') {
+                session.write_all(mime).map_err(WriteError::Connection)?;
+                // RFC 3501 §9 and RFC 9051 §9: the literal's octet count
+                // excludes the CRLF that terminates the APPEND command.
+                session.write_all(b"\r\n").map_err(WriteError::Connection)?;
+                return write_reply("APPEND", session.read_reply(&tag, "APPEND")).map(|_| ());
+            }
+            if text_starts_with_tag(&line, &tag) {
+                let status = line[tag.len()..].trim();
+                if status.split_ascii_whitespace().next().is_some_and(|word| {
+                    word.eq_ignore_ascii_case("NO") || word.eq_ignore_ascii_case("BAD")
+                }) {
+                    return Err(WriteError::Refused(format!("APPEND failed: {status}")));
+                }
+                break;
+            }
+            if is_bye(line.as_bytes()) {
+                break;
+            }
+            session.note_untagged(&line);
+        }
+        session.disconnect();
+        Err(WriteError::Connection(imap_err(
+            "APPEND continuation missing",
+        )))
+    }
+
     /// `SELECT` the mailbox read-write and return its UIDVALIDITY.
     pub(in crate::imap) fn select(&mut self, mailbox: &str) -> Result<u32, WriteError> {
+        self.select_with_next(mailbox).map(|(validity, _)| validity)
+    }
+
+    pub(in crate::imap) fn select_with_next(
+        &mut self,
+        mailbox: &str,
+    ) -> Result<(u32, Option<u32>), WriteError> {
         let name = quote_imap(mailbox).map_err(|err| WriteError::Refused(err.to_string()))?;
         let modifier = if self.session.condstore {
             " (CONDSTORE)"
@@ -147,11 +201,18 @@ impl WriteSession {
                 .untagged
                 .iter()
                 .any(|line| has_code(&line.text, "NOMODSEQ"));
-        reply
+        let validity = reply
             .untagged
             .iter()
             .find_map(|line| bracket_u32(&line.text, "UIDVALIDITY"))
-            .ok_or_else(|| WriteError::Refused(format!("SELECT {mailbox} returned no UIDVALIDITY")))
+            .ok_or_else(|| {
+                WriteError::Refused(format!("SELECT {mailbox} returned no UIDVALIDITY"))
+            })?;
+        let next = reply
+            .untagged
+            .iter()
+            .find_map(|line| bracket_u32(&line.text, "UIDNEXT"));
+        Ok((validity, next))
     }
 
     pub(in crate::imap) fn conditional(&self) -> bool {
@@ -293,6 +354,7 @@ impl WriteSession {
     pub(in crate::imap) fn search_message_id(
         &mut self,
         message_id: &str,
+        limit: usize,
     ) -> Result<Vec<u32>, WriteError> {
         let value = quote_imap(&format!("<{message_id}>"))
             .map_err(|err| WriteError::Refused(err.to_string()))?;
@@ -300,7 +362,21 @@ impl WriteSession {
             "UID SEARCH",
             &format!("UID SEARCH HEADER Message-ID {value}"),
         )?;
-        Ok(search_uids(&reply.untagged).unwrap_or_default())
+        search_uids(&reply.untagged, limit)
+            .ok_or_else(|| WriteError::Refused("UID SEARCH returned no usable result".into()))
+    }
+
+    /// Which UIDs still exist in the closed range allocated after APPEND.
+    pub(in crate::imap) fn search_uid_range(
+        &mut self,
+        first: u32,
+        last: u32,
+        limit: usize,
+    ) -> Result<Vec<u32>, WriteError> {
+        let reply = self.run("UID SEARCH", &format!("UID SEARCH UID {first}:{last}"))?;
+        search_uids(&reply.untagged, limit)
+            .filter(|uids| uids.iter().all(|uid| (first..=last).contains(uid)))
+            .ok_or_else(|| WriteError::Refused("UID SEARCH returned no usable UID range".into()))
     }
 
     /// The `Message-ID` header of each of the UIDs in the selected mailbox,
@@ -320,7 +396,14 @@ impl WriteSession {
         Ok(reply
             .untagged
             .into_iter()
-            .filter_map(|line| parse_fetch(&line.text, line.literals))
+            .filter_map(|line| {
+                parse_fetch_with_section(
+                    &line.text,
+                    line.literals,
+                    Some("HEADER.FIELDS (MESSAGE-ID)"),
+                )
+            })
+            .filter(|fetched| !fetched.skipped && !fetched.body_missing && !fetched.body.is_empty())
             .map(|fetched| (fetched.uid, fetched.body))
             .collect())
     }
@@ -330,13 +413,25 @@ impl WriteSession {
     }
 
     fn run(&mut self, label: &str, command: &str) -> Result<Reply, WriteError> {
-        match self.session.command(label, command) {
-            Ok(reply) => Ok(reply),
-            Err(Error::Backend(message)) if message.contains(&format!("{label} failed:")) => {
-                Err(WriteError::Refused(message))
-            }
-            Err(err) => Err(WriteError::Connection(err)),
+        write_reply(label, self.session.command(label, command))
+    }
+}
+
+fn write_reply(label: &str, result: Result<Reply, Error>) -> Result<Reply, WriteError> {
+    match result {
+        Ok(reply) => Ok(reply),
+        Err(Error::Backend(message))
+            if message
+                .split_once(&format!("{label} failed: "))
+                .is_some_and(|(_, status)| {
+                    status.split_ascii_whitespace().next().is_some_and(|word| {
+                        word.eq_ignore_ascii_case("NO") || word.eq_ignore_ascii_case("BAD")
+                    })
+                }) =>
+        {
+            Err(WriteError::Refused(message))
         }
+        Err(err) => Err(WriteError::Connection(err)),
     }
 }
 

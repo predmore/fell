@@ -63,34 +63,59 @@ pub struct PreparedBody {
 
 impl PreparedBody {
     pub fn rich(&self) -> Rich {
-        if !self.body.folded.document.is_empty() {
-            Rich::Html(Arc::clone(&self.body))
-        } else if let Some(plain) = &self.fallback {
-            Rich::PlainPart(Arc::clone(plain))
-        } else {
-            Rich::Plain
-        }
+        rich_body(&self.body, self.fallback.as_ref())
     }
 }
 
 impl BodyJob {
     pub fn prepare(self) -> PreparedBody {
-        let body = prepare_html(&self.html, &self.headers);
-        let subject = self
-            .headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("Subject"))
-            .map_or("", |(_, subject)| subject.as_str());
-        let fallback = self
-            .plain
-            .filter(|plain| body.folded.document.is_empty() && !plain.trim().is_empty())
-            .map(|plain| Arc::new(render_stored_body(Some(&plain), "", subject)));
+        let (body, fallback) = prepare_parts(&self.html, self.plain.as_deref(), &self.headers);
         PreparedBody {
-            body: Arc::new(body),
+            body,
             fallback,
             id: self.id,
             stamp: self.stamp,
         }
+    }
+}
+
+/// The first sent card uses the same MIME parts and history folding as a reread.
+pub(crate) fn prepare_sent(message: &fell_core::Message) -> Rich {
+    let Some(parts) = &message.parts else {
+        return Rich::Plain;
+    };
+    let Some(html) = &parts.html else {
+        return Rich::Plain;
+    };
+    let mut headers = crate::present::mail_headers(message);
+    headers.extend(parts.bulk_headers.iter().cloned());
+    let (body, fallback) = prepare_parts(html, parts.plain.as_deref(), &headers);
+    rich_body(&body, fallback.as_ref())
+}
+
+fn prepare_parts(
+    html: &str,
+    plain: Option<&str>,
+    headers: &[(String, String)],
+) -> (Arc<HtmlBody>, Option<Arc<RenderedBody>>) {
+    let body = prepare_html(html, headers);
+    let subject = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("Subject"))
+        .map_or("", |(_, subject)| subject.as_str());
+    let fallback = plain
+        .filter(|plain| body.folded.document.is_empty() && !plain.trim().is_empty())
+        .map(|plain| Arc::new(render_stored_body(Some(plain), "", subject)));
+    (Arc::new(body), fallback)
+}
+
+fn rich_body(body: &Arc<HtmlBody>, fallback: Option<&Arc<RenderedBody>>) -> Rich {
+    if !body.folded.document.is_empty() {
+        Rich::Html(Arc::clone(body))
+    } else if let Some(plain) = fallback {
+        Rich::PlainPart(Arc::clone(plain))
+    } else {
+        Rich::Plain
     }
 }
 
@@ -1108,6 +1133,35 @@ mod tests {
             &[],
         );
         assert_eq!(body.fold_lines, vec![0, 3]);
+    }
+
+    #[test]
+    fn a_sent_reply_has_the_same_card_body_before_and_after_refresh() {
+        let parent = mail("parent@fell.test", "parent@fell.test", 20, None);
+        let mut reply = mail(
+            "reply@fell.test",
+            "parent@fell.test",
+            10,
+            Some(html_parts(
+                "<p>Thursday works.</p><p>On Mon, Ada wrote:</p>\
+                 <blockquote><p>Does Thursday work?</p></blockquote>",
+                &[],
+            )),
+        );
+        reply.headers.subject = "Re: Plans".into();
+        let Rich::Html(first) = prepare_sent(&reply) else {
+            panic!("the first card needs the prepared body");
+        };
+        let store = store_with(&[parent, reply]);
+        let view = open(&store, "parent@fell.test");
+        let last = view.last().unwrap();
+        let refreshed = read_job(&store, &account().id, &last.id, &last.mail_headers)
+            .unwrap()
+            .prepare();
+        assert_eq!(first.fold_lines, [0, 2]);
+        assert_eq!(first.fold_lines, refreshed.body.fold_lines);
+        assert_eq!(first.folded.sections, refreshed.body.folded.sections);
+        assert_eq!(first.folded.document, refreshed.body.folded.document);
     }
 
     fn heavy_newsletter() -> String {

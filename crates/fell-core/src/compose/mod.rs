@@ -21,8 +21,9 @@ pub use frontmatter::{
     mailbox_parts, parse_address_line,
 };
 pub use hub::{
-    DraftHub, HubEvent, MAYBE_SENT_NOTICE, editor_is_running, file_fallback_edit,
-    file_fallback_get, file_fallback_replace_body, request_send_without_editor, rpc_call,
+    DraftHub, HubEvent, LOCAL_SENT_COPY_FAILED, MAYBE_SENT_NOTICE, editor_is_running,
+    file_fallback_edit, file_fallback_get, file_fallback_replace_body, request_send_without_editor,
+    rpc_call,
 };
 pub use markdown::{
     Block, BlockBody, Inline, StyleKind, StyleSpan, StyledDoc, doc_to_html, html_to_doc,
@@ -34,14 +35,16 @@ pub use persist::{
     DraftSummary, StoredCompose, ensure_draft_folder, mailbox_db_path, open_owned_draft,
     remember_compose_store, remembered_store_path, stored_compose_account, stored_compose_owner,
 };
-pub(crate) use persist::{confirm_synced_sends, mark_discarded, undo_discard};
+pub(crate) use persist::{
+    confirm_synced_sends, mark_discarded, record_confirmed_send, undo_discard,
+};
 pub use reply::{
     ForwardSummary, MAX_REFERENCES, ReplyKind, ReplyParts, ReplyStart, build_references,
     forward_subject, own_addresses, reply_recipients, reply_subject, start_reply,
     start_reply_in_zone,
 };
 pub use session::{
-    AddressView, AttachmentView, DraftSession, HunkView, ReplyContext, SendLock, SentBcc, Snapshot,
+    AddressView, AttachmentView, DraftSession, HunkView, ReplyContext, SendLock, SentCopy, Snapshot,
 };
 pub use workspace::{
     MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_FILES, control_dir, draft_file_is_symlink, draft_folder,

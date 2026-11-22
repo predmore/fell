@@ -27,8 +27,8 @@ use gpui::{
     InteractiveElement, IntoElement, KeyDownEvent, Keystroke, MouseButton, MouseMoveEvent,
     MouseUpEvent, ParentElement, Pixels, Render, ScrollHandle, ScrollStrategy, SharedString,
     StatefulInteractiveElement, Styled, StyledText, TextStyle, TitlebarOptions,
-    UniformListScrollHandle, Window, WindowBounds, WindowOptions, div, point, prelude::*, px, rgb,
-    size, uniform_list,
+    UniformListScrollHandle, Window, WindowBounds, WindowHandle, WindowOptions, div, point,
+    prelude::*, px, rgb, size, uniform_list,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -36,6 +36,7 @@ use fell_core::actions::LabelUndoTarget;
 use fell_core::compose::{DraftSummary, ReplyKind};
 
 use crate::attachments::{self, Download, Fetcher, Request as AttachmentRequest};
+use crate::compose_ui::ComposeView;
 use crate::draft_host::DraftHome;
 use crate::frame_log::{FrameLog, SharedFrameLog};
 use crate::inbox_motion::{Disclosures, InboxMotion, PaneEntry, StatusMotion};
@@ -112,6 +113,26 @@ pub fn run(trace_start: Option<Instant>) {
                     trace.window_created(window);
                 }
                 let view = cx.new(|cx| Inbox::new(window, cx));
+                view.update(cx, |_, cx| {
+                    let mut viewport = (window.viewport_size(), window.scale_factor());
+                    cx.observe_window_bounds(window, move |_, window, cx| {
+                        let previous = viewport;
+                        viewport = (window.viewport_size(), window.scale_factor());
+                        if viewport == previous {
+                            return;
+                        }
+                        // Lay out the new bounds as soon as configure arrives,
+                        // so the next compositor frame can present immediately.
+                        window.defer(cx, |window, cx| window.draw(cx).clear());
+                    })
+                    .detach();
+                    cx.observe_window_activation(window, |_, window, cx| {
+                        if window.is_window_active() {
+                            cx.notify();
+                        }
+                    })
+                    .detach();
+                });
                 let focus = view.read(cx).focus.clone();
                 window.focus(&focus);
                 view
@@ -119,19 +140,71 @@ pub fn run(trace_start: Option<Instant>) {
         );
         match view {
             Ok(view) => {
-                if let Some(trace) = trace {
-                    cx.on_window_closed(move |cx| {
-                        if !cx.windows().contains(&view.into()) {
-                            trace.finish();
-                        }
-                    })
-                    .detach();
-                }
+                cx.set_global(InboxWindow(view));
+                cx.on_window_closed(move |cx| {
+                    if cx.windows().contains(&view.into()) {
+                        let _ = view.update(cx, |inbox, _, cx| {
+                            if inbox.motion.has_pending_messages() {
+                                cx.notify();
+                            }
+                        });
+                    } else if let Some(trace) = &trace {
+                        trace.finish();
+                    }
+                })
+                .detach();
             }
             Err(_) => fell_core::diagnostic!(ERROR, "Could not open inbox window"),
         }
         cx.activate(true);
     });
+}
+
+struct InboxWindow(WindowHandle<Inbox>);
+
+impl gpui::Global for InboxWindow {}
+
+/// Put the committed copy into the inbox before the compose window closes.
+pub(crate) fn present_sent_copy(
+    cx: &mut App,
+    thread: ThreadId,
+    message: fell_core::Message,
+    rich: Rich,
+) {
+    let Some(inbox) = cx.try_global::<InboxWindow>().map(|inbox| inbox.0) else {
+        return;
+    };
+    let _ = inbox.update(cx, |inbox, _, cx| {
+        if message.account_id != inbox.account_id {
+            return;
+        }
+        inbox.show_sent_copy(thread, message, rich);
+        inbox.request_threads(
+            ReadIntent {
+                refresh_open: true,
+                ..ReadIntent::default()
+            },
+            cx,
+        );
+        cx.notify();
+    });
+}
+
+fn compose_open(cx: &App) -> bool {
+    cx.windows()
+        .iter()
+        .any(|handle| handle.downcast::<ComposeView>().is_some())
+}
+
+pub(crate) fn wake_sent_copy_sync(cx: &mut App) {
+    if let Some(inbox) = cx.try_global::<InboxWindow>().map(|inbox| inbox.0) {
+        let _ = inbox.update(cx, |inbox, _, _| {
+            // A failed local insert can still have queued the server copy.
+            if let Some(sync) = &inbox.sync {
+                sync.write_back_now();
+            }
+        });
+    }
 }
 
 /// Why the folder is being reread. Requests made while a read is in flight
@@ -428,20 +501,7 @@ fn not_sent_detail(session: &Session, write: &DroppedWrite, count: usize) -> Str
         DropReason::NotFound => format!("{messages} not found in {folder} on the server"),
         DropReason::NoMove => "This server can't move mail; archive stays in Fell".to_string(),
         DropReason::Abandoned => format!("{messages} left half moved in {folder} on the server"),
-    }
-}
-
-/// What the inbox says while a reply or forward's window comes up:
-/// "reply all · Jon".
-fn reply_notice(kind: ReplyKind, sender: &str) -> String {
-    format!("{}{sender}", reply_notice_prefix(kind))
-}
-
-fn reply_notice_prefix(kind: ReplyKind) -> &'static str {
-    match kind {
-        ReplyKind::Reply => "reply · ",
-        ReplyKind::ReplyAll => "reply all · ",
-        ReplyKind::Forward => "forward · ",
+        DropReason::UnconfirmedAppend => "Sent · server copy unconfirmed".to_string(),
     }
 }
 
@@ -507,6 +567,7 @@ struct Inbox {
     /// The scroll handle has bounds for this conversation's current messages.
     conv_layout_current: bool,
     painted_reader: Option<ReaderLayout>,
+    sent_arrival_anchor: Option<ScrollAnchor>,
     /// Background sync for the account file. `None` for the demo mailbox.
     sync: Option<SyncHandle>,
     /// The folder the rows on screen came from. `session.folder` changes on
@@ -698,6 +759,7 @@ impl Inbox {
             body_refresh: BodyRefresh::default(),
             conv_layout_current: false,
             painted_reader: None,
+            sent_arrival_anchor: None,
             sync: None,
             list_folder: FolderRole::Inbox.default_name().into(),
             list_label: None,
@@ -950,15 +1012,38 @@ impl Inbox {
                                 return;
                             }
                             SyncEvent::WriteBackNotice {
-                                dropped,
+                                mut dropped,
                                 flag_recovery_delayed,
+                                sent_append_delayed,
                             } => {
-                                let text = write_back_notice(
-                                    &inbox.session,
-                                    &dropped,
-                                    flag_recovery_delayed,
-                                );
-                                inbox.session.show_toast(text, true);
+                                let sent_failed = dropped
+                                    .iter()
+                                    .any(|write| write.kind == OutboxKind::AppendSent);
+                                dropped.retain(|write| write.kind != OutboxKind::AppendSent);
+                                let mut lines = Vec::new();
+                                let local_save_failed =
+                                    inbox.session.status_notice().is_some_and(|notice| {
+                                        notice.text == fell_core::compose::LOCAL_SENT_COPY_FAILED
+                                    });
+                                if sent_failed {
+                                    lines.push("Sent · server copy unconfirmed".to_string());
+                                }
+                                if !dropped.is_empty() || flag_recovery_delayed {
+                                    lines.push(write_back_notice(
+                                        &inbox.session,
+                                        &dropped,
+                                        flag_recovery_delayed,
+                                    ));
+                                }
+                                if !lines.is_empty() {
+                                    inbox.session.show_toast(lines.join(" · "), true);
+                                } else if sent_append_delayed && !local_save_failed {
+                                    inbox
+                                        .session
+                                        .show_toast("Sent · retrying server copy", false);
+                                } else {
+                                    return;
+                                }
                                 cx.notify();
                                 return;
                             }
@@ -1358,7 +1443,7 @@ impl Inbox {
                     quotes: self.session.quotes_open.clone(),
                     recipients: self.session.recipients_open.clone(),
                     arrival: self.motion.arrival(self.frame_now),
-                    alphas: self.motion.body_alphas(self.frame_now),
+                    alphas: self.motion.arrival_alphas(self.frame_now, false),
                     disclosures,
                 }));
             }
@@ -2368,6 +2453,62 @@ impl Inbox {
         .detach();
     }
 
+    fn show_sent_copy(&mut self, thread: ThreadId, mut message: fell_core::Message, rich: Rich) {
+        if self.open_thread.as_deref() != Some(thread.as_str())
+            || self.session.cursor_id != self.open_thread
+            || !self.search_preview_current()
+            || self
+                .session
+                .messages
+                .iter()
+                .any(|shown| shown.id == message.headers.message_id.as_str())
+        {
+            return;
+        }
+        let viewing = self
+            .session
+            .search_source(thread.as_str())
+            .unwrap_or(&self.session.folder);
+        let parts = message.parts.take();
+        let mut shown = present::conversation(
+            std::slice::from_ref(&message),
+            &self.session.account_email,
+            &self.session.roles,
+            &self.session.folders,
+            viewing,
+        )
+        .remove(0);
+        shown.rich = rich;
+        if let Some(parts) = parts {
+            shown.attachments = attachments::visible_parts(parts.mime_parts);
+        }
+        // A stale read must not replace the just-committed reply. Keep the
+        // reader's existing cursor and viewport, and fade in the new body.
+        self.conv_gen.fetch_add(1, Ordering::SeqCst);
+        let follow = self.conversation_at_bottom()
+            && self.session.message_cursor + 1 == self.session.messages.len();
+        let anchor = if self.conv_layout_current && self.motion.conv_glide.is_none() {
+            ScrollAnchor::capture(&self.conv_scroll, usize::from(self.conv_note_slot))
+        } else {
+            None
+        };
+        self.invalidate_conversation_layout();
+        self.motion.message_arrived(&shown.id);
+        let messages = &mut self.session.messages;
+        let at = messages.partition_point(|old| old.date_unix <= shown.date_unix);
+        messages.insert(at, shown);
+        self.sent_arrival_anchor = anchor.map(|mut anchor| {
+            anchor.index += usize::from(at <= anchor.index);
+            anchor
+        });
+        if follow && at + 1 == messages.len() {
+            self.session.message_cursor = at;
+            self.reveal = Reveal::Following(RevealPhase::Laying);
+        } else if at <= self.session.message_cursor && messages.len() > 1 {
+            self.session.message_cursor += 1;
+        }
+    }
+
     /// Reload the theme when Omarchy, GTK, or Alacritty settings change.
     /// inotify wakes this; without it, a slow poll does.
     fn watch_theme(&self, cx: &mut Context<Self>) {
@@ -3051,24 +3192,10 @@ impl Inbox {
                 .show_toast("Compose is not available here", true);
             return;
         };
-        // The window takes a moment to appear: say what is coming now.
-        if id.is_none() {
-            self.session.show_toast("New draft", false);
-        } else {
-            let subject = self
-                .session
-                .cursor_thread()
-                .map(|row| row.subject.clone())
-                .unwrap_or_default();
-            self.session
-                .show_toast(format!("Opening draft \u{201c}{subject}\u{201d}"), false);
-        }
-        let notice = self.session.toast_generation();
         if let Some(id) = &id
             && crate::draft_host::show_draft(&hub, id)
         {
             self.watch_held_draft(&hub, id, cx);
-            self.settle_opening_notice(notice, cx);
             return;
         }
         let Some(home) = self.draft_home.clone() else {
@@ -3100,9 +3227,7 @@ impl Inbox {
                         // `false` while another open of it is still reading
                         // it; that one shows it when it lands.
                         inbox.watch_held_draft(&hub, &id, cx);
-                        if crate::draft_host::show_draft(&hub, &id) {
-                            inbox.settle_opening_notice(notice, cx);
-                        }
+                        crate::draft_host::show_draft(&hub, &id);
                     }
                     Err(err) => {
                         let what = if creating {
@@ -3145,7 +3270,6 @@ impl Inbox {
             return;
         };
         let parent_id = fell_core::MessageId::new(&target.id);
-        let sender = target.sender.clone();
         let Some(hub) = cx
             .try_global::<crate::draft_host::AgentDrafts>()
             .map(|drafts| drafts.0.clone())
@@ -3164,9 +3288,7 @@ impl Inbox {
         if let Some(note) = &suggestion {
             self.note_in_flight = Some(note.id);
         }
-        self.session.show_toast(reply_notice(kind, &sender), false);
         self.forwarding_attachments |= forwarding;
-        let notice = self.session.toast_generation();
         let account = self.account_id.clone();
         let email = self.session.account_email.clone();
         let roles = self.session.roles.clone();
@@ -3234,9 +3356,7 @@ impl Inbox {
                         if let Some(note) = suggestion {
                             inbox.agent_note_resolved(&note);
                         }
-                        if crate::draft_host::show_draft(&hub, &id) {
-                            inbox.settle_opening_notice(notice, cx);
-                        }
+                        crate::draft_host::show_draft(&hub, &id);
                     }
                     Err(err) => {
                         if suggestion.is_some() {
@@ -3256,13 +3376,6 @@ impl Inbox {
             });
         })
         .detach();
-    }
-
-    /// The window is on its way: once it has had time to show, the inbox's
-    /// "opening" notice `notice` has done its job and goes, unless something
-    /// newer replaced it, such as the notice for a second draft opened since.
-    fn settle_opening_notice(&mut self, notice: u64, cx: &mut Context<Self>) {
-        self.dismiss_notice_after(notice, std::time::Duration::from_millis(700), cx);
     }
 
     fn expire_action_notice(&mut self, cx: &mut Context<Self>) {
@@ -3755,6 +3868,7 @@ impl Inbox {
         self.body_refresh = BodyRefresh::default();
         self.note_visit = None;
         self.instant_conversation_scroll = false;
+        self.sent_arrival_anchor = None;
         self.release_landing();
         self.conv_layout_current = false;
         self.reveal.cancel_pending();
@@ -4107,7 +4221,10 @@ impl Render for Inbox {
             || std::mem::take(&mut self.instant_conversation_scroll);
         self.advance_glides(now, window.scale_factor());
         let refreshing_body = !self.body_refresh.is_empty();
-        let anchor = self.apply_body_refresh(now);
+        let anchor = self
+            .sent_arrival_anchor
+            .take()
+            .or_else(|| self.apply_body_refresh(now));
         let reveal_attachment = std::mem::take(&mut self.reveal_attachment);
         let spin_attachment = self.motion.motion.enabled()
             && panes.1
@@ -4119,6 +4236,32 @@ impl Render for Inbox {
             });
         self.want_bodies(cx);
         self.motion.narrow_status = width < present::NARROW_WIDTH;
+        let composing = compose_open(cx);
+        let viewport = (window.viewport_size(), window.scale_factor());
+        let waiting_for_resize = self.motion.waiting_for_uncover(viewport.0, composing, now);
+        let uncovered = panes.1 && !composing && !waiting_for_resize;
+        if let Some(frame) = self
+            .motion
+            .stage_arriving_messages(uncovered.then_some(viewport))
+        {
+            let this = cx.weak_entity();
+            // GPUI runs next-frame callbacks before submitting the scene. Let
+            // this callback present the pinned frame and start the clock on
+            // its callback, provided no configure replaced that scene.
+            window.on_next_frame(move |window, _| {
+                window.on_next_frame(move |window, cx| {
+                    if !compose_open(cx) {
+                        let viewport = (window.viewport_size(), window.scale_factor());
+                        let _ = this.update(cx, |inbox, cx| {
+                            let now = inbox.motion.clock.now();
+                            if inbox.motion.reveal_arriving_messages(viewport, frame, now) {
+                                cx.notify();
+                            }
+                        });
+                    }
+                });
+            });
+        }
         self.motion.observe(&self.session, panes, now);
         let reflow = self.motion.reading_reflow(now);
         let list_width = list_width(width, self.split);
@@ -4302,7 +4445,8 @@ impl Render for Inbox {
             note_expanded_in_band: !self.session.agent_notes.collapsed,
             hide_message_cursor: self.note_pin.eligible() && !self.message_selected(),
             return_glide: returning.map(|(_, glide)| glide),
-            alphas: self.motion.body_alphas(now),
+            alphas: self.motion.arrival_alphas(now, false),
+            card_alphas: self.motion.arrival_alphas(now, true),
             disclosures: self.motion.disclosures(&self.session, now),
             anchor: returning.map(|(anchor, _)| anchor).or(anchor),
             frames: self.frames.clone(),
@@ -4319,6 +4463,7 @@ impl Render for Inbox {
             now,
         );
         let animating = self.motion.tick(now)
+            | waiting_for_resize
             | self.note_view.running()
             | self.note_pin.running()
             | self
@@ -4556,6 +4701,7 @@ struct ConvFrame {
     return_glide: Option<LandingGlide>,
     /// Bodies fading in, by message id: their opacity.
     alphas: HashMap<String, f32>,
+    card_alphas: HashMap<String, f32>,
     disclosures: Disclosures,
     /// The message held at its previous viewport position, or at the top on open.
     anchor: Option<ScrollAnchor>,
@@ -7092,6 +7238,11 @@ fn conversation(
                     cx,
                 )
             };
+            let block = if let Some(alpha) = frame.card_alphas.get(&message.id) {
+                div().opacity(*alpha).child(block).into_any_element()
+            } else {
+                block
+            };
             if let Some((anchor, probe)) = &hold
                 && anchor.index == index
             {
@@ -8402,6 +8553,21 @@ fn status_bar(
             ),
         }
     };
+    // Reserve a stable slot through routine sync passes. Progress and
+    // recovery guidance can use more space when they have more to say.
+    let steady_sync = outage.is_none()
+        && reply_check.is_none()
+        && matches!(
+            session.sync,
+            SyncKind::Connecting
+                | SyncKind::Syncing { progress: None, .. }
+                | SyncKind::Synced { .. }
+        );
+    let sync_width = if steady_sync {
+        bar_px(window, "synced just now · 0000 new", size, ui)
+    } else {
+        bar_px(window, &sync_label, size, ui)
+    };
     let details = outage.is_none() && session.detail_text().is_some();
     // What the bar spends before the notice, measured as drawn: the
     // padding, the mode in mono, sync, the dots, the gaps between the
@@ -8410,7 +8576,7 @@ fn status_bar(
     let mut used = 28.0 + 2.0 * 12.0 + 2.0;
     used += bar_px(window, session.mode_label(), size, mono) + dot;
     if !narrow {
-        used += 2.0 * 12.0 + dot + bar_px(window, &sync_label, size, ui);
+        used += 2.0 * 12.0 + dot + sync_width;
         if let Some(key) = &sync_hint {
             used += bar_px(window, &format!(" · {key} for log"), size, ui);
         }
@@ -8497,6 +8663,12 @@ fn status_bar(
                 .child(
                     div()
                         .flex_none()
+                        .when(steady_sync, |slot| {
+                            slot.w(px(sync_width))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                        })
                         .text_color(rgb(sync_color))
                         .when(status.sync_opacity < 1.0, |label| {
                             label.opacity(status.sync_opacity)

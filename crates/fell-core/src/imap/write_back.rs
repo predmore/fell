@@ -31,6 +31,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::Error;
 use crate::account::AccountId;
+use crate::folders::{FolderRole, FolderRoles};
 use crate::outbox::{
     self, DropReason, DroppedWrite, OutboxEntry, OutboxKind, Outcome, ReplayReport, Reversed,
     Settled,
@@ -38,9 +39,9 @@ use crate::outbox::{
 };
 use crate::store::{Store, copies::CopyFlags};
 
-use super::ImapConfig;
 use super::rfc822::{copy_message_id, is_synthetic_message_id};
-use super::session::{FlagReply, Placed, WriteError, WriteSession};
+use super::session::{FlagReply, Placed, WriteError, WriteSession, quote_imap};
+use super::{ImapConfig, listed_mailboxes};
 
 mod labels;
 
@@ -48,27 +49,25 @@ mod labels;
 pub(crate) const MAX_ATTEMPTS: u32 = 5;
 /// Wait before the next try, by attempts so far. The last one repeats.
 const BACKOFF_SECS: [i64; 5] = [10, 30, 120, 600, 1800];
+/// Inconclusive checks are independent of explicit APPEND refusals.
+pub(super) const MAX_APPEND_CHECKS: u32 = 5;
+pub(super) const APPEND_UID_LIMIT: usize = 500;
+const APPEND_HEADER_BATCH: usize = 100;
 
 /// Send every outbox row that is due. Returns what was sent and dropped.
 /// A connection that fails part way is in [`ReplayReport::interrupted`];
 /// what was settled before it stays settled.
-pub(crate) fn replay(
-    config: &ImapConfig,
-    account_id: &AccountId,
-    store: &Store,
-) -> crate::Result<ReplayReport> {
-    replay_with(config, account_id, store, &|| {})
-}
-
-/// [`replay`], running `before_send` after the pass loaded its rows and
-/// just before it marks a batch sent. Tests change the store there.
 pub(super) fn replay_with(
     config: &ImapConfig,
     account_id: &AccountId,
     store: &Store,
+    append_sent: bool,
     before_send: &dyn Fn(),
 ) -> crate::Result<ReplayReport> {
-    let entries = outbox::unfinished(store, account_id)?;
+    let mut entries = outbox::unfinished(store, account_id)?;
+    if !append_sent {
+        entries.retain(|entry| entry.kind != OutboxKind::AppendSent);
+    }
     let mut report = ReplayReport::default();
     if entries.is_empty() {
         return Ok(report);
@@ -78,7 +77,6 @@ pub(super) fn replay_with(
         report.waiting = entries.len();
         return Ok(report);
     }
-    let mut session = WriteSession::open(config)?;
     let mut pass = Pass {
         store,
         account_id,
@@ -88,18 +86,58 @@ pub(super) fn replay_with(
         held_moves: HashMap::new(),
         unconfirmed_stores: HashMap::new(),
         listing: None,
+        sent_mailbox: None,
+        overrides: &config.folder_overrides,
         selected: None,
         bounds: HashMap::new(),
         before_send,
         report: &mut report,
     };
-    let result = pass.run(&mut session);
+    let result = match WriteSession::open(config) {
+        Ok(mut session) => {
+            let result = pass.run(&mut session);
+            if !matches!(&result, Err(Stop::Connection(_))) {
+                session.logout();
+            }
+            result
+        }
+        Err(err)
+            if entries
+                .iter()
+                .any(|entry| entry.kind == OutboxKind::AppendSent && entry.retry_unix <= now) =>
+        {
+            let note = err.to_string();
+            for (index, entry) in entries.iter().enumerate() {
+                if entry.kind == OutboxKind::AppendSent && entry.retry_unix <= now {
+                    let guard = store.try_lock_mailbox_operation(".append-sent")?;
+                    if (guard.is_none() && store.db_path().is_some())
+                        || outbox::pending_append(store, entry)?.is_none()
+                    {
+                        continue;
+                    }
+                    match pass.retry_append(index, &note, AppendRetry::Deferred) {
+                        Ok(()) => {}
+                        Err(Stop::Store(error)) => return Err(error),
+                        Err(_) => break,
+                    }
+                }
+            }
+            Err(Stop::Connection(err))
+        }
+        Err(err) => return Err(err),
+    };
     let settled = pass.settled.iter().filter(|done| **done).count();
-    session.logout();
     match result {
         Ok(()) => {}
         Err(Stop::Store(err)) => return Err(err),
-        Err(Stop::Connection(err)) => report.interrupted = Some(err.to_string()),
+        Err(
+            Stop::AppendRetry(message) | Stop::AppendRefused(message) | Stop::AppendCheck(message),
+        ) => {
+            return Err(Error::Backend(message));
+        }
+        Err(Stop::Connection(err) | Stop::AppendCheckDisconnected(err)) => {
+            report.interrupted = Some(err.to_string());
+        }
         // Write-back was turned off by another process mid-pass.
         Err(Stop::Stale) => {}
     }
@@ -110,8 +148,28 @@ pub(super) fn replay_with(
 enum Stop {
     Connection(Error),
     Store(Error),
+    AppendRetry(String),
+    AppendRefused(String),
+    AppendCheck(String),
+    AppendCheckDisconnected(Error),
     /// The row is no longer in this write-back generation: send nothing more.
     Stale,
+}
+
+fn append_check_error(error: WriteError) -> Stop {
+    match error {
+        WriteError::Refused(message) => Stop::AppendCheck(message),
+        WriteError::Connection(error @ Error::ImapLineLimit { .. }) => {
+            Stop::AppendCheckDisconnected(error)
+        }
+        WriteError::Connection(error) => Stop::Connection(error),
+    }
+}
+
+enum AppendRetry {
+    Deferred,
+    Refused,
+    Inconclusive { checks: u32 },
 }
 
 enum MoveHold {
@@ -139,6 +197,8 @@ struct Pass<'a> {
     unconfirmed_stores: HashMap<String, HashSet<(u32, u32)>>,
     /// Folder name → raw mailbox name, from LIST when first needed.
     listing: Option<HashMap<String, String>>,
+    sent_mailbox: Option<String>,
+    overrides: &'a [(FolderRole, String)],
     /// The mailbox selected now and its UIDVALIDITY.
     selected: Option<(String, u32)>,
     /// Row id → the target's `(UIDVALIDITY, UIDNEXT)` before its first
@@ -179,6 +239,10 @@ impl Pass<'_> {
                         .insert(entry.message_id.clone(), MoveHold::EarlierMove);
                 }
                 OutboxKind::Move => self.replay_move(session, index, &mut visited)?,
+                OutboxKind::AppendSent if entry.retry_unix <= self.now => {
+                    self.replay_append(session, index)?;
+                }
+                OutboxKind::AppendSent => {}
                 _ if matches!(held_move, Some(MoveHold::EarlierMove)) => {}
                 OutboxKind::Seen | OutboxKind::Flagged => self.replay_flag(session, index)?,
                 OutboxKind::Keyword | OutboxKind::BridgeLabel => {
@@ -189,6 +253,245 @@ impl Pass<'_> {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn replay_append(&mut self, session: &mut WriteSession, index: usize) -> Result<(), Stop> {
+        // Serialize recovery and transfer across app processes. Recheck the
+        // row once we have the lock: another pass may already have sent it.
+        let guard = self.store.try_lock_mailbox_operation(".append-sent")?;
+        if guard.is_none() && self.store.db_path().is_some() {
+            return Ok(());
+        }
+        let entry = &self.entries[index];
+        let Some(pending) = outbox::pending_append(self.store, entry)? else {
+            return Ok(());
+        };
+        match self.append(session, entry, &pending) {
+            Ok(()) => {
+                if outbox::complete_append(self.store, entry)? {
+                    self.report.sent += 1;
+                    self.settled[index] = true;
+                }
+                Ok(())
+            }
+            Err(Stop::Connection(err)) => {
+                self.retry_append(index, &err.to_string(), AppendRetry::Deferred)?;
+                Err(Stop::Connection(err))
+            }
+            Err(Stop::AppendRetry(message)) => {
+                self.retry_append(index, &message, AppendRetry::Deferred)
+            }
+            Err(Stop::AppendRefused(message)) => {
+                self.retry_append(index, &message, AppendRetry::Refused)
+            }
+            Err(Stop::AppendCheck(message)) => self.retry_append(
+                index,
+                &message,
+                AppendRetry::Inconclusive {
+                    checks: pending.checks,
+                },
+            ),
+            Err(Stop::AppendCheckDisconnected(err)) => {
+                self.retry_append(
+                    index,
+                    &err.to_string(),
+                    AppendRetry::Inconclusive {
+                        checks: pending.checks,
+                    },
+                )?;
+                Err(Stop::Connection(err))
+            }
+            Err(stop) => Err(stop),
+        }
+    }
+
+    fn append(
+        &mut self,
+        session: &mut WriteSession,
+        entry: &OutboxEntry,
+        pending: &outbox::PendingAppend,
+    ) -> Result<(), Stop> {
+        let (mailbox, bound) = if let Some(mailbox) = &pending.sent_to {
+            // Refresh the selected UID state before checking for the copy.
+            self.selected = None;
+            let (validity, next) = session
+                .select_with_next(mailbox)
+                .map_err(append_check_error)?;
+            self.selected = Some((mailbox.clone(), validity));
+            let next = next.unwrap_or_default();
+            if Self::check_append(session, entry, pending, mailbox, validity, next)? {
+                return Ok(());
+            }
+            (mailbox.clone(), (validity, next))
+        } else {
+            self.load_listing(session)?;
+            let mailbox = self
+                .sent_mailbox
+                .clone()
+                .ok_or_else(|| Stop::AppendRetry("no Sent mailbox".into()))?;
+            let bound = if self
+                .selected
+                .as_ref()
+                .is_some_and(|(name, _)| name == &mailbox)
+            {
+                self.selected = None;
+                match session.select_with_next(&mailbox) {
+                    Ok((validity, next)) => {
+                        self.selected = Some((mailbox.clone(), validity));
+                        (validity, next.unwrap_or_default())
+                    }
+                    Err(WriteError::Refused(message)) => return Err(Stop::AppendRetry(message)),
+                    Err(WriteError::Connection(err)) => return Err(Stop::Connection(err)),
+                }
+            } else {
+                match session.status(&mailbox) {
+                    Ok(bound) => bound,
+                    Err(WriteError::Refused(message)) => return Err(Stop::AppendRetry(message)),
+                    Err(WriteError::Connection(err)) => return Err(Stop::Connection(err)),
+                }
+            };
+            (mailbox, bound)
+        };
+        // Never send without a bound that recovery can use if the reply is lost.
+        if bound.1 == 0 {
+            return Err(Stop::AppendRetry(
+                "Sent UIDNEXT could not be verified".into(),
+            ));
+        }
+        let quoted_mailbox = quote_imap(&mailbox).map_err(Stop::AppendRetry)?;
+        if !outbox::mark_append_sent(self.store, entry, &mailbox, bound)? {
+            return Err(Stop::Stale);
+        }
+        match session.append_seen(&quoted_mailbox, &pending.mime) {
+            Ok(()) => Ok(()),
+            Err(WriteError::Refused(message)) => Err(Stop::AppendRefused(message)),
+            Err(WriteError::Connection(error)) => Err(Stop::Connection(error)),
+        }
+    }
+
+    /// True means the copy is present, false means it is safe to APPEND.
+    fn check_append(
+        session: &mut WriteSession,
+        entry: &OutboxEntry,
+        pending: &outbox::PendingAppend,
+        mailbox: &str,
+        validity: u32,
+        next: u32,
+    ) -> Result<bool, Stop> {
+        let candidates = session
+            .search_message_id(&entry.message_id, APPEND_UID_LIMIT)
+            .map_err(append_check_error)?;
+        if !candidates.is_empty() {
+            let (found, _) =
+                Self::check_append_headers(session, entry, mailbox, validity, &candidates)?;
+            return if found {
+                Ok(true)
+            } else {
+                Err(Stop::AppendCheck(
+                    "Sent Message-ID check found no exact match".into(),
+                ))
+            };
+        }
+        if pending.validity != 0 && validity != pending.validity {
+            return Ok(false);
+        }
+        if pending.next == 0 || next < pending.next {
+            return Err(Stop::AppendCheck(
+                "Sent UIDNEXT could not be verified".into(),
+            ));
+        }
+        if next == pending.next {
+            // A successful APPEND allocates a UID even if it is expunged later.
+            return Ok(false);
+        }
+        if next - pending.next > APPEND_UID_LIMIT as u32 {
+            return Err(Stop::AppendCheck(
+                "Sent UID range is too large to verify".into(),
+            ));
+        }
+        // UIDNEXT may also advance for unrelated arrivals. List the existing
+        // UIDs in the closed range so gaps are distinguished from missing
+        // FETCH responses, and check every header before sending again.
+        let uids = session
+            .search_uid_range(pending.next, next - 1, APPEND_UID_LIMIT)
+            .map_err(append_check_error)?;
+        let (found, complete) =
+            Self::check_append_headers(session, entry, mailbox, validity, &uids)?;
+        if found || complete {
+            Ok(found)
+        } else {
+            Err(Stop::AppendCheck(
+                "Sent UID range had missing headers".into(),
+            ))
+        }
+    }
+
+    fn check_append_headers(
+        session: &mut WriteSession,
+        entry: &OutboxEntry,
+        mailbox: &str,
+        validity: u32,
+        uids: &[u32],
+    ) -> Result<(bool, bool), Stop> {
+        let mut complete = true;
+        for batch in uids.chunks(APPEND_HEADER_BATCH) {
+            let headers = session
+                .uid_fetch_message_ids(batch)
+                .map_err(append_check_error)?;
+            let returned: HashSet<_> = headers.iter().map(|(uid, _)| *uid).collect();
+            if headers.iter().any(|(uid, bytes)| {
+                batch.binary_search(uid).is_ok()
+                    && copy_message_id(mailbox, validity, *uid, bytes, false).as_str()
+                        == entry.message_id
+            }) {
+                return Ok((true, true));
+            }
+            complete &= batch.iter().all(|uid| returned.contains(uid));
+        }
+        Ok((false, complete))
+    }
+
+    fn retry_append(
+        &mut self,
+        index: usize,
+        message: &str,
+        retry: AppendRetry,
+    ) -> Result<(), Stop> {
+        let entry = &self.entries[index];
+        let attempts = match retry {
+            AppendRetry::Deferred | AppendRetry::Refused => entry.attempts,
+            AppendRetry::Inconclusive { checks } => checks,
+        };
+        match retry {
+            AppendRetry::Refused if attempts + 1 >= MAX_ATTEMPTS => {
+                return self.drop_row(index, DropReason::Refused, message);
+            }
+            AppendRetry::Inconclusive { .. } if attempts + 1 >= MAX_APPEND_CHECKS => {
+                return self.drop_row(index, DropReason::UnconfirmedAppend, message);
+            }
+            _ => {}
+        }
+        let wait = BACKOFF_SECS[(attempts as usize).min(BACKOFF_SECS.len() - 1)];
+        let refused = matches!(retry, AppendRetry::Refused);
+        match outbox::settle(
+            self.store,
+            self.account_id,
+            entry,
+            None,
+            None,
+            Outcome::Retry {
+                error: message,
+                retry_unix: self.now + wait,
+                counts: refused,
+                refused,
+                append_check: matches!(retry, AppendRetry::Inconclusive { .. }),
+            },
+        )? {
+            Settled::Recorded => self.report.sent_append_delayed |= entry.error.is_empty(),
+            Settled::Stale => return Err(Stop::Stale),
+            Settled::Retired | Settled::Recovering => {}
         }
         Ok(())
     }
@@ -594,7 +897,7 @@ impl Pass<'_> {
             Ok(uidvalidity) if uidvalidity == bound_uidvalidity => uidvalidity,
             Ok(_) | Err(_) => return Ok(None),
         };
-        let found = match session.search_message_id(&entry.message_id) {
+        let found = match session.search_message_id(&entry.message_id, usize::MAX) {
             Ok(found) => found,
             Err(WriteError::Refused(_)) => return Ok(None),
             Err(WriteError::Connection(err)) => return Err(Stop::Connection(err)),
@@ -672,8 +975,16 @@ impl Pass<'_> {
         if let Some(raw) = queued {
             return Ok(Some(raw.to_string()));
         }
+        self.load_listing(session)?;
+        Ok(self.listed(folder))
+    }
+
+    fn load_listing(&mut self, session: &mut WriteSession) -> Result<(), Stop> {
         if self.listing.is_none() {
             let listed = session.list().map_err(Stop::Connection)?;
+            self.sent_mailbox = FolderRoles::detect(&listed_mailboxes(&listed), self.overrides)
+                .get(FolderRole::Sent)
+                .map(|folder| folder.raw.clone());
             self.listing = Some(
                 listed
                     .into_iter()
@@ -681,7 +992,7 @@ impl Pass<'_> {
                     .collect(),
             );
         }
-        Ok(self.listed(folder))
+        Ok(())
     }
 
     fn listed(&self, folder: &str) -> Option<String> {
@@ -755,12 +1066,13 @@ impl Pass<'_> {
                 retry_unix: self.now + wait,
                 counts: true,
                 refused,
+                append_check: false,
             },
         )?;
         match settled {
             Settled::Stale => return Err(Stop::Stale),
-            // Undone, and the server never moved it: it and its reverse are
-            // settled, with nothing to say.
+            // A retired write needs no notice. For a refused move, undo's
+            // queued reverse is retired as well.
             Settled::Retired => {
                 for (at, other) in entries.iter().enumerate() {
                     if at == index || other.reverses == Some(entry.id) {

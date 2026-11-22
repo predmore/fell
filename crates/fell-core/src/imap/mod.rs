@@ -11,7 +11,7 @@
 mod bodies;
 mod part_fetch;
 mod projections;
-mod rfc822;
+pub(crate) mod rfc822;
 mod session;
 mod stored_metadata;
 mod utf7;
@@ -164,14 +164,15 @@ impl Drop for BatchLimitGuard {
     }
 }
 
-/// Send the account's queued archive and move rows ([`crate::outbox`]) on
+/// Send the account's queued writes ([`crate::outbox`]) on
 /// a separate `SELECT` session.
 pub(crate) fn replay_outbox(
     config: &ImapConfig,
     account_id: &AccountId,
     store: &crate::store::Store,
+    append_sent: bool,
 ) -> Result<crate::outbox::ReplayReport, Error> {
-    write_back::replay(config, account_id, store)
+    write_back::replay_with(config, account_id, store, append_sent, &|| {})
 }
 
 /// Log in, count selectable mailboxes, and log out. Reads no mail.

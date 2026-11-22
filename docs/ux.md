@@ -19,7 +19,7 @@ Decided with Jon on 2026-11-16. This is the bar the UX judges score against (eve
 ## Quiet: no noise
 - Do not print key hints for obvious actions (`Esc` to close, `Enter` to open, `j`/`k`, `q` to quit). An empty state says what is true ("No mail matches"), not how to leave it.
 - Show a key only where it is the answer to a question the user has right now and they could not guess it: a fix for an error, a pending agent suggestion, a destructive confirm. Discovery lives in which-key and the `:` palette.
-- One message at a time in the status bar; notices fade out on their own.
+- One message at a time in the status bar. A replacement notice starts fading in after the old notice fades out. Notices also fade out on their own.
 
 ## Layout: two panes
 - Left: the thread list for the current folder (or search results).
@@ -80,7 +80,7 @@ Decided with Jon on 2026-11-16. This is the bar the UX judges score against (eve
 
 ## Compose: styled markdown you edit as plain text
 - `c` in the inbox (and Compose in the palette) opens the compose window on a new draft for the account, starting on the To line. There is one compose window: opening another draft moves it there. `gd` lists your drafts, newest first, above the synced Drafts folder; `Enter` opens the selected one in the editor. Closing the window keeps the draft and the inbox says so ("draft saved · gd drafts").
-- After a successful send, the compose window closes, the inbox shows "Sent" with the subject, and the draft leaves the drafts list. After a rejection the draft stays open for editing, with `:details` for the server's reply. An uncertain send keeps the draft locked and points to Sent. A matching copy confirms the send, and a missing copy leaves delivery unknown. `:unlock` asks the person to accept the duplicate risk before restoring editing and Send.
+- After a successful send, the compose window closes, the inbox shows "Sent" with the subject, and the draft leaves the drafts list. A sent reply fades into the open conversation and keeps the reader anchored. A server copy that needs retrying gets a short status notice. After a rejection the draft stays open for editing, with `:details` for the server's reply. An uncertain send keeps the draft locked and points to Sent. A matching copy confirms the send, and a missing copy leaves delivery unknown. `:unlock` asks the person to accept the duplicate risk before restoring editing and Send.
 - The composer is a markdown editor that styles as you type. The text you edit is always plain markdown (no hidden rich-text model, no toolbar needed), but headings, bold, italics, code, lists, quotes and links render styled in place, so the draft looks like the email the recipient will get.
 - Markdown markers (`**`, `#`, `>`, link URLs) stay editable: they show dimmed on the line the cursor is on and fold away elsewhere. Cursor movement, selection, undo and vim motions behave exactly as in plain text.
 - Inline images render in place, at a sensible max width. Paste or drag an image (or attach with a key) and it inserts a markdown image reference that displays as the image; deleting the reference removes the image. Images go out as inline CID parts, not links to anywhere.
