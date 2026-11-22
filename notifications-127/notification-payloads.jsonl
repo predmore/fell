@@ -1,0 +1,46 @@
+{"profile": "dark", "assertion": "First sync stored three unread messages without notifying"}
+{"profile": "dark", "assertion": "The next arrival was suppressed while Fell was focused on Inbox"}
+{"profile": "dark", "ms": 5537.92, "event": "Notify", "id": 1, "app": "Fell", "replaces": 0, "icon": "mail-unread", "title": "Avery Lane — Weekly planning · 5", "body": "Observation 5", "actions": ["default", "Open", "archive", "Archive", "mark-read", "Mark read"], "hints": {"desktop-entry": "dev.predmore.fell"}, "timeout": -1, "ms_since_commit_observed": {"mail-5@demo.test": 109.19}}
+{"profile": "dark", "assertion": "The notified message started unread"}
+{"profile": "dark", "ms": 6862.62, "event": "ActionInvoked", "id": 1, "action": "mark-read"}
+{"profile": "dark", "assertion": "Mark read changed the local Inbox row and IMAP returned Seen"}
+{"profile": "dark", "assertion": "Pressing u undid Mark read locally and on the IMAP server"}
+{"profile": "dark", "ms": 10596.85, "event": "Notify", "id": 2, "app": "Fell", "replaces": 0, "icon": "mail-unread", "title": "5 new messages", "body": "", "actions": ["default", "Open", "archive", "Archive", "mark-read", "Mark read"], "hints": {"desktop-entry": "dev.predmore.fell"}, "timeout": -1, "ms_since_commit_observed": {"mail-6@demo.test": 38.95, "mail-7@demo.test": 38.95, "mail-8@demo.test": 38.95, "mail-9@demo.test": 38.95, "mail-10@demo.test": 38.95}}
+{"profile": "dark", "assertion": "Five arrivals produced one additional notification"}
+{"profile": "dark", "ms": 10998.5, "event": "ActivationToken", "id": 2}
+{"profile": "dark", "ms": 10999.8, "event": "ActionInvoked", "id": 2, "action": "default"}
+{"profile": "dark", "assertion": "Default action opened and marked the latest grouped thread read"}
+{"profile": "dark", "assertion": "Fell sent the daemon-supplied activation token to the nested compositor"}
+{"profile": "light", "assertion": "First sync stored three unread messages without notifying"}
+{"profile": "light", "assertion": "The next arrival was suppressed while Fell was focused on Inbox"}
+{"profile": "light", "ms": 5485.79, "event": "Notify", "id": 1, "app": "Fell", "replaces": 0, "icon": "mail-unread", "title": "New mail", "body": "", "actions": ["default", "Open", "archive", "Archive", "mark-read", "Mark read"], "hints": {"desktop-entry": "dev.predmore.fell"}, "timeout": -1, "ms_since_commit_observed": {"mail-5@demo.test": 58.69}}
+{"profile": "light", "assertion": "The notified message started unread"}
+{"profile": "light", "ms": 7992.44, "event": "ActionInvoked", "id": 1, "action": "mark-read"}
+{"profile": "light", "assertion": "Mark read changed the local Inbox row and IMAP returned Seen"}
+{"profile": "light", "ms": 10042.99, "event": "Notify", "id": 2, "app": "Fell", "replaces": 0, "icon": "mail-unread", "title": "New mail", "body": "", "actions": ["default", "Open", "archive", "Archive", "mark-read", "Mark read"], "hints": {"desktop-entry": "dev.predmore.fell"}, "timeout": -1, "ms_since_commit_observed": {"mail-6@demo.test": 58.12, "mail-7@demo.test": 58.12, "mail-8@demo.test": 58.12, "mail-9@demo.test": 58.12, "mail-10@demo.test": 58.12}}
+{"profile": "light", "assertion": "Five arrivals produced one additional notification"}
+{"profile": "light", "ms": 10428.16, "event": "ActionInvoked", "id": 2, "action": "default"}
+{"profile": "light", "assertion": "Default action opened and marked the latest grouped thread read"}
+{"profile": "narrow", "assertion": "First sync stored three unread messages without notifying"}
+{"profile": "narrow", "assertion": "The next arrival was suppressed while Fell was focused on Inbox"}
+{"profile": "narrow", "ms": 16750.4, "event": "Notify", "id": 1, "app": "Fell", "replaces": 0, "icon": "mail-unread", "title": "Avery Lane — Weekly planning · 5", "body": "Observation 5", "actions": ["default", "Open", "archive", "Archive", "mark-read", "Mark read"], "hints": {"desktop-entry": "dev.predmore.fell"}, "timeout": -1, "ms_since_commit_observed": {"mail-5@demo.test": 108.87}}
+{"profile": "narrow", "assertion": "The notified message started unread"}
+{"profile": "narrow", "ms": 19104.15, "event": "ActionInvoked", "id": 1, "action": "mark-read"}
+{"profile": "narrow", "assertion": "Mark read changed the local Inbox row and IMAP returned Seen"}
+{"profile": "narrow", "ms": 22750.12, "event": "Notify", "id": 2, "app": "Fell", "replaces": 0, "icon": "mail-unread", "title": "5 new messages", "body": "", "actions": ["default", "Open", "archive", "Archive", "mark-read", "Mark read"], "hints": {"desktop-entry": "dev.predmore.fell"}, "timeout": -1, "ms_since_commit_observed": {"mail-6@demo.test": 2.73, "mail-7@demo.test": 2.73, "mail-8@demo.test": 2.73, "mail-9@demo.test": 2.73, "mail-10@demo.test": 2.74}}
+{"profile": "narrow", "assertion": "Five arrivals produced one additional notification"}
+{"profile": "narrow", "ms": 23145.46, "event": "ActionInvoked", "id": 2, "action": "default"}
+{"profile": "narrow", "assertion": "Default action opened and marked the latest grouped thread read"}
+{"profile": "disabled", "assertion": "First sync stored three unread messages without notifying"}
+{"profile": "disabled", "assertion": "The next arrival was suppressed while Fell was focused on Inbox"}
+{"profile": "disabled", "assertion": "Notifications stayed off while Fell was unfocused"}
+{"profile": "no-daemon", "assertion": "First sync stored three unread messages without notifying"}
+{"profile": "no-daemon", "assertion": "The next arrival was suppressed while Fell was focused on Inbox"}
+{"profile": "no-daemon", "assertion": "Two background arrivals synced without a notification daemon and Fell logged one failure"}
+{"profile": "archive", "assertion": "First sync stored three unread messages without notifying"}
+{"profile": "archive", "assertion": "The next arrival was suppressed while Fell was focused on Inbox"}
+{"profile": "archive", "ms": 8555.32, "event": "Notify", "id": 1, "app": "Fell", "replaces": 0, "icon": "mail-unread", "title": "Avery Lane — Weekly planning · 5", "body": "Observation 5", "actions": ["default", "Open", "archive", "Archive", "mark-read", "Mark read"], "hints": {"desktop-entry": "dev.predmore.fell"}, "timeout": -1, "ms_since_commit_observed": {"mail-5@demo.test": 139.82}}
+{"profile": "archive", "assertion": "The notified message started unread"}
+{"profile": "archive", "ms": 8683.99, "event": "ActionInvoked", "id": 1, "action": "archive"}
+{"profile": "archive", "assertion": "Archive moved the notified conversation out of Inbox through the normal guarded action"}
+{"profile": "archive", "assertion": "Pressing u restored the archived conversation to Inbox"}
