@@ -172,7 +172,7 @@ pub enum FolderIntent {
     LabelList,
 }
 
-/// One-line result of the last move or undo. The next key clears it.
+/// One-line result of the last move or undo.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Toast {
     pub text: String,
@@ -618,6 +618,17 @@ impl Session {
 
     pub fn clear_toast(&mut self) {
         self.toast = None;
+    }
+
+    pub fn dismiss_key_notice(&mut self, generation: u64, undo_pending: bool) {
+        if !undo_pending
+            && self
+                .toast
+                .as_ref()
+                .is_some_and(|toast| toast.label.is_none())
+        {
+            self.clear_toast_if(generation);
+        }
     }
 
     pub fn show_sync_requested(&mut self) {
@@ -2914,7 +2925,7 @@ impl Session {
 
     /// Show `change` on the loaded rows `ids` now, in this frame, and
     /// return the store write for the view. `None` when no row changes.
-    fn mark_rows(&mut self, ids: Vec<String>, change: FlagChange) -> Option<FlagEdit> {
+    pub(crate) fn mark_rows(&mut self, ids: Vec<String>, change: FlagChange) -> Option<FlagEdit> {
         let mut changed = Vec::new();
         for row in self.threads.iter_mut().filter(|row| ids.contains(&row.id)) {
             let (unread, starred) = match change {
@@ -5786,6 +5797,37 @@ mod tests {
         assert_eq!(session.status_notice(), Some(&crash));
         session.on_key(KeyId::Escape, 10);
         assert!(session.status_notice().is_none());
+    }
+
+    #[test]
+    fn label_notices_survive_keys_and_undo_keeps_the_notice_it_replaces() {
+        let mut session = session();
+        session.show_label_toast(present::LabelNotice {
+            verb: "Removed",
+            label: "travel".into(),
+            relation: "from",
+            subject: None,
+            count: 1,
+            undo: true,
+        });
+        let removal = session.toast_generation();
+        for key in [KeyId::Char('/'), KeyId::Enter] {
+            let step = session.on_key(key, 10);
+            session.dismiss_key_notice(removal, step.undo);
+            assert_eq!(
+                session.status_notice().unwrap().text,
+                "Removed “travel” from 1 conversation · u"
+            );
+        }
+        assert!(session.clear_toast_if(removal));
+
+        session.end_search();
+        session.show_toast("Archived · u", false);
+        let archive = session.toast_generation();
+        let step = session.on_key(KeyId::Char('u'), 10);
+        assert!(step.undo);
+        session.dismiss_key_notice(archive, step.undo);
+        assert_eq!(session.status_notice().unwrap().text, "Archived · u");
     }
 
     fn empty_message(expanded: bool) -> ConvMessage {

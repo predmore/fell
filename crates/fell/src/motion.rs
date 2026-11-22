@@ -74,7 +74,7 @@ impl ReadingReflow {
 pub const RISE_PX: f32 = 6.0;
 /// How far a notice rises as it comes in, and again as it leaves, in
 /// pixels: a notice replacing another reads as a swap, not a smear.
-pub const NOTICE_RISE_PX: f32 = 2.0;
+pub const NOTICE_RISE_PX: f32 = 3.0;
 /// How far a pane that comes into view slides in from its side, in pixels.
 pub const PANE_SLIDE_PX: f32 = 24.0;
 /// Another thread's messages, and another folder's rows, arrive at this

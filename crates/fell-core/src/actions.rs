@@ -623,6 +623,17 @@ impl Store {
         threads: &[ThreadId],
         trash_folder: &str,
     ) -> Result<LocalAction> {
+        self.purge_threads_counted(account_id, threads, trash_folder)
+            .map(|(action, _)| action)
+    }
+
+    /// Purge from a single Trash folder and count the conversations changed.
+    pub fn purge_threads_counted(
+        &self,
+        account_id: &AccountId,
+        threads: &[ThreadId],
+        trash_folder: &str,
+    ) -> Result<(LocalAction, usize)> {
         let trash_folder = canonical_folder(trash_folder)?;
         let roles = self.folder_roles(account_id)?;
         if !roles.is(FolderRole::Trash, &trash_folder) {
@@ -630,14 +641,22 @@ impl Store {
                 "permanent delete only removes mail from Trash".into(),
             ));
         }
-        self.apply_threads(account_id, threads, ActionKind::Purge, None, |_, rows| {
-            let plans = plan_expunge(rows, &trash_folder);
-            if plans.is_empty() {
-                return Err(Error::Action(format!("no messages in {trash_folder}")));
-            }
-            let summary = format!("deleted {} from {trash_folder} for good", plans.len());
-            Ok((summary, plans))
-        })
+        let mut count = 0;
+        let action =
+            self.apply_threads(account_id, threads, ActionKind::Purge, None, |_, rows| {
+                let plans = plan_expunge(rows, &trash_folder);
+                if plans.is_empty() {
+                    return Err(Error::Action(format!("no messages in {trash_folder}")));
+                }
+                count = plans
+                    .iter()
+                    .map(|plan| plan.before.thread_id.as_str())
+                    .collect::<HashSet<_>>()
+                    .len();
+                let summary = format!("deleted {} from {trash_folder} for good", plans.len());
+                Ok((summary, plans))
+            })?;
+        Ok((action, count))
     }
 
     /// Permanently remove each search hit from its own Trash scope.
@@ -3371,8 +3390,17 @@ mod tests {
             "permanent delete only removes mail from Trash"
         );
 
-        let purged = store.purge_threads(&account("a1"), &both, "trash").unwrap();
+        let targets = [
+            first.clone(),
+            second.clone(),
+            unrelated.clone(),
+            first.clone(),
+        ];
+        let (purged, count) = store
+            .purge_threads_counted(&account("a1"), &targets, "trash")
+            .unwrap();
         assert_eq!(purged.kind, ActionKind::Purge);
+        assert_eq!(count, 2);
         assert_eq!(purged.summary, "deleted 2 from trash for good");
         // The Sent reply is not in Trash and stays; the rest is gone.
         assert_eq!(

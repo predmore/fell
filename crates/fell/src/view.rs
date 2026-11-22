@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use fell_core::{
     AccountConfig, AccountId, CidRepairBatch, CidRepairProgress, DropReason, DroppedWrite,
-    FolderRole, FolderRoles, FolderSpan, ListKey, MessageId, OutboxKind, ThreadId,
+    FlagChange, FolderRole, FolderRoles, FolderSpan, ListKey, MessageId, OutboxKind, ThreadId,
 };
 use futures::StreamExt;
 use gpui::{
@@ -296,6 +296,41 @@ impl PendingLabels {
     }
 }
 
+#[derive(Default)]
+struct PendingRowFlags {
+    unread: Option<PendingFlag>,
+    starred: Option<PendingFlag>,
+}
+
+struct PendingFlag {
+    write: u64,
+    value: bool,
+    /// The last page request that could predate this write's reply.
+    through: Option<u64>,
+}
+
+impl PendingRowFlags {
+    fn slot(&mut self, change: FlagChange) -> &mut Option<PendingFlag> {
+        match change {
+            FlagChange::Read | FlagChange::Unread => &mut self.unread,
+            FlagChange::Star | FlagChange::Unstar => &mut self.starred,
+        }
+    }
+
+    fn land(&mut self, read: u64) -> bool {
+        for flag in [&mut self.unread, &mut self.starred] {
+            if flag
+                .as_ref()
+                .and_then(|flag| flag.through)
+                .is_some_and(|through| read > through)
+            {
+                *flag = None;
+            }
+        }
+        self.unread.is_some() || self.starred.is_some()
+    }
+}
+
 /// Use one notice so a flag failure and a move failure can both be seen.
 fn write_back_notice(
     session: &Session,
@@ -474,10 +509,8 @@ struct Inbox {
     /// Threads taken out of the list whose archive or move has not landed.
     /// A read that started before the write cannot paint them back.
     pending_removals: std::collections::HashSet<String>,
-    /// Read and star shown on rows before their write lands, by thread id:
-    /// `(write, unread, starred)`. A read that started before the write
-    /// cannot paint the old state back. Only the latest write clears it.
-    pending_flags: std::collections::HashMap<String, (u64, bool, bool)>,
+    /// Flag edits on loaded rows, kept until a page requested after the write lands.
+    pending_flags: HashMap<String, PendingRowFlags>,
     pending_labels: PendingLabels,
     label_targets_read: u64,
     /// Bumped by every read or star write.
@@ -1153,20 +1186,26 @@ impl Inbox {
             (more_before, more_after),
             label.is_some(),
         );
+        self.pending_flags
+            .retain(|_, flags| flags.land(self.read_gen));
         if !switched {
             for row in &mut rows {
-                let Some(&(_, now_unread, starred)) = self.pending_flags.get(&row.id) else {
+                let Some(flags) = self.pending_flags.get(&row.id) else {
                     continue;
                 };
-                if row.unread != now_unread {
-                    unread = if now_unread {
+                if let Some(flag) = &flags.unread
+                    && row.unread != flag.value
+                {
+                    unread = if flag.value {
                         unread + 1
                     } else {
                         unread.saturating_sub(1)
                     };
+                    row.unread = flag.value;
                 }
-                row.unread = now_unread;
-                row.starred = starred;
+                if let Some(flag) = &flags.starred {
+                    row.starred = flag.value;
+                }
             }
         }
         let Some((more_before, more_after)) = edges else {
@@ -2158,7 +2197,12 @@ impl Inbox {
     fn change_mailbox<T: Send + 'static>(
         &mut self,
         change: impl FnOnce(&fell_core::Store) -> Result<T, fell_core::Error> + Send + 'static,
-        done: impl FnOnce(&mut Self, Result<T, fell_core::Error>) -> Option<ReadIntent> + 'static,
+        done: impl FnOnce(
+            &mut Self,
+            Result<T, fell_core::Error>,
+            &mut Context<Self>,
+        ) -> Option<ReadIntent>
+        + 'static,
         cx: &mut Context<Self>,
     ) {
         // Retain the current view while the write runs. It will be
@@ -2168,7 +2212,7 @@ impl Inbox {
         cx.spawn(async move |this, cx| {
             finish_mailbox_change(reply, |result| {
                 let _ = this.update(cx, |inbox, cx| {
-                    let after = done(inbox, result);
+                    let after = done(inbox, result, cx);
                     if inbox.session.search.is_some() {
                         let select = after
                             .as_ref()
@@ -2301,7 +2345,7 @@ impl Inbox {
         }
         self.change_mailbox(
             move |store| store.move_thread(&account, &thread, &from, &to).map(|_| ()),
-            move |inbox, result| match result {
+            move |inbox, result, _| match result {
                 Ok(()) => {
                     inbox.pending_removals.remove(&id);
                     let label = inbox.session.folder_text(&destination);
@@ -2386,7 +2430,7 @@ impl Inbox {
         }
         self.change_mailbox(
             move |store| removal.in_folder(store, &account, threads, folder),
-            move |inbox, result| {
+            move |inbox, result, _| {
                 for id in &ids {
                     inbox.pending_removals.remove(id);
                 }
@@ -2522,6 +2566,7 @@ impl Inbox {
                 .label_target_subject()
                 .map(present::display_safe),
             count,
+            undo: !edit.add,
         };
         let change = if edit.add {
             fell_core::LabelChange::Add(edit.name)
@@ -2530,13 +2575,14 @@ impl Inbox {
         };
         self.change_mailbox(
             move |store| store.label_threads(&account, &threads, change),
-            move |inbox, result| {
+            move |inbox, result, cx| {
                 inbox
                     .pending_labels
                     .finish(pending, result.is_ok().then_some(inbox.read_gen));
                 match result {
                     Ok(_) => {
                         inbox.session.show_label_toast(notice);
+                        inbox.expire_action_notice(cx);
                         inbox.send_to_server();
                     }
                     Err(err) => inbox.session.show_toast(err.to_string(), true),
@@ -2561,7 +2607,7 @@ impl Inbox {
                 let select = restored_folder_key(store, &account, &reading, &restored);
                 Ok((action, restored, select))
             },
-            move |inbox, result| {
+            move |inbox, result, cx| {
                 inbox.undos_in_flight -= 1;
                 match result {
                     Ok((action, restored, select)) => {
@@ -2599,10 +2645,12 @@ impl Inbox {
                                 relation,
                                 subject,
                                 count,
+                                undo: false,
                             });
                         } else {
                             inbox.session.show_toast("Undone", false);
                         }
+                        inbox.expire_action_notice(cx);
                         inbox.send_to_server();
                         if inbox.session.search.is_some() && !restored.is_empty() {
                             inbox.search_view.prefer = restored;
@@ -2642,7 +2690,7 @@ impl Inbox {
         let account = self.account_id.clone();
         self.change_mailbox(
             move |store| hub.discard(store, &account, &ids),
-            |inbox, result| {
+            |inbox, result, _| {
                 match result {
                     Ok(()) => {
                         inbox.session.picked.clear();
@@ -2669,7 +2717,7 @@ impl Inbox {
             let account = self.account_id.clone();
             self.change_mailbox(
                 move |store| store.flag_scoped_threads(&account, &scopes, edit.change),
-                |inbox, result| {
+                |inbox, result, _| {
                     match result {
                         Ok(Some(_)) => inbox.send_to_server(),
                         Ok(None) => {}
@@ -2686,14 +2734,8 @@ impl Inbox {
         }
         self.flag_gen += 1;
         let generation = self.flag_gen;
-        for row in self
-            .session
-            .threads
-            .iter()
-            .filter(|row| edit.ids.contains(&row.id))
-        {
-            self.pending_flags
-                .insert(row.id.clone(), (generation, row.unread, row.starred));
+        for id in &edit.ids {
+            self.protect_flag(id, edit.change, generation, None);
         }
         let account = self.account_id.clone();
         let folder = if self.list_label.is_some() {
@@ -2706,10 +2748,19 @@ impl Inbox {
         let ids = edit.ids;
         self.change_mailbox(
             move |store| store.flag_threads(&account, &threads, &folder, change),
-            move |inbox, result| {
-                inbox
-                    .pending_flags
-                    .retain(|id, (written, _, _)| !(ids.contains(id) && *written == generation));
+            move |inbox, result, _| {
+                for id in ids {
+                    if let Some(flags) = inbox.pending_flags.get_mut(&id) {
+                        let slot = flags.slot(change);
+                        if let Some(flag) = slot.as_mut().filter(|flag| flag.write == generation) {
+                            if result.is_ok() {
+                                flag.through = Some(inbox.read_gen);
+                            } else {
+                                *slot = None;
+                            }
+                        }
+                    }
+                }
                 match result {
                     Ok(Some(_)) => inbox.send_to_server(),
                     Ok(None) => {}
@@ -2724,6 +2775,29 @@ impl Inbox {
         );
     }
 
+    fn protect_flag(
+        &mut self,
+        id: &str,
+        change: FlagChange,
+        write: u64,
+        through: Option<u64>,
+    ) -> bool {
+        let slot = self
+            .pending_flags
+            .entry(id.into())
+            .or_default()
+            .slot(change);
+        if slot.as_ref().is_some_and(|flag| flag.write > write) {
+            return false;
+        }
+        *slot = Some(PendingFlag {
+            write,
+            value: matches!(change, FlagChange::Unread | FlagChange::Star),
+            through,
+        });
+        true
+    }
+
     fn toggle_off_page_flags(&mut self, ids: Vec<String>, star: bool, cx: &mut Context<Self>) {
         if self.session.folder != self.list_folder || self.session.label_scope != self.list_label {
             self.session
@@ -2734,6 +2808,10 @@ impl Inbox {
         let folder = self.list_folder.clone();
         let label = self.list_label.clone();
         let selected = ids.len();
+        self.flag_gen += 1;
+        let generation = self.flag_gen;
+        let targets = ids.clone();
+        let scope = (folder.clone(), label.clone());
         self.change_mailbox(
             move |store| {
                 use fell_core::store::ListSource;
@@ -2742,8 +2820,26 @@ impl Inbox {
                     .map_or(ListSource::Folder(&folder), ListSource::Label);
                 store.toggle_selected_flags(&account, &ids, source, star)
             },
-            move |inbox, result| match result {
+            move |inbox, result, _| match result {
                 Ok((change, count)) => {
+                    // The transaction decides the direction using every
+                    // selected row, including the ones we cannot see yet.
+                    if inbox.session.search.is_none()
+                        && inbox.list_folder == scope.0
+                        && inbox.list_label == scope.1
+                    {
+                        let mut loaded: Vec<_> = inbox
+                            .session
+                            .threads
+                            .iter()
+                            .filter(|row| targets.contains(&row.id))
+                            .map(|row| row.id.clone())
+                            .collect();
+                        loaded.retain(|id| {
+                            inbox.protect_flag(id, change, generation, Some(inbox.read_gen))
+                        });
+                        inbox.session.mark_rows(loaded, change);
+                    }
                     inbox.session.show_flag_notice(change, selected, count);
                     inbox.send_to_server();
                     Some(ReadIntent {
@@ -3014,6 +3110,10 @@ impl Inbox {
         self.dismiss_notice_after(notice, std::time::Duration::from_millis(700), cx);
     }
 
+    fn expire_action_notice(&mut self, cx: &mut Context<Self>) {
+        self.dismiss_notice_after(self.session.toast_generation(), Duration::from_secs(3), cx);
+    }
+
     fn dismiss_notice_after(
         &mut self,
         notice: u64,
@@ -3174,8 +3274,10 @@ impl Inbox {
         } else {
             None
         };
-        self.session.clear_toast();
+        let previous_notice = self.session.toast_generation();
         let step = self.session.on_key(key, page);
+        self.session
+            .dismiss_key_notice(previous_notice, step.undo || self.undos_in_flight > 0);
         if let Some((trace, started)) = trace {
             trace.key(started, step.action.map_or("Inbox input", Action::label));
         }
@@ -6715,7 +6817,10 @@ fn conversation(
             }
         })
         .when(retained, |pane| {
-            pane.child(preview_shield(theme, session.search_results_current()))
+            pane.child(preview_shield(
+                theme,
+                leaving.is_none() && session.search_results_current(),
+            ))
         })
 }
 
@@ -7943,7 +8048,16 @@ fn status_bar(
             .when(hint_opacity < 1.0, |hints| hints.opacity(hint_opacity))
             .child(format!("{count}{hint}"))
     });
-    let (current, leaving) = (status.notice, status.leaving);
+    let text = status
+        .leaving
+        .filter(|(_, opacity)| *opacity > 0.0)
+        .map(|(toast, opacity)| (toast, opacity, leaving_dy))
+        .or_else(|| {
+            status
+                .notice
+                .filter(|(_, opacity)| *opacity > 0.0)
+                .map(|(toast, opacity)| (toast, opacity, notice_dy))
+        });
     div()
         .relative()
         .h(px(30.))
@@ -8029,28 +8143,8 @@ fn status_bar(
                             ),
                     )
                 })
-                .map(|cell| match (current, leaving) {
-                    (Some((toast, opacity)), Some((old, gone))) => cell
-                        .child(notice_text(&toast, opacity, notice_dy))
-                        // The notice it replaced fades out over it.
-                        .child(
-                            div()
-                                .absolute()
-                                .top(px(0.))
-                                .bottom(px(0.))
-                                .left(px(0.))
-                                .right(px(0.))
-                                .flex()
-                                .items_center()
-                                .child(notice_text(&old, gone, leaving_dy)),
-                        ),
-                    (Some((toast, opacity)), None) => {
-                        cell.child(notice_text(&toast, opacity, notice_dy))
-                    }
-                    (None, Some((toast, opacity))) => {
-                        cell.child(notice_text(&toast, opacity, leaving_dy))
-                    }
-                    (None, None) => cell,
+                .when_some(text, |cell, (toast, opacity, dy)| {
+                    cell.child(notice_text(&toast, opacity, dy))
                 }),
         )
         .map(|bar| match hints {
@@ -8773,8 +8867,8 @@ impl Removal {
     ) -> fell_core::Result<usize> {
         if self == Self::Purge {
             return store
-                .purge_threads(account, &threads, &folder)
-                .map(|_| threads.len());
+                .purge_threads_counted(account, &threads, &folder)
+                .map(|(_, count)| count);
         }
         let scopes: Vec<_> = threads.into_iter().map(|id| (id, folder.clone())).collect();
         match self {
@@ -8994,6 +9088,29 @@ mod tests {
             outcome,
             Some(Err(fell_core::Error::Action(message))) if message == "Could not update this mailbox"
         ));
+    }
+
+    #[test]
+    fn page_reads_retire_only_the_flags_they_could_have_seen() {
+        let mut pending = super::PendingRowFlags {
+            unread: Some(super::PendingFlag {
+                write: 1,
+                value: false,
+                through: None,
+            }),
+            starred: Some(super::PendingFlag {
+                write: 2,
+                value: true,
+                through: Some(12),
+            }),
+        };
+        assert!(pending.land(12));
+        assert!(pending.starred.as_ref().unwrap().value);
+        assert!(pending.land(13));
+        assert!(pending.starred.is_none());
+        assert!(!pending.unread.as_ref().unwrap().value);
+        pending.unread.as_mut().unwrap().through = Some(13);
+        assert!(!pending.land(14));
     }
 
     #[test]

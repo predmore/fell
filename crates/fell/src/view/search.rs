@@ -490,7 +490,7 @@ impl Inbox {
                     .purge_scoped_threads(&account, &scopes)
                     .map(|action| (action, scopes.len())),
             },
-            move |inbox, result| match result {
+            move |inbox, result, _| match result {
                 Ok((action, count)) => {
                     if inbox
                         .session

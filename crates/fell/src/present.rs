@@ -1116,27 +1116,30 @@ pub struct LabelNotice {
     pub relation: &'static str,
     pub subject: Option<String>,
     pub count: usize,
+    pub undo: bool,
 }
 
 impl LabelNotice {
     pub fn fit(&self, max_px: f32, measure: impl Fn(&str) -> f32) -> String {
+        let hint = if self.undo { " · u" } else { "" };
+        let end_quote = format!("”{hint}");
         let prefix = format!("{} “{}” {} ", self.verb, self.label, self.relation);
         if let Some(subject) = self.subject.as_deref().filter(|s| !s.trim().is_empty()) {
             let before = format!("{prefix}“");
-            let full = format!("{before}{subject}”");
+            let full = format!("{before}{subject}{end_quote}");
             if measure(&full) <= max_px {
                 return full;
             }
             let subject = subject.replace(['“', '”'], "");
-            let short = cut_to(&subject, &before, "”", max_px, &measure);
+            let short = cut_to(&subject, &before, &end_quote, max_px, &measure);
             if measure(&short) <= max_px {
                 return short;
             }
         }
         let suffix = if self.count == 1 {
-            format!("” {} 1 conversation", self.relation)
+            format!("” {} 1 conversation{hint}", self.relation)
         } else {
-            format!("” {} {} conversations", self.relation, self.count)
+            format!("” {} {} conversations{hint}", self.relation, self.count)
         };
         let before = format!("{} “", self.verb);
         let full = format!("{before}{}{suffix}", self.label);
@@ -1147,7 +1150,8 @@ impl LabelNotice {
         if measure(&short) <= max_px {
             return short;
         }
-        cut_to(&full, "", "", max_px, &measure)
+        let full = full.strip_suffix(hint).unwrap_or(&full);
+        cut_to(full, "", hint, max_px, &measure)
     }
 }
 
@@ -1889,11 +1893,14 @@ mod tests {
             relation: "from",
             subject: Some("Tickets to the annual meeting in the harbour".into()),
             count: 1,
+            undo: true,
         };
-        assert_eq!(
-            notice.fit(room, width),
-            "Removed “travel” from “Tickets to the…”"
-        );
+        let removed = notice.fit(room, width);
+        assert!(removed.starts_with("Removed “travel” from “Tickets"));
+        assert!(removed.ends_with("…” · u"));
+        assert!(width(&removed) <= room);
+
+        notice.undo = false;
         notice.verb = "Restored";
         notice.relation = "to";
         let restored = notice.fit(room, width);
