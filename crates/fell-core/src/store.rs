@@ -4140,7 +4140,8 @@ fn ensure_agent_grant_revision(conn: &Connection) -> Result<()> {
         conn,
         "agent_grant_revision",
         "2",
-        "CREATE TRIGGER bump_agent_grant_revision
+        "DROP TRIGGER IF EXISTS bump_agent_grant_revision;
+         CREATE TRIGGER bump_agent_grant_revision
          AFTER UPDATE OF enabled, can_read, can_triage, can_draft, can_annotate ON agent_grants
          BEGIN
              UPDATE agent_grants SET revision = revision + 1

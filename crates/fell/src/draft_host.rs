@@ -223,15 +223,30 @@ impl DraftHome {
         start: ReplyStart,
         note: &crate::model::NoteRequest,
     ) -> Result<String, String> {
+        let id = new_draft_id();
+        self.open_suggested_reply(hub, account, start, note, &id)?;
+        Ok(id)
+    }
+
+    fn open_suggested_reply(
+        &self,
+        hub: &DraftHub,
+        account: &AccountId,
+        start: ReplyStart,
+        note: &crate::model::NoteRequest,
+        id: &str,
+    ) -> Result<(), String> {
         let fell_core::notes::NoteDecision::Accept(position) = note.decision else {
             return Err("The agent note changed".into());
         };
-        let id = new_draft_id();
+        let Some(_opening) = hub.begin_open(id) else {
+            return Err("The reply draft is already opening".into());
+        };
         let store = fell_core::Store::open(&self.store).map_err(|err| err.to_string())?;
         let action = store
             .save_suggested_reply(
                 &StoredCompose {
-                    id: id.clone(),
+                    id: id.to_owned(),
                     account_id: account.clone(),
                     fields: start.fields,
                     body: String::new(),
@@ -245,15 +260,24 @@ impl DraftHome {
                 position,
             )
             .map_err(|err| err.to_string())?;
-        if let Err(err) = self.open(hub, &id, account) {
-            store
-                .rollback_suggested_reply(account, action)
-                .map_err(|rollback| {
-                    format!("{err}. Couldn't restore the suggestion: {rollback}")
-                })?;
+        if let Err(mut err) = self.open_reserved(hub, id, account, &store) {
+            if let Err(rollback) = store.rollback_suggested_reply(account, id, action) {
+                err.push_str(&format!(". Couldn't roll back the reply: {rollback}"));
+            }
+            let folder = self.root.join(id);
+            for path in [&folder, &fell_core::compose::control_dir(&folder)] {
+                if let Err(cleanup) = std::fs::remove_dir_all(path)
+                    && !matches!(
+                        cleanup.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    )
+                {
+                    err.push_str(&format!(". Couldn't remove the reply files: {cleanup}"));
+                }
+            }
             return Err(err);
         }
-        Ok(id)
+        Ok(())
     }
 
     /// Make draft `id` live in `hub` as the mailbox holds it. Its folder is
@@ -269,19 +293,29 @@ impl DraftHome {
         let Some(_opening) = hub.begin_open(id) else {
             return Ok(());
         };
-        let folder = self.root.join(id);
         let store = fell_core::Store::open(&self.store).map_err(|err| err.to_string())?;
+        self.open_reserved(hub, id, account, &store)
+    }
+
+    fn open_reserved(
+        &self,
+        hub: &DraftHub,
+        id: &str,
+        account: &AccountId,
+        store: &fell_core::Store,
+    ) -> Result<(), String> {
+        let folder = self.root.join(id);
         let refreshed = store
             .refresh_compose_folder(id, &folder)
             .map_err(|err| err.to_string())?;
         if refreshed.is_none() {
             return Err("the draft is no longer in the mailbox".into());
         }
-        let session = DraftSession::open_with_store(&folder, account.clone(), &store)?;
+        let session = DraftSession::open_with_store(&folder, account.clone(), store)?;
         if hub.insert_new(session) {
             // The sync notification could have arrived after the lock was
             // read and before the session became visible to the hub.
-            hub.with_session(id, |live| live.refresh_send_confirmation(&store));
+            hub.with_session(id, |live| live.refresh_send_confirmation(store));
         } else {
             // The socket made it live meanwhile, and the copy read here has
             // just saved over its folder. Put the live text back.
@@ -839,13 +873,17 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn failing_to_open_a_suggested_reply_restores_the_suggestion() {
+    fn failing_to_open_a_suggested_reply_removes_the_draft_and_restores_the_suggestion() {
         use fell_core::{AgentGrant, notes::NoteDecision};
 
         let account = me();
         let home = temp_home("suggested-reply-failure", &account);
-        // The store write succeeds, then the draft folder cannot be created.
-        std::fs::write(&home.root, "file in place of the draft root").unwrap();
+        let draft = "failed-reply";
+        let folder = home.root.join(draft);
+        let control = fell_core::compose::control_dir(&folder);
+        // Materialization writes files, then rejects the unexpected thread copy.
+        std::fs::create_dir_all(folder.join("thread")).unwrap();
+        std::fs::create_dir_all(&control).unwrap();
         let store = fell_core::Store::open(&home.store).unwrap();
         let parent = parent_message(&account);
         let thread = store.upsert_message(&parent).unwrap();
@@ -879,10 +917,13 @@ pub(crate) mod tests {
             std::slice::from_ref(&account.email),
             &fell_core::FolderRoles::default(),
         );
-        assert!(
-            home.new_suggested_reply(&DraftHub::new(), &account.id, start, &request)
-                .is_err()
-        );
+        let error = home
+            .open_suggested_reply(&DraftHub::new(), &account.id, start, &request, draft)
+            .unwrap_err();
+        assert!(error.contains("draft folder must not contain a thread copy"));
+        assert!(store.load_compose(draft).unwrap().is_none());
+        assert!(!folder.exists());
+        assert!(!control.exists());
         let notes = store.thread_notes(&account.id, &thread).unwrap();
         assert_eq!(
             notes[0].suggestions[0].action,
@@ -892,6 +933,7 @@ pub(crate) mod tests {
             store.undo(&account.id).unwrap().kind,
             fell_core::ActionKind::AnnotateThread
         );
+        assert!(store.thread_notes(&account.id, &thread).unwrap().is_empty());
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use fs4::fs_std::FileExt;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::store::Store;
 use crate::{AccountId, Result};
@@ -341,9 +341,13 @@ impl Store {
         Ok(action)
     }
 
-    /// A draft failed to open after the suggestion was accepted. Restore only
-    /// that accept, even if another mailbox action has landed since the save.
-    pub fn rollback_suggested_reply(&self, account: &AccountId, action: i64) -> Result<()> {
+    /// Remove a reply that failed to open and restore its exact suggestion.
+    pub fn rollback_suggested_reply(
+        &self,
+        account: &AccountId,
+        draft: &str,
+        action: i64,
+    ) -> Result<()> {
         let tx = crate::store::begin_immediate(&self.conn)?;
         let changed = tx.execute(
             "UPDATE local_actions SET undone = 1
@@ -352,6 +356,14 @@ impl Store {
         )?;
         if changed > 0 {
             crate::notes::undo_local(&tx, account, action)?;
+        }
+        let belongs_to_account = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM compose_drafts WHERE id = ?1 AND account_id = ?2)",
+            params![draft, account.as_str()],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if belongs_to_account {
+            delete_compose_in(&tx, draft)?;
         }
         tx.commit()?;
         Ok(())
@@ -862,20 +874,19 @@ impl Store {
     /// Forget draft `id`: its row, attachments, review and send record.
     pub(crate) fn delete_compose(&self, id: &str) -> Result<()> {
         let tx = crate::store::begin_immediate(&self.conn)?;
-        tx.execute_batch(REVIEW_SCHEMA)?;
-        tx.execute(
-            "DELETE FROM compose_review WHERE draft_id = ?1",
-            params![id],
-        )?;
-        tx.execute(
-            "DELETE FROM compose_attachments WHERE draft_id = ?1",
-            params![id],
-        )?;
-        tx.execute("DELETE FROM compose_send WHERE draft_id = ?1", params![id])?;
-        tx.execute("DELETE FROM compose_drafts WHERE id = ?1", params![id])?;
+        delete_compose_in(&tx, id)?;
         tx.commit()?;
         Ok(())
     }
+}
+
+fn delete_compose_in(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute_batch(REVIEW_SCHEMA)?;
+    conn.execute("DELETE FROM compose_review WHERE draft_id = ?1", [id])?;
+    conn.execute("DELETE FROM compose_attachments WHERE draft_id = ?1", [id])?;
+    conn.execute("DELETE FROM compose_send WHERE draft_id = ?1", [id])?;
+    conn.execute("DELETE FROM compose_drafts WHERE id = ?1", [id])?;
+    Ok(())
 }
 
 /// Write `stored` out as draft `id`'s folder, attachments included.

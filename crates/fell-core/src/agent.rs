@@ -185,8 +185,7 @@ impl crate::Store {
     }
 
     /// Every stored grant, revoked ones included, by agent then account.
-    /// `last_action_unix` is the newest logged triage or draft action; reads
-    /// are not logged.
+    /// `last_action_unix` is the newest logged action. Reads are not logged.
     pub fn list_agent_grants(&self) -> Result<Vec<AgentSummary>> {
         let mut stmt = self.conn.prepare(
             "SELECT g.agent_id, g.account_id, g.enabled, g.can_read, g.can_triage, g.can_draft, g.can_annotate,
@@ -884,7 +883,6 @@ pub(crate) fn read_grant(
         .unwrap_or(AgentGrant::DISABLED))
 }
 
-
 fn check_actor_grant(
     conn: &Connection,
     account: &AccountId,
@@ -1520,6 +1518,145 @@ mod tests {
     }
 
     #[test]
+    fn annotation_and_its_agent_undo_recheck_a_scope_changed_by_settings() {
+        let root =
+            std::env::temp_dir().join(format!("fell-annotation-revoke-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("mail.db");
+        let (mcp, account, thread) = seed(Store::open(&path).unwrap());
+        let settings = Store::open(&path).unwrap();
+        let grant = AgentGrant::enabled(true, false, false).with_annotation(true);
+        settings.set_agent_grant(&account, "bot", grant).unwrap();
+        let annotate =
+            || mcp.annotate_thread(&account, &thread, "bot", Some("Summary"), &[], "Reviewed");
+        let action = annotate().unwrap();
+        assert_eq!(mcp.agent_grant(&account, "bot").unwrap(), grant);
+        let before = settings.list_agent_grants().unwrap().remove(0);
+        let after = settings
+            .update_agent_grant(&before, grant.with_annotation(false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(mcp.list_agent_grants().unwrap(), [after]);
+        assert!(
+            settings
+                .update_agent_grant(&before, grant)
+                .unwrap()
+                .is_none()
+        );
+
+        assert!(
+            annotate()
+                .unwrap_err()
+                .to_string()
+                .contains("annotate scope")
+        );
+        assert!(
+            mcp.undo_actor(&account, "agent:bot")
+                .unwrap_err()
+                .to_string()
+                .contains("annotate scope")
+        );
+        assert_eq!(
+            mcp.thread_notes(&account, &thread).unwrap()[0].id,
+            action.id
+        );
+        assert_eq!(settings.agent_undo(&account).unwrap().id, action.id);
+    }
+
+    #[test]
+    fn undoing_a_dismissal_restores_the_latest_withdrawn_note() {
+        let (store, account, thread) = seeded();
+        store
+            .set_agent_grant(
+                &account,
+                "bot",
+                AgentGrant::enabled(false, false, false).with_annotation(true),
+            )
+            .unwrap();
+        let annotate = |summary| {
+            store
+                .annotate_thread(&account, &thread, "bot", Some(summary), &[], "Reviewed")
+                .unwrap()
+        };
+        let older = annotate("Earlier");
+        let latest = annotate("Latest");
+        store
+            .resolve_thread_note(
+                &account,
+                &thread,
+                "INBOX",
+                latest.id,
+                crate::notes::NoteDecision::Dismiss,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            store.undo_actor(&account, "agent:bot").unwrap().id,
+            latest.id
+        );
+        assert_eq!(
+            store.thread_notes(&account, &thread).unwrap()[0].id,
+            older.id
+        );
+        assert_eq!(
+            store.undo_with_note(&account).unwrap().1,
+            Some("Note restored")
+        );
+        assert_eq!(
+            store.thread_notes(&account, &thread).unwrap()[0].id,
+            latest.id
+        );
+        assert_eq!(
+            store.undo_with_note(&account).unwrap().1,
+            Some("Note removed")
+        );
+        assert_eq!(
+            store.thread_notes(&account, &thread).unwrap()[0].id,
+            older.id
+        );
+    }
+
+    #[test]
+    fn undoing_a_superseded_dismissal_keeps_the_replacement() {
+        let (store, account, thread) = seeded();
+        store
+            .set_agent_grant(
+                &account,
+                "bot",
+                AgentGrant::enabled(false, false, false).with_annotation(true),
+            )
+            .unwrap();
+        let annotate = |summary| {
+            store
+                .annotate_thread(&account, &thread, "bot", Some(summary), &[], "Reviewed")
+                .unwrap()
+        };
+        let older = annotate("Earlier");
+        let dismissal = store
+            .resolve_thread_note(
+                &account,
+                &thread,
+                "INBOX",
+                older.id,
+                crate::notes::NoteDecision::Dismiss,
+                false,
+            )
+            .unwrap();
+        store.undo_actor(&account, "agent:bot").unwrap();
+        let newer = annotate("Latest");
+        let tx = crate::store::immediate_transaction(&store.conn).unwrap();
+        let undo = crate::notes::undo_local(&tx, &account, dismissal.id)
+            .unwrap()
+            .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(undo.notice(&dismissal), "Note no longer current");
+        assert_eq!(
+            store.thread_notes(&account, &thread).unwrap()[0].id,
+            newer.id
+        );
+    }
+
+    #[test]
     fn notes_keep_one_version_per_actor_and_recover_previous_on_undo() {
         use crate::notes::NoteDecision;
 
@@ -1836,7 +1973,7 @@ mod tests {
         assert_eq!(notes()[0].suggestions.len(), 1);
         assert_eq!(
             store.undo_with_note(&account).unwrap().1,
-            Some("Unstarred · suggestion restored")
+            Some("Unstarred · restored")
         );
         assert_eq!(notes()[0].suggestions.len(), 2);
         assert!(!messages().iter().any(|msg| msg.starred));

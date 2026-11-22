@@ -1,8 +1,8 @@
 //! Inbox session: folders, selection, chords, palette. No drawing.
 
 pub mod agents;
-pub mod search;
 mod notes;
+pub mod search;
 pub use notes::{AgentNotes, NoteRequest, SUGGESTIONS_QUERY};
 
 use std::collections::{HashMap, HashSet};

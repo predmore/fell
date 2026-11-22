@@ -439,7 +439,7 @@ fn link_action(
 
 pub(crate) enum NoteUndo {
     Annotation,
-    Dismissal,
+    Dismissal { restored: bool },
     Acceptance { snoozed: bool },
 }
 
@@ -447,13 +447,14 @@ impl NoteUndo {
     pub(crate) fn notice(self, action: &LocalAction) -> &'static str {
         match self {
             Self::Annotation => "Note removed",
-            Self::Dismissal => "Note restored",
+            Self::Dismissal { restored: true } => "Note restored",
+            Self::Dismissal { restored: false } => "Note no longer current",
             Self::Acceptance { snoozed: true } => "Snooze undone · suggestion restored",
             Self::Acceptance { snoozed: false } => match action.kind {
                 ActionKind::Archive => "Unarchived · suggestion restored",
                 ActionKind::Label => "Label removed · suggestion restored",
                 ActionKind::Read => "Marked unread · suggestion restored",
-                ActionKind::Star => "Unstarred · suggestion restored",
+                ActionKind::Star => "Unstarred · restored",
                 ActionKind::AcceptSuggestion if action.summary == REPLY_OPENED => {
                     "Reply draft kept · suggestion restored"
                 }
@@ -485,13 +486,56 @@ pub(crate) fn undo_local(
         )?;
         return Ok(Some(match operation {
             ANNOTATION => NoteUndo::Annotation,
-            DISMISSAL => NoteUndo::Dismissal,
+            DISMISSAL => NoteUndo::Dismissal {
+                restored: restore_dismissed(conn, account, note)?,
+            },
             _ => NoteUndo::Acceptance {
                 snoozed: related.is_some(),
             },
         }));
     }
     Ok(None)
+}
+
+fn restore_dismissed(conn: &Connection, account: &AccountId, note: i64) -> Result<bool> {
+    let withdrawn = conn
+        .query_row(
+            "SELECT thread_id, actor FROM thread_notes AS dismissed
+             WHERE id = ?1 AND account_id = ?2 AND active = 0 AND NOT EXISTS (
+                 SELECT 1 FROM thread_notes AS newer
+                 WHERE newer.account_id = dismissed.account_id
+                   AND newer.thread_id = dismissed.thread_id AND newer.actor = dismissed.actor
+                   AND newer.id > dismissed.id
+             )",
+            params![note, account.as_str()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    if let Some((thread, actor)) = withdrawn {
+        conn.execute(
+            "UPDATE thread_notes SET active = 0
+             WHERE account_id = ?1 AND thread_id = ?2 AND actor = ?3 AND active = 1",
+            params![account.as_str(), thread, actor],
+        )?;
+        conn.execute("UPDATE thread_notes SET active = 1 WHERE id = ?1", [note])?;
+        // Its annotation is live again. Both the reader and agent can undo it.
+        conn.execute("UPDATE agent_actions SET undone = 0 WHERE id = ?1", [note])?;
+        conn.execute(
+            "UPDATE local_actions SET undone = 0 WHERE id IN (
+                 SELECT action_id FROM local_thread_note_actions WHERE note_id = ?1 AND operation = ?2
+             )",
+            params![note, ANNOTATION],
+        )?;
+        conn.execute(
+            "UPDATE local_thread_note_actions SET undone = 0 WHERE note_id = ?1 AND operation = ?2",
+            params![note, ANNOTATION],
+        )?;
+    }
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM visible_thread_notes WHERE id = ?1 AND account_id = ?2)",
+        params![note, account.as_str()],
+        |row| row.get(0),
+    )?)
 }
 
 pub(crate) fn drop_thread(conn: &Connection, account: &str, thread: &str) -> Result<()> {

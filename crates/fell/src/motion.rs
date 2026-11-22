@@ -367,6 +367,14 @@ impl Glide {
     pub fn running(&self, now: Instant) -> bool {
         self.transition.running(now)
     }
+
+    /// Keep the destination in viewport coordinates after its origin moves.
+    pub fn move_origin(&mut self, now: Instant, drawn: f32, delta: f32) -> f32 {
+        let end = self.transition.started + self.transition.duration;
+        self.from = drawn - delta;
+        self.transition = Transition::new(now, end.saturating_duration_since(now));
+        self.from
+    }
 }
 
 /// How one row of a list is drawn while the list changes.

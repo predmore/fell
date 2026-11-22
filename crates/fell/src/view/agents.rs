@@ -738,8 +738,18 @@ mod tests {
             width: 578.,
         });
         let switches = [
-            ["agent-0-Read", "agent-0-Triage", "agent-0-Draft"],
-            ["agent-1-Read", "agent-1-Triage", "agent-1-Draft"],
+            [
+                "agent-0-Read",
+                "agent-0-Triage",
+                "agent-0-Draft",
+                "agent-0-Annotate",
+            ],
+            [
+                "agent-1-Read",
+                "agent-1-Triage",
+                "agent-1-Draft",
+                "agent-1-Annotate",
+            ],
         ];
         for width in [578., 386.] {
             let mut before = None;

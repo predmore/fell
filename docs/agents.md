@@ -13,7 +13,7 @@ Licensing: ACP's Rust crate (`agent-client-protocol`) is Apache-2.0, so it's fin
 
 ## Thread notes
 
-Grant an agent the `annotate` scope with `fell-mcp grant AGENT --annotate`. Include any other scope flags the agent should retain. The scope starts off. `annotate_thread` takes a thread ID, a reason for the action log, and a plain-text summary of up to 1,024 UTF-8 bytes, suggested actions, or both. An agent's newest note replaces its previous note on the thread.
+Turn on Annotate for an agent in Fell's Agents section, or run `fell-mcp grant AGENT --annotate` with any other scope flags the agent should retain. The scope starts off. `annotate_thread` takes a thread ID, a reason for the action log, and a plain-text summary of up to 1,024 UTF-8 bytes, suggested actions, or both. An agent's newest note replaces its previous note on the thread.
 
 Suggestions can be `archive`, `label:NAME`, `reply`, `snooze:UNIX_SECONDS`, `mark_read`, or `star`. The conversation attributes the note to the agent and shows the keys for the user to accept a suggestion. A suggested reply opens a normal draft. Undo restores the suggestion and keeps that draft and any edits. Fell displays note text as untrusted data and only acts on a suggestion when the user accepts it.
 

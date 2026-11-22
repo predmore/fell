@@ -16,7 +16,13 @@ pub enum Control {
 }
 
 impl Control {
-    pub const ALL: [Self; 5] = [Self::Read, Self::Triage, Self::Draft, Self::Annotate, Self::Revoke];
+    pub const ALL: [Self; 5] = [
+        Self::Read,
+        Self::Triage,
+        Self::Draft,
+        Self::Annotate,
+        Self::Revoke,
+    ];
 
     pub const fn label(self) -> &'static str {
         match self {

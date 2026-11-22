@@ -39,6 +39,19 @@ impl ReaderLanding {
 impl ScrollAnchor {
     /// Capture the first message with a visible part, including a clipped top.
     pub fn capture(scroll: &ScrollHandle, first_message: usize) -> Option<Self> {
+        Self::capture_where(scroll, first_message, |_| true)
+    }
+
+    /// Capture the first message whose header starts inside the viewport.
+    pub fn capture_header(scroll: &ScrollHandle, first_message: usize) -> Option<Self> {
+        Self::capture_where(scroll, first_message, |y| y >= px(0.))
+    }
+
+    fn capture_where(
+        scroll: &ScrollHandle,
+        first_message: usize,
+        visible: impl Fn(Pixels) -> bool,
+    ) -> Option<Self> {
         let view = scroll.bounds();
         // GPUI clamps wheel deltas during prepaint. Capture the position
         // the wheel would have drawn with the old content.
@@ -53,10 +66,12 @@ impl ScrollAnchor {
         };
         (start.max(first_message)..scroll.children_count()).find_map(|index| {
             let item = scroll.bounds_for_item(index)?;
-            visible_top(view, offset, item).map(|y| Self {
-                index: index - first_message,
-                y,
-            })
+            visible_top(view, offset, item)
+                .filter(|y| visible(*y))
+                .map(|y| Self {
+                    index: index - first_message,
+                    y,
+                })
         })
     }
 

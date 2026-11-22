@@ -105,7 +105,7 @@ pub(super) struct NoteFrame {
     details: (f32, f32),
     height: f32,
     alpha: f32,
-    leaving: bool,
+    pub(super) leaving: bool,
     suggestions: Option<(ThreadNote, f32)>,
     scroll: ScrollHandle,
 }
@@ -257,7 +257,7 @@ fn header_height(ui_px: f32) -> Pixels {
     px(ui_px + 12.0)
 }
 
-fn pinned_header_height(ui_px: f32) -> Pixels {
+pub(super) fn pinned_header_height(ui_px: f32) -> Pixels {
     header_height(ui_px) + px(PINNED_BORDER + PINNED_HEADER_GAP)
 }
 
@@ -267,6 +267,15 @@ pub(super) struct NotePin {
     id: Option<i64>,
     newest: Option<i64>,
     arrival: Option<Transition>,
+    new_arrival: bool,
+    reader: Option<ScrollAnchor>,
+    divider: Option<Transition>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct PinnedFrame {
+    pub alpha: f32,
+    pub divider: f32,
 }
 
 impl NotePin {
@@ -274,7 +283,7 @@ impl NotePin {
         Self {
             id: note,
             newest,
-            arrival: None,
+            ..Self::default()
         }
     }
 
@@ -285,21 +294,30 @@ impl NotePin {
         scrolled: bool,
         motion: &Motion,
         now: Instant,
-    ) {
-        if scrolled
-            && let Some(note) = note
-            && !note.seen
-            && Some(note.id) == newest
+    ) -> bool {
+        let arriving = scrolled
             && newest > self.newest
-        {
-            self.id = Some(note.id);
+            && note.is_some_and(|note| !note.seen && Some(note.id) == newest);
+        if arriving {
+            self.id = newest;
             self.arrival = motion.start(motion::FADE, now);
+            self.new_arrival = true;
+            self.reader = None;
         }
         self.newest = self.newest.max(newest);
+        arriving
     }
 
     pub(super) fn matches(&self, note: Option<&ThreadNote>) -> bool {
         self.id.is_some() && self.id == note.map(|note| note.id)
+    }
+
+    pub(super) fn eligible(&self) -> bool {
+        self.id.is_some()
+    }
+
+    pub(super) fn arriving(&self) -> bool {
+        self.new_arrival
     }
 
     pub(super) fn band(
@@ -309,27 +327,77 @@ impl NotePin {
         offset: Option<Pixels>,
         ui_px: f32,
     ) -> Pixels {
-        if self.matches(note)
-            && (visiting || offset.is_some_and(|offset| header_scrolled_away(offset, ui_px)))
-        {
+        if self.matches(note) && (visiting || offset.is_some_and(scrolled_from_top)) {
             pinned_header_height(ui_px)
         } else {
             px(0.)
         }
     }
 
-    pub(super) fn alpha(&mut self, now: Instant) -> f32 {
-        self.arrival = self.arrival.filter(|fade| fade.running(now));
-        motion::progress(self.arrival.as_ref(), now)
+    pub(super) fn paint(
+        &mut self,
+        active: bool,
+        was_pinned: bool,
+        note: Option<&NoteFrame>,
+        motion: &Motion,
+        now: Instant,
+    ) -> Option<PinnedFrame> {
+        if active && !was_pinned {
+            self.divider = motion.start(motion::QUICK, now);
+        }
+        self.divider = self.divider.filter(|fade| fade.running(now));
+        let alpha = if active {
+            motion::progress(self.arrival.as_ref(), now)
+        } else {
+            // The inline dismissal already fades for 120 ms before shrinking.
+            // Keep the band until that fade has finished.
+            let leaving = note.filter(|note| {
+                was_pinned && note.leaving && self.id == Some(note.note.id) && note.alpha > 0.
+            })?;
+            leaving.alpha * motion::progress(self.arrival.as_ref(), now)
+        };
+        Some(PinnedFrame {
+            alpha,
+            divider: alpha * motion::progress(self.divider.as_ref(), now),
+        })
+    }
+
+    pub(super) fn keep_reader_clear(
+        &mut self,
+        band: Pixels,
+        selected: Option<ScrollAnchor>,
+        now: Instant,
+    ) -> Option<ScrollAnchor> {
+        if std::mem::take(&mut self.new_arrival) && band > px(0.) {
+            self.reader = selected.filter(|anchor| anchor.y < band);
+        }
+        let progress = motion::progress(self.arrival.as_ref(), now);
+        let anchor = self.reader.map(|mut anchor| {
+            anchor.y = px(motion::lerp(
+                f32::from(anchor.y - band),
+                f32::from(anchor.y.max(px(0.))),
+                progress,
+            ));
+            anchor
+        });
+        if progress >= 1. {
+            self.arrival = None;
+            self.reader = None;
+        }
+        anchor
+    }
+
+    pub(super) fn release_reader(&mut self) {
+        self.reader = None;
     }
 
     pub(super) fn running(&self) -> bool {
-        self.arrival.is_some()
+        self.arrival.is_some() || self.divider.is_some()
     }
 }
 
-fn header_scrolled_away(offset: Pixels, ui_px: f32) -> bool {
-    offset <= -header_height(ui_px)
+fn scrolled_from_top(offset: Pixels) -> bool {
+    offset < px(0.)
 }
 
 fn active(session: &Session, frame: &NoteFrame, live: Live) -> bool {
@@ -426,6 +494,7 @@ pub(super) fn slot(
     columns: ReaderColumns,
     frame: &NoteFrame,
     inline_header: bool,
+    pinned: bool,
     live: Live,
     window: &Window,
     cx: &mut Context<Inbox>,
@@ -439,10 +508,11 @@ pub(super) fn slot(
             session,
             frame,
             frame.closed,
-            active,
+            active && !pinned,
             "toggle-agent-note",
             cx,
         )
+        .opacity(if pinned { 0. } else { 1. })
     });
     let summary = display_safe(&frame.note.summary, true);
     let detail = (frame.details.0 > 0.0).then(|| {
@@ -492,7 +562,7 @@ pub(super) fn pinned_header(
     columns: ReaderColumns,
     frame: &NoteFrame,
     expanded: bool,
-    alpha: f32,
+    paint: PinnedFrame,
     live: Live,
     cx: &mut Context<Inbox>,
 ) -> AnyElement {
@@ -501,7 +571,7 @@ pub(super) fn pinned_header(
         session,
         frame,
         !expanded,
-        active(session, frame, live) && alpha > 0.0,
+        active(session, frame, live) && paint.alpha > 0.0,
         "toggle-pinned-note",
         cx,
     );
@@ -531,11 +601,15 @@ pub(super) fn pinned_header(
         })
         .child(
             div()
-                .border_b(px(PINNED_BORDER))
-                .border_color(rgb(theme.border))
                 .px(px(super::CONVERSATION_PAD_PX))
                 .child(note_column(theme, columns, header))
-                .opacity(alpha),
+                .opacity(paint.alpha),
+        )
+        .child(
+            div()
+                .h(px(PINNED_BORDER))
+                .bg(rgb(theme.border))
+                .opacity(paint.divider),
         )
         .into_any_element()
 }
@@ -763,6 +837,7 @@ pub(super) struct NoteVisit {
     pub note: i64,
     message: String,
     y: Pixels,
+    clipped_selection: bool,
     pub returning: Option<NoteReturn>,
 }
 
@@ -773,6 +848,16 @@ pub(super) struct NoteReturn {
 }
 
 impl Inbox {
+    pub(super) fn reader_entered_conversation(&mut self) {
+        if self.open_thread == self.session.cursor_id
+            && let Some(note) = self.session.note()
+            && !self.note_pin.matches(Some(note))
+        {
+            // The list preview may have received the note before the reader opened.
+            self.note_pin = NotePin::opened(Some(note.id), self.note_pin.newest);
+        }
+    }
+
     pub(super) fn toggle_pinned_note(&mut self) {
         if self.open_thread != self.session.cursor_id {
             return;
@@ -783,26 +868,38 @@ impl Inbox {
         if self.note_band == px(0.) {
             return;
         }
+        self.release_landing();
+        self.note_pin.release_reader();
+        if self.session.agent_notes.collapsed {
+            self.return_from_note(note);
+            return;
+        }
         let scroll = &self.conv_scroll;
         let offset = f32::from(clamped_offset(scroll));
         if let Some(visit) = &mut self.note_visit
             && visit.note == note
         {
             if visit.returning.take().is_some() {
-                self.session.agent_notes.collapsed = false;
                 self.glide_conversation_for(offset, 0., motion::PANE, 0.);
-            } else {
-                self.session.agent_notes.collapsed = true;
-                self.return_from_note(note);
             }
             return;
         }
         let first_message = usize::from(self.conv_note_slot);
-        let anchor = match self.reveal {
-            super::Reveal::Reading { selected: false } => None,
-            _ => ScrollAnchor::capture_message(scroll, self.session.message_cursor, first_message),
-        }
-        .or_else(|| ScrollAnchor::capture(scroll, first_message));
+        let selected = self.message_selected();
+        let clipped = selected
+            .then(|| {
+                ScrollAnchor::capture_message(scroll, self.session.message_cursor, first_message)
+            })
+            .flatten()
+            .filter(|anchor| anchor.y < px(0.));
+        let anchor = clipped
+            .map(|anchor| ScrollAnchor {
+                y: px(0.),
+                ..anchor
+            })
+            .or_else(|| ScrollAnchor::capture_header(scroll, first_message))
+            // A single tall message may cover the entire viewport.
+            .or_else(|| ScrollAnchor::capture(scroll, first_message));
         let Some(anchor) = anchor else { return };
         let Some(message) = self.session.messages.get(anchor.index) else {
             return;
@@ -812,24 +909,36 @@ impl Inbox {
         // The pinned band now supplies the inline header. Account for its
         // removal from the scroll content before the opening glide.
         let offset = (offset + f32::from(header_height(self.theme.ui_px))).min(0.);
-        self.reader_took_over(false);
+        self.reveal = super::Reveal::Reading { selected };
         self.note_visit = Some(NoteVisit {
             note,
             message,
             y: anchor.y + self.note_band,
+            clipped_selection: clipped.is_some(),
             returning: None,
         });
-        self.session.agent_notes.collapsed = false;
         self.glide_conversation_for(offset, 0., motion::PANE, 0.);
     }
 
     pub(super) fn agent_note_resolved(&mut self, request: &NoteRequest) {
+        self.finish_note_decision();
         if self.open_thread.as_deref() == Some(&request.thread)
             && self.session.cursor_id == self.open_thread
         {
             self.return_from_note(request.id);
         }
         self.session.agent_notes.resolved(request);
+    }
+
+    pub(super) fn finish_note_decision(&mut self) {
+        self.note_in_flight = None;
+        self.note_generation = self.note_generation.wrapping_add(1);
+    }
+
+    fn note_read_current(&self, generation: u64) -> bool {
+        generation == self.note_generation
+            && self.note_in_flight.is_none()
+            && self.undos_in_flight == 0
     }
 
     fn return_from_note(&mut self, note: i64) {
@@ -842,13 +951,15 @@ impl Inbox {
         let offset = f32::from(clamped_offset(&self.conv_scroll));
         let from = self.motion.glide_from_conversation(offset);
         self.motion.conv_glide = None;
+        let duration = if visit.clipped_selection {
+            motion::SLIDE
+        } else {
+            motion::PANE
+        };
         visit.returning = Some(NoteReturn {
             from: px(from),
             band: self.note_band,
-            time: self
-                .motion
-                .motion
-                .start(motion::PANE, self.motion.clock.now()),
+            time: self.motion.motion.start(duration, self.motion.clock.now()),
         });
     }
 
@@ -867,38 +978,50 @@ impl Inbox {
         };
         if glide.progress >= 1.0 || index.is_none() {
             self.note_visit = None;
-            if let Some(index) = index {
-                self.session.message_cursor = index;
-            }
         }
         index.map(|index| (ScrollAnchor { index, y }, glide))
     }
 
-    pub(super) fn update_agent_notes(&mut self, thread: &str, notes: Vec<ThreadNote>) -> bool {
+    pub(super) fn update_agent_notes(
+        &mut self,
+        generation: u64,
+        thread: &str,
+        notes: Vec<ThreadNote>,
+    ) -> bool {
+        if !self.note_read_current(generation) {
+            return false;
+        }
         let scrolled = self.open_thread.as_deref() == Some(thread)
             && self.conv_layout_current
             && self.session.pane == Pane::Conversation
             && self.note_visit.is_none()
-            && header_scrolled_away(clamped_offset(&self.conv_scroll), self.theme.ui_px);
+            && scrolled_from_top(clamped_offset(&self.conv_scroll));
         let newest = notes.first().map(|note| note.id);
         let state = &mut self.session.agent_notes;
         let changed = state.update(Some(thread.to_owned()), notes);
         if self.open_thread.as_deref() == Some(thread) {
             let current = state.current(Some(thread));
             if self.note_visit.as_ref().is_some_and(|visit| {
-                visit.returning.is_none()
-                    && self.note_in_flight != Some(visit.note)
-                    && current.is_none_or(|note| note.id != visit.note)
+                visit.returning.is_none() && current.is_none_or(|note| note.id != visit.note)
             }) {
                 self.note_visit = None;
             }
-            self.note_pin.observe(
+            let arriving = self.note_pin.observe(
                 current,
                 newest,
                 scrolled,
                 &self.motion.motion,
                 self.motion.clock.now(),
             );
+            if arriving
+                && self
+                    .session
+                    .toast
+                    .as_ref()
+                    .is_some_and(|toast| toast.text == "Note dismissed")
+            {
+                self.session.clear_toast();
+            }
         }
         changed
     }
@@ -910,21 +1033,29 @@ impl Inbox {
                 cx.background_executor()
                     .timer(Duration::from_millis(450))
                     .await;
-                let Ok(Some((store, account, open, to_see))) = this.update(cx, |inbox, _| {
-                    if inbox.account_id.as_str().is_empty() {
-                        return None;
-                    }
-                    let open = inbox
-                        .open_thread
-                        .clone()
-                        .filter(|id| Some(id) == inbox.session.cursor_id.as_ref());
-                    let to_see = (inbox.session.pane == Pane::Conversation
-                        && !inbox.session.agent_notes.collapsed
-                        && inbox.note_in_view())
-                    .then(|| inbox.session.note().map(|note| note.id))
-                    .flatten();
-                    Some((inbox.store.clone(), inbox.account_id.clone(), open, to_see))
-                }) else {
+                let Ok(Some((store, account, open, to_see, generation))) =
+                    this.update(cx, |inbox, _| {
+                        if inbox.account_id.as_str().is_empty() {
+                            return None;
+                        }
+                        let open = inbox
+                            .open_thread
+                            .clone()
+                            .filter(|id| Some(id) == inbox.session.cursor_id.as_ref());
+                        let to_see = (inbox.session.pane == Pane::Conversation
+                            && !inbox.session.agent_notes.collapsed
+                            && inbox.note_in_view())
+                        .then(|| inbox.session.note().map(|note| note.id))
+                        .flatten();
+                        Some((
+                            inbox.store.clone(),
+                            inbox.account_id.clone(),
+                            open,
+                            to_see,
+                            inbox.note_generation,
+                        ))
+                    })
+                else {
                     if this.upgrade().is_none() {
                         break;
                     }
@@ -955,6 +1086,9 @@ impl Inbox {
                 };
                 if this
                     .update(cx, |inbox, cx| {
+                        if !inbox.note_read_current(generation) {
+                            return;
+                        }
                         let state = &mut inbox.session.agent_notes;
                         let marker_changed = state.unread != unread;
                         let filter_changed = state.pending_threads != pending;
@@ -964,7 +1098,7 @@ impl Inbox {
                             open == inbox.open_thread && open == inbox.session.cursor_id
                         });
                         let note_changed = open.zip(shown).is_some_and(|(thread, notes)| {
-                            inbox.update_agent_notes(&thread, notes)
+                            inbox.update_agent_notes(generation, &thread, notes)
                         });
                         if filter_changed
                             && inbox.session.search.as_ref().is_some_and(|search| {
@@ -1052,22 +1186,20 @@ impl Inbox {
             move |store| {
                 store.resolve_thread_note(&account, &thread, &folder, id, decision, scoped)
             },
-            move |inbox, result| {
-                inbox.note_in_flight = None;
-                match result {
-                    Ok(_) => {
-                        inbox.agent_note_resolved(&note);
-                        inbox.send_to_server();
-                        inbox.session.show_toast(notice, false);
-                        Some(ReadIntent {
-                            changed: true,
-                            ..ReadIntent::default()
-                        })
-                    }
-                    Err(err) => {
-                        inbox.session.show_toast(err.to_string(), true);
-                        None
-                    }
+            move |inbox, result| match result {
+                Ok(_) => {
+                    inbox.agent_note_resolved(&note);
+                    inbox.send_to_server();
+                    inbox.session.show_toast(notice, false);
+                    Some(ReadIntent {
+                        changed: true,
+                        ..ReadIntent::default()
+                    })
+                }
+                Err(err) => {
+                    inbox.finish_note_decision();
+                    inbox.session.show_toast(err.to_string(), true);
+                    None
                 }
             },
             cx,
@@ -1078,6 +1210,7 @@ impl Inbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{AppContext, TestAppContext};
 
     fn note(id: i64, seen: bool) -> ThreadNote {
         ThreadNote {
@@ -1088,6 +1221,21 @@ mod tests {
             summary: "Survey update".into(),
             suggestions: Vec::new(),
         }
+    }
+
+    fn test_inbox(path: std::path::PathBuf, cx: &mut Context<Inbox>) -> Inbox {
+        Inbox::with_startup(
+            crate::mailbox::Startup {
+                keymap: keymap::Keymap::default(),
+                split: 0.4,
+                read_dwell_ms: 0,
+                error: None,
+                config: None,
+                path: Ok(path),
+            },
+            None,
+            cx,
+        )
     }
 
     #[test]
@@ -1113,17 +1261,13 @@ mod tests {
     }
 
     #[test]
-    fn a_collapsed_inline_header_clears_the_view_before_its_band_takes_over() {
+    fn the_band_replaces_the_inline_header_on_the_first_scroll() {
         let note = note(1, true);
         let pin = NotePin::opened(Some(1), Some(1));
         let ui_px = 14.;
         let header = header_height(ui_px);
         assert_eq!(pin.band(Some(&note), false, Some(px(0.)), ui_px), px(0.));
-        assert_eq!(
-            pin.band(Some(&note), false, Some(px(1.) - header), ui_px),
-            px(0.)
-        );
-        let band = pin.band(Some(&note), false, Some(-header), ui_px);
+        let band = pin.band(Some(&note), false, Some(px(-1.)), ui_px);
         assert_eq!(band, header + px(9.));
         assert_eq!(pin.band(Some(&note), true, Some(px(0.)), ui_px), band);
     }
@@ -1150,9 +1294,195 @@ mod tests {
         // A genuinely new, unseen annotation can pin while reading.
         pin.observe(Some(&note(7, false)), Some(7), true, &motion, start);
         assert!(pin.matches(Some(&note(7, false))));
-        assert_eq!(pin.alpha(start), 0.);
-        assert!(pin.alpha(start + Duration::from_millis(60)) > 0.);
-        assert_eq!(pin.alpha(start + motion::FADE), 1.);
+        let mut paint = |now| pin.paint(true, false, None, &motion, now).unwrap().alpha;
+        assert_eq!(paint(start), 0.);
+        assert!(paint(start + Duration::from_millis(60)) > 0.);
+        assert_eq!(paint(start + motion::FADE), 1.);
+    }
+
+    #[test]
+    fn crossing_the_band_preserves_message_and_page_glide_destinations() {
+        let now = Instant::now();
+        let pin = NotePin::opened(Some(1), Some(1));
+        let note = note(1, true);
+        for target in [-92., -680.] {
+            assert_eq!(pin.band(Some(&note), false, Some(px(0.)), 14.), px(0.));
+            let mut glide =
+                motion::Glide::start(&Motion::new(true), 0., target, 0., motion::SLIDE, now)
+                    .unwrap();
+            let crossing = now + Duration::from_millis(16);
+            let drawn = glide.value(crossing);
+            let band = f32::from(pin.band(Some(&note), false, Some(px(drawn)), 14.));
+            assert!(band > 0.);
+            glide.move_origin(crossing, drawn, band);
+            assert!((band + glide.value(crossing) - drawn).abs() < 0.001);
+            let destination_top = -target + band + glide.value(now + motion::SLIDE);
+            assert_eq!(
+                destination_top, band,
+                "destination is flush with the mail viewport"
+            );
+        }
+    }
+
+    #[test]
+    fn collapsing_a_scrolled_pinned_note_without_a_visit_keeps_the_offset() {
+        use gpui::{Entity, Render};
+
+        struct Reader(Entity<Inbox>);
+
+        impl Render for Reader {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let inbox = self.0.read(cx);
+                div()
+                    .h(px(400.))
+                    .id("test-reader")
+                    .overflow_y_scroll()
+                    .track_scroll(&inbox.conv_scroll)
+                    .children((0..12).map(|_| div().h(px(80.))))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = TestAppContext::single();
+        let (reader, cx) = app.add_window_view(|_, cx| {
+            Reader(cx.new(|cx| test_inbox(dir.path().join("test.db"), cx)))
+        });
+        cx.run_until_parked();
+        let inbox = reader.read_with(cx, |reader, _| reader.0.clone());
+        let store = fell_core::Store::open_in_memory().unwrap();
+        let account = crate::fixtures::fixture_account();
+        store.upsert_account(&account).unwrap();
+        crate::fixtures::seed_if_empty(&store, &account).unwrap();
+        let thread = store.list_threads(&account.id).unwrap().remove(0).thread_id;
+        let messages = crate::view::read_conversation(
+            &store,
+            &account.id,
+            &thread,
+            (&account.email, &Default::default(), &[], "INBOX"),
+        )
+        .unwrap();
+        inbox.update(cx, |inbox, _| {
+            let id = thread.0;
+            inbox.open_thread = Some(id.clone());
+            inbox.session.cursor_id = Some(id.clone());
+            inbox.session.pane = Pane::Conversation;
+            inbox.session.messages = vec![messages[0].clone(); 11];
+            inbox
+                .session
+                .agent_notes
+                .update(Some(id), vec![note(1, true)]);
+            inbox.note_band = pinned_header_height(inbox.theme.ui_px);
+            inbox.conv_note_slot = true;
+            inbox.conv_scroll.set_offset(point(px(0.), px(-140.)));
+            inbox.reader_took_over(false);
+            assert_eq!(clamped_offset(&inbox.conv_scroll), px(-140.));
+
+            assert!(
+                inbox
+                    .session
+                    .perform(Action::ToggleAgentNote, 1)
+                    .toggle_agent_note
+            );
+            inbox.toggle_pinned_note();
+            assert!(inbox.session.agent_notes.collapsed);
+            assert_eq!(inbox.conv_scroll.offset().y, px(-140.));
+            assert!(inbox.motion.conv_glide.is_none());
+            assert!(inbox.note_visit.is_none());
+        });
+    }
+
+    #[test]
+    fn a_refresh_started_before_a_note_decision_cannot_restore_old_chips() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = TestAppContext::single();
+        let inbox = app.new(|cx| test_inbox(dir.path().join("test.db"), cx));
+        inbox.update(&mut app, |inbox, _| {
+            let thread = "survey";
+            let mut before = note(1, true);
+            before
+                .suggestions
+                .push(fell_core::notes::PendingSuggestion {
+                    position: 0,
+                    action: Suggestion::Star,
+                });
+            inbox.session.cursor_id = Some(thread.into());
+            inbox.open_thread = Some(thread.into());
+            let current = inbox.note_generation;
+            assert!(inbox.update_agent_notes(current, thread, vec![before.clone()]));
+            for decision in [NoteDecision::Accept(0), NoteDecision::Dismiss] {
+                let old_generation = inbox.note_generation;
+                let old_notes = vec![inbox.session.note().unwrap().clone()];
+                inbox.note_in_flight = Some(1);
+                assert!(!inbox.update_agent_notes(old_generation, thread, old_notes.clone()));
+                inbox.agent_note_resolved(&NoteRequest {
+                    thread: thread.into(),
+                    id: 1,
+                    decision,
+                    reply: false,
+                });
+                assert!(!inbox.update_agent_notes(old_generation, thread, old_notes));
+                match decision {
+                    NoteDecision::Accept(_) => {
+                        assert!(inbox.session.note().unwrap().suggestions.is_empty())
+                    }
+                    NoteDecision::Dismiss => assert!(inbox.session.note().is_none()),
+                }
+            }
+            assert!(inbox.update_agent_notes(inbox.note_generation, thread, vec![note(2, false)]));
+            assert_eq!(inbox.session.note().unwrap().id, 2);
+        });
+    }
+
+    #[test]
+    fn dismissal_keeps_the_band_until_the_header_finishes_fading() {
+        let now = Instant::now();
+        let motion = Motion::new(true);
+        let note = note(1, true);
+        let mut view = NoteView::default();
+        let mut pin = NotePin::opened(Some(1), Some(1));
+        view.observe(Some("thread"), Some(&note), false, &motion, now);
+        view.observe(Some("thread"), None, false, &motion, now);
+        let paint = |pin: &mut NotePin, elapsed| {
+            let frame = view.frame(now + elapsed);
+            pin.paint(false, true, frame.as_ref(), &motion, now + elapsed)
+        };
+        assert_eq!(paint(&mut pin, Duration::ZERO).unwrap().alpha, 1.);
+        let halfway = paint(&mut pin, Duration::from_millis(60)).unwrap();
+        assert!(halfway.alpha > 0. && halfway.alpha < 1.);
+        assert!(paint(&mut pin, motion::FADE).is_none());
+    }
+
+    #[test]
+    fn a_live_note_moves_only_the_selection_that_its_band_would_cover() {
+        let now = Instant::now();
+        let note = note(1, false);
+        let band = pinned_header_height(14.);
+        let motion = Motion::new(true);
+        let mut pin = NotePin::default();
+        let anchor = |y| ScrollAnchor { index: 4, y };
+        assert!(pin.observe(Some(&note), Some(1), true, &motion, now));
+        assert!(
+            pin.keep_reader_clear(band, Some(anchor(band)), now)
+                .is_none()
+        );
+
+        let mut pin = NotePin::default();
+        pin.observe(Some(&note), Some(1), true, &motion, now);
+        let y = px(3.);
+        assert_eq!(
+            pin.keep_reader_clear(band, Some(anchor(y)), now).unwrap().y,
+            y - band
+        );
+        let halfway = pin
+            .keep_reader_clear(band, None, now + Duration::from_millis(60))
+            .unwrap();
+        assert!(halfway.y > y - band && halfway.y < y);
+        assert_eq!(
+            pin.keep_reader_clear(band, None, now + motion::SLIDE)
+                .unwrap()
+                .y,
+            y
+        );
     }
 
     #[test]
