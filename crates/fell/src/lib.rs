@@ -191,6 +191,7 @@ mod tests {
     struct Counting {
         sends: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         answer: fn() -> fell_core::Result<()>,
+        append_sent: bool,
         /// The message bytes of the latest transmission.
         mime: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     }
@@ -200,6 +201,7 @@ mod tests {
             Self {
                 sends: Default::default(),
                 answer,
+                append_sent: false,
                 mime: Default::default(),
             }
         }
@@ -223,6 +225,10 @@ mod tests {
     impl MailBackend for Counting {
         fn kind(&self) -> fell_core::BackendKind {
             fell_core::BackendKind::Bridge
+        }
+
+        fn append_sent(&self) -> bool {
+            self.append_sent
         }
 
         fn fetch_changes(
@@ -264,6 +270,65 @@ mod tests {
         );
         assert_eq!(backend.count(), 1);
         assert!(session.snapshot().send_block.is_some());
+    }
+
+    #[test]
+    fn a_direct_editor_send_queues_the_sent_copy_and_reports_a_failed_local_save() {
+        for reject_local in [false, true] {
+            let mut session = real_session("editor-append");
+            let account = session.account_id().clone();
+            let db = mailbox_of(&session);
+            let store = fell_core::Store::open(&db).unwrap();
+            store.set_write_back(&account, true).unwrap();
+            let mut config = fell_core::AccountConfig::bridge(
+                "jon@example.com",
+                "jon",
+                fell_core::PasswordSource::Inline("fixture-password".into()),
+            );
+            config.id = account.as_str().to_string();
+            config.write_back = true;
+            config.save_sent = fell_core::SaveSent::Append;
+            let mut backend = Counting::new(|| Ok(()));
+            backend.append_sent = fell_core::backend_for(&account, Some(&config))
+                .unwrap()
+                .append_sent();
+
+            if reject_local {
+                rusqlite::Connection::open(&db)
+                    .unwrap()
+                    .execute_batch(
+                        "CREATE TRIGGER reject_local_sent BEFORE INSERT ON messages
+                         BEGIN SELECT RAISE(ABORT, 'local insert failed'); END;",
+                    )
+                    .unwrap();
+            }
+
+            assert!(send_from_editor(&mut session, &backend).is_ok());
+            assert_eq!(backend.count(), 1);
+            assert_eq!(
+                session.send_lock(),
+                Some(fell_core::compose::SendLock::Sent)
+            );
+            let outbox = store.outbox(&account).unwrap();
+            assert_eq!(outbox.len(), 1);
+            assert_eq!(outbox[0].kind, fell_core::OutboxKind::AppendSent);
+            assert_eq!(outbox[0].message_id, backend.message_id().as_str());
+            assert_eq!(
+                store
+                    .message(&account, &backend.message_id())
+                    .unwrap()
+                    .is_none(),
+                reject_local
+            );
+            assert_eq!(
+                session
+                    .snapshot()
+                    .notices
+                    .iter()
+                    .any(|notice| { notice == fell_core::compose::LOCAL_SENT_COPY_FAILED }),
+                reject_local
+            );
+        }
     }
 
     #[test]
@@ -352,7 +417,7 @@ mod tests {
                     assert_eq!(press, 0);
                     let counting = backend.clone();
                     crate::compose_ui::transmit_from_hub(&hub, "hub", prepared, move |_| {
-                        Ok((Box::new(counting), false))
+                        Ok(Box::new(counting))
                     })
                     .0
                     .unwrap();
@@ -431,7 +496,7 @@ mod tests {
         let (outcome, copy) =
             crate::compose_ui::transmit_from_hub(&hub, &sent, prepared, |account| {
                 asked.lock().unwrap().push(account.clone());
-                Ok((Box::new(counting), false))
+                Ok(Box::new(counting))
             });
         assert!(outcome.is_ok());
         let (_, message, _) = copy.unwrap().unwrap();
@@ -495,7 +560,7 @@ mod tests {
         let counting = backend.clone();
         crate::compose_ui::transmit_from_hub(hub, id, prepared, move |account| {
             asked.lock().unwrap().push(account.clone());
-            Ok((Box::new(counting), false))
+            Ok(Box::new(counting))
         })
         .0
     }

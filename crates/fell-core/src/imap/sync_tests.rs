@@ -38,6 +38,7 @@ pub(super) fn unused_smtp() -> crate::SmtpConfig {
         port: 0,
         security: ImapSecurity::StartTls,
         accept_invalid_certs: false,
+        append_sent: false,
     }
 }
 

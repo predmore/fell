@@ -2878,6 +2878,48 @@ fn sent_append_is_reissued_with_unchanged_uidnext() {
 }
 
 #[test]
+fn sent_append_waits_for_uidnext_then_retries_an_interrupted_append() {
+    let fixture = sent_fixture();
+    record_reply(&fixture, true);
+    fixture.server.state.lock().unwrap().mailboxes[1].omit_uidnext = true;
+    fixture
+        .server
+        .writes
+        .lock()
+        .unwrap()
+        .lose_append_before_commit = true;
+    let append_commands = || {
+        fixture
+            .commands()
+            .iter()
+            .filter(|command| command.contains(" APPEND "))
+            .count()
+    };
+
+    let report = fixture.replay();
+    assert!(report.sent_append_delayed);
+    assert_eq!(report.waiting, 1);
+    assert!(report.interrupted.is_none());
+    let row = &fixture.store.outbox(&fixture.account.id).unwrap()[0];
+    assert_eq!(row.state, OutboxState::Pending);
+    assert!(!row.sent);
+    assert_eq!(row.attempts, 0);
+    assert!(row.retry_unix > crate::outbox::now_unix());
+    assert_eq!(append_commands(), 0);
+
+    fixture.server.state.lock().unwrap().mailboxes[1].omit_uidnext = false;
+    fixture.make_due();
+    assert!(fixture.replay().interrupted.is_some());
+    assert!(fixture.store.outbox(&fixture.account.id).unwrap()[0].sent);
+    assert!(fixture.on_server("Filed mail").is_empty());
+
+    fixture.make_due();
+    assert_eq!(fixture.replay().sent, 1);
+    assert_eq!(fixture.on_server("Filed mail").len(), 1);
+    assert_eq!(append_commands(), 2);
+}
+
+#[test]
 fn sent_append_rechecks_the_new_range_and_records_a_fresh_bound() {
     let fixture = sent_fixture();
     lose_sent_append(&fixture);

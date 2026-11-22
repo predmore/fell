@@ -342,18 +342,24 @@ impl Pass<'_> {
                         self.selected = Some((mailbox.clone(), validity));
                         (validity, next.unwrap_or_default())
                     }
-                    Err(WriteError::Refused(_)) => (0, 0),
+                    Err(WriteError::Refused(message)) => return Err(Stop::AppendRetry(message)),
                     Err(WriteError::Connection(err)) => return Err(Stop::Connection(err)),
                 }
             } else {
                 match session.status(&mailbox) {
                     Ok(bound) => bound,
-                    Err(WriteError::Refused(_)) => (0, 0),
+                    Err(WriteError::Refused(message)) => return Err(Stop::AppendRetry(message)),
                     Err(WriteError::Connection(err)) => return Err(Stop::Connection(err)),
                 }
             };
             (mailbox, bound)
         };
+        // Never send without a bound that recovery can use if the reply is lost.
+        if bound.1 == 0 {
+            return Err(Stop::AppendRetry(
+                "Sent UIDNEXT could not be verified".into(),
+            ));
+        }
         let quoted_mailbox = quote_imap(&mailbox).map_err(Stop::AppendRetry)?;
         if !outbox::mark_append_sent(self.store, entry, &mailbox, bound)? {
             return Err(Stop::Stale);

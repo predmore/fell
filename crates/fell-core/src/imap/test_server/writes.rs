@@ -374,8 +374,13 @@ fn status(tag: &str, rest: &str, state: &TestState) -> String {
     };
     let highest = mailbox.messages.iter().map(|m| m.uid).max().unwrap_or(0);
     let next = mailbox.uidnext.unwrap_or(highest + 1).max(highest + 1);
+    let next = if mailbox.omit_uidnext {
+        String::new()
+    } else {
+        format!(" UIDNEXT {next}")
+    };
     format!(
-        "* STATUS {name:?} (UIDVALIDITY {} UIDNEXT {next})\r\n{tag} OK STATUS completed\r\n",
+        "* STATUS {name:?} (UIDVALIDITY {}{next})\r\n{tag} OK STATUS completed\r\n",
         mailbox.uidvalidity
     )
 }

@@ -2356,7 +2356,15 @@ pub fn send_from_editor(
 ) -> Result<fell_core::SentMessage, SendFailure> {
     let prepared = prepare_from_editor(session)?;
     // This call holds the session throughout, so the claim cannot be lost.
-    let result = prepared.transmit_checked(backend, false, || true, |_| {});
+    let result = prepared.transmit_checked(
+        backend,
+        || true,
+        |stored| {
+            if stored.is_err() {
+                session.report_sent_copy_failure();
+            }
+        },
+    );
     log_send_result(&result);
     session.end_send(lock_after(&result));
     result
@@ -2410,7 +2418,7 @@ pub fn prepare_from_editor(
 /// The backend for a send from the window: the demo mailbox, or the account
 /// file's login and SMTP settings for this account id. Resolves the account
 /// password, so call it off the UI thread.
-type SendBackend = (Box<dyn MailBackend + Send>, bool);
+type SendBackend = Box<dyn MailBackend + Send>;
 type StoredSentCopy = fell_core::Result<(
     fell_core::ThreadId,
     fell_core::Message,
@@ -2419,12 +2427,7 @@ type StoredSentCopy = fell_core::Result<(
 
 fn account_backend(account: &AccountId) -> Result<SendBackend, SendFailure> {
     let config = crate::mailbox::send_account_config(account).map_err(SendFailure::Unavailable)?;
-    let append = config
-        .as_ref()
-        .is_some_and(fell_core::AccountConfig::append_sent);
-    let backend =
-        fell_core::backend_for(account, config.as_ref()).map_err(SendFailure::from_core)?;
-    Ok((backend, append))
+    fell_core::backend_for(account, config.as_ref()).map_err(SendFailure::from_core)
 }
 
 /// Transmit a send [`prepare_from_editor`] claimed and record how it ended on
@@ -2441,10 +2444,9 @@ pub(crate) fn transmit_from_hub(
     // While the lock is held every edit path is refused, so the prepared
     // message is still the draft. Only a send that lost its lock stops.
     let mut copy = None;
-    let result = backend(&prepared.account).and_then(|(backend, append)| {
+    let result = backend(&prepared.account).and_then(|backend| {
         prepared.transmit_checked(
             backend.as_ref(),
-            append,
             || {
                 hub.with_session(id, |session| session.send_lock())
                     .flatten()
@@ -2490,7 +2492,6 @@ impl PreparedSend {
     fn transmit_checked(
         self,
         backend: &dyn MailBackend,
-        append: bool,
         still_claimed: impl FnOnce() -> bool,
         saved: impl FnOnce(StoredSentCopy),
     ) -> Result<fell_core::SentMessage, SendFailure> {
@@ -2511,10 +2512,13 @@ impl PreparedSend {
         if let Some((record, mime)) = sent_copy {
             match &result {
                 Ok(_) => {
-                    let stored = record.save(&mime, append).map(|(thread, message)| {
-                        let rich = crate::mail_body::prepare_sent(&message);
-                        (thread, message, rich)
-                    });
+                    let stored =
+                        record
+                            .save(&mime, backend.append_sent())
+                            .map(|(thread, message)| {
+                                let rich = crate::mail_body::prepare_sent(&message);
+                                (thread, message, rich)
+                            });
                     if stored.is_err() {
                         fell_core::diagnostic!(WARN, "Could not save local Sent copy");
                         remember_bcc(record);

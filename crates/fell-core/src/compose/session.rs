@@ -1369,6 +1369,11 @@ impl DraftSession {
         self.send_guard = None;
     }
 
+    /// Tell the editor that delivery succeeded but its local copy could not be saved.
+    pub fn report_sent_copy_failure(&mut self) {
+        self.notices.push(super::LOCAL_SENT_COPY_FAILED.into());
+    }
+
     /// Apply confirmation of a recorded uncertain send. A live transfer
     /// still owns its editor until the SMTP worker ends it.
     pub(crate) fn confirm_uncertain_send(&mut self) {

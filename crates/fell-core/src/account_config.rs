@@ -476,6 +476,7 @@ impl AccountConfig {
             // Same rule as IMAP: only Bridge on this machine skips the
             // certificate check.
             accept_invalid_certs: self.backend == BackendKind::Bridge && literal_loopback(&host),
+            append_sent: self.append_sent(),
             host,
             port,
             security,

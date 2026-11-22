@@ -31,6 +31,8 @@ pub struct SmtpConfig {
     /// Bridge signs its local listener with its own certificate. Only allowed
     /// for a loopback host.
     pub accept_invalid_certs: bool,
+    /// Queue a server Sent copy after successful submission.
+    pub append_sent: bool,
 }
 
 impl SmtpConfig {
@@ -41,6 +43,7 @@ impl SmtpConfig {
             port: 1025,
             security: ImapSecurity::StartTls,
             accept_invalid_certs: true,
+            append_sent: false,
         }
     }
 }
@@ -689,6 +692,7 @@ Bcc: this is body text\r\n"
                 port,
                 security,
                 accept_invalid_certs: true,
+                append_sent: false,
             },
         }
     }
