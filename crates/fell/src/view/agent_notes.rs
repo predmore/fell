@@ -1047,7 +1047,17 @@ impl Inbox {
         if glide.progress >= 1.0 || index.is_none() {
             self.note_visit = None;
         }
-        index.map(|index| (ScrollAnchor { index, y }, glide))
+        index.map(|index| {
+            (
+                ScrollAnchor {
+                    index,
+                    y,
+                    snap_headers: false,
+                    body_scroll: None,
+                },
+                glide,
+            )
+        })
     }
 
     pub(super) fn update_agent_notes(
@@ -1298,9 +1308,11 @@ mod tests {
                 split: 0.4,
                 read_dwell_ms: 0,
                 error: None,
+                account_missing: true,
                 config: None,
                 path: Ok(path),
             },
+            true,
             None,
             cx,
         )
@@ -1606,7 +1618,12 @@ mod tests {
                 assert_eq!(paint.height, target * paint.alpha);
                 assert_eq!(paint.divider, paint.alpha);
                 assert!(paint.height >= previous);
-                let selected = selected_y.map(|y| ScrollAnchor { index: 4, y });
+                let selected = selected_y.map(|y| ScrollAnchor {
+                    index: 4,
+                    y,
+                    snap_headers: false,
+                    body_scroll: None,
+                });
                 let hold = pin.arrival_anchor(target, paint.height, selected, time);
                 match selected_y {
                     Some(y) if y < target => {

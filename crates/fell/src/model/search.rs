@@ -67,6 +67,13 @@ pub struct SearchReply {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MatchLanding {
+    Best,
+    CurrentMatch,
+    KeepReader,
+}
+
 impl SearchReply {
     pub fn new(
         results: fell_core::Result<fell_core::SearchResults>,
@@ -692,7 +699,7 @@ impl Session {
         generation: u64,
         thread: &str,
         matches: Vec<SearchMatch>,
-        land: bool,
+        landing: MatchLanding,
     ) -> bool {
         let Some(search) = self
             .search
@@ -705,17 +712,21 @@ impl Session {
             return false;
         };
         search.matches_for = Some((generation, thread.to_owned()));
-        search.matches = if matches.is_empty() {
-            vec![SearchMatch {
-                message: hit.message.clone(),
-                preview: None,
-            }]
-        } else {
-            matches
-        };
-        if !land
-            && let Some(message) = self.messages.get(self.message_cursor)
-            && search.matches.iter().any(|hit| hit.message.0 == message.id)
+        search.matches =
+            if matches.is_empty() && (landing != MatchLanding::KeepReader || hit.related) {
+                vec![SearchMatch {
+                    message: hit.message.clone(),
+                    preview: None,
+                }]
+            } else {
+                matches
+            };
+        let current_matches = self
+            .messages
+            .get(self.message_cursor)
+            .is_some_and(|message| search.matches.iter().any(|hit| hit.message.0 == message.id));
+        if landing == MatchLanding::KeepReader
+            || (landing == MatchLanding::CurrentMatch && current_matches)
         {
             return self.reveal_matching_quote(self.message_cursor);
         }
@@ -1393,7 +1404,12 @@ mod tests {
             "Inbox",
         ));
         assert!(matches.len() > 1);
-        session.set_search_matches(session.search_generation, &thread, matches.clone(), true);
+        session.set_search_matches(
+            session.search_generation,
+            &thread,
+            matches.clone(),
+            MatchLanding::Best,
+        );
         let representative = session.message_cursor;
         session.on_key(KeyId::Char('n'), 10);
         assert_ne!(session.message_cursor, representative);

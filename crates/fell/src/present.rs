@@ -71,9 +71,10 @@ pub struct ConvMessage {
 }
 
 /// What the conversation says in place of a body it does not have.
-pub fn missing_body_line(state: fell_core::BodyState) -> Option<String> {
+pub fn missing_body_line(state: fell_core::BodyState, syncing: bool) -> Option<String> {
     match state {
         fell_core::BodyState::Stored => None,
+        fell_core::BodyState::Pending if syncing => Some("Downloading…".into()),
         fell_core::BodyState::Pending => Some("Not downloaded yet".into()),
         fell_core::BodyState::TooLarge => Some(format!(
             "Too large to download (over {} MB)",
@@ -88,6 +89,12 @@ pub fn awaiting_bodies(shown: &[ConvMessage]) -> bool {
     shown
         .iter()
         .any(|message| message.body_state == fell_core::BodyState::Pending)
+}
+
+pub fn newest_body_ready(shown: &[ConvMessage]) -> bool {
+    shown
+        .last()
+        .is_some_and(|message| message.body_state != fell_core::BodyState::Pending)
 }
 
 pub fn same_messages(shown: &[ConvMessage], read: &[ConvMessage]) -> bool {
@@ -125,18 +132,20 @@ pub fn conversation_fits(max_offset: f32) -> bool {
 /// Room a message's start needs on screen to count as in view.
 const START_IN_VIEW_PX: f32 = 48.0;
 
-/// The offset that shows the start of the message at `item_top` (scroll
-/// content coordinates, as GPUI lays them out), or `None` when its start
-/// is in view already and nothing should move.
-pub fn offset_to_show_start(
-    item_top: f32,
-    view_top: f32,
-    view_bottom: f32,
+/// The offset that reveals the card (or its header when it is too tall).
+/// Both vertical spans are in scroll content coordinates.
+pub fn offset_to_show_message(
+    (item_top, item_bottom): (f32, f32),
+    (view_top, view_bottom): (f32, f32),
     offset: f32,
     max: f32,
 ) -> Option<f32> {
-    let on_screen = item_top + offset;
-    if on_screen >= view_top - 0.5 && on_screen <= view_bottom - START_IN_VIEW_PX {
+    let required_bottom = if item_bottom - item_top <= view_bottom - view_top {
+        item_bottom
+    } else {
+        item_top + START_IN_VIEW_PX
+    };
+    if item_top + offset >= view_top - 0.5 && required_bottom + offset <= view_bottom {
         return None;
     }
     let target = offset_to_message_top(item_top, view_top, max);
@@ -1429,6 +1438,23 @@ mod tests {
     }
 
     #[test]
+    fn the_first_inbox_preview_opens_when_the_newest_body_is_ready() {
+        use fell_core::BodyState::{Pending, Stored, TooLarge};
+
+        assert!(!newest_body_ready(&[]));
+        let mut messages = [
+            shown_message("a", Stored, "older"),
+            shown_message("b", Pending, ""),
+        ];
+        assert!(!newest_body_ready(&messages));
+        messages[0].body_state = Pending;
+        messages[1] = shown_message("b", Stored, "newest");
+        assert!(newest_body_ready(&messages));
+        messages[1].body_state = TooLarge;
+        assert!(newest_body_ready(&messages));
+    }
+
+    #[test]
     fn a_reread_that_only_fills_bodies_is_told_apart_from_new_mail() {
         use fell_core::BodyState::{Pending, Stored};
         let shown = vec![
@@ -1467,25 +1493,36 @@ mod tests {
     }
 
     #[test]
-    fn a_body_arriving_moves_the_pane_only_to_show_the_newest_start() {
+    fn a_body_arriving_reveals_the_whole_newest_card_when_it_fits() {
         assert!(conversation_fits(0.0));
         assert!(!conversation_fits(400.0), "keep any reading position");
         // Viewport 100..700. The newest message starts in view: stay.
-        assert_eq!(offset_to_show_start(300.0, 100.0, 700.0, 0.0, 900.0), None);
+        assert_eq!(
+            offset_to_show_message((300., 400.), (100., 700.), 0., 900.),
+            None
+        );
         // Older bodies pushed its start below the fold: glide to it.
         assert_eq!(
-            offset_to_show_start(1_000.0, 100.0, 700.0, 0.0, 900.0),
+            offset_to_show_message((1000., 1100.), (100., 700.), 0., 900.),
             Some(-900.0)
         );
         // Never past the end.
         assert_eq!(
-            offset_to_show_start(1_000.0, 100.0, 700.0, 0.0, 600.0),
+            offset_to_show_message((1000., 1100.), (100., 700.), 0., 600.),
             Some(-600.0)
         );
         // Its start only just peeks in at the bottom: still glide.
         assert_eq!(
-            offset_to_show_start(680.0, 100.0, 700.0, 0.0, 900.0),
+            offset_to_show_message((680., 720.), (100., 700.), 0., 900.),
             Some(-580.0)
+        );
+        assert_eq!(
+            offset_to_show_message((520., 730.), (100., 700.), 0., 58.),
+            Some(-58.),
+        );
+        assert_eq!(
+            offset_to_show_message((300., 1000.), (100., 700.), 0., 900.),
+            None,
         );
     }
 
@@ -1503,13 +1540,17 @@ mod tests {
     #[test]
     fn a_body_not_downloaded_says_why() {
         use fell_core::BodyState::{Pending, Stored, TooLarge};
-        assert_eq!(missing_body_line(Stored), None);
+        assert_eq!(missing_body_line(Stored, true), None);
         assert_eq!(
-            missing_body_line(Pending).as_deref(),
+            missing_body_line(Pending, true).as_deref(),
+            Some("Downloading…")
+        );
+        assert_eq!(
+            missing_body_line(Pending, false).as_deref(),
             Some("Not downloaded yet")
         );
         assert_eq!(
-            missing_body_line(TooLarge).as_deref(),
+            missing_body_line(TooLarge, true).as_deref(),
             Some("Too large to download (over 32 MB)")
         );
     }

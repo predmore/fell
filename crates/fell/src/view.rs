@@ -10,12 +10,13 @@ mod help;
 mod notification_actions;
 mod search;
 
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use fell_core::{
     AccountConfig, AccountId, CidRepairBatch, CidRepairProgress, DropReason, DroppedWrite,
@@ -27,8 +28,8 @@ use gpui::{
     InteractiveElement, IntoElement, KeyDownEvent, Keystroke, MouseButton, MouseMoveEvent,
     MouseUpEvent, ParentElement, Pixels, Render, ScrollHandle, ScrollStrategy, SharedString,
     StatefulInteractiveElement, Styled, StyledText, TextStyle, TitlebarOptions,
-    UniformListScrollHandle, Window, WindowBounds, WindowHandle, WindowOptions, div, point,
-    prelude::*, px, rgb, size, uniform_list,
+    UniformListScrollHandle, Window, WindowBounds, WindowOptions, div, point, prelude::*, px, rgb,
+    size, uniform_list,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -46,17 +47,18 @@ use crate::mail_body::{
 };
 use crate::mailbox;
 use crate::model::{
-    Banner, DRAFT_NOT_THREAD, Fetch, FlagEdit, FolderIntent, LabelEdit, Overlay, PickerChoice,
-    QueryFault, ReadDwell, Session, Step, SyncKind, Toast, row_key,
+    Banner, DRAFT_NOT_THREAD, DownloadStatus, Fetch, FlagEdit, FolderIntent, LabelEdit, Overlay,
+    PickerChoice, QueryFault, ReadDwell, Session, Step, SyncKind, Toast, grouped, row_key,
 };
-use crate::motion::{self, Glide, ListShift, Motion, RowMotion};
+use crate::motion::{self, Glide, LayerSwap, ListShift, Motion, RowMotion, SwapFrame, Transition};
+use crate::onboarding::Onboarding;
 use crate::present::{self, ConvMessage, Pane, Rich, ThreadRow};
 use crate::render::READING_MEASURE_PX;
 use crate::reply_check::{ReplyCheck, ReplyChecks};
 use crate::row_widths::{self, RowFrame, RowWidths};
 use crate::scroll_anchor::{
-    LandingGlide, LandingHold, LayoutProbe, LayoutSlot, ReaderLanding, Reveal, RevealPhase,
-    ScrollAnchor, clamped_offset,
+    LandingGlide, LandingHold, LayoutProbe, LayoutSlot, MessageProbes, ReaderLanding, Reveal,
+    RevealPhase, ScrollAnchor, clamped_offset,
 };
 use crate::store_actor::StoreClient;
 use crate::sync_worker::{self, SyncEvent, SyncHandle};
@@ -67,9 +69,9 @@ use crate::ui_trace::UiTrace;
 use crate::worker::Worker;
 
 use self::agent_notes::NoteVisit;
-use self::disclosure::disclosure;
+use self::disclosure::{GrowingMessage, disclosure};
 
-pub fn run(trace_start: Option<Instant>) {
+pub fn run(demo: bool, trace_start: Option<Instant>) {
     fell_core::diagnostic!(INFO, "Opening inbox");
     Application::new().run(move |cx: &mut App| {
         let trace = trace_start.and_then(|start| match UiTrace::open(start) {
@@ -92,62 +94,49 @@ pub fn run(trace_start: Option<Instant>) {
             })
             .detach();
         }
-        // Agents' drafts open in a compose window from here; see draft_host.
-        let _hub = crate::draft_host::host_agent_drafts(cx);
+        let startup = mailbox::startup();
         let (width, height) = window_size();
         let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
-        let view = cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("Fell".into()),
-                    ..Default::default()
-                }),
-                app_id: Some("dev.predmore.fell".into()),
-                focus: true,
-                show: true,
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: Some(TitlebarOptions {
+                title: Some("Fell".into()),
                 ..Default::default()
-            },
-            |window, cx| {
+            }),
+            app_id: Some("dev.predmore.fell".into()),
+            focus: true,
+            show: true,
+            ..Default::default()
+        };
+        let view = if startup.account_missing && !demo {
+            cx.open_window(options, |window, cx| {
                 if let Some(trace) = &trace {
                     trace.window_created(window);
                 }
-                let view = cx.new(|cx| Inbox::new(window, cx));
-                view.update(cx, |_, cx| {
-                    let mut viewport = (window.viewport_size(), window.scale_factor());
-                    cx.observe_window_bounds(window, move |_, window, cx| {
-                        let previous = viewport;
-                        viewport = (window.viewport_size(), window.scale_factor());
-                        if viewport == previous {
-                            return;
-                        }
-                        // Lay out the new bounds as soon as configure arrives,
-                        // so the next compositor frame can present immediately.
-                        window.defer(cx, |window, cx| window.draw(cx).clear());
-                    })
-                    .detach();
-                    cx.observe_window_activation(window, |_, window, cx| {
-                        if window.is_window_active() {
-                            cx.notify();
-                        }
-                    })
-                    .detach();
-                });
-                let focus = view.read(cx).focus.clone();
-                window.focus(&focus);
-                view
-            },
-        );
+                cx.new(|cx| crate::onboarding::Onboarding::new(window, cx))
+            })
+            .map(gpui::AnyWindowHandle::from)
+        } else {
+            crate::draft_host::host_agent_drafts(cx);
+            cx.open_window(options, |window, cx| {
+                if let Some(trace) = &trace {
+                    trace.window_created(window);
+                }
+                cx.new(|cx| Inbox::focused(startup, demo, window, cx))
+            })
+            .map(gpui::AnyWindowHandle::from)
+        };
         match view {
             Ok(view) => {
-                cx.set_global(InboxWindow(view));
                 cx.on_window_closed(move |cx| {
-                    if cx.windows().contains(&view.into()) {
-                        let _ = view.update(cx, |inbox, _, cx| {
-                            if inbox.motion.has_pending_messages() {
-                                cx.notify();
-                            }
-                        });
+                    if cx.windows().contains(&view) {
+                        if let Some(inbox) = cx.try_global::<InboxWindow>().copied() {
+                            inbox.update(cx, |inbox, cx| {
+                                if inbox.motion.has_pending_messages() {
+                                    cx.notify();
+                                }
+                            });
+                        }
                     } else if let Some(trace) = &trace {
                         trace.finish();
                     }
@@ -160,9 +149,20 @@ pub fn run(trace_start: Option<Instant>) {
     });
 }
 
-struct InboxWindow(WindowHandle<Inbox>);
+#[derive(Clone, Copy)]
+struct InboxWindow(gpui::AnyWindowHandle);
 
 impl gpui::Global for InboxWindow {}
+
+impl InboxWindow {
+    fn update(self, cx: &mut App, update: impl FnOnce(&mut Inbox, &mut Context<Inbox>)) {
+        let _ = self.0.update(cx, |root, _, cx| {
+            if let Ok(inbox) = root.downcast::<Inbox>() {
+                inbox.update(cx, update);
+            }
+        });
+    }
+}
 
 /// Put the committed copy into the inbox before the compose window closes.
 pub(crate) fn present_sent_copy(
@@ -171,10 +171,10 @@ pub(crate) fn present_sent_copy(
     message: fell_core::Message,
     rich: Rich,
 ) {
-    let Some(inbox) = cx.try_global::<InboxWindow>().map(|inbox| inbox.0) else {
+    let Some(inbox) = cx.try_global::<InboxWindow>().copied() else {
         return;
     };
-    let _ = inbox.update(cx, |inbox, _, cx| {
+    inbox.update(cx, |inbox, cx| {
         if message.account_id != inbox.account_id {
             return;
         }
@@ -197,14 +197,36 @@ fn compose_open(cx: &App) -> bool {
 }
 
 pub(crate) fn wake_sent_copy_sync(cx: &mut App) {
-    if let Some(inbox) = cx.try_global::<InboxWindow>().map(|inbox| inbox.0) {
-        let _ = inbox.update(cx, |inbox, _, _| {
+    if let Some(inbox) = cx.try_global::<InboxWindow>().copied() {
+        inbox.update(cx, |inbox, _| {
             // A failed local insert can still have queued the server copy.
             if let Some(sync) = &inbox.sync {
                 sync.write_back_now();
             }
         });
     }
+}
+
+pub(crate) fn finish_onboarding(
+    setup: gpui::Entity<Onboarding>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let startup = mailbox::startup();
+    crate::draft_host::host_agent_drafts(cx);
+    window.replace_root(cx, |window, cx| {
+        let mut inbox = Inbox::focused(startup, false, window, cx);
+        inbox.first_preview = FirstPreview::Handoff;
+        inbox.waiting_for_first_rows = true;
+        inbox.waiting_for_inbox_total = true;
+        let now = inbox.motion.clock.now();
+        inbox
+            .motion
+            .observe_header(&inbox.list_folder, None, None, now);
+        inbox.setup_exit = LayerSwap::start(inbox.motion.motion, now, motion::QUICK, motion::FADE)
+            .map(|swap| (setup, swap));
+        inbox
+    });
 }
 
 /// Why the folder is being reread. Requests made while a read is in flight
@@ -512,6 +534,51 @@ const ROW_PX: f32 = 68.0;
 /// curve, so one late frame cannot carry it half the way ([`Glide::gentle_beyond`]).
 const LONG_GLIDE_PX: f32 = 4.0 * ROW_PX;
 
+const FIRST_PREVIEW_WAIT: Duration = Duration::from_millis(1500);
+
+#[derive(Default, PartialEq, Eq)]
+enum FirstPreview {
+    #[default]
+    Off,
+    Handoff,
+    Waiting(Instant),
+    AllowPending,
+}
+
+impl FirstPreview {
+    fn finish_handoff(&mut self, now: Instant) -> bool {
+        if *self == Self::Handoff {
+            *self = Self::Waiting(now + FIRST_PREVIEW_WAIT);
+            return true;
+        }
+        false
+    }
+
+    fn waits_for_body(&self) -> bool {
+        matches!(self, Self::Handoff | Self::Waiting(_))
+    }
+
+    fn allow_pending(&mut self) -> bool {
+        if self.waits_for_body() {
+            *self = Self::AllowPending;
+            return true;
+        }
+        false
+    }
+
+    fn sync_changed(&mut self, sync: &SyncKind) -> bool {
+        !matches!(sync, SyncKind::Connecting | SyncKind::Syncing { .. }) && self.allow_pending()
+    }
+
+    fn expire(&mut self, now: Instant) -> bool {
+        matches!(self, Self::Waiting(deadline) if now >= *deadline) && self.allow_pending()
+    }
+
+    fn take(&mut self) -> bool {
+        std::mem::take(self) != Self::Off
+    }
+}
+
 struct Inbox {
     focus: FocusHandle,
     notifications: Option<crate::notifications::Queue>,
@@ -542,8 +609,18 @@ struct Inbox {
     note_generation: u64,
     session: Session,
     theme: Theme,
+    setup_exit: Option<(gpui::Entity<Onboarding>, LayerSwap)>,
+    first_preview: FirstPreview,
+    waiting_for_first_rows: bool,
+    waiting_for_inbox_total: bool,
+    status_labels: StatusLabels,
     list_scroll: UniformListScrollHandle,
     conv_scroll: ScrollHandle,
+    // Keep the extra scroll range on the first preview thread after input,
+    // so taking over the reader cannot clamp the viewport and jump.
+    preview_padding: bool,
+    preview_laid_out: bool,
+    preview_card_height: Rc<Cell<gpui::Pixels>>,
     palette_scroll: ScrollHandle,
     folder_scroll: ScrollHandle,
     agents_scroll: ScrollHandle,
@@ -564,6 +641,8 @@ struct Inbox {
     reveal: Reveal,
     /// Latest body-only read, applied together with its scroll correction.
     body_refresh: BodyRefresh,
+    pending_bodies: PendingBodies,
+    body_landing: Option<(gpui::Pixels, Transition)>,
     /// The scroll handle has bounds for this conversation's current messages.
     conv_layout_current: bool,
     painted_reader: Option<ReaderLayout>,
@@ -632,10 +711,6 @@ struct Inbox {
     landing: ReaderLanding,
 }
 
-/// Room kept for a body that is still being prepared: a short paragraph, so
-/// a reply does not leave a hole and a newsletter grows only downward.
-const PENDING_BODY_PX: f32 = 66.0;
-
 /// What a `G` will show, read ahead: the folder's last rows and the
 /// conversation of the last one.
 struct Warm {
@@ -653,12 +728,37 @@ struct Warm {
 const WARM_ROWS: usize = 2;
 
 impl Inbox {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::with_startup(mailbox::startup(), Some(window), cx)
+    fn focused(
+        startup: mailbox::Startup,
+        demo: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let inbox = Self::with_startup(startup, demo, Some(window), cx);
+        window.focus(&inbox.focus);
+        cx.set_global(InboxWindow(window.window_handle()));
+        let mut viewport = (window.viewport_size(), window.scale_factor());
+        cx.observe_window_bounds(window, move |_, window, cx| {
+            let previous = viewport;
+            viewport = (window.viewport_size(), window.scale_factor());
+            if viewport != previous {
+                // Draw at the new bounds for the next compositor frame.
+                window.defer(cx, |window, cx| window.draw(cx).clear());
+            }
+        })
+        .detach();
+        cx.observe_window_activation(window, |_, window, cx| {
+            if window.is_window_active() {
+                cx.notify();
+            }
+        })
+        .detach();
+        inbox
     }
 
     fn with_startup(
         startup: mailbox::Startup,
+        demo: bool,
         window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -670,7 +770,7 @@ impl Inbox {
         let (store, ready) = StoreClient::spawn(
             {
                 let config = config.clone();
-                move || mailbox::open_store(path.clone(), config.as_ref())
+                move || mailbox::open_store(path.clone(), config.as_ref(), demo)
             },
             notices,
         );
@@ -735,6 +835,11 @@ impl Inbox {
             note_in_flight: None,
             note_generation: 0,
             session,
+            setup_exit: None,
+            first_preview: FirstPreview::Off,
+            waiting_for_first_rows: false,
+            waiting_for_inbox_total: false,
+            status_labels: StatusLabels::default(),
             store,
             startup_crash: None,
             worker_restart_notice: None,
@@ -742,6 +847,9 @@ impl Inbox {
             theme,
             list_scroll: UniformListScrollHandle::new(),
             conv_scroll: ScrollHandle::new(),
+            preview_padding: false,
+            preview_laid_out: false,
+            preview_card_height: Rc::default(),
             palette_scroll: ScrollHandle::new(),
             folder_scroll: ScrollHandle::new(),
             agents_scroll: ScrollHandle::new(),
@@ -757,6 +865,8 @@ impl Inbox {
             open_subject: String::new(),
             reveal: Reveal::Waiting,
             body_refresh: BodyRefresh::default(),
+            pending_bodies: PendingBodies::default(),
+            body_landing: None,
             conv_layout_current: false,
             painted_reader: None,
             sent_arrival_anchor: None,
@@ -800,7 +910,13 @@ impl Inbox {
         .detach();
         inbox.show_crash_notice(cx);
         inbox.watch_store_restarts(store_restarts, cx);
-        inbox.watch_theme(cx);
+        theme::follow(cx, |inbox, next, cx| {
+            if inbox.theme != next {
+                inbox.theme = next;
+                inbox.row_widths.clear();
+                cx.notify();
+            }
+        });
         inbox.watch_reviews(cx);
         inbox.watch_notes(cx);
         inbox.watch_dates(cx);
@@ -863,6 +979,15 @@ impl Inbox {
             self.draft_home = None;
         }
         self.session.sync = opened.sync;
+        self.first_preview.sync_changed(&self.session.sync);
+        if let Some(warning) = opened.warning {
+            self.session.show_toast(warning, false);
+            self.dismiss_notice_after(
+                self.session.toast_generation(),
+                std::time::Duration::from_secs(8),
+                cx,
+            );
+        }
         cx.default_global::<ReplyChecks>()
             .start(self.account_id.clone(), sync_with.is_none() || store_failed);
         if !store_failed {
@@ -1067,6 +1192,23 @@ impl Inbox {
                         if matches!(kind, SyncKind::Failed(_)) {
                             cx.global_mut::<ReplyChecks>().set_offline(true);
                         }
+                        let active =
+                            matches!(kind, SyncKind::Connecting | SyncKind::Syncing { .. });
+                        if !active
+                            || matches!(&kind, SyncKind::Syncing {
+                            progress: Some(progress),
+                            ..
+                        } if progress.folder == inbox.session.roles.label("INBOX"))
+                        {
+                            inbox.waiting_for_inbox_total = false;
+                        }
+                        let finishing =
+                            !active && matches!(inbox.session.sync, SyncKind::Syncing { .. });
+                        if finishing {
+                            inbox
+                                .pending_bodies
+                                .wait_for_read(inbox.conv_gen.load(Ordering::SeqCst));
+                        }
                         if matches!(kind, SyncKind::Synced { .. }) {
                             cx.global_mut::<ReplyChecks>().set_offline(false);
                             if wrote {
@@ -1077,8 +1219,11 @@ impl Inbox {
                             // while it was not can go now.
                             inbox.bodies_asked.retry_failed();
                         }
+                        let open_pending = inbox.first_preview.sync_changed(&kind);
                         inbox.session.apply_sync_status(kind);
-                        if wrote {
+                        if finishing && inbox.session.search.is_some() {
+                            inbox.read_selected_messages(true, cx);
+                        } else if wrote || finishing {
                             inbox.request_threads(
                                 ReadIntent {
                                     refresh_open: true,
@@ -1086,14 +1231,21 @@ impl Inbox {
                                 },
                                 cx,
                             );
+                        } else if open_pending {
+                            inbox.read_selected_messages(true, cx);
                         }
                         cx.notify();
                     })
                     .is_ok();
                 if !alive {
-                    break;
+                    return;
                 }
             }
+            let _ = this.update(cx, |inbox, cx| {
+                if inbox.first_preview.allow_pending() {
+                    inbox.read_selected_messages(true, cx);
+                }
+            });
         })
         .detach();
     }
@@ -1311,6 +1463,7 @@ impl Inbox {
                     self.session.label_scope.clone_from(&self.list_label);
                 }
                 self.session.fail_query(QueryFault::Folder, err);
+                self.settle_pending_bodies();
                 cx.notify();
                 return;
             }
@@ -1443,7 +1596,7 @@ impl Inbox {
                     quotes: self.session.quotes_open.clone(),
                     recipients: self.session.recipients_open.clone(),
                     arrival: self.motion.arrival(self.frame_now),
-                    alphas: self.motion.arrival_alphas(self.frame_now, false),
+                    alphas: self.motion.body_alphas(self.frame_now),
                     disclosures,
                 }));
             }
@@ -1471,6 +1624,7 @@ impl Inbox {
         for row in &rows {
             self.row_widths.observe_labels(&row.id, &row.labels, now);
         }
+        self.waiting_for_first_rows &= rows.is_empty();
         self.session.set_page(rows, more_before, more_after, unread);
         if let Some(key) = &intent.select
             && self.session.select_if_present(key.thread_id.as_str())
@@ -1528,7 +1682,7 @@ impl Inbox {
             || self.session.cursor_draft().is_some()
             || (refresh_open && !follow_up_pending)
         {
-            self.request_messages(true, cx);
+            self.read_selected_messages(true, cx);
         }
         // A cursor move that waited for these rows may need more.
         self.issue_fetch(cx);
@@ -1979,10 +2133,12 @@ impl Inbox {
     /// A key goes straight to the destination while outgoing paint fades.
     fn settle_motion(&mut self) {
         self.reveal.cancel_pending();
+        self.setup_exit = None;
         let now = self.motion.clock.now();
         let settled = self.motion.settle(now);
         self.row_widths.settle();
         self.agents_motion.settle();
+        self.settle_search_match();
         if let Some(y) = settled.list {
             self.set_list_offset(y);
         }
@@ -1993,21 +2149,39 @@ impl Inbox {
         }
     }
 
+    /// An explicit selection can open a conversation while bodies download.
+    fn request_messages(&mut self, force: bool, cx: &mut Context<Self>) {
+        self.first_preview.take();
+        self.read_selected_messages(force, cx);
+    }
+
     /// Read the selected thread on the store thread. A read that is stale
     /// by the time the store thread reaches it is skipped there.
-    fn request_messages(&mut self, force: bool, cx: &mut Context<Self>) {
+    fn read_selected_messages(&mut self, force: bool, cx: &mut Context<Self>) {
         let Some(id) = self.session.cursor_id.clone() else {
             self.conv_gen.fetch_add(1, Ordering::SeqCst);
             self.clear_open_message();
+            self.settle_pending_bodies();
             return;
         };
         if !force && self.open_thread.as_deref() == Some(id.as_str()) {
             return;
         }
         if !self.session.search_results_current() {
+            if self
+                .session
+                .search
+                .as_ref()
+                .is_some_and(|search| search.pending)
+            {
+                self.search_view.refresh_open_after_reply |= self.pending_bodies.after.is_some();
+            } else {
+                self.settle_pending_bodies();
+            }
             return;
         }
         if let Some(draft) = self.session.cursor_draft() {
+            self.first_preview.take();
             // A draft is shown from the drafts list, not read as a thread.
             self.conv_gen.fetch_add(1, Ordering::SeqCst);
             self.body_loads.clear();
@@ -2032,6 +2206,7 @@ impl Inbox {
             }
             self.session.clear_query_fault(QueryFault::Message);
             self.mark_open(id, None);
+            self.settle_pending_bodies();
             return;
         }
         let opening = self.open_thread.as_deref() != Some(&id);
@@ -2053,123 +2228,176 @@ impl Inbox {
             Some((generation, search.effective_query().to_owned()))
         });
         let cached = self.bodies.stamps();
+        let wait_for_body = self.first_preview.waits_for_body();
         let reply = self.store.call(move |store| {
             if current.load(Ordering::SeqCst) != generation {
-                return None;
+                return Ok(None);
             }
-            Some(
+            let mut view =
                 read_conversation(store, &account, &thread, (&me, &roles, &names, &viewing))
-                    .map(|mut view| {
-                        let reads = mail_body::read_bodies(store, &account, &mut view, &cached);
-                        let matches = query.as_ref().map(|(accepted, query)| {
-                            (
-                                *accepted,
-                                store
-                                    .search_thread_matches(&account, query, &thread)
-                                    .unwrap_or_default(),
-                            )
-                        });
-                        let latest_note = opening
-                            .then(|| {
-                                store
-                                    .latest_thread_note_id(&account, &thread)
-                                    .ok()
-                                    .flatten()
-                            })
-                            .flatten();
-                        let notes = store.thread_notes(&account, &thread).ok();
-                        (view, reads, matches, notes, latest_note)
-                    })
-                    .map_err(|err| err.to_string()),
-            )
+                    .map_err(|err| err.to_string())?;
+            // The automatic preview after setup waits for the last message.
+            // Each sync write refreshes the folder and retries this read.
+            if wait_for_body && !present::newest_body_ready(&view) {
+                return Ok(None);
+            }
+            let reads = mail_body::read_bodies(store, &account, &mut view, &cached);
+            let matches = query.as_ref().map(|(accepted, query)| {
+                (
+                    *accepted,
+                    store
+                        .search_thread_matches(&account, query, &thread)
+                        .unwrap_or_default(),
+                )
+            });
+            let latest_note = opening
+                .then(|| {
+                    store
+                        .latest_thread_note_id(&account, &thread)
+                        .ok()
+                        .flatten()
+                })
+                .flatten();
+            let notes = store.thread_notes(&account, &thread).ok();
+            Ok(Some(ConversationRead {
+                view,
+                reads,
+                matches,
+                notes,
+                latest_note,
+                note_generation,
+            }))
         });
         cx.spawn(async move |this, cx| {
-            let Ok(Some(result)) = reply.await else {
-                return;
-            };
+            let result = reply
+                .await
+                .unwrap_or_else(|_| Err("Mailbox store stopped".into()));
             let _ = this.update(cx, |inbox, cx| {
-                if inbox.conv_gen.load(Ordering::SeqCst) != generation
-                    || inbox.session.cursor_id.as_deref() != Some(id.as_str())
-                {
-                    return;
-                }
-                let log = inbox.frames.clone();
-                FrameLog::event(log.as_ref(), "messages", || match result {
-                    Ok((view, _, _, _, _)) if view.is_empty() && inbox.session.search.is_some() => {
-                        // A hit may disappear between the two reads. Search
-                        // has its own list, so a folder read cannot replace it.
-                        inbox.clear_open_message();
-                        inbox.session.cancel_read_delay();
-                        inbox.session.clear_query_fault(QueryFault::Message);
-                        if inbox.session.search_results_current() {
-                            inbox.refresh_search(cx);
-                        }
-                    }
-                    Ok((view, _, _, _, _))
-                        if view.is_empty() && !inbox.session.messages.is_empty() =>
-                    {
-                        // The open thread key can disappear between the folder
-                        // and message reads. Keep the conversation until a
-                        // folder read confirms where its messages belong.
-                        if !inbox.read_in_flight {
-                            inbox.request_threads(ReadIntent::default(), cx);
-                        }
-                    }
-                    Ok((mut view, reads, matches, notes, latest_note)) => {
-                        if let Some(notes) = notes {
-                            inbox.update_agent_notes(note_generation, &id, notes);
-                        }
-                        inbox.body_loads.accept(reads, &mut inbox.bodies, &mut view);
-                        inbox.session.clear_query_fault(QueryFault::Message);
-                        let same = inbox.open_thread.as_deref() == Some(id.as_str());
-                        // Sync may rekey the thread as its bodies arrive.
-                        // A read of the same messages still belongs to the reader.
-                        let in_place = (same || !view.is_empty())
-                            && present::same_messages(&inbox.session.messages, &view);
-                        let follow = if in_place {
-                            inbox.keep_shown_text(&mut view);
-                            inbox.queue_conversation_refresh(view);
-                            false
-                        } else if same {
-                            inbox.keep_shown_text(&mut view);
-                            let bottom = inbox.conversation_at_bottom();
-                            inbox.invalidate_conversation_layout();
-                            inbox.session.refresh_messages(view, bottom)
-                        } else {
-                            inbox.invalidate_conversation_layout();
-                            inbox.reveal = Reveal::Waiting;
-                            inbox.motion.show_thread(&mut inbox.session, view);
-                            // A new thread starts at the top of the reader's
-                            // message. Scrolling only far enough to show its
-                            // end would cut the row above it, or its header
-                            // when it is tall. A thread that fits stays put.
-                            inbox.land_on_reader();
-                            false
-                        };
-                        if let Some((accepted, matches)) = matches
-                            && inbox
-                                .session
-                                .set_search_matches(accepted, &id, matches, !same)
-                        {
-                            inbox.land_on_reader();
-                        }
-                        inbox.mark_open(id, latest_note);
-                        if follow {
-                            inbox.scroll_conversation();
-                        }
-                    }
-                    Err(err) => {
-                        // Never leave another thread's body under this row.
-                        if inbox.open_thread.as_deref() != Some(id.as_str()) {
-                            inbox.clear_open_message();
-                        }
-                        inbox.session.fail_query(QueryFault::Message, err);
-                    }
-                });
-                cx.notify();
+                inbox.receive_conversation(id, generation, result, cx)
             });
         })
         .detach();
+    }
+
+    fn receive_conversation(
+        &mut self,
+        id: String,
+        generation: u64,
+        result: Result<Option<ConversationRead>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.conv_gen.load(Ordering::SeqCst) != generation
+            || self.session.cursor_id.as_deref() != Some(id.as_str())
+        {
+            return;
+        }
+        let inbox = self;
+        let log = inbox.frames.clone();
+        FrameLog::event(log.as_ref(), "messages", || match result {
+            Ok(None) => inbox.finish_body_refresh(generation, true),
+            Ok(Some(read)) if read.view.is_empty() && inbox.session.search.is_some() => {
+                // A hit may disappear between the two reads. Search
+                // has its own list, so a folder read cannot replace it.
+                inbox.clear_open_message();
+                inbox.settle_pending_bodies();
+                inbox.session.cancel_read_delay();
+                inbox.session.clear_query_fault(QueryFault::Message);
+                if inbox.session.search_results_current() {
+                    inbox.refresh_search(cx);
+                }
+            }
+            Ok(Some(read)) if read.view.is_empty() && !inbox.session.messages.is_empty() => {
+                // The open thread key can disappear between the folder
+                // and message reads. Keep the conversation until a
+                // folder read confirms where its messages belong.
+                if !inbox.read_in_flight {
+                    inbox.request_threads(ReadIntent::default(), cx);
+                }
+            }
+            Ok(Some(ConversationRead {
+                mut view,
+                reads,
+                matches,
+                notes,
+                latest_note,
+                note_generation,
+            })) => {
+                if let Some(notes) = notes {
+                    inbox.update_agent_notes(note_generation, &id, notes);
+                }
+                let automatic = inbox.first_preview.take();
+                inbox.body_loads.accept(reads, &mut inbox.bodies, &mut view);
+                inbox.session.clear_query_fault(QueryFault::Message);
+                let same = inbox.open_thread.as_deref() == Some(id.as_str());
+                // Sync may rekey the thread as its bodies arrive.
+                // A read of the same messages still belongs to the reader.
+                let in_place = (same || !view.is_empty())
+                    && present::same_messages(&inbox.session.messages, &view);
+                let follow = if in_place {
+                    inbox.keep_shown_text(&mut view);
+                    inbox.queue_conversation_refresh(view, generation);
+                    false
+                } else if same {
+                    inbox.keep_shown_text(&mut view);
+                    let preview = inbox.reveal == Reveal::Preview;
+                    let bottom = preview || inbox.conversation_at_bottom();
+                    let padding = inbox.preview_padding;
+                    let laid_out = inbox.preview_laid_out;
+                    inbox.invalidate_conversation_layout();
+                    inbox.preview_padding = padding;
+                    inbox.preview_laid_out = laid_out;
+                    let follow = inbox.session.refresh_messages(view, bottom);
+                    inbox.finish_body_refresh(generation, true);
+                    if preview {
+                        inbox.land_on_first_preview();
+                    }
+                    follow && !preview
+                } else {
+                    inbox.invalidate_conversation_layout();
+                    inbox.reveal = Reveal::Waiting;
+                    inbox.motion.show_thread(&mut inbox.session, view);
+                    inbox.finish_body_refresh(generation, false);
+                    // Keep the initial header landing while the
+                    // preview's pending bodies fill in.
+                    if automatic
+                        || (inbox.session.cursor_awaits_body()
+                            && inbox.pending_bodies.downloading(&inbox.session.sync))
+                    {
+                        inbox.land_on_first_preview();
+                    } else {
+                        inbox.land_on_reader();
+                    }
+                    false
+                };
+                let landing = if inbox.quiet_search_preview() {
+                    crate::model::search::MatchLanding::KeepReader
+                } else if same {
+                    crate::model::search::MatchLanding::CurrentMatch
+                } else {
+                    crate::model::search::MatchLanding::Best
+                };
+                if let Some((accepted, matches)) = matches
+                    && inbox
+                        .session
+                        .set_search_matches(accepted, &id, matches, landing)
+                {
+                    inbox.land_on_reader();
+                }
+                inbox.mark_open(id, latest_note);
+                if follow {
+                    inbox.scroll_conversation();
+                }
+            }
+            Err(err) => {
+                // Never leave another thread's body under this row.
+                if inbox.open_thread.as_deref() != Some(id.as_str()) {
+                    inbox.clear_open_message();
+                }
+                inbox.settle_pending_bodies();
+                inbox.session.fail_query(QueryFault::Message, err);
+            }
+        });
+        cx.notify();
     }
 
     /// Keep an existing body visible while its stored HTML is prepared.
@@ -2189,24 +2417,28 @@ impl Inbox {
         }
     }
 
-    fn queue_conversation_refresh(&mut self, messages: Vec<ConvMessage>) {
+    fn queue_conversation_refresh(&mut self, messages: Vec<ConvMessage>, generation: u64) {
         // Newly downloaded bodies can push the latest message below a short
         // pane. An already scrollable pane keeps the reader where they are.
-        let downloaded = self
-            .session
-            .messages
-            .iter()
-            .zip(&messages)
-            .any(|(old, new)| {
-                old.body_state == fell_core::BodyState::Pending && old.body_state != new.body_state
-            });
-        if downloaded {
+        let downloaded =
+            self.session
+                .messages
+                .iter()
+                .zip(&messages)
+                .enumerate()
+                .any(|(index, (old, new))| {
+                    (index == self.session.message_cursor
+                        || matches!(self.reveal, Reveal::Following(_)))
+                        && old.body_state == fell_core::BodyState::Pending
+                        && old.body_state != new.body_state
+                });
+        if downloaded && self.reveal != Reveal::Preview && self.body_landing.is_none() {
             self.reveal.body_changed(
                 self.conv_layout_current
                     && present::conversation_fits(f32::from(self.conv_scroll.max_offset().height)),
             );
         }
-        self.body_refresh.messages = Some(messages);
+        self.body_refresh.messages = Some((messages, generation));
         // The new store read already consulted the cache at its accepted revision.
         self.body_refresh.rich.clear();
     }
@@ -2239,7 +2471,8 @@ impl Inbox {
         let messages = self
             .body_refresh
             .messages
-            .as_deref()
+            .as_ref()
+            .map(|(messages, _)| messages.as_slice())
             .unwrap_or(&self.session.messages);
         if messages.iter().any(|message| {
             message.id == id && matches!(message.rich, Rich::Pending | Rich::Missing)
@@ -2507,43 +2740,6 @@ impl Inbox {
         } else if at <= self.session.message_cursor && messages.len() > 1 {
             self.session.message_cursor += 1;
         }
-    }
-
-    /// Reload the theme when Omarchy, GTK, or Alacritty settings change.
-    /// inotify wakes this; without it, a slow poll does.
-    fn watch_theme(&self, cx: &mut Context<Self>) {
-        let (changed, mut changes) = futures::channel::mpsc::unbounded();
-        let watching = theme::watch(changed);
-        cx.spawn(async move |this, cx| {
-            loop {
-                if watching {
-                    if changes.next().await.is_none() {
-                        break;
-                    }
-                } else {
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_secs(1))
-                        .await;
-                }
-                let next = cx
-                    .background_executor()
-                    .spawn(async { theme::load() })
-                    .await;
-                let alive = this
-                    .update(cx, |inbox, cx| {
-                        if inbox.theme != next {
-                            inbox.theme = next;
-                            inbox.row_widths.clear();
-                            cx.notify();
-                        }
-                    })
-                    .is_ok();
-                if !alive {
-                    break;
-                }
-            }
-        })
-        .detach();
     }
 
     fn watch_dates(&self, cx: &mut Context<Self>) {
@@ -3487,6 +3683,10 @@ impl Inbox {
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let started = Instant::now();
+        if self.reveal == Reveal::Preview {
+            self.reader_took_over(false);
+            cx.notify();
+        }
         if self.session.search_editing() && self.search_edit_key(event, started, cx) {
             cx.stop_propagation();
             // Prepare the edited field as soon as input dispatch has
@@ -3734,7 +3934,11 @@ impl Inbox {
             self.request_threads(ReadIntent::default(), cx);
         } else if step.reload_messages {
             self.request_messages(true, cx);
-        } else if searching && self.session.search.is_none() {
+        } else if (searching && self.session.search.is_none())
+            || (self.first_preview != FirstPreview::Off
+                && pane_before == Pane::List
+                && self.session.pane == Pane::Conversation)
+        {
             self.request_messages(false, cx);
         }
         if self.session.search.is_none()
@@ -3869,6 +4073,11 @@ impl Inbox {
         self.note_visit = None;
         self.instant_conversation_scroll = false;
         self.sent_arrival_anchor = None;
+        self.preview_padding = false;
+        self.preview_laid_out = false;
+        if self.reveal == Reveal::Preview {
+            self.reveal = Reveal::Waiting;
+        }
         self.release_landing();
         self.conv_layout_current = false;
         self.reveal.cancel_pending();
@@ -3876,18 +4085,23 @@ impl Inbox {
 
     fn apply_body_refresh(&mut self, now: Instant) -> Option<ScrollAnchor> {
         // Let a keyboard glide finish in the geometry it was calculated from.
-        if self.motion.conv_glide.is_some() || self.body_refresh.is_empty() {
+        if self.motion.conv_glide.is_some() {
+            return None;
+        }
+        if self.body_refresh.is_empty() && !self.motion.has_body_growth() {
             return None;
         }
         let refresh = std::mem::take(&mut self.body_refresh);
-        self.conversation_revision = self.conversation_revision.wrapping_add(1);
-        if self.reveal.pending() || !refresh.rich.is_empty() {
+        if !refresh.is_empty() {
+            self.conversation_revision = self.conversation_revision.wrapping_add(1);
+        }
+        if !refresh.rich.is_empty() && self.body_landing.is_none() {
             self.reveal.body_changed(false);
         }
         if self.reveal.pending() {
             self.release_landing();
         }
-        let anchor = if self.conv_layout_current {
+        let anchor = if self.conv_layout_current && self.reveal != Reveal::Preview {
             self.reveal.body_anchor(
                 &self.conv_scroll,
                 self.session.message_cursor,
@@ -3896,45 +4110,113 @@ impl Inbox {
         } else {
             None
         };
+        if refresh.is_empty() {
+            return anchor;
+        }
         let selected = self.session.message_cursor;
         let rich_arrived = self
             .session
             .messages
             .get(selected)
             .is_some_and(|message| refresh.rich.contains_key(&message.id));
-        refresh.apply(&mut self.session, &mut self.motion, now);
+        let layout_current = self.conv_layout_current;
+        let scroll = &self.conv_scroll;
+        let padded_last = self
+            .preview_padding
+            .then(|| self.session.messages.len().saturating_sub(1));
+        let height = |index| {
+            if !layout_current {
+                return None;
+            }
+            let height = if padded_last == Some(index) {
+                self.preview_card_height.get()
+            } else {
+                scroll
+                    .bounds_for_item(index + usize::from(self.conv_note_slot))?
+                    .size
+                    .height
+            };
+            (height > px(0.)).then(|| f32::from(height))
+        };
+        let generation = refresh.messages.as_ref().map(|(_, generation)| *generation);
+        let downloading = self.pending_bodies.downloading(&self.session.sync);
+        refresh.apply(
+            &mut self.session,
+            &mut self.motion,
+            now,
+            height,
+            downloading,
+        );
+        if let Some(generation) = generation {
+            self.finish_body_refresh_at(generation, true, now);
+        }
+        if self.reveal.pending()
+            && self.motion.body_growth_running(now)
+            && layout_current
+            && let Some(placeholder) = ScrollAnchor::capture_message(
+                &self.conv_scroll,
+                selected,
+                usize::from(self.conv_note_slot),
+            )
+            && let Some(slide) = self.motion.motion.start(motion::PANE, now)
+        {
+            self.body_landing = Some((self.conv_scroll.bounds().top() + placeholder.y, slide));
+            self.reveal.cancel_pending();
+        }
         if rich_arrived && self.session.reveal_matching_quote(selected) {
             self.land_on_reader();
         }
         anchor
     }
 
-    /// The frame after bodies were filled in laid them out: glide to the
-    /// newest message's start if it is out of view. Nothing moves when it
-    /// shows already.
-    fn reveal_newest(&mut self, window: &mut Window) {
+    fn finish_body_refresh(&mut self, generation: u64, crossfade: bool) {
+        let now = self.motion.clock.now();
+        self.finish_body_refresh_at(generation, crossfade, now);
+    }
+
+    fn finish_body_refresh_at(&mut self, generation: u64, crossfade: bool, now: Instant) {
+        let animate = crossfade && self.has_missing_bodies();
+        self.pending_bodies
+            .applied(generation, animate, self.motion.motion, now);
+    }
+
+    fn settle_pending_bodies(&mut self) {
+        let animate = self.has_missing_bodies();
+        self.pending_bodies
+            .settle(animate, self.motion.motion, self.motion.clock.now());
+    }
+
+    fn has_missing_bodies(&self) -> bool {
+        !matches!(self.session.sync, SyncKind::Syncing { .. })
+            && present::awaiting_bodies(&self.session.messages)
+    }
+
+    /// Once the new bodies are laid out, glide to the reader's message
+    /// if it is clipped. The first-run preview follows its growing cards
+    /// directly through its per-frame landing.
+    fn reveal_reader(&mut self, window: &mut Window) {
         match self.reveal {
-            Reveal::Waiting | Reveal::Following(RevealPhase::Idle) | Reveal::Reading { .. } => {}
+            Reveal::Waiting
+            | Reveal::Preview
+            | Reveal::Following(RevealPhase::Idle)
+            | Reveal::Reading { .. } => {}
             Reveal::Following(RevealPhase::Laying) => {
                 self.reveal = Reveal::Following(RevealPhase::Ready);
                 window.request_animation_frame();
             }
             Reveal::Following(RevealPhase::Ready) => {
                 self.reveal = Reveal::Following(RevealPhase::Idle);
-                let last = self.session.messages.len().saturating_sub(1);
-                let Some(item) = self
-                    .conv_scroll
-                    .bounds_for_item(last + usize::from(self.conv_note_slot))
-                else {
+                let Some(item) = self.conv_scroll.bounds_for_item(
+                    self.session.message_cursor + usize::from(self.conv_note_slot),
+                ) else {
                     return;
                 };
                 let view = self.conv_scroll.bounds();
                 let offset = f32::from(self.conv_scroll.offset().y);
                 let max = f32::from(self.conv_scroll.max_offset().height);
-                if let Some(to) = present::offset_to_show_start(
-                    f32::from(item.top()),
-                    f32::from(view.top()),
-                    f32::from(view.bottom()),
+                if let Some(to) = present::offset_to_show_message(
+                    (item.top().into(), item.bottom().into()),
+                    (view.top().into(), view.bottom().into()),
                     offset,
                     max,
                 ) {
@@ -3956,16 +4238,35 @@ impl Inbox {
         }
     }
 
-    /// Put the reader's message at the top of the viewport and keep it
-    /// there while the conversation lays out: [`LandingHold`] sets the
-    /// offset from each frame's own layout, before it paints.
+    /// Hold the reader's message using each frame's own layout bounds.
     fn land_on_reader(&mut self) {
+        self.body_landing = None;
         self.landing.hold(
             self.session
                 .messages
                 .get(self.session.message_cursor)
                 .map(|message| message.id.as_str()),
         );
+    }
+
+    fn land_on_first_preview(&mut self) {
+        self.preview_padding = !self.session.messages.is_empty();
+        if self.preview_padding {
+            self.reveal = Reveal::Preview;
+            self.session.message_cursor = self.session.messages.len() - 1;
+            self.land_on_reader();
+        }
+    }
+
+    /// A narrow inbox can receive its first preview while the reader is
+    /// hidden. Opening that pane still gets its initial landing after the
+    /// key takes over, including the frame that learns its viewport height.
+    fn first_preview_layout(&mut self, visible: bool) -> Option<ScrollAnchor> {
+        if !visible || !self.preview_padding || self.preview_laid_out {
+            return None;
+        }
+        self.preview_laid_out = self.conv_scroll.bounds().size.height > px(0.);
+        Some(ScrollAnchor::landing(&self.session, self.reveal))
     }
 
     /// Hold this message until the reader scrolls or moves to another one.
@@ -3976,13 +4277,31 @@ impl Inbox {
             .messages
             .get(index)
             .map(|message| message.id.as_str());
-        self.landing
-            .anchor(current, index, self.motion.conv_glide.is_some())
+        self.landing.anchor(
+            current,
+            ScrollAnchor::landing(&self.session, self.reveal),
+            self.motion.conv_glide.is_some(),
+        )
     }
 
     /// The reader took over: stop holding their message in place.
     fn release_landing(&mut self) {
+        self.body_landing = None;
         self.landing.hold(None);
+    }
+
+    fn growing_body_landing(&mut self, now: Instant) -> Option<ScrollAnchor> {
+        let (from, slide) = self.body_landing?;
+        let moving = slide.running(now);
+        if !moving {
+            self.body_landing = None;
+        }
+        let mut anchor = ScrollAnchor::landing(&self.session, self.reveal);
+        anchor.snap_headers = false;
+        if moving {
+            anchor.body_scroll = Some((from, motion::ease_out_quad(slide.linear(now))));
+        }
+        Some(anchor)
     }
 
     /// Message navigation aligns the selected header using laid-out bounds.
@@ -4189,7 +4508,7 @@ impl Inbox {
             search.editing = false;
             self.session.remember_search();
         }
-        if changed {
+        if changed || self.first_preview != FirstPreview::Off {
             self.request_messages(true, cx);
         }
         self.scroll_list_to_cursor();
@@ -4292,12 +4611,12 @@ impl Render for Inbox {
         } else {
             reveal_attachment
         };
-        self.motion.observe_header(
-            &self.list_folder,
-            self.list_label.as_deref(),
-            self.session.unread_threads(),
-            now,
-        );
+        let waiting_for_total = self.waiting_for_inbox_total
+            && self.session.roles.is(FolderRole::Inbox, &self.list_folder);
+        let unread = (!self.waiting_for_first_rows && !waiting_for_total)
+            .then(|| self.session.unread_threads());
+        self.motion
+            .observe_header(&self.list_folder, self.list_label.as_deref(), unread, now);
         let banner = self
             .session
             .search
@@ -4326,8 +4645,8 @@ impl Render for Inbox {
             card_fit(&self.session, &picker_choices, &self.theme, window),
             now,
         );
-        if self.body_refresh.is_empty() {
-            self.reveal_newest(window);
+        if self.body_refresh.is_empty() && !self.motion.body_growth_running(now) {
+            self.reveal_reader(window);
         }
         let layout_anchor = || {
             if (previous_reading != self.motion.reading_target() || self.motion.reading_sliding())
@@ -4414,10 +4733,24 @@ impl Render for Inbox {
             .note_pin
             .arrival_anchor(target_band, band, selected, now);
         if arrival_anchor.is_some() || agent_note.as_ref().is_some_and(|frame| frame.leaving) {
-            self.release_landing();
+            // Passive note motion releases the held alignment. A growing
+            // body already compensates for the moving viewport.
+            self.landing.hold(None);
         }
         let returning = self.note_return(now);
         let viewing_note = visiting && returning.is_none();
+        let preview_padding = self.preview_padding.then(|| PreviewPadding {
+            // The previous scroll bounds can still belong to a different
+            // thread, or be empty when a narrow reader has never opened.
+            // Start with an upper bound and trim the slack after layout.
+            viewport: if self.preview_laid_out {
+                self.conv_scroll.bounds().size.height
+            } else {
+                window.viewport_size().height
+            },
+            newest_height: self.preview_card_height.clone(),
+        });
+        let first_preview_layout = self.first_preview_layout(panes.1);
         let anchor = if viewing_note {
             // Keep the note's top while message bodies finish loading.
             if self.motion.conv_glide.is_none() {
@@ -4426,34 +4759,64 @@ impl Render for Inbox {
             }
             None
         } else {
-            arrival_anchor.or_else(|| self.hold_landing()).or_else(|| {
-                anchor.or(note_anchor).map(|mut anchor| {
-                    anchor.y -= band_delta;
-                    anchor
+            self.growing_body_landing(now)
+                .or(arrival_anchor)
+                .or_else(|| self.hold_landing())
+                .or(first_preview_layout)
+                .or_else(|| {
+                    anchor.or(note_anchor).map(|mut anchor| {
+                        anchor.y -= band_delta;
+                        anchor
+                    })
                 })
-            })
         };
         let note_details_only = self.note_visit.as_ref().is_some_and(|visit| {
             agent_note
                 .as_ref()
                 .is_some_and(|frame| frame.note.id == visit.note)
         });
+        let setup_frame = self
+            .setup_exit
+            .as_ref()
+            .and_then(|(_, swap)| swap.frame(now));
+        if setup_frame.is_none() {
+            self.setup_exit = None;
+            if self.first_preview.finish_handoff(real) {
+                cx.spawn(async |this, cx| {
+                    cx.background_executor().timer(FIRST_PREVIEW_WAIT).await;
+                    let _ = this.update(cx, |inbox, cx| {
+                        if inbox.first_preview.expire(Instant::now()) {
+                            inbox.read_selected_messages(true, cx);
+                        }
+                    });
+                })
+                .detach();
+            }
+        }
+        let preview_current = self.search_preview_current();
         let conv = ConvFrame {
+            syncing: self.pending_bodies.downloading(&self.session.sync),
+            missing_fade: self.pending_bodies.fade(now),
             agent_note,
             pin,
             note_details_only,
             note_expanded_in_band: !self.session.agent_notes.collapsed,
             hide_message_cursor: self.note_pin.eligible() && !self.message_selected(),
             return_glide: returning.map(|(_, glide)| glide),
-            alphas: self.motion.arrival_alphas(now, false),
-            card_alphas: self.motion.arrival_alphas(now, true),
+            card_alphas: self.motion.card_alphas(now),
+            alphas: self.motion.body_alphas(now),
+            heights: self.motion.body_heights(now),
+            outgoing_placeholders: self.motion.body_placeholders(),
+            preview_padding,
             disclosures: self.motion.disclosures(&self.session, now),
             anchor: returning.map(|(anchor, _)| anchor).or(anchor),
             frames: self.frames.clone(),
             attachment_download: self.attachment_download.clone(),
             reveal_attachment,
             spin_attachment,
-            preview_current: self.search_preview_current(),
+            preview_current,
+            quiet_preview: self.quiet_search_preview(),
+            match_line: self.search_match_frame(now, preview_current),
             leaving: self.leaving_reader.clone().map(|reader| (reader, exit)),
         };
         self.conv_layout_current = panes.1;
@@ -4462,6 +4825,14 @@ impl Render for Inbox {
             &self.motion.motion,
             now,
         );
+        let reply_check = cx.try_global::<ReplyChecks>().and_then(|checks| {
+            let selected = self.session.reply_target().filter(|_| {
+                self.open_thread.is_some() && self.open_thread == self.session.cursor_id
+            });
+            selected.and_then(|target| checks.for_message(&target.id))
+        });
+        let status = StatusLabel::new(&self.theme, &self.session, reply_check, width);
+        let status_labels = self.status_labels.update(status, self.motion.motion, now);
         let animating = self.motion.tick(now)
             | waiting_for_resize
             | self.note_view.running()
@@ -4471,6 +4842,12 @@ impl Render for Inbox {
                 .as_ref()
                 .is_some_and(|visit| visit.returning.is_some())
             | verify_pin
+            | setup_frame.is_some()
+            | status_labels.outgoing.is_some()
+            | status_labels.count_fade.is_some()
+            | self.body_landing.is_some()
+            | conv.missing_fade.is_some()
+            | conv.match_line.animating
             | self.row_widths.running(now)
             | spin_attachment
             | agents_animating
@@ -4565,13 +4942,9 @@ impl Render for Inbox {
         let subject = self.shown_subject();
         let cached_preview = self.search_preview_for(panes, animating || refreshing_body, &subject);
         let cached_search_rows = self.search_rows_for(animating);
-        let reply_check = cx.try_global::<ReplyChecks>().and_then(|checks| {
-            let selected = self.session.reply_target().filter(|_| {
-                self.open_thread.is_some() && self.open_thread == self.session.cursor_id
-            });
-            selected.and_then(|target| checks.for_message(&target.id))
-        });
-        shell(
+        let background = theme.background;
+        let leaving_banner = self.motion.leaving_banner(now);
+        let root = shell(
             theme,
             &self.session,
             &mut self.motion,
@@ -4588,10 +4961,11 @@ impl Render for Inbox {
                 cached_preview,
                 list: ListContent {
                     banner,
+                    leaving_banner,
                     leaving: self.leaving_rows.clone().map(|rows| (rows, exit)),
                     cached_results: cached_search_rows,
                 },
-                reply_check,
+                status_labels,
             },
             width,
             (list_width, split_width),
@@ -4620,7 +4994,27 @@ impl Render for Inbox {
                     .absolute()
                     .size_0(),
             )
-        })
+        });
+        let shell = || div().relative().size_full().bg(rgb(background));
+        match (setup_frame, &self.setup_exit) {
+            (Some(SwapFrame::Leaving(opacity)), Some((setup, _))) => {
+                let layer = setup.update(cx, |setup, cx| setup.leaving_layer(window, cx));
+                shell()
+                    .child(root.opacity(0.))
+                    .child(
+                        layer
+                            .absolute()
+                            .inset_0()
+                            .overflow_hidden()
+                            .opacity(motion::lerp(motion::ARRIVE_FROM, 1., opacity)),
+                    )
+                    .into_any_element()
+            }
+            (Some(SwapFrame::Arriving(progress)), _) => shell()
+                .child(root.opacity(motion::lerp(motion::ARRIVE_FROM, 1., progress)))
+                .into_any_element(),
+            _ => root.into_any_element(),
+        }
     }
 }
 
@@ -4652,7 +5046,7 @@ struct Shown {
     reader: ReaderLayout,
     cached_preview: Option<(u64, gpui::AnyView)>,
     list: ListContent,
-    reply_check: Option<ReplyCheck>,
+    status_labels: StatusLabelsFrame,
 }
 
 struct LeavingReader {
@@ -4686,6 +5080,7 @@ struct LeavingRow {
 #[derive(Default)]
 struct ListContent {
     banner: Option<(Banner, f32)>,
+    leaving_banner: Option<(Banner, f32)>,
     leaving: Option<(Arc<[LeavingRow]>, f32)>,
     cached_results: Option<(u64, gpui::AnyView)>,
 }
@@ -4699,9 +5094,14 @@ struct ConvFrame {
     note_expanded_in_band: bool,
     hide_message_cursor: bool,
     return_glide: Option<LandingGlide>,
+    syncing: bool,
+    missing_fade: Option<f32>,
     /// Bodies fading in, by message id: their opacity.
     alphas: HashMap<String, f32>,
     card_alphas: HashMap<String, f32>,
+    heights: HashMap<String, (f32, f32)>,
+    outgoing_placeholders: HashMap<String, bool>,
+    preview_padding: Option<PreviewPadding>,
     disclosures: Disclosures,
     /// The message held at its previous viewport position, or at the top on open.
     anchor: Option<ScrollAnchor>,
@@ -4710,6 +5110,8 @@ struct ConvFrame {
     reveal_attachment: bool,
     spin_attachment: bool,
     preview_current: bool,
+    quiet_preview: bool,
+    match_line: search::MatchLineFrame,
     leaving: Option<(Arc<LeavingReader>, f32)>,
 }
 
@@ -4730,6 +5132,24 @@ impl ConvFrame {
     }
 }
 
+struct PreviewPadding {
+    viewport: gpui::Pixels,
+    newest_height: Rc<Cell<gpui::Pixels>>,
+}
+
+impl PreviewPadding {
+    fn wrap_newest(&self, card: gpui::AnyElement) -> gpui::AnyElement {
+        let height = self.newest_height.clone();
+        // The difference between the pane and the card becomes space after
+        // the card in the same layout pass, even while the body is growing.
+        div()
+            .min_h(self.viewport)
+            .child(card)
+            .on_children_prepainted(move |bounds, _, _| height.set(bounds[0].size.height))
+            .into_any_element()
+    }
+}
+
 /// Observe GPUI's scroll offset before and after it handles a wheel event.
 /// The observer is painted before the scroll pane, so it runs after that
 /// pane in the bubble phase. Clamping here uses its current layout.
@@ -4747,7 +5167,10 @@ fn observe_wheel(scroll: ScrollHandle, showing: bool, cx: &mut Context<Inbox>) -
                     let over_reader = showing && scroll.bounds().contains(&event.position);
                     let moved = clamped_offset(&scroll) != before;
                     let _ = inbox.update(cx, |inbox, cx| {
-                        if over_reader && inbox.session.overlay == Overlay::None {
+                        if inbox.reveal == Reveal::Preview && inbox.session.overlay == Overlay::None
+                        {
+                            inbox.reader_took_over(false);
+                        } else if over_reader && inbox.session.overlay == Overlay::None {
                             if !moved {
                                 return;
                             }
@@ -4797,7 +5220,7 @@ fn shell(
         reader,
         cached_preview,
         list,
-        reply_check,
+        status_labels,
     } = shown;
     let frames = conv.frames.clone();
     let same_scope = session.search.is_none()
@@ -5018,7 +5441,7 @@ fn shell(
                                     |pane| {
                                         pane.child(preview_shield(
                                             &theme,
-                                            session.search_results_current(),
+                                            session.search_results_current() && !conv.quiet_preview,
                                         ))
                                     },
                                 );
@@ -5072,7 +5495,7 @@ fn shell(
             &theme,
             session,
             status,
-            reply_check,
+            status_labels,
             width,
             window,
         ))
@@ -5379,16 +5802,13 @@ fn header(
         clip_shaped(window, &style, text, room.floor(), weight, None)
             .filter(|line| f32::from(line.width).ceil() <= room)
     };
-    let count_width = |unread| {
-        line_px_with_style(
-            window,
-            &style,
-            &format!("{unread} unread"),
-            FontWeight::NORMAL,
-        )
-        .ceil()
-    };
-    let count = |unread: usize| {
+    let figures = tabular_style(window, theme, theme.ui_px);
+    let count_text = |unread| format!("{} unread", grouped(unread));
+    let count_width =
+        |text: &str| line_px_with_style(window, &figures, text, FontWeight::NORMAL).ceil();
+    let count = |unread: usize, room: f32| {
+        let text = count_text(unread);
+        let required = count_width(&text);
         div()
             .flex_none()
             .whitespace_nowrap()
@@ -5397,92 +5817,119 @@ fn header(
             } else {
                 theme.dimmed
             }))
-            .child(format!("{unread} unread"))
+            .font(figures.font())
+            .when(required > room, |count| {
+                count.text_size(px(theme.ui_px * room / required))
+            })
+            .child(text)
     };
-    let folder_group =
-        |(folder, label): (&str, Option<&str>), unread, count_fade: Option<(usize, f32)>| {
-            let drafts = label.is_none() && session.roles.is(FolderRole::Drafts, folder);
-            let count_room = count_fade.map_or_else(
-                || count_width(unread),
-                |(old, shown)| motion::lerp(count_width(old), count_width(unread), shown),
-            );
-            let count_space = if drafts { 0. } else { COUNT_GAP + count_room };
-            let name_room = (room - ACCOUNT_MIN - count_space).max(0.);
-            let title = label.map_or_else(|| session.roles.label(folder), present::display_safe);
-            let name = if label.is_some() {
-                fit(&title, name_room, FontWeight::SEMIBOLD)
-            } else {
-                fit_folder_path(
-                    &title,
-                    FolderFit::Header,
-                    |path| {
-                        clip_shaped(
-                            window,
-                            &style,
-                            path,
-                            name_room.floor(),
-                            FontWeight::SEMIBOLD,
-                            None,
-                        )
-                    },
-                    |line| &line.text,
-                )
-            };
-            let name_width = name
-                .as_ref()
-                .map_or(0., |line| f32::from(line.width).ceil());
-            let detail = label
-                .map(|_| "Label".into())
-                .or_else(|| session.folder_detail(folder))
-                .and_then(|text| fit(&text, name_room - name_width - 6., FontWeight::NORMAL));
-            let detail_space = detail
-                .as_ref()
-                .map_or(0., |line| 6. + f32::from(line.width).ceil());
-            let group = div()
-                .flex_none()
-                .flex()
-                .items_center()
-                .gap(px(COUNT_GAP))
-                .child(
-                    div()
-                        .flex_none()
-                        .flex()
-                        .items_baseline()
-                        .gap(px(6.))
-                        .children(name.map(|line| {
-                            div()
-                                .flex_none()
-                                .whitespace_nowrap()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(line.text)
-                        }))
-                        .children(detail.map(|line| {
-                            div()
-                                .flex_none()
-                                .whitespace_nowrap()
-                                .text_color(rgb(theme.dimmed))
-                                .child(line.text)
-                        })),
-                )
-                .when(!drafts, |row| {
-                    row.child(
+    let folder_group = |(folder, label): (&str, Option<&str>),
+                        unread: Option<usize>,
+                        count_fade: Option<(Option<usize>, f32)>| {
+        let drafts = label.is_none() && session.roles.is(FolderRole::Drafts, folder);
+        let (old, shown) = count_fade.unwrap_or((None, 1.));
+        let inbox = label.is_none() && session.roles.is(FolderRole::Inbox, folder);
+        let measure = |unread| count_width(&count_text(unread));
+        let count_room = if inbox {
+            inbox_count_room(count_width)
+        } else {
+            measure(888)
+                .max(unread.map_or(0., measure))
+                .max(old.map_or(0., measure))
+        };
+        let count_space = if drafts { 0. } else { COUNT_GAP + count_room };
+        let name_room = (room - ACCOUNT_MIN - count_space).max(0.);
+        let title = label.map_or_else(|| session.roles.label(folder), present::display_safe);
+        let name = if label.is_some() {
+            fit(&title, name_room, FontWeight::SEMIBOLD)
+        } else {
+            fit_folder_path(
+                &title,
+                FolderFit::Header,
+                |path| {
+                    clip_shaped(
+                        window,
+                        &style,
+                        path,
+                        name_room.floor(),
+                        FontWeight::SEMIBOLD,
+                        None,
+                    )
+                },
+                |line| &line.text,
+            )
+        };
+        let name_width = name
+            .as_ref()
+            .map_or(0., |line| f32::from(line.width).ceil());
+        let detail = label
+            .map(|_| "Label".into())
+            .or_else(|| session.folder_detail(folder))
+            .and_then(|text| fit(&text, name_room - name_width - 6., FontWeight::NORMAL));
+        let detail_space = detail
+            .as_ref()
+            .map_or(0., |line| 6. + f32::from(line.width).ceil());
+        let group = div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(COUNT_GAP))
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_baseline()
+                    .gap(px(6.))
+                    .children(name.map(|line| {
+                        #[cfg(test)]
+                        let text = line.text.clone();
+                        let label = div()
+                            .flex_none()
+                            .whitespace_nowrap()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(line.text);
+                        #[cfg(test)]
+                        let label = label.when(inbox, |label| {
+                            label.on_children_prepainted(move |bounds, _, _| {
+                                tests::INBOX_LABEL_X.with_borrow_mut(|positions| {
+                                    positions.push((bounds[0].left(), text.clone()));
+                                });
+                            })
+                        });
+                        label
+                    }))
+                    .children(detail.map(|line| {
                         div()
                             .flex_none()
-                            .relative()
-                            .flex()
-                            .justify_end()
-                            .w(px(count_room))
-                            .child(count(unread).opacity(count_fade.map_or(1., |(_, shown)| shown)))
-                            .children(count_fade.map(|(old, shown)| {
-                                count(old).absolute().right_0().top_0().opacity(1. - shown)
-                            })),
-                    )
-                });
-            (group, name_width + detail_space + count_space)
-        };
+                            .whitespace_nowrap()
+                            .text_color(rgb(theme.dimmed))
+                            .child(line.text)
+                    })),
+            )
+            .when(!drafts, |row| {
+                row.child(
+                    div()
+                        .flex_none()
+                        .relative()
+                        .flex()
+                        .when(!inbox, |count| count.justify_end())
+                        .w(px(count_room))
+                        .children(unread.map(|unread| count(unread, count_room).opacity(shown)))
+                        .children(old.map(|old| {
+                            count(old, count_room)
+                                .absolute()
+                                .when(inbox, |count| count.left_0())
+                                .when(!inbox, |count| count.right_0())
+                                .top_0()
+                                .opacity(1. - shown)
+                        })),
+                )
+            });
+        (group, name_width + detail_space + count_space)
+    };
 
     let (current, current_width) =
-        folder_group(scope, session.unread_threads(), motion.unread_count(now));
+        folder_group(scope, motion.header_unread(), motion.unread_count(now));
     let label_header_opacity = motion.label_header_opacity(now);
     let fade = motion.folder_header();
     let leaving = fade
@@ -5556,6 +6003,13 @@ fn header(
         )
 }
 
+/// Keep the Inbox name fixed. Six digits cover large mailboxes at the
+/// normal size, and longer labels fit within the same room.
+fn inbox_count_room(measure: impl FnOnce(&str) -> f32) -> f32 {
+    measure("888,888 unread")
+}
+
+#[allow(clippy::too_many_arguments)]
 fn thread_list(
     theme: &Theme,
     session: &Session,
@@ -5606,6 +6060,12 @@ fn thread_list(
                     .banner
                     .map(|(banner, opacity)| empty_state(theme, banner).opacity(opacity)),
             )
+            .children(content.leaving_banner.map(|(banner, opacity)| {
+                empty_state(theme, banner)
+                    .absolute()
+                    .inset_0()
+                    .opacity(opacity)
+            }))
             .when_some(content.leaving, |pane, (rows, opacity)| {
                 pane.child(leaving_label_rows(
                     theme.clone(),
@@ -6783,6 +7243,15 @@ fn paint_shaped_text(
     .flex_none()
 }
 
+fn tabular_style(window: &Window, theme: &Theme, size: f32) -> TextStyle {
+    static FEATURES: OnceLock<gpui::FontFeatures> = OnceLock::new();
+    let mut style = conversation_line_style(window, theme, px(size));
+    style.font_features = FEATURES
+        .get_or_init(|| gpui::FontFeatures(Arc::new(vec![("tnum".into(), 1)])))
+        .clone();
+    style
+}
+
 /// The width of `text` as the status bar draws it: its size and family.
 fn bar_px(window: &Window, text: &str, size: f32, family: Option<&String>) -> f32 {
     if text.is_empty() {
@@ -6843,6 +7312,8 @@ fn splitter(theme: &Theme, cx: &mut Context<Inbox>) -> impl IntoElement {
 
 const CONVERSATION_RULE_PX: f32 = 2.;
 const CONVERSATION_PAD_PX: f32 = 20.;
+const CONVERSATION_BOTTOM_PX: f32 = 28.;
+const MESSAGE_GAP_PX: f32 = 8.;
 const MESSAGE_PAD_PX: f32 = 8.;
 const COLLAPSED_GAP_PX: f32 = 12.;
 const COLLAPSED_NARROW_GAP_PX: f32 = 8.;
@@ -7082,8 +7553,53 @@ fn collapsed_sender_budget(
 /// The latest reread and accepted HTML preparations for the open thread.
 #[derive(Default)]
 struct BodyRefresh {
-    messages: Option<Vec<ConvMessage>>,
+    messages: Option<(Vec<ConvMessage>, u64)>,
     rich: HashMap<String, Rich>,
+}
+
+struct ConversationRead {
+    notes: Option<Vec<fell_core::notes::ThreadNote>>,
+    latest_note: Option<i64>,
+    note_generation: u64,
+    view: Vec<ConvMessage>,
+    reads: mail_body::BodyReads,
+    matches: Option<(u64, Vec<fell_core::SearchMatch>)>,
+}
+
+#[derive(Default)]
+struct PendingBodies {
+    /// A read already in flight at the end of a pass can still be stale.
+    after: Option<u64>,
+    missing: Option<Transition>,
+}
+
+impl PendingBodies {
+    fn downloading(&self, sync: &SyncKind) -> bool {
+        matches!(sync, SyncKind::Syncing { .. }) || self.after.is_some()
+    }
+
+    fn wait_for_read(&mut self, generation: u64) {
+        self.after = Some(generation);
+        self.missing = None;
+    }
+
+    fn applied(&mut self, generation: u64, animate: bool, motion: Motion, now: Instant) {
+        if self.after.is_some_and(|after| generation > after) {
+            self.settle(animate, motion, now);
+        }
+    }
+
+    fn settle(&mut self, animate: bool, motion: Motion, now: Instant) {
+        if self.after.take().is_some() && animate {
+            self.missing = motion.start(motion::FADE, now);
+        }
+    }
+
+    fn fade(&self, now: Instant) -> Option<f32> {
+        self.missing
+            .filter(|transition| transition.running(now))
+            .map(|transition| transition.progress(now))
+    }
 }
 
 impl BodyRefresh {
@@ -7091,9 +7607,16 @@ impl BodyRefresh {
         self.messages.is_none() && self.rich.is_empty()
     }
 
-    fn apply(self, session: &mut Session, motion: &mut InboxMotion, now: Instant) {
+    fn apply(
+        self,
+        session: &mut Session,
+        motion: &mut InboxMotion,
+        now: Instant,
+        height: impl Fn(usize) -> Option<f32>,
+        downloading: bool,
+    ) {
         let mut rich = self.rich;
-        if let Some(mut messages) = self.messages {
+        if let Some((mut messages, _)) = self.messages {
             for message in &mut messages {
                 if let Some(ready) = rich.remove(&message.id) {
                     message.rich = ready;
@@ -7102,16 +7625,24 @@ impl BodyRefresh {
             let changed = present::bodies_filled(&session.messages, &messages)
                 .expect("a queued reread keeps the same message order");
             for index in changed {
-                motion.body_arrived(&messages[index].id, now);
+                let old_height = session.messages[index]
+                    .expanded
+                    .then(|| height(index))
+                    .flatten();
+                let placeholder = (session.messages[index].body_state
+                    == fell_core::BodyState::Pending
+                    && messages[index].body_state != fell_core::BodyState::Pending)
+                    .then_some(downloading);
+                motion.body_arrived(&messages[index].id, old_height, placeholder, now);
             }
             session.refresh_same_messages(messages);
         } else {
-            for message in &mut session.messages {
+            for (index, message) in session.messages.iter_mut().enumerate() {
                 if let Some(ready) = rich.remove(&message.id)
                     && ready != message.rich
                 {
                     if message.expanded {
-                        motion.body_arrived(&message.id, now);
+                        motion.body_arrived(&message.id, height(index), None, now);
                     }
                     message.rich = ready;
                 }
@@ -7187,11 +7718,11 @@ fn conversation(
     };
     let live = Live(live.0 && leaving.is_none());
     let arrival = leaving.map_or_else(|| motion.arrival(now), |(reader, _)| reader.arrival);
+    let chip_probe = (live.0 && frame.reveal_attachment).then(LayoutSlot::default);
     let hold = frame
         .anchor
-        .filter(|_| leaving.is_none())
-        .map(|anchor| (anchor, LayoutSlot::default()));
-    let chip_probe = (live.0 && frame.reveal_attachment).then(LayoutSlot::default);
+        .filter(|_| leaving.is_none() && scroll.is_some() && chip_probe.is_none())
+        .map(|anchor| MessageProbes::new(anchor, shown.len(), frame.return_glide));
     let collapsed_rows = OnceCell::new();
     let retained = !frame.preview_current && session.search.is_some() && !subject.is_empty();
     // Short subjects keep their one-line measure in both modes.
@@ -7199,6 +7730,7 @@ fn conversation(
         let style = conversation_line_style(window, theme, px(theme.ui_px + 11.0));
         line_px_with_style(window, &style, &subject, FontWeight::BOLD).ceil() + 4.0
     });
+    let padding = frame.preview_padding.as_ref().filter(|_| scroll.is_some());
     let messages: Vec<_> = shown
         .iter()
         .enumerate()
@@ -7224,15 +7756,15 @@ fn conversation(
                     cx,
                 )
             } else {
-                let body = frame.body_alpha(&message.id);
                 collapsed_message(
                     theme,
                     message,
                     index,
-                    (cursor, body),
+                    cursor,
                     columns,
                     collapsed_rows
                         .get_or_init(|| CollapsedRows::new(window, theme, columns.card.width)),
+                    frame,
                     live,
                     window,
                     cx,
@@ -7243,16 +7775,25 @@ fn conversation(
             } else {
                 block
             };
-            if let Some((anchor, probe)) = &hold
-                && anchor.index == index
-            {
-                LayoutProbe {
+            let block = match frame.heights.get(&message.id) {
+                Some(&(from, progress)) if progress < 1.0 && message.expanded => GrowingMessage {
                     inner: block,
-                    slot: probe.clone(),
+                    width: px(columns.pane_right + 2. * MESSAGE_PAD_PX),
+                    from,
+                    progress,
+                    gap: px(MESSAGE_GAP_PX),
                 }
-                .into_any_element()
+                .into_any_element(),
+                _ => block,
+            };
+            let block = if let Some(padding) = padding.filter(|_| index + 1 == shown.len()) {
+                padding.wrap_newest(block)
             } else {
                 block
+            };
+            match &hold {
+                Some(probes) => probes.wrap(index, block),
+                None => block,
             }
         })
         .collect();
@@ -7347,42 +7888,23 @@ fn conversation(
                             window,
                             cx,
                         )
-                    });
-                let body = div()
-                    .id("conversation-scroll")
-                    .flex_1()
-                    .min_h(px(0.))
-                    .map(|body| match &scroll {
-                        Some(scroll) => body.overflow_y_scroll().track_scroll(scroll),
-                        None => body.overflow_hidden(),
                     })
-                    .px(px(CONVERSATION_PAD_PX))
-                    .pb(px(28.))
-                    .when(arrival < 1.0, |body| body.opacity(arrival))
-                    .children(note)
-                    .children(messages)
-                    .into_any_element();
-                let landing = chip_probe
-                    .map(|probe| (None, probe))
-                    .or_else(|| hold.map(|(anchor, probe)| (Some(anchor.y), probe)));
-                match (&scroll, landing) {
-                    (Some(scroll), Some((y, probe))) => LandingHold {
-                        inner: body,
-                        probe,
-                        scroll: scroll.clone(),
-                        y,
-                        glide: frame.return_glide,
-                        frames: frame.frames.clone(),
-                    }
-                    .into_any_element(),
-                    _ => body,
-                }
+                    .map(IntoElement::into_any_element);
+                conversation_body(
+                    note.into_iter().chain(messages),
+                    scroll,
+                    hold,
+                    chip_probe,
+                    padding.map(|padding| padding.viewport),
+                    arrival,
+                    frame.frames.clone(),
+                )
             }
         })
         .when(retained, |pane| {
             pane.child(preview_shield(
                 theme,
-                leaving.is_none() && session.search_results_current(),
+                leaving.is_none() && session.search_results_current() && !frame.quiet_preview,
             ))
         })
 }
@@ -7395,7 +7917,51 @@ fn expanded_card_fill(theme: &Theme, focus: f32) -> u32 {
     )
 }
 
-fn preview_shield(theme: &Theme, results_current: bool) -> impl IntoElement {
+fn conversation_body(
+    children: impl IntoIterator<Item = gpui::AnyElement>,
+    scroll: Option<ScrollHandle>,
+    hold: Option<MessageProbes>,
+    chip_probe: Option<LayoutSlot>,
+    preview_viewport: Option<gpui::Pixels>,
+    arrival: f32,
+    frames: Option<SharedFrameLog>,
+) -> gpui::AnyElement {
+    let bottom = px(if preview_viewport.is_some() {
+        0.
+    } else {
+        CONVERSATION_BOTTOM_PX
+    });
+    let resize = preview_viewport.zip(scroll.clone());
+    let body = div()
+        .when_some(resize, |body, (height, scroll)| {
+            body.on_children_prepainted(move |_, window, _| {
+                if scroll.bounds().size.height != height {
+                    window.request_animation_frame();
+                }
+            })
+        })
+        .id("conversation-scroll")
+        .flex_1()
+        .min_h(px(0.))
+        .map(|body| match &scroll {
+            Some(scroll) => body.overflow_y_scroll().track_scroll(scroll),
+            None => body.overflow_hidden(),
+        })
+        .px(px(CONVERSATION_PAD_PX))
+        .pb(bottom)
+        .when(arrival < 1.0, |body| body.opacity(arrival))
+        .children(children)
+        .into_any_element();
+    match (scroll, hold, chip_probe) {
+        (Some(scroll), Some(hold), _) => hold.hold(body, scroll, bottom, frames).into_any_element(),
+        (Some(scroll), _, Some(probe)) => {
+            LandingHold::reveal(body, scroll, probe, frames).into_any_element()
+        }
+        _ => body,
+    }
+}
+
+fn preview_shield(theme: &Theme, show_feedback: bool) -> impl IntoElement {
     div()
         .id("retained-preview")
         .absolute()
@@ -7403,7 +7969,7 @@ fn preview_shield(theme: &Theme, results_current: bool) -> impl IntoElement {
         .top_0()
         .left_0()
         .occlude()
-        .when(results_current, |shield| {
+        .when(show_feedback, |shield| {
             shield.child(
                 div()
                     .absolute()
@@ -7446,9 +8012,10 @@ fn collapsed_message(
     theme: &Theme,
     message: &ConvMessage,
     index: usize,
-    (cursor, body): (f32, f32),
+    cursor: f32,
     columns: ReaderColumns,
     rows: &CollapsedRows,
+    frame: &ConvFrame,
     live: Live,
     window: &Window,
     cx: &mut Context<Inbox>,
@@ -7456,7 +8023,8 @@ fn collapsed_message(
     let now = now_unix();
     let mut date = present::relative_date(now, message.date_unix);
     let dimmed = motion::mix(theme.dimmed, theme.on_selection, cursor);
-    let missing = present::missing_body_line(message.body_state);
+    let (body, outgoing) = frame.body_labels(message);
+    let missing = present::missing_body_line(message.body_state, frame.syncing);
     let snippet = missing.as_deref().unwrap_or(&message.snippet);
     let measure =
         |text: &str| line_px_with_style(window, &rows.style, text, FontWeight::NORMAL).ceil();
@@ -7548,27 +8116,42 @@ fn collapsed_message(
                 }),
             )
         });
-    let leading = div()
-        .flex()
-        .items_center()
-        .gap(px(rows.gap))
-        .child(
-            div()
-                .w(px(sender_w))
-                .flex_none()
-                .whitespace_nowrap()
-                .font_weight(FontWeight::MEDIUM)
-                .children(sender.map(|line| line.text)),
-        )
-        .child(
-            div()
-                .w(px(snippet_w))
-                .flex_none()
-                .whitespace_nowrap()
-                .text_color(rgb(dimmed))
-                .when(body < 1.0, |line| line.opacity(body))
-                .children(clip(snippet, snippet_w, FontWeight::NORMAL).map(|line| line.text)),
-        );
+    let leading =
+        div()
+            .flex()
+            .items_center()
+            .gap(px(rows.gap))
+            .child(
+                div()
+                    .w(px(sender_w))
+                    .flex_none()
+                    .whitespace_nowrap()
+                    .font_weight(FontWeight::MEDIUM)
+                    .children(sender.map(|line| line.text)),
+            )
+            .child(
+                div()
+                    .w(px(snippet_w))
+                    .flex_none()
+                    .relative()
+                    .whitespace_nowrap()
+                    .text_color(rgb(dimmed))
+                    .child(div().opacity(body).children(
+                        clip(snippet, snippet_w, FontWeight::NORMAL).map(|line| line.text),
+                    ))
+                    .children(
+                        outgoing
+                            .and_then(|line| clip(&line, snippet_w, FontWeight::NORMAL))
+                            .map(|line| {
+                                div()
+                                    .absolute()
+                                    .left_0()
+                                    .top_0()
+                                    .opacity(1. - body)
+                                    .child(line.text)
+                            }),
+                    ),
+            );
     message_date_row(
         row,
         rows.gap,
@@ -7773,7 +8356,7 @@ fn expanded_message(
         .id(gpui::ElementId::named_usize("message", index))
         .px(px(MESSAGE_PAD_PX))
         .py(px(10.))
-        .mb(px(8.))
+        .mb(px(MESSAGE_GAP_PX))
         .relative()
         .child(
             div()
@@ -7829,11 +8412,7 @@ fn expanded_message(
         .child(
             columns.card.place(
                 div()
-                    .children(
-                        live.0
-                            .then(|| search::match_reason(theme, session, message))
-                            .flatten(),
-                    )
+                    .children(frame.match_line.render(theme, message))
                     // What a draft answers, under who it goes to, as in its window.
                     .children(message.context.as_ref().map(|line| {
                         div()
@@ -7929,21 +8508,76 @@ fn message_body(
     frame: &ConvFrame,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
-    let alpha = frame.body_alpha(&message.id);
-    if let Some(line) = present::missing_body_line(message.body_state) {
-        return folds.columns.flow(
-            |columns| columns.prose,
-            |_, _| {
-                div()
-                    .pb(px(8.))
-                    .line_height(px(theme.ui_px * 1.45))
-                    .text_color(rgb(theme.dimmed))
-                    .opacity(alpha)
-                    .child(line.clone())
-                    .into_any_element()
-            },
-        );
+    let (alpha, outgoing) = frame.body_labels(message);
+    let body = match present::missing_body_line(message.body_state, frame.syncing) {
+        Some(line) => missing_message_body(theme, folds.columns, &line, alpha),
+        None => stored_message_body(theme, message, folds, frame, alpha, cx),
+    };
+    let Some(line) = outgoing else {
+        return body;
+    };
+    div()
+        .relative()
+        .child(body)
+        .child(div().absolute().inset_0().child(missing_message_body(
+            theme,
+            folds.columns,
+            &line,
+            1.0 - alpha,
+        )))
+        .into_any_element()
+}
+
+impl ConvFrame {
+    fn body_labels(&self, message: &ConvMessage) -> (f32, Option<String>) {
+        use fell_core::BodyState::Pending;
+
+        let (alpha, was_downloading) = if message.body_state == Pending
+            && !self.syncing
+            && let Some(alpha) = self.missing_fade
+        {
+            (alpha, Some(true))
+        } else {
+            (
+                self.body_alpha(&message.id),
+                self.outgoing_placeholders.get(&message.id).copied(),
+            )
+        };
+        let outgoing = was_downloading
+            .filter(|_| alpha < 1.)
+            .and_then(|downloading| present::missing_body_line(Pending, downloading));
+        (alpha, outgoing)
     }
+}
+
+fn missing_message_body(
+    theme: &Theme,
+    columns: ReaderColumns,
+    line: &str,
+    alpha: f32,
+) -> gpui::AnyElement {
+    columns.flow(
+        |columns| columns.prose,
+        |_, _| {
+            div()
+                .pb(px(8.))
+                .line_height(px(theme.ui_px * 1.45))
+                .text_color(rgb(theme.dimmed))
+                .opacity(alpha)
+                .child(line.to_owned())
+                .into_any_element()
+        },
+    )
+}
+
+fn stored_message_body(
+    theme: &Theme,
+    message: &ConvMessage,
+    folds: FoldView,
+    frame: &ConvFrame,
+    alpha: f32,
+    cx: &mut Context<Inbox>,
+) -> gpui::AnyElement {
     let reveal = frame.disclosures().quotes.get(&message.id).copied();
     if let Rich::Html(body) = &message.rich {
         return div()
@@ -7953,8 +8587,10 @@ fn message_body(
     }
     let blocks: Vec<gpui::AnyElement> = match &message.rich {
         Rich::Html(_) => unreachable!(),
-        Rich::Pending => vec![div().h(px(PENDING_BODY_PX)).into_any_element()],
-        Rich::Plain | Rich::PlainPart(_) | Rich::Missing => {
+        Rich::Pending if message.body.blocks.is_empty() => {
+            return missing_message_body(theme, folds.columns, "Preparing message…", alpha);
+        }
+        Rich::Pending | Rich::Plain | Rich::PlainPart(_) | Rich::Missing => {
             // A signature and the quote next to it fold as one, as in HTML.
             // A draft's markdown is painted as its compose window shows it.
             let palette = mail_body::palette(theme);
@@ -8482,6 +9118,231 @@ fn recipient_lines(
         .into_any_element()
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StatusPhase {
+    Sync(std::mem::Discriminant<SyncKind>),
+    Download,
+    Reply(ReplyCheck),
+}
+
+#[derive(Clone)]
+struct StatusLabel {
+    phase: StatusPhase,
+    text: String,
+    download: Option<DownloadStatus>,
+    color: u32,
+    steady_sync: bool,
+}
+
+impl StatusLabel {
+    fn new(theme: &Theme, session: &Session, reply_check: Option<ReplyCheck>, width: f32) -> Self {
+        let download = reply_check
+            .is_none()
+            .then(|| session.sync.download_status())
+            .flatten();
+        let phase = if let Some(check) = reply_check {
+            StatusPhase::Reply(check)
+        } else if download.is_some() {
+            StatusPhase::Download
+        } else {
+            StatusPhase::Sync(std::mem::discriminant(&session.sync))
+        };
+        let (text, color) = match reply_check {
+            Some(ReplyCheck::Waiting) => ("Reply-To unverified".into(), theme.dimmed),
+            Some(ReplyCheck::Checking) => ("Checking Reply-To…".into(), theme.dimmed),
+            Some(ReplyCheck::Unavailable) => {
+                let key = keymap::binding_text(&session.keymap, Action::SyncNow);
+                let label = if width < present::NARROW_WIDTH {
+                    format!("Retry Reply-To · {key}")
+                } else {
+                    format!("Reply-To unavailable · {key} to retry")
+                };
+                (label, theme.error)
+            }
+            Some(ReplyCheck::Verified) => (
+                format!(
+                    "Reply-To verified · {} to reply",
+                    keymap::binding_text(&session.keymap, Action::Reply)
+                ),
+                theme.accent,
+            ),
+            None => (
+                if download.is_some() {
+                    String::new()
+                } else {
+                    session.sync.status()
+                },
+                if session.sync.is_error() {
+                    theme.error
+                } else {
+                    theme.dimmed
+                },
+            ),
+        };
+        Self {
+            phase,
+            text,
+            download,
+            color,
+            steady_sync: reply_check.is_none()
+                && matches!(
+                    session.sync,
+                    SyncKind::Connecting
+                        | SyncKind::Syncing { progress: None, .. }
+                        | SyncKind::Synced { .. }
+                ),
+        }
+    }
+
+    fn draw(
+        &self,
+        theme: &Theme,
+        size: f32,
+        room: f32,
+        window: &Window,
+        fading_count: Option<(&str, f32)>,
+    ) -> (gpui::Div, f32) {
+        let ui = theme.ui_family.as_ref();
+        let label = div()
+            .flex_none()
+            .whitespace_nowrap()
+            .text_size(px(size))
+            .text_color(rgb(self.color));
+        let Some(DownloadStatus {
+            prefix,
+            done,
+            total,
+            suffix,
+        }) = &self.download
+        else {
+            let width = bar_px(window, &self.text, size, ui).ceil();
+            return (label.child(self.text.clone()), width);
+        };
+        let figures = tabular_style(window, theme, size);
+        let figure_width =
+            |text| line_px_with_style(window, &figures, text, FontWeight::NORMAL).ceil();
+        let count_room = figure_width(total)
+            .max(figure_width(done))
+            .max(fading_count.map_or(0., |(old, _)| figure_width(old)));
+        let suffix_width = bar_px(window, suffix, size, ui).ceil();
+        let prefix_room = room - count_room - suffix_width;
+        let short;
+        let prefix = if bar_px(window, prefix, size, ui).ceil() > prefix_room {
+            short = format!("Downloading {total} · ");
+            &short
+        } else {
+            prefix
+        };
+        let width = bar_px(window, prefix, size, ui).ceil() + count_room + suffix_width;
+        let shown = fading_count.map_or(1.0, |(_, progress)| progress);
+        let label = label
+            .flex()
+            .items_baseline()
+            .child(div().flex_none().child(prefix.clone()))
+            .child(
+                div()
+                    .relative()
+                    .w(px(count_room))
+                    .flex_none()
+                    .font(figures.font())
+                    .child(div().text_right().opacity(shown).child(done.clone()))
+                    .children(fading_count.map(|(old, progress)| {
+                        div()
+                            .absolute()
+                            .right_0()
+                            .top_0()
+                            .opacity(1.0 - progress)
+                            .child(old.to_owned())
+                    })),
+            )
+            .child(div().flex_none().child(suffix.clone()));
+        (label, width)
+    }
+}
+
+#[derive(Default)]
+struct StatusLabels {
+    current: Option<StatusLabel>,
+    outgoing: Option<(StatusLabel, Transition)>,
+    count_fade: motion::NumberFade<String>,
+}
+
+struct StatusLabelsFrame {
+    current: StatusLabel,
+    outgoing: Option<(StatusLabel, f32)>,
+    count_fade: Option<(String, f32)>,
+}
+
+impl StatusLabels {
+    fn update(&mut self, next: StatusLabel, motion: Motion, now: Instant) -> StatusLabelsFrame {
+        let old = self.current.replace(next.clone());
+        if self
+            .outgoing
+            .as_ref()
+            .is_some_and(|(_, fade)| !fade.running(now))
+        {
+            self.outgoing = None;
+        }
+        if let Some(old) = old {
+            if old.phase != next.phase {
+                self.outgoing = motion.start(motion::FADE, now).map(|fade| (old, fade));
+                self.count_fade = motion::NumberFade::default();
+            } else if let (Some(old_download), Some(next_download)) =
+                (&old.download, &next.download)
+                && old_download.done != next_download.done
+                && self.outgoing.is_none()
+            {
+                self.count_fade
+                    .change(old_download.done.clone(), motion, now);
+            }
+        }
+        StatusLabelsFrame {
+            current: next,
+            count_fade: self
+                .count_fade
+                .frame(now)
+                .map(|(old, shown)| (old.clone(), shown)),
+            outgoing: self
+                .outgoing
+                .as_ref()
+                .map(|(prior, fade)| (prior.clone(), fade.linear(now))),
+        }
+    }
+}
+
+impl StatusLabelsFrame {
+    fn fading_count(&self) -> Option<(&str, f32)> {
+        self.count_fade
+            .as_ref()
+            .map(|(old, shown)| (old.as_str(), *shown))
+    }
+
+    fn draw(&self, theme: &Theme, size: f32, room: f32, window: &Window) -> (gpui::Div, f32) {
+        let Some((old, elapsed)) = &self.outgoing else {
+            return self
+                .current
+                .draw(theme, size, room, window, self.fading_count());
+        };
+
+        // Keep both measures while the phase changes. Only a brief, dim
+        // overlap passes through the middle of the fade.
+        let (current, width) = self.current.draw(theme, size, room, window, None);
+        let (old, old_width) = old.draw(theme, size, room, window, None);
+        let width = width.max(old_width);
+        let incoming = motion::ease_out((*elapsed - 0.45) / 0.55);
+        let outgoing = motion::fade_out(*elapsed / 0.6);
+        (
+            div()
+                .flex_none()
+                .relative()
+                .w(px(width))
+                .child(current.opacity(incoming))
+                .child(old.absolute().top_0().left_0().opacity(outgoing)),
+            width,
+        )
+    }
+}
+
 /// Mode, sync state and one notice. At rest there are no key hints
 /// (docs/ux.md, Quiet): the right side shows only what the reader is
 /// typing, a count or a chord's prefix, while which-key lists the rest.
@@ -8489,7 +9350,7 @@ fn status_bar(
     theme: &Theme,
     session: &Session,
     status: StatusMotion,
-    reply_check: Option<ReplyCheck>,
+    labels: StatusLabelsFrame,
     width: f32,
     window: &Window,
 ) -> gpui::Div {
@@ -8518,72 +9379,76 @@ fn status_bar(
     let ui = theme.ui_family.as_ref();
     let mono = theme.mono_family.as_ref();
     let hint_opacity = status.hints;
+    let (padding, gap) = if width < 420. { (8., 6.) } else { (14., 12.) };
+    let mode_width = bar_px(window, session.mode_label(), size, mono);
+    let dot_width = bar_px(window, "·", size, ui);
     let outage = session.worker_outage();
-    let sync_hint =
-        outage.map(|_| keymap::binding_text(&session.keymap, Action::OpenDiagnosticLog));
-    let (sync_label, sync_color) = if let Some(worker) = outage {
-        (worker.outage_notice().to_string(), theme.error)
+    let details = outage.is_none() && session.detail_text().is_some();
+    let details_width = if details {
+        gap + bar_px(window, "· ? details", size, ui)
     } else {
-        match reply_check {
-            Some(ReplyCheck::Waiting) => ("Reply-To unverified".into(), theme.dimmed),
-            Some(ReplyCheck::Checking) => ("Checking Reply-To…".into(), theme.dimmed),
-            Some(ReplyCheck::Unavailable) => {
-                let key = keymap::binding_text(&session.keymap, Action::SyncNow);
-                let label = if width < present::NARROW_WIDTH {
-                    format!("Retry Reply-To · {key}")
-                } else {
-                    format!("Reply-To unavailable · {key} to retry")
-                };
-                (label, theme.error)
-            }
-            Some(ReplyCheck::Verified) => (
-                format!(
-                    "Reply-To verified · {} to reply",
-                    keymap::binding_text(&session.keymap, Action::Reply)
-                ),
-                theme.accent,
-            ),
-            None => (
-                session.sync.status(),
-                if session.sync.is_error() {
-                    theme.error
-                } else {
-                    theme.dimmed
-                },
-            ),
+        0.
+    };
+    let trailing = if noticed {
+        gap + dot_width
+    } else {
+        16. + if hint.is_empty() && count.is_empty() {
+            0.
+        } else {
+            gap + bar_px(window, &format!("{count}{hint}"), size, mono)
         }
     };
-    // Reserve a stable slot through routine sync passes. Progress and
-    // recovery guidance can use more space when they have more to say.
-    let steady_sync = outage.is_none()
-        && reply_check.is_none()
-        && matches!(
-            session.sync,
-            SyncKind::Connecting
-                | SyncKind::Syncing { progress: None, .. }
-                | SyncKind::Synced { .. }
-        );
-    let sync_width = if steady_sync {
-        bar_px(window, "synced just now · 0000 new", size, ui)
-    } else {
-        bar_px(window, &sync_label, size, ui)
-    };
-    let details = outage.is_none() && session.detail_text().is_some();
+    let sync_room =
+        width - 2. * padding - 3. * gap - mode_width - dot_width - details_width - trailing;
     // What the bar spends before the notice, measured as drawn: the
     // padding, the mode in mono, sync, the dots, the gaps between the
     // children. No typed keys show beside a notice, so no air after it.
-    let dot = bar_px(window, "·", size, ui);
-    let mut used = 28.0 + 2.0 * 12.0 + 2.0;
-    used += bar_px(window, session.mode_label(), size, mono) + dot;
-    if !narrow {
-        used += 2.0 * 12.0 + dot + sync_width;
-        if let Some(key) = &sync_hint {
-            used += bar_px(window, &format!(" · {key} for log"), size, ui);
+    let draw_sync = |size| {
+        if let Some(worker) = outage {
+            let key = keymap::binding_text(&session.keymap, Action::OpenDiagnosticLog);
+            let text = worker.outage_notice();
+            let width = bar_px(window, &format!("{text} · {key} for log"), size, ui);
+            let label = div()
+                .text_size(px(size))
+                .whitespace_nowrap()
+                .text_color(rgb(theme.error))
+                .child(status_text(
+                    text.to_owned(),
+                    Some((&key, " for log")),
+                    theme,
+                ));
+            (label, width)
+        } else if !narrow
+            && labels.current.steady_sync
+            && labels
+                .outgoing
+                .as_ref()
+                .is_none_or(|(old, _)| old.steady_sync)
+        {
+            // Keep the routine sync slot fixed even while its text fades.
+            let width = bar_px(window, "synced just now · 0000 new", size, ui).ceil();
+            let (label, _) = labels.draw(theme, size, sync_room, window);
+            (label.w(px(width)).truncate(), width)
+        } else {
+            labels.draw(theme, size, sync_room, window)
         }
-    }
-    if details {
-        used += 12.0 + bar_px(window, "· ? details", size, ui);
-    }
+    };
+    let (label, sync_width) = draw_sync(size);
+    // The count slot is measured for every digit of the total. Tight
+    // windows give the full label room even when both numbers are long.
+    let (label, sync_width) = if sync_width > sync_room {
+        let fitted_size = (size * (sync_room - 3.).max(0.) / sync_width).max(1.);
+        draw_sync(fitted_size)
+    } else {
+        (label, sync_width)
+    };
+    let shared_width = 2. * padding + 2. * gap + mode_width + dot_width + details_width;
+    let used = shared_width
+        + if narrow {
+            0.
+        } else {
+            sync_width + 2. * gap + dot_width
+        };
     let scale = window.scale_factor();
     let notice_text = |toast: &Toast, opacity: f32, dy: f32| {
         let hint = toast
@@ -8614,6 +9479,12 @@ fn status_bar(
             })
             .child(status_text(text, hint, theme))
     };
+    let label = label.opacity(status.sync_opacity);
+    let (wide_sync, narrow_sync) = if narrow {
+        (None, Some(label))
+    } else {
+        (Some(label), None)
+    };
     let (notice_dy, leaving_dy) = (status.notice_dy, status.leaving_dy);
     let hints = (!count.is_empty() || !hint.is_empty()).then(|| {
         div()
@@ -8639,11 +9510,11 @@ fn status_bar(
     div()
         .relative()
         .h(px(30.))
-        .px(px(14.))
+        .px(px(padding))
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(12.))
+        .gap(px(gap))
         .border_t(px(1.))
         .border_color(rgb(theme.border))
         .bg(rgb(theme.surface))
@@ -8660,25 +9531,7 @@ fn status_bar(
         )
         .when(!narrow, |bar| {
             bar.child(div().flex_none().text_color(rgb(theme.dimmed)).child("·"))
-                .child(
-                    div()
-                        .flex_none()
-                        .when(steady_sync, |slot| {
-                            slot.w(px(sync_width))
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_ellipsis()
-                        })
-                        .text_color(rgb(sync_color))
-                        .when(status.sync_opacity < 1.0, |label| {
-                            label.opacity(status.sync_opacity)
-                        })
-                        .child(status_text(
-                            sync_label.clone(),
-                            sync_hint.as_deref().map(|key| (key, " for log")),
-                            theme,
-                        )),
-                )
+                .child(wide_sync.unwrap().flex_none())
         })
         .when(details, |bar| {
             bar.child(div().text_color(rgb(theme.error)).child("· ? details"))
@@ -8713,18 +9566,8 @@ fn status_bar(
                             .inset_0()
                             .flex()
                             .items_center()
-                            .opacity(status.sync * status.sync_opacity)
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_color(rgb(sync_color))
-                                    .child(status_text(
-                                        sync_label,
-                                        sync_hint.as_deref().map(|key| (key, " for log")),
-                                        theme,
-                                    )),
-                            ),
+                            .opacity(status.sync)
+                            .child(narrow_sync.unwrap().min_w_0().truncate()),
                     )
                 })
                 .when_some(text, |cell, (toast, opacity, dy)| {
@@ -8740,7 +9583,7 @@ fn status_bar(
                     .absolute()
                     .top(px(0.))
                     .bottom(px(0.))
-                    .right(px(14.))
+                    .right(px(padding))
                     .flex()
                     .items_center()
                     .child(hints),
@@ -9649,18 +10492,24 @@ impl<T: Styled> FontOpt for T {
 
 #[cfg(test)]
 mod tests {
+    thread_local! {
+        pub(super) static INBOX_LABEL_X: std::cell::RefCell<Vec<(gpui::Pixels, gpui::SharedString)>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
+    }
     use super::{
-        FolderFit, LIST_BORDER_PX, MESSAGE_HEADER_GAP_PX, MESSAGE_PAD_PX, READING_MEASURE_PX,
-        ReaderColumns, account_header, collapsed_sender_budget, ctrl_letter, expanded_header_flow,
-        expanded_header_widths, fit_folder_path, key_from, message_content_width,
-        picker_card_height, should_follow_visible, unread_bar_dx, useful_header_email,
-        write_back_notice,
+        FIRST_PREVIEW_WAIT, FirstPreview, FolderFit, LIST_BORDER_PX, MESSAGE_HEADER_GAP_PX,
+        MESSAGE_PAD_PX, READING_MEASURE_PX, ReaderColumns, account_header, collapsed_sender_budget,
+        ctrl_letter, expanded_header_flow, expanded_header_widths, fit_folder_path, key_from,
+        message_content_width, picker_card_height, should_follow_visible, unread_bar_dx,
+        useful_header_email, write_back_notice,
     };
     use crate::keymap::KeyId;
-    use crate::model::Overlay;
+    use crate::model::{Overlay, SyncKind};
     use crate::motion;
     use crate::present::Pane;
     use gpui::{IntoElement, Keystroke, Modifiers, div};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn a_dropped_mailbox_reply_still_runs_failure_completion() {
@@ -9863,6 +10712,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_second_of_frame_rate_download_ticks_keeps_the_latest_count_visible() {
+        use super::{Motion, StatusLabel, StatusLabels, StatusPhase};
+
+        let mut labels = StatusLabels::default();
+        let start = Instant::now();
+        let next = |done| StatusLabel {
+            phase: StatusPhase::Download,
+            text: String::new(),
+            download: SyncKind::Syncing {
+                new_messages: None,
+                progress: Some(fell_core::SyncProgress {
+                    folder: "Inbox".into(),
+                    total: 85,
+                    done,
+                }),
+            }
+            .download_status(),
+            color: 0,
+            steady_sync: false,
+        };
+        for count in 0..=60 {
+            let now = start + Duration::from_secs_f64(f64::from(count) / 60.);
+            let frame = labels.update(next(count), Motion::new(true), now);
+            let current = &frame.current.download.as_ref().unwrap().done;
+            let fading = frame.fading_count();
+            let dominant = match fading {
+                Some((old, shown)) if shown < 0.5 => old,
+                _ => current,
+            };
+            assert_eq!(current, &count.to_string());
+            if count >= 3 {
+                assert_eq!(dominant, current, "frame {count}");
+            }
+            if count >= 9 {
+                assert!(fading.is_none(), "a busy stream never restarts the fade");
+            }
+        }
+        let next_burst = start + Duration::from_secs(2);
+        let frame = labels.update(next(61), Motion::new(true), next_burst);
+        assert_eq!(frame.fading_count(), Some(("60", 0.)));
+    }
+
     fn stroke(key: &str, key_char: &str, shift: bool) -> Keystroke {
         Keystroke {
             modifiers: Modifiers {
@@ -10029,6 +10921,801 @@ mod tests {
             list().iter().map(ListKey::of).collect::<Vec<_>>(),
             original.iter().map(ListKey::of).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn first_preview_releases_pending_bodies_when_sync_stops() {
+        use crate::model::SyncFailure;
+        use fell_core::SyncFailureKind;
+
+        let active = SyncKind::Syncing {
+            new_messages: None,
+            progress: None,
+        };
+        for terminal in [
+            SyncKind::LocalOffline,
+            SyncKind::StoreError,
+            SyncKind::Synced {
+                at: 0,
+                changed: false,
+                new_messages: None,
+            },
+            SyncKind::Failed(SyncFailure {
+                kind: SyncFailureKind::Unreachable,
+                bridge: false,
+                detail: "fixture stopped".into(),
+                recovery: None,
+            }),
+        ] {
+            let mut preview = FirstPreview::Handoff;
+            assert!(!preview.sync_changed(&SyncKind::Connecting));
+            assert!(!preview.sync_changed(&active));
+            assert!(preview.sync_changed(&terminal));
+            assert!(!preview.waits_for_body());
+            assert!(
+                preview.take(),
+                "the fallback still gets the automatic landing"
+            );
+            assert!(!preview.take());
+        }
+    }
+
+    #[test]
+    fn first_preview_times_out_after_the_setup_exit_finishes() {
+        let mut preview = FirstPreview::Handoff;
+        let exit = Instant::now() + Duration::from_secs(3);
+        assert!(!preview.expire(exit));
+        assert!(preview.finish_handoff(exit));
+        assert!(!preview.finish_handoff(exit));
+        assert!(!preview.expire(exit + Duration::from_millis(1499)));
+        assert!(preview.waits_for_body());
+        assert!(preview.expire(exit + FIRST_PREVIEW_WAIT));
+        assert!(!preview.waits_for_body());
+        assert!(preview.take());
+    }
+
+    pub(super) fn with_pending_inbox(
+        test: impl FnOnce(&mut super::Inbox, &mut gpui::Context<super::Inbox>),
+    ) {
+        use gpui::TestAppContext;
+
+        let store = fell_core::Store::open_in_memory().unwrap();
+        let account = crate::fixtures::fixture_account();
+        store.upsert_account(&account).unwrap();
+        crate::fixtures::seed_if_empty(&store, &account).unwrap();
+        let page = store
+            .folder_page(
+                &account.id,
+                "INBOX",
+                &fell_core::FolderSpan::Top { rows: 1 },
+            )
+            .unwrap();
+        let mut rows = crate::present::thread_rows(&page.threads, &account.email);
+        let row = rows.remove(0);
+        let mut messages = super::read_conversation(
+            &store,
+            &account.id,
+            &fell_core::ThreadId(row.id.clone()),
+            (
+                &account.email,
+                &fell_core::FolderRoles::default(),
+                &[],
+                "INBOX",
+            ),
+        )
+        .unwrap();
+        messages[0].body_state = fell_core::BodyState::Pending;
+
+        let mut app = TestAppContext::single();
+        let inbox = app.add_window(|window, cx| {
+            super::Inbox::with_startup(
+                crate::mailbox::Startup {
+                    keymap: Default::default(),
+                    split: 0.4,
+                    read_dwell_ms: 0,
+                    error: None,
+                    account_missing: true,
+                    config: None,
+                    path: Err("in-memory test".into()),
+                },
+                false,
+                Some(window),
+                cx,
+            )
+        });
+        inbox
+            .update(&mut app, |inbox, _, cx| {
+                inbox.motion = super::InboxMotion::new(motion::Motion::new(true));
+                inbox.session.set_messages(messages);
+                inbox.session.cursor_id = Some(row.id.clone());
+                inbox.mark_open(row.id.clone(), None);
+                inbox.session.set_threads(vec![row]);
+                inbox.pending_bodies.wait_for_read(0);
+                inbox.conv_gen.store(1, std::sync::atomic::Ordering::SeqCst);
+                test(inbox, cx);
+                assert!(!inbox.pending_bodies.downloading(&inbox.session.sync));
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn pending_bodies_settle_without_a_cursor() {
+        with_pending_inbox(|inbox, cx| {
+            inbox.session.cursor_id = None;
+            inbox.read_selected_messages(true, cx);
+            assert!(inbox.session.messages.is_empty());
+            assert!(
+                inbox
+                    .pending_bodies
+                    .fade(inbox.motion.clock.now())
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn pending_bodies_settle_when_switching_to_a_draft() {
+        with_pending_inbox(|inbox, cx| {
+            inbox.session.threads[0].draft = Some("local-draft".into());
+            inbox.read_selected_messages(true, cx);
+            assert!(inbox.session.messages.is_empty());
+            assert!(
+                inbox
+                    .pending_bodies
+                    .fade(inbox.motion.clock.now())
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn pending_bodies_fade_when_the_conversation_read_fails() {
+        with_pending_inbox(|inbox, cx| {
+            let id = inbox.open_thread.clone().unwrap();
+            inbox.receive_conversation(id, 1, Err("failed to read thread".into()), cx);
+            assert!(
+                inbox
+                    .pending_bodies
+                    .fade(inbox.motion.clock.now())
+                    .is_some()
+            );
+        });
+    }
+
+    #[test]
+    fn pending_bodies_wait_on_the_folder_read_after_the_open_thread_reads_empty() {
+        with_pending_inbox(|inbox, cx| {
+            let id = inbox.open_thread.clone().unwrap();
+            inbox.read_in_flight = true;
+            let reply = super::ConversationRead {
+                notes: None,
+                latest_note: None,
+                note_generation: 0,
+                view: Vec::new(),
+                reads: Default::default(),
+                matches: None,
+            };
+            inbox.receive_conversation(id, 1, Ok(Some(reply)), cx);
+            assert!(inbox.pending_bodies.downloading(&inbox.session.sync));
+            assert!(
+                inbox
+                    .pending_bodies
+                    .fade(inbox.motion.clock.now())
+                    .is_none()
+            );
+            let id = inbox.open_thread.clone().unwrap();
+            let reply = super::ConversationRead {
+                notes: None,
+                latest_note: None,
+                note_generation: 0,
+                view: inbox.session.messages.clone(),
+                reads: Default::default(),
+                matches: None,
+            };
+            inbox.receive_conversation(id, 1, Ok(Some(reply)), cx);
+            let now = inbox.motion.clock.now();
+            inbox.apply_body_refresh(now);
+        });
+    }
+
+    #[test]
+    fn pending_bodies_fade_when_the_folder_read_fails() {
+        with_pending_inbox(|inbox, cx| {
+            inbox.show_threads(
+                (inbox.session.folder.clone(), None),
+                Err("failed to read folder".into()),
+                super::ReadIntent::default(),
+                false,
+                cx,
+            );
+            assert!(
+                inbox
+                    .pending_bodies
+                    .fade(inbox.motion.clock.now())
+                    .is_some()
+            );
+        });
+    }
+
+    #[test]
+    fn pending_bodies_settle_during_stale_search_and_reread_the_same_preview() {
+        use crate::model::search::{Hit, SearchReply};
+        use std::sync::atomic::Ordering;
+
+        with_pending_inbox(|inbox, cx| {
+            let row = inbox.session.threads[0].clone();
+            let reply = || SearchReply {
+                rows: vec![row.clone()],
+                hits: [(
+                    row.id.clone(),
+                    Hit {
+                        message: fell_core::MessageId("fixture-message".into()),
+                        related: false,
+                        preview: None,
+                        folder: Some("INBOX".into()),
+                    },
+                )]
+                .into(),
+                correction: None,
+                error: None,
+            };
+            inbox.session.on_key(KeyId::Char('/'), 10);
+            inbox.session.type_search("field");
+            assert!(
+                inbox
+                    .session
+                    .apply_search_reply(inbox.session.search_generation, &mut reply())
+            );
+            inbox.session.type_search(" notes");
+            assert!(!inbox.session.search_results_current());
+
+            inbox.read_selected_messages(true, cx);
+            assert_eq!(
+                crate::present::missing_body_line(
+                    fell_core::BodyState::Pending,
+                    inbox.pending_bodies.downloading(&inbox.session.sync),
+                )
+                .as_deref(),
+                Some("Downloading…")
+            );
+            assert!(
+                inbox
+                    .pending_bodies
+                    .fade(inbox.motion.clock.now())
+                    .is_none()
+            );
+            let before = inbox.conv_gen.load(Ordering::SeqCst);
+
+            inbox.show_search_reply(inbox.session.search_generation, reply(), cx);
+            assert_eq!(inbox.conv_gen.load(Ordering::SeqCst), before + 1);
+            assert_eq!(inbox.open_thread.as_deref(), Some(row.id.as_str()));
+            assert!(inbox.pending_bodies.downloading(&inbox.session.sync));
+
+            let mut view = inbox.session.messages.clone();
+            view[0].body_state = fell_core::BodyState::Stored;
+            inbox.receive_conversation(
+                row.id,
+                before + 1,
+                Ok(Some(super::ConversationRead {
+                    notes: None,
+                    latest_note: None,
+                    note_generation: 0,
+                    view,
+                    reads: Default::default(),
+                    matches: None,
+                })),
+                cx,
+            );
+            let now = inbox.motion.clock.now();
+            inbox.apply_body_refresh(now);
+            assert!(
+                inbox
+                    .pending_bodies
+                    .fade(inbox.motion.clock.now())
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn pending_bodies_settle_when_the_search_reply_fails() {
+        with_pending_inbox(|inbox, cx| {
+            inbox.session.on_key(KeyId::Char('/'), 10);
+            inbox.session.type_search("field");
+            inbox.session.cursor_id.clone_from(&inbox.open_thread);
+            inbox.read_selected_messages(true, cx);
+            assert!(inbox.search_view.refresh_open_after_reply);
+            assert!(inbox.pending_bodies.downloading(&inbox.session.sync));
+
+            inbox.show_search_reply(
+                inbox.session.search_generation,
+                crate::model::search::SearchReply {
+                    rows: Vec::new(),
+                    hits: Default::default(),
+                    correction: None,
+                    error: Some("failed to search".into()),
+                },
+                cx,
+            );
+            assert!(!inbox.search_view.refresh_open_after_reply);
+            assert!(
+                inbox
+                    .pending_bodies
+                    .fade(inbox.motion.clock.now())
+                    .is_some()
+            );
+        });
+    }
+
+    #[test]
+    fn open_search_match_holds_its_height_through_the_post_sync_reread() {
+        use crate::model::search::{Hit, MatchLanding, SearchReply};
+        use fell_core::{MessageId, SearchMatch, SearchPreview};
+
+        with_pending_inbox(|inbox, cx| {
+            let row = inbox.session.threads[0].clone();
+            let message = MessageId(inbox.session.messages[0].id.clone());
+            let reply = || SearchReply {
+                rows: vec![row.clone()],
+                hits: [(
+                    row.id.clone(),
+                    Hit {
+                        message: message.clone(),
+                        related: false,
+                        preview: None,
+                        folder: Some("INBOX".into()),
+                    },
+                )]
+                .into(),
+                correction: None,
+                error: None,
+            };
+            let hit = |text: &str| SearchMatch {
+                message: message.clone(),
+                preview: Some(SearchPreview {
+                    text: format!("Harbor {text}"),
+                    highlights: std::iter::once(0..6).collect(),
+                }),
+            };
+            let now = Instant::now();
+            inbox.session.on_key(KeyId::Char('/'), 10);
+            inbox.session.type_search("Harbor");
+            let generation = inbox.session.search_generation;
+            assert!(inbox.session.apply_search_reply(generation, &mut reply()));
+            inbox.session.search.as_mut().unwrap().editing = false;
+            inbox.session.pane = super::Pane::Conversation;
+            inbox.session.set_search_matches(
+                generation,
+                &row.id,
+                vec![hit("checkpoint")],
+                MatchLanding::Best,
+            );
+            let line = |inbox: &mut super::Inbox, at| {
+                let frame = inbox.search_match_frame(at, inbox.search_preview_current());
+                (frame.reserved_height(&inbox.theme), frame.animating)
+            };
+            let (height, animating) = line(inbox, now);
+            assert!(height > 0.);
+            assert!(!animating);
+
+            let mut previous_height = height;
+            for (step, (matches, target_height, changes)) in [
+                (vec![hit("checkpoint")], height, false),
+                (vec![hit("checkpoint revised")], height, true),
+                (Vec::new(), 0., true),
+                (vec![hit("checkpoint")], height, true),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let now = now + Duration::from_secs(step as u64 + 1);
+                if step == 0 {
+                    inbox.session.search.as_mut().unwrap().editing = true;
+                    inbox.session.type_search(" checkpoint");
+                    inbox.session.search.as_mut().unwrap().editing = false;
+                    inbox.read_selected_messages(true, cx);
+                    assert!(inbox.search_view.refresh_open_after_reply);
+                } else {
+                    assert!(inbox.session.refresh_search(now));
+                }
+                assert_eq!(line(inbox, now), (previous_height, false));
+                let generation = inbox.session.search_generation;
+                inbox.show_search_reply(generation, reply(), cx);
+                assert!(!inbox.search_preview_current());
+                assert!(inbox.quiet_search_preview());
+                assert_eq!(line(inbox, now), (previous_height, false));
+
+                let read = inbox.conv_gen.load(std::sync::atomic::Ordering::SeqCst);
+                inbox.receive_conversation(
+                    row.id.clone(),
+                    read,
+                    Ok(Some(super::ConversationRead {
+                        notes: None,
+                        latest_note: None,
+                        note_generation: 0,
+                        view: inbox.session.messages.clone(),
+                        reads: Default::default(),
+                        matches: Some((generation, matches)),
+                    })),
+                    cx,
+                );
+                inbox.apply_body_refresh(now);
+                assert!(inbox.search_preview_current());
+                assert_eq!(line(inbox, now), (previous_height, changes));
+                let (halfway, _) = line(inbox, now + motion::FADE / 2);
+                if previous_height != target_height {
+                    assert!(halfway > 0. && halfway < height);
+                } else {
+                    assert_eq!(halfway, height);
+                }
+                assert_eq!(line(inbox, now + motion::FADE), (target_height, false));
+                previous_height = target_height;
+            }
+        });
+    }
+
+    #[test]
+    fn final_body_refresh_crossfades_only_bodies_still_missing() {
+        use super::{BodyRefresh, ConvFrame, InboxMotion, PendingBodies, Session};
+        use crate::{fixtures, keymap::Keymap, present};
+        use fell_core::{BodyState, FolderRoles, Store};
+
+        let store = Store::open_in_memory().unwrap();
+        let account = fixtures::fixture_account();
+        store.upsert_account(&account).unwrap();
+        fixtures::seed_if_empty(&store, &account).unwrap();
+        let id = &store.list_threads(&account.id).unwrap()[0].thread_id;
+        let mut stored = super::read_conversation(
+            &store,
+            &account.id,
+            id,
+            (&account.email, &FolderRoles::default(), &[], "INBOX"),
+        )
+        .unwrap()
+        .remove(0);
+        stored.expanded = true;
+        let mut missing = stored.clone();
+        missing.id = "missing@demo.test".into();
+        missing.body_state = BodyState::Pending;
+        let mut was_pending = stored.clone();
+        was_pending.body_state = BodyState::Pending;
+        let mut session = Session::new(
+            String::new(),
+            account.email,
+            SyncKind::LocalOffline,
+            Keymap::default(),
+        );
+        session.set_messages(vec![missing.clone(), was_pending]);
+
+        let now = Instant::now();
+        let mut motion = InboxMotion::new(motion::Motion::new(true));
+        let mut pending = PendingBodies::default();
+        pending.wait_for_read(7);
+        pending.applied(7, true, motion.motion, now);
+        assert!(
+            pending.downloading(&session.sync),
+            "the old read cannot settle the pass"
+        );
+        assert_eq!(
+            present::missing_body_line(missing.body_state, pending.downloading(&session.sync))
+                .as_deref(),
+            Some("Downloading…")
+        );
+        assert!(pending.fade(now).is_none());
+
+        BodyRefresh {
+            messages: Some((vec![missing, stored], 8)),
+            ..BodyRefresh::default()
+        }
+        .apply(
+            &mut session,
+            &mut motion,
+            now,
+            |_| Some(100.),
+            pending.downloading(&SyncKind::LocalOffline),
+        );
+        pending.applied(
+            8,
+            present::awaiting_bodies(&session.messages),
+            motion.motion,
+            now,
+        );
+        let frames = |at| ConvFrame {
+            syncing: pending.downloading(&session.sync),
+            missing_fade: pending.fade(at),
+            alphas: motion.body_alphas(at),
+            heights: motion.body_heights(at),
+            outgoing_placeholders: motion.body_placeholders(),
+            ..ConvFrame::default()
+        };
+        let first = frames(now);
+        let [missing, ready] = &session.messages[..] else {
+            panic!("two messages")
+        };
+        assert_eq!(
+            first.body_labels(missing),
+            (0., Some("Downloading…".into()))
+        );
+        assert_eq!(first.body_labels(ready), (0., Some("Downloading…".into())));
+        assert_eq!(first.heights[&ready.id], (100., 0.));
+        let next = frames(now + Duration::from_millis(16));
+        assert_eq!(next.body_labels(ready).0, next.heights[&ready.id].1);
+        assert!(next.body_labels(ready).0 > 0.);
+        assert!(next.body_labels(missing).0 > 0.);
+        assert!(!next.heights.contains_key(&missing.id));
+        let settled = frames(now + motion::FADE);
+        assert_eq!(settled.body_labels(missing), (1., None));
+        assert_eq!(
+            present::missing_body_line(missing.body_state, settled.syncing).as_deref(),
+            Some("Not downloaded yet")
+        );
+        assert_eq!(
+            present::missing_body_line(ready.body_state, settled.syncing),
+            None
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an isolated nested Wayland compositor"]
+    fn inbox_label_stays_put_with_late_total_and_growing_counts() {
+        use crate::{keymap::Keymap, model::Session};
+        use gpui::{App, Context, Render, Window, prelude::*, px};
+
+        require_nested_wayland();
+
+        struct Headers(Session, crate::theme::Theme);
+        impl Render for Headers {
+            fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let now = Instant::now();
+                div().flex().flex_col().children([360., 980.].map(|width| {
+                    let mut motion = super::InboxMotion::new(motion::Motion::new(true));
+                    div().w(px(width)).children(
+                        [
+                            None,
+                            Some(61),
+                            Some(1061),
+                            Some(7727),
+                            Some(u32::MAX as usize),
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(step, unread)| {
+                            let at = now + Duration::from_millis(step as u64 * 140);
+                            motion.observe_header("INBOX", None, unread, at);
+                            super::header(
+                                &self.1,
+                                &self.0,
+                                ("INBOX", None),
+                                &mut motion,
+                                at + Duration::from_millis(60),
+                                width,
+                                window,
+                            )
+                        }),
+                    )
+                }))
+            }
+        }
+
+        gpui::Application::new().run(|cx: &mut App| {
+            let window = cx
+                .open_window(gpui::WindowOptions::default(), |_, cx| {
+                    cx.new(|_| {
+                        Headers(
+                            Session::new(
+                                "Robin Ellis",
+                                "robin@demo.test",
+                                SyncKind::LocalOffline,
+                                Keymap::default(),
+                            ),
+                            crate::theme::load(),
+                        )
+                    })
+                })
+                .unwrap();
+            cx.spawn(async move |cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(40))
+                    .await;
+                cx.update(|cx| {
+                    window
+                        .update(cx, |_, window, cx| {
+                            window.defer(cx, |window, cx| {
+                                INBOX_LABEL_X.with_borrow_mut(Vec::clear);
+                                window.draw(cx).clear();
+                                INBOX_LABEL_X.with_borrow(|positions| {
+                                    assert_eq!(positions.len(), 10);
+                                    for width in positions.as_chunks::<5>().0 {
+                                        assert!(width[0].0 > px(0.));
+                                        assert!(
+                                            width.iter().all(|(x, text)| *x == width[0].0
+                                                && text.as_ref() == "Inbox"),
+                                            "{width:?}"
+                                        );
+                                    }
+                                });
+                                cx.quit();
+                            });
+                        })
+                        .unwrap();
+                })
+                .unwrap();
+            })
+            .detach();
+        });
+    }
+
+    fn require_nested_wayland() {
+        use std::os::unix::fs::FileTypeExt;
+        use std::path::PathBuf;
+        let display = PathBuf::from(std::env::var_os("WAYLAND_DISPLAY").unwrap());
+        let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
+        assert_eq!(
+            std::env::var_os("FELL_TEST_NESTED_WAYLAND").as_deref(),
+            Some(display.as_os_str())
+        );
+        assert!(display.is_absolute() && display.parent() == Some(runtime.as_path()));
+        assert!(display.metadata().unwrap().file_type().is_socket());
+        assert!(std::env::var_os("DISPLAY").is_none());
+    }
+
+    #[test]
+    #[ignore = "requires an isolated nested Wayland compositor"]
+    fn opening_landings_use_the_real_conversation_end_probe() {
+        use super::{
+            MessageProbes, PreviewPadding, ReaderLanding, ScrollAnchor, conversation_body,
+        };
+        use gpui::{App, Context, IntoElement, Render, ScrollHandle, Window, div, prelude::*, px};
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        require_nested_wayland();
+
+        struct Case {
+            heights: &'static [f32],
+            automatic: bool,
+            pending: bool,
+            expected_header: Option<usize>,
+            newest_height: Rc<Cell<gpui::Pixels>>,
+            scroll: ScrollHandle,
+        }
+
+        struct Landings(Vec<Case>);
+
+        impl Render for Landings {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .flex()
+                    .children(self.0.iter().enumerate().map(|(index, case)| {
+                        let mut landing = ReaderLanding::default();
+                        landing.hold(Some("newest"));
+                        let padding = case.automatic.then(|| PreviewPadding {
+                            viewport: px(340.),
+                            newest_height: case.newest_height.clone(),
+                        });
+                        let anchor = landing
+                            .anchor(
+                                Some("newest"),
+                                ScrollAnchor {
+                                    index: case.heights.len() - 1,
+                                    y: px(0.),
+                                    snap_headers: case.pending,
+                                    body_scroll: None,
+                                },
+                                false,
+                            )
+                            .unwrap();
+                        let probes = MessageProbes::new(anchor, case.heights.len(), None);
+                        let cards: Vec<_> = case
+                            .heights
+                            .iter()
+                            .enumerate()
+                            .map(|(index, height)| {
+                                let card = div().h(px(*height)).mb(px(8.)).into_any_element();
+                                let card = match &padding {
+                                    Some(padding) if index + 1 == case.heights.len() => {
+                                        padding.wrap_newest(card)
+                                    }
+                                    _ => card,
+                                };
+                                probes.wrap(index, card)
+                            })
+                            .collect();
+                        div()
+                            .id(("case", index))
+                            .flex()
+                            .flex_col()
+                            .w(px(125.))
+                            .h(px(300.))
+                            .child(conversation_body(
+                                cards,
+                                Some(case.scroll.clone()),
+                                Some(probes),
+                                None,
+                                padding.map(|padding| padding.viewport),
+                                1.,
+                                None,
+                            ))
+                    }))
+            }
+        }
+
+        let checked = Rc::new(Cell::new(false));
+        let completed = checked.clone();
+        gpui::Application::new().run(move |cx: &mut App| {
+            let handle = cx
+                .open_window(gpui::WindowOptions::default(), |_, cx| {
+                    cx.new(|_| {
+                        Landings(
+                            [
+                                (&[160., 90., 200., 80.][..], true, false, Some(3)),
+                                (&[160., 90., 200., 68.][..], true, false, Some(3)),
+                                (&[390., 430., 640., 230.][..], true, false, Some(3)),
+                                (&[60., 80.][..], true, false, Some(1)),
+                                (&[160., 400.][..], true, false, Some(1)),
+                                (&[60., 280., 40.][..], false, true, None),
+                            ]
+                            .into_iter()
+                            .map(|(heights, automatic, pending, expected_header)| Case {
+                                heights,
+                                automatic,
+                                pending,
+                                expected_header,
+                                scroll: ScrollHandle::new(),
+                                newest_height: Rc::default(),
+                            })
+                            .collect(),
+                        )
+                    })
+                })
+                .unwrap();
+            cx.spawn(async move |cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(40))
+                    .await;
+                cx.update(|cx| {
+                    let entity = handle.entity(cx).unwrap();
+                    handle
+                        .update(cx, |_, window, cx| {
+                            window.defer(cx, move |window, cx| {
+                                window.draw(cx).clear();
+                                for case in &entity.read(cx).0 {
+                                    let view = case.scroll.bounds();
+                                    let newest = case
+                                        .scroll
+                                        .bounds_for_item(case.heights.len() - 1)
+                                        .unwrap();
+                                    let offset = case.scroll.offset().y;
+                                    if let Some(header) = case.expected_header {
+                                        let header = case.scroll.bounds_for_item(header).unwrap();
+                                        assert_eq!(header.top() + offset, view.top());
+                                    } else {
+                                        assert_eq!(offset, -case.scroll.max_offset().height);
+                                        assert_eq!(offset, px(-124.));
+                                    }
+                                    let height = *case.heights.last().unwrap();
+                                    if case.automatic {
+                                        assert_eq!(case.newest_height.get(), px(height));
+                                    }
+                                    if px(height) <= view.size.height {
+                                        assert!(
+                                            newest.top() + offset + px(height) <= view.bottom()
+                                        );
+                                    }
+                                    assert!(newest.top() + offset >= view.top());
+                                    assert!(offset >= -case.scroll.max_offset().height);
+                                }
+                                completed.set(true);
+                                cx.quit();
+                            });
+                        })
+                        .unwrap();
+                })
+                .unwrap();
+            })
+            .detach();
+        });
+        assert!(checked.get());
     }
 
     #[test]

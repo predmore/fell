@@ -1,5 +1,4 @@
-//! Open the local store and read the account file. With no account file, an
-//! empty store is filled with fixture mail so the window has something to show.
+//! Open the local store and read the account file.
 
 use std::env;
 use std::ffi::OsStr;
@@ -21,6 +20,7 @@ pub struct Startup {
     /// is marked read. 0, the default, marks it as it opens.
     pub read_dwell_ms: u64,
     pub error: Option<String>,
+    pub account_missing: bool,
     pub config: Option<AccountConfig>,
     pub path: Result<PathBuf, String>,
 }
@@ -30,21 +30,26 @@ pub struct Opened {
     pub account: Account,
     pub sync: SyncKind,
     pub error: Option<String>,
+    pub warning: Option<String>,
 }
 
 pub fn startup() -> Startup {
     let (keymap, keymap_error) = load_keymap();
     let split = load_split();
     let read_dwell_ms = load_read_dwell();
-    let (config, config_error) = match load_account_config() {
-        Ok(config) => (config, None),
-        Err(err) => (None, Some(err)),
+    let (config, account_missing, config_error) = match load_account_config() {
+        Ok(config) => {
+            let missing = config.is_none();
+            (config, missing, None)
+        }
+        Err(err) => (None, false, Some(err)),
     };
     Startup {
         keymap,
         split,
         read_dwell_ms,
         error: join_errors([keymap_error, config_error]),
+        account_missing,
         config,
         path: store_path(),
     }
@@ -55,22 +60,16 @@ pub fn startup() -> Startup {
 pub fn open_store(
     path: Result<PathBuf, String>,
     config: Option<&AccountConfig>,
+    demo: bool,
 ) -> (Store, Opened) {
     let opened = path
         .and_then(|path| open_at(&path).map_err(|err| err.to_string()))
-        .and_then(|store| match prepare(&store, config) {
-            Ok((account, sync)) => Ok((store, account, sync)),
-            Err(err) => Err(err.to_string()),
+        .and_then(|store| {
+            let opened = prepare(&store, config, demo).map_err(|err| err.to_string())?;
+            Ok((store, opened))
         });
     match opened {
-        Ok((store, account, sync)) => (
-            store,
-            Opened {
-                account,
-                sync,
-                error: None,
-            },
-        ),
+        Ok(result) => result,
         Err(error) => fallback(error),
     }
 }
@@ -162,6 +161,7 @@ pub(crate) fn save_notification_mode(
     mode: fell_core::NotificationMode,
 ) -> Result<(), String> {
     let path = account_config_path().ok_or_else(|| "No account is set up".to_string())?;
+    let lock = lock_account_dir(&path).map_err(|err| err.to_string())?;
     let (config, text) = read_account_config_text(&path)
         .map_err(|err| err.to_string())?
         .ok_or_else(|| "No account is set up".to_string())?;
@@ -180,7 +180,9 @@ pub(crate) fn save_notification_mode(
     }
     use std::fmt::Write as _;
     let _ = writeln!(updated, "notifications = \"{}\"", mode.as_str());
-    stage_account_text_at(path, &updated)?.publish()?;
+    stage_account_text_at(path, &updated, false, lock)
+        .and_then(StagedAccountConfig::publish)
+        .map_err(|err| err.to_string())?;
     Ok(())
 }
 
@@ -233,25 +235,80 @@ pub fn load_account_file() -> Result<(PathBuf, AccountConfig), String> {
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum AccountFileError {
+    AlreadyConfigured,
+    Write(String),
+}
+
+impl From<String> for AccountFileError {
+    fn from(detail: String) -> Self {
+        Self::Write(detail)
+    }
+}
+
+impl From<&str> for AccountFileError {
+    fn from(detail: &str) -> Self {
+        detail.to_owned().into()
+    }
+}
+
+impl std::fmt::Display for AccountFileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyConfigured => {
+                f.write_str("An account is already configured. Reopen Fell to use it.")
+            }
+            Self::Write(detail) => f.write_str(detail),
+        }
+    }
+}
+
 /// Prepare the file so setup can save its keyring password before publishing
 /// the new config with mode 0600. Dropping the staged file keeps the current
 /// config in place.
-pub(crate) fn stage_account_config(config: &AccountConfig) -> Result<StagedAccountConfig, String> {
+pub(crate) fn stage_account_config(
+    config: &AccountConfig,
+) -> Result<StagedAccountConfig, AccountFileError> {
+    stage_config(config, false)
+}
+
+pub(crate) fn stage_new_account_config(
+    config: &AccountConfig,
+) -> Result<StagedAccountConfig, AccountFileError> {
+    stage_config(config, true)
+}
+
+fn stage_config(
+    config: &AccountConfig,
+    first_run: bool,
+) -> Result<StagedAccountConfig, AccountFileError> {
     let path = account_config_path()
         .ok_or_else(|| "no config directory; set HOME or XDG_CONFIG_HOME".to_string())?;
-    stage_account_config_at(path, config)
+    stage_account_config_at(path, config, first_run)
 }
 
 pub(crate) struct StagedAccountConfig {
     path: PathBuf,
     file: tempfile::NamedTempFile,
+    first_run: bool,
+    _lock: fs::File,
 }
 
 impl StagedAccountConfig {
-    pub(crate) fn publish(self) -> Result<PathBuf, String> {
-        self.file
-            .persist(&self.path)
-            .map_err(|err| format!("{}: {}", self.path.display(), err.error))?;
+    pub(crate) fn publish(self) -> Result<PathBuf, AccountFileError> {
+        let installed = if self.first_run {
+            self.file.persist_noclobber(&self.path)
+        } else {
+            self.file.persist(&self.path)
+        };
+        installed.map_err(|err| {
+            if self.first_run && err.error.kind() == std::io::ErrorKind::AlreadyExists {
+                AccountFileError::AlreadyConfigured
+            } else {
+                format!("{}: {}", self.path.display(), err.error).into()
+            }
+        })?;
         Ok(self.path)
     }
 }
@@ -259,23 +316,50 @@ impl StagedAccountConfig {
 pub(crate) fn stage_account_config_at(
     path: PathBuf,
     config: &AccountConfig,
-) -> Result<StagedAccountConfig, String> {
-    stage_account_text_at(path, &config.render())
+    first_run: bool,
+) -> Result<StagedAccountConfig, AccountFileError> {
+    let lock = lock_account_dir(&path)?;
+    stage_account_text_at(path, &config.render(), first_run, lock)
 }
 
-fn stage_account_text_at(path: PathBuf, config: &str) -> Result<StagedAccountConfig, String> {
-    use std::io::Write;
-
+fn lock_account_dir(path: &Path) -> Result<fs::File, AccountFileError> {
     let dir = path.parent().expect("account file has a parent directory");
     create_mailbox_dirs(dir).map_err(|err| err.to_string())?;
-    // NamedTempFile creates a private (0600 on Unix) file and gives each
-    // attempt its own path, so concurrent setup attempts cannot reuse it.
+    // Serialize setup through publication, since a concurrent attempt could
+    // otherwise replace the credential while this config is being written.
+    let lock = fs::File::open(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
+    lock.try_lock()
+        .map_err(|err| format!("Couldn't lock the account directory: {err}"))?;
+    Ok(lock)
+}
+
+fn stage_account_text_at(
+    path: PathBuf,
+    config: &str,
+    first_run: bool,
+    lock: fs::File,
+) -> Result<StagedAccountConfig, AccountFileError> {
+    use std::io::Write;
+
+    if first_run {
+        match path.symlink_metadata() {
+            Ok(_) => return Err(AccountFileError::AlreadyConfigured),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(format!("{}: {err}", path.display()).into()),
+        }
+    }
+    let dir = path.parent().expect("account file has a parent directory");
     let mut file =
         tempfile::NamedTempFile::new_in(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
     file.write_all(config.as_bytes())
         .and_then(|()| file.as_file().sync_all())
         .map_err(|err| format!("{}: {err}", file.path().display()))?;
-    Ok(StagedAccountConfig { path, file })
+    Ok(StagedAccountConfig {
+        path,
+        file,
+        first_run,
+        _lock: lock,
+    })
 }
 
 fn fallback(error: String) -> (Store, Opened) {
@@ -285,37 +369,60 @@ fn fallback(error: String) -> (Store, Opened) {
     (
         store,
         Opened {
-            account: fixture_account(),
+            account: Account {
+                id: AccountId(String::new()),
+                display_name: String::new(),
+                email: String::new(),
+                backend_kind: fell_core::BackendKind::Imap,
+            },
             sync: SyncKind::StoreError,
             error: Some(error),
+            warning: None,
         },
     )
 }
 
-fn prepare(
-    store: &Store,
-    config: Option<&AccountConfig>,
-) -> fell_core::Result<(Account, SyncKind)> {
+fn prepare(store: &Store, config: Option<&AccountConfig>, demo: bool) -> fell_core::Result<Opened> {
     if let Some(config) = config {
         let account = config.account();
-        store.upsert_account(&account)?;
-        // Before the window can archive anything, so the first action is
-        // queued for the server or not as the file says.
-        store.set_write_back(&account.id, config.write_back)?;
-        return Ok((account, SyncKind::Connecting));
+        let retained = store.configure_account(&account, config.write_back)?;
+        let warning =
+            (!retained.is_empty()).then(|| "Kept older local mail, drafts, and outbox".to_owned());
+        return Ok(Opened {
+            account,
+            sync: SyncKind::Connecting,
+            error: None,
+            warning,
+        });
     }
     let accounts = store.list_accounts()?;
-    if accounts.is_empty() {
+    if demo && accounts.is_empty() {
         let account = fixture_account();
         seed_if_empty(store, &account)?;
-        return Ok((account, SyncKind::FixtureOffline));
+        return Ok(Opened {
+            account,
+            sync: SyncKind::FixtureOffline,
+            error: None,
+            warning: None,
+        });
     }
-    let account = accounts.into_iter().next().unwrap();
-    if store.list_threads(&account.id)?.is_empty() {
-        Ok((account, SyncKind::FirstSync))
+    let account = accounts
+        .into_iter()
+        .find(|account| demo || !fell_core::is_demo_account(&account.id))
+        .ok_or_else(|| fell_core::Error::Invalid("No readable account configuration.".into()))?;
+    let sync = if fell_core::is_demo_account(&account.id) {
+        SyncKind::FixtureOffline
+    } else if store.list_threads(&account.id)?.is_empty() {
+        SyncKind::FirstSync
     } else {
-        Ok((account, SyncKind::LocalOffline))
-    }
+        SyncKind::LocalOffline
+    };
+    Ok(Opened {
+        account,
+        sync,
+        error: None,
+        warning: None,
+    })
 }
 
 fn open_at(path: &Path) -> fell_core::Result<Store> {
@@ -531,7 +638,7 @@ mod tests {
             "me@proton.me",
             fell_core::PasswordSource::Inline("p\"w #1".into()),
         );
-        stage_account_config_at(path.clone(), &config)
+        stage_account_config_at(path.clone(), &config, true)
             .unwrap()
             .publish()
             .unwrap();
@@ -548,7 +655,8 @@ mod tests {
             password: fell_core::PasswordSource::Keyring,
             ..config.clone()
         };
-        let staged = stage_account_config_at(path.clone(), &keyring).unwrap();
+        let staged = stage_account_config_at(path.clone(), &keyring, false).unwrap();
+        assert!(stage_account_config_at(path.clone(), &config, false).is_err());
         let staged_path = staged.file.path().to_owned();
         assert_eq!(
             read_account_config(&staged_path).unwrap(),
@@ -557,9 +665,9 @@ mod tests {
         // A failed keyring write drops the staged file and keeps the installed account.
         drop(staged);
         assert!(!staged_path.exists());
+        assert!(stage_account_config_at(path.clone(), &config, true).is_err());
         assert_eq!(read_account_config(&path).unwrap(), Some(config));
-
-        stage_account_config_at(path.clone(), &keyring)
+        stage_account_config_at(path.clone(), &keyring, false)
             .unwrap()
             .publish()
             .unwrap();
@@ -569,17 +677,82 @@ mod tests {
     #[test]
     fn configured_account_wins_over_fixture_mail() {
         let store = Store::open_in_memory().unwrap();
-        let (fixture, kind) = prepare(&store, None).unwrap();
-        assert_eq!(kind, SyncKind::FixtureOffline);
+        assert!(prepare(&store, None, false).is_err());
+        assert!(store.list_accounts().unwrap().is_empty());
+        let opened = prepare(&store, None, true).unwrap();
+        assert_eq!(opened.sync, SyncKind::FixtureOffline);
+        let fixture = opened.account;
+        assert!(prepare(&store, None, false).is_err());
+        for id in ["local", "fixture", "demo"] {
+            let mut demo = fixture.clone();
+            demo.id = AccountId(id.into());
+            seed_if_empty(&store, &demo).unwrap();
+            assert!(!store.list_threads(&demo.id).unwrap().is_empty());
+            store
+                .set_agent_grant(
+                    &demo.id,
+                    "bot",
+                    fell_core::AgentGrant::enabled(true, true, true),
+                )
+                .unwrap();
+        }
         let config = AccountConfig::bridge(
             "me@proton.me",
             "me@proton.me",
             fell_core::PasswordSource::Inline("x".into()),
         );
-        let (account, kind) = prepare(&store, Some(&config)).unwrap();
-        assert_eq!(kind, SyncKind::Connecting);
+        let opened = prepare(&store, Some(&config), true).unwrap();
+        assert_eq!(opened.sync, SyncKind::Connecting);
+        assert!(opened.warning.is_none());
+        let account = opened.account;
         assert_eq!(account.email, "me@proton.me");
-        assert_ne!(account.id, fixture.id);
+        assert_eq!(store.list_accounts().unwrap(), [account]);
+        assert!(store.list_agent_grants().unwrap().is_empty());
+        for id in ["local", "fixture", "demo"].map(|id| AccountId(id.into())) {
+            assert!(store.list_threads(&id).unwrap().is_empty());
+            assert!(
+                store
+                    .agent_grant(&id, "bot")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unknown account")
+            );
+        }
+    }
+
+    #[test]
+    fn a_reserved_real_account_keeps_the_disk_mailbox_open_on_each_launch() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mail.db");
+        let legacy = Account {
+            email: "legacy@example.test".into(),
+            ..fixture_account()
+        };
+        let store = Store::open(&path).unwrap();
+        store.upsert_account(&legacy).unwrap();
+        drop(store);
+
+        let config = AccountConfig::bridge(
+            "configured@example.test",
+            "configured@example.test",
+            fell_core::PasswordSource::Inline("test".into()),
+        );
+        for _ in 0..2 {
+            let (store, opened) = open_store(Ok(path.clone()), Some(&config), false);
+            assert_eq!(store.db_path(), Some(path.as_path()));
+            assert_eq!(opened.sync, SyncKind::Connecting);
+            assert!(opened.error.is_none());
+            assert_eq!(
+                opened.warning.as_deref(),
+                Some("Kept older local mail, drafts, and outbox")
+            );
+            assert_eq!(opened.account.id, config.account().id);
+            assert!(store.get_account(&opened.account.id).unwrap().is_some());
+            assert_eq!(
+                store.get_account(&legacy.id).unwrap().unwrap().email,
+                legacy.email
+            );
+        }
     }
 
     #[test]

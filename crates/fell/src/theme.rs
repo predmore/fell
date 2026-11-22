@@ -37,7 +37,9 @@ pub struct Theme {
     label_outline: u32,
     selected_label_outline: u32,
     pub error: u32,
+    pub success: u32,
     pub border: u32,
+    pub input_border: u32,
     pub star: u32,
     pub ui_family: Option<String>,
     pub ui_px: f32,
@@ -174,6 +176,7 @@ fn map_palette(
     let (foreground, dimmed) = text_pair(foreground, dimmed, surface);
     let accent_raw = color(raw, &["accent", "blue", "color4", "color12"]).unwrap_or(foreground);
     let error_raw = color(raw, &["red", "bright_red", "color1"]).unwrap_or(0xcc3333);
+    let success_raw = color(raw, &["green", "bright_green", "color2"]).unwrap_or(0x31935d);
     let star_raw = color(raw, &["yellow", "bright_yellow", "color3"]).unwrap_or(accent_raw);
     // The row highlight is the theme selection, or the theme surface when a
     // palette has no selection key. A light wash stays light. Text on it is
@@ -195,6 +198,7 @@ fn map_palette(
         let fill = mix(bg, fg, 0.14);
         (ensure(fg, fill, TEXT_CONTRAST), fill)
     };
+    let border = mix(background, foreground, 0.16);
     Theme {
         name,
         kind,
@@ -214,7 +218,13 @@ fn map_palette(
         // A warning chip sits on a selected row too, so the error colour
         // holds AA on the selection as well as on the page.
         error: ensure_all(error_raw, &[background, surface, selection], TEXT_CONTRAST),
-        border: mix(background, foreground, 0.16),
+        success: ensure_all(success_raw, &[background, surface], TEXT_CONTRAST),
+        border,
+        input_border: ensure_all(
+            mix(border, foreground, 0.35),
+            &[background, surface],
+            MARK_CONTRAST,
+        ),
         // The star shows on the selected row too, so it meets AA there.
         star: ensure_all(star_raw, &[background, surface, selection], TEXT_CONTRAST),
         ui_family: fonts.ui_family.clone(),
@@ -278,6 +288,7 @@ pub fn contrast_ok(theme: &Theme) -> bool {
             || contrast(theme.dimmed, bg) < TEXT_CONTRAST
             || contrast(theme.accent, bg) < TEXT_CONTRAST
             || contrast(theme.error, bg) < TEXT_CONTRAST
+            || contrast(theme.success, bg) < TEXT_CONTRAST
             || contrast(theme.star, bg) < TEXT_CONTRAST
         {
             return false;
@@ -308,6 +319,34 @@ pub fn contrast_ok(theme: &Theme) -> bool {
 /// so the caller polls instead.
 pub fn watch(changed: futures::channel::mpsc::UnboundedSender<()>) -> bool {
     watch_dirs(watched_dirs(), changed)
+}
+
+pub fn follow<V: 'static>(
+    cx: &mut gpui::Context<V>,
+    mut update: impl FnMut(&mut V, Theme, &mut gpui::Context<V>) + 'static,
+) {
+    use futures::StreamExt as _;
+
+    let (changed, mut changes) = futures::channel::mpsc::unbounded();
+    let watching = watch(changed);
+    cx.spawn(async move |this, cx| {
+        loop {
+            if watching {
+                if changes.next().await.is_none() {
+                    break;
+                }
+            } else {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(1))
+                    .await;
+            }
+            let next = cx.background_executor().spawn(async { load() }).await;
+            if this.update(cx, |view, cx| update(view, next, cx)).is_err() {
+                break;
+            }
+        }
+    })
+    .detach();
 }
 
 /// Each folder holding a file `load` reads, and that folder's parent, so a
@@ -1010,6 +1049,22 @@ mod tests {
         );
         drop(rx);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn onboarding_controls_meet_contrast_requirements() {
+        for theme in every_test_theme() {
+            let button = contrast(theme.accent, theme.background);
+            let border_on_page = contrast(theme.input_border, theme.background);
+            let border_on_input = contrast(theme.input_border, theme.surface);
+            assert!(button >= TEXT_CONTRAST, "{}", theme.name);
+            assert!(border_on_page >= MARK_CONTRAST, "{}", theme.name);
+            assert!(border_on_input >= MARK_CONTRAST, "{}", theme.name);
+            println!(
+                "{}: primary {button:.2}, input against page {border_on_page:.2}, input fill {border_on_input:.2}",
+                theme.name
+            );
+        }
     }
 
     #[test]

@@ -814,9 +814,9 @@ fn revoke(opts: &Opts, io: &mut Io<'_>) -> Result<(), CliError> {
 fn serve(opts: &Opts, io: &mut Io<'_>) -> Result<(), CliError> {
     fell_core::diagnostic!(INFO, "MCP server starting");
     let (_, store) = open_store(opts, io)?;
-    let account = opts.account.clone().unwrap_or_default();
+    let account = resolve_account(&store, opts.account.as_deref(), io)?.id;
     let agent = opts.agent.clone().unwrap_or_default();
-    let mut session = Session::new(store, AccountId(account), agent).map_err(CliError::new)?;
+    let mut session = Session::new(store, account, agent).map_err(CliError::new)?;
     // `cli_main` already holds the stdin lock in `io.input`; std's stdin
     // lock is not reentrant, so serve over the same handles.
     session
