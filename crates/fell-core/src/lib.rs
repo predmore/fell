@@ -73,8 +73,8 @@ pub use store::{
     folder_aliases,
 };
 pub use sync::{
-    ReplyToBackfill, ReplyToProgress, SyncReport, fetch_message_bodies, fetch_message_body,
-    fetch_missing_bodies, sync_once, sync_with_progress,
+    InboxArrival, ReplyToBackfill, ReplyToProgress, SyncReport, fetch_message_bodies,
+    fetch_message_body, fetch_missing_bodies, sync_once, sync_with_arrivals, sync_with_progress,
 };
 pub use threading::{ThreadId, header_parent_thread_id, resolve_thread_id};
 

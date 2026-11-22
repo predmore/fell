@@ -6,6 +6,7 @@ mod attachment_chips;
 mod diagnostics;
 pub(crate) mod disclosure;
 mod help;
+mod notification_actions;
 mod search;
 
 use std::cell::OnceCell;
@@ -13,7 +14,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use fell_core::{
     AccountConfig, AccountId, CidRepairBatch, CidRepairProgress, DropReason, DroppedWrite,
@@ -108,7 +109,7 @@ pub fn run(trace_start: Option<Instant>) {
                 if let Some(trace) = &trace {
                     trace.window_created(window);
                 }
-                let view = cx.new(Inbox::new);
+                let view = cx.new(|cx| Inbox::new(window, cx));
                 let focus = view.read(cx).focus.clone();
                 window.focus(&focus);
                 view
@@ -146,6 +147,8 @@ struct ReadIntent {
     /// Undo: select this thread when it is back in the folder, loading the
     /// rows around it if they are not loaded.
     select: Option<ListKey>,
+    /// A desktop notification opens the conversation after its row lands.
+    open_selected: bool,
     /// Rows the list asked for beyond the ones it holds.
     fetch: Fetch,
 }
@@ -155,7 +158,13 @@ impl ReadIntent {
         self.switch |= later.switch;
         self.refresh_open |= later.refresh_open;
         self.changed |= later.changed;
-        self.select = later.select.or(self.select);
+        if later.select.is_some() {
+            self.select = later.select;
+            self.open_selected = later.open_selected;
+        } else if later.switch && self.open_selected {
+            self.select = None;
+            self.open_selected = false;
+        }
         self.fetch = self.fetch.merge(later.fetch);
         self
     }
@@ -443,6 +452,8 @@ const LONG_GLIDE_PX: f32 = 4.0 * ROW_PX;
 
 struct Inbox {
     focus: FocusHandle,
+    viewing_inbox: Arc<AtomicBool>,
+    pending_activation: Option<crate::notifications::Activation>,
     /// The mailbox connection's own thread. The window never calls SQLite.
     store: StoreClient,
     startup_crash: Option<std::path::PathBuf>,
@@ -568,7 +579,7 @@ struct Warm {
 const WARM_ROWS: usize = 2;
 
 impl Inbox {
-    fn new(cx: &mut Context<Self>) -> Self {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let startup = mailbox::startup();
         let theme = theme::load();
         let config = startup.config.clone();
@@ -602,8 +613,24 @@ impl Inbox {
             session.record_startup_error(error);
         }
         let reader = cx.entity().downgrade();
+        let viewing_inbox = Arc::new(AtomicBool::new(window.is_window_active()));
+        let notifications = config
+            .as_ref()
+            .filter(|config| config.notifications)
+            .map(|config| {
+                let (queue, invoked) =
+                    crate::notifications::start(viewing_inbox.clone(), config.notification_content);
+                Self::watch_notifications(window.window_handle(), invoked, cx);
+                cx.observe_window_activation(window, |inbox, window, _| {
+                    inbox.track_inbox_visibility(window)
+                })
+                .detach();
+                queue
+            });
         let mut inbox = Self {
             focus: cx.focus_handle(),
+            viewing_inbox,
+            pending_activation: None,
             account_id: config
                 .as_ref()
                 .map(|config| config.account().id)
@@ -674,7 +701,9 @@ impl Inbox {
             let Ok(opened) = ready.await else {
                 return;
             };
-            let _ = this.update(cx, |inbox, cx| inbox.on_store_ready(opened, sync_with, cx));
+            let _ = this.update(cx, |inbox, cx| {
+                inbox.on_store_ready(opened, sync_with, notifications, cx)
+            });
         })
         .detach();
         inbox.show_crash_notice(cx);
@@ -720,6 +749,7 @@ impl Inbox {
         &mut self,
         opened: mailbox::Opened,
         sync_with: Option<(AccountConfig, std::path::PathBuf)>,
+        notifications: Option<crate::notifications::Queue>,
         cx: &mut Context<Self>,
     ) {
         if let Some(trace) = cx.try_global::<UiTrace>() {
@@ -749,7 +779,7 @@ impl Inbox {
         // Sync opens its own connection only after this one finished opening
         // and migrating the file, so the two never race for the first lock.
         if !store_failed && let Some((config, path)) = sync_with {
-            let (handle, events) = sync_worker::start(config, path);
+            let (handle, events) = sync_worker::start(config, path, notifications);
             self.sync = Some(handle);
             self.watch_sync(events, cx);
         }
@@ -990,7 +1020,14 @@ impl Inbox {
         let refresh_labels = self.session.loading || intent.changed || intent.is_refresh();
         let same_scope = folder == self.list_folder && label == self.list_label;
         // A folder the rows on screen do not come from opens at its top.
-        let span = if !same_scope || self.session.threads.is_empty() {
+        let span = if let Some(key) = intent.select.as_ref().filter(|_| intent.open_selected) {
+            FolderSpan::Window {
+                first: Some(key.clone()),
+                last: key.clone(),
+                before: self.session.load_rows / 2,
+                after: self.session.load_rows / 2,
+            }
+        } else if !same_scope || self.session.threads.is_empty() {
             FolderSpan::Top {
                 rows: self.session.load_rows,
             }
@@ -1376,6 +1413,12 @@ impl Inbox {
         }
         // A cursor move that waited for these rows may need more.
         self.issue_fetch(cx);
+        if intent.open_selected
+            && let Some(key) = intent.select
+            && self.session.cursor_id.as_deref() == Some(key.thread_id.as_str())
+        {
+            self.open_notification_selection(cx);
+        }
         cx.notify();
     }
 
@@ -3852,6 +3895,7 @@ impl Inbox {
 
 impl Render for Inbox {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.track_inbox_visibility(window);
         if !self.session.loading
             && let Some(start) = self.cid_repair.take()
         {

@@ -51,7 +51,8 @@ pub(super) fn observe(
     let before = split_field(&previous);
     // A Bridge observation carries a label mailbox's name. Generic IMAP
     // observations carry raw FLAGS keywords, which we keep on the copy.
-    let is_label = |keyword: &str| bridge || !is_reserved_keyword(keyword);
+    let bridge_view = bridge && super::views::has_view(conn, account_id, &copy.mailbox)?;
+    let is_label = |keyword: &str| bridge_view || !is_reserved_keyword(keyword);
     let removed = before
         .iter()
         .any(|keyword| is_label(keyword) && !contains(&unique, keyword));

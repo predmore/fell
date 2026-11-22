@@ -19,6 +19,8 @@
 //! # smtp_security = "starttls"  # "plain" only for a loopback address
 //! # sent_folder = "Sent Items"  # only for a server that does not mark its folders
 //! # write_back = true           # send moves and flag changes to the server (off by default)
+//! # notifications = false       # disable desktop notifications for this account
+//! # notification_content = false # show only "New mail"
 //! ```
 //!
 //! Sync learns which folder is Sent, Drafts, Trash and so on from the
@@ -86,6 +88,8 @@ pub struct AccountConfig {
     pub folders: Vec<(FolderRole, String)>,
     /// `write_back = true` sends moves and read and star changes to the server.
     pub write_back: bool,
+    pub notifications: bool,
+    pub notification_content: bool,
 }
 
 impl AccountConfig {
@@ -111,6 +115,8 @@ impl AccountConfig {
             smtp_security: None,
             folders: Vec::new(),
             write_back: false,
+            notifications: true,
+            notification_content: true,
         }
     }
 
@@ -233,6 +239,14 @@ impl AccountConfig {
             .map(|value| value.flag("write_back"))
             .transpose()?
             .unwrap_or(false);
+        let notifications = get("notifications")
+            .map(|value| value.flag("notifications"))
+            .transpose()?
+            .unwrap_or(true);
+        let notification_content = get("notification_content")
+            .map(|value| value.flag("notification_content"))
+            .transpose()?
+            .unwrap_or(true);
         if let Some((key, _)) = fields.first() {
             return Err(invalid(format!("unknown key {key}")));
         }
@@ -252,6 +266,8 @@ impl AccountConfig {
             smtp_security,
             folders,
             write_back,
+            notifications,
+            notification_content,
         };
         config.validate()?;
         Ok(config)
@@ -343,6 +359,12 @@ impl AccountConfig {
         }
         if self.write_back {
             out.push_str("write_back = true\n");
+        }
+        if !self.notifications {
+            out.push_str("notifications = false\n");
+        }
+        if !self.notification_content {
+            out.push_str("notification_content = false\n");
         }
         out
     }
@@ -757,6 +779,20 @@ mod tests {
             let err = AccountConfig::parse(&format!("{base}{line}")).unwrap_err();
             assert!(err.to_string().contains(message), "{line}: {err}");
         }
+    }
+
+    #[test]
+    fn notifications_default_to_showing_content_and_round_trip() {
+        let base = "email = \"a@b\"\npassword = \"x\"\n";
+        let default = AccountConfig::parse(base).unwrap();
+        assert!(default.notifications && default.notification_content);
+        let private =
+            AccountConfig::parse(&format!("{base}notification_content = false\n")).unwrap();
+        assert!(private.notifications && !private.notification_content);
+        assert_eq!(AccountConfig::parse(&private.render()).unwrap(), private);
+        let disabled = AccountConfig::parse(&format!("{base}notifications = false\n")).unwrap();
+        assert!(!disabled.notifications && disabled.notification_content);
+        assert_eq!(AccountConfig::parse(&disabled.render()).unwrap(), disabled);
     }
 
     #[test]

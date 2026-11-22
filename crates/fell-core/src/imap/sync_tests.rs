@@ -277,6 +277,100 @@ fn local_server_syncs_into_the_store() {
 }
 
 #[test]
+fn inbox_arrivals_skip_history_copies_seen_sent_muted_and_junk() {
+    let mut state = sample_state();
+    let inbox = state
+        .mailboxes
+        .iter_mut()
+        .find(|m| m.name == "INBOX")
+        .unwrap();
+    inbox.messages[1].flags.push("$MuTeD".into());
+    for name in ["Spam", "Trash"] {
+        state.mailboxes.push(FixtureMailbox {
+            name: name.into(),
+            list_flags: String::new(),
+            uidvalidity: 1,
+            uidnext: None,
+            omit_uidnext: false,
+            reject_examine: false,
+            reject_fetch: false,
+            vanished: Vec::new(),
+            messages: Vec::new(),
+        });
+    }
+    let server = TestServer::spawn(state);
+    let acct = account("notifications", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let store = Store::open_in_memory().unwrap();
+    let sync = |arrivals: &mut Vec<_>| {
+        crate::sync_with_arrivals(
+            &acct,
+            &backend,
+            &store,
+            &mut |_| {},
+            Some(&mut |batch| {
+                for arrival in batch.unwrap() {
+                    assert!(store.message(&acct.id, &arrival.id).unwrap().is_some());
+                    arrivals.push(arrival);
+                }
+            }),
+        )
+        .unwrap();
+    };
+    let mut arrivals = Vec::new();
+    sync(&mut arrivals);
+    assert!(arrivals.is_empty());
+
+    {
+        let mut state = server.state.lock().unwrap();
+        for (folder, uid, id, parent, from, flags) in [
+            ("INBOX", 6, "valid@x", None, "Avery <avery@x>", &[][..]),
+            ("INBOX", 7, "seen@x", None, "avery@x", &["\\Seen"][..]),
+            ("INBOX", 8, "mine@x", None, "C@X", &[][..]),
+            ("INBOX", 9, "muted@x", Some("reply@x"), "avery@x", &[][..]),
+            ("INBOX", 10, "junk@x", None, "avery@x", &["$Junk"][..]),
+            ("INBOX", 11, "root@x", None, "avery@x", &[][..]),
+            ("Spam", 1, "spam@x", None, "avery@x", &[][..]),
+            ("Trash", 1, "trash@x", None, "avery@x", &[][..]),
+            ("Sent", 2, "sent@x", None, "avery@x", &[][..]),
+        ] {
+            state
+                .mailboxes
+                .iter_mut()
+                .find(|m| m.name == folder)
+                .unwrap()
+                .messages
+                .push(FixtureMessage {
+                    uid,
+                    flags: flags.iter().map(|flag| (*flag).into()).collect(),
+                    modseq: 2,
+                    body_form: BodyForm::Literal,
+                    raw: raw_message(
+                        id,
+                        parent,
+                        "New",
+                        from,
+                        "First line\r\nPrivate second line",
+                        "",
+                    ),
+                });
+        }
+    }
+    sync(&mut arrivals);
+    assert_eq!(arrivals.len(), 1);
+    assert_eq!(arrivals[0].id.as_str(), "valid@x");
+    assert_eq!(arrivals[0].sender, "Avery");
+    assert_eq!(arrivals[0].snippet, "First line");
+    arrivals.clear();
+    sync(&mut arrivals);
+    assert!(arrivals.is_empty());
+}
+
+#[test]
 fn second_sync_fetches_only_new_uids() {
     let server = TestServer::spawn(sample_state());
     let acct = account("a1", BackendKind::Imap);

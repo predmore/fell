@@ -21,12 +21,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use fell_core::{
     Account, AccountConfig, BackendKind, DroppedWrite, InboxWait, MessageId, MessageParts,
     ReplyToBackfill, ReplyToProgress, Store, SyncFailureKind, SyncReport, diagnostic,
-    fetch_message_bodies, fetch_missing_bodies, sync_with_progress,
+    fetch_message_bodies, fetch_missing_bodies, sync_with_arrivals,
 };
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use futures::channel::oneshot;
 
 use crate::model::{SyncFailure, SyncKind};
+use crate::notifications;
 use crate::worker::{Restart, Worker, WorkerEvent};
 
 /// Longest time between passes after a pass succeeds. IDLE on INBOX starts
@@ -243,13 +244,15 @@ fn refuse_body(ask: BodyAsk) {
 pub fn start(
     config: AccountConfig,
     store_path: PathBuf,
+    notifications: Option<notifications::Queue>,
 ) -> (SyncHandle, UnboundedReceiver<SyncEvent>) {
-    start_with(config, store_path, || {})
+    start_with(config, store_path, notifications, || {})
 }
 
 fn start_with(
     config: AccountConfig,
     store_path: PathBuf,
+    notifications: Option<notifications::Queue>,
     mut before_run: impl FnMut() + Send + 'static,
 ) -> (SyncHandle, UnboundedReceiver<SyncEvent>) {
     let (events_tx, events) = unbounded();
@@ -263,7 +266,7 @@ fn start_with(
             });
             restart.run(|recovered| {
                 before_run();
-                run(&config, &store_path, &events_tx, &wake_rx, recovered);
+                run(&config, &store_path, &events_tx, &wake_rx, recovered, notifications.as_ref());
             });
         })
         .expect("spawn sync thread");
@@ -276,6 +279,7 @@ fn run(
     events: &UnboundedSender<SyncEvent>,
     wake: &Receiver<Request>,
     recovered: &mut dyn FnMut(),
+    notifications: Option<&notifications::Queue>,
 ) {
     let bridge = config.backend == BackendKind::Bridge;
     let send = |kind: SyncKind| events.unbounded_send(SyncEvent::Status(kind)).is_ok();
@@ -347,25 +351,39 @@ fn run(
         let mut progress = PassProgress::default();
         let mut batches = 0usize;
         let mut confirmed = 0;
+        let mut on_arrivals = |arrivals| {
+            if let Some(queue) = notifications {
+                queue.committed(arrivals);
+            }
+        };
         let result = config.backend().and_then(|backend| {
-            sync_with_progress(&account, backend.as_ref(), &store, &mut |report| {
-                if report.confirmed_drafts.len() > confirmed {
-                    alive &= events
-                        .unbounded_send(SyncEvent::SendsConfirmed(
-                            report.confirmed_drafts[confirmed..].to_vec(),
-                        ))
-                        .is_ok();
-                    confirmed = report.confirmed_drafts.len();
-                }
-                batches += 1;
-                if batches.is_multiple_of(CHECKPOINT_EVERY) {
-                    let _ = store.checkpoint(false);
-                }
-                if let Some(status) = progress.update(report, Instant::now()) {
-                    alive &= send(status);
-                }
-            })
+            sync_with_arrivals(
+                &account,
+                backend.as_ref(),
+                &store,
+                &mut |report| {
+                    if report.confirmed_drafts.len() > confirmed {
+                        alive &= events
+                            .unbounded_send(SyncEvent::SendsConfirmed(
+                                report.confirmed_drafts[confirmed..].to_vec(),
+                            ))
+                            .is_ok();
+                        confirmed = report.confirmed_drafts.len();
+                    }
+                    batches += 1;
+                    if batches.is_multiple_of(CHECKPOINT_EVERY) {
+                        let _ = store.checkpoint(false);
+                    }
+                    if let Some(status) = progress.update(report, Instant::now()) {
+                        alive &= send(status);
+                    }
+                },
+                notifications.map(|_| &mut on_arrivals as &mut dyn FnMut(_)),
+            )
         });
+        if let Some(queue) = notifications {
+            queue.pass_ended();
+        }
         if !alive {
             return;
         }
@@ -796,7 +814,7 @@ mod restart_tests {
         let path =
             std::path::PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap()).join("mail.db");
         let mut first = true;
-        let (_handle, mut events) = start_with(config, path, move || {
+        let (_handle, mut events) = start_with(config, path, None, move || {
             assert!(!std::mem::take(&mut first), "synthetic-panic-payload");
         });
 

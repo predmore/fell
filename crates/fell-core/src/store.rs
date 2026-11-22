@@ -26,6 +26,7 @@ use crate::threading::{ThreadId, resolve_thread_id};
 pub(crate) mod bodies;
 pub(crate) mod copies;
 mod dates;
+pub(crate) mod inbox_arrivals;
 pub(crate) mod intents;
 pub(crate) mod keywords;
 mod part_cache;
@@ -744,6 +745,15 @@ impl Store {
         account_id: &AccountId,
         delta: &MailboxDelta,
     ) -> Result<DeltaWrites> {
+        self.apply_sync_delta_observed(account_id, delta, None)
+    }
+
+    pub(crate) fn apply_sync_delta_observed(
+        &self,
+        account_id: &AccountId,
+        delta: &MailboxDelta,
+        mut observer: Option<&mut inbox_arrivals::Observer<'_>>,
+    ) -> Result<DeltaWrites> {
         let mut tx = self.begin_sync_write()?;
         let mut merge_roles = MergeRoles::new(delta.roles.as_ref());
         let bridge = (!delta.flags.is_empty() || !delta.links.is_empty())
@@ -754,6 +764,7 @@ impl Store {
             false
         };
         let mut new_messages = 0;
+        let mut inbox_arrivals = Vec::new();
         let keyword_copies: HashSet<_> = if delta.messages.is_empty() {
             HashSet::new()
         } else {
@@ -776,13 +787,20 @@ impl Store {
             let Some(mut message) = crate::actions::message_for_delta(&tx, message)? else {
                 continue;
             };
-            views::project_arrival(&tx, &mut message)?;
+            let projected = views::project_arrival(&tx, &mut message)?;
             // These labels have copy provenance and are applied with FLAGS below.
-            if keyword_copies.contains(&message.remote_id.0) {
+            if keyword_copies.contains(&message.remote_id.0) && (!bridge || projected) {
                 message.labels.clear();
             }
             // A combined delta can carry the listing for these messages.
-            new_messages += usize::from(insert_message(&tx, &message, &mut merge_roles)?);
+            if insert_message(&tx, &message, &mut merge_roles)? {
+                new_messages += 1;
+                if let Some(watch) = &observer
+                    && watch.is_arrival(&message)
+                {
+                    inbox_arrivals.push(message.headers.message_id.clone());
+                }
+            }
             if let Some(date) = delta.deferred_dates.get(&message.remote_id)
                 && message.headers.date_unix == 0
                 && let Some(id) = canonical_id_on(&tx, account_id, &message.headers.message_id)?
@@ -822,6 +840,9 @@ impl Store {
                 self.rethread_written(&tx, account_id)?;
             }
             tx.commit()?;
+            if let Some(watch) = observer.take() {
+                watch.committed(self, &inbox_arrivals);
+            }
             #[cfg(test)]
             if let Some(hook) = self.on_sync_commit.borrow_mut().as_mut() {
                 hook()?;
@@ -843,6 +864,9 @@ impl Store {
             set_sync_cursor_on(&tx, account_id, cursor)?;
         }
         tx.commit()?;
+        if let Some(watch) = observer {
+            watch.committed(self, &inbox_arrivals);
+        }
         self.seal_private_files()?;
         Ok(DeltaWrites {
             new_messages,
@@ -1058,6 +1082,15 @@ impl Store {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    /// Resolve a message or collapsed alias to its current conversation.
+    pub fn thread_for_message(
+        &self,
+        account: &AccountId,
+        id: &MessageId,
+    ) -> Result<Option<ThreadId>> {
+        thread_id_for_message_id(&self.conn, account, id)
     }
 
     /// The list snippet for a canonical message ID from a search hit.

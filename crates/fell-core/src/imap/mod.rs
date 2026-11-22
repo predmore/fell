@@ -1812,10 +1812,22 @@ fn flag_update(
                     .into_iter()
                     .collect(),
             ),
-            _ => (mode.keywords && item.flags_present).then(|| rfc822::keywords(&item.flags)),
+            _ if mode.keywords => item.flags_present.then(|| rfc822::keywords(&item.flags)),
+            None => item.flags_present.then(|| {
+                item.flags
+                    .iter()
+                    .filter(|flag| is_delivery_keyword(flag))
+                    .cloned()
+                    .collect()
+            }),
+            _ => None,
         },
         modseq: item.modseq,
     }
+}
+
+fn is_delivery_keyword(flag: &str) -> bool {
+    flag.eq_ignore_ascii_case("$Muted") || flag.eq_ignore_ascii_case("$Junk")
 }
 
 /// Reserved IMAP flags and keywords, matched as whole, case-insensitive atoms.
