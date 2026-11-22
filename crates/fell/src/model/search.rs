@@ -585,6 +585,7 @@ impl Session {
         if let Some(error) = reply.error.take() {
             // An invalid query has no result set of its own. Keep the last
             // valid rows, cursor and reader while presenting the error.
+            self.clear_toast();
             let search = self.search.as_mut().unwrap();
             self.deferred_read = None;
             search.pending = false;
@@ -1188,6 +1189,45 @@ mod tests {
         );
         assert_eq!(session.threads.len(), 1);
         assert!(!session.search_results_current());
+        session.on_key(KeyId::Escape, 10);
+        assert!(session.status_notice().is_none());
+    }
+
+    #[test]
+    fn a_search_error_replaces_a_label_notice_that_survived_typing() {
+        let mut session = session();
+        session.show_label_toast(crate::present::LabelNotice {
+            verb: "Removed",
+            label: "travel".into(),
+            relation: "from",
+            subject: None,
+            count: 1,
+            undo: true,
+        });
+        let removal = session.toast_generation();
+
+        session.on_key(KeyId::Char('/'), 10);
+        session.dismiss_key_notice(removal, false);
+        session.type_search("after:not-a-date");
+        session.on_key(KeyId::Enter, 10);
+        session.dismiss_key_notice(removal, false);
+        assert!(session.status_notice().unwrap().label.is_some());
+
+        let store = fell_core::Store::open_in_memory().unwrap();
+        let account = crate::fixtures::fixture_account();
+        let result = store.search(&account.id, "after:not-a-date");
+        land(
+            &mut session,
+            SearchReply::new(
+                result,
+                HashMap::new(),
+                HashMap::new(),
+                "reader@example.test",
+            ),
+        );
+        let notice = session.status_notice().unwrap();
+        assert_eq!(notice.text, "expected YYYY-MM-DD, got not-a-date");
+        assert!(notice.alert);
         session.on_key(KeyId::Escape, 10);
         assert!(session.status_notice().is_none());
     }

@@ -3883,6 +3883,7 @@ impl Render for Inbox {
                     .any(|message| message.expanded && &message.id == id)
             });
         self.want_bodies(cx);
+        self.motion.narrow_status = width < present::NARROW_WIDTH;
         self.motion.observe(&self.session, panes, now);
         let reflow = self.motion.reading_reflow(now);
         let list_width = list_width(width, self.split);
@@ -8019,7 +8020,7 @@ fn status_bar(
         let measure = |text: &str| bar_px(window, text, size, ui);
         let text = toast.label.as_ref().map_or_else(
             || present::fit_notice(&toast.text, room, measure),
-                |label| label.fit(room, measure),
+            |label| label.fit(room, measure),
         );
         div()
             .overflow_hidden()

@@ -20,6 +20,8 @@ use crate::worker::Worker;
 /// slow frame two rows never look selected.
 pub const SELECTION_FROM: f32 = 0.6;
 
+const STATUS_SWAP_OUT: Duration = Duration::from_millis(60);
+
 /// The folder label and count leaving the header as a pair.
 pub struct FolderHeaderFade {
     pub folder: String,
@@ -192,6 +194,8 @@ pub struct InboxMotion {
     pub conv_glide: Option<Glide>,
     last_worker_outage: Option<Worker>,
     sync_in: Option<Transition>,
+    /// Sync and notices share a cell in a narrow status bar.
+    pub narrow_status: bool,
     toast_in: Option<Transition>,
     /// The notice that is leaving and its fade.
     toast_out: Option<((Toast, f32), Transition)>,
@@ -333,6 +337,7 @@ impl InboxMotion {
             conv_glide: None,
             last_worker_outage: None,
             sync_in: None,
+            narrow_status: false,
             toast_in: None,
             toast_out: None,
             last_toast: None,
@@ -571,7 +576,9 @@ impl InboxMotion {
         let conversation = self.conv_glide.take();
         self.list_from = list.map(|glide| glide.value(now));
         self.conv_from = conversation.map(|glide| glide.value(now));
-        if self.toast_out.is_none() {
+        let sync_leaving =
+            self.narrow_status && self.last_toast.is_some() && self.sync_opacity(now) > 0.0;
+        if self.toast_out.is_none() && !sync_leaving {
             self.toast_in = None;
         }
         self.sync_in = None;
@@ -901,16 +908,20 @@ impl InboxMotion {
             (Some(toast), Some(old)) if *toast != old.0 => {
                 // Narrow layouts share one cell. Finish the old text before
                 // the next can rise into it, and keep sync out of the handoff.
-                let out = Duration::from_millis(60);
-                self.toast_out = start(out).map(|fade| (old, fade));
-                self.toast_in = self.motion.start(motion::QUICK, now + out);
+                self.toast_out = start(STATUS_SWAP_OUT).map(|fade| (old, fade));
+                self.toast_in = self.motion.start(motion::QUICK, now + STATUS_SWAP_OUT);
             }
             (Some(_), Some(_)) => {
                 // Repeating the same notice keeps it visible.
             }
             (Some(_), None) => {
-                self.toast_in = start(motion::FADE);
-                self.sync_fade = start(motion::FADE).map(|fade| (sync, fade));
+                let (sync_out, notice_delay, notice_in) = if self.narrow_status && sync > 0.0 {
+                    (STATUS_SWAP_OUT, STATUS_SWAP_OUT, motion::QUICK)
+                } else {
+                    (motion::FADE, Duration::ZERO, motion::FADE)
+                };
+                self.sync_fade = start(sync_out).map(|fade| (sync, fade));
+                self.toast_in = self.motion.start(notice_in, now + notice_delay);
                 self.hints_from = if self.last_chord { 0.0 } else { 1.0 };
                 self.hints_out = start(motion::FADE);
             }
@@ -1256,20 +1267,41 @@ mod tests {
     }
 
     #[test]
+    fn narrow_sync_text_fades_out_before_the_first_notice_rises() {
+        let now = Instant::now();
+        let mut motions = InboxMotion::new(Motion::new(true));
+        motions.narrow_status = true;
+        let mut session = session();
+        session.show_toast("Archived · u", false);
+        motions.observe(&session, (true, false), now);
+
+        let halfway = later(now, 30);
+        motions.settle(halfway);
+        for ms in [0, 17, 30, 59, 60, 61, 77, 139, 140] {
+            let status = motions.status(&session, later(now, ms));
+            let (_, opacity) = status.notice.unwrap();
+            assert_eq!(status.sync > 0.0, ms < 60, "{ms} ms");
+            assert_eq!(opacity > 0.0, ms > 60, "{ms} ms");
+            assert_eq!(status.notice_dy == motion::NOTICE_RISE_PX, ms <= 60);
+        }
+        assert_eq!(
+            notice_opacity(&motions, &session, later(now, 140)),
+            Some(1.0)
+        );
+    }
+
+    #[test]
     fn narrow_sync_text_returns_after_the_last_notice_fades_out() {
         let now = Instant::now();
         let mut motions = InboxMotion::new(Motion::new(true));
+        motions.narrow_status = true;
         let mut session = session();
         assert_eq!(motions.status(&session, now).sync, 1.0);
         session.show_toast("Removed a label", false);
         motions.observe(&session, (true, false), now);
         assert_eq!(motions.status(&session, now).sync, 1.0);
 
-        let halfway = now + motion::FADE / 2;
-        let during = motions.status(&session, halfway);
-        assert!((0.0..1.0).contains(&during.sync));
-        assert_eq!(during.sync + during.notice.unwrap().1, 1.0);
-        let entered = now + motion::FADE;
+        let entered = now + STATUS_SWAP_OUT + motion::QUICK;
         assert_eq!(motions.status(&session, entered).sync, 0.0);
 
         session.clear_toast();
@@ -1285,6 +1317,7 @@ mod tests {
         assert_eq!(motions.status(&session, gone + motion::FADE).sync, 1.0);
 
         let mut reduced = InboxMotion::new(Motion::new(false));
+        reduced.narrow_status = true;
         session.show_toast("Removed a label", false);
         reduced.observe(&session, (true, false), now);
         assert_eq!(reduced.status(&session, now).sync, 0.0);
