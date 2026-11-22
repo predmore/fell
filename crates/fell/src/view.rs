@@ -774,6 +774,7 @@ impl Inbox {
             },
             notices,
         );
+        cx.set_global(crate::compose_ui::RecipientStore(store.clone()));
         let (name, email) = match &config {
             Some(config) => {
                 let account = config.account();
@@ -3687,6 +3688,7 @@ impl Inbox {
             self.reader_took_over(false);
             cx.notify();
         }
+        self.settle_correspondent_menu();
         if self.session.search_editing() && self.search_edit_key(event, started, cx) {
             cx.stop_propagation();
             // Prepare the edited field as soon as input dispatch has
@@ -4944,6 +4946,7 @@ impl Render for Inbox {
         let cached_search_rows = self.search_rows_for(animating);
         let background = theme.background;
         let leaving_banner = self.motion.leaving_banner(now);
+        let recipient_popup = self.search_recipient_popup(window, cx, real);
         let root = shell(
             theme,
             &self.session,
@@ -4966,6 +4969,7 @@ impl Render for Inbox {
                     cached_results: cached_search_rows,
                 },
                 status_labels,
+                recipient_popup,
             },
             width,
             (list_width, split_width),
@@ -5047,6 +5051,7 @@ struct Shown {
     cached_preview: Option<(u64, gpui::AnyView)>,
     list: ListContent,
     status_labels: StatusLabelsFrame,
+    recipient_popup: Option<gpui::Deferred>,
 }
 
 struct LeavingReader {
@@ -5221,6 +5226,7 @@ fn shell(
         cached_preview,
         list,
         status_labels,
+        recipient_popup,
     } = shown;
     let frames = conv.frames.clone();
     let same_scope = session.search.is_none()
@@ -5366,6 +5372,7 @@ fn shell(
                 window,
             ),
         })
+        .children(recipient_popup)
         .child(
             div()
                 .relative()

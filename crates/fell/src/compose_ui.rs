@@ -1,6 +1,9 @@
 //! Compose window. The buffer is plain markdown. Styling is a view of that
 //! text, through the same document model the conversation renderer uses.
 
+mod recipients;
+pub(crate) use recipients::RecipientStore;
+
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv6Addr;
 use std::ops::Range;
@@ -280,6 +283,8 @@ pub struct ComposeView {
     bcc_line: String,
     subject_line: String,
     field_col: usize,
+    recipients: recipients::Completion,
+    frames: Option<crate::frame_log::SharedFrameLog>,
     theme: ThemeKind,
     /// The Omarchy theme this window follows, live. `None` uses the
     /// built-in palette for `theme`.
@@ -363,6 +368,8 @@ impl ComposeView {
             bcc_line: join_addrs(&snap.bcc),
             subject_line: snap.subject,
             field_col: 0,
+            recipients: recipients::Completion::default(),
+            frames: crate::frame_log::FrameLog::from_env(),
             theme: ThemeKind::Dark,
             look: None,
             raw: false,
@@ -1256,7 +1263,11 @@ impl ComposeView {
             return;
         }
         if self.field != Field::Body {
-            self.field_key(key, typed);
+            if palette_shortcut {
+                self.palette = Some(String::new());
+            } else if !self.recipient_key(key, &event.keystroke.modifiers) {
+                self.field_key(key, typed);
+            }
             return;
         }
         if event.keystroke.modifiers.control && key == "enter" {
@@ -1334,6 +1345,9 @@ impl ComposeView {
                     .clear(self.draft_id.as_ref());
             }
             "send" => self.send(cx),
+            "complete recipient" if locked.is_none() => {
+                self.accept_recipient(self.recipients.selected());
+            }
             "discard" => self.discard(cx),
             "preview" => {
                 self.preview = !self.preview;
@@ -1735,7 +1749,13 @@ impl ComposeView {
 
 impl Render for ComposeView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(frames) = &self.frames {
+            frames
+                .borrow_mut()
+                .render_started(std::time::Instant::now(), self.recipients.animating());
+        }
         self.sync_from_hub();
+        self.update_recipient_completion(cx);
         if self.closing {
             window.remove_window();
         }
@@ -1811,6 +1831,7 @@ impl Render for ComposeView {
             .and_then(|theme| theme.ui_family.clone())
             .unwrap_or_else(|| "Liberation Sans".into());
         let wide = window.viewport_size().width > px(640.);
+        let overlay = self.recipient_overlay(window, cx, colors);
         let feedback = self.send_feedback.feedback(lock, attempt.as_ref());
         if (self.send_panel == SendPanel::ConfirmUnlock && lock != Some(SendLock::MaybeSent))
             || (self.send_panel == SendPanel::Details
@@ -1860,8 +1881,17 @@ impl Render for ComposeView {
         div()
             .id("compose")
             .track_focus(&self.focus)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if let Some(frames) = &this.frames {
+                    frames
+                        .borrow_mut()
+                        .key(std::time::Instant::now(), event.keystroke.unparse());
+                }
                 this.on_key(event, cx);
+                this.update_recipient_completion(cx);
+                if matches!(this.field, Field::To | Field::Cc | Field::Bcc) {
+                    window.defer(cx, |window, cx| window.draw(cx).clear());
+                }
                 // Every key can change what is on screen (cursor, focused
                 // edit, status), not only the ones that touch the draft.
                 cx.notify();
@@ -1875,6 +1905,17 @@ impl Render for ComposeView {
             .text_size(px(16.))
             .font_weight(FontWeight(400.))
             .font_family(ui_family.clone())
+            .when_some(self.frames.clone(), |root, frames| {
+                let paint = frames.clone();
+                root.child(
+                    gpui::canvas(
+                        move |_, _, _| frames.borrow_mut().mark(0, std::time::Instant::now()),
+                        move |_, _, _, _| paint.borrow_mut().mark(2, std::time::Instant::now()),
+                    )
+                    .absolute()
+                    .size_0(),
+                )
+            })
             .child(header(&snap, colors).flex_shrink_0())
             // Everything between the header and the Attachments divider:
             // the HTML preview panel covers exactly this, so it never ends
@@ -1887,8 +1928,16 @@ impl Render for ComposeView {
                     .flex_1()
                     .min_h(px(0.))
                     .child(
-                        self.fields_view(&snap, colors, wide, window, &ui_family, reply_check)
-                            .flex_shrink_0(),
+                        self.fields_view(
+                            &snap,
+                            colors,
+                            wide,
+                            window,
+                            &ui_family,
+                            reply_check,
+                            overlay,
+                        )
+                        .flex_shrink_0(),
                     )
                     .child(self.body_view(&snap, colors, window, &ui_family, cx))
                     .children(
@@ -1924,12 +1973,28 @@ impl Render for ComposeView {
                     matches!(lock, None | Some(SendLock::MaybeSent)),
                     colors,
                 )
+                .when(self.recipients.has_matches(), |panel| {
+                    panel.child(div().text_sm().child("Complete recipient"))
+                })
             }))
             .children(self.preview.then(|| preview_scrim(colors)))
+            .when_some(self.frames.clone(), |root, frames| {
+                frames.borrow_mut().built(std::time::Instant::now());
+                let prepaint = frames.clone();
+                root.child(
+                    gpui::canvas(
+                        move |_, _, _| prepaint.borrow_mut().mark(1, std::time::Instant::now()),
+                        move |_, _, _, _| frames.borrow_mut().painted(std::time::Instant::now()),
+                    )
+                    .absolute()
+                    .size_0(),
+                )
+            })
     }
 }
 
 impl ComposeView {
+    #[allow(clippy::too_many_arguments)]
     fn fields_view(
         &self,
         snap: &Snapshot,
@@ -1938,7 +2003,16 @@ impl ComposeView {
         window: &Window,
         family: &str,
         reply_check: Option<ReplyCheck>,
+        overlay: Option<(Field, gpui::Deferred)>,
     ) -> gpui::Div {
+        let mut overlay = overlay;
+        let mut overlay_for = |field| {
+            if overlay.as_ref().is_some_and(|(anchor, _)| *anchor == field) {
+                overlay.take().map(|(_, popup)| popup)
+            } else {
+                None
+            }
+        };
         let mut column = div().flex().flex_col().bg(rgb(colors.panel)).px_4().py_1();
         let redirects = redirects(snap);
         // A context row's subject gives way, with an ellipsis, so who and
@@ -1970,6 +2044,7 @@ impl ComposeView {
             wide,
             &redirects,
             Some(to_hint),
+            overlay_for(Field::To),
         );
         // Cc and Bcc always keep a row each, so tabbing into them never
         // moves the body.
@@ -1983,6 +2058,7 @@ impl ComposeView {
             wide,
             &none,
             Some(("none", colors.dim)),
+            overlay_for(Field::Cc),
         );
         column = field_row(
             column,
@@ -1994,6 +2070,7 @@ impl ComposeView {
             wide,
             &none,
             Some(("none", colors.dim)),
+            overlay_for(Field::Bcc),
         );
         column
             .child(subject_row(
@@ -2473,8 +2550,8 @@ fn log_send_result(result: &Result<fell_core::SentMessage, SendFailure>) {
     }
 }
 
-/// Keep the Bcc of a message the server has, or may have, so the Sent copy
-/// shows it once it syncs. A message that was not sent leaves no record.
+/// Keep confirmed recipients for completion and Bcc for the Sent copy.
+/// A draft whose transmission failed leaves no record.
 /// The write runs on its own thread with a few retries: the mail already
 /// went out, so a busy mailbox must neither hold up the send nor lose this.
 fn remember_bcc(record: fell_core::compose::SentCopy) {
@@ -2588,6 +2665,7 @@ fn field_row(
     wide: bool,
     redirects: &HashSet<String>,
     placeholder: Option<(&str, u32)>,
+    overlay: Option<gpui::Deferred>,
 ) -> gpui::Div {
     // While a field is being edited it shows the raw line. Otherwise each
     // address stands alone, with its note beside it: "(first time)" for one
@@ -2672,6 +2750,7 @@ fn field_row(
     };
     parent.child(
         div()
+            .relative()
             .flex()
             .gap_3()
             .px_1()
@@ -2686,7 +2765,8 @@ fn field_row(
                     .text_color(rgb(colors.fg))
                     .child(label.to_string()),
             )
-            .child(shown.flex_1().min_w(px(0.))),
+            .child(shown.flex_1().min_w(px(0.)))
+            .children(overlay),
     )
 }
 
@@ -5968,6 +6048,7 @@ fn palette_action(query: &str) -> Option<&'static str> {
         return Some("unlock");
     }
     match query.as_str() {
+        "complete recipient" | "complete" => return Some("complete recipient"),
         "details" => return Some("details"),
         "dismiss" => return Some("dismiss"),
         _ => {}

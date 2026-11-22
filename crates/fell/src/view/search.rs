@@ -11,8 +11,9 @@ use gpui::{HighlightStyle, StyledText};
 
 use super::*;
 use crate::model::search::{
-    CompletionField, MatchLanding, REFRESH_FEEDBACK_DELAY, Search, SearchReply,
+    CompletionField, MatchLanding, REFRESH_FEEDBACK_DELAY, Search, SearchReply, Suggestion,
 };
+use crate::recipient_menu::{self, Menu};
 
 const PREVIEW_BATCH: usize = 32;
 const SUGGESTION_LIMIT: usize = 4;
@@ -28,6 +29,7 @@ pub(super) struct SearchView {
     preview_asked: HashSet<MessageId>,
     accepted: Arc<AtomicU64>,
     completion_revision: Arc<AtomicU64>,
+    correspondent_menu: Menu,
     pub(super) folder_revision: u64,
     pub(super) prefer: Vec<ThreadId>,
     preview_key: Option<PreviewKey>,
@@ -974,16 +976,20 @@ impl Inbox {
         let account = self.account_id.clone();
         let store = self.store.clone();
         cx.spawn(async move |this, cx| {
-            let reply = store.call_search_completion(move |store| {
+            let address = field.is_address();
+            let job = move |store: &Store| {
                 if latest.load(Ordering::Relaxed) == revision {
                     search_suggestions(store, &account, field, &prefix)
                 } else {
                     Vec::new()
                 }
-            });
-            let Ok(suggestions) = reply.await else {
-                return;
             };
+            let suggestions = if address {
+                store.call(job).await
+            } else {
+                store.call_search_completion(job).await
+            }
+            .unwrap_or_default();
             let _ = this.update(cx, |inbox, cx| {
                 if inbox
                     .search_view
@@ -992,13 +998,107 @@ impl Inbox {
                     == revision
                     && let Some(search) = inbox.session.search.as_mut()
                 {
+                    if address {
+                        let rows: Vec<_> = suggestions
+                            .iter()
+                            .filter_map(|suggestion| match suggestion {
+                                Suggestion::Correspondent(person) => Some(person.clone()),
+                                Suggestion::Value(_) => None,
+                            })
+                            .collect();
+                        let menu = &mut inbox.search_view.correspondent_menu;
+                        let current = menu.rows().get(search.suggestion_index);
+                        search.suggestion_index = current
+                            .and_then(|person| {
+                                rows.iter()
+                                    .position(|row| row.email.eq_ignore_ascii_case(&person.email))
+                            })
+                            .unwrap_or(0);
+                        menu.update(rows, inbox.motion.motion, Instant::now());
+                    } else {
+                        search.suggestion_index = 0;
+                    }
                     search.suggestions = suggestions;
-                    search.suggestion_index = 0;
                     cx.notify();
                 }
             });
         })
         .detach();
+    }
+
+    pub(super) fn settle_correspondent_menu(&mut self) {
+        self.search_view.correspondent_menu.finish_opening();
+    }
+
+    pub(super) fn search_recipient_popup(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        now: Instant,
+    ) -> Option<gpui::Deferred> {
+        let active = self
+            .session
+            .search
+            .as_ref()
+            .filter(|search| search.editing)
+            .filter(|search| {
+                search
+                    .completion_key()
+                    .is_some_and(|(field, prefix)| field.is_address() && !prefix.is_empty())
+            });
+        let menu = &mut self.search_view.correspondent_menu;
+        if active.is_none() {
+            menu.update(Vec::new(), self.motion.motion, now);
+        }
+        let selected = active
+            .filter(|search| !search.suggestions.is_empty())
+            .map(|search| search.suggestion_index);
+        let (people, opacity, inset) = menu.visible(window, now);
+        if people.is_empty() || self.session.overlay != Overlay::None {
+            return None;
+        }
+        let theme = &self.theme;
+        let width = (window.viewport_size().width - px(28.)).min(px(460.));
+        Some(gpui::deferred(
+            div()
+                .absolute()
+                .left(px(14.))
+                .top(px(38. + inset))
+                .child(recipient_menu::popup(
+                    people,
+                    selected,
+                    recipient_menu::Colors {
+                        surface: theme.surface,
+                        border: theme.border,
+                        text: theme.foreground,
+                        dim: theme.dimmed,
+                        selection: theme.selection,
+                        accent: theme.accent,
+                    },
+                    opacity,
+                    width,
+                    |index, row| {
+                        if selected.is_some() {
+                            row.id(("search-recipient", index))
+                                .cursor_pointer()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |inbox, _, _, cx| {
+                                        let before = inbox.before_step();
+                                        if let Some(search) = inbox.session.search.as_mut() {
+                                            search.suggestion_index = index;
+                                        }
+                                        let step = inbox.session.accept_search_suggestion();
+                                        inbox.apply_step(step, before, cx);
+                                    }),
+                                )
+                                .into_any_element()
+                        } else {
+                            row.into_any_element()
+                        }
+                    },
+                )),
+        ))
     }
 
     fn queue_search_previews(
@@ -1122,7 +1222,16 @@ fn search_suggestions(
     account: &AccountId,
     field: CompletionField,
     prefix: &str,
-) -> Vec<String> {
+) -> Vec<Suggestion> {
+    if field.is_address() {
+        return store
+            .correspondent_suggestions(account, prefix)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|person| !person.email.eq_ignore_ascii_case(prefix))
+            .map(Suggestion::Correspondent)
+            .collect();
+    }
     match field {
         CompletionField::Mailbox(field) => store
             .search_suggestions(account, field, prefix, SUGGESTION_LIMIT)
@@ -1134,6 +1243,7 @@ fn search_suggestions(
     }
     .into_iter()
     .filter(|value| !value.eq_ignore_ascii_case(prefix))
+    .map(Suggestion::Value)
     .collect()
 }
 
@@ -1242,11 +1352,18 @@ pub(super) fn feedback(
     let suggestion = search
         .suggestions
         .get(search.suggestion_index)
+        .and_then(|suggestion| match suggestion {
+            Suggestion::Value(value) => Some(value),
+            Suggestion::Correspondent(_) => None,
+        })
         .filter(|_| search.editing && (!search.results_current() || search.correction.is_none()));
-    let correction = search
-        .correction
-        .as_ref()
-        .filter(|_| search.results_current());
+    let correction = search.correction.as_ref().filter(|_| {
+        search.results_current()
+            && !matches!(
+                search.suggestions.first(),
+                Some(Suggestion::Correspondent(_))
+            )
+    });
     let show_pending = search.show_pending_feedback(Instant::now());
     let line = if let Some(correction) = correction {
         Some((format!("Did you mean {correction}?"), true))

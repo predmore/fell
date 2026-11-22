@@ -4,7 +4,9 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
-use fell_core::{MessageId, SearchField, SearchHit, SearchLocation, SearchMatch, SearchPreview};
+use fell_core::{
+    Address, MessageId, SearchField, SearchHit, SearchLocation, SearchMatch, SearchPreview,
+};
 
 use super::{Fetch, Pending, Session, Step, Toast};
 use crate::keymap::KeyId;
@@ -36,7 +38,7 @@ pub struct Search {
     pub pending: bool,
     pub error: Option<Toast>,
     pub correction: Option<String>,
-    pub suggestions: Vec<String>,
+    pub suggestions: Vec<Suggestion>,
     pub suggestion_index: usize,
     completion_key: Option<(CompletionField, String)>,
     pub hits: HashMap<String, Hit>,
@@ -150,6 +152,30 @@ impl SearchReply {
 pub enum CompletionField {
     Mailbox(SearchField),
     Flag(&'static str),
+}
+
+impl CompletionField {
+    pub fn is_address(self) -> bool {
+        matches!(
+            self,
+            Self::Mailbox(SearchField::Sender | SearchField::Recipient)
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum Suggestion {
+    Value(String),
+    Correspondent(Address),
+}
+
+impl Suggestion {
+    fn value(&self) -> &str {
+        match self {
+            Self::Value(value) => value,
+            Self::Correspondent(person) => &person.email,
+        }
+    }
 }
 
 pub struct Completion<'a> {
@@ -343,6 +369,14 @@ impl Session {
                 self.end_search();
                 return Step::default();
             }
+            KeyId::Enter
+                if matches!(
+                    search.suggestions.get(search.suggestion_index),
+                    Some(Suggestion::Correspondent(_))
+                ) =>
+            {
+                return self.accept_search_suggestion();
+            }
             KeyId::Enter => {
                 search.editing = false;
                 // Remember a submitted query, including one whose response
@@ -351,9 +385,20 @@ impl Session {
                 return Step::default();
             }
             KeyId::Tab => return self.accept_search_suggestion(),
-            KeyId::Up | KeyId::Down if !search.suggestions.is_empty() => {
+            KeyId::Up | KeyId::Down | KeyId::Ctrl('n' | 'p')
+                if !search.suggestions.is_empty()
+                    && (matches!(key, KeyId::Up | KeyId::Down)
+                        || matches!(
+                            search.suggestions.first(),
+                            Some(Suggestion::Correspondent(_))
+                        )) =>
+            {
                 let len = search.suggestions.len();
-                let step = if key == KeyId::Down { 1 } else { len - 1 };
+                let step = if matches!(key, KeyId::Down | KeyId::Ctrl('n')) {
+                    1
+                } else {
+                    len - 1
+                };
                 search.suggestion_index = (search.suggestion_index + step) % len;
                 return Step::default();
             }
@@ -535,7 +580,6 @@ impl Session {
         }
         search.completion_key = key;
         search.suggestions.clear();
-        search.suggestion_index = 0;
         Step {
             search_completion: true,
             ..Step::default()
@@ -546,7 +590,9 @@ impl Session {
         let Some(search) = self.search.as_mut() else {
             return Step::default();
         };
-        if search.results_current()
+        if !matches!(search.suggestions.get(search.suggestion_index),
+            Some(Suggestion::Correspondent(_)) if search.editing)
+            && search.results_current()
             && let Some(corrected) = search.correction.take()
         {
             // The store has already run this correction and supplied its hits.
@@ -559,13 +605,14 @@ impl Session {
             && let Some(suggestion) = search.suggestions.get(search.suggestion_index)
             && let Some(completion) = completion(&search.query, search.caret)
         {
+            let suggestion = suggestion.value();
             let value = if suggestion
                 .chars()
                 .any(|ch| ch.is_ascii_whitespace() || ch == '"')
             {
                 format!("\"{}\"", suggestion.replace('"', "\"\""))
             } else {
-                suggestion.clone()
+                suggestion.to_owned()
             };
             let end = completion.value.start + value.len();
             search.query.replace_range(completion.value, &value);
@@ -1296,8 +1343,10 @@ mod tests {
         ));
         assert_eq!(value.prefix, "Ar");
         land(&mut session, reply(vec![], None));
-        session.search.as_mut().unwrap().suggestions =
-            vec!["Archive".into(), "Archive 2025".into()];
+        session.search.as_mut().unwrap().suggestions = vec![
+            Suggestion::Value("Archive".into()),
+            Suggestion::Value("Archive 2025".into()),
+        ];
         session.on_key(KeyId::Down, 10);
         assert!(session.on_key(KeyId::Tab, 10).search_request);
         assert_eq!(
