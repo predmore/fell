@@ -33,6 +33,11 @@ pub struct BodyModel {
 impl BodyModel {
     pub fn from_prepared(mail: PreparedMail) -> Self {
         let mode = mail.suggested;
+        fell_core::diagnostic!(
+            DEBUG,
+            "Prepared message rendering",
+            web_view = mode == RenderMode::Web
+        );
         Self {
             mail,
             mode,

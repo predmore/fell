@@ -2338,6 +2338,7 @@ pub fn send_from_editor(
     let sent_bcc = prepared.sent_bcc.take();
     // This call holds the session throughout, so the claim cannot be lost.
     let result = prepared.transmit_checked(backend, || true);
+    log_send_result(&result);
     session.end_send(lock_after(&result));
     remember_bcc(sent_bcc, &result);
     result
@@ -2415,9 +2416,23 @@ pub(crate) fn transmit_from_hub(
                 == Some(SendLock::InFlight)
         })
     });
+    log_send_result(&result);
     hub.with_session(id, |session| session.end_send(lock_after(&result)));
     remember_bcc(sent_bcc, &result);
     result
+}
+
+fn log_send_result(result: &Result<fell_core::SentMessage, SendFailure>) {
+    match result {
+        Ok(_) => fell_core::diagnostic!(INFO, "Message sent"),
+        Err(SendFailure::MaybeSent(_)) => {
+            fell_core::diagnostic!(WARN, "Message delivery uncertain")
+        }
+        Err(SendFailure::CredentialsRejected(_)) => {
+            fell_core::diagnostic!(WARN, "SMTP credentials rejected")
+        }
+        Err(_) => fell_core::diagnostic!(WARN, "Message not sent"),
+    }
 }
 
 /// Keep the Bcc of a message the server has, or may have, so the Sent copy
@@ -2435,19 +2450,15 @@ fn remember_bcc(
         return;
     };
     std::thread::spawn(move || {
-        let mut last = None;
         for attempt in 0..4 {
             if attempt > 0 {
                 std::thread::sleep(std::time::Duration::from_secs(2 * attempt));
             }
-            match record.save() {
-                Ok(()) => return,
-                Err(err) => last = Some(err),
+            if record.save().is_ok() {
+                return;
             }
         }
-        if let Some(err) = last {
-            eprintln!("fell: could not record the Bcc of a sent message: {err}");
-        }
+        fell_core::diagnostic!(WARN, "Could not record Bcc for a send");
     });
 }
 
@@ -2460,6 +2471,7 @@ impl PreparedSend {
         backend: &dyn MailBackend,
         still_claimed: impl FnOnce() -> bool,
     ) -> Result<fell_core::SentMessage, SendFailure> {
+        fell_core::diagnostic!(DEBUG, "Preparing SMTP transmission");
         let pending = backend
             .submit_composed(self.outgoing.draft, self.outgoing.mime, self.files)
             .map_err(SendFailure::from_core)?;

@@ -66,7 +66,7 @@ impl UiTrace {
             .suffix(".jsonl")
             .tempfile_in(dir)?
             .keep()?;
-        eprintln!("fell: UI trace at {}", path.display());
+        let _ = writeln!(io::stderr(), "fell: UI trace at {}", path.display());
         let mut trace = Trace {
             out: BufWriter::new(file),
             start,
@@ -115,8 +115,8 @@ impl UiTrace {
     }
 
     pub(crate) fn store_opened(&self, error: Option<&str>) {
-        let event = if let Some(error) = error {
-            eprintln!("fell: could not open mailbox store: {error}");
+        let event = if error.is_some() {
+            fell_core::diagnostic!(WARN, "UI trace recorded a failed store open");
             "store_open_failed"
         } else {
             "store_opened"
@@ -179,12 +179,13 @@ impl UiTrace {
             if let Some(max) = samples.last() {
                 let p50 = samples[samples.len().div_ceil(2) - 1];
                 let p95 = samples[(samples.len() * 95).div_ceil(100) - 1];
-                eprintln!(
+                let _ = writeln!(
+                    io::stderr(),
                     "fell: {label}: {}/{received} keys, p50 {p50:.3} ms, p95 {p95:.3} ms, max {max:.3} ms",
                     samples.len(),
                 );
             } else {
-                eprintln!("fell: {label}: 0/{received} keys timed");
+                let _ = writeln!(io::stderr(), "fell: {label}: 0/{received} keys timed");
             }
         }
     }

@@ -626,11 +626,12 @@ fn index_loop(path: &Path, stop: &Arc<AtomicBool>, pause: &AtomicBool, source: &
         }
         match source.load() {
             Ok(embedder) => break embedder,
-            Err(err) => {
-                eprintln!(
-                    "fell: the local embedding model did not load ({err}); \
-                     the index is left as it is, retrying in {}s",
-                    retry.as_secs_f32()
+            Err(_) => {
+                #[cfg(unix)]
+                crate::diagnostic!(
+                    WARN,
+                    "Could not load the local embedding model; retrying",
+                    retry_ms = retry.as_millis() as u64
                 );
                 sleep_unless_stopped(retry, stop);
                 retry = retry.saturating_mul(2).min(LOAD_RETRY_MAX);

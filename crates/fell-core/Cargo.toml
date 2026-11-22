@@ -19,8 +19,10 @@ ui-confirm = ["dep:fell-confirm"]
 test-utils = []
 
 [dependencies]
+backtrace = "0.3"
 fell-confirm = { workspace = true, optional = true }
 fell-render.workspace = true
+fell-version.workspace = true
 fs4 = { version = "0.13", default-features = false, features = ["sync"] }
 # Stored body parts (src/store/bodies.rs). Pure Rust DEFLATE, MIT OR Zlib OR
 # Apache-2.0, already in the tree through `png`.
@@ -34,6 +36,9 @@ rustls-native-certs = "0.8.5"
 saphyr = { version = "0.3.4", default-features = false }
 similar = { version = "3.2.1", default-features = false, features = ["std", "text"] }
 thiserror.workspace = true
+time = { version = "0.3", features = ["formatting", "local-offset"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
 # Local embedding model (see src/embed/onnx.rs). Pure Rust, MIT OR Apache-2.0,
 # no native runtime and no build-time download. `transformers` is off: the
 # pinned MiniLM graph only uses standard ONNX ops.
@@ -48,6 +53,7 @@ fell-confirm.workspace = true
 # Builds a tiny ONNX graph in tests. Same major version tract-onnx uses.
 prost = "0.14"
 rcgen = "0.13"
+tempfile = "3"
 
 [lints.rust]
 unsafe_code = "forbid"

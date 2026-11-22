@@ -33,6 +33,7 @@ raw-window-handle = "0.6"
 # like the IMAP client in fell-core.
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8.5"
+shlex = "2"
 smallvec = "1"
 tempfile = "3"
 ureq = { version = "3.5.2", default-features = false, features = ["rustls-no-provider"] }

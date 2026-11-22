@@ -12,6 +12,8 @@ pub mod agent;
 pub mod backend;
 pub mod compose;
 pub mod credentials;
+#[cfg(unix)]
+pub mod diagnostics;
 pub mod embed;
 pub mod folders;
 pub mod imap;

@@ -60,6 +60,16 @@ cargo run -p fell
 
 `fell` opens a two-pane inbox on the local store. With no account set up, an empty store is filled with fixture threads, and the status line says the sync is offline.
 
+## Diagnostics
+
+Fell and Fell MCP write a rolling log to `${XDG_STATE_HOME:-$HOME/.local/state}/fell/logs/fell.log`. Fell keeps five files of up to 5 MiB each, including the active log. The default level is info. Start with `FELL_LOG=debug` for more detail. Both levels omit credentials, message text, subjects, addresses and raw error text.
+
+`Space ? l` opens the log, and `Space ? c` opens the crash report. Both actions are in the command palette and use `$EDITOR` when set or the system file opener otherwise. On systems with `xdg-terminal-exec`, Fell gives the configured editor a terminal. Help is available on `?` or `Space ? ?`.
+
+Crash reports are stored in `fell/crashes/` under the same state directory. They include the build version, thread, backtrace and up to 200 recent log lines. When a worker recovers from a panic, its report remains available from the crash report action.
+
+Run `fell --report` to write a local bundle under `fell/reports/` containing the build version, recent log and latest crash report. The command prints the path. Review the file before attaching it to an issue. Fell keeps the log, crash reports and bundles owner-only (mode `0600`).
+
 ### Trace inbox performance
 
 Run `fell --trace` or `FELL_TRACE=1 fell` and open the inbox as usual. Fell prints the path to a private JSONL file under `${XDG_STATE_HOME:-$HOME/.local/state}/fell/trace/`. The trace records startup milestones and measures inbox keyboard actions through CPU paint and Wayland compositor presentation. It records action names and timings. Closing the inbox prints p50, p95, max, and sample counts for both measurements. The [100,000-message replay](bench/README.md#replay-the-inbox) runs the same trace against a synthetic mailbox.

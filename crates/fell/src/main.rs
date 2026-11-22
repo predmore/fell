@@ -5,7 +5,9 @@
 
 use fell::render::{self, Reader};
 use fell::{ComposeView, ThemeKind, open_demo};
+use fell_core::{diagnostic, diagnostics};
 use std::ffi::OsString;
+use std::io::{self, Write as _};
 use std::time::Instant;
 
 use gpui::{
@@ -21,6 +23,7 @@ Usage:
   fell embeddings status|install|remove
                                the local search model
   fell mcp add|list|revoke     connect an agent (runs fell-mcp)
+  fell --report                write a diagnostic report for review
   fell --version               print the build version
   fell --help                  print this help
 
@@ -39,6 +42,7 @@ enum Command {
     TraceInbox,
     Help,
     Version,
+    Report,
     Account(Vec<String>),
     Embeddings(Vec<String>),
     Mcp(Vec<OsString>),
@@ -64,6 +68,9 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         Some("account") => return Ok(Command::Account(args[1..].to_vec())),
         Some("embeddings") => return Ok(Command::Embeddings(args[1..].to_vec())),
         _ => {}
+    }
+    if args == ["--report"] {
+        return Ok(Command::Report);
     }
     let mut fixture = None;
     let mut trace = false;
@@ -146,6 +153,9 @@ fn size_value(name: &str, raw: &str) -> Result<f32, String> {
 fn main() {
     let started = Instant::now();
     // `fell mcp` passes its arguments through untouched, even non-UTF-8 paths.
+    if diagnostics::init().is_err() {
+        let _ = writeln!(io::stderr(), "Fell could not initialize its diagnostic log");
+    }
     let raw: Vec<OsString> = std::env::args_os().skip(1).collect();
     if raw.first().is_some_and(|arg| arg == "mcp") {
         mcp(&raw[1..]);
@@ -154,13 +164,29 @@ fn main() {
     let command = match parse_args(&args) {
         Ok(command) => command,
         Err(err) => {
-            eprintln!("fell: {err}\n\n{USAGE}");
+            diagnostic!(WARN, "Fell command line rejected");
+            let _ = writeln!(io::stderr(), "fell: {err}\n\n{USAGE}");
             std::process::exit(2);
         }
     };
     match command {
         Command::Help => println!("{USAGE}"),
         Command::Version => println!("{}", fell_version::VERSION),
+        Command::Report => match diagnostics::write_report() {
+            Ok(path) => println!("{}", path.display()),
+            Err(err) => {
+                diagnostic!(
+                    ERROR,
+                    "Could not write diagnostic report",
+                    error = &err as &dyn std::error::Error
+                );
+                let _ = writeln!(
+                    io::stderr(),
+                    "fell: could not write diagnostic report: {err}"
+                );
+                std::process::exit(1);
+            }
+        },
         Command::Account(args) => std::process::exit(fell::account_command(&args)),
         Command::Embeddings(args) => std::process::exit(fell::embeddings_command(&args)),
         Command::Mcp(args) => mcp(&args),
@@ -184,7 +210,8 @@ fn mcp(args: &[OsString]) -> ! {
         .and_then(|exe| exe.parent().map(|dir| dir.join("fell-mcp")))
         .filter(|path| path.is_file());
     let Some(program) = sibling else {
-        eprintln!("fell: fell-mcp is not installed next to fell");
+        diagnostic!(ERROR, "Fell MCP executable is missing");
+        let _ = writeln!(io::stderr(), "fell: fell-mcp is not installed next to fell");
         std::process::exit(2);
     };
     // Must match `fell_mcp::FELL_MCP_ARG0`; fell does not link fell-mcp.
@@ -192,7 +219,16 @@ fn mcp(args: &[OsString]) -> ! {
         .arg0("fell mcp")
         .args(args)
         .exec();
-    eprintln!("fell: could not start {}: {err}", program.display());
+    diagnostic!(
+        ERROR,
+        "Could not start Fell MCP",
+        error = &err as &dyn std::error::Error
+    );
+    let _ = writeln!(
+        io::stderr(),
+        "fell: could not start {}: {err}",
+        program.display()
+    );
     std::process::exit(2);
 }
 
@@ -339,6 +375,8 @@ mod tests {
     #[test]
     fn known_forms_still_parse() {
         assert_eq!(parse(&[]), Ok(Command::Inbox));
+        assert_eq!(parse(&["--report"]), Ok(Command::Report));
+        assert!(parse(&["--report", "--trace"]).is_err());
         assert_eq!(
             parse(&["account", "setup", "--bogus"]),
             Ok(Command::Account(vec!["setup".into(), "--bogus".into()]))

@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::ops::Range;
 
 use fell_core::compose::ReplyKind;
+use fell_core::diagnostics::DiagnosticFile;
 use fell_core::onboarding::connection_recovery;
 use fell_core::{
     AccountConfig, BackendKind, Error, FlagChange, FolderRole, FolderRoles, FolderSpan, ListKey,
@@ -18,6 +19,7 @@ use fell_core::{
 use crate::attachments::{Request as AttachmentRequest, Target as AttachmentTarget};
 use crate::keymap::{self, Action, KeyId, Keymap, PaletteItem, SeqMatch, WhichItem};
 use crate::present::{ConvMessage, NOTICE_DOT, Pane, ThreadRow, display_safe, merge_folders};
+use crate::worker::Worker;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SyncKind {
@@ -173,6 +175,17 @@ pub enum FolderIntent {
 pub struct Toast {
     pub text: String,
     pub alert: bool,
+    pub hint: Option<(String, &'static str)>,
+}
+
+impl Toast {
+    pub fn with_hint(text: impl Into<String>, key: String, suffix: &'static str) -> Self {
+        Self {
+            text: text.into(),
+            alert: false,
+            hint: Some((key, suffix)),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -308,6 +321,7 @@ pub struct Step {
     pub sync_now: bool,
     /// Bring back the agent review window that closed last.
     pub reopen_review: bool,
+    pub open_diagnostic: Option<DiagnosticFile>,
     /// `c`: start a new draft and open it in the compose editor.
     pub compose: bool,
     /// Open the selected row's draft in the compose editor.
@@ -394,6 +408,7 @@ pub struct Session {
     pub count: String,
     pub keymap: Keymap,
     pub sync: SyncKind,
+    pub worker_outages: HashSet<Worker>,
     /// Mailbox or keymap failure from startup. Folder and message reads do not clear it.
     pub startup_error: Option<String>,
     /// Failure from the latest folder or message read.
@@ -412,6 +427,7 @@ pub struct Session {
     pub folder_index: usize,
     pub folder_intent: FolderIntent,
     pub toast: Option<Toast>,
+    pub startup_crash_notice: Option<Toast>,
     /// Counts notices shown; see [`Session::toast_generation`].
     toast_generation: u64,
     /// The manual sync acknowledgement, until the worker sends status.
@@ -499,6 +515,8 @@ impl Session {
             folder_index: 0,
             folder_intent: FolderIntent::Go,
             toast: None,
+            startup_crash_notice: None,
+            worker_outages: HashSet::new(),
             toast_generation: 0,
             sync_notice: None,
             pending_move: None,
@@ -513,17 +531,23 @@ impl Session {
     }
 
     pub fn show_toast(&mut self, text: impl Into<String>, alert: bool) {
-        self.toast_generation = self.toast_generation.wrapping_add(1);
-        self.toast = Some(Toast {
+        self.set_toast(Toast {
             text: text.into(),
             alert,
+            hint: None,
         });
+    }
+
+    pub fn set_toast(&mut self, toast: Toast) {
+        self.toast_generation = self.toast_generation.wrapping_add(1);
+        self.toast = Some(toast);
     }
 
     pub fn status_notice(&self) -> Option<&Toast> {
         self.toast
             .as_ref()
             .or_else(|| self.search.as_ref()?.error.as_ref())
+            .or(self.startup_crash_notice.as_ref())
     }
 
     pub fn clear_toast(&mut self) {
@@ -540,6 +564,12 @@ impl Session {
             self.clear_toast_if(notice);
         }
         self.sync = status;
+    }
+
+    pub fn worker_outage(&self) -> Option<Worker> {
+        [Worker::Store, Worker::BackgroundStore, Worker::Sync]
+            .into_iter()
+            .find(|worker| self.worker_outages.contains(worker))
     }
 
     /// Which notice is on screen: every `show_toast` makes a new one, even
@@ -1536,6 +1566,9 @@ impl Session {
     }
 
     pub fn on_key(&mut self, key: KeyId, page_rows: usize) -> Step {
+        if key == KeyId::Escape {
+            self.startup_crash_notice = None;
+        }
         self.apply_input(|session| session.handle_key(key, page_rows))
     }
 
@@ -1929,6 +1962,8 @@ impl Session {
                     | Action::Undo
                     | Action::ReopenReview
                     | Action::Agents
+                    | Action::OpenDiagnosticLog
+                    | Action::OpenCrashReport
             )
         {
             self.count.clear();
@@ -2227,6 +2262,13 @@ impl Session {
                 step.agents = self.agents.open();
             }
             Action::AgentControl(_) | Action::UndoAgentRevoke => {}
+            Action::OpenDiagnosticLog | Action::OpenCrashReport => {
+                self.count.clear();
+                step.open_diagnostic = Some(match action {
+                    Action::OpenDiagnosticLog => DiagnosticFile::Log,
+                    _ => DiagnosticFile::Crash,
+                });
+            }
             Action::ReopenReview => {
                 self.count.clear();
                 return Step {
@@ -4947,6 +4989,20 @@ mod tests {
         assert!(session.clear_toast_if(second));
         assert!(session.toast.is_none());
         assert!(!session.clear_toast_if(second), "nothing left to clear");
+    }
+
+    #[test]
+    fn the_startup_crash_notice_survives_navigation_and_ordinary_toasts() {
+        let (mut session, _) = paged(30, 10, 2);
+        let crash = Toast::with_hint("Fell crashed last time", "space ? c".into(), " to view");
+        session.startup_crash_notice = Some(crash.clone());
+        session.show_toast("Other notice", false);
+        // The inbox clears its ordinary toast before handling a key.
+        session.clear_toast();
+        session.on_key(KeyId::Char('j'), 10);
+        assert_eq!(session.status_notice(), Some(&crash));
+        session.on_key(KeyId::Escape, 10);
+        assert!(session.status_notice().is_none());
     }
 
     fn empty_message(expanded: bool) -> ConvMessage {

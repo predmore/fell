@@ -20,13 +20,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fell_core::{
     Account, AccountConfig, BackendKind, DroppedWrite, InboxWait, MessageId, MessageParts,
-    ReplyToBackfill, ReplyToProgress, Store, SyncFailureKind, SyncReport, fetch_message_bodies,
-    fetch_missing_bodies, sync_with_progress,
+    ReplyToBackfill, ReplyToProgress, Store, SyncFailureKind, SyncReport, diagnostic,
+    fetch_message_bodies, fetch_missing_bodies, sync_with_progress,
 };
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use futures::channel::oneshot;
 
 use crate::model::{SyncFailure, SyncKind};
+use crate::worker::{Restart, Worker, WorkerEvent};
 
 /// Longest time between passes after a pass succeeds. IDLE on INBOX starts
 /// one sooner when mail arrives; other folders are caught up on this timer.
@@ -60,6 +61,7 @@ const BODIES_BETWEEN_PASSES: usize = 48;
 /// What the sync thread tells the window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncEvent {
+    Worker(WorkerEvent),
     /// The status to show. `Syncing`, and `Synced` with `changed`, can also
     /// refresh mail that has just been written.
     Status(SyncKind),
@@ -242,21 +244,38 @@ pub fn start(
     config: AccountConfig,
     store_path: PathBuf,
 ) -> (SyncHandle, UnboundedReceiver<SyncEvent>) {
+    start_with(config, store_path, || {})
+}
+
+fn start_with(
+    config: AccountConfig,
+    store_path: PathBuf,
+    mut before_run: impl FnMut() + Send + 'static,
+) -> (SyncHandle, UnboundedReceiver<SyncEvent>) {
     let (events_tx, events) = unbounded();
     let (wake, wake_rx) = mpsc::channel();
     let write_back = config.write_back;
     std::thread::Builder::new()
         .name("fell-sync".into())
-        .spawn(move || run(config, store_path, events_tx, wake_rx))
+        .spawn(move || {
+            let mut restart = Restart::new(Worker::Sync, |event| {
+                events_tx.unbounded_send(SyncEvent::Worker(event)).is_ok()
+            });
+            restart.run(|recovered| {
+                before_run();
+                run(&config, &store_path, &events_tx, &wake_rx, recovered);
+            });
+        })
         .expect("spawn sync thread");
     (SyncHandle { wake, write_back }, events)
 }
 
 fn run(
-    config: AccountConfig,
-    store_path: PathBuf,
-    events: UnboundedSender<SyncEvent>,
-    wake: Receiver<Request>,
+    config: &AccountConfig,
+    store_path: &std::path::Path,
+    events: &UnboundedSender<SyncEvent>,
+    wake: &Receiver<Request>,
+    recovered: &mut dyn FnMut(),
 ) {
     let bridge = config.backend == BackendKind::Bridge;
     let send = |kind: SyncKind| events.unbounded_send(SyncEvent::Status(kind)).is_ok();
@@ -265,9 +284,14 @@ fn run(
     // instead of giving up on a lock.
     let mut failures = 0usize;
     let store = loop {
-        match Store::open(&store_path) {
+        match Store::open(store_path) {
             Ok(store) => break store,
             Err(err) => {
+                diagnostic!(
+                    DEBUG,
+                    "Sync could not open mailbox",
+                    error = &err as &dyn std::error::Error
+                );
                 let delay = BACKOFF[failures.min(BACKOFF.len() - 1)] / 5;
                 failures += 1;
                 // A lock held while the window's connection finishes opening
@@ -318,6 +342,7 @@ fn run(
                 return;
             }
         }
+        diagnostic!(DEBUG, "Sync pass started", write_back = config.write_back);
         let mut alive = true;
         let mut progress = PassProgress::default();
         let mut batches = 0usize;
@@ -349,6 +374,13 @@ fn run(
         let synced = result.is_ok();
         let delay = match result {
             Ok(report) => {
+                recovered();
+                diagnostic!(
+                    INFO,
+                    "Sync pass completed",
+                    batches = batches as u64,
+                    changed = report.changed
+                );
                 failures = 0;
                 if !send(SyncKind::Synced {
                     at: unix_now(),
@@ -362,7 +394,12 @@ fn run(
             Err(err) => {
                 let delay = BACKOFF[failures.min(BACKOFF.len() - 1)];
                 failures += 1;
-                if !send(SyncKind::Failed(SyncFailure::connection(&config, &err))) {
+                diagnostic!(
+                    WARN,
+                    "Sync pass failed",
+                    error = &err as &dyn std::error::Error
+                );
+                if !send(SyncKind::Failed(SyncFailure::connection(config, &err))) {
                     return;
                 }
                 delay
@@ -372,7 +409,7 @@ fn run(
         // for the rest of the delay. Asks left over from the last gap go
         // first.
         bodies.new_gap();
-        bodies.serve(&config, &store, &account);
+        bodies.serve(config, &store, &account);
         let until = Instant::now() + delay;
         if !snippets_repaired {
             let mut changed = false;
@@ -392,13 +429,13 @@ fn run(
         }
         let mut pending = if synced {
             fill_old_mail(
-                &config,
+                config,
                 &store,
                 &account,
-                &wake,
+                wake,
                 &mut bodies,
                 &mut reply_to,
-                &events,
+                events,
             )
         } else {
             None
@@ -408,10 +445,10 @@ fn run(
                 Some(Woke::Body(ask)) => {
                     bodies.push(ask);
                     // The asks a conversation sends together go in one batch.
-                    if let Some(woke) = queue_bodies(&wake, &mut bodies) {
+                    if let Some(woke) = queue_bodies(wake, &mut bodies) {
                         break woke;
                     }
-                    bodies.serve(&config, &store, &account);
+                    bodies.serve(config, &store, &account);
                 }
                 Some(woke) => break woke,
                 None => {}
@@ -421,9 +458,9 @@ fn run(
                 break Woke::Timer;
             }
             pending = Some(if synced && idle {
-                wait_on_inbox(&config, &store, &account, left, &wake, &mut idle)
+                wait_on_inbox(config, &store, &account, left, wake, &mut idle)
             } else {
-                wait_on_timer(&wake, left)
+                wait_on_timer(wake, left)
             });
         };
         match woke {
@@ -437,7 +474,7 @@ fn run(
                         Request::Ask(more) => shown |= more == Ask::Sync,
                     }
                 }
-                bodies.serve(&config, &store, &account);
+                bodies.serve(config, &store, &account);
                 if shown && !send(SyncKind::Connecting) {
                     return;
                 }
@@ -712,5 +749,88 @@ mod body_queue_tests {
             mime_parts: Vec::new(),
         };
         assert_eq!(body_answer(Some(parts)), Ok(true));
+    }
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+    use fell_core::diagnostics::{self, DiagnosticFile};
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn injected_panic_writes_report_and_sync_restarts() {
+        // Installing a process-global panic hook in the child keeps it out
+        // of concurrent tests in the unit test process.
+        const CHILD: &str = "FELL_TEST_SYNC_PANIC_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let state = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sync_worker::restart_tests::injected_panic_writes_report_and_sync_restarts",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("XDG_STATE_HOME", state.path())
+                .env_remove("DISPLAY")
+                .env_remove("WAYLAND_DISPLAY")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        diagnostics::init().unwrap();
+        let config = AccountConfig::bridge(
+            "demo@example.test",
+            "demo",
+            // Fail before connecting to any host.
+            fell_core::PasswordSource::Command("exit 1".into()),
+        );
+        let path =
+            std::path::PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap()).join("mail.db");
+        let mut first = true;
+        let (_handle, mut events) = start_with(config, path, move || {
+            assert!(!std::mem::take(&mut first), "synthetic-panic-payload");
+        });
+
+        // Symbolizing the panic can take several seconds in a debug build
+        // when the rest of the workspace suite is busy.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut restarting = false;
+        loop {
+            match events.try_recv() {
+                Ok(SyncEvent::Worker(WorkerEvent::Restarted(Worker::Sync))) => restarting = true,
+                Ok(SyncEvent::Status(SyncKind::Failed(failure))) => {
+                    assert!(restarting);
+                    assert_eq!(failure.kind, SyncFailureKind::Password);
+                    break;
+                }
+                Ok(event) => panic!("unexpected sync event: {event:?}"),
+                Err(_) => {
+                    if Instant::now() >= deadline {
+                        eprintln!(
+                            "sync worker did not finish another pass; restart notice: {restarting}"
+                        );
+                        panic!("sync worker never restarted");
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+        let path = DiagnosticFile::Crash.path().unwrap();
+        assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        let report = std::fs::read_to_string(path).unwrap();
+        assert!(report.contains("Thread: fell-sync"));
+        assert!(report.contains("Backtrace"));
+        assert!(report.contains("Recovered by worker: true"));
+        assert!(!report.contains("synthetic-panic-payload"));
+        assert!(diagnostics::take_crash_notice().is_none());
     }
 }
