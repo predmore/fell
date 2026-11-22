@@ -28,8 +28,8 @@ use gpui::{
     InteractiveElement, IntoElement, KeyDownEvent, Keystroke, MouseButton, MouseMoveEvent,
     MouseUpEvent, ParentElement, Pixels, Render, ScrollHandle, ScrollStrategy, SharedString,
     StatefulInteractiveElement, Styled, StyledText, TextStyle, TitlebarOptions,
-    UniformListScrollHandle, Window, WindowBounds, WindowOptions, div, point,
-    prelude::*, px, rgb, size, uniform_list,
+    UniformListScrollHandle, Window, WindowBounds, WindowOptions, div, point, prelude::*, px, rgb,
+    size, uniform_list,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -4732,13 +4732,24 @@ impl Render for Inbox {
         let arrival_anchor = self
             .note_pin
             .arrival_anchor(target_band, band, selected, now);
-        if (arrival_anchor.is_some() && self.body_landing.is_none())
-            || agent_note.as_ref().is_some_and(|frame| frame.leaving)
-        {
-            self.release_landing();
+        if arrival_anchor.is_some() || agent_note.as_ref().is_some_and(|frame| frame.leaving) {
+            // Passive note motion releases the held alignment. A growing
+            // body already compensates for the moving viewport.
+            self.landing.hold(None);
         }
         let returning = self.note_return(now);
         let viewing_note = visiting && returning.is_none();
+        let preview_padding = self.preview_padding.then(|| PreviewPadding {
+            // The previous scroll bounds can still belong to a different
+            // thread, or be empty when a narrow reader has never opened.
+            // Start with an upper bound and trim the slack after layout.
+            viewport: if self.preview_laid_out {
+                self.conv_scroll.bounds().size.height
+            } else {
+                window.viewport_size().height
+            },
+            newest_height: self.preview_card_height.clone(),
+        });
         let first_preview_layout = self.first_preview_layout(panes.1);
         let anchor = if viewing_note {
             // Keep the note's top while message bodies finish loading.
@@ -4782,17 +4793,6 @@ impl Render for Inbox {
                 .detach();
             }
         }
-        let preview_padding = self.preview_padding.then(|| PreviewPadding {
-            // The previous scroll bounds can still belong to a different
-            // thread, or be empty when a narrow reader has never opened.
-            // Start with an upper bound and trim the slack after layout.
-            viewport: if self.preview_laid_out {
-                self.conv_scroll.bounds().size.height
-            } else {
-                window.viewport_size().height
-            },
-            newest_height: self.preview_card_height.clone(),
-        });
         let preview_current = self.search_preview_current();
         let conv = ConvFrame {
             syncing: self.pending_bodies.downloading(&self.session.sync),
@@ -9131,6 +9131,7 @@ struct StatusLabel {
     text: String,
     download: Option<DownloadStatus>,
     color: u32,
+    steady_sync: bool,
 }
 
 impl StatusLabel {
@@ -9183,6 +9184,13 @@ impl StatusLabel {
             text,
             download,
             color,
+            steady_sync: reply_check.is_none()
+                && matches!(
+                    session.sync,
+                    SyncKind::Connecting
+                        | SyncKind::Syncing { progress: None, .. }
+                        | SyncKind::Synced { .. }
+                ),
         }
     }
 
@@ -9410,6 +9418,17 @@ fn status_bar(
                     theme,
                 ));
             (label, width)
+        } else if !narrow
+            && labels.current.steady_sync
+            && labels
+                .outgoing
+                .as_ref()
+                .is_none_or(|(old, _)| old.steady_sync)
+        {
+            // Keep the routine sync slot fixed even while its text fades.
+            let width = bar_px(window, "synced just now · 0000 new", size, ui).ceil();
+            let (label, _) = labels.draw(theme, size, sync_room, window);
+            (label.w(px(width)).truncate(), width)
         } else {
             labels.draw(theme, size, sync_room, window)
         }
@@ -10712,6 +10731,7 @@ mod tests {
             }
             .download_status(),
             color: 0,
+            steady_sync: false,
         };
         for count in 0..=60 {
             let now = start + Duration::from_secs_f64(f64::from(count) / 60.);

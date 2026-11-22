@@ -1274,9 +1274,16 @@ impl InboxMotion {
         self.message_fades
             .iter()
             .map(|(id, fade)| {
-                (id.clone(), motion::lerp(motion::ARRIVE_FROM, 1.0, fade.progress(now)))
+                (
+                    id.clone(),
+                    motion::lerp(motion::ARRIVE_FROM, 1.0, fade.progress(now)),
+                )
             })
-            .chain(self.messages_pending.iter().map(|id| (id.clone(), pending_alpha)))
+            .chain(
+                self.messages_pending
+                    .iter()
+                    .map(|id| (id.clone(), pending_alpha)),
+            )
             .collect()
     }
 
@@ -1850,7 +1857,7 @@ mod tests {
         assert!(!motion.waiting_for_uncover(tiled, true, now));
         assert!(motion.waiting_for_uncover(tiled, false, now));
         assert!(motion.waiting_for_uncover(tiled, false, later(now, 80)));
-        assert_eq!(motion.arrival_alphas(later(now, 80), true)["reply"], 0.0);
+        assert_eq!(motion.card_alphas(later(now, 80))["reply"], 0.0);
         assert!(!motion.waiting_for_uncover(uncovered, false, later(now, 80)));
 
         // A different arrangement of windows may give the inbox new bounds.
@@ -1873,22 +1880,14 @@ mod tests {
         let presented = later(now, 500);
         assert!(!motion.reveal_arriving_messages(uncovered, old_frame, presented));
         assert!(!motion.tick(presented));
-        assert_eq!(
-            motion.card_alphas(presented)["reply"],
-            motion::ARRIVE_FROM
-        );
+        assert_eq!(motion.card_alphas(presented)["reply"], motion::ARRIVE_FROM);
 
         let callback = later(presented, 40);
         assert!(motion.reveal_arriving_messages(uncovered, resized_frame, callback));
-        assert_eq!(
-            motion.card_alphas(callback)["reply"],
-            motion::ARRIVE_FROM
-        );
+        assert_eq!(motion.card_alphas(callback)["reply"], motion::ARRIVE_FROM);
         let halfway = later(callback, 60);
         assert!(motion.tick(halfway));
-        assert!(
-            (motion::ARRIVE_FROM..1.0).contains(&motion.card_alphas(halfway)["reply"])
-        );
+        assert!((motion::ARRIVE_FROM..1.0).contains(&motion.card_alphas(halfway)["reply"]));
         assert!(!motion.tick(later(callback, 120)));
     }
 
