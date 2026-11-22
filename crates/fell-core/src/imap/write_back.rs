@@ -1071,8 +1071,8 @@ impl Pass<'_> {
         )?;
         match settled {
             Settled::Stale => return Err(Stop::Stale),
-            // Undone, and the server never moved it: it and its reverse are
-            // settled, with nothing to say.
+            // A retired write needs no notice. For a refused move, undo's
+            // queued reverse is retired as well.
             Settled::Retired => {
                 for (at, other) in entries.iter().enumerate() {
                     if at == index || other.reverses == Some(entry.id) {

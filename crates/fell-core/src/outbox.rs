@@ -1193,8 +1193,8 @@ pub(crate) enum Settled {
     /// A superseded flag STORE may already have landed. Its replacement
     /// waits for a complete observation of that attempt.
     Recovering,
-    /// A superseded flag or a refused move that undo had already reversed.
-    /// Neither needs another attempt or a notice.
+    /// A row that no longer needs another attempt or a notice, such as an
+    /// undone label, a superseded flag or a refused move that undo reversed.
     Retired,
     /// The row is from an earlier write-back generation (write-back was
     /// turned off while it was on the wire) and is left as it is. The pass
@@ -1235,17 +1235,14 @@ pub(crate) fn settle(
         tx.commit()?;
         return Ok(Settled::Stale);
     }
-    if entry.kind == OutboxKind::AppendSent && live.is_none() {
+    if live.is_none() && entry.kind != OutboxKind::Move {
         tx.commit()?;
         return Ok(Settled::Retired);
     }
     let recovering = entry.kind.flag_name().is_some()
         && matches!(live, Some((_, true, true)))
         && matches!(outcome, Outcome::Retry { refused: false, .. });
-    if entry.kind.flag_name().is_some()
-        && live.is_none_or(|(_, superseded, _)| superseded)
-        && !recovering
-    {
+    if entry.kind.flag_name().is_some() && matches!(live, Some((_, true, _))) && !recovering {
         tx.execute(
             "UPDATE server_outbox SET state = 'dropped', error = 'superseded', settled_unix = ?2
              WHERE id = ?1 AND state = 'pending'",

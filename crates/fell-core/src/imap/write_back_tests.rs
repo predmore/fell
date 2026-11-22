@@ -651,6 +651,51 @@ fn keyword_undo_survives_a_fetch_after_an_interrupted_store() {
 }
 
 #[test]
+fn keyword_undone_during_the_last_attempt_retires_quietly() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mail.db");
+    let fx = Fixture::with_store(Store::open(&path).unwrap());
+    let account = &fx.account.id;
+    let alpha = fx.thread("INBOX", "Alpha");
+    let action = fx
+        .store
+        .label_thread(account, &alpha, crate::LabelChange::Add("Review".into()))
+        .unwrap();
+    let rows = fx.store.outbox(account).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].kind, OutboxKind::Keyword);
+    fx.store
+        .connection()
+        .execute(
+            "UPDATE server_outbox SET attempts = ?1 WHERE id = ?2",
+            rusqlite::params![super::write_back::MAX_ATTEMPTS - 1, rows[0].id],
+        )
+        .unwrap();
+
+    // SELECT is in flight, but the label STORE has not been sent yet.
+    let undo_account = account.clone();
+    fx.server.writes.lock().unwrap().before_refusing_select = Some(Box::new(move || {
+        let store = Store::open(path).unwrap();
+        assert_eq!(store.undo(&undo_account).unwrap().id, action.id);
+        assert!(store.outbox(&undo_account).unwrap().is_empty());
+    }));
+    fx.clear_commands();
+    let report = fx.replay_as_window();
+    assert!(
+        fx.writes()
+            .iter()
+            .any(|command| command.contains(" SELECT "))
+    );
+    assert!(fx.stores().is_empty());
+    assert!(
+        fx.store.thread_messages(account, &alpha).unwrap()[0]
+            .labels
+            .is_empty()
+    );
+    assert_eq!(report, Default::default());
+}
+
+#[test]
 fn keyword_labels_preserve_reserved_flags_and_undo_per_copy() {
     let mut state = flag_state(false);
     state.mailboxes[0].messages[0]

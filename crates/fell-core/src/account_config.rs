@@ -927,6 +927,45 @@ mod tests {
     }
 
     #[test]
+    fn sent_and_notification_settings_round_trip_with_defaults_omitted() {
+        let base = "email = \"demo@example.com\"\npassword = \"fixture\"\n";
+        for (settings, save_sent, notifications) in [
+            (
+                "save_sent = \"auto\"\nnotifications = \"on\"",
+                SaveSent::Auto,
+                NotificationMode::On,
+            ),
+            (
+                "save_sent = \"append\"\nnotifications = true\nnotification_content = false",
+                SaveSent::Append,
+                NotificationMode::Private,
+            ),
+            (
+                "save_sent = \"server\"\nnotifications = \"off\"",
+                SaveSent::Server,
+                NotificationMode::Off,
+            ),
+        ] {
+            let config = AccountConfig::parse(&format!("{base}{settings}\n")).unwrap();
+            assert_eq!(
+                (config.save_sent, config.notifications),
+                (save_sent, notifications)
+            );
+            let rendered = config.render();
+            assert_eq!(
+                rendered.contains("save_sent ="),
+                save_sent != SaveSent::Auto
+            );
+            assert_eq!(
+                rendered.contains("notifications ="),
+                notifications != NotificationMode::On
+            );
+            assert!(!rendered.contains("notification_content"));
+            assert_eq!(AccountConfig::parse(&rendered).unwrap(), config);
+        }
+    }
+
+    #[test]
     fn write_back_is_off_unless_turned_on() {
         let base = "email = \"me@proton.me\"\npassword = \"pw\"\n";
         let off = AccountConfig::parse(base).unwrap();

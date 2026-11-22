@@ -20,6 +20,8 @@ pub(in crate::imap) struct WriteFixture {
     pub uidplus: bool,
     /// Answer every `UID MOVE` with this NO text.
     pub refuse: Option<String>,
+    /// Run the hook when the next `SELECT` arrives, then answer it with NO.
+    pub before_refusing_select: Option<Box<dyn FnOnce() + Send>>,
     /// Answer `UID SEARCH HEADER Message-ID` with NO.
     pub refuse_search: bool,
     /// Return this many tagged-OK empty HEADER searches before finding the copy.
@@ -68,12 +70,18 @@ pub(super) fn handle(
     out: &mut Counted,
 ) -> bool {
     let reply = match verb {
-        "SELECT" => select(
-            tag,
-            rest,
-            &state.lock().expect("state"),
-            writes.lock().expect("writes").nomodseq,
-        ),
+        "SELECT" => {
+            let (hook, nomodseq) = {
+                let mut writes = writes.lock().expect("writes");
+                (writes.before_refusing_select.take(), writes.nomodseq)
+            };
+            if let Some(hook) = hook {
+                hook();
+                format!("{tag} NO SELECT refused\r\n")
+            } else {
+                select(tag, rest, &state.lock().expect("state"), nomodseq)
+            }
+        }
         "STATUS" => status(tag, rest, &state.lock().expect("state")),
         "CREATE" => create_label(tag, rest, &mut state.lock().expect("state")),
         "UID" => {
