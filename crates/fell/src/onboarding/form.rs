@@ -81,7 +81,7 @@ impl Provider {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum Service {
     Imap = 0,
     Smtp = 1,
@@ -114,7 +114,7 @@ impl Endpoint {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum Field {
     Email,
     Name,

@@ -38,6 +38,7 @@ fn focus_ring(accent: u32, radius: f32) -> Div {
 
 impl Render for Onboarding {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.painted_fields.clear();
         let now = self.clock.frame(Instant::now());
         let mut old_layer = None;
         let mut arrival = 1.;
@@ -878,8 +879,7 @@ impl Onboarding {
                             cx.listener(move |view, e: &gpui::MouseDownEvent, window, cx| {
                                 window.focus(&view.focus);
                                 view.transition = None;
-                                view.select(Control::Field(field));
-                                view.point_caret(field, e.position, e.modifiers.shift);
+                                view.click_field(field, e.position, e.modifiers.shift);
                                 cx.notify();
                             }),
                         )
@@ -1135,6 +1135,36 @@ mod tests {
 
     use super::*;
     use crate::motion::Motion;
+    use gpui::{EntityInputHandler, Modifiers, TestAppContext, point};
+
+    #[test]
+    fn clicking_an_unfocused_field_inserts_text_at_the_click() {
+        let mut app = TestAppContext::single();
+        let (entity, cx) = app.add_window_view(|window, cx| {
+            let mut setup = Onboarding::init(window, cx);
+            setup.form.choose(Provider::Bridge);
+            setup
+                .form
+                .set_text(Field::Email, "reader@example.test".into());
+            setup.select(Control::Field(Field::Name));
+            setup
+        });
+        let position = cx.update(|_, cx| {
+            let layout = &entity.read(cx).painted_fields[&Field::Email];
+            point(
+                layout.origin.x + layout.line.x_for_index(6),
+                layout.origin.y + px(4.),
+            )
+        });
+        cx.simulate_click(position, Modifiers::default());
+        cx.update(|window, cx| {
+            entity.update(cx, |setup, cx| {
+                assert_eq!(setup.control, Control::Field(Field::Email));
+                setup.replace_text_in_range(None, "+tag", window, cx);
+                assert_eq!(setup.form.text(Field::Email), "reader+tag@example.test");
+            });
+        });
+    }
 
     #[test]
     #[ignore = "requires an isolated nested Wayland compositor"]

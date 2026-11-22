@@ -15,7 +15,6 @@ pub(super) struct Editor {
     anchor: usize,
     caret: usize,
     marked: Option<Range<usize>>,
-    layout: Option<FieldLayout>,
 }
 
 impl Editor {
@@ -39,10 +38,9 @@ impl Editor {
     }
 }
 
-struct FieldLayout {
-    field: Field,
-    origin: Point<Pixels>,
-    line: gpui::ShapedLine,
+pub(super) struct FieldLayout {
+    pub(super) origin: Point<Pixels>,
+    pub(super) line: gpui::ShapedLine,
 }
 
 impl Onboarding {
@@ -54,22 +52,24 @@ impl Onboarding {
         }
     }
 
-    pub(super) fn point_caret(&mut self, field: Field, position: Point<Pixels>, extend: bool) {
-        let Some(layout) = &self.editor.layout else {
-            return;
-        };
-        if layout.field == field {
+    pub(super) fn click_field(&mut self, field: Field, position: Point<Pixels>, extend: bool) {
+        let control = Control::Field(field);
+        let extend = extend && self.control == control;
+        let at = self.painted_fields.get(&field).map(|layout| {
             let index = layout
                 .line
                 .closest_index_for_x(position.x - layout.origin.x);
             let text = self.form.text(field);
-            let at = if field == Field::Password {
+            if field == Field::Password {
                 text.char_indices()
                     .nth(index / '•'.len_utf8())
                     .map_or(text.len(), |(i, _)| i)
             } else {
                 index.min(text.len())
-            };
+            }
+        });
+        self.select(control);
+        if let Some(at) = at {
             self.editor.move_to(at, extend);
         }
     }
@@ -265,22 +265,19 @@ impl Onboarding {
                     }
                 }
                 let _ = line.paint(origin, bounds.size.height, window, cx);
-                if focused {
-                    if selected.is_empty() && focus.is_focused(window) {
-                        window.paint_quad(fill(
-                            Bounds::new(
-                                point(origin.x + caret, origin.y + px(2.)),
-                                size(px(1.5), bounds.size.height - px(4.)),
-                            ),
-                            accent,
-                        ));
-                    }
+                if focused && selected.is_empty() && focus.is_focused(window) {
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(origin.x + caret, origin.y + px(2.)),
+                            size(px(1.5), bounds.size.height - px(4.)),
+                        ),
+                        accent,
+                    ));
+                }
+                if active {
                     entity.update(cx, |view, _| {
-                        view.editor.layout = Some(FieldLayout {
-                            field,
-                            origin,
-                            line,
-                        });
+                        view.painted_fields
+                            .insert(field, FieldLayout { origin, line });
                     });
                 }
             },

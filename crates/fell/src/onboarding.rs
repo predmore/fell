@@ -4,6 +4,7 @@ mod form;
 mod input;
 mod layout;
 
+use std::collections::HashMap;
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
@@ -20,7 +21,7 @@ use crate::setup::save_account;
 use crate::theme::{self, Theme};
 
 use self::form::{Check, Field, Form, Provider, Service, Step, Storage};
-use self::input::Editor;
+use self::input::{Editor, FieldLayout};
 
 const STEP_OUT: Duration = Duration::from_millis(60);
 const STEP_IN: Duration = Duration::from_millis(140);
@@ -60,6 +61,7 @@ pub(crate) struct Onboarding {
     focus: FocusHandle,
     control: Control,
     editor: Editor,
+    painted_fields: HashMap<Field, FieldLayout>,
     theme: Theme,
     motion: Motion,
     clock: motion::Clock,
@@ -101,6 +103,7 @@ impl Onboarding {
             focus,
             control: Control::Provider(Provider::Bridge),
             editor: Editor::default(),
+            painted_fields: HashMap::new(),
             theme: theme::load(),
             motion: Motion::from_env(),
             clock: motion::Clock::default(),
