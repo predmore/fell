@@ -216,6 +216,26 @@ impl DraftHome {
         Ok(id)
     }
 
+    pub fn open_server_draft(
+        &self,
+        hub: &DraftHub,
+        account: &AccountId,
+        thread: &fell_core::ThreadId,
+    ) -> Result<String, String> {
+        let config = crate::mailbox::send_account_config(account)
+            .map_err(|_| "The account is unavailable".to_string())?
+            .ok_or_else(|| "There is no server draft in the demo mailbox".to_string())?;
+        let store = fell_core::Store::open(&self.store).map_err(|err| err.to_string())?;
+        let id = config
+            .import_server_draft(&store, thread, &new_draft_id())
+            .map_err(|err| {
+                fell_core::diagnostic!(WARN, "Could not import server draft");
+                err.to_string()
+            })?;
+        self.open(hub, &id, account)?;
+        Ok(id)
+    }
+
     pub fn new_suggested_reply(
         &self,
         hub: &DraftHub,

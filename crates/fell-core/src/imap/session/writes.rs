@@ -133,19 +133,21 @@ impl WriteSession {
         self.session.list_selectable()
     }
 
-    /// APPEND the exact SMTP MIME to a quoted mailbox as a synchronizing literal.
-    pub(in crate::imap) fn append_seen(
+    /// APPEND to a quoted mailbox as a synchronizing literal.
+    pub(in crate::imap) fn append(
         &mut self,
         quoted_mailbox: &str,
         mime: &[u8],
-    ) -> Result<(), WriteError> {
+        draft: bool,
+    ) -> Result<Option<(u32, u32)>, WriteError> {
+        let flags = if draft { "\\Draft \\Seen" } else { "\\Seen" };
         let session = &mut self.session;
         session.tag += 1;
         let tag = format!("a{}", session.tag);
         session
             .write_all(
                 format!(
-                    "{tag} APPEND {quoted_mailbox} (\\Seen) {{{}}}\r\n",
+                    "{tag} APPEND {quoted_mailbox} ({flags}) {{{}}}\r\n",
                     mime.len()
                 )
                 .as_bytes(),
@@ -158,7 +160,9 @@ impl WriteSession {
                 // RFC 3501 §9 and RFC 9051 §9: the literal's octet count
                 // excludes the CRLF that terminates the APPEND command.
                 session.write_all(b"\r\n").map_err(WriteError::Connection)?;
-                return write_reply("APPEND", session.read_reply(&tag, "APPEND")).map(|_| ());
+                let reply = write_reply("APPEND", session.read_reply(&tag, "APPEND"))?;
+                return Ok(appenduid(&reply.ok)
+                    .or_else(|| reply.untagged.iter().find_map(|line| appenduid(&line.text))));
             }
             if text_starts_with_tag(&line, &tag) {
                 let status = line[tag.len()..].trim();
@@ -493,6 +497,17 @@ fn status_values(text: &str) -> Option<(u32, u32)> {
         number_after(items, "UIDVALIDITY ")?,
         number_after(items, "UIDNEXT ")?,
     ))
+}
+
+fn appenduid(text: &str) -> Option<(u32, u32)> {
+    let at = text.to_ascii_uppercase().find("[APPENDUID ")?;
+    let mut words = text[at + "[APPENDUID ".len()..]
+        .split_once(']')?
+        .0
+        .split_ascii_whitespace();
+    let validity: u32 = words.next()?.parse().ok()?;
+    let uid: u32 = words.next()?.parse().ok()?;
+    (validity != 0 && uid != 0 && words.next().is_none()).then_some((validity, uid))
 }
 
 /// `[COPYUID <uidvalidity> <source set> <new set>]` anywhere in a reply line.

@@ -106,6 +106,99 @@ pub(super) fn keywords(flags: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Read the draft's editable plain part and decoded files from the same MIME.
+pub(crate) fn parse_draft(
+    account: &AccountId,
+    id: &str,
+    from: &str,
+    raw: &[u8],
+) -> crate::Result<crate::compose::StoredCompose> {
+    use crate::compose::{DraftFields, ReplyParts, ResolvedFile, StoredCompose};
+
+    let parsed = MessageParser::new()
+        .parse(raw)
+        .ok_or_else(|| crate::Error::Action("Couldn't read the server draft".into()))?;
+    let addresses = |list| {
+        address_list(list)
+            .iter()
+            .map(crate::compose::format_address)
+            .collect()
+    };
+    let fields = DraftFields {
+        from: address_list(parsed.from())
+            .iter()
+            .find(|address| address.email.eq_ignore_ascii_case(from))
+            .map(crate::compose::format_address)
+            .unwrap_or_else(|| from.to_string()),
+        to: addresses(parsed.to()),
+        cc: addresses(parsed.cc()),
+        bcc: addresses(parsed.bcc()),
+        subject: parsed.subject().unwrap_or_default().into(),
+        in_reply_to: parsed
+            .in_reply_to()
+            .and_then(|ids| ids.first())
+            .map(str::to_string),
+        ..DraftFields::default()
+    };
+    let mut body = joined(parsed.text_body(), |kind| matches!(kind, PartKind::Text))
+        .or_else(|| parsed.body_text(0).map(|text| text.into_owned()))
+        .unwrap_or_default()
+        .replace("\r\n", "\n");
+    let references = parsed
+        .references()
+        .map(|ids| ids.iter().map(str::to_string).collect())
+        .unwrap_or_default();
+    let paths = crate::compose::inline_image_paths(&body);
+    let mut files = Vec::new();
+    let mut bytes = 0_u64;
+    for part in parsed.attachments() {
+        let index = files.len() + 1;
+        bytes += part.decoded_len() as u64;
+        if index > crate::compose::MAX_ATTACHMENT_FILES
+            || bytes > crate::compose::MAX_ATTACHMENT_BYTES
+        {
+            return Err(crate::Error::Action(
+                "Server draft exceeds compose attachment limits".into(),
+            ));
+        }
+        let mime = mime_type(&part);
+        let name = crate::parts::sanitize_filename(part.attachment_name(), &mime);
+        let inline_src = part.content_id().and_then(|cid| {
+            paths.iter().find(|path| {
+                crate::compose::draft_content_id(path) == cid
+                    || path.strip_prefix("cid:") == Some(cid)
+            })
+        });
+        let path = if let Some(src) = inline_src {
+            let basename = name.replace(['(', ')'], "_");
+            let path = format!("files/{index:02}-{basename}");
+            body = body.replace(&format!("]({src})"), &format!("]({path})"));
+            path
+        } else {
+            format!("files/{index:02}-{name}")
+        };
+        files.push(ResolvedFile {
+            path,
+            display_name: name,
+            bytes: part.decoded().into_owned(),
+            inline: inline_src.is_some(),
+        });
+    }
+    Ok(StoredCompose {
+        id: id.to_string(),
+        account_id: account.clone(),
+        fields,
+        body,
+        files,
+        identities: crate::compose::email_of(from).into_iter().collect(),
+        owner: String::new(),
+        reply: ReplyParts {
+            references,
+            ..ReplyParts::default()
+        },
+    })
+}
+
 /// Parse the exact outgoing MIME without inventing a server copy or UID.
 pub(crate) fn local_sent_message(account: &AccountId, folder: &str, mime: &[u8]) -> Message {
     let mut message = parse_message(

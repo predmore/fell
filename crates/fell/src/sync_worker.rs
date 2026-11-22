@@ -129,6 +129,7 @@ enum Ask {
 /// Whether the fetch left a stored HTML part, or why it did not finish.
 pub type BodyReply = Result<bool, String>;
 
+#[derive(Clone)]
 pub struct SyncHandle {
     wake: Sender<Request>,
     /// `write_back` in the account file.

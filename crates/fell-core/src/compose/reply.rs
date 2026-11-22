@@ -337,7 +337,7 @@ fn build_references_keeping(
 
 /// An address as a draft's To or Cc line holds it: `Name <email>`, with the
 /// name in quotes when it has a comma or another special character.
-fn format_address(address: &Address) -> String {
+pub(crate) fn format_address(address: &Address) -> String {
     let email = address.email.trim().to_string();
     let name: String = address
         .name

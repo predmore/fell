@@ -38,6 +38,7 @@ pub(in crate::imap) struct WriteFixture {
     /// Apply the next command with this verb (`"MOVE"`), then drop the
     /// connection before any reply.
     pub lose_reply_to: Option<&'static str>,
+    pub lose_before_store: bool,
     pub before_store: Option<Box<dyn FnOnce() + Send>>,
     pub refuse_store_uid: Option<u32>,
     pub modified_no: bool,
@@ -116,6 +117,10 @@ pub(super) fn handle(
                 if !selected_write {
                     format!("{tag} BAD STORE requires SELECT\r\n")
                 } else {
+                    if std::mem::take(&mut writes.lose_before_store) {
+                        let _ = out.stream.shutdown(std::net::Shutdown::Both);
+                        return true;
+                    }
                     if let Some(hook) = writes.before_store.take() {
                         hook();
                     }
@@ -201,18 +206,21 @@ pub(super) fn append(
     let reply = match (writes.refuse_append, mailbox, literals.pop()) {
         (true, _, _) => format!("{tag} NO Sent storage temporarily unavailable\r\n"),
         (false, Some(mailbox), Some(raw)) => {
-            let uid = mailbox
-                .messages
-                .iter()
-                .map(|message| message.uid)
-                .max()
-                .unwrap_or(0)
-                + 1;
-            let flags = if rest.ends_with(" (\\Seen)") {
-                vec!["\\Seen".into()]
-            } else {
-                Vec::new()
-            };
+            let uid = mailbox.uidnext.unwrap_or_else(|| {
+                mailbox
+                    .messages
+                    .iter()
+                    .map(|message| message.uid)
+                    .max()
+                    .unwrap_or(0)
+                    + 1
+            });
+            mailbox.uidnext = Some(uid + 1);
+            let flags = rest
+                .rsplit_once(" (")
+                .and_then(|(_, flags)| flags.strip_suffix(')'))
+                .map(|flags| flags.split_ascii_whitespace().map(str::to_string).collect())
+                .unwrap_or_default();
             mailbox.messages.push(FixtureMessage {
                 uid,
                 flags,
@@ -225,7 +233,14 @@ pub(super) fn append(
                 let _ = out.stream.shutdown(std::net::Shutdown::Both);
                 return;
             }
-            format!("{tag} OK APPEND done\r\n")
+            if writes.uidplus {
+                format!(
+                    "{tag} OK [APPENDUID {} {uid}] APPEND done\r\n",
+                    mailbox.uidvalidity
+                )
+            } else {
+                format!("{tag} OK APPEND done\r\n")
+            }
         }
         _ => format!("{tag} BAD invalid APPEND\r\n"),
     };

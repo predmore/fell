@@ -74,6 +74,21 @@ pub(crate) fn fetch_part(
             "imap: {section:?} is not a part number"
         )));
     }
+    fetch_copy(config, copy, section, encoded_size, progress)
+}
+
+/// Read the full draft in the same bounded windows as attachment fetches.
+pub(crate) fn fetch_draft(config: &ImapConfig, copy: &RemoteId) -> Result<Option<Vec<u8>>, Error> {
+    fetch_copy(config, copy, "", 0, &mut |_| ControlFlow::Continue(()))
+}
+
+fn fetch_copy(
+    config: &ImapConfig,
+    copy: &RemoteId,
+    section: &str,
+    encoded_size: u64,
+    progress: &mut dyn FnMut(u64) -> ControlFlow<()>,
+) -> Result<Option<Vec<u8>>, Error> {
     let Some((mailbox, uidvalidity, uid)) = parse_remote_id(&copy.0)
         .and_then(|copy| Some((unescape_mailbox(&copy.mailbox)?, copy.uidvalidity, copy.uid)))
     else {

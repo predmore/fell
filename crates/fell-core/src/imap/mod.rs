@@ -9,7 +9,7 @@
 //! the store compares with the copies it recorded.
 
 mod bodies;
-mod part_fetch;
+pub(crate) mod part_fetch;
 mod projections;
 pub(crate) mod rfc822;
 mod session;

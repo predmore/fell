@@ -53,6 +53,7 @@ fn sentence_case(text: &str) -> String {
 }
 
 pub struct DraftHub {
+    server_draft_wake: Mutex<Option<super::server::Wake>>,
     sessions: Mutex<HashMap<String, DraftSession>>,
     listeners: Mutex<Vec<Listener>>,
     focused: Mutex<Option<String>>,
@@ -108,6 +109,7 @@ impl Default for DraftHub {
 impl DraftHub {
     pub fn new() -> Self {
         Self {
+            server_draft_wake: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
             listeners: Mutex::new(Vec::new()),
             focused: Mutex::new(None),
@@ -197,6 +199,7 @@ impl DraftHub {
             return false;
         };
         session.open_for_edit();
+        session.server_save.allow();
         *self.focused.lock().expect("focused") = Some(id.to_string());
         self.reveals.fetch_add(1, Ordering::SeqCst);
         drop(sessions);
@@ -345,16 +348,48 @@ impl DraftHub {
         self.emit();
     }
 
+    /// The GUI's sync worker wakes once an editor save reaches the outbox.
+    pub fn on_server_draft_queued(&self, wake: impl Fn() + Send + Sync + 'static) {
+        *self.server_draft_wake.lock().expect("server draft wake") = Some(Arc::new(wake));
+    }
+
+    fn server_draft_wake(&self) -> Option<super::server::Wake> {
+        self.server_draft_wake
+            .lock()
+            .expect("server draft wake")
+            .clone()
+    }
+
+    /// Called only by the compose window. Agent request_send can reveal a
+    /// window but does not grant permission to publish that draft.
+    pub fn poll_server_draft(&self, id: &str, now_ms: u64) {
+        if self.shown.lock().expect("shown").as_deref() != Some(id) {
+            return;
+        }
+        if let Some(wake) = self.server_draft_wake() {
+            self.with_session(id, |session| {
+                session.flush_server_if_due(Some(now_ms), &wake)
+            });
+        }
+    }
+
     /// Queue every save still waiting on the editor's debounce, then wait
     /// until each live draft's saves are on disk. The app calls this when it
     /// quits.
     pub fn settle_all(&self) {
+        let wake = self.server_draft_wake();
+        let shown = self.shown.lock().expect("shown").clone();
         let waiters: Vec<super::SaveWaiter> = self
             .sessions
             .lock()
             .expect("sessions")
             .values_mut()
             .filter_map(|session| {
+                if let Some(wake) = &wake
+                    && shown.as_deref() == Some(session.id())
+                {
+                    session.flush_server_if_due(None, wake);
+                }
                 let _ = session.flush_pending();
                 session.save_waiter()
             })
@@ -387,7 +422,11 @@ impl DraftHub {
         };
         // No window has it open for editing any more. Typing still waiting
         // on the save debounce is saved now.
+        let wake = was_shown.then(|| self.server_draft_wake()).flatten();
         let summary = self.with_session(id, |session| {
+            if let Some(wake) = &wake {
+                session.flush_server_if_due(None, wake);
+            }
             let _ = session.flush_pending();
             session.close_editor();
             let snap = session.snapshot();
@@ -497,6 +536,7 @@ impl DraftHub {
             return false;
         }
         session.request_send();
+        session.server_save.allow();
         *self.focused.lock().expect("focused") = Some(id);
         self.reveals.fetch_add(1, Ordering::SeqCst);
         drop(sessions);

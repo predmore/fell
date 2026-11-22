@@ -481,6 +481,26 @@ impl ComposeView {
     }
 
     pub fn watch_live(&self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
+                if this
+                    .update(cx, |this, _| {
+                        if matches!(this.field, Field::Subject | Field::Body)
+                            || fell_core::compose::parse_address_line(this.header_text()).is_ok()
+                        {
+                            this.hub.poll_server_draft(this.draft_id.as_ref(), now_ms());
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
         cx.observe_window_activation(window, |this, window, cx| {
             if window.is_window_active() && !this.closing {
                 this.refresh_send_availability(cx);
@@ -970,18 +990,23 @@ impl ComposeView {
         }
     }
 
+    fn record_field(&self, field: Field) -> Option<Result<(), String>> {
+        self.hub
+            .with_session(self.draft_id.as_ref(), |session| match field {
+                Field::To => session.set_addresses_from_user("to", &self.to_line),
+                Field::Cc => session.set_addresses_from_user("cc", &self.cc_line),
+                Field::Bcc => session.set_addresses_from_user("bcc", &self.bcc_line),
+                Field::Subject => {
+                    session.set_subject_from_user(self.subject_line.clone());
+                    Ok(())
+                }
+                Field::Body => Ok(()),
+            })
+    }
+
     fn commit_field(&mut self, field: Field) -> bool {
         let id = self.draft_id.to_string();
-        let result = self.hub.with_session(&id, |session| match field {
-            Field::To => session.set_addresses_from_user("to", &self.to_line),
-            Field::Cc => session.set_addresses_from_user("cc", &self.cc_line),
-            Field::Bcc => session.set_addresses_from_user("bcc", &self.bcc_line),
-            Field::Subject => {
-                session.set_subject_from_user(self.subject_line.clone());
-                Ok(())
-            }
-            Field::Body => Ok(()),
-        });
+        let result = self.record_field(field);
         match result {
             Some(Ok(())) => {
                 let _ = self.hub.with_session(&id, |session| session.flush());
@@ -1313,6 +1338,7 @@ impl ComposeView {
             } else if !self.recipient_key(key, &event.keystroke.modifiers) {
                 self.field_key(key, typed);
             }
+            self.arm_debounced_flush(cx);
             return;
         }
         if event.keystroke.modifiers.control && key == "enter" {
@@ -1548,6 +1574,16 @@ impl ComposeView {
         self.status = "space".into();
     }
 
+    fn header_text(&self) -> &str {
+        match self.field {
+            Field::To => &self.to_line,
+            Field::Cc => &self.cc_line,
+            Field::Bcc => &self.bcc_line,
+            Field::Subject => &self.subject_line,
+            Field::Body => "",
+        }
+    }
+
     fn field_key(&mut self, key: &str, typed: Option<&str>) {
         let line = match self.field {
             Field::To => &mut self.to_line,
@@ -1557,9 +1593,6 @@ impl ComposeView {
             Field::Body => return,
         };
         match key {
-            "backspace" => {
-                line.pop();
-            }
             "tab" | "enter" => {
                 let field = self.field;
                 if self.commit_field(field) {
@@ -1568,13 +1601,23 @@ impl ComposeView {
                         self.status = "insert".into();
                     }
                 }
+                return;
             }
-            "j" | "k" if typed.is_none() => {}
+            "backspace" => {
+                line.pop();
+            }
             _ => {
-                if let Some(ch) = typed {
-                    line.push_str(ch);
-                }
+                let Some(ch) = typed else { return };
+                line.push_str(ch);
             }
+        }
+        // Recipient completion owns unfinished tokens. Only committed
+        // recipients are eligible for a server save.
+        if self.field == Field::Subject && self.record_field(self.field) == Some(Ok(())) {
+            self.hub.with_session(self.draft_id.as_ref(), |session| {
+                session.arm_outbound(now_ms())
+            });
+            self.flush_pending = true;
         }
     }
 

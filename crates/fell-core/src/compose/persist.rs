@@ -108,6 +108,9 @@ pub(crate) fn mark_discarded(
            ))",
         params![account.as_str(), id, action_id, SEND_SENT],
     )?;
+    if changed == 1 {
+        crate::outbox::drafts::cancel_unsent(conn, account, id)?;
+    }
     Ok(changed == 1)
 }
 
@@ -154,6 +157,7 @@ pub(crate) fn record_confirmed_send(
             SEND_MAYBE_SENT
         ],
     )?;
+    crate::outbox::drafts::queue_delete(conn, account, draft_id)?;
     Ok(())
 }
 
@@ -194,7 +198,7 @@ pub(crate) fn confirm_synced_sends(
         return Ok(Vec::new());
     };
     let mailbox = crate::imap::escape_mailbox(&sent);
-    let mut confirmed = Vec::new();
+    let mut confirmed: Vec<String> = Vec::new();
     let mut update = conn.prepare_cached(
         "UPDATE compose_send SET state = ?4, updated_unix = ?5
          WHERE account_id = ?1 AND state = ?2 AND message_id = ?3
@@ -230,6 +234,9 @@ pub(crate) fn confirm_synced_sends(
                 confirm(message_id)?;
             }
         }
+    }
+    for id in &confirmed {
+        crate::outbox::drafts::queue_delete(conn, account_id, id)?;
     }
     Ok(confirmed)
 }
@@ -323,6 +330,63 @@ fn save_compose_in(
 }
 
 impl Store {
+    /// Which exact server copy a row in Drafts opens for editing.
+    pub(crate) fn server_draft_source(
+        &self,
+        account: &AccountId,
+        thread: &crate::ThreadId,
+    ) -> Result<Option<crate::outbox::drafts::Copy>> {
+        let roles = self.folder_roles(account)?;
+        let Some(folder) = roles.get(crate::FolderRole::Drafts) else {
+            return Ok(None);
+        };
+        let found: Option<(u32, u32)> = self
+            .conn
+            .query_row(
+                "SELECT c.uidvalidity, c.uid FROM message_copies c
+             JOIN messages m ON m.account_id = c.account_id AND m.message_id = c.message_id
+             WHERE c.account_id = ?1 AND c.mailbox = ?2 AND m.thread_id = ?3
+             ORDER BY m.date_unix DESC, c.uid DESC LIMIT 1",
+                params![
+                    account.as_str(),
+                    crate::imap::escape_mailbox(&folder.raw),
+                    thread.as_str()
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(found.map(|(validity, uid)| crate::outbox::drafts::Copy {
+            mailbox: folder.raw.clone(),
+            validity,
+            uid,
+        }))
+    }
+
+    pub(crate) fn import_server_draft(
+        &self,
+        copy: &crate::outbox::drafts::Copy,
+        draft: &StoredCompose,
+    ) -> Result<String> {
+        workspace::validate_id(&draft.id).map_err(crate::Error::Invalid)?;
+        let tx = crate::store::begin_immediate(&self.conn)?;
+        let account = &draft.account_id;
+        if let Some(id) = crate::outbox::drafts::local_id(&tx, account, copy)? {
+            return Ok(id);
+        }
+        save_compose_in(&tx, draft, Some(&draft.files), None)?;
+        crate::outbox::drafts::import(
+            &tx,
+            account,
+            &draft.id,
+            copy,
+            &super::server::digest(draft, &draft.files),
+        )?;
+        self.hide_server_draft_copy(&tx, account, copy)?;
+        tx.commit()?;
+        self.seal_private_files()?;
+        Ok(draft.id.clone())
+    }
+
     pub fn save_compose(&self, draft: &StoredCompose) -> Result<()> {
         self.save_compose_parts(draft, Some(&draft.files), None)
     }
@@ -522,9 +586,10 @@ impl Store {
         lock: Option<SendLock>,
     ) -> Result<()> {
         self.conn.pragma_update(None, "synchronous", "FULL")?;
+        let tx = crate::store::begin_immediate(&self.conn)?;
         match lock {
             None => {
-                self.conn.execute(
+                tx.execute(
                     "UPDATE compose_send SET state = ?3, updated_unix = ?4, message_id = NULL
                      WHERE account_id = ?1 AND draft_id = ?2 AND state = ?5",
                     params![
@@ -542,7 +607,7 @@ impl Store {
                     SendLock::MaybeSent | SendLock::InFlight => SEND_MAYBE_SENT,
                 };
                 // `sent` only moves up; "may have been sent" never replaces it.
-                self.conn.execute(
+                tx.execute(
                     "INSERT INTO compose_send (account_id, draft_id, state, updated_unix)
                      VALUES (?1, ?2, ?3, ?4)
                      ON CONFLICT(account_id, draft_id) DO UPDATE SET
@@ -553,6 +618,10 @@ impl Store {
                 )?;
             }
         }
+        if lock == Some(SendLock::Sent) {
+            crate::outbox::drafts::queue_delete(&tx, account_id, draft_id)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 

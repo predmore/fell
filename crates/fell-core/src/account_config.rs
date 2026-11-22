@@ -19,7 +19,7 @@
 //! # smtp_security = "starttls"  # "plain" only for a loopback address
 //! # sent_folder = "Sent Items"  # only for a server that does not mark its folders
 //! # save_sent = "auto"        # "append" or "server" overrides provider detection
-//! # write_back = true           # send moves and flag changes to the server (off by default)
+//! # write_back = true           # send local changes to the server (off by default)
 //! # notifications = "on"       # "on", "private", or "off"
 //! ```
 //!
@@ -34,8 +34,8 @@
 //! and selects `"append"` elsewhere. Set `"server"` to let your provider
 //! file the copy, or `"append"` to have Fell file it with IMAP.
 //!
-//! With `write_back = true`, Fell queues Sent appends, moves, and read and star
-//! changes for the sync thread (see [`crate::outbox`]). With write-back off,
+//! With `write_back = true`, Fell queues drafts, Sent appends, moves, and read and
+//! star changes for the sync thread (see [`crate::outbox`]). With write-back off,
 //! append mode saves the local Sent copy only.
 //!
 //! Sending uses only this file's username and password source, never anything in a
@@ -559,6 +559,30 @@ impl AccountConfig {
             &self.username,
             &password,
         ))
+    }
+
+    /// Import the newest copy from this thread in the listed Drafts mailbox.
+    /// The remote UID stays attached to the resulting local compose draft.
+    pub fn import_server_draft(
+        &self,
+        store: &crate::Store,
+        thread: &crate::ThreadId,
+        draft_id: &str,
+    ) -> Result<String> {
+        let account = self.account();
+        let copy = store
+            .server_draft_source(&account.id, thread)?
+            .ok_or_else(|| crate::Error::Action("Server draft is no longer in Drafts".into()))?;
+        let remote = crate::RemoteId(format!(
+            "imap:{}:{}:{}",
+            copy.validity,
+            copy.uid,
+            crate::imap::escape_mailbox(&copy.mailbox)
+        ));
+        let raw = crate::imap::part_fetch::fetch_draft(&self.imap_config()?, &remote)?
+            .ok_or_else(|| crate::Error::Action("Server draft is no longer available".into()))?;
+        let draft = crate::imap::rfc822::parse_draft(&account.id, draft_id, &account.email, &raw)?;
+        store.import_server_draft(&copy, &draft)
     }
 
     fn imap_config(&self) -> Result<ImapConfig> {

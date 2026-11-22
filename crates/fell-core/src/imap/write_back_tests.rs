@@ -152,9 +152,7 @@ impl Fixture {
         replay_outbox(&self.backend.config, &self.account.id, &self.store, true).unwrap()
     }
 
-    /// Replay as the sync thread does, through the account file: what the
-    /// status line is given.
-    fn replay_as_window(&self) -> crate::outbox::ReplayReport {
+    fn account_config(&self) -> crate::AccountConfig {
         let mut config = crate::AccountConfig::bridge(
             "c@x",
             "caleb",
@@ -165,7 +163,12 @@ impl Fixture {
         config.port = self.server.addr.port();
         config.security = ImapSecurity::Plain;
         config.write_back = true;
-        config.replay_outbox(&self.store).unwrap()
+        config
+    }
+
+    /// Replay as the sync thread does. This is what the status line sees.
+    fn replay_as_window(&self) -> crate::outbox::ReplayReport {
+        self.account_config().replay_outbox(&self.store).unwrap()
     }
 
     fn sync(&self) {
@@ -3357,4 +3360,285 @@ fn server_mode_and_disabled_write_back_keep_only_the_local_sent_row() {
                 .all(|command| !command.contains(" APPEND "))
         );
     }
+}
+
+const SERVER_DRAFTS: &str = "Work in progress";
+
+fn draft_fixture(store: Store) -> Fixture {
+    Fixture::with(
+        store,
+        state_with(vec![
+            mailbox("INBOX", "", 7, &[(1, "Alpha")]),
+            mailbox(SERVER_DRAFTS, "\\Drafts", 64, &[]),
+            mailbox("Filed mail", "\\Sent", 65, &[]),
+        ]),
+    )
+}
+
+fn draft_appends(fixture: &Fixture) -> usize {
+    fixture
+        .commands()
+        .iter()
+        .filter(|command| command.contains(" APPEND "))
+        .count()
+}
+
+fn draft_hub(home: &std::path::Path, fixture: &Fixture) -> crate::compose::DraftHub {
+    use crate::compose::{DraftFields, DraftHub, DraftSession};
+    let db = fixture.store.db_path().unwrap();
+    let account = fixture.account.id.clone();
+    let folder = DraftSession::start_in(
+        home,
+        "draft-test",
+        account.clone(),
+        DraftFields {
+            from: fixture.account.email.clone(),
+            to: vec!["Avery <avery@example.test>".into()],
+            bcc: vec!["Taylor <taylor@example.test>".into()],
+            subject: "Weekly notes".into(),
+            ..DraftFields::default()
+        },
+        "",
+        db,
+    )
+    .unwrap();
+    let mut session = DraftSession::open_with_store(&folder, account, &fixture.store).unwrap();
+    session.bind_store(db);
+    let hub = DraftHub::new();
+    hub.on_server_draft_queued(|| {});
+    hub.insert(session);
+    hub
+}
+
+fn wait_for_draft(hub: &crate::compose::DraftHub) {
+    hub.with_session("draft-test", |session| session.save_waiter())
+        .flatten()
+        .unwrap()
+        .wait()
+        .unwrap();
+}
+
+fn set_draft_body(hub: &crate::compose::DraftHub, body: String) {
+    hub.with_session("draft-test", |session| session.set_body_from_user(body))
+        .unwrap();
+}
+
+#[test]
+fn server_draft_debounce_close_and_sync_deduplicate() {
+    let dir = tempfile::tempdir().unwrap();
+    let fx = draft_fixture(Store::open(dir.path().join("mail.db")).unwrap());
+    let hub = draft_hub(&dir.path().join("drafts"), &fx);
+    // An agent can request an editor reveal without authorizing IMAP.
+    hub.with_session("draft-test", |session| session.request_send())
+        .unwrap();
+    hub.note_shown("draft-test");
+    hub.poll_server_draft("draft-test", 0);
+    hub.poll_server_draft("draft-test", 6000);
+    wait_for_draft(&hub);
+    assert_eq!(fx.replay().sent, 0);
+    assert!(hub.show("draft-test"));
+
+    for edit in 0..20 {
+        set_draft_body(&hub, format!("# Notes\n\nEdit {edit}"));
+        hub.poll_server_draft("draft-test", 7000 + edit * 250);
+        assert_eq!(fx.replay().sent, 0);
+    }
+    hub.poll_server_draft("draft-test", 17_000);
+    wait_for_draft(&hub);
+    assert_eq!(fx.replay().sent, 1);
+    assert_eq!(fx.on_server(SERVER_DRAFTS), [(1, "Weekly notes".into())]);
+    assert_eq!(fx.flags(SERVER_DRAFTS, 1), ["\\Draft", "\\Seen"]);
+    fx.sync();
+    assert!(fx.subjects(SERVER_DRAFTS).is_empty());
+    assert_eq!(
+        fx.store
+            .unsent_compose_drafts(&fx.account.id)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    set_draft_body(&hub, "Edited again before close".into());
+    hub.note_hidden("draft-test");
+    wait_for_draft(&hub);
+    assert_eq!(fx.replay().sent, 1);
+    assert_eq!(fx.on_server(SERVER_DRAFTS), [(2, "Weekly notes".into())]);
+    assert_eq!(draft_appends(&fx), 2);
+    assert!(
+        fx.commands()
+            .iter()
+            .any(|cmd| cmd.ends_with("UID EXPUNGE 1"))
+    );
+    assert!(!fx.commands().iter().any(|cmd| cmd.ends_with(" EXPUNGE")));
+}
+
+#[test]
+fn server_draft_import_round_trips_and_confirmed_send_cleans_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let fx = draft_fixture(Store::open(dir.path().join("mail.db")).unwrap());
+    let config = fx.account_config();
+    let mime = b"From: Robin <c@x>\r\nTo: Avery <avery@example.test>\r\n\
+        Cc: Blake <blake@example.test>\r\nBcc: Taylor <taylor@example.test>\r\n\
+        Subject: Field notes\r\nMessage-ID: <remote-draft@example.test>\r\n\
+        MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=notes\r\n\r\n\
+        --notes\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n# Field notes\r\n\r\nTwo routes.\r\n\
+        --notes\r\nContent-Type: application/octet-stream\r\n\
+        Content-Disposition: attachment; filename=map.txt\r\n\
+        Content-Transfer-Encoding: base64\r\n\r\nbWFw\r\n--notes--\r\n";
+    fx.deliver(SERVER_DRAFTS, 1, mime.to_vec());
+    fx.sync();
+    let thread = fx.thread(SERVER_DRAFTS, "Field notes");
+    let id = config
+        .import_server_draft(&fx.store, &thread, "imported-draft")
+        .unwrap();
+    let stored = fx.store.load_compose(&id).unwrap().unwrap();
+    assert_eq!(stored.fields.from, "Robin <c@x>");
+    assert_eq!(
+        stored.identities.as_slice(),
+        std::slice::from_ref(&fx.account.email)
+    );
+    assert_eq!(stored.fields.to, ["Avery <avery@example.test>"]);
+    assert_eq!(stored.fields.cc, ["Blake <blake@example.test>"]);
+    assert_eq!(stored.fields.bcc, ["Taylor <taylor@example.test>"]);
+    assert_eq!(stored.fields.subject, "Field notes");
+    assert_eq!(stored.body.trim_end(), "# Field notes\n\nTwo routes.");
+    assert_eq!(stored.files[0].display_name, "map.txt");
+    assert_eq!(stored.files[0].bytes, b"map");
+    assert!(fx.subjects(SERVER_DRAFTS).is_empty());
+    fx.sync();
+    assert!(fx.subjects(SERVER_DRAFTS).is_empty());
+
+    // Exercise the same confirmation transaction as the editor after SMTP.
+    fx.store
+        .record_sent_message(
+            &fx.account.id,
+            &id,
+            &crate::MessageId::new("reply@compose.fell"),
+            &[],
+            REPLY_MIME,
+            false,
+        )
+        .unwrap();
+    assert_eq!(fx.replay().sent, 1);
+    assert!(fx.on_server(SERVER_DRAFTS).is_empty());
+    assert_eq!(draft_appends(&fx), 0);
+}
+
+#[test]
+fn server_draft_recovers_a_crash_before_cleanup_and_a_lost_append_reply() {
+    let dir = tempfile::tempdir().unwrap();
+    let fx = draft_fixture(Store::open(dir.path().join("mail.db")).unwrap());
+    let hub = draft_hub(&dir.path().join("drafts"), &fx);
+    let queue = |body: &str| {
+        assert!(hub.show("draft-test"));
+        hub.note_shown("draft-test");
+        set_draft_body(&hub, body.into());
+        hub.note_hidden("draft-test");
+        wait_for_draft(&hub);
+    };
+    queue("Original");
+    assert_eq!(fx.replay().sent, 1);
+
+    queue("Replacement");
+    fx.server.writes.lock().unwrap().lose_before_store = true;
+    assert!(fx.replay().interrupted.is_some());
+    assert_eq!(fx.on_server(SERVER_DRAFTS).len(), 2);
+    let pending = fx.store.outbox(&fx.account.id).unwrap().pop().unwrap();
+    assert_eq!(pending.placed_uid, Some(2));
+    fx.sync();
+    assert!(fx.subjects(SERVER_DRAFTS).is_empty());
+    queue("Saved after restart");
+    fx.make_due();
+    assert_eq!(fx.replay().sent, 2);
+    assert_eq!(fx.on_server(SERVER_DRAFTS), [(3, "Weekly notes".into())]);
+    assert_eq!(draft_appends(&fx), 3);
+
+    queue("Saved with a missing APPEND reply");
+    {
+        let mut writes = fx.server.writes.lock().unwrap();
+        writes.lose_reply_to = Some("APPEND");
+        writes.empty_header_searches = 1;
+    }
+    assert!(fx.replay().interrupted.is_some());
+    assert_eq!(fx.on_server(SERVER_DRAFTS).len(), 2);
+    fx.make_due();
+    assert_eq!(fx.replay().sent, 1);
+    assert_eq!(fx.on_server(SERVER_DRAFTS), [(4, "Weekly notes".into())]);
+    assert_eq!(draft_appends(&fx), 4);
+    assert!(
+        fx.commands()
+            .iter()
+            .any(|cmd| cmd.contains("UID SEARCH UID 4:4"))
+    );
+}
+
+#[test]
+fn server_draft_write_back_off_and_cleanup_without_uidplus() {
+    let dir = tempfile::tempdir().unwrap();
+    let fx = draft_fixture(Store::open(dir.path().join("mail.db")).unwrap());
+    let hub = draft_hub(&dir.path().join("drafts"), &fx);
+    let queue = |body: &str| {
+        hub.show("draft-test");
+        hub.note_shown("draft-test");
+        set_draft_body(&hub, body.into());
+        hub.note_hidden("draft-test");
+        wait_for_draft(&hub);
+    };
+    fx.server.writes.lock().unwrap().uidplus = false;
+    fx.store.set_write_back(&fx.account.id, false).unwrap();
+    queue("Local only");
+    assert_eq!(fx.replay().sent, 0);
+    assert_eq!(draft_appends(&fx), 0);
+    fx.store.set_write_back(&fx.account.id, true).unwrap();
+    queue("First server copy");
+    assert_eq!(fx.replay().sent, 1);
+    fx.deliver(SERVER_DRAFTS, 50, REPLY_MIME.to_vec());
+    fx.server.state.lock().unwrap().mailboxes[1].uidnext = Some(51);
+    queue("Updated");
+    assert_eq!(fx.replay().sent, 1);
+    assert_eq!(fx.on_server(SERVER_DRAFTS).len(), 3);
+    assert!(
+        fx.flags(SERVER_DRAFTS, 1)
+            .contains(&"\\Deleted".to_string())
+    );
+    assert!(
+        !fx.flags(SERVER_DRAFTS, 50)
+            .contains(&"\\Deleted".to_string())
+    );
+    assert!(!fx.commands().iter().any(|cmd| cmd.contains(" EXPUNGE")));
+}
+
+#[test]
+fn server_draft_new_save_checks_an_unconfirmed_copy_before_replacing_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let fx = draft_fixture(Store::open(dir.path().join("mail.db")).unwrap());
+    let hub = draft_hub(&dir.path().join("drafts"), &fx);
+    let queue = |body: &str| {
+        hub.show("draft-test");
+        hub.note_shown("draft-test");
+        set_draft_body(&hub, body.into());
+        hub.note_hidden("draft-test");
+        wait_for_draft(&hub);
+    };
+    queue("Original");
+    assert_eq!(fx.replay().sent, 1);
+    queue("Unconfirmed");
+    {
+        let mut writes = fx.server.writes.lock().unwrap();
+        writes.lose_reply_to = Some("APPEND");
+        writes.refuse_search = true;
+    }
+    assert!(fx.replay().interrupted.is_some());
+    queue("Already queued before recovery stopped");
+    for _ in 0..super::write_back::MAX_APPEND_CHECKS {
+        fx.make_due();
+        assert_eq!(fx.replay().sent, 0);
+    }
+    assert_eq!(draft_appends(&fx), 2);
+    assert_eq!(fx.on_server(SERVER_DRAFTS).len(), 2);
+    fx.server.writes.lock().unwrap().refuse_search = false;
+    queue("Next authorized save");
+    assert_eq!(fx.replay().sent, 2);
+    assert_eq!(draft_appends(&fx), 3);
+    assert_eq!(fx.on_server(SERVER_DRAFTS), [(3, "Weekly notes".into())]);
 }

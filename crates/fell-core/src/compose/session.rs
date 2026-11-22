@@ -257,6 +257,7 @@ pub struct DraftSession {
     reply_context: Option<ReplyContext>,
     /// When the latest unflushed editor change was armed. `None` when the file is current.
     outbound_since: Option<u64>,
+    pub(super) server_save: super::server::Debounce,
     /// Synchronous saves: the attachment stamp last copied into the mailbox.
     save_cache: SaveCache,
     /// Saves run here, off the lock the editor paints from, once attached.
@@ -397,6 +398,7 @@ impl DraftSession {
             send_requested_by: None,
             reply_context: None,
             outbound_since: None,
+            server_save: Default::default(),
             save_cache: SaveCache::default(),
             writer: None,
             own_writes: OwnWrites::default(),
@@ -702,6 +704,7 @@ impl DraftSession {
     /// The window showing this draft closed. Agents may delete it again.
     pub fn close_editor(&mut self) {
         self.open = false;
+        self.server_save = Default::default();
         self.focused = false;
     }
 
@@ -784,8 +787,14 @@ impl DraftSession {
     pub fn set_addresses_from_user(&mut self, field: &str, line: &str) -> Result<(), String> {
         self.ensure_editable()?;
         let parsed = parse_address_line(line)?;
-        if !matches!(field, "to" | "cc" | "bcc") {
-            return Err("unknown address field".into());
+        let current = match field {
+            "to" => &self.fields.to,
+            "cc" => &self.fields.cc,
+            "bcc" => &self.fields.bcc,
+            _ => return Err("unknown address field".into()),
+        };
+        if *current == parsed {
+            return Ok(());
         }
         self.begin_user_change();
         let before = self.hunk_base();
@@ -1023,12 +1032,23 @@ impl DraftSession {
     /// lock is not held across disk I/O; a failed write shows as a notice on
     /// the next save. Without one it writes before returning.
     pub fn flush(&mut self) -> Result<(), String> {
+        self.flush_with_server(None)
+    }
+
+    pub(super) fn flush_server_if_due(&mut self, now_ms: Option<u64>, wake: &super::server::Wake) {
+        if self.send_lock.is_none() && self.server_save.due(self.revision, now_ms) {
+            let _ = self.flush_with_server(Some(wake.clone()));
+        }
+    }
+
+    fn flush_with_server(&mut self, server: Option<super::server::Wake>) -> Result<(), String> {
         self.outbound_since = None;
         let text = self.serialize();
         let job = SaveJob {
             folder: self.folder.clone(),
             text: text.clone(),
             mailbox: Some(self.mailbox_save(&text)),
+            server,
         };
         self.last_written = text.clone();
         if let Some(writer) = &self.writer {

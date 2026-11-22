@@ -997,7 +997,14 @@ impl Inbox {
         // Sync opens its own connection only after this one finished opening
         // and migrating the file, so the two never race for the first lock.
         if !store_failed && let Some((config, path)) = sync_with {
+            let write_back = config.write_back;
             let (handle, events) = sync_worker::start(config, path, self.notifications.clone());
+            if write_back && let Some(drafts) = cx.try_global::<crate::draft_host::AgentDrafts>() {
+                let sync = handle.clone();
+                drafts
+                    .0
+                    .on_server_draft_queued(move || sync.write_back_now());
+            }
             self.sync = Some(handle);
             self.watch_sync(events, cx);
         }
@@ -1145,8 +1152,24 @@ impl Inbox {
                                 let sent_failed = dropped
                                     .iter()
                                     .any(|write| write.kind == OutboxKind::AppendSent);
-                                dropped.retain(|write| write.kind != OutboxKind::AppendSent);
+                                let draft_failed = dropped.iter().any(|write| {
+                                    matches!(
+                                        write.kind,
+                                        OutboxKind::AppendDraft | OutboxKind::DeleteDraft
+                                    )
+                                });
+                                dropped.retain(|write| {
+                                    !matches!(
+                                        write.kind,
+                                        OutboxKind::AppendSent
+                                            | OutboxKind::AppendDraft
+                                            | OutboxKind::DeleteDraft
+                                    )
+                                });
                                 let mut lines = Vec::new();
+                                if draft_failed {
+                                    lines.push("Drafts · server copy unconfirmed".to_string());
+                                }
                                 let local_save_failed =
                                     inbox.session.status_notice().is_some_and(|notice| {
                                         notice.text == fell_core::compose::LOCAL_SENT_COPY_FAILED
@@ -3380,7 +3403,12 @@ impl Inbox {
     /// `c` (no id) or Enter on a draft row: bring the compose window up on
     /// the draft. A live draft shows at once; otherwise it is created or read
     /// from the mailbox off this thread, then shown.
-    fn open_draft(&mut self, id: Option<String>, cx: &mut Context<Self>) {
+    fn open_draft(
+        &mut self,
+        id: Option<String>,
+        remote: Option<fell_core::ThreadId>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(hub) = cx
             .try_global::<crate::draft_host::AgentDrafts>()
             .map(|drafts| drafts.0.clone())
@@ -3404,15 +3432,16 @@ impl Inbox {
         };
         let account = self.account_id.clone();
         let email = self.session.account_email.clone();
-        let creating = id.is_none();
+        let creating = id.is_none() && remote.is_none();
         // The draft goes live in the hub off this thread; only showing it
         // happens here.
         let task = cx.background_executor().spawn({
             let hub = hub.clone();
             async move {
-                match id {
-                    Some(id) => home.open(&hub, &id, &account).map(|()| id),
-                    None => home.new_draft(&hub, &account, &email),
+                match (id, remote) {
+                    (Some(id), _) => home.open(&hub, &id, &account).map(|()| id),
+                    (None, Some(thread)) => home.open_server_draft(&hub, &account, &thread),
+                    (None, None) => home.new_draft(&hub, &account, &email),
                 }
             }
         });
@@ -3895,12 +3924,16 @@ impl Inbox {
             }
         }
         if step.compose {
-            self.open_draft(None, cx);
+            self.open_draft(None, None, cx);
         }
-        if step.open_draft
-            && let Some(id) = self.session.cursor_draft().map(str::to_string)
-        {
-            self.open_draft(Some(id), cx);
+        if step.open_draft {
+            let id = self.session.cursor_draft().map(str::to_string);
+            let server = if id.is_none() {
+                self.session.cursor_id.clone().map(fell_core::ThreadId)
+            } else {
+                None
+            };
+            self.open_draft(id, server, cx);
         }
         if let Some(kind) = step.reply {
             self.start_reply(kind, None, cx);

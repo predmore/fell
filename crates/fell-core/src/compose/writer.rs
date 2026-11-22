@@ -22,6 +22,7 @@ pub(crate) struct SaveJob {
     pub folder: PathBuf,
     pub text: String,
     pub mailbox: Option<MailboxSave>,
+    pub server: Option<super::server::Wake>,
 }
 
 /// The mailbox row for the draft. `store_path` is `None` when the session
@@ -60,7 +61,8 @@ impl SaveJob {
         // reads it now; the mailbox holds them.
         let _ = std::fs::remove_file(workspace::control_dir(&self.folder).join("hunks.json"));
         if let Some(mailbox) = self.mailbox {
-            persist_mailbox(&self.folder, mailbox, cache).map_err(SaveError::Mailbox)?;
+            persist_mailbox_with_server(&self.folder, mailbox, cache, self.server.as_ref())
+                .map_err(SaveError::Mailbox)?;
         }
         Ok(())
     }
@@ -73,6 +75,15 @@ pub(crate) fn persist_mailbox(
     folder: &Path,
     mailbox: MailboxSave,
     cache: &mut SaveCache,
+) -> Result<(), String> {
+    persist_mailbox_with_server(folder, mailbox, cache, None)
+}
+
+fn persist_mailbox_with_server(
+    folder: &Path,
+    mailbox: MailboxSave,
+    cache: &mut SaveCache,
+    server: Option<&super::server::Wake>,
 ) -> Result<(), String> {
     let path = mailbox
         .store_path
@@ -87,15 +98,18 @@ pub(crate) fn persist_mailbox(
     if stamp == cache.attachment_stamp {
         store
             .save_compose_parts(&draft, None, review)
-            .map_err(|err| err.to_string())
+            .map_err(|err| err.to_string())?;
     } else {
         let files = workspace::resolve_closure(folder, &draft.fields, &draft.body).files;
         store
             .save_compose_parts(&draft, Some(&files), review)
             .map_err(|err| err.to_string())?;
         cache.attachment_stamp = stamp;
-        Ok(())
     }
+    if let Some(wake) = server {
+        super::server::queue(&store, folder, &draft, wake);
+    }
+    Ok(())
 }
 
 struct Progress {
@@ -256,8 +270,10 @@ impl SaveWaiter {
 fn write_loop(rx: Receiver<(u64, SaveJob)>, shared: Arc<Shared>) {
     let mut cache = SaveCache::default();
     while let Ok(mut next) = rx.recv() {
-        // Only the newest queued save is worth writing.
-        while let Ok(newer) = rx.try_recv() {
+        // A server save owns the authorized snapshot. Run it before a later
+        // local-only save that might come from an agent after the editor closes.
+        while next.1.server.is_none() {
+            let Ok(newer) = rx.try_recv() else { break };
             next = newer;
         }
         let (number, job) = next;

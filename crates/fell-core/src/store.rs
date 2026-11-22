@@ -808,6 +808,14 @@ impl Store {
                 .map(|flag| &flag.remote_id.0)
                 .collect()
         };
+        let drafts_mailbox = if delta.messages.is_empty() {
+            None
+        } else {
+            merge_roles
+                .listed(&tx, account_id)?
+                .get(FolderRole::Drafts)
+                .map(|folder| crate::imap::escape_mailbox(&folder.raw))
+        };
         for message in &delta.messages {
             if &message.account_id != account_id {
                 return Err(crate::Error::Backend(format!(
@@ -815,6 +823,18 @@ impl Store {
                     account_id.as_str(),
                     message.account_id.as_str()
                 )));
+            }
+            if let Some(mailbox) = &drafts_mailbox
+                && let Some(copy) = crate::imap::parse_remote_id(&message.remote_id.0)
+                && &copy.mailbox == mailbox
+                && crate::outbox::drafts::hides(
+                    &tx,
+                    account_id,
+                    &copy,
+                    &message.headers.message_id,
+                )?
+            {
+                continue;
             }
             // Skip a folder archive or delete already took off this message.
             let Some(mut message) = crate::actions::message_for_delta(&tx, message)? else {
@@ -961,6 +981,18 @@ impl Store {
     }
 
     /// Re-resolve the threads this transaction's writes touched.
+    pub(crate) fn hide_server_draft_copy(
+        &self,
+        tx: &Connection,
+        account: &AccountId,
+        copy: &crate::outbox::drafts::Copy,
+    ) -> Result<()> {
+        if copies::hide_draft(tx, account, copy)? {
+            self.rethread_written(tx, account)?;
+        }
+        Ok(())
+    }
+
     fn rethread_written(&self, conn: &Connection, account_id: &AccountId) -> Result<()> {
         #[cfg(test)]
         if self.full_rethread.get() {
@@ -2622,19 +2654,24 @@ impl<'a> MergeRoles<'a> {
         }
     }
 
+    fn listed(&mut self, conn: &Connection, account: &AccountId) -> Result<&FolderRoles> {
+        if self.listed.is_none() {
+            self.listed = Some(Cow::Owned(
+                roles::listed(conn, account)?.unwrap_or_default(),
+            ));
+        }
+        Ok(self.listed.as_deref().expect("loaded roles"))
+    }
+
     fn resolve<'b>(
         &'b mut self,
         conn: &Connection,
         message: &Message,
         fallback: &'b mut Option<FolderRoles>,
     ) -> Result<&'b FolderRoles> {
-        if self.listed.is_none() {
-            self.listed = Some(Cow::Owned(
-                roles::listed(conn, &message.account_id)?.unwrap_or_default(),
-            ));
-        }
-        if let Some(found) = self.listed.as_deref().filter(|roles| !roles.is_empty()) {
-            return Ok(found);
+        let listed = self.listed(conn, &message.account_id)?;
+        if !listed.is_empty() {
+            return Ok(listed);
         }
         match fallback {
             Some(found) => Ok(found),
