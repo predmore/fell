@@ -1,0 +1,271 @@
+method call time=1795310119.278802 sender=:1.3 -> destination=org.freedesktop.Notifications serial=3 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=GetCapabilities
+method call time=1795310129.284490 sender=:1.17 -> destination=org.freedesktop.Notifications serial=19 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=GetCapabilities
+method call time=1795310129.293889 sender=:1.17 -> destination=:1.2 serial=20 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=Notify
+   string "Fell"
+   uint32 0
+   string "mail-unread"
+   string "Avery Lane"
+   string "<b>Maps for the harbor survey</b>
+Hi Robin, The updated map includes the south pier and the new footpath. Could you review it before Thursday?"
+   array [
+      string "default"
+      string "Open"
+      string "archive"
+      string "Archive"
+      string "mark-read"
+      string "Mark as read"
+   ]
+   array [
+      dict entry(
+         string "desktop-entry"
+         variant             string "dev.predmore.fell"
+      )
+      dict entry(
+         string "category"
+         variant             string "email.arrived"
+      )
+   ]
+   int32 -1
+signal time=1795310132.813123 sender=:1.2 -> destination=(null destination) serial=27 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=ActionInvoked
+   uint32 1
+   string "mark-read"
+method call time=1795310132.814652 sender=:1.17 -> destination=:1.2 serial=21 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=CloseNotification
+   uint32 1
+signal time=1795310132.819916 sender=:1.2 -> destination=(null destination) serial=29 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=NotificationClosed
+   uint32 1
+   uint32 3
+method call time=1795310152.173045 sender=:1.17 -> destination=org.freedesktop.Notifications serial=22 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=GetCapabilities
+method call time=1795310152.174712 sender=:1.17 -> destination=:1.2 serial=23 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=Notify
+   string "Fell"
+   uint32 0
+   string "mail-unread"
+   string "4 new messages"
+   string "Sam Ortiz, Priya Shah and 2 others"
+   array [
+      string "default"
+      string "Open Inbox"
+   ]
+   array [
+      dict entry(
+         string "category"
+         variant             string "email.arrived"
+      )
+      dict entry(
+         string "desktop-entry"
+         variant             string "dev.predmore.fell"
+      )
+   ]
+   int32 -1
+method call time=1795310153.580293 sender=:1.17 -> destination=org.freedesktop.Notifications serial=24 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=GetCapabilities
+method call time=1795310153.580876 sender=:1.17 -> destination=:1.2 serial=25 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=Notify
+   string "Fell"
+   uint32 2
+   string "mail-unread"
+   string "7 new messages"
+   string "Sam Ortiz, Avery Lane and 5 others"
+   array [
+      string "default"
+      string "Open Inbox"
+   ]
+   array [
+      dict entry(
+         string "category"
+         variant             string "email.arrived"
+      )
+      dict entry(
+         string "desktop-entry"
+         variant             string "dev.predmore.fell"
+      )
+   ]
+   int32 -1
+signal time=1795310154.984512 sender=:1.2 -> destination=(null destination) serial=67 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=ActionInvoked
+   uint32 2
+   string "default"
+method call time=1795310154.986106 sender=:1.17 -> destination=:1.2 serial=26 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=CloseNotification
+   uint32 2
+signal time=1795310154.986591 sender=:1.2 -> destination=(null destination) serial=69 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=NotificationClosed
+   uint32 2
+   uint32 3
+method call time=1795310160.232238 sender=:1.17 -> destination=org.freedesktop.Notifications serial=27 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=GetCapabilities
+method call time=1795310160.235941 sender=:1.17 -> destination=:1.2 serial=28 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=Notify
+   string "Fell"
+   uint32 0
+   string "mail-unread"
+   string "Nora Kim"
+   string "<b>Updated weather window</b>
+The forecast looks clear through noon tomorrow."
+   array [
+      string "default"
+      string "Open"
+      string "archive"
+      string "Archive"
+      string "mark-read"
+      string "Mark as read"
+   ]
+   array [
+      dict entry(
+         string "desktop-entry"
+         variant             string "dev.predmore.fell"
+      )
+      dict entry(
+         string "category"
+         variant             string "email.arrived"
+      )
+   ]
+   int32 -1
+method call time=1795310161.980034 sender=:1.17 -> destination=:1.2 serial=29 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=CloseNotification
+   uint32 3
+signal time=1795310161.980064 sender=:1.2 -> destination=(null destination) serial=86 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=NotificationClosed
+   uint32 3
+   uint32 3
+method call time=1795310171.197355 sender=:1.17 -> destination=org.freedesktop.Notifications serial=30 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=GetCapabilities
+method call time=1795310171.198425 sender=:1.17 -> destination=:1.2 serial=31 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=Notify
+   string "Fell"
+   uint32 0
+   string "mail-unread"
+   string "New mail"
+   string ""
+   array [
+      string "default"
+      string "Open"
+   ]
+   array [
+      dict entry(
+         string "category"
+         variant             string "email.arrived"
+      )
+      dict entry(
+         string "desktop-entry"
+         variant             string "dev.predmore.fell"
+      )
+   ]
+   int32 -1
+signal time=1795310172.086269 sender=:1.2 -> destination=(null destination) serial=107 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=NotificationClosed
+   uint32 4
+   uint32 2
+method call time=1795310172.550120 sender=:1.17 -> destination=org.freedesktop.Notifications serial=32 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=GetCapabilities
+method call time=1795310172.554979 sender=:1.17 -> destination=:1.2 serial=33 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=Notify
+   string "Fell"
+   uint32 0
+   string "mail-unread"
+   string "3 new messages"
+   string ""
+   array [
+      string "default"
+      string "Open Inbox"
+   ]
+   array [
+      dict entry(
+         string "category"
+         variant             string "email.arrived"
+      )
+      dict entry(
+         string "desktop-entry"
+         variant             string "dev.predmore.fell"
+      )
+   ]
+   int32 -1
+method call time=1795310177.296621 sender=:1.17 -> destination=:1.2 serial=34 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=CloseNotification
+   uint32 5
+signal time=1795310177.296750 sender=:1.2 -> destination=(null destination) serial=126 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=NotificationClosed
+   uint32 5
+   uint32 3
+method call time=1795310186.548502 sender=:1.17 -> destination=org.freedesktop.Notifications serial=35 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=GetCapabilities
+method call time=1795310186.552844 sender=:1.17 -> destination=:1.2 serial=36 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=Notify
+   string "Fell"
+   uint32 0
+   string "mail-unread"
+   string "Rowan Bell"
+   string "<b>New pickup location</b>
+The supplier moved our pickup to the east warehouse."
+   array [
+      string "default"
+      string "Open"
+      string "archive"
+      string "Archive"
+      string "mark-read"
+      string "Mark as read"
+   ]
+   array [
+      dict entry(
+         string "desktop-entry"
+         variant             string "dev.predmore.fell"
+      )
+      dict entry(
+         string "category"
+         variant             string "email.arrived"
+      )
+   ]
+   int32 -1
+method call time=1795310188.375280 sender=:1.17 -> destination=:1.2 serial=37 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=CloseNotification
+   uint32 6
+signal time=1795310188.375513 sender=:1.2 -> destination=(null destination) serial=145 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=NotificationClosed
+   uint32 6
+   uint32 3
+method call time=1795310190.083263 sender=:1.17 -> destination=org.freedesktop.Notifications serial=38 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=GetCapabilities
+method call time=1795310190.088507 sender=:1.17 -> destination=:1.2 serial=39 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=Notify
+   string "Fell"
+   uint32 0
+   string "mail-unread"
+   string "Mira Chen"
+   string "<b>Updated cable order</b>
+The replacement cable ships on Monday."
+   array [
+      string "default"
+      string "Open"
+      string "archive"
+      string "Archive"
+      string "mark-read"
+      string "Mark as read"
+   ]
+   array [
+      dict entry(
+         string "category"
+         variant             string "email.arrived"
+      )
+      dict entry(
+         string "desktop-entry"
+         variant             string "dev.predmore.fell"
+      )
+   ]
+   int32 -1
+method call time=1795310190.785684 sender=:1.17 -> destination=:1.2 serial=40 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=CloseNotification
+   uint32 7
+signal time=1795310190.785757 sender=:1.2 -> destination=(null destination) serial=164 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=NotificationClosed
+   uint32 7
+   uint32 3
+method call time=1795310192.751700 sender=:1.17 -> destination=org.freedesktop.Notifications serial=41 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=GetCapabilities
+method call time=1795310192.778272 sender=:1.17 -> destination=:1.2 serial=42 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=Notify
+   string "Fell"
+   uint32 0
+   string "mail-unread"
+   string "Theo Park"
+   string "<b>Map printout is ready</b>
+The print shop has the updated file and will hold it at the counter."
+   array [
+      string "default"
+      string "Open"
+      string "archive"
+      string "Archive"
+      string "mark-read"
+      string "Mark as read"
+   ]
+   array [
+      dict entry(
+         string "category"
+         variant             string "email.arrived"
+      )
+      dict entry(
+         string "desktop-entry"
+         variant             string "dev.predmore.fell"
+      )
+   ]
+   int32 -1
+signal time=1795310194.657384 sender=:1.2 -> destination=(null destination) serial=187 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=ActionInvoked
+   uint32 8
+   string "mark-read"
+method call time=1795310194.658516 sender=:1.17 -> destination=:1.2 serial=43 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=CloseNotification
+   uint32 8
+signal time=1795310194.658616 sender=:1.2 -> destination=(null destination) serial=189 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=NotificationClosed
+   uint32 8
+   uint32 3

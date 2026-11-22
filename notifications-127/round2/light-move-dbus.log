@@ -1,0 +1,33 @@
+method call time=1795310594.010688 sender=:1.3 -> destination=org.freedesktop.Notifications serial=3 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=GetCapabilities
+method call time=1795310600.545744 sender=:1.17 -> destination=org.freedesktop.Notifications serial=19 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=GetCapabilities
+method call time=1795310600.547766 sender=:1.17 -> destination=:1.2 serial=20 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=Notify
+   string "Fell"
+   uint32 0
+   string "[installed Fell icon]/dev.predmore.fell.png"
+   string "Mira Chen"
+   string "<b>Updated cable order</b>
+The replacement cable ships on Monday."
+   array [
+      string "default"
+      string "Open"
+      string "archive"
+      string "Archive"
+      string "mark-read"
+      string "Mark as read"
+   ]
+   array [
+      dict entry(
+         string "category"
+         variant             string "email.arrived"
+      )
+      dict entry(
+         string "desktop-entry"
+         variant             string "dev.predmore.fell"
+      )
+   ]
+   int32 -1
+method call time=1795310602.009754 sender=:1.17 -> destination=:1.2 serial=21 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=CloseNotification
+   uint32 1
+signal time=1795310602.009940 sender=:1.2 -> destination=(null destination) serial=21 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=NotificationClosed
+   uint32 1
+   uint32 3

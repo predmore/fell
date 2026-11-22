@@ -1,0 +1,32 @@
+Mako 1.11.0, nested Sway, fresh session bus, and a loopback mailbox with synthetic mail.
+Delivery-trigger timing includes IMAP transfer and SQLite commit. The light capture placed Fell's packaged icon in the isolated data directory. The read, undo, and stale toasts were repeated in a shorter run to capture their visible text.
+
+Dark: 403–749 ms from synthetic delivery trigger to Notify.
+Single notice 1 offered Open, Archive and Mark as read. Mark and undo changed SQLite and the loopback IMAP server.
+Group of seven replaced group of four at notification ID 2. Open Inbox left the newest message unread.
+Focusing the Inbox closed the active notice without marking its message read.
+Palette changed all three modes live. The private burst contained only a count and the default action. CONDSTORE removed a notice after a remote read.
+A remote move out of the Inbox closed the notice while the message was still unread.
+A synthetic local move committed immediately before the action. The stale Mark as read action left the Archive message unread.
+Visible Marked read, Undone, and stale Inbox toasts captured.
+
+Light: 468–633 ms from synthetic delivery trigger to Notify.
+Single notice 1 offered Open, Archive and Mark as read. Mark and undo changed SQLite and the loopback IMAP server.
+Group of seven replaced group of four at notification ID 2. Open Inbox left the newest message unread.
+Focusing the Inbox closed the active notice without marking its message read.
+Palette changed all three modes live. The private burst contained only a count and the default action. CONDSTORE removed a notice after a remote read.
+Visible Marked read, Undone, and stale Inbox toasts captured.
+A remote move out of the Inbox closed the notice while the message was still unread.
+
+Narrow: 430–1174 ms from synthetic delivery trigger to Notify.
+Single notice 1 offered Open, Archive and Mark as read. Mark and undo changed SQLite and the loopback IMAP server.
+Group of seven replaced group of four at notification ID 2. Open Inbox left the newest message unread.
+Focusing the Inbox closed the active notice without marking its message read.
+Palette changed all three modes live. The private burst contained only a count and the default action. CONDSTORE removed a notice after a remote read.
+A remote move out of the Inbox closed the notice while the message was still unread.
+A synthetic local move committed immediately before the action. The stale Mark as read action left the Archive message unread.
+Visible Marked read, Undone, and stale Inbox toasts captured.
+
+Separate narrow capture timed D-Bus Notify against the first visible SQLite row. The last absent read and first visible read bound each commit.
+Avery Lane: Notify reached the bus 240–245 ms after the SQLite commit.
+4 new messages: Notify reached the bus 69–75 ms after the SQLite commit.

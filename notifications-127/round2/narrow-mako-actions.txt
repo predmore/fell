@@ -1,0 +1,26 @@
+Notification 1: Avery Lane
+  App name: Fell
+  Category: email.arrived
+  Desktop entry: dev.predmore.fell
+  Actions:
+    mark-read: Mark as read
+    archive: Archive
+    default: Open
+Notification 2: 7 new messages
+  App name: Fell
+  Category: email.arrived
+  Desktop entry: dev.predmore.fell
+  Actions:
+    default: Open Inbox
+Notification 4: New mail
+  App name: Fell
+  Category: email.arrived
+  Desktop entry: dev.predmore.fell
+  Actions:
+    default: Open
+Notification 5: 3 new messages
+  App name: Fell
+  Category: email.arrived
+  Desktop entry: dev.predmore.fell
+  Actions:
+    default: Open Inbox
