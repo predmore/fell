@@ -2157,12 +2157,14 @@ impl Inbox {
         let Some(id) = self.session.cursor_id.clone() else {
             self.conv_gen.fetch_add(1, Ordering::SeqCst);
             self.clear_open_message();
+            self.settle_pending_bodies();
             return;
         };
         if !force && self.open_thread.as_deref() == Some(id.as_str()) {
             return;
         }
         if !self.session.search_results_current() {
+            self.search_view.refresh_open_after_reply |= self.settle_pending_bodies();
             return;
         }
         if let Some(draft) = self.session.cursor_draft() {
@@ -2191,6 +2193,7 @@ impl Inbox {
             }
             self.session.clear_query_fault(QueryFault::Message);
             self.mark_open(id, None);
+            self.settle_pending_bodies();
             return;
         }
         let opening = self.open_thread.as_deref() != Some(&id);
@@ -2243,113 +2246,139 @@ impl Inbox {
                 })
                 .flatten();
             let notes = store.thread_notes(&account, &thread).ok();
-            Ok(Some((view, reads, matches, notes, latest_note)))
+            Ok(Some(ConversationRead {
+                view,
+                reads,
+                matches,
+                notes,
+                latest_note,
+                note_generation,
+            }))
         });
         cx.spawn(async move |this, cx| {
-            let Ok(result) = reply.await else {
-                return;
-            };
+            let result = reply
+                .await
+                .unwrap_or_else(|_| Err("Mailbox store stopped".into()));
             let _ = this.update(cx, |inbox, cx| {
-                if inbox.conv_gen.load(Ordering::SeqCst) != generation
-                    || inbox.session.cursor_id.as_deref() != Some(id.as_str())
-                {
-                    return;
-                }
-                let log = inbox.frames.clone();
-                FrameLog::event(log.as_ref(), "messages", || match result {
-                    Ok(None) => {}
-                    Ok(Some((view, _, _, _, _))) if view.is_empty() && inbox.session.search.is_some() => {
-                        // A hit may disappear between the two reads. Search
-                        // has its own list, so a folder read cannot replace it.
-                        inbox.clear_open_message();
-                        inbox.session.cancel_read_delay();
-                        inbox.session.clear_query_fault(QueryFault::Message);
-                        if inbox.session.search_results_current() {
-                            inbox.refresh_search(cx);
-                        }
-                    }
-                    Ok(Some((view, _, _, _, _)))
-                        if view.is_empty() && !inbox.session.messages.is_empty() =>
-                    {
-                        // The open thread key can disappear between the folder
-                        // and message reads. Keep the conversation until a
-                        // folder read confirms where its messages belong.
-                        if !inbox.read_in_flight {
-                            inbox.request_threads(ReadIntent::default(), cx);
-                        }
-                    }
-                    Ok(Some((mut view, reads, matches, notes, latest_note))) => {
-                        if let Some(notes) = notes {
-                            inbox.update_agent_notes(note_generation, &id, notes);
-                        }
-                        let automatic = inbox.first_preview.take();
-                        inbox.body_loads.accept(reads, &mut inbox.bodies, &mut view);
-                        inbox.session.clear_query_fault(QueryFault::Message);
-                        let same = inbox.open_thread.as_deref() == Some(id.as_str());
-                        // Sync may rekey the thread as its bodies arrive.
-                        // A read of the same messages still belongs to the reader.
-                        let in_place = (same || !view.is_empty())
-                            && present::same_messages(&inbox.session.messages, &view);
-                        let follow = if in_place {
-                            inbox.keep_shown_text(&mut view);
-                            inbox.queue_conversation_refresh(view, generation);
-                            false
-                        } else if same {
-                            inbox.keep_shown_text(&mut view);
-                            let preview = inbox.reveal == Reveal::Preview;
-                            let bottom = preview || inbox.conversation_at_bottom();
-                            let padding = inbox.preview_padding;
-                            let laid_out = inbox.preview_laid_out;
-                            inbox.invalidate_conversation_layout();
-                            inbox.preview_padding = padding;
-                            inbox.preview_laid_out = laid_out;
-                            let follow = inbox.session.refresh_messages(view, bottom);
-                            inbox.finish_body_refresh(generation, true);
-                            if preview {
-                                inbox.land_on_first_preview();
-                            }
-                            follow && !preview
-                        } else {
-                            inbox.invalidate_conversation_layout();
-                            inbox.reveal = Reveal::Waiting;
-                            inbox.motion.show_thread(&mut inbox.session, view);
-                            inbox.finish_body_refresh(generation, false);
-                            // Keep the initial header landing while the
-                            // preview's pending bodies fill in.
-                            if automatic
-                                || (inbox.session.cursor_awaits_body()
-                                    && inbox.pending_bodies.downloading(&inbox.session.sync))
-                            {
-                                inbox.land_on_first_preview();
-                            } else {
-                                inbox.land_on_reader();
-                            }
-                            false
-                        };
-                        if let Some((accepted, matches)) = matches
-                            && inbox
-                                .session
-                                .set_search_matches(accepted, &id, matches, !same)
-                        {
-                            inbox.land_on_reader();
-                        }
-                        inbox.mark_open(id, latest_note);
-                        if follow {
-                            inbox.scroll_conversation();
-                        }
-                    }
-                    Err(err) => {
-                        // Never leave another thread's body under this row.
-                        if inbox.open_thread.as_deref() != Some(id.as_str()) {
-                            inbox.clear_open_message();
-                        }
-                        inbox.session.fail_query(QueryFault::Message, err);
-                    }
-                });
-                cx.notify();
+                inbox.receive_conversation(id, generation, result, cx)
             });
         })
         .detach();
+    }
+
+    fn receive_conversation(
+        &mut self,
+        id: String,
+        generation: u64,
+        result: Result<Option<ConversationRead>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.conv_gen.load(Ordering::SeqCst) != generation
+            || self.session.cursor_id.as_deref() != Some(id.as_str())
+        {
+            return;
+        }
+        let inbox = self;
+        let log = inbox.frames.clone();
+        FrameLog::event(log.as_ref(), "messages", || match result {
+            Ok(None) => inbox.finish_body_refresh(generation, true),
+            Ok(Some(read)) if read.view.is_empty() && inbox.session.search.is_some() => {
+                // A hit may disappear between the two reads. Search
+                // has its own list, so a folder read cannot replace it.
+                inbox.clear_open_message();
+                inbox.settle_pending_bodies();
+                inbox.session.cancel_read_delay();
+                inbox.session.clear_query_fault(QueryFault::Message);
+                if inbox.session.search_results_current() {
+                    inbox.refresh_search(cx);
+                }
+            }
+            Ok(Some(read)) if read.view.is_empty() && !inbox.session.messages.is_empty() => {
+                // The open thread key can disappear between the folder
+                // and message reads. Keep the conversation until a
+                // folder read confirms where its messages belong.
+                inbox.settle_pending_bodies();
+                if !inbox.read_in_flight {
+                    inbox.request_threads(ReadIntent::default(), cx);
+                }
+            }
+            Ok(Some(ConversationRead {
+                mut view,
+                reads,
+                matches,
+                notes,
+                latest_note,
+                note_generation,
+            })) => {
+                if let Some(notes) = notes {
+                    inbox.update_agent_notes(note_generation, &id, notes);
+                }
+                let automatic = inbox.first_preview.take();
+                inbox.body_loads.accept(reads, &mut inbox.bodies, &mut view);
+                inbox.session.clear_query_fault(QueryFault::Message);
+                let same = inbox.open_thread.as_deref() == Some(id.as_str());
+                // Sync may rekey the thread as its bodies arrive.
+                // A read of the same messages still belongs to the reader.
+                let in_place = (same || !view.is_empty())
+                    && present::same_messages(&inbox.session.messages, &view);
+                let follow = if in_place {
+                    inbox.keep_shown_text(&mut view);
+                    inbox.queue_conversation_refresh(view, generation);
+                    false
+                } else if same {
+                    inbox.keep_shown_text(&mut view);
+                    let preview = inbox.reveal == Reveal::Preview;
+                    let bottom = preview || inbox.conversation_at_bottom();
+                    let padding = inbox.preview_padding;
+                    let laid_out = inbox.preview_laid_out;
+                    inbox.invalidate_conversation_layout();
+                    inbox.preview_padding = padding;
+                    inbox.preview_laid_out = laid_out;
+                    let follow = inbox.session.refresh_messages(view, bottom);
+                    inbox.finish_body_refresh(generation, true);
+                    if preview {
+                        inbox.land_on_first_preview();
+                    }
+                    follow && !preview
+                } else {
+                    inbox.invalidate_conversation_layout();
+                    inbox.reveal = Reveal::Waiting;
+                    inbox.motion.show_thread(&mut inbox.session, view);
+                    inbox.finish_body_refresh(generation, false);
+                    // Keep the initial header landing while the
+                    // preview's pending bodies fill in.
+                    if automatic
+                        || (inbox.session.cursor_awaits_body()
+                            && inbox.pending_bodies.downloading(&inbox.session.sync))
+                    {
+                        inbox.land_on_first_preview();
+                    } else {
+                        inbox.land_on_reader();
+                    }
+                    false
+                };
+                if let Some((accepted, matches)) = matches
+                    && inbox
+                        .session
+                        .set_search_matches(accepted, &id, matches, !same)
+                {
+                    inbox.land_on_reader();
+                }
+                inbox.mark_open(id, latest_note);
+                if follow {
+                    inbox.scroll_conversation();
+                }
+            }
+            Err(err) => {
+                // Never leave another thread's body under this row.
+                if inbox.open_thread.as_deref() != Some(id.as_str()) {
+                    inbox.clear_open_message();
+                }
+                inbox.settle_pending_bodies();
+                inbox.session.fail_query(QueryFault::Message, err);
+            }
+        });
+        cx.notify();
     }
 
     /// Keep an existing body visible while its stored HTML is prepared.
@@ -4120,11 +4149,20 @@ impl Inbox {
     }
 
     fn finish_body_refresh_at(&mut self, generation: u64, crossfade: bool, now: Instant) {
-        let animate = crossfade
-            && !matches!(self.session.sync, SyncKind::Syncing { .. })
-            && present::awaiting_bodies(&self.session.messages);
+        let animate = crossfade && self.has_missing_bodies();
         self.pending_bodies
             .applied(generation, animate, self.motion.motion, now);
+    }
+
+    fn settle_pending_bodies(&mut self) -> bool {
+        let animate = self.has_missing_bodies();
+        self.pending_bodies
+            .settle(animate, self.motion.motion, self.motion.clock.now())
+    }
+
+    fn has_missing_bodies(&self) -> bool {
+        !matches!(self.session.sync, SyncKind::Syncing { .. })
+            && present::awaiting_bodies(&self.session.messages)
     }
 
     /// Once the new bodies are laid out, glide to the reader's message
@@ -7476,6 +7514,15 @@ struct BodyRefresh {
     rich: HashMap<String, Rich>,
 }
 
+struct ConversationRead {
+    notes: Option<Vec<fell_core::notes::ThreadNote>>,
+    latest_note: Option<i64>,
+    note_generation: u64,
+    view: Vec<ConvMessage>,
+    reads: mail_body::BodyReads,
+    matches: Option<(u64, Vec<fell_core::SearchMatch>)>,
+}
+
 #[derive(Default)]
 struct PendingBodies {
     /// A read already in flight at the end of a pass can still be stale.
@@ -7495,13 +7542,18 @@ impl PendingBodies {
 
     fn applied(&mut self, generation: u64, animate: bool, motion: Motion, now: Instant) {
         if self.after.is_some_and(|after| generation > after) {
-            self.after = None;
-            self.missing = if animate {
-                motion.start(motion::FADE, now)
-            } else {
-                None
-            };
+            self.settle(animate, motion, now);
         }
+    }
+
+    fn settle(&mut self, animate: bool, motion: Motion, now: Instant) -> bool {
+        if self.after.take().is_none() {
+            return false;
+        }
+        if animate {
+            self.missing = motion.start(motion::FADE, now);
+        }
+        true
     }
 
     fn fade(&self, now: Instant) -> Option<f32> {
@@ -9151,11 +9203,11 @@ impl StatusLabel {
                     .w(px(count_room))
                     .flex_none()
                     .font(figures.font())
-                    .child(div().opacity(shown).child(done.clone()))
+                    .child(div().text_right().opacity(shown).child(done.clone()))
                     .children(fading_count.map(|(old, progress)| {
                         div()
                             .absolute()
-                            .left_0()
+                            .right_0()
                             .top_0()
                             .opacity(1.0 - progress)
                             .child(old.to_owned())
@@ -10853,6 +10905,177 @@ mod tests {
         assert!(preview.expire(exit + FIRST_PREVIEW_WAIT));
         assert!(!preview.waits_for_body());
         assert!(preview.take());
+    }
+
+    fn with_pending_inbox(test: impl FnOnce(&mut super::Inbox, &mut gpui::Context<super::Inbox>)) {
+        use gpui::{AppContext, TestAppContext};
+
+        let store = fell_core::Store::open_in_memory().unwrap();
+        let account = crate::fixtures::fixture_account();
+        store.upsert_account(&account).unwrap();
+        crate::fixtures::seed_if_empty(&store, &account).unwrap();
+        let page = store
+            .folder_page(
+                &account.id,
+                "INBOX",
+                &fell_core::FolderSpan::Top { rows: 1 },
+            )
+            .unwrap();
+        let mut rows = crate::present::thread_rows(&page.threads, &account.email);
+        let row = rows.remove(0);
+        let mut messages = super::read_conversation(
+            &store,
+            &account.id,
+            &fell_core::ThreadId(row.id.clone()),
+            (
+                &account.email,
+                &fell_core::FolderRoles::default(),
+                &[],
+                "INBOX",
+            ),
+        )
+        .unwrap();
+        messages[0].body_state = fell_core::BodyState::Pending;
+
+        let mut app = TestAppContext::single();
+        let inbox = app.new(|cx| {
+            super::Inbox::new(
+                crate::mailbox::Startup {
+                    keymap: Default::default(),
+                    split: 0.4,
+                    read_dwell_ms: 0,
+                    error: None,
+                    account_missing: true,
+                    config: None,
+                    path: Err("in-memory test".into()),
+                },
+                false,
+                cx,
+            )
+        });
+        inbox.update(&mut app, |inbox, cx| {
+            inbox.motion = super::InboxMotion::new(motion::Motion::new(true));
+            inbox.session.set_messages(messages);
+            inbox.session.cursor_id = Some(row.id.clone());
+            inbox.mark_open(row.id.clone(), None);
+            inbox.session.set_threads(vec![row]);
+            inbox.pending_bodies.wait_for_read(0);
+            inbox.conv_gen.store(1, std::sync::atomic::Ordering::SeqCst);
+            test(inbox, cx);
+            assert!(!inbox.pending_bodies.downloading(&inbox.session.sync));
+        });
+    }
+
+    #[test]
+    fn pending_bodies_settle_without_a_cursor() {
+        with_pending_inbox(|inbox, cx| {
+            inbox.session.cursor_id = None;
+            inbox.read_selected_messages(true, cx);
+            assert!(inbox.session.messages.is_empty());
+            assert!(
+                inbox
+                    .pending_bodies
+                    .fade(inbox.motion.clock.now())
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn pending_bodies_settle_when_switching_to_a_draft() {
+        with_pending_inbox(|inbox, cx| {
+            inbox.session.threads[0].draft = Some("local-draft".into());
+            inbox.read_selected_messages(true, cx);
+            assert!(inbox.session.messages.is_empty());
+            assert!(
+                inbox
+                    .pending_bodies
+                    .fade(inbox.motion.clock.now())
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn pending_bodies_fade_when_the_conversation_read_fails() {
+        with_pending_inbox(|inbox, cx| {
+            let id = inbox.open_thread.clone().unwrap();
+            inbox.receive_conversation(id, 1, Err("failed to read thread".into()), cx);
+            assert!(
+                inbox
+                    .pending_bodies
+                    .fade(inbox.motion.clock.now())
+                    .is_some()
+            );
+        });
+    }
+
+    #[test]
+    fn pending_bodies_fade_when_the_open_thread_reads_empty() {
+        with_pending_inbox(|inbox, cx| {
+            let id = inbox.open_thread.clone().unwrap();
+            inbox.read_in_flight = true;
+            let reply = super::ConversationRead {
+                view: Vec::new(),
+                reads: Default::default(),
+                matches: None,
+            };
+            inbox.receive_conversation(id, 1, Ok(Some(reply)), cx);
+            assert!(
+                inbox
+                    .pending_bodies
+                    .fade(inbox.motion.clock.now())
+                    .is_some()
+            );
+        });
+    }
+
+    #[test]
+    fn pending_bodies_settle_during_stale_search_and_reread_the_same_preview() {
+        use crate::model::search::{Hit, SearchReply};
+        use std::sync::atomic::Ordering;
+
+        with_pending_inbox(|inbox, cx| {
+            let row = inbox.session.threads[0].clone();
+            let reply = || SearchReply {
+                rows: vec![row.clone()],
+                hits: [(
+                    row.id.clone(),
+                    Hit {
+                        message: fell_core::MessageId("fixture-message".into()),
+                        related: false,
+                        preview: None,
+                        folder: Some("INBOX".into()),
+                    },
+                )]
+                .into(),
+                correction: None,
+                error: None,
+            };
+            inbox.session.on_key(KeyId::Char('/'), 10);
+            inbox.session.type_search("field");
+            assert!(
+                inbox
+                    .session
+                    .apply_search_reply(inbox.session.search_generation, &mut reply())
+            );
+            inbox.session.type_search(" notes");
+            assert!(!inbox.session.search_results_current());
+
+            inbox.read_selected_messages(true, cx);
+            assert!(inbox.pending_bodies.after.is_none());
+            assert!(
+                inbox
+                    .pending_bodies
+                    .fade(inbox.motion.clock.now())
+                    .is_some()
+            );
+            let before = inbox.conv_gen.load(Ordering::SeqCst);
+
+            inbox.show_search_reply(inbox.session.search_generation, reply(), cx);
+            assert_eq!(inbox.conv_gen.load(Ordering::SeqCst), before + 1);
+            assert_eq!(inbox.open_thread.as_deref(), Some(row.id.as_str()));
+        });
     }
 
     #[test]

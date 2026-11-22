@@ -250,8 +250,8 @@ impl<T: PartialEq> Change<T> {
     }
 }
 
-impl Change<Bridge> {
-    pub(super) fn layers(&self) -> Option<(Bridge, [f32; 2], f32)> {
+impl<T: Copy> Change<T> {
+    pub(super) fn layers(&self) -> Option<(T, [f32; 2], f32)> {
         let (old, _, from) = self.swap.as_ref()?;
         Some(match self.frame.as_ref()? {
             SwapFrame::Leaving(alpha) => {
@@ -335,7 +335,8 @@ pub(in crate::onboarding) struct Feedback {
     pub(super) connection_actions: Actions,
     pub(super) save_actions: Actions,
     pub(super) primary: Option<Action>,
-    pub(super) primary_label: Crossfade<Option<&'static str>>,
+    primary_label: Change<Option<&'static str>>,
+    pub(super) primary_width: Crossfade<Option<&'static str>>,
     pub(super) save_title: Change<&'static str>,
     pub(super) save_subtitle: Change<&'static str>,
     pub(super) save_note: Change<SaveState>,
@@ -351,6 +352,7 @@ impl Feedback {
     pub fn settle(&mut self) {
         self.bridge.settle();
         self.primary_label.settle();
+        self.primary_width.settle();
         self.connection.settle();
         for action in self
             .connection_actions
@@ -459,6 +461,14 @@ impl Feedback {
         }
     }
 
+    pub(super) fn primary_text(&self, label: &'static str) -> (&'static str, f32) {
+        match self.primary_label.layers() {
+            Some((Some(old), [out, _], _)) if out > 0. => (old, out),
+            Some((Some(_), [_, arrival], _)) => (label, arrival),
+            _ => (label, 1.),
+        }
+    }
+
     pub fn refresh(&mut self, form: &Form, bridge: Bridge, motion: Motion, now: Instant) -> bool {
         self.bridge
             .update(bridge, motion, now, motion::QUICK, motion::QUICK);
@@ -521,9 +531,10 @@ impl Feedback {
             }
         }
         self.primary = primary;
-        let primary_active =
-            self.primary_label
-                .update(primary.map(|action| action.label), motion, now);
+        let label = primary.map(|action| action.label);
+        self.primary_label
+            .update(label, motion, now, STEP_OUT, motion::QUICK);
+        let width_active = self.primary_width.update(label, motion, now);
         if self.back_tint.is_some_and(|(_, fade)| !fade.running(now)) {
             self.back_tint = None;
         }
@@ -560,7 +571,8 @@ impl Feedback {
         }
 
         let mut active = self.bridge.tick(now)
-            | primary_active
+            | self.primary_label.tick(now)
+            | width_active
             | server_active
             | self.connection.tick(now)
             | self.save_title.tick(now)
@@ -605,6 +617,44 @@ mod tests {
             assert!(alpha[incoming] >= motion::ARRIVE_FROM);
             assert_eq!(alpha[1 - incoming], 0.);
         }
+    }
+
+    #[test]
+    fn primary_text_fades_in_sequence_while_width_eases() {
+        let now = Instant::now();
+        let motion = Motion::new(true);
+        let mut feedback = Feedback::default();
+        let mut form = Form::default();
+        form.step = Step::Servers;
+        feedback.refresh(&form, Bridge::Checking, motion, now);
+        feedback.settle();
+        form.step = Step::Connection;
+
+        for elapsed in 0..140 {
+            let at = now + Duration::from_millis(elapsed);
+            assert!(feedback.refresh(&form, Bridge::Checking, motion, at));
+            let (text, opacity) = feedback.primary_text("Testing…");
+            assert_eq!(
+                text,
+                if elapsed < 60 {
+                    "Test connection"
+                } else {
+                    "Testing…"
+                }
+            );
+            assert!(opacity >= motion::ARRIVE_FROM);
+            if elapsed == 60 {
+                assert_eq!(opacity, motion::ARRIVE_FROM);
+            }
+            assert_eq!(feedback.primary_width.frame.is_some(), elapsed < 120);
+        }
+        feedback.refresh(
+            &form,
+            Bridge::Checking,
+            motion,
+            now + Duration::from_millis(140),
+        );
+        assert_eq!(feedback.primary_text("Testing…"), ("Testing…", 1.));
     }
 
     #[test]

@@ -36,6 +36,7 @@ pub(super) struct SearchView {
     rows_were_current: bool,
     arrival: Option<motion::Transition>,
     settling_reply: Option<SearchReply>,
+    pub(super) refresh_open_after_reply: bool,
 }
 
 #[derive(PartialEq)]
@@ -45,6 +46,7 @@ struct PreviewKey {
     theme: Theme,
     offset: gpui::Pixels,
     split: f32,
+    syncing: bool,
 }
 
 #[derive(PartialEq)]
@@ -100,6 +102,7 @@ impl Render for CachedPreview {
                     agent_note: inbox.note_view.frame(inbox.frame_now),
                     anchor: inbox.hold_landing(),
                     frames: inbox.frames.clone(),
+                    syncing: inbox.pending_bodies.downloading(&inbox.session.sync),
                     // The outer pane owns the shield when the preview is stale.
                     preview_current: true,
                     ..ConvFrame::default()
@@ -207,6 +210,7 @@ impl Inbox {
             theme: self.theme.clone(),
             offset: self.conv_scroll.offset().y,
             split: self.split,
+            syncing: self.pending_bodies.downloading(&self.session.sync),
         };
         if self.search_view.preview_key.as_ref() != Some(&key) {
             self.search_view.preview_key = Some(key);
@@ -318,6 +322,7 @@ impl Inbox {
         }
         if switched || cleared {
             self.search_view.arrival = None;
+            self.search_view.refresh_open_after_reply = false;
             self.motion.list = None;
             self.motion.list_glide = None;
             self.motion.conv_glide = None;
@@ -737,7 +742,7 @@ impl Inbox {
         .detach();
     }
 
-    fn show_search_reply(
+    pub(super) fn show_search_reply(
         &mut self,
         generation: u64,
         mut reply: SearchReply,
@@ -809,7 +814,9 @@ impl Inbox {
                         .as_deref()
                         .and_then(|id| self.session.search_source(id))
                         == old_scope.as_deref();
-                if same_preview && self.open_thread.is_some() {
+                let refresh_open = std::mem::take(&mut self.search_view.refresh_open_after_reply)
+                    || self.pending_bodies.after.is_some();
+                if same_preview && self.open_thread.is_some() && !refresh_open {
                     self.refresh_search_matches(cx);
                 } else {
                     self.request_messages(true, cx);

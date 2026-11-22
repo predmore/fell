@@ -709,21 +709,10 @@ impl Onboarding {
                     .shape_line(label.into(), px(self.theme.ui_px), &[run], None);
             f32::from(text.width).ceil() + 26.
         };
-        let (old, shown) = self.feedback.primary_label.frame.unwrap_or((None, 1.));
+        let (old, shown) = self.feedback.primary_width.frame.unwrap_or((None, 1.));
         let new_width = width(action.label);
         let button_width = motion::lerp(old.map_or(new_width, width), new_width, shown);
-        let label = |text, opacity| {
-            div()
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .whitespace_nowrap()
-                .overflow_hidden()
-                .opacity(opacity)
-                .child(text)
-        };
+        let (text, opacity) = self.feedback.primary_text(action.label);
         Some(
             div()
                 .absolute()
@@ -743,8 +732,17 @@ impl Onboarding {
                     .relative()
                     .w(px(button_width))
                     .h(px(self.theme.ui_px + 18.))
-                    .child(label(action.label, if old.is_some() { shown } else { 1. }))
-                    .children(old.map(|text| label(text, 1. - shown))),
+                    .child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .whitespace_nowrap()
+                            .opacity(opacity)
+                            .child(div().flex_none().child(text)),
+                    ),
                 ),
         )
     }
