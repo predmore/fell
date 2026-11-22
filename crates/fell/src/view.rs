@@ -634,7 +634,9 @@ impl Inbox {
             session.record_startup_error(error);
         }
         let reader = cx.entity().downgrade();
-        let window_active = window.as_ref().is_some_and(|window| window.is_window_active());
+        let window_active = window
+            .as_ref()
+            .is_some_and(|window| window.is_window_active());
         let notifications = config.as_ref().zip(window).map(|(config, window)| {
             let (queue, invoked) = crate::notifications::start(
                 window_active,

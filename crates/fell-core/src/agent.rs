@@ -16,6 +16,7 @@ use crate::{Error, Result};
 
 const ACTION_COLS: &str = "id, account_id, actor, kind, summary, undone, created_unix";
 const SNOOZE_SUMMARY_PREFIX: &str = "snoozed thread until ";
+pub(crate) const SNOOZE_CHANGED_NOTICE: &str = "Snooze already changed";
 
 /// Per-agent access to one account. Missing rows are [`AgentGrant::DISABLED`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -694,9 +695,8 @@ impl crate::Store {
             check_actor_grant(&tx, account_id, actor, scope)?;
         }
         if undo_action(&tx, account_id, &action)? == UndoEffect::SnoozeChanged {
-            return Err(snooze_changed_error());
-        }
-        if action.kind == "snooze" {
+            action.summary = SNOOZE_CHANGED_NOTICE.into();
+        } else if action.kind == "snooze" {
             crate::notes::undo_snooze_acceptance(&tx, action.id)?;
         }
         tx.commit()?;
@@ -2286,6 +2286,102 @@ mod tests {
             store.undo_with_note(&account).unwrap().1,
             Some("Note removed")
         );
+    }
+
+    #[test]
+    fn agent_undo_retires_a_snooze_changed_by_a_duplicate_fold() {
+        let (store, account, thread) = seeded();
+        store
+            .set_agent_grant(&account, "ada", AgentGrant::enabled(false, true, false))
+            .unwrap();
+        let older = store
+            .mark_thread_read(&account, &thread, "agent:ada")
+            .unwrap()
+            .unwrap();
+        let until = now_unix() + 3600;
+        let snooze = store
+            .snooze_thread(&account, &thread, until, "agent:ada")
+            .unwrap()
+            .unwrap();
+        let mut echo = message(
+            "a1",
+            "echo@x",
+            None,
+            "Invoice March",
+            "please pay",
+            false,
+            &["INBOX"],
+            &[],
+            10,
+        );
+        echo.list_id = Some("list.example".into());
+        echo.snooze_until = Some(until + 3600);
+        store.upsert_message(&echo).unwrap();
+        let folded = only_message(&store, &account, &thread);
+        assert_eq!(folded.len(), 2);
+        assert_eq!(folded[0].snooze_until, echo.snooze_until);
+        assert_eq!(folded[1].snooze_until, Some(until));
+
+        let retired = store.agent_undo(&account).unwrap();
+        assert_eq!(retired.id, snooze.id);
+        assert_eq!(retired.summary, "Snooze already changed");
+        assert!(retired.undone);
+        assert_eq!(only_message(&store, &account, &thread), folded);
+
+        let undone = store.agent_undo(&account).unwrap();
+        assert_eq!(undone.id, older.id);
+        assert_eq!(undone.kind, "mark_read");
+        let restored = only_message(&store, &account, &thread);
+        assert!(restored[0].unread);
+        assert_eq!(restored[0].snooze_until, echo.snooze_until);
+    }
+
+    #[test]
+    fn agent_undo_keeps_the_entry_when_a_newer_agent_changed_the_snooze() {
+        for unsnooze in [false, true] {
+            let (store, account, thread) = seeded();
+            for agent in ["ada", "bo"] {
+                store
+                    .set_agent_grant(&account, agent, AgentGrant::enabled(false, true, false))
+                    .unwrap();
+            }
+            let until = now_unix() + 3600;
+            let older = store
+                .snooze_thread(&account, &thread, until, "agent:ada")
+                .unwrap()
+                .unwrap();
+            let expected = (!unsnooze).then_some(until + 3600);
+            match expected {
+                Some(until) => store.snooze_thread(&account, &thread, until, "agent:bo"),
+                None => store.unsnooze_thread(&account, &thread, "agent:bo"),
+            }
+            .unwrap()
+            .unwrap();
+
+            let err = store
+                .undo_actor_action(&account, "agent:ada", older.id)
+                .unwrap_err();
+            assert_eq!(err.to_string(), "Cannot undo snooze · snooze changed");
+            assert_eq!(
+                store.latest_open_action(&account, "agent:ada").unwrap(),
+                Some(older.clone())
+            );
+            assert!(
+                only_message(&store, &account, &thread)
+                    .iter()
+                    .all(|message| message.snooze_until == expected)
+            );
+            store.undo_actor(&account, "agent:bo").unwrap();
+            assert_eq!(
+                store.undo_actor(&account, "agent:ada").unwrap().id,
+                older.id
+            );
+            assert!(
+                only_message(&store, &account, &thread)
+                    .iter()
+                    .all(|message| message.snooze_until.is_none())
+            );
+        }
     }
 
     #[test]

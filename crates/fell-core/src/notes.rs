@@ -451,7 +451,7 @@ impl NoteUndo {
             Self::Annotation => "Note removed",
             Self::Dismissal { restored: true } => "Note restored",
             Self::Dismissal { restored: false } => "Note no longer current",
-            Self::SnoozeChanged => "Snooze already changed",
+            Self::SnoozeChanged => crate::agent::SNOOZE_CHANGED_NOTICE,
             Self::Acceptance { snoozed: true } => "Snooze undone · suggestion restored",
             Self::Acceptance { snoozed: false } => match action.kind {
                 ActionKind::Archive => "Unarchived · suggestion restored",
