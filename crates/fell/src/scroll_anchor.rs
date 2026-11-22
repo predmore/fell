@@ -14,7 +14,7 @@ pub(super) struct ScrollAnchor {
     /// For an automatic or pending preview, align to a complete header
     /// when the selected message is too close to the end to align itself.
     pub snap_headers: bool,
-    /// Ease from the placeholder's viewport Y while its card grows.
+    /// Starting window Y and easing progress for a body-growth landing.
     pub body_scroll: Option<(Pixels, f32)>,
 }
 
@@ -196,8 +196,9 @@ fn offset_for_body_growth(
     from_y: Pixels,
     progress: f32,
 ) -> Pixels {
-    // The cards above this header already use their eased heights. Ease
-    // only the header's viewport position, then remove their full offset.
+    // Ease the header in window coordinates, so its origin stays fixed as
+    // the note band moves the viewport. Cancel the full height change of
+    // the cards above it, whose heights are already eased.
     let target_y = item.top() + target;
     let y = from_y + (target_y - from_y) * progress;
     offset_to_hold(view, item, y - view.top())
@@ -580,6 +581,28 @@ mod tests {
             assert!(y <= previous_y, "frame {frame}: {y:?} > {previous_y:?}");
             assert!((f32::from(y) - 180. * (1. - ease)).abs() < 0.001);
             previous_y = y;
+        }
+    }
+
+    #[test]
+    fn a_reserving_note_band_and_body_growth_share_the_header_landing() {
+        let from_y = px(230.);
+        for frame in 0..=120 {
+            let ease = motion::ease_out_quad(frame as f32 / 120.);
+            let band = 48. * ease;
+            let view = vertical_bounds(50. + band, 450. - band);
+            let growth = 800. * ease;
+            let original = vertical_bounds(370. + band, 100.);
+            let grown = vertical_bounds(370. + band + growth, 100.);
+            let offset = |item| {
+                let target = offset_to_hold(view, item, px(0.));
+                offset_for_body_growth(view, item, target, from_y, ease)
+            };
+            assert!((f32::from(offset(original) - offset(grown)) - growth).abs() < 0.001);
+
+            let header_y = grown.top() + offset(grown);
+            let eased_y = from_y + (view.top() - from_y) * ease;
+            assert!((f32::from(header_y - eased_y)).abs() < 0.001);
         }
     }
 

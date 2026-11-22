@@ -57,8 +57,8 @@ use crate::render::READING_MEASURE_PX;
 use crate::reply_check::{ReplyCheck, ReplyChecks};
 use crate::row_widths::{self, RowFrame, RowWidths};
 use crate::scroll_anchor::{
-    LandingGlide, LandingHold, LayoutProbe, LayoutSlot, MessageProbes, ReaderLanding, Reveal, RevealPhase,
-    ScrollAnchor, clamped_offset,
+    LandingGlide, LandingHold, LayoutProbe, LayoutSlot, MessageProbes, ReaderLanding, Reveal,
+    RevealPhase, ScrollAnchor, clamped_offset,
 };
 use crate::store_actor::StoreClient;
 use crate::sync_worker::{self, SyncEvent, SyncHandle};
@@ -4131,7 +4131,10 @@ impl Inbox {
             let height = if padded_last == Some(index) {
                 self.preview_card_height.get()
             } else {
-                scroll.bounds_for_item(index + usize::from(self.conv_note_slot))?.size.height
+                scroll
+                    .bounds_for_item(index + usize::from(self.conv_note_slot))?
+                    .size
+                    .height
             };
             (height > px(0.)).then(|| f32::from(height))
         };
@@ -4150,7 +4153,11 @@ impl Inbox {
         if self.reveal.pending()
             && self.motion.body_growth_running(now)
             && layout_current
-            && let Some(placeholder) = ScrollAnchor::capture_message(&self.conv_scroll, selected, usize::from(self.conv_note_slot))
+            && let Some(placeholder) = ScrollAnchor::capture_message(
+                &self.conv_scroll,
+                selected,
+                usize::from(self.conv_note_slot),
+            )
             && let Some(slide) = self.motion.motion.start(motion::PANE, now)
         {
             self.body_landing = Some((self.conv_scroll.bounds().top() + placeholder.y, slide));
@@ -4199,10 +4206,9 @@ impl Inbox {
             }
             Reveal::Following(RevealPhase::Ready) => {
                 self.reveal = Reveal::Following(RevealPhase::Idle);
-                let Some(item) = self
-                    .conv_scroll
-                    .bounds_for_item(self.session.message_cursor + usize::from(self.conv_note_slot))
-                else {
+                let Some(item) = self.conv_scroll.bounds_for_item(
+                    self.session.message_cursor + usize::from(self.conv_note_slot),
+                ) else {
                     return;
                 };
                 let view = self.conv_scroll.bounds();
@@ -4726,7 +4732,9 @@ impl Render for Inbox {
         let arrival_anchor = self
             .note_pin
             .arrival_anchor(target_band, band, selected, now);
-        if (arrival_anchor.is_some() && self.body_landing.is_none()) || agent_note.as_ref().is_some_and(|frame| frame.leaving) {
+        if (arrival_anchor.is_some() && self.body_landing.is_none())
+            || agent_note.as_ref().is_some_and(|frame| frame.leaving)
+        {
             self.release_landing();
         }
         let returning = self.note_return(now);
@@ -4740,12 +4748,16 @@ impl Render for Inbox {
             }
             None
         } else {
-            self.growing_body_landing(now).or(arrival_anchor).or_else(|| self.hold_landing()).or(first_preview_layout).or_else(|| {
-                anchor.or(note_anchor).map(|mut anchor| {
-                    anchor.y -= band_delta;
-                    anchor
+            self.growing_body_landing(now)
+                .or(arrival_anchor)
+                .or_else(|| self.hold_landing())
+                .or(first_preview_layout)
+                .or_else(|| {
+                    anchor.or(note_anchor).map(|mut anchor| {
+                        anchor.y -= band_delta;
+                        anchor
+                    })
                 })
-            })
         };
         let note_details_only = self.note_visit.as_ref().is_some_and(|visit| {
             agent_note
@@ -7879,13 +7891,13 @@ fn conversation(
                     })
                     .map(IntoElement::into_any_element);
                 conversation_body(
-                note.into_iter().chain(messages),
-                scroll,
-                hold,
-                chip_probe,
-                padding.map(|padding| padding.viewport),
-                arrival,
-                frame.frames.clone(),
+                    note.into_iter().chain(messages),
+                    scroll,
+                    hold,
+                    chip_probe,
+                    padding.map(|padding| padding.viewport),
+                    arrival,
+                    frame.frames.clone(),
                 )
             }
         })
@@ -11574,7 +11586,7 @@ mod tests {
                             )
                             .unwrap();
                         let probes = MessageProbes::new(anchor, case.heights.len(), None);
-                        let cards = case
+                        let cards: Vec<_> = case
                             .heights
                             .iter()
                             .enumerate()
