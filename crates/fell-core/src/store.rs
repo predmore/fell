@@ -752,7 +752,7 @@ impl Store {
         &self,
         account_id: &AccountId,
         delta: &MailboxDelta,
-        mut observer: Option<&mut inbox_arrivals::Observer<'_>>,
+        observer: Option<&mut inbox_arrivals::Observer<'_>>,
     ) -> Result<DeltaWrites> {
         let mut tx = self.begin_sync_write()?;
         let mut merge_roles = MergeRoles::new(delta.roles.as_ref());
@@ -787,9 +787,9 @@ impl Store {
             let Some(mut message) = crate::actions::message_for_delta(&tx, message)? else {
                 continue;
             };
-            let projected = views::project_arrival(&tx, &mut message)?;
+            views::project_arrival(&tx, &mut message)?;
             // These labels have copy provenance and are applied with FLAGS below.
-            if keyword_copies.contains(&message.remote_id.0) && (!bridge || projected) {
+            if keyword_copies.contains(&message.remote_id.0) {
                 message.labels.clear();
             }
             // A combined delta can carry the listing for these messages.
@@ -840,9 +840,6 @@ impl Store {
                 self.rethread_written(&tx, account_id)?;
             }
             tx.commit()?;
-            if let Some(watch) = observer.take() {
-                watch.committed(self, &inbox_arrivals);
-            }
             #[cfg(test)]
             if let Some(hook) = self.on_sync_commit.borrow_mut().as_mut() {
                 hook()?;
@@ -3546,8 +3543,12 @@ fn apply_flag(
     bridge: bool,
 ) -> Result<()> {
     let copy = crate::imap::parse_remote_id(&flag.remote_id.0);
-    if let (Some(copy), Some(keywords)) = (&copy, &flag.keywords) {
-        keywords::observe(conn, account_id, copy, flag.modseq, keywords, bridge)?;
+    if let Some(copy) = &copy {
+        if let Some(keywords) = &flag.keywords {
+            keywords::observe(conn, account_id, copy, flag.modseq, keywords, bridge, false)?;
+        } else if let Some(keywords) = &flag.delivery_keywords {
+            keywords::observe(conn, account_id, copy, flag.modseq, keywords, bridge, true)?;
+        }
     }
     let fresh = if let Some(copy) = &copy
         && ((flag.unread.is_some() && flag.modseq.is_some()) || (bridge && flag.flagged.is_some()))
@@ -8509,6 +8510,7 @@ mod tests {
                         unread: Some(false),
                         flagged: None,
                         keywords: None,
+                        delivery_keywords: None,
                         modseq: None,
                     }],
                     cursor: None,

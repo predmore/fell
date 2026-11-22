@@ -1,8 +1,7 @@
 use std::collections::HashSet;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use fell_core::{FlagChange, FolderRole};
+use fell_core::{AccountId, FlagChange, FolderRole, MessageId, NotificationMode, Store, ThreadId};
 use futures::StreamExt;
 use futures::channel::mpsc::UnboundedReceiver;
 use gpui::{AnyWindowHandle, Context, Window};
@@ -13,13 +12,54 @@ use crate::model::Overlay;
 use crate::notifications::{self, Invoked};
 use crate::present::Pane;
 
+const GONE: &str = "Conversation is no longer in the Inbox";
+
+enum Edit {
+    Gone,
+    Unchanged,
+    Changed(String),
+}
+
 impl Inbox {
     pub(super) fn track_inbox_visibility(&self, window: &Window) {
+        let Some(queue) = &self.notifications else {
+            return;
+        };
         let viewing = window.is_window_active()
             && self.session.search.is_none()
             && self.session.roles.is(FolderRole::Inbox, &self.list_folder)
             && self.session.folder == self.list_folder;
-        self.viewing_inbox.store(viewing, Ordering::Relaxed);
+        queue.set_viewing(viewing);
+    }
+
+    pub(super) fn set_notification_mode(&mut self, mode: NotificationMode, cx: &mut Context<Self>) {
+        let Some(queue) = self.notifications.clone() else {
+            self.session.show_toast("No account is set up", true);
+            return;
+        };
+        let account = self.account_id.clone();
+        let saved = self.store.call(move |_| {
+            crate::mailbox::save_notification_mode(&account, mode)?;
+            queue.set_mode(mode);
+            Ok::<_, String>(())
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(result) = saved.await else {
+                return;
+            };
+            let _ = this.update(cx, |inbox, cx| {
+                match result {
+                    Ok(()) => inbox
+                        .session
+                        .show_toast(Action::Notifications(mode).label(), false),
+                    Err(err) => inbox
+                        .session
+                        .show_toast(format!("Could not save notifications · {err}"), true),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub(super) fn watch_notifications(
@@ -50,7 +90,15 @@ impl Inbox {
     ) {
         let account = self.account_id.clone();
         let folder = self.session.roles.name(FolderRole::Inbox).to_owned();
-        if matches!(invoked.action, notifications::Action::Open) {
+        if matches!(
+            invoked.action,
+            notifications::Action::Open | notifications::Action::OpenInbox
+        ) {
+            let pane = if matches!(invoked.action, notifications::Action::OpenInbox) {
+                Pane::List
+            } else {
+                Pane::Conversation
+            };
             self.activate_from_notification(window, invoked.token, cx);
             window.focus(&self.focus);
             let reply = self.store.call(move |store| {
@@ -66,23 +114,29 @@ impl Inbox {
             cx.spawn(async move |this, cx| {
                 let result = reply.await;
                 let _ = this.update(cx, |inbox, cx| {
-                    if let Ok(Ok(Some(key))) = result {
+                    let key = result.ok().and_then(Result::ok).flatten();
+                    if key.is_some() || pane == Pane::List {
                         let before = inbox.before_step();
                         inbox.session.overlay = Overlay::None;
                         let step = inbox.session.perform(Action::Inbox, inbox.page_rows());
+                        if pane == Pane::List {
+                            inbox.session.pane = Pane::List;
+                            inbox.session.cancel_read_delay();
+                            inbox.session.leave_attachments();
+                        }
                         inbox.apply_step(step, before, cx);
+                    }
+                    if let Some(key) = key {
                         inbox.request_threads(
                             ReadIntent {
                                 select: Some(key),
-                                open_selected: true,
+                                notification_pane: Some(pane),
                                 ..Default::default()
                             },
                             cx,
                         );
                     } else {
-                        inbox
-                            .session
-                            .show_toast("Conversation is no longer in the Inbox", false);
+                        inbox.session.show_toast(GONE, false);
                         cx.notify();
                     }
                 });
@@ -93,32 +147,15 @@ impl Inbox {
 
         let archive = matches!(invoked.action, notifications::Action::Archive);
         self.change_mailbox(
-            move |store| {
-                let mut seen = HashSet::new();
-                let mut threads = Vec::new();
-                for id in invoked.messages {
-                    if let Some(thread) = store.thread_for_message(&account, &id)?
-                        && seen.insert(thread.clone())
-                    {
-                        threads.push((thread, folder.clone()));
-                    }
-                }
-                if archive {
-                    let (_, changed) = store.archive_scoped_threads(&account, &threads)?;
-                    Ok(Some(archived_notice(threads.len(), changed)))
-                } else {
-                    Ok(store
-                        .flag_scoped_threads(&account, &threads, FlagChange::Read)?
-                        .map(|_| "Marked read".to_owned()))
-                }
-            },
+            move |store| edit_notification(store, &account, &folder, invoked.messages, archive),
             move |inbox, result| {
                 match result {
-                    Ok(Some(notice)) => {
+                    Ok(Edit::Changed(notice)) => {
                         inbox.session.show_toast(notice, false);
                         inbox.send_to_server();
                     }
-                    Ok(None) => {}
+                    Ok(Edit::Gone) => inbox.session.show_toast(GONE, false),
+                    Ok(Edit::Unchanged) => {}
                     Err(err) => {
                         let text = if archive {
                             archive_failure(&err)
@@ -182,5 +219,109 @@ impl Inbox {
             }
         })
         .detach();
+    }
+}
+
+fn edit_notification(
+    store: &Store,
+    account: &AccountId,
+    folder: &str,
+    messages: Vec<MessageId>,
+    archive: bool,
+) -> fell_core::Result<Edit> {
+    let mut seen = HashSet::<ThreadId>::new();
+    let mut threads = Vec::new();
+    for id in messages {
+        if let Some(thread) = store.thread_for_message(account, &id)?
+            && seen.insert(thread.clone())
+            && store.folder_key_of(account, folder, &thread)?.is_some()
+        {
+            threads.push((thread, folder.to_owned()));
+        }
+    }
+    if threads.is_empty() {
+        return Ok(Edit::Gone);
+    }
+    if archive {
+        let (_, changed) = store.archive_scoped_threads(account, &threads)?;
+        Ok(Edit::Changed(archived_notice(threads.len(), changed)))
+    } else {
+        Ok(
+            match store.flag_scoped_threads(account, &threads, FlagChange::Read)? {
+                Some(_) => Edit::Changed("Marked read · u".to_owned()),
+                None => Edit::Unchanged,
+            },
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_notification_thread_does_not_block_marking_the_remaining_thread_read() {
+        let store = Store::open_in_memory().unwrap();
+        let account = crate::fixtures::fixture_account();
+        crate::fixtures::seed_if_empty(&store, &account).unwrap();
+        let account = account.id;
+        let folder = FolderRole::Inbox.default_name();
+        let mut unread = store
+            .list_threads(&account)
+            .unwrap()
+            .into_iter()
+            .filter_map(|row| {
+                store
+                    .thread_messages(&account, &row.thread_id)
+                    .unwrap()
+                    .into_iter()
+                    .find(|msg| msg.unread && msg.folders.iter().any(|name| name == folder))
+                    .map(|msg| (row.thread_id, msg.headers.message_id))
+            });
+        let (stale_thread, stale) = unread.next().unwrap();
+        let (current_thread, current) = unread.next().unwrap();
+        store
+            .move_thread(&account, &stale_thread, folder, "Archive")
+            .unwrap();
+        let messages = vec![stale.clone(), current.clone(), current.clone()];
+        assert_eq!(
+            store
+                .unread_inbox_messages(&account, &messages[..2])
+                .unwrap(),
+            std::slice::from_ref(&current)
+        );
+        assert!(
+            store
+                .flag_scoped_threads(
+                    &account,
+                    &[
+                        (current_thread, folder.into()),
+                        (stale_thread, folder.into())
+                    ],
+                    FlagChange::Read,
+                )
+                .is_err()
+        );
+        assert!(matches!(
+            edit_notification(&store, &account, folder, messages, false).unwrap(),
+            Edit::Changed(text) if text == "Marked read · u"
+        ));
+        assert!(
+            store
+                .unread_inbox_messages(&account, std::slice::from_ref(&current))
+                .unwrap()
+                .is_empty()
+        );
+        store.undo(&account).unwrap();
+        assert_eq!(
+            store
+                .unread_inbox_messages(&account, &[stale.clone(), current.clone()])
+                .unwrap(),
+            [current]
+        );
+        assert!(matches!(
+            edit_notification(&store, &account, folder, vec![stale], false).unwrap(),
+            Edit::Gone
+        ));
     }
 }

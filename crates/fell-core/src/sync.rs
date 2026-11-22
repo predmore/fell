@@ -65,8 +65,8 @@ pub fn sync_with_progress(
 }
 
 /// Like [`sync_with_progress`], with an optional observer of new unread
-/// Inbox messages. The observer runs after each commit, even when the pass
-/// later fails. A lookup failure is reported to the observer only.
+/// Inbox messages. The observer runs after each delta's final commit,
+/// even when the pass later fails. A lookup failure only reaches the observer.
 pub fn sync_with_arrivals(
     account: &Account,
     backend: &dyn MailBackend,

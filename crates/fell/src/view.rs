@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use fell_core::{
     AccountConfig, AccountId, CidRepairBatch, CidRepairProgress, DropReason, DroppedWrite,
@@ -147,8 +147,8 @@ struct ReadIntent {
     /// Undo: select this thread when it is back in the folder, loading the
     /// rows around it if they are not loaded.
     select: Option<ListKey>,
-    /// A desktop notification opens the conversation after its row lands.
-    open_selected: bool,
+    /// What the notification opens once its row lands.
+    notification_pane: Option<Pane>,
     /// Rows the list asked for beyond the ones it holds.
     fetch: Fetch,
 }
@@ -160,10 +160,10 @@ impl ReadIntent {
         self.changed |= later.changed;
         if later.select.is_some() {
             self.select = later.select;
-            self.open_selected = later.open_selected;
-        } else if later.switch && self.open_selected {
+            self.notification_pane = later.notification_pane;
+        } else if later.switch && self.notification_pane.is_some() {
             self.select = None;
-            self.open_selected = false;
+            self.notification_pane = None;
         }
         self.fetch = self.fetch.merge(later.fetch);
         self
@@ -452,7 +452,7 @@ const LONG_GLIDE_PX: f32 = 4.0 * ROW_PX;
 
 struct Inbox {
     focus: FocusHandle,
-    viewing_inbox: Arc<AtomicBool>,
+    notifications: Option<crate::notifications::Queue>,
     pending_activation: Option<crate::notifications::Activation>,
     /// The mailbox connection's own thread. The window never calls SQLite.
     store: StoreClient,
@@ -613,23 +613,23 @@ impl Inbox {
             session.record_startup_error(error);
         }
         let reader = cx.entity().downgrade();
-        let viewing_inbox = Arc::new(AtomicBool::new(window.is_window_active()));
-        let notifications = config
-            .as_ref()
-            .filter(|config| config.notifications)
-            .map(|config| {
-                let (queue, invoked) =
-                    crate::notifications::start(viewing_inbox.clone(), config.notification_content);
-                Self::watch_notifications(window.window_handle(), invoked, cx);
-                cx.observe_window_activation(window, |inbox, window, _| {
-                    inbox.track_inbox_visibility(window)
-                })
-                .detach();
-                queue
-            });
+        let notifications = config.as_ref().map(|config| {
+            let (queue, invoked) = crate::notifications::start(
+                window.is_window_active(),
+                config.notifications,
+                store.clone(),
+                config.account().id,
+            );
+            Self::watch_notifications(window.window_handle(), invoked, cx);
+            cx.observe_window_activation(window, |inbox, window, _| {
+                inbox.track_inbox_visibility(window)
+            })
+            .detach();
+            queue
+        });
         let mut inbox = Self {
             focus: cx.focus_handle(),
-            viewing_inbox,
+            notifications,
             pending_activation: None,
             account_id: config
                 .as_ref()
@@ -701,9 +701,7 @@ impl Inbox {
             let Ok(opened) = ready.await else {
                 return;
             };
-            let _ = this.update(cx, |inbox, cx| {
-                inbox.on_store_ready(opened, sync_with, notifications, cx)
-            });
+            let _ = this.update(cx, |inbox, cx| inbox.on_store_ready(opened, sync_with, cx));
         })
         .detach();
         inbox.show_crash_notice(cx);
@@ -749,7 +747,6 @@ impl Inbox {
         &mut self,
         opened: mailbox::Opened,
         sync_with: Option<(AccountConfig, std::path::PathBuf)>,
-        notifications: Option<crate::notifications::Queue>,
         cx: &mut Context<Self>,
     ) {
         if let Some(trace) = cx.try_global::<UiTrace>() {
@@ -779,7 +776,7 @@ impl Inbox {
         // Sync opens its own connection only after this one finished opening
         // and migrating the file, so the two never race for the first lock.
         if !store_failed && let Some((config, path)) = sync_with {
-            let (handle, events) = sync_worker::start(config, path, notifications);
+            let (handle, events) = sync_worker::start(config, path, self.notifications.clone());
             self.sync = Some(handle);
             self.watch_sync(events, cx);
         }
@@ -1020,7 +1017,11 @@ impl Inbox {
         let refresh_labels = self.session.loading || intent.changed || intent.is_refresh();
         let same_scope = folder == self.list_folder && label == self.list_label;
         // A folder the rows on screen do not come from opens at its top.
-        let span = if let Some(key) = intent.select.as_ref().filter(|_| intent.open_selected) {
+        let span = if let Some(key) = intent
+            .select
+            .as_ref()
+            .filter(|_| intent.notification_pane.is_some())
+        {
             FolderSpan::Window {
                 first: Some(key.clone()),
                 last: key.clone(),
@@ -1413,7 +1414,7 @@ impl Inbox {
         }
         // A cursor move that waited for these rows may need more.
         self.issue_fetch(cx);
-        if intent.open_selected
+        if intent.notification_pane == Some(Pane::Conversation)
             && let Some(key) = intent.select
             && self.session.cursor_id.as_deref() == Some(key.thread_id.as_str())
         {
@@ -2255,6 +2256,11 @@ impl Inbox {
         cx.spawn(async move |this, cx| {
             finish_mailbox_change(reply, |result| {
                 let _ = this.update(cx, |inbox, cx| {
+                    if result.is_ok()
+                        && let Some(queue) = &inbox.notifications
+                    {
+                        queue.refresh();
+                    }
                     let after = done(inbox, result, cx);
                     if inbox.session.search.is_some() {
                         let select = after
@@ -3463,6 +3469,9 @@ impl Inbox {
                     .session
                     .show_toast("No account is set up · run fell account setup", true),
             }
+        }
+        if let Some(mode) = step.notification_mode {
+            self.set_notification_mode(mode, cx);
         }
         // Reads go to the store thread. The list moves on this frame; the
         // conversation follows when its read lands.

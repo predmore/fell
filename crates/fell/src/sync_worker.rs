@@ -332,6 +332,11 @@ fn run(
         // Replay writes before the read-only pass, so it sees their results.
         // A failure here is a connection problem the pass reports.
         if let Ok(report) = config.replay_outbox(&store) {
+            if report.flags_changed
+                && let Some(queue) = &notifications
+            {
+                queue.refresh();
+            }
             if report.flags_changed && events.unbounded_send(SyncEvent::FlagsChanged).is_err() {
                 return;
             }

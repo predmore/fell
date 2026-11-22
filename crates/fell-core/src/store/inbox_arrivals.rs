@@ -1,8 +1,8 @@
 use rusqlite::{OptionalExtension, params};
 
 use crate::folders::{FolderRole, FolderRoles};
-use crate::imap::{MailboxCheckpoint, cap_snippet, parse_remote_id};
-use crate::{Account, Message, MessageId, Result, Store};
+use crate::imap::{MailboxCheckpoint, parse_remote_id};
+use crate::{Account, AccountId, Message, MessageId, Result, Store};
 
 use super::split_field;
 
@@ -50,7 +50,7 @@ impl Observer<'_> {
         let roles = store.folder_roles(&self.account.id)?;
         let mut query = store.conn.prepare_cached(
             "SELECT COALESCE(NULLIF(trim(m.from_name), ''), m.from_email), m.subject,
-                    m.snippet, substr(m.body_text, 1, 160), m.date_unix, m.folders
+                    m.snippet, m.date_unix, m.folders
              FROM messages m
              WHERE m.account_id = ?1 AND m.message_id = ?2 AND m.unread = 1
                AND NOT EXISTS (
@@ -71,30 +71,57 @@ impl Observer<'_> {
                     Ok((
                         row.get(0)?,
                         row.get(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get(4)?,
-                        row.get::<_, String>(5)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 })
                 .optional()?;
-            if let Some((sender, subject, snippet, body, date_unix, folders)) = row
+            if let Some((sender, subject, snippet, date_unix, folders)) = row
                 && in_inbox(&roles, &folders)
             {
-                let first_line = body
-                    .as_deref()
-                    .and_then(|body| body.lines().map(str::trim).find(|line| !line.is_empty()))
-                    .unwrap_or(&snippet);
                 arrivals.push(InboxArrival {
                     id: id.clone(),
                     sender,
                     subject,
-                    snippet: cap_snippet(first_line).to_owned(),
+                    snippet,
                     date_unix,
                 });
             }
         }
         Ok(arrivals)
+    }
+}
+
+impl Store {
+    /// Recheck the exact arrivals an alert represents, even if threading
+    /// changed or a message ID collapsed into another copy since delivery.
+    pub fn unread_inbox_messages(
+        &self,
+        account: &AccountId,
+        ids: &[MessageId],
+    ) -> Result<Vec<MessageId>> {
+        let roles = self.folder_roles(account)?;
+        let mut query = self.conn.prepare_cached(
+            "SELECT folders FROM messages
+             WHERE account_id = ?1 AND message_id = ?2 AND unread = 1 AND archived = 0",
+        )?;
+        let mut unread = Vec::new();
+        for id in ids {
+            if let Some(canonical) = self.canonical_id(account, id)?
+                && let Some(folders) = query
+                    .query_row(params![account.as_str(), canonical], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .optional()?
+                && split_field(&folders)
+                    .iter()
+                    .any(|folder| roles.is(FolderRole::Inbox, folder))
+            {
+                unread.push(id.clone());
+            }
+        }
+        Ok(unread)
     }
 }
 

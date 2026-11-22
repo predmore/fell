@@ -552,6 +552,7 @@ mod tests {
                 unread: Some(unread),
                 flagged: None,
                 keywords: None,
+                delivery_keywords: None,
                 modseq: None,
             }],
             ..MailboxDelta::default()
@@ -1007,6 +1008,7 @@ mod tests {
                 unread: Some(unread),
                 flagged: None,
                 keywords: None,
+                delivery_keywords: None,
                 modseq: None,
             }],
             ..MailboxDelta::default()

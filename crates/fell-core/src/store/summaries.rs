@@ -1855,6 +1855,7 @@ mod tests {
                                     unread: Some(rng.chance(50)),
                                     flagged: None,
                                     keywords: None,
+                                    delivery_keywords: None,
                                     modseq: None,
                                 })
                                 .collect();

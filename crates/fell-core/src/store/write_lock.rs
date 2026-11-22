@@ -400,6 +400,7 @@ mod tests {
                     unread: Some(false),
                     flagged: None,
                     keywords: None,
+                    delivery_keywords: None,
                     modseq: None,
                 })
                 .collect(),
@@ -480,6 +481,7 @@ mod tests {
                     unread: Some(unread),
                     flagged: None,
                     keywords: None,
+                    delivery_keywords: None,
                     modseq: None,
                 })
                 .collect(),
@@ -697,6 +699,52 @@ mod tests {
     }
 
     #[test]
+    fn an_arrival_removed_by_a_split_delta_is_never_reported() {
+        let store = Store::open_in_memory().unwrap();
+        let account = account();
+        store.upsert_account(&account).unwrap();
+        let last = u32::try_from(super::super::SPLIT_DELTA_AT).unwrap();
+        let mut delta = end_of_inbox(1..=last, last + 1, false, "after-settle");
+        let gone = inbox_message(last + 1);
+        let live = inbox_message(last + 2);
+        let ids = [
+            gone.headers.message_id.clone(),
+            live.headers.message_id.clone(),
+        ];
+        delta.messages = vec![gone, live];
+        let mut batches = Vec::new();
+        let mut observer = super::super::inbox_arrivals::Observer {
+            account: &account,
+            checkpoint: crate::imap::MailboxCheckpoint {
+                uidvalidity: 1,
+                uid: last,
+                modseq: None,
+                uidnext: None,
+                pruned: None,
+                floor: None,
+                keyword_baseline: false,
+                projected: false,
+                star_baseline: false,
+            },
+            send: &mut |batch| {
+                assert_eq!(token(&store).as_deref(), Some("after-settle"));
+                batches.push(
+                    batch
+                        .unwrap()
+                        .into_iter()
+                        .map(|arrival| arrival.id)
+                        .collect::<Vec<_>>(),
+                );
+            },
+        };
+        store
+            .apply_sync_delta_observed(&account.id, &delta, Some(&mut observer))
+            .unwrap();
+        assert!(store.message(&account.id, &ids[0]).unwrap().is_none());
+        assert_eq!(batches, [vec![ids[1].clone()]]);
+    }
+
+    #[test]
     fn a_message_committed_before_a_split_delta_error_is_already_stored_on_retry() {
         let store = Store::open_in_memory().unwrap();
         let account = account();
@@ -863,6 +911,7 @@ mod tests {
                     unread: Some(uid % 3 == 0),
                     flagged: None,
                     keywords: None,
+                    delivery_keywords: None,
                     modseq: None,
                 })
                 .collect(),

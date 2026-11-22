@@ -354,7 +354,7 @@ fn inbox_arrivals_skip_history_copies_seen_sent_muted_and_junk() {
                         parent,
                         "New",
                         from,
-                        "First line\r\nPrivate second line",
+                        "Hi Robin,\r\n\r\nThe route map is ready for review.",
                         "",
                     ),
                 });
@@ -364,10 +364,100 @@ fn inbox_arrivals_skip_history_copies_seen_sent_muted_and_junk() {
     assert_eq!(arrivals.len(), 1);
     assert_eq!(arrivals[0].id.as_str(), "valid@x");
     assert_eq!(arrivals[0].sender, "Avery");
-    assert_eq!(arrivals[0].snippet, "First line");
+    assert_eq!(
+        arrivals[0].snippet,
+        "Hi Robin, The route map is ready for review."
+    );
     arrivals.clear();
     sync(&mut arrivals);
     assert!(arrivals.is_empty());
+}
+
+#[test]
+fn delivery_keywords_do_not_replace_an_imap_copys_labels() {
+    let mut state = sample_state();
+    state.condstore = true;
+    state
+        .mailboxes
+        .iter_mut()
+        .find(|mailbox| mailbox.name == "INBOX")
+        .unwrap()
+        .messages[1]
+        .flags
+        .push("Travel".into());
+    let server = TestServer::spawn(state);
+    let acct = account("delivery-labels", BackendKind::Imap);
+    let full = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let partial = BridgeBackend {
+        account_id: acct.id.clone(),
+        imap: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let store = Store::open_in_memory().unwrap();
+    let message = |id| {
+        store
+            .message(&acct.id, &crate::MessageId::new(id))
+            .unwrap()
+            .unwrap()
+    };
+    let copy_keywords = |uid| {
+        store.connection().query_row(
+            "SELECT keywords FROM message_copies WHERE account_id = ?1 AND mailbox = 'INBOX' AND uid = ?2",
+            rusqlite::params![acct.id.as_str(), uid],
+            |row| row.get::<_, String>(0),
+        ).unwrap()
+    };
+    sync_once(&acct, &full, &store).unwrap();
+    assert_eq!(message("reply@x").labels, ["Travel"]);
+    {
+        let mut state = server.state.lock().unwrap();
+        let inbox = state
+            .mailboxes
+            .iter_mut()
+            .find(|mailbox| mailbox.name == "INBOX")
+            .unwrap();
+        inbox.messages[1].modseq = 2;
+        inbox.messages[1].flags = vec!["\\Seen".into(), "$Muted".into()];
+        inbox.messages.push(FixtureMessage {
+            uid: 6,
+            flags: vec!["Project".into(), "$Junk".into()],
+            modseq: 2,
+            body_form: BodyForm::Literal,
+            raw: raw_message(
+                "new@x",
+                None,
+                "Route notes",
+                "Avery <avery@x>",
+                "See attached notes.",
+                "",
+            ),
+        });
+    }
+    sync_once(&acct, &partial, &store).unwrap();
+    let reply = message("reply@x");
+    assert!(!reply.unread);
+    assert_eq!(reply.labels, ["Travel"]);
+    assert_eq!(copy_keywords(2), "Travel\u{1e}$Muted");
+    assert_eq!(message("new@x").labels, ["Project"]);
+    assert_eq!(copy_keywords(6), "$Junk");
+
+    {
+        let mut state = server.state.lock().unwrap();
+        let inbox = state
+            .mailboxes
+            .iter_mut()
+            .find(|mailbox| mailbox.name == "INBOX")
+            .unwrap();
+        inbox.messages[1].modseq = 3;
+        inbox.messages[1].flags = vec!["\\Seen".into()];
+    }
+    sync_once(&acct, &partial, &store).unwrap();
+    assert_eq!(message("reply@x").labels, ["Travel"]);
+    assert_eq!(copy_keywords(2), "Travel");
 }
 
 #[test]
