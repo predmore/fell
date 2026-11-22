@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 
 use rusqlite::{Connection, OptionalExtension, params};
+use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
 
 use crate::actions::{ensure_action_schema, flags::apply_flags_in, insert_local_action};
 use crate::agent::{WriteScope, canonical_label, check_write_grant, insert_action};
@@ -631,14 +632,22 @@ pub fn display_safe(text: &str, multiline: bool) -> String {
         .filter(|&ch| {
             (multiline && ch == '\n')
                 || (!ch.is_control()
+                    && ch.general_category() != GeneralCategory::Format
+                    // Default_Ignorable_Code_Point ranges not covered by Format.
                     && !matches!(
                         ch,
-                        '\u{061c}'
-                            | '\u{200b}'..='\u{200f}'
-                            | '\u{2028}'..='\u{202e}'
-                            | '\u{2060}'..='\u{2069}'
-                            | '\u{feff}'
-                    ))
+                        '\u{034f}'
+                            | '\u{115f}'..='\u{1160}'
+                            | '\u{17b4}'..='\u{17b5}'
+                            | '\u{180b}'..='\u{180f}'
+                            | '\u{2065}'
+                            | '\u{3164}'
+                            | '\u{fe00}'..='\u{fe0f}'
+                            | '\u{ffa0}'
+                            | '\u{fff0}'..='\u{fff8}'
+                            | '\u{e0000}'..='\u{e0fff}'
+                    )
+                    && !matches!(ch, '\u{2028}' | '\u{2029}'))
         })
         .collect()
 }

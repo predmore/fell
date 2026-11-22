@@ -267,7 +267,11 @@ impl NoteFrame {
         canvas(
             move |bounds, window, _| {
                 let clip = window.content_mask().bounds;
-                if clip.size.height > px(0.) && clip.size.width > px(0.) && bounds.intersects(&clip)
+                let height = bounds.bottom().min(clip.bottom()) - bounds.top().max(clip.top());
+                if bounds.size.height > px(0.)
+                    && clip.size.width > px(0.)
+                    && bounds.intersects(&clip)
+                    && height >= bounds.size.height / 2.0
                 {
                     visible.set(Some(id));
                 }
@@ -458,7 +462,7 @@ fn note_header(
     cx: &mut Context<Inbox>,
 ) -> gpui::Stateful<gpui::Div> {
     let (position, total) = session.agent_notes.position();
-    let actor = display_safe(&frame.note.actor, false);
+    let actor = &frame.note.actor;
     let dimmed = rgb(theme::note_text(theme.dimmed, theme.background));
     let kind = if frame.note.summary.is_empty() {
         "Agent suggestions"
@@ -491,11 +495,13 @@ fn note_header(
                 .flex_1()
                 .truncate()
                 .text_color(dimmed)
-                .child(if actor.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!("· {actor}")
-                }),
+                .child(
+                    if actor.trim().is_empty() || display_safe(actor, false) != *actor {
+                        String::new()
+                    } else {
+                        format!("· {actor}")
+                    },
+                ),
         )
         .when(total > 1 && !frame.leaving, |row| {
             row.child(div().flex_none().child(format!("{position}/{total}")))
@@ -1376,7 +1382,14 @@ mod tests {
         cx.run_until_parked();
         let visible = |cx: &mut _| reader.read_with(cx, |reader, _| reader.note.visible(1));
         assert!(visible(cx), "the header fits above the fold");
-        for (offset, expected) in [(55., false), (75., true), (145., false)] {
+        for (offset, expected) in [
+            (25., false), // One pixel of the header.
+            (13., true),  // Half of the header.
+            (55., false),
+            (70., false), // One pixel of the chip.
+            (79., true),  // Half of the chip.
+            (145., false),
+        ] {
             reader.update(cx, |reader, cx| {
                 reader.scroll.set_offset(point(px(0.), px(-offset)));
                 cx.notify();
