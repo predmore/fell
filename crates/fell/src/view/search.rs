@@ -333,6 +333,9 @@ impl Inbox {
             }
             self.conv_gen.fetch_add(1, Ordering::SeqCst);
             self.clear_open_message();
+            if cleared {
+                self.settle_pending_bodies();
+            }
         }
         if switched || previous != generation {
             self.search_view.settling_reply = None;
@@ -351,6 +354,12 @@ impl Inbox {
         }
         if step.search_request && self.search_view.ready {
             self.request_search(cx);
+        }
+        if previous != generation
+            && self.session.search_results_current()
+            && std::mem::take(&mut self.search_view.refresh_open_after_reply)
+        {
+            self.request_messages(true, cx);
         }
         if step.search_completion && self.search_view.ready {
             self.request_search_completion(cx);
@@ -766,6 +775,8 @@ impl Inbox {
             let offset = self.list_offset();
             if self.session.apply_search_reply(generation, &mut reply) {
                 if !self.session.search_results_current() {
+                    self.search_view.refresh_open_after_reply = false;
+                    self.settle_pending_bodies();
                     cx.notify();
                     return;
                 }

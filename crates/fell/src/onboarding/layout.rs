@@ -701,18 +701,16 @@ impl Onboarding {
             style.font_family = family.clone().into();
         }
         style.font_weight = FontWeight::SEMIBOLD;
+        let padding = 12.;
         let width = |label: &'static str| {
             let run = style.to_run(label.len());
             let text =
                 window
                     .text_system()
                     .shape_line(label.into(), px(self.theme.ui_px), &[run], None);
-            f32::from(text.width).ceil() + 26.
+            f32::from(text.width).ceil() + 2. * (padding + 1.)
         };
-        let (old, shown) = self.feedback.primary_width.frame.unwrap_or((None, 1.));
-        let new_width = width(action.label);
-        let button_width = motion::lerp(old.map_or(new_width, width), new_width, shown);
-        let (text, opacity) = self.feedback.primary_text(action.label);
+        let (text, opacity, button_width) = self.feedback.primary_label_frame(action.label, width);
         Some(
             div()
                 .absolute()
@@ -735,7 +733,11 @@ impl Onboarding {
                     .child(
                         div()
                             .absolute()
-                            .inset_0()
+                            .top_0()
+                            .bottom_0()
+                            .left(px(padding))
+                            .right(px(padding))
+                            .overflow_hidden()
                             .flex()
                             .items_center()
                             .justify_center()

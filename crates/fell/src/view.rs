@@ -1461,6 +1461,7 @@ impl Inbox {
                     self.session.label_scope.clone_from(&self.list_label);
                 }
                 self.session.fail_query(QueryFault::Folder, err);
+                self.settle_pending_bodies();
                 cx.notify();
                 return;
             }
@@ -2164,7 +2165,16 @@ impl Inbox {
             return;
         }
         if !self.session.search_results_current() {
-            self.search_view.refresh_open_after_reply |= self.settle_pending_bodies();
+            if self
+                .session
+                .search
+                .as_ref()
+                .is_some_and(|search| search.pending)
+            {
+                self.search_view.refresh_open_after_reply |= self.pending_bodies.after.is_some();
+            } else {
+                self.settle_pending_bodies();
+            }
             return;
         }
         if let Some(draft) = self.session.cursor_draft() {
@@ -2297,7 +2307,6 @@ impl Inbox {
                 // The open thread key can disappear between the folder
                 // and message reads. Keep the conversation until a
                 // folder read confirms where its messages belong.
-                inbox.settle_pending_bodies();
                 if !inbox.read_in_flight {
                     inbox.request_threads(ReadIntent::default(), cx);
                 }
@@ -4154,10 +4163,10 @@ impl Inbox {
             .applied(generation, animate, self.motion.motion, now);
     }
 
-    fn settle_pending_bodies(&mut self) -> bool {
+    fn settle_pending_bodies(&mut self) {
         let animate = self.has_missing_bodies();
         self.pending_bodies
-            .settle(animate, self.motion.motion, self.motion.clock.now())
+            .settle(animate, self.motion.motion, self.motion.clock.now());
     }
 
     fn has_missing_bodies(&self) -> bool {
@@ -7546,14 +7555,10 @@ impl PendingBodies {
         }
     }
 
-    fn settle(&mut self, animate: bool, motion: Motion, now: Instant) -> bool {
-        if self.after.take().is_none() {
-            return false;
-        }
-        if animate {
+    fn settle(&mut self, animate: bool, motion: Motion, now: Instant) {
+        if self.after.take().is_some() && animate {
             self.missing = motion.start(motion::FADE, now);
         }
-        true
     }
 
     fn fade(&self, now: Instant) -> Option<f32> {
@@ -9370,7 +9375,11 @@ fn status_bar(
                 .text_size(px(size))
                 .whitespace_nowrap()
                 .text_color(rgb(theme.error))
-                .child(status_text(text.to_owned(), Some((&key, " for log")), theme));
+                .child(status_text(
+                    text.to_owned(),
+                    Some((&key, " for log")),
+                    theme,
+                ));
             (label, width)
         } else {
             labels.draw(theme, size, sync_room, window)
@@ -11011,7 +11020,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_bodies_fade_when_the_open_thread_reads_empty() {
+    fn pending_bodies_wait_on_the_folder_read_after_the_open_thread_reads_empty() {
         with_pending_inbox(|inbox, cx| {
             let id = inbox.open_thread.clone().unwrap();
             inbox.read_in_flight = true;
@@ -11021,6 +11030,35 @@ mod tests {
                 matches: None,
             };
             inbox.receive_conversation(id, 1, Ok(Some(reply)), cx);
+            assert!(inbox.pending_bodies.downloading(&inbox.session.sync));
+            assert!(
+                inbox
+                    .pending_bodies
+                    .fade(inbox.motion.clock.now())
+                    .is_none()
+            );
+            let id = inbox.open_thread.clone().unwrap();
+            let reply = super::ConversationRead {
+                view: inbox.session.messages.clone(),
+                reads: Default::default(),
+                matches: None,
+            };
+            inbox.receive_conversation(id, 1, Ok(Some(reply)), cx);
+            let now = inbox.motion.clock.now();
+            inbox.apply_body_refresh(now);
+        });
+    }
+
+    #[test]
+    fn pending_bodies_fade_when_the_folder_read_fails() {
+        with_pending_inbox(|inbox, cx| {
+            inbox.show_threads(
+                inbox.session.folder.clone(),
+                Err("failed to read folder".into()),
+                super::ReadIntent::default(),
+                false,
+                cx,
+            );
             assert!(
                 inbox
                     .pending_bodies
@@ -11063,18 +11101,77 @@ mod tests {
             assert!(!inbox.session.search_results_current());
 
             inbox.read_selected_messages(true, cx);
-            assert!(inbox.pending_bodies.after.is_none());
+            assert_eq!(
+                crate::present::missing_body_line(
+                    fell_core::BodyState::Pending,
+                    inbox.pending_bodies.downloading(&inbox.session.sync),
+                )
+                .as_deref(),
+                Some("Downloading…")
+            );
             assert!(
                 inbox
                     .pending_bodies
                     .fade(inbox.motion.clock.now())
-                    .is_some()
+                    .is_none()
             );
             let before = inbox.conv_gen.load(Ordering::SeqCst);
 
             inbox.show_search_reply(inbox.session.search_generation, reply(), cx);
             assert_eq!(inbox.conv_gen.load(Ordering::SeqCst), before + 1);
             assert_eq!(inbox.open_thread.as_deref(), Some(row.id.as_str()));
+            assert!(inbox.pending_bodies.downloading(&inbox.session.sync));
+
+            let mut view = inbox.session.messages.clone();
+            view[0].body_state = fell_core::BodyState::Stored;
+            inbox.receive_conversation(
+                row.id,
+                before + 1,
+                Ok(Some(super::ConversationRead {
+                    view,
+                    reads: Default::default(),
+                    matches: None,
+                })),
+                cx,
+            );
+            let now = inbox.motion.clock.now();
+            inbox.apply_body_refresh(now);
+            assert!(
+                inbox
+                    .pending_bodies
+                    .fade(inbox.motion.clock.now())
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn pending_bodies_settle_when_the_search_reply_fails() {
+        with_pending_inbox(|inbox, cx| {
+            inbox.session.on_key(KeyId::Char('/'), 10);
+            inbox.session.type_search("field");
+            inbox.session.cursor_id.clone_from(&inbox.open_thread);
+            inbox.read_selected_messages(true, cx);
+            assert!(inbox.search_view.refresh_open_after_reply);
+            assert!(inbox.pending_bodies.downloading(&inbox.session.sync));
+
+            inbox.show_search_reply(
+                inbox.session.search_generation,
+                crate::model::search::SearchReply {
+                    rows: Vec::new(),
+                    hits: Default::default(),
+                    correction: None,
+                    error: Some("failed to search".into()),
+                },
+                cx,
+            );
+            assert!(!inbox.search_view.refresh_open_after_reply);
+            assert!(
+                inbox
+                    .pending_bodies
+                    .fade(inbox.motion.clock.now())
+                    .is_some()
+            );
         });
     }
 

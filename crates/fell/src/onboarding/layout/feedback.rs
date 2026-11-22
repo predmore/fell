@@ -336,7 +336,6 @@ pub(in crate::onboarding) struct Feedback {
     pub(super) save_actions: Actions,
     pub(super) primary: Option<Action>,
     primary_label: Change<Option<&'static str>>,
-    pub(super) primary_width: Crossfade<Option<&'static str>>,
     pub(super) save_title: Change<&'static str>,
     pub(super) save_subtitle: Change<&'static str>,
     pub(super) save_note: Change<SaveState>,
@@ -352,7 +351,6 @@ impl Feedback {
     pub fn settle(&mut self) {
         self.bridge.settle();
         self.primary_label.settle();
-        self.primary_width.settle();
         self.connection.settle();
         for action in self
             .connection_actions
@@ -461,11 +459,20 @@ impl Feedback {
         }
     }
 
-    pub(super) fn primary_text(&self, label: &'static str) -> (&'static str, f32) {
+    pub(super) fn primary_label_frame(
+        &self,
+        label: &'static str,
+        width: impl Fn(&'static str) -> f32,
+    ) -> (&'static str, f32, f32) {
+        let target = width(label);
         match self.primary_label.layers() {
-            Some((Some(old), [out, _], _)) if out > 0. => (old, out),
-            Some((Some(_), [_, arrival], _)) => (label, arrival),
-            _ => (label, 1.),
+            Some((Some(old), [out, _], _)) if out > 0. => (old, out, width(old).max(target)),
+            Some((Some(old), [_, arrival], progress)) => (
+                label,
+                arrival,
+                motion::lerp(width(old).max(target), target, progress),
+            ),
+            _ => (label, 1., target),
         }
     }
 
@@ -534,7 +541,6 @@ impl Feedback {
         let label = primary.map(|action| action.label);
         self.primary_label
             .update(label, motion, now, STEP_OUT, motion::QUICK);
-        let width_active = self.primary_width.update(label, motion, now);
         if self.back_tint.is_some_and(|(_, fade)| !fade.running(now)) {
             self.back_tint = None;
         }
@@ -572,7 +578,6 @@ impl Feedback {
 
         let mut active = self.bridge.tick(now)
             | self.primary_label.tick(now)
-            | width_active
             | server_active
             | self.connection.tick(now)
             | self.save_title.tick(now)
@@ -620,7 +625,7 @@ mod tests {
     }
 
     #[test]
-    fn primary_text_fades_in_sequence_while_width_eases() {
+    fn primary_label_holds_width_until_the_outgoing_text_fades() {
         let now = Instant::now();
         let motion = Motion::new(true);
         let mut feedback = Feedback::default();
@@ -629,11 +634,13 @@ mod tests {
         feedback.refresh(&form, Bridge::Checking, motion, now);
         feedback.settle();
         form.step = Step::Connection;
+        let measure = |label| if label == "Testing…" { 90. } else { 140. };
 
+        let mut last_width = 140.;
         for elapsed in 0..140 {
             let at = now + Duration::from_millis(elapsed);
             assert!(feedback.refresh(&form, Bridge::Checking, motion, at));
-            let (text, opacity) = feedback.primary_text("Testing…");
+            let (text, opacity, width) = feedback.primary_label_frame("Testing…", measure);
             assert_eq!(
                 text,
                 if elapsed < 60 {
@@ -643,10 +650,14 @@ mod tests {
                 }
             );
             assert!(opacity >= motion::ARRIVE_FROM);
+            if elapsed <= 60 {
+                assert_eq!(width, 140.);
+            }
             if elapsed == 60 {
                 assert_eq!(opacity, motion::ARRIVE_FROM);
             }
-            assert_eq!(feedback.primary_width.frame.is_some(), elapsed < 120);
+            assert!((90.0..=last_width).contains(&width));
+            last_width = width;
         }
         feedback.refresh(
             &form,
@@ -654,7 +665,10 @@ mod tests {
             motion,
             now + Duration::from_millis(140),
         );
-        assert_eq!(feedback.primary_text("Testing…"), ("Testing…", 1.));
+        assert_eq!(
+            feedback.primary_label_frame("Testing…", measure),
+            ("Testing…", 1., 90.)
+        );
     }
 
     #[test]
