@@ -51,6 +51,7 @@ pub(crate) const MAX_ATTEMPTS: u32 = 5;
 const BACKOFF_SECS: [i64; 5] = [10, 30, 120, 600, 1800];
 /// Inconclusive checks are independent of explicit APPEND refusals.
 pub(super) const MAX_APPEND_CHECKS: u32 = 5;
+pub(super) const APPEND_UID_LIMIT: usize = 500;
 const APPEND_HEADER_BATCH: usize = 100;
 
 /// Send every outbox row that is due. Returns what was sent and dropped.
@@ -134,7 +135,9 @@ pub(super) fn replay_with(
         ) => {
             return Err(Error::Backend(message));
         }
-        Err(Stop::Connection(err)) => report.interrupted = Some(err.to_string()),
+        Err(Stop::Connection(err) | Stop::AppendCheckDisconnected(err)) => {
+            report.interrupted = Some(err.to_string());
+        }
         // Write-back was turned off by another process mid-pass.
         Err(Stop::Stale) => {}
     }
@@ -148,6 +151,7 @@ enum Stop {
     AppendRetry(String),
     AppendRefused(String),
     AppendCheck(String),
+    AppendCheckDisconnected(Error),
     /// The row is no longer in this write-back generation: send nothing more.
     Stale,
 }
@@ -155,6 +159,9 @@ enum Stop {
 fn append_check_error(error: WriteError) -> Stop {
     match error {
         WriteError::Refused(message) => Stop::AppendCheck(message),
+        WriteError::Connection(error @ Error::ImapLineLimit { .. }) => {
+            Stop::AppendCheckDisconnected(error)
+        }
         WriteError::Connection(error) => Stop::Connection(error),
     }
 }
@@ -286,6 +293,16 @@ impl Pass<'_> {
                     checks: pending.checks,
                 },
             ),
+            Err(Stop::AppendCheckDisconnected(err)) => {
+                self.retry_append(
+                    index,
+                    &err.to_string(),
+                    AppendRetry::Inconclusive {
+                        checks: pending.checks,
+                    },
+                )?;
+                Err(Stop::Connection(err))
+            }
             Err(stop) => Err(stop),
         }
     }
@@ -358,7 +375,7 @@ impl Pass<'_> {
         next: u32,
     ) -> Result<bool, Stop> {
         let candidates = session
-            .search_message_id(&entry.message_id)
+            .search_message_id(&entry.message_id, APPEND_UID_LIMIT)
             .map_err(append_check_error)?;
         if !candidates.is_empty() {
             let (found, _) =
@@ -383,11 +400,16 @@ impl Pass<'_> {
             // A successful APPEND allocates a UID even if it is expunged later.
             return Ok(false);
         }
+        if next - pending.next > APPEND_UID_LIMIT as u32 {
+            return Err(Stop::AppendCheck(
+                "Sent UID range is too large to verify".into(),
+            ));
+        }
         // UIDNEXT may also advance for unrelated arrivals. List the existing
         // UIDs in the closed range so gaps are distinguished from missing
         // FETCH responses, and check every header before sending again.
         let uids = session
-            .search_uid_range(pending.next, next - 1)
+            .search_uid_range(pending.next, next - 1, APPEND_UID_LIMIT)
             .map_err(append_check_error)?;
         let (found, complete) =
             Self::check_append_headers(session, entry, mailbox, validity, &uids)?;
@@ -869,7 +891,7 @@ impl Pass<'_> {
             Ok(uidvalidity) if uidvalidity == bound_uidvalidity => uidvalidity,
             Ok(_) | Err(_) => return Ok(None),
         };
-        let found = match session.search_message_id(&entry.message_id) {
+        let found = match session.search_message_id(&entry.message_id, usize::MAX) {
             Ok(found) => found,
             Err(WriteError::Refused(_)) => return Ok(None),
             Err(WriteError::Connection(err)) => return Err(Stop::Connection(err)),

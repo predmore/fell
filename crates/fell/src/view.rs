@@ -505,20 +505,6 @@ fn not_sent_detail(session: &Session, write: &DroppedWrite, count: usize) -> Str
     }
 }
 
-/// What the inbox says while a reply or forward's window comes up:
-/// "reply all · Jon".
-fn reply_notice(kind: ReplyKind, sender: &str) -> String {
-    format!("{}{sender}", reply_notice_prefix(kind))
-}
-
-fn reply_notice_prefix(kind: ReplyKind) -> &'static str {
-    match kind {
-        ReplyKind::Reply => "reply · ",
-        ReplyKind::ReplyAll => "reply all · ",
-        ReplyKind::Forward => "forward · ",
-    }
-}
-
 /// Height of one thread row. Rows never change height, so the list can
 /// place, scroll to and animate any row from its index.
 const ROW_PX: f32 = 68.0;
@@ -3206,24 +3192,10 @@ impl Inbox {
                 .show_toast("Compose is not available here", true);
             return;
         };
-        // The window takes a moment to appear: say what is coming now.
-        if id.is_none() {
-            self.session.show_toast("New draft", false);
-        } else {
-            let subject = self
-                .session
-                .cursor_thread()
-                .map(|row| row.subject.clone())
-                .unwrap_or_default();
-            self.session
-                .show_toast(format!("Opening draft \u{201c}{subject}\u{201d}"), false);
-        }
-        let notice = self.session.toast_generation();
         if let Some(id) = &id
             && crate::draft_host::show_draft(&hub, id)
         {
             self.watch_held_draft(&hub, id, cx);
-            self.settle_opening_notice(notice, cx);
             return;
         }
         let Some(home) = self.draft_home.clone() else {
@@ -3255,9 +3227,7 @@ impl Inbox {
                         // `false` while another open of it is still reading
                         // it; that one shows it when it lands.
                         inbox.watch_held_draft(&hub, &id, cx);
-                        if crate::draft_host::show_draft(&hub, &id) {
-                            inbox.settle_opening_notice(notice, cx);
-                        }
+                        crate::draft_host::show_draft(&hub, &id);
                     }
                     Err(err) => {
                         let what = if creating {
@@ -3300,7 +3270,6 @@ impl Inbox {
             return;
         };
         let parent_id = fell_core::MessageId::new(&target.id);
-        let sender = target.sender.clone();
         let Some(hub) = cx
             .try_global::<crate::draft_host::AgentDrafts>()
             .map(|drafts| drafts.0.clone())
@@ -3319,9 +3288,7 @@ impl Inbox {
         if let Some(note) = &suggestion {
             self.note_in_flight = Some(note.id);
         }
-        self.session.show_toast(reply_notice(kind, &sender), false);
         self.forwarding_attachments |= forwarding;
-        let notice = self.session.toast_generation();
         let account = self.account_id.clone();
         let email = self.session.account_email.clone();
         let roles = self.session.roles.clone();
@@ -3389,9 +3356,7 @@ impl Inbox {
                         if let Some(note) = suggestion {
                             inbox.agent_note_resolved(&note);
                         }
-                        if crate::draft_host::show_draft(&hub, &id) {
-                            inbox.settle_opening_notice(notice, cx);
-                        }
+                        crate::draft_host::show_draft(&hub, &id);
                     }
                     Err(err) => {
                         if suggestion.is_some() {
@@ -3411,13 +3376,6 @@ impl Inbox {
             });
         })
         .detach();
-    }
-
-    /// The window is on its way: once it has had time to show, the inbox's
-    /// "opening" notice `notice` has done its job and goes, unless something
-    /// newer replaced it, such as the notice for a second draft opened since.
-    fn settle_opening_notice(&mut self, notice: u64, cx: &mut Context<Self>) {
-        self.dismiss_notice_after(notice, std::time::Duration::from_millis(700), cx);
     }
 
     fn expire_action_notice(&mut self, cx: &mut Context<Self>) {
@@ -4278,18 +4236,30 @@ impl Render for Inbox {
             });
         self.want_bodies(cx);
         self.motion.narrow_status = width < present::NARROW_WIDTH;
-        if panes.1 && self.motion.has_pending_messages() && !compose_open(cx) {
-            // Start in the compositor's frame callback, even if a resize
-            // drew a scene while compose still covered the window.
+        let composing = compose_open(cx);
+        let viewport = (window.viewport_size(), window.scale_factor());
+        let waiting_for_resize = self.motion.waiting_for_uncover(viewport.0, composing, now);
+        let uncovered = panes.1 && !composing && !waiting_for_resize;
+        if let Some(frame) = self
+            .motion
+            .stage_arriving_messages(uncovered.then_some(viewport))
+        {
             let this = cx.weak_entity();
-            window.on_next_frame(move |_, cx| {
-                if !compose_open(cx) {
-                    let _ = this.update(cx, |inbox, cx| {
-                        let now = inbox.motion.clock.now();
-                        inbox.motion.reveal_arriving_messages(now);
-                        cx.notify();
-                    });
-                }
+            // GPUI runs next-frame callbacks before submitting the scene. Let
+            // this callback present the pinned frame and start the clock on
+            // its callback, provided no configure replaced that scene.
+            window.on_next_frame(move |window, _| {
+                window.on_next_frame(move |window, cx| {
+                    if !compose_open(cx) {
+                        let viewport = (window.viewport_size(), window.scale_factor());
+                        let _ = this.update(cx, |inbox, cx| {
+                            let now = inbox.motion.clock.now();
+                            if inbox.motion.reveal_arriving_messages(viewport, frame, now) {
+                                cx.notify();
+                            }
+                        });
+                    }
+                });
             });
         }
         self.motion.observe(&self.session, panes, now);
@@ -4493,6 +4463,7 @@ impl Render for Inbox {
             now,
         );
         let animating = self.motion.tick(now)
+            | waiting_for_resize
             | self.note_view.running()
             | self.note_pin.running()
             | self
@@ -8582,6 +8553,21 @@ fn status_bar(
             ),
         }
     };
+    // Reserve a stable slot through routine sync passes. Progress and
+    // recovery guidance can use more space when they have more to say.
+    let steady_sync = outage.is_none()
+        && reply_check.is_none()
+        && matches!(
+            session.sync,
+            SyncKind::Connecting
+                | SyncKind::Syncing { progress: None, .. }
+                | SyncKind::Synced { .. }
+        );
+    let sync_width = if steady_sync {
+        bar_px(window, "synced just now · 0000 new", size, ui)
+    } else {
+        bar_px(window, &sync_label, size, ui)
+    };
     let details = outage.is_none() && session.detail_text().is_some();
     // What the bar spends before the notice, measured as drawn: the
     // padding, the mode in mono, sync, the dots, the gaps between the
@@ -8590,7 +8576,7 @@ fn status_bar(
     let mut used = 28.0 + 2.0 * 12.0 + 2.0;
     used += bar_px(window, session.mode_label(), size, mono) + dot;
     if !narrow {
-        used += 2.0 * 12.0 + dot + bar_px(window, &sync_label, size, ui);
+        used += 2.0 * 12.0 + dot + sync_width;
         if let Some(key) = &sync_hint {
             used += bar_px(window, &format!(" · {key} for log"), size, ui);
         }
@@ -8677,6 +8663,12 @@ fn status_bar(
                 .child(
                     div()
                         .flex_none()
+                        .when(steady_sync, |slot| {
+                            slot.w(px(sync_width))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                        })
                         .text_color(rgb(sync_color))
                         .when(status.sync_opacity < 1.0, |label| {
                             label.opacity(status.sync_opacity)

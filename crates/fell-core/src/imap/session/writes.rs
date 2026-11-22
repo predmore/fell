@@ -354,6 +354,7 @@ impl WriteSession {
     pub(in crate::imap) fn search_message_id(
         &mut self,
         message_id: &str,
+        limit: usize,
     ) -> Result<Vec<u32>, WriteError> {
         let value = quote_imap(&format!("<{message_id}>"))
             .map_err(|err| WriteError::Refused(err.to_string()))?;
@@ -361,7 +362,7 @@ impl WriteSession {
             "UID SEARCH",
             &format!("UID SEARCH HEADER Message-ID {value}"),
         )?;
-        search_uids(&reply.untagged)
+        search_uids(&reply.untagged, limit)
             .ok_or_else(|| WriteError::Refused("UID SEARCH returned no usable result".into()))
     }
 
@@ -370,9 +371,10 @@ impl WriteSession {
         &mut self,
         first: u32,
         last: u32,
+        limit: usize,
     ) -> Result<Vec<u32>, WriteError> {
         let reply = self.run("UID SEARCH", &format!("UID SEARCH UID {first}:{last}"))?;
-        search_uids(&reply.untagged)
+        search_uids(&reply.untagged, limit)
             .filter(|uids| uids.iter().all(|uid| (first..=last).contains(uid)))
             .ok_or_else(|| WriteError::Refused("UID SEARCH returned no usable UID range".into()))
     }

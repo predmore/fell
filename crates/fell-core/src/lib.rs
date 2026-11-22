@@ -96,6 +96,8 @@ pub enum Error {
     SendUnconfirmed,
     #[error("{0}")]
     Backend(String),
+    #[error("imap: response line from {host} exceeds the {limit} byte limit")]
+    ImapLineLimit { host: String, limit: usize },
     #[error(transparent)]
     Keyring(#[from] credentials::KeyringError),
     #[error("{0}")]

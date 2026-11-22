@@ -10,6 +10,8 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use gpui::{Pixels, Size};
+
 use crate::keymap::KeyId;
 use crate::model::{Banner, FolderIntent, Overlay, PickerChoice, Session, Toast};
 use crate::motion::{self, Ghost, Glide, ListShift, Motion, Transition};
@@ -239,6 +241,12 @@ pub struct InboxMotion {
     bodies: HashMap<String, (Transition, bool)>,
     /// Sent cards already laid out but hidden until the compose hand-off.
     messages_pending: HashSet<String>,
+    /// The pending cards are painted at their starting opacity for this viewport.
+    arrival_frame: Option<((Size<Pixels>, f32), u64)>,
+    arrival_frame_id: u64,
+    /// The inbox's viewport before compose could tile over it.
+    uncovered_size: Option<Size<Pixels>>,
+    uncover_started: Option<Instant>,
     /// Where a glide a key interrupted was drawn, so the next glide starts
     /// there instead of snapping to the old target first.
     list_from: Option<f32>,
@@ -372,6 +380,10 @@ impl InboxMotion {
             card_glide: None,
             bodies: HashMap::new(),
             messages_pending: HashSet::new(),
+            arrival_frame: None,
+            arrival_frame_id: 0,
+            uncovered_size: None,
+            uncover_started: None,
             quotes: DisclosureMotion::default(),
             recipients: DisclosureMotion::default(),
             last_unread: None,
@@ -563,6 +575,7 @@ impl InboxMotion {
         self.arrival_pending = true;
         self.bodies.clear();
         self.messages_pending.clear();
+        self.arrival_frame = None;
     }
 
     /// Jump every transition to its end state: a key acts on what the
@@ -598,6 +611,7 @@ impl InboxMotion {
         self.finish_empty_list_entry();
         self.bodies.clear();
         self.messages_pending.clear();
+        self.arrival_frame = None;
         self.quotes.transitions.clear();
         self.recipients.transitions.clear();
         self.unread_out = None;
@@ -1114,19 +1128,67 @@ impl InboxMotion {
     /// Fade in the whole card when a newly sent reply joins the open thread.
     pub fn message_arrived(&mut self, id: &str) {
         self.messages_pending.insert(id.to_string());
+        self.arrival_frame = None;
     }
 
     pub fn has_pending_messages(&self) -> bool {
         !self.messages_pending.is_empty()
     }
 
-    pub fn reveal_arriving_messages(&mut self, now: Instant) {
+    /// Wait for the inbox geometry to return before exposing the sent card.
+    /// Compose can close before the compositor configures the expanded tile.
+    /// A changed desktop layout may settle at a different size.
+    pub fn waiting_for_uncover(
+        &mut self,
+        size: Size<Pixels>,
+        composing: bool,
+        now: Instant,
+    ) -> bool {
+        if composing || !self.has_pending_messages() {
+            self.uncover_started = None;
+            if !composing {
+                self.uncovered_size = Some(size);
+            }
+            return false;
+        }
+        self.uncovered_size.is_some_and(|previous| previous != size)
+            && now.duration_since(*self.uncover_started.get_or_insert(now)) < motion::FADE
+    }
+
+    /// Pin the first visible frame and return its token once per viewport.
+    pub fn stage_arriving_messages(
+        &mut self,
+        viewport: Option<(Size<Pixels>, f32)>,
+    ) -> Option<u64> {
+        let Some(viewport) = viewport.filter(|_| self.has_pending_messages()) else {
+            self.arrival_frame = None;
+            return None;
+        };
+        if self.arrival_frame.is_some_and(|(last, _)| last == viewport) {
+            return None;
+        }
+        self.arrival_frame_id = self.arrival_frame_id.wrapping_add(1);
+        self.arrival_frame = Some((viewport, self.arrival_frame_id));
+        Some(self.arrival_frame_id)
+    }
+
+    pub fn reveal_arriving_messages(
+        &mut self,
+        viewport: (Size<Pixels>, f32),
+        frame: u64,
+        now: Instant,
+    ) -> bool {
+        if self.arrival_frame != Some((viewport, frame)) {
+            return false;
+        }
+        self.arrival_frame = None;
         if let Some(fade) = self.motion.start(motion::FADE, now) {
             self.bodies
                 .extend(self.messages_pending.drain().map(|id| (id, (fade, true))));
         } else {
             self.messages_pending.clear();
         }
+        true
     }
 
     /// Opacity for each body or card still settling in, by message id.
@@ -1141,7 +1203,16 @@ impl InboxMotion {
             })
             .collect();
         if whole_card {
-            alphas.extend(self.messages_pending.iter().map(|id| (id.clone(), 0.0)));
+            let pending_alpha = match self.arrival_frame {
+                Some(_) if self.motion.enabled() => motion::ARRIVE_FROM,
+                Some(_) => 1.0,
+                None => 0.0,
+            };
+            alphas.extend(
+                self.messages_pending
+                    .iter()
+                    .map(|id| (id.clone(), pending_alpha)),
+            );
         }
         alphas
     }
@@ -1635,24 +1706,56 @@ mod tests {
     }
 
     #[test]
-    fn a_sent_cards_fade_starts_on_the_first_revealed_frame() {
+    fn the_old_tile_stays_hidden_until_the_inbox_restores_its_size() {
         let mut motion = InboxMotion::new(Motion::new(true));
         let now = Instant::now();
+        let tiled = gpui::size(gpui::px(420.), gpui::px(780.));
+        let uncovered = gpui::size(gpui::px(840.), gpui::px(780.));
+        assert!(!motion.waiting_for_uncover(uncovered, false, now));
         motion.message_arrived("reply");
-        let revealed = later(now, 500);
-        assert!(!motion.tick(revealed));
-        assert_eq!(motion.arrival_alphas(revealed, true)["reply"], 0.0);
-        motion.reveal_arriving_messages(revealed);
+        assert!(!motion.waiting_for_uncover(tiled, true, now));
+        assert!(motion.waiting_for_uncover(tiled, false, now));
+        assert!(motion.waiting_for_uncover(tiled, false, later(now, 80)));
+        assert_eq!(motion.arrival_alphas(later(now, 80), true)["reply"], 0.0);
+        assert!(!motion.waiting_for_uncover(uncovered, false, later(now, 80)));
+
+        // A different arrangement of windows may give the inbox new bounds.
+        assert!(!motion.waiting_for_uncover(tiled, false, later(now, 120)));
+    }
+
+    #[test]
+    fn a_sent_card_stays_pinned_until_the_callback_for_its_resized_frame() {
+        let mut motion = InboxMotion::new(Motion::new(true));
+        let now = Instant::now();
+        let tiled = (gpui::size(gpui::px(600.), gpui::px(780.)), 1.0);
+        let uncovered = (gpui::size(gpui::px(1200.), gpui::px(780.)), 1.0);
+        motion.message_arrived("reply");
+        assert!(motion.stage_arriving_messages(None).is_none());
+        assert_eq!(motion.arrival_alphas(now, true)["reply"], 0.0);
+
+        let old_frame = motion.stage_arriving_messages(Some(tiled)).unwrap();
+        let resized_frame = motion.stage_arriving_messages(Some(uncovered)).unwrap();
+        assert!(motion.stage_arriving_messages(Some(uncovered)).is_none());
+        let presented = later(now, 500);
+        assert!(!motion.reveal_arriving_messages(uncovered, old_frame, presented));
+        assert!(!motion.tick(presented));
         assert_eq!(
-            motion.arrival_alphas(revealed, true)["reply"],
+            motion.arrival_alphas(presented, true)["reply"],
             motion::ARRIVE_FROM
         );
-        let halfway = later(revealed, 60);
+
+        let callback = later(presented, 40);
+        assert!(motion.reveal_arriving_messages(uncovered, resized_frame, callback));
+        assert_eq!(
+            motion.arrival_alphas(callback, true)["reply"],
+            motion::ARRIVE_FROM
+        );
+        let halfway = later(callback, 60);
         assert!(motion.tick(halfway));
         assert!(
             (motion::ARRIVE_FROM..1.0).contains(&motion.arrival_alphas(halfway, true)["reply"])
         );
-        assert!(!motion.tick(later(revealed, 120)));
+        assert!(!motion.tick(later(callback, 120)));
     }
 
     #[test]

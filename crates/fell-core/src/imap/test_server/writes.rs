@@ -24,6 +24,8 @@ pub(in crate::imap) struct WriteFixture {
     pub refuse_search: bool,
     /// Return this many tagged-OK empty HEADER searches before finding the copy.
     pub empty_header_searches: usize,
+    /// Override a selected write session's range search with this many UID hits.
+    pub range_search_hits: Option<usize>,
     pub omit_message_id_header: Option<u32>,
     pub close_on_login: bool,
     pub refuse_append: bool,
@@ -90,6 +92,11 @@ pub(super) fn handle(
                 } else {
                     search_message_id(tag, args, &state)
                 }
+            } else if selected_write
+                && strip_prefix_ignore(rest, "SEARCH UID ").is_some()
+                && let Some(hits) = writes.range_search_hits
+            {
+                format!("* SEARCH{}\r\n{tag} OK SEARCH\r\n", " 1".repeat(hits))
             } else if let Some(args) = strip_prefix_ignore(rest, "FETCH ")
                 && args
                     .to_ascii_uppercase()

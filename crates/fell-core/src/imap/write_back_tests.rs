@@ -2961,6 +2961,71 @@ fn a_range_with_missing_headers_does_not_repeat_append() {
     assert_eq!(fixture.on_server("Filed mail").len(), 1);
 }
 
+#[test]
+fn a_huge_uid_span_drops_an_unconfirmed_append_without_searching_the_range() {
+    let fixture = sent_fixture();
+    lose_sent_append(&fixture);
+    fixture.server.state.lock().unwrap().mailboxes[1].uidnext = Some(u32::MAX);
+    let before = fixture.commands().len();
+    assert_unconfirmed_append_drops(&fixture);
+    assert!(
+        without_tags(&fixture.commands()[before..])
+            .iter()
+            .all(|command| !command.starts_with("UID SEARCH UID "))
+    );
+}
+
+#[test]
+fn too_many_search_hits_drop_an_unconfirmed_append_without_fetching_headers() {
+    let fixture = sent_fixture();
+    lose_sent_append(&fixture);
+    fixture.server.state.lock().unwrap().mailboxes[1].uidnext = Some(2);
+    fixture.server.writes.lock().unwrap().range_search_hits =
+        Some(super::write_back::APPEND_UID_LIMIT + 1);
+    let before = fixture.commands().len();
+    assert_unconfirmed_append_drops(&fixture);
+    let commands = without_tags(&fixture.commands()[before..]);
+    assert!(
+        commands
+            .iter()
+            .any(|command| command == "UID SEARCH UID 1:1")
+    );
+    assert!(
+        commands
+            .iter()
+            .all(|command| !command.starts_with("UID FETCH "))
+    );
+}
+
+#[test]
+fn an_oversized_search_line_counts_as_a_check_and_disconnects() {
+    let fixture = sent_fixture();
+    lose_sent_append(&fixture);
+    fixture.server.state.lock().unwrap().mailboxes[1].uidnext = Some(2);
+    // Each UID adds two bytes, so the line exceeds the real 1 MiB cap.
+    fixture.server.writes.lock().unwrap().range_search_hits = Some(512 * 1024);
+    let before = fixture.commands().len();
+    assert_unconfirmed_append_drops(&fixture);
+    let recorded = fixture.commands();
+    let commands = without_tags(&recorded[before..]);
+    let check_count = super::write_back::MAX_APPEND_CHECKS as usize;
+    assert_eq!(
+        recorded[before..]
+            .iter()
+            .filter(|command| command.starts_with("LOGIN"))
+            .count(),
+        check_count,
+    );
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| *command == "UID SEARCH UID 1:1")
+            .count(),
+        check_count,
+    );
+    assert!(commands.iter().all(|command| command != "LOGOUT"));
+}
+
 fn assert_unconfirmed_append_drops(fixture: &Fixture) {
     for check in 1..=super::write_back::MAX_APPEND_CHECKS {
         fixture.make_due();

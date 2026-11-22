@@ -439,7 +439,7 @@ impl Session {
             }
             Err(err) => return Err(err),
         };
-        Ok(search_uids(&lines))
+        Ok(search_uids(&lines, usize::MAX))
     }
 
     /// UID and `Message-ID` header of messages `first..=last` by sequence
@@ -930,10 +930,7 @@ impl Session {
         loop {
             if let Some(pos) = buf.iter().position(|byte| *byte == b'\n') {
                 if pos > limit {
-                    return Err(imap_err(format!(
-                        "response line from {} exceeds the {limit} byte limit",
-                        self.host
-                    )));
+                    return Err(self.close_on_line_limit(limit));
                 }
                 let mut line = buf.drain(..=pos).collect::<Vec<_>>();
                 self.restore_buf(buf);
@@ -946,14 +943,20 @@ impl Session {
                 return Ok(line);
             }
             if buf.len() > limit {
-                return Err(imap_err(format!(
-                    "response line from {} exceeds the {limit} byte limit",
-                    self.host
-                )));
+                return Err(self.close_on_line_limit(limit));
             }
             if !self.fill(&mut buf)? {
                 return Err(imap_err(format!("connection to {} closed", self.host)));
             }
+        }
+    }
+
+    fn close_on_line_limit(&mut self, limit: usize) -> Error {
+        // The remainder of the line cannot be read as a new response.
+        self.disconnect();
+        Error::ImapLineLimit {
+            host: self.host.clone(),
+            limit,
         }
     }
 
@@ -1048,7 +1051,7 @@ enum LiteralBytes {
 }
 
 /// The UIDs in a `UID SEARCH` reply's `* SEARCH` lines, ascending.
-fn search_uids(lines: &[Logical]) -> Option<Vec<u32>> {
+fn search_uids(lines: &[Logical], limit: usize) -> Option<Vec<u32>> {
     let mut result = None;
     for line in lines {
         let mut words = line.text.split_whitespace();
@@ -1062,7 +1065,8 @@ fn search_uids(lines: &[Logical]) -> Option<Vec<u32>> {
         let uids = result.get_or_insert_with(Vec::new);
         for word in words {
             match word.parse() {
-                Ok(uid) => uids.push(uid),
+                Ok(uid) if uids.len() < limit => uids.push(uid),
+                Ok(_) => return None,
                 // A modifier such as `(MODSEQ n)`, not a UID.
                 Err(_) if word.starts_with('(') => break,
                 Err(_) => return None,
