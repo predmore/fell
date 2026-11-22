@@ -2641,10 +2641,10 @@ fn log_send_result(result: &Result<fell_core::SentMessage, SendFailure>) {
 /// A draft whose transmission failed leaves no record.
 /// The write runs on its own thread with a few retries: the mail already
 /// went out, so a busy mailbox must neither hold up the send nor lose this.
-fn remember_bcc(record: fell_core::compose::SentCopy) {
+fn remember_sent_recipients(record: fell_core::compose::SentCopy, confirmed: bool) {
     std::thread::spawn(move || {
-        if record.remember_bcc().is_err() {
-            fell_core::diagnostic!(WARN, "Could not record Bcc for a send");
+        if record.remember_recipients(confirmed).is_err() {
+            fell_core::diagnostic!(WARN, "Could not record recipients for a send");
         }
     });
 }
@@ -2685,11 +2685,11 @@ impl PreparedSend {
                             });
                     if stored.is_err() {
                         fell_core::diagnostic!(WARN, "Could not save local Sent copy");
-                        remember_bcc(record);
+                        remember_sent_recipients(record, true);
                     }
                     saved(stored);
                 }
-                Err(SendFailure::MaybeSent(_)) => remember_bcc(record),
+                Err(SendFailure::MaybeSent(_)) => remember_sent_recipients(record, false),
                 Err(_) => {}
             }
         }

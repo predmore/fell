@@ -17,6 +17,7 @@ pub(super) const WRITE_BATCH: usize = 32;
 const MAINTENANCE_BATCH: usize = 128;
 const PREFIX_CHARS: usize = 24;
 const LIMIT: usize = 6;
+const CANDIDATE_LIMIT: usize = 48;
 
 // The queue exists before store upgrades that use WriteTx. Its producers
 // are installed with the index, after the older upgrades have finished.
@@ -240,22 +241,15 @@ impl Store {
         self.correspondent_suggestions_excluding(account, prefix, &HashSet::new())
     }
 
-    /// Keeps up to six matches after skipping the given lowercase addresses.
+    /// Keeps up to six matches from the first 48 ranked candidates after
+    /// skipping the given lowercase addresses.
     pub fn correspondent_suggestions_excluding(
         &self,
         account: &AccountId,
         prefix: &str,
         excluded: &HashSet<String>,
     ) -> Result<Vec<Address>> {
-        let mut result = suggest(
-            &self.conn,
-            account,
-            prefix,
-            LIMIT.saturating_add(excluded.len()),
-        )?;
-        result.retain(|person| !excluded.contains(&person.email.to_lowercase()));
-        result.truncate(LIMIT);
-        Ok(result)
+        suggest(&self.conn, account, prefix, LIMIT, excluded)
     }
 }
 
@@ -264,6 +258,7 @@ pub(super) fn suggest(
     account: &AccountId,
     prefix: &str,
     limit: usize,
+    excluded: &HashSet<String>,
 ) -> Result<Vec<Address>> {
     let prefix = fold(prefix);
     if prefix.is_empty() || limit == 0 {
@@ -272,15 +267,20 @@ pub(super) fn suggest(
     let indexed_end = prefix.char_indices().nth(PREFIX_CHARS).map(|(i, _)| i);
     let indexed = &prefix[..indexed_end.unwrap_or(prefix.len())];
     let mut select = conn.prepare_cached(
-        "SELECT c.email, c.name FROM correspondent_prefixes p
+        "SELECT c.email, c.name, p.address FROM correspondent_prefixes p
          CROSS JOIN correspondents c ON c.account_id = p.account_id AND c.address = p.address
          WHERE p.account_id = ?1 AND p.prefix = ?2
-         ORDER BY p.automated, p.outbound DESC, p.score DESC, p.address",
+         ORDER BY p.automated, p.outbound DESC, p.score DESC, p.address
+         LIMIT ?3",
     )?;
-    let mut rows = select.query(params![account.as_str(), indexed])?;
+    let candidates = i64::try_from(CANDIDATE_LIMIT.max(limit)).unwrap_or(i64::MAX);
+    let mut rows = select.query(params![account.as_str(), indexed, candidates])?;
     let mut result = Vec::with_capacity(limit.min(LIMIT));
     while result.len() < limit {
         let Some(row) = rows.next()? else { break };
+        if !excluded.is_empty() && excluded.contains(&row.get::<_, String>(2)?) {
+            continue;
+        }
         let person = Address {
             email: row.get(0)?,
             name: row.get(1)?,
@@ -1099,7 +1099,7 @@ mod tests {
         drop(insert);
         tx.commit().unwrap();
 
-        let ranked = suggest(&store.conn, &account, "alex", LIMIT + 2).unwrap();
+        let ranked = suggest(&store.conn, &account, "alex", LIMIT + 2, &HashSet::new()).unwrap();
         let excluded = ranked[..2]
             .iter()
             .map(|person| person.email.to_lowercase())
@@ -1109,6 +1109,15 @@ mod tests {
                 .correspondent_suggestions_excluding(&account, "alex", &excluded)
                 .unwrap(),
             ranked[2..]
+        );
+        let excluded = (15_000..20_000)
+            .map(|i| format!("alex{i:05}@example.test"))
+            .collect();
+        assert!(
+            store
+                .correspondent_suggestions_excluding(&account, "alex", &excluded)
+                .unwrap()
+                .is_empty()
         );
 
         // Include a one-letter prefix that matches every row, initials, a

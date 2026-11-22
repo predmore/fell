@@ -268,7 +268,7 @@ impl Search {
     }
 }
 
-fn address_filters(query: &str) -> HashSet<String> {
+fn address_filters(query: &str, operator: &str) -> HashSet<String> {
     let mut quoted = false;
     query
         .split(|ch: char| {
@@ -277,14 +277,14 @@ fn address_filters(query: &str) -> HashSet<String> {
             }
             !quoted && ch.is_ascii_whitespace()
         })
+        .filter(|token| !token.is_empty())
+        .take(crate::recipient_menu::EXCLUSION_LIMIT)
         .filter_map(|token| {
             let (field, value) = token.split_once(':')?;
-            if field.eq_ignore_ascii_case("from") || field.eq_ignore_ascii_case("to") {
-                let value = value.trim_matches('"');
-                fell_core::compose::email_of(value).map(|email| email.to_lowercase())
-            } else {
-                None
+            if !field.eq_ignore_ascii_case(operator) {
+                return None;
             }
+            fell_core::compose::email_of(value.trim_matches('"')).map(|email| email.to_lowercase())
         })
         .collect()
 }
@@ -601,10 +601,15 @@ impl Session {
     fn update_search_completion(&mut self) -> Step {
         let search = self.search.as_mut().unwrap();
         let key = completion(&search.query, search.caret).map(|c| (c.field, c.prefix.to_owned()));
-        let excluded = if let Some((field, prefix)) = &key
-            && field.is_address()
+        let address_operator = match key.as_ref().map(|(field, _)| field) {
+            Some(CompletionField::Mailbox(SearchField::Sender)) => Some("from"),
+            Some(CompletionField::Mailbox(SearchField::Recipient)) => Some("to"),
+            _ => None,
+        };
+        let excluded = if let Some((_, prefix)) = &key
+            && let Some(operator) = address_operator
         {
-            let mut excluded = address_filters(&search.query);
+            let mut excluded = address_filters(&search.query, operator);
             if prefix.contains('@') {
                 excluded.insert(prefix.to_lowercase());
             }
@@ -1398,19 +1403,35 @@ mod tests {
     fn address_completion_tracks_filters_elsewhere_in_the_query() {
         let mut session = session();
         session.on_key(KeyId::Char('/'), 10);
-        session.type_search(r#"FROM:"RUBEN@EXAMPLE.TEST" subject:"to:ignored@example.test" to:ru"#);
+        session.type_search(
+            r#"FROM:"RUBEN@EXAMPLE.TEST" subject:"to:ignored@example.test" TO:"RUTH@EXAMPLE.TEST" to:ru"#,
+        );
         let search = session.search.as_ref().unwrap();
         assert_eq!(
             search.completion_exclusions(),
-            &HashSet::from(["ruben@example.test".into()])
+            &HashSet::from(["ruth@example.test".into()])
         );
         let search = session.search.as_mut().unwrap();
-        search.query.push_str(" from:ruth@example.test");
+        search.query.push_str(" from:rose@example.test");
+        assert!(!session.update_search_completion().search_completion);
+        let search = session.search.as_mut().unwrap();
+        search.query.push_str(" to:rose@example.test");
         assert!(session.update_search_completion().search_completion);
         assert_eq!(
             session.search.as_ref().unwrap().completion_exclusions(),
-            &HashSet::from(["ruben@example.test".into(), "ruth@example.test".into()])
+            &HashSet::from(["rose@example.test".into(), "ruth@example.test".into()])
         );
+    }
+
+    #[test]
+    fn address_filter_exclusions_stop_after_the_token_budget() {
+        let query: String = (0..5_000)
+            .map(|i| format!("from:alex{i}@example.test "))
+            .collect();
+        let excluded = address_filters(&query, "from");
+        assert_eq!(excluded.len(), crate::recipient_menu::EXCLUSION_LIMIT);
+        assert!(excluded.contains("alex199@example.test"));
+        assert!(!excluded.contains("alex200@example.test"));
     }
 
     #[test]

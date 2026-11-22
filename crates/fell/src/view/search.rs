@@ -2389,10 +2389,11 @@ fn tab_before_the_store_is_ready_accepts_the_first_correspondent_reply() {
             split: 0.42,
             read_dwell_ms: 0,
             error: None,
+            account_missing: true,
             config: None,
             path: Ok(root.path().join("mail.db")),
         };
-        let mut inbox = Inbox::with_startup(startup, None, cx);
+        let mut inbox = Inbox::with_startup(startup, true, None, cx);
         inbox.session.on_key(KeyId::Char('/'), 10);
         assert!(inbox.session.type_search("from:ru").search_completion);
         inbox.request_search_completion(cx);

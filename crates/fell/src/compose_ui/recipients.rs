@@ -76,12 +76,14 @@ impl ComposeView {
         let next = self
             .recipient_line()
             .filter(|_| !self.closing && !self.discarding && !self.preview)
-            .and_then(prefix)
-            .map(|prefix| Lookup {
-                draft: self.draft_id.clone(),
-                field: self.field,
-                prefix: prefix.to_owned(),
-                excluded: self.excluded_recipients(),
+            .and_then(|line| {
+                let start = token_start(line);
+                Some(Lookup {
+                    draft: self.draft_id.clone(),
+                    field: self.field,
+                    prefix: prefix(&line[start..])?.to_owned(),
+                    excluded: self.excluded_recipients(start),
+                })
             });
         let completion = &mut self.recipients;
         if completion.key == next {
@@ -193,7 +195,7 @@ impl ComposeView {
         .detach();
     }
 
-    fn excluded_recipients(&self) -> HashSet<String> {
+    fn excluded_recipients(&self, active_token_start: usize) -> HashSet<String> {
         [
             (Field::To, self.to_line.as_str()),
             (Field::Cc, self.cc_line.as_str()),
@@ -202,11 +204,11 @@ impl ComposeView {
         .into_iter()
         .flat_map(|(field, line)| {
             let completed = if field == self.field {
-                &line[..token_start(line)]
+                &line[..active_token_start]
             } else {
                 line
             };
-            recipient_tokens(completed)
+            recipient_tokens(completed).take(recipient_menu::EXCLUSION_LIMIT)
         })
         .filter_map(email_of)
         .map(|email| email.to_lowercase())
@@ -271,10 +273,10 @@ impl ComposeView {
             Field::Bcc => &mut self.bcc_line,
             _ => return false,
         };
-        if prefix(line).is_none() {
+        let start = token_start(line);
+        if prefix(&line[start..]).is_none() {
             return false;
         }
-        let start = token_start(line);
         line.truncate(start);
         if start > 0 {
             line.push(' ');
@@ -337,6 +339,9 @@ impl ComposeView {
 
 /// The last top-level comma. A comma in a quoted name belongs to that name.
 fn token_start(line: &str) -> usize {
+    if !line.contains('"') {
+        return line.rfind(',').map_or(0, |index| index + 1);
+    }
     line.len() - recipient_tokens(line).last().unwrap_or_default().len()
 }
 
@@ -357,8 +362,8 @@ fn recipient_tokens(line: &str) -> impl Iterator<Item = &str> {
     })
 }
 
-fn prefix(line: &str) -> Option<&str> {
-    let token = line[token_start(line)..].trim();
+fn prefix(token: &str) -> Option<&str> {
+    let token = token.trim();
     if token.is_empty() || (token.contains('<') && email_of(token).is_some()) {
         return None;
     }
@@ -434,7 +439,7 @@ mod tests {
             compose.cc_line = "Rhea <rhea@EXAMPLE.test>".into();
             compose.bcc_line = "ravi@example.test".into();
             assert_eq!(
-                compose.excluded_recipients(),
+                compose.excluded_recipients(token_start(&compose.to_line)),
                 [
                     "ruben@example.test",
                     "rhea@example.test",
@@ -444,6 +449,30 @@ mod tests {
                 .into_iter()
                 .collect()
             );
+        });
+    }
+
+    #[test]
+    fn a_five_thousand_address_line_has_a_bounded_exclusion_set() {
+        let root = tempfile::tempdir().unwrap();
+        let (hub, id, folder) = open_demo(root.path().to_owned(), ThemeKind::Dark).unwrap();
+        let mut app = gpui::TestAppContext::single();
+        let (view, cx) = app.add_window_view(|_, cx| ComposeView::new(hub, id, folder, cx));
+        view.update(cx, |compose, _| {
+            compose.field = Field::To;
+            compose.to_line = (0..5_000)
+                .map(|i| format!("alex{i}@example.test, "))
+                .collect();
+            compose.to_line.push_str("alex");
+            compose.cc_line = "rhea@example.test".into();
+            compose.bcc_line.clear();
+            let start = token_start(&compose.to_line);
+            assert_eq!(prefix(&compose.to_line[start..]), Some("alex"));
+            let excluded = compose.excluded_recipients(start);
+            assert_eq!(excluded.len(), recipient_menu::EXCLUSION_LIMIT + 1);
+            assert!(excluded.contains("alex199@example.test"));
+            assert!(!excluded.contains("alex200@example.test"));
+            assert!(excluded.contains("rhea@example.test"));
         });
     }
 

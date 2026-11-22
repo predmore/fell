@@ -1550,10 +1550,14 @@ impl Store {
         match field {
             Folder => crate::search::folder_suggestions(&self.conn, account, prefix, limit),
             Label => crate::search::label_suggestions(&self.conn, account, prefix, limit),
-            Sender | Recipient => Ok(correspondents::suggest(&self.conn, account, prefix, limit)?
-                .into_iter()
-                .map(|person| person.email)
-                .collect()),
+            Sender | Recipient => {
+                Ok(
+                    correspondents::suggest(&self.conn, account, prefix, limit, &HashSet::new())?
+                        .into_iter()
+                        .map(|person| person.email)
+                        .collect(),
+                )
+            }
         }
     }
 
@@ -2517,6 +2521,11 @@ fn delete_demo_account(conn: &Connection, id: &str) -> Result<()> {
         "review_drafts",
         "compose_drafts",
         "compose_send",
+        "correspondent_prefixes",
+        "correspondent_sightings",
+        "correspondents",
+        "correspondent_sends",
+        "correspondent_dirty",
     ] {
         conn.execute(&format!("DELETE FROM {table} WHERE account_id = ?1"), [id])?;
     }
@@ -4695,10 +4704,31 @@ mod tests {
 
         let store = Store::open(&path).unwrap();
         assert!(!store.list_threads(&demo.id).unwrap().is_empty());
+        while store.maintain_correspondents().unwrap() {}
+        let indexed = store.correspondent_suggestions(&demo.id, "from").unwrap();
+        assert!(!indexed.is_empty());
         let configured = account_b();
         store.configure_account(&configured, true).unwrap();
         assert!(store.get_account(&demo.id).unwrap().is_none());
         assert!(store.list_threads(&demo.id).unwrap().is_empty());
+        for table in [
+            "correspondent_prefixes",
+            "correspondent_sightings",
+            "correspondents",
+            "correspondent_sends",
+            "correspondent_dirty",
+        ] {
+            assert!(
+                !store
+                    .conn
+                    .query_row(
+                        &format!("SELECT EXISTS (SELECT 1 FROM {table} WHERE account_id = ?1)"),
+                        [demo.id.as_str()],
+                        |row| row.get::<_, bool>(0)
+                    )
+                    .unwrap()
+            );
+        }
         assert!(store.write_back(&configured.id).unwrap());
         drop(store);
         std::fs::remove_file(&path).unwrap();
