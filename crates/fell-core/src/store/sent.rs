@@ -1,7 +1,9 @@
 //! Sent membership until a real copy backs it. An empty server folder can
 //! never sweep a just-sent message or one that lives only in Fell.
 
-use rusqlite::{Connection, params};
+use std::time::Duration;
+
+use rusqlite::{Connection, ErrorCode, params};
 
 use super::{MergeRoles, Store, canonical_id_on, copies, find_stored, immediate_transaction};
 use super::{insert_arrival, sent_bcc, split_field, thread_id_for_message_id};
@@ -17,6 +19,24 @@ CREATE TABLE IF NOT EXISTS local_sent (
     FOREIGN KEY (account_id, message_id) REFERENCES messages(account_id, message_id) ON DELETE CASCADE
 ) WITHOUT ROWID;
 ";
+
+/// Let the sync writer finish before falling back to the queue-only save.
+pub(crate) fn retry_sent_write<T>(mut save: impl FnMut() -> Result<T>) -> Result<T> {
+    for seconds in [2, 4, 6] {
+        match save() {
+            Err(Error::Store(error))
+                if matches!(
+                    error.sqlite_error_code(),
+                    Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+                ) =>
+            {
+                std::thread::sleep(Duration::from_secs(seconds));
+            }
+            result => return result,
+        }
+    }
+    save()
+}
 
 impl Store {
     pub(crate) fn record_sent_message(
@@ -38,7 +58,9 @@ impl Store {
             // with no parseable addresses still cannot go into the outbox.
             crate::smtp::sender(mime)?;
         }
-        match self.insert_sent_message(draft_id, bcc, &mut message, append.then_some(mime)) {
+        match retry_sent_write(|| {
+            self.insert_sent_message(draft_id, bcc, &mut message, append.then_some(mime))
+        }) {
             Ok(thread) => Ok((thread, message)),
             Err(local) => {
                 if append && let Err(queue) = self.queue_sent_after_failed_insert(account, id, mime)
@@ -83,12 +105,13 @@ impl Store {
         self.rethread_written(&tx, account)?;
         let thread = thread_id_for_message_id(&tx, account, id)?
             .ok_or_else(|| Error::Action("sent message missing after threading".into()))?;
-        message.headers.message_id = MessageId(
+        let canonical = MessageId(
             canonical_id_on(&tx, account, id)?
                 .ok_or_else(|| Error::Action("sent message missing after threading".into()))?,
         );
         tx.commit()?;
         // Only the person's conversation gets the envelope's Bcc.
+        message.headers.message_id = canonical;
         message.bcc = bcc.to_vec();
         Ok(thread)
     }

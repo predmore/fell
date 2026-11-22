@@ -434,7 +434,7 @@ mod tests {
                 Ok((Box::new(counting), false))
             });
         assert!(outcome.is_ok());
-        let (_, message) = copy.unwrap().unwrap();
+        let (_, message, _) = copy.unwrap().unwrap();
         assert_eq!(message.headers.subject, "Lunch");
         assert!(message.folders.iter().any(|folder| folder == "Sent"));
         let end = crate::compose_ui::finish_send(&hub, &sent, &other, true, &outcome);

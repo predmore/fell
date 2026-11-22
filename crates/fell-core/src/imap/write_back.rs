@@ -49,6 +49,9 @@ mod labels;
 pub(crate) const MAX_ATTEMPTS: u32 = 5;
 /// Wait before the next try, by attempts so far. The last one repeats.
 const BACKOFF_SECS: [i64; 5] = [10, 30, 120, 600, 1800];
+/// Inconclusive checks are independent of explicit APPEND refusals.
+pub(super) const MAX_APPEND_CHECKS: u32 = 5;
+const APPEND_HEADER_BATCH: usize = 100;
 
 /// Send every outbox row that is due. Returns what was sent and dropped.
 /// A connection that fails part way is in [`ReplayReport::interrupted`];
@@ -111,7 +114,7 @@ pub(super) fn replay_with(
                     {
                         continue;
                     }
-                    match pass.retry_append(index, &note, false, false) {
+                    match pass.retry_append(index, &note, AppendRetry::Deferred) {
                         Ok(()) => {}
                         Err(Stop::Store(error)) => return Err(error),
                         Err(_) => break,
@@ -126,10 +129,11 @@ pub(super) fn replay_with(
     match result {
         Ok(()) => {}
         Err(Stop::Store(err)) => return Err(err),
-        Err(Stop::AppendRetry(message) | Stop::AppendRefused(message)) => {
+        Err(
+            Stop::AppendRetry(message) | Stop::AppendRefused(message) | Stop::AppendCheck(message),
+        ) => {
             return Err(Error::Backend(message));
         }
-        Err(Stop::AppendSearchEmpty) => unreachable!("APPEND recovery settles an empty check"),
         Err(Stop::Connection(err)) => report.interrupted = Some(err.to_string()),
         // Write-back was turned off by another process mid-pass.
         Err(Stop::Stale) => {}
@@ -143,16 +147,22 @@ enum Stop {
     Store(Error),
     AppendRetry(String),
     AppendRefused(String),
-    AppendSearchEmpty,
+    AppendCheck(String),
     /// The row is no longer in this write-back generation: send nothing more.
     Stale,
 }
 
-fn append_error(error: WriteError) -> Stop {
+fn append_check_error(error: WriteError) -> Stop {
     match error {
-        WriteError::Refused(message) => Stop::AppendRetry(message),
+        WriteError::Refused(message) => Stop::AppendCheck(message),
         WriteError::Connection(error) => Stop::Connection(error),
     }
+}
+
+enum AppendRetry {
+    Deferred,
+    Refused,
+    Inconclusive { checks: u32 },
 }
 
 enum MoveHold {
@@ -251,7 +261,7 @@ impl Pass<'_> {
         let Some(pending) = outbox::pending_append(self.store, entry)? else {
             return Ok(());
         };
-        match self.append(session, entry, pending) {
+        match self.append(session, entry, &pending) {
             Ok(()) => {
                 if outbox::complete_append(self.store, entry)? {
                     self.report.sent += 1;
@@ -260,14 +270,22 @@ impl Pass<'_> {
                 Ok(())
             }
             Err(Stop::Connection(err)) => {
-                self.retry_append(index, &err.to_string(), false, false)?;
+                self.retry_append(index, &err.to_string(), AppendRetry::Deferred)?;
                 Err(Stop::Connection(err))
             }
-            Err(Stop::AppendRetry(message)) => self.retry_append(index, &message, false, false),
-            Err(Stop::AppendRefused(message)) => self.retry_append(index, &message, true, false),
-            Err(Stop::AppendSearchEmpty) => {
-                self.retry_append(index, "Sent copy not visible yet", false, true)
+            Err(Stop::AppendRetry(message)) => {
+                self.retry_append(index, &message, AppendRetry::Deferred)
             }
+            Err(Stop::AppendRefused(message)) => {
+                self.retry_append(index, &message, AppendRetry::Refused)
+            }
+            Err(Stop::AppendCheck(message)) => self.retry_append(
+                index,
+                &message,
+                AppendRetry::Inconclusive {
+                    checks: pending.checks,
+                },
+            ),
             Err(stop) => Err(stop),
         }
     }
@@ -276,40 +294,20 @@ impl Pass<'_> {
         &mut self,
         session: &mut WriteSession,
         entry: &OutboxEntry,
-        pending: outbox::PendingAppend,
+        pending: &outbox::PendingAppend,
     ) -> Result<(), Stop> {
-        let (mailbox, bound) = if let Some(mailbox) = pending.sent_to {
-            // A fresh SELECT also refreshes the mailbox's UID state. Keep
-            // the pass's cache consistent with the selection on the wire.
+        let (mailbox, bound) = if let Some(mailbox) = &pending.sent_to {
+            // Refresh the selected UID state before checking for the copy.
             self.selected = None;
-            let (validity, next) = session.select_with_next(&mailbox).map_err(append_error)?;
+            let (validity, next) = session
+                .select_with_next(mailbox)
+                .map_err(append_check_error)?;
             self.selected = Some((mailbox.clone(), validity));
-            let candidates = session
-                .search_message_id(&entry.message_id)
-                .map_err(append_error)?;
-            if !candidates.is_empty() {
-                let headers = session
-                    .uid_fetch_message_ids(&candidates)
-                    .map_err(append_error)?;
-                if headers.iter().any(|(uid, bytes)| {
-                    candidates.contains(uid)
-                        && copy_message_id(&mailbox, validity, *uid, bytes, false).as_str()
-                            == entry.message_id
-                }) {
-                    return Ok(());
-                }
-                return Err(Stop::AppendRetry(
-                    "Sent Message-ID check found no exact match".into(),
-                ));
+            let next = next.unwrap_or_default();
+            if Self::check_append(session, entry, pending, mailbox, validity, next)? {
+                return Ok(());
             }
-            // Two empty searches, in different passes, are enough only if
-            // the mailbox has not allocated any UIDs since the APPEND.
-            // An empty HEADER result alone can lag or be unsupported.
-            let current_bound = next.map(|next| (validity, next));
-            if !pending.checked_empty || current_bound.is_none() || current_bound != pending.bound {
-                return Err(Stop::AppendSearchEmpty);
-            }
-            (mailbox, current_bound)
+            (mailbox.clone(), (validity, next))
         } else {
             self.load_listing(session)?;
             let mailbox = self
@@ -325,15 +323,15 @@ impl Pass<'_> {
                 match session.select_with_next(&mailbox) {
                     Ok((validity, next)) => {
                         self.selected = Some((mailbox.clone(), validity));
-                        next.map(|next| (validity, next))
+                        (validity, next.unwrap_or_default())
                     }
-                    Err(WriteError::Refused(_)) => None,
+                    Err(WriteError::Refused(_)) => (0, 0),
                     Err(WriteError::Connection(err)) => return Err(Stop::Connection(err)),
                 }
             } else {
                 match session.status(&mailbox) {
-                    Ok(bound) => Some(bound),
-                    Err(WriteError::Refused(_)) => None,
+                    Ok(bound) => bound,
+                    Err(WriteError::Refused(_)) => (0, 0),
                     Err(WriteError::Connection(err)) => return Err(Stop::Connection(err)),
                 }
             };
@@ -350,18 +348,105 @@ impl Pass<'_> {
         }
     }
 
+    /// True means the copy is present, false means it is safe to APPEND.
+    fn check_append(
+        session: &mut WriteSession,
+        entry: &OutboxEntry,
+        pending: &outbox::PendingAppend,
+        mailbox: &str,
+        validity: u32,
+        next: u32,
+    ) -> Result<bool, Stop> {
+        let candidates = session
+            .search_message_id(&entry.message_id)
+            .map_err(append_check_error)?;
+        if !candidates.is_empty() {
+            let (found, _) =
+                Self::check_append_headers(session, entry, mailbox, validity, &candidates)?;
+            return if found {
+                Ok(true)
+            } else {
+                Err(Stop::AppendCheck(
+                    "Sent Message-ID check found no exact match".into(),
+                ))
+            };
+        }
+        if pending.validity != 0 && validity != pending.validity {
+            return Ok(false);
+        }
+        if pending.next == 0 || next < pending.next {
+            return Err(Stop::AppendCheck(
+                "Sent UIDNEXT could not be verified".into(),
+            ));
+        }
+        if next == pending.next {
+            // A successful APPEND allocates a UID even if it is expunged later.
+            return Ok(false);
+        }
+        // UIDNEXT may also advance for unrelated arrivals. List the existing
+        // UIDs in the closed range so gaps are distinguished from missing
+        // FETCH responses, and check every header before sending again.
+        let uids = session
+            .search_uid_range(pending.next, next - 1)
+            .map_err(append_check_error)?;
+        let (found, complete) =
+            Self::check_append_headers(session, entry, mailbox, validity, &uids)?;
+        if found || complete {
+            Ok(found)
+        } else {
+            Err(Stop::AppendCheck(
+                "Sent UID range had missing headers".into(),
+            ))
+        }
+    }
+
+    fn check_append_headers(
+        session: &mut WriteSession,
+        entry: &OutboxEntry,
+        mailbox: &str,
+        validity: u32,
+        uids: &[u32],
+    ) -> Result<(bool, bool), Stop> {
+        let mut complete = true;
+        for batch in uids.chunks(APPEND_HEADER_BATCH) {
+            let headers = session
+                .uid_fetch_message_ids(batch)
+                .map_err(append_check_error)?;
+            let returned: HashSet<_> = headers.iter().map(|(uid, _)| *uid).collect();
+            if headers.iter().any(|(uid, bytes)| {
+                batch.binary_search(uid).is_ok()
+                    && copy_message_id(mailbox, validity, *uid, bytes, false).as_str()
+                        == entry.message_id
+            }) {
+                return Ok((true, true));
+            }
+            complete &= batch.iter().all(|uid| returned.contains(uid));
+        }
+        Ok((false, complete))
+    }
+
     fn retry_append(
         &mut self,
         index: usize,
         message: &str,
-        refused: bool,
-        checked_empty: bool,
+        retry: AppendRetry,
     ) -> Result<(), Stop> {
         let entry = &self.entries[index];
-        if refused && entry.attempts + 1 >= MAX_ATTEMPTS {
-            return self.drop_row(index, DropReason::Refused, message);
+        let attempts = match retry {
+            AppendRetry::Deferred | AppendRetry::Refused => entry.attempts,
+            AppendRetry::Inconclusive { checks } => checks,
+        };
+        match retry {
+            AppendRetry::Refused if attempts + 1 >= MAX_ATTEMPTS => {
+                return self.drop_row(index, DropReason::Refused, message);
+            }
+            AppendRetry::Inconclusive { .. } if attempts + 1 >= MAX_APPEND_CHECKS => {
+                return self.drop_row(index, DropReason::UnconfirmedAppend, message);
+            }
+            _ => {}
         }
-        let wait = BACKOFF_SECS[(entry.attempts as usize).min(BACKOFF_SECS.len() - 1)];
+        let wait = BACKOFF_SECS[(attempts as usize).min(BACKOFF_SECS.len() - 1)];
+        let refused = matches!(retry, AppendRetry::Refused);
         match outbox::settle(
             self.store,
             self.account_id,
@@ -373,7 +458,7 @@ impl Pass<'_> {
                 retry_unix: self.now + wait,
                 counts: refused,
                 refused,
-                append_empty: checked_empty,
+                append_check: matches!(retry, AppendRetry::Inconclusive { .. }),
             },
         )? {
             Settled::Recorded => self.report.sent_append_delayed |= entry.error.is_empty(),
@@ -953,7 +1038,7 @@ impl Pass<'_> {
                 retry_unix: self.now + wait,
                 counts: true,
                 refused,
-                append_empty: false,
+                append_check: false,
             },
         )?;
         match settled {

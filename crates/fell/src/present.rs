@@ -799,10 +799,7 @@ pub fn conversation(
             let email = message.headers.from.email.clone();
             ConvMessage {
                 id: message.headers.message_id.as_str().to_string(),
-                mail_headers: vec![
-                    ("Subject".into(), message.headers.subject.clone()),
-                    ("From".into(), from_header(&message.headers.from)),
-                ],
+                mail_headers: mail_headers(message),
                 sender: display_name(&message.headers.from.name, &email, me),
                 email,
                 folders: message
@@ -839,6 +836,13 @@ pub fn conversation(
             }
         })
         .collect()
+}
+
+pub(crate) fn mail_headers(message: &Message) -> Vec<(String, String)> {
+    vec![
+        ("Subject".into(), message.headers.subject.clone()),
+        ("From".into(), from_header(&message.headers.from)),
+    ]
 }
 
 fn participant_spans(thread: &FolderThread, me: &str) -> (Vec<NameSpan>, usize) {

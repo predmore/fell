@@ -228,6 +228,9 @@ impl Fixture {
     fn deliver(&self, name: &str, uid: u32, raw: Vec<u8>) {
         let mut state = self.server.state.lock().unwrap();
         let mailbox = state.mailboxes.iter_mut().find(|m| m.name == name).unwrap();
+        if let Some(next) = &mut mailbox.uidnext {
+            *next = (*next).max(uid + 1);
+        }
         mailbox.messages.push(FixtureMessage {
             uid,
             flags: Vec::new(),
@@ -2027,13 +2030,15 @@ fn uidvalidity_reset_drops_only_that_folders_flag_writes_with_a_notice() {
     assert_eq!(fx.local_flags(&alpha), (true, true));
 }
 
-fn flag_db(label: &str) -> std::path::PathBuf {
+fn write_back_db(label: &str) -> std::path::PathBuf {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir =
-        std::env::temp_dir().join(format!("fell-flags-{label}-{}-{stamp}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "fell-write-back-{label}-{}-{stamp}",
+        std::process::id()
+    ));
     std::fs::create_dir(&dir).unwrap();
     dir.join("mail.db")
 }
@@ -2041,7 +2046,7 @@ fn flag_db(label: &str) -> std::path::PathBuf {
 #[test]
 fn flag_queue_recovers_a_lost_reply_on_restart_without_repeating_store() {
     for condstore in [false, true] {
-        let path = flag_db("restart");
+        let path = write_back_db("restart");
         let mut fx = Fixture::with(Store::open(&path).unwrap(), flag_state(condstore));
         let alpha = fx.thread("INBOX", "Alpha");
         fx.flag(&alpha, FlagChange::Read);
@@ -2312,7 +2317,7 @@ fn an_edit_during_select_retires_the_unsent_snapshot() {
 #[test]
 fn a_conflict_in_flight_keeps_a_newer_local_intent_even_with_the_same_value() {
     let server_state = flag_state(true);
-    let path = flag_db("in-flight");
+    let path = write_back_db("in-flight");
     let fx = Fixture::with(Store::open(&path).unwrap(), server_state);
     let alpha = fx.thread("INBOX", "Alpha");
     fx.flag(&alpha, FlagChange::Read);
@@ -2444,7 +2449,7 @@ fn a_fetch_missing_flag_bits_records_its_revision_and_waits() {
 
 #[test]
 fn an_unstar_survives_a_restart_after_the_older_star_reply_is_lost() {
-    let path = flag_db("superseded");
+    let path = write_back_db("superseded");
     let mut fx = Fixture::with(Store::open(&path).unwrap(), flag_state(true));
     let alpha = fx.thread("INBOX", "Alpha");
     fx.flag(&alpha, FlagChange::Star);
@@ -2785,23 +2790,16 @@ fn sent_append_recovers_a_lost_reply_without_a_second_append() {
     {
         let mut writes = fixture.server.writes.lock().unwrap();
         writes.lose_reply_to = Some("APPEND");
-        // The first two HEADER searches succeed but omit the stored copy.
-        writes.empty_header_searches = 2;
+        // The first HEADER search succeeds but omits the stored copy.
+        writes.empty_header_searches = 1;
     }
     let report = fixture.replay();
     assert!(report.sent_append_delayed);
     assert_eq!(report.waiting, 1);
-    for _ in 0..2 {
-        fixture.make_due();
-        let report = fixture.replay();
-        assert_eq!(report.sent, 0);
-        assert_eq!(report.waiting, 1);
-        assert!(!report.sent_append_delayed);
-        assert_eq!(fixture.on_server("Filed mail").len(), 1);
-    }
     fixture.make_due();
     let report = fixture.replay();
     assert_eq!(report.sent, 1);
+    assert!(!report.sent_append_delayed);
     assert_eq!(fixture.replay().sent, 0);
     assert_eq!(fixture.on_server("Filed mail").len(), 1);
     let state = fixture.server.state.lock().unwrap();
@@ -2859,10 +2857,8 @@ fn append_connection_failures_do_not_use_the_refusal_budget() {
     assert_eq!(fixture.on_server("Filed mail").len(), 1);
 }
 
-#[test]
-fn sent_append_is_reissued_after_two_empty_searches_with_no_new_uid() {
-    let fixture = sent_fixture();
-    record_reply(&fixture, true);
+fn lose_sent_append(fixture: &Fixture) {
+    record_reply(fixture, true);
     fixture
         .server
         .writes
@@ -2871,11 +2867,161 @@ fn sent_append_is_reissued_after_two_empty_searches_with_no_new_uid() {
         .lose_append_before_commit = true;
     assert!(fixture.replay().interrupted.is_some());
     fixture.make_due();
-    let report = fixture.replay();
-    assert_eq!(report.sent, 0);
-    assert_eq!(report.waiting, 1);
-    assert!(fixture.on_server("Filed mail").is_empty());
+}
+
+#[test]
+fn sent_append_is_reissued_with_unchanged_uidnext() {
+    let fixture = sent_fixture();
+    lose_sent_append(&fixture);
+    assert_eq!(fixture.replay().sent, 1);
+    assert_eq!(fixture.on_server("Filed mail").len(), 1);
+}
+
+#[test]
+fn sent_append_rechecks_the_new_range_and_records_a_fresh_bound() {
+    let fixture = sent_fixture();
+    lose_sent_append(&fixture);
+    fixture.deliver(
+        "Filed mail",
+        3,
+        b"Subject: Unrelated\r\nMessage-ID: <other@x>\r\n\r\n".to_vec(),
+    );
+    fixture.server.writes.lock().unwrap().lose_reply_to = Some("APPEND");
+    assert!(fixture.replay().interrupted.is_some());
+    let row = &fixture.store.outbox(&fixture.account.id).unwrap()[0];
     fixture.make_due();
+    let pending = crate::outbox::pending_append(&fixture.store, row)
+        .unwrap()
+        .unwrap();
+    assert_eq!((pending.validity, pending.next, pending.checks), (65, 4, 0));
+    assert_eq!(
+        fixture.on_server("Filed mail"),
+        [(3, "Unrelated".into()), (4, "Re: Alpha".into())]
+    );
+    let commands = without_tags(&fixture.commands());
+    assert!(
+        commands
+            .iter()
+            .any(|command| command == "UID SEARCH UID 1:3")
+    );
+    assert!(
+        commands
+            .iter()
+            .any(|command| command.starts_with("UID FETCH 3 "))
+    );
+    assert_eq!(fixture.replay().sent, 1);
+    assert_eq!(
+        fixture.on_server("Filed mail"),
+        [(3, "Unrelated".into()), (4, "Re: Alpha".into())]
+    );
+}
+
+#[test]
+fn sent_append_is_reissued_after_a_uidvalidity_reset() {
+    let fixture = sent_fixture();
+    lose_sent_append(&fixture);
+    fixture.server.state.lock().unwrap().mailboxes[1].uidvalidity += 1;
+    assert_eq!(fixture.replay().sent, 1);
+    assert_eq!(fixture.on_server("Filed mail").len(), 1);
+}
+
+#[test]
+fn a_missing_uidnext_drops_an_unconfirmed_append() {
+    let fixture = sent_fixture();
+    lose_sent_append(&fixture);
+    fixture.server.state.lock().unwrap().mailboxes[1].omit_uidnext = true;
+    assert_unconfirmed_append_drops(&fixture);
+    assert!(fixture.on_server("Filed mail").is_empty());
+}
+
+#[test]
+fn search_hits_without_an_exact_message_id_drop_an_unconfirmed_append() {
+    let fixture = sent_fixture();
+    lose_sent_append(&fixture);
+    fixture.deliver(
+        "Filed mail",
+        1,
+        b"Subject: Unrelated\r\nMessage-ID: <REPLY@compose.fell>\r\n\r\n".to_vec(),
+    );
+    assert_unconfirmed_append_drops(&fixture);
+    assert_eq!(fixture.on_server("Filed mail").len(), 1);
+}
+
+#[test]
+fn a_range_with_missing_headers_does_not_repeat_append() {
+    let fixture = sent_fixture();
+    lose_sent_append(&fixture);
+    fixture.deliver(
+        "Filed mail",
+        1,
+        b"Subject: Unrelated\r\nMessage-ID: <other@x>\r\n\r\n".to_vec(),
+    );
+    fixture.server.writes.lock().unwrap().omit_message_id_header = Some(1);
+    assert_unconfirmed_append_drops(&fixture);
+    assert_eq!(fixture.on_server("Filed mail").len(), 1);
+}
+
+fn assert_unconfirmed_append_drops(fixture: &Fixture) {
+    for check in 1..=super::write_back::MAX_APPEND_CHECKS {
+        fixture.make_due();
+        let report = fixture.replay();
+        let row = &fixture.store.outbox(&fixture.account.id).unwrap()[0];
+        assert_eq!(row.attempts, 0);
+        if check < super::write_back::MAX_APPEND_CHECKS {
+            assert_eq!(report.waiting, 1);
+            assert!(report.dropped.is_empty());
+            assert_eq!(row.state, OutboxState::Pending);
+            fixture.make_due();
+            let pending = crate::outbox::pending_append(&fixture.store, row)
+                .unwrap()
+                .unwrap();
+            assert_eq!(pending.checks, check);
+        } else {
+            assert_eq!(report.waiting, 0);
+            assert_eq!(report.dropped[0].kind, OutboxKind::AppendSent);
+            assert_eq!(report.dropped[0].reason, DropReason::UnconfirmedAppend);
+            assert_eq!(row.state, OutboxState::Dropped);
+        }
+    }
+    assert_eq!(
+        fixture
+            .commands()
+            .iter()
+            .filter(|command| command.contains(" APPEND "))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn sent_copy_survives_a_write_lock_past_both_old_save_attempts() {
+    let database = write_back_db("sent-write-lock");
+    let fixture = Fixture::with(
+        Store::open(&database).unwrap(),
+        state_with(vec![
+            mailbox("INBOX", "", 7, &[(1, "Alpha")]),
+            mailbox("Filed mail", "\\Sent", 65, &[]),
+        ]),
+    );
+    let parent = fixture.thread("INBOX", "Alpha");
+    fixture
+        .store
+        .connection()
+        .busy_timeout(std::time::Duration::from_millis(20))
+        .unwrap();
+    let writer = rusqlite::Connection::open(database).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    // Establish that the same connection used for saving cannot take the
+    // write lock. Keep the lock past the former local/queue-only timeouts.
+    assert!(crate::store::immediate_transaction(fixture.store.connection()).is_err());
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        writer.execute_batch("COMMIT").unwrap();
+    });
+    let thread = record_reply(&fixture, true);
+    writer.join().unwrap();
+    assert_eq!(thread, parent);
+    assert_eq!(fixture.store.outbox(&fixture.account.id).unwrap().len(), 1);
     assert_eq!(fixture.replay().sent, 1);
     assert_eq!(fixture.on_server("Filed mail").len(), 1);
 }

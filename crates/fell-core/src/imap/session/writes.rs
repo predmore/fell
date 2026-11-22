@@ -11,8 +11,8 @@ use crate::store::copies::CopyFlags;
 
 use super::super::ImapConfig;
 use super::{
-    Listed, Reply, Session, bracket_u32, fetch_modseq, imap_err, is_bye, number_after, parse_fetch,
-    parse_flags, quote_imap, search_uids, text_starts_with_tag,
+    Listed, Reply, Session, bracket_u32, fetch_modseq, imap_err, is_bye, number_after,
+    parse_fetch_with_section, parse_flags, quote_imap, search_uids, text_starts_with_tag,
 };
 
 /// How a write command failed.
@@ -365,6 +365,18 @@ impl WriteSession {
             .ok_or_else(|| WriteError::Refused("UID SEARCH returned no usable result".into()))
     }
 
+    /// Which UIDs still exist in the closed range allocated after APPEND.
+    pub(in crate::imap) fn search_uid_range(
+        &mut self,
+        first: u32,
+        last: u32,
+    ) -> Result<Vec<u32>, WriteError> {
+        let reply = self.run("UID SEARCH", &format!("UID SEARCH UID {first}:{last}"))?;
+        search_uids(&reply.untagged)
+            .filter(|uids| uids.iter().all(|uid| (first..=last).contains(uid)))
+            .ok_or_else(|| WriteError::Refused("UID SEARCH returned no usable UID range".into()))
+    }
+
     /// The `Message-ID` header of each of the UIDs in the selected mailbox,
     /// as `(uid, header bytes)`. Headers only, with `BODY.PEEK`, so nothing
     /// is marked read. A UID the mailbox does not have is left out.
@@ -382,7 +394,14 @@ impl WriteSession {
         Ok(reply
             .untagged
             .into_iter()
-            .filter_map(|line| parse_fetch(&line.text, line.literals))
+            .filter_map(|line| {
+                parse_fetch_with_section(
+                    &line.text,
+                    line.literals,
+                    Some("HEADER.FIELDS (MESSAGE-ID)"),
+                )
+            })
+            .filter(|fetched| !fetched.skipped && !fetched.body_missing && !fetched.body.is_empty())
             .map(|fetched| (fetched.uid, fetched.body))
             .collect())
     }

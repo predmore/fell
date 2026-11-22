@@ -108,7 +108,7 @@ CREATE TABLE IF NOT EXISTS server_outbox (
     -- Extra copies bound from an early keyword edit replay with that edit.
     keyword_parent INTEGER,
     append_mime BLOB,
-    append_empty INTEGER NOT NULL DEFAULT 0
+    append_checks INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_server_outbox_state ON server_outbox(account_id, state, id);
@@ -148,7 +148,7 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("server_outbox", "append_mime", "BLOB"),
     (
         "server_outbox",
-        "append_empty",
+        "append_checks",
         "INTEGER NOT NULL DEFAULT 0",
     ),
     (
@@ -315,6 +315,8 @@ pub enum DropReason {
     FolderReset,
     /// The server kept refusing the move.
     Refused,
+    /// The result of a Sent APPEND could not be verified.
+    UnconfirmedAppend,
     /// The folder, or the message in it, never turned up on the server.
     NotFound,
     /// The server has no MOVE. Fell does not copy and expunge instead, so
@@ -471,8 +473,9 @@ pub(crate) struct PendingAppend {
     pub mime: Vec<u8>,
     /// The exact mailbox used if a command may already have reached it.
     pub sent_to: Option<String>,
-    pub bound: Option<Bound>,
-    pub checked_empty: bool,
+    pub validity: u32,
+    pub next: u32,
+    pub checks: u32,
 }
 
 pub(crate) fn pending_append(store: &Store, entry: &OutboxEntry) -> Result<Option<PendingAppend>> {
@@ -480,18 +483,18 @@ pub(crate) fn pending_append(store: &Store, entry: &OutboxEntry) -> Result<Optio
         .connection()
         .query_row(
             "SELECT o.append_mime, CASE WHEN o.sent THEN o.target_mailbox END,
-                    o.target_uidvalidity, o.target_uidnext, o.append_empty
+                    o.target_uidvalidity, o.target_uidnext, o.append_checks
          FROM server_outbox o JOIN write_back_accounts a USING (account_id)
          WHERE o.id = ?1 AND o.state = 'pending' AND a.enabled
            AND o.generation = a.generation AND o.retry_unix <= ?2",
             params![entry.id, now_unix()],
             |row| {
-                let bound: Bound = (row.get(2)?, row.get(3)?);
                 Ok(PendingAppend {
                     mime: row.get(0)?,
                     sent_to: row.get(1)?,
-                    bound: (bound.0 != 0 && bound.1 != 0).then_some(bound),
-                    checked_empty: row.get(4)?,
+                    validity: row.get(2)?,
+                    next: row.get(3)?,
+                    checks: row.get(4)?,
                 })
             },
         )
@@ -502,14 +505,14 @@ pub(crate) fn mark_append_sent(
     store: &Store,
     entry: &OutboxEntry,
     mailbox: &str,
-    bound: Option<Bound>,
+    bound: Bound,
 ) -> Result<bool> {
     let tx = crate::store::immediate_transaction(store.connection())?;
-    let (validity, next) = bound.unwrap_or_default();
+    let (validity, next) = bound;
     let changed = tx.execute(
         "UPDATE server_outbox
          SET sent = 1, target_mailbox = ?2, target_uidvalidity = ?3, target_uidnext = ?4,
-             append_empty = 0
+             append_checks = 0
          WHERE id = ?1 AND state = 'pending' AND generation IN
              (SELECT generation FROM write_back_accounts WHERE account_id = server_outbox.account_id AND enabled)",
         params![entry.id, mailbox, validity, next],
@@ -1175,7 +1178,7 @@ pub(crate) enum Outcome<'a> {
         retry_unix: i64,
         counts: bool,
         refused: bool,
-        append_empty: bool,
+        append_check: bool,
     },
     Dropped {
         error: &'a str,
@@ -1258,7 +1261,7 @@ pub(crate) fn settle(
             retry_unix,
             counts,
             refused,
-            append_empty,
+            append_check,
         } => {
             // Undone while it was on the wire, and now refused: the server
             // never moved it, so there is nothing to move back.
@@ -1270,7 +1273,7 @@ pub(crate) fn settle(
                 "UPDATE server_outbox
                  SET attempts = attempts + ?2, retry_unix = ?3, error = ?4,
                      sent = CASE WHEN ?5 THEN 0 ELSE sent END,
-                     append_empty = ?6
+                     append_checks = append_checks + ?6
                  WHERE id = ?1",
                 params![
                     entry.id,
@@ -1278,7 +1281,7 @@ pub(crate) fn settle(
                     retry_unix,
                     error,
                     refused,
-                    append_empty
+                    append_check
                 ],
             )?;
             tx.commit()?;

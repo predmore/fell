@@ -237,7 +237,7 @@ pub struct InboxMotion {
     arrival_pending: bool,
     /// Bodies settling into the open thread, by message id.
     bodies: HashMap<String, (Transition, bool)>,
-    /// Sent cards already laid out for the hand-off, awaiting an active inbox frame.
+    /// Sent cards already laid out but hidden until the compose hand-off.
     messages_pending: HashSet<String>,
     /// Where a glide a key interrupted was drawn, so the next glide starts
     /// there instead of snapping to the old target first.
@@ -1113,9 +1113,7 @@ impl InboxMotion {
 
     /// Fade in the whole card when a newly sent reply joins the open thread.
     pub fn message_arrived(&mut self, id: &str) {
-        if self.motion.enabled() {
-            self.messages_pending.insert(id.to_string());
-        }
+        self.messages_pending.insert(id.to_string());
     }
 
     pub fn has_pending_messages(&self) -> bool {
@@ -1126,6 +1124,8 @@ impl InboxMotion {
         if let Some(fade) = self.motion.start(motion::FADE, now) {
             self.bodies
                 .extend(self.messages_pending.drain().map(|id| (id, (fade, true))));
+        } else {
+            self.messages_pending.clear();
         }
     }
 
@@ -1141,11 +1141,7 @@ impl InboxMotion {
             })
             .collect();
         if whole_card {
-            alphas.extend(
-                self.messages_pending
-                    .iter()
-                    .map(|id| (id.clone(), motion::ARRIVE_FROM)),
-            );
+            alphas.extend(self.messages_pending.iter().map(|id| (id.clone(), 0.0)));
         }
         alphas
     }
@@ -1645,10 +1641,7 @@ mod tests {
         motion.message_arrived("reply");
         let revealed = later(now, 500);
         assert!(!motion.tick(revealed));
-        assert_eq!(
-            motion.arrival_alphas(revealed, true)["reply"],
-            motion::ARRIVE_FROM
-        );
+        assert_eq!(motion.arrival_alphas(revealed, true)["reply"], 0.0);
         motion.reveal_arriving_messages(revealed);
         assert_eq!(
             motion.arrival_alphas(revealed, true)["reply"],

@@ -24,6 +24,7 @@ pub(in crate::imap) struct WriteFixture {
     pub refuse_search: bool,
     /// Return this many tagged-OK empty HEADER searches before finding the copy.
     pub empty_header_searches: usize,
+    pub omit_message_id_header: Option<u32>,
     pub close_on_login: bool,
     pub refuse_append: bool,
     /// Disconnect without committing the next APPEND.
@@ -95,7 +96,7 @@ pub(super) fn handle(
                     .contains("BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]")
                 && selected_write
             {
-                fetch_message_ids(tag, args, &state)
+                fetch_message_ids(tag, args, &state, writes.omit_message_id_header)
             } else if let Some(args) = strip_prefix_ignore(rest, "STORE ") {
                 if !selected_write {
                     format!("{tag} BAD STORE requires SELECT\r\n")
@@ -224,6 +225,11 @@ fn select(tag: &str, rest: &str, state: &TestState, nomodseq: bool) -> String {
     };
     let highest = mailbox.messages.iter().map(|m| m.uid).max().unwrap_or(0);
     let next = mailbox.uidnext.unwrap_or(highest + 1);
+    let next = if mailbox.omit_uidnext {
+        String::new()
+    } else {
+        format!("* OK [UIDNEXT {next}] next\r\n")
+    };
     let revision = if !state.condstore {
         String::new()
     } else if nomodseq {
@@ -233,7 +239,7 @@ fn select(tag: &str, rest: &str, state: &TestState, nomodseq: bool) -> String {
         format!("* OK [HIGHESTMODSEQ {highest}] highest\r\n")
     };
     format!(
-        "* {} EXISTS\r\n* OK [UIDVALIDITY {}] UIDs valid\r\n* OK [UIDNEXT {next}] next\r\n\
+        "* {} EXISTS\r\n* OK [UIDVALIDITY {}] UIDs valid\r\n{next}\
          {revision}{tag} OK [READ-WRITE] SELECT completed\r\n",
         mailbox.messages.len(),
         mailbox.uidvalidity
@@ -369,7 +375,7 @@ fn status(tag: &str, rest: &str, state: &TestState) -> String {
 
 /// `UID FETCH <set> (UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])` in the
 /// selected mailbox.
-fn fetch_message_ids(tag: &str, args: &str, state: &TestState) -> String {
+fn fetch_message_ids(tag: &str, args: &str, state: &TestState, omit_header: Option<u32>) -> String {
     let Some(name) = selected(state) else {
         return format!("{tag} BAD no mailbox selected\r\n");
     };
@@ -381,6 +387,10 @@ fn fetch_message_ids(tag: &str, args: &str, state: &TestState) -> String {
     let mut reply = String::new();
     for (index, message) in mailbox.messages.iter().enumerate() {
         if !uid_in_range(message.uid, set, highest) {
+            continue;
+        }
+        if omit_header == Some(message.uid) {
+            reply.push_str(&format!("* {} FETCH (UID {})\r\n", index + 1, message.uid));
             continue;
         }
         let header = String::from_utf8_lossy(&message_id_header(&message.raw)).into_owned();

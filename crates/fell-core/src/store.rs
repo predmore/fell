@@ -32,6 +32,7 @@ pub(crate) mod keywords;
 mod part_cache;
 mod roles;
 mod sent;
+pub(crate) use sent::retry_sent_write;
 pub(crate) mod sent_bcc;
 mod sent_echo_repair;
 mod summaries;

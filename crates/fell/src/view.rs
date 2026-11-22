@@ -114,6 +114,18 @@ pub fn run(trace_start: Option<Instant>) {
                 }
                 let view = cx.new(|cx| Inbox::new(window, cx));
                 view.update(cx, |_, cx| {
+                    let mut viewport = (window.viewport_size(), window.scale_factor());
+                    cx.observe_window_bounds(window, move |_, window, cx| {
+                        let previous = viewport;
+                        viewport = (window.viewport_size(), window.scale_factor());
+                        if viewport == previous {
+                            return;
+                        }
+                        // Lay out the new bounds as soon as configure arrives,
+                        // so the next compositor frame can present immediately.
+                        window.defer(cx, |window, cx| window.draw(cx).clear());
+                    })
+                    .detach();
                     cx.observe_window_activation(window, |_, window, cx| {
                         if window.is_window_active() {
                             cx.notify();
@@ -157,33 +169,31 @@ pub(crate) fn present_sent_copy(
     cx: &mut App,
     thread: ThreadId,
     message: fell_core::Message,
-) -> Option<futures::channel::oneshot::Receiver<()>> {
-    let inbox = cx.try_global::<InboxWindow>()?.0;
-    inbox
-        .update(cx, |inbox, window, cx| {
-            if message.account_id != inbox.account_id {
-                return None;
-            }
-            let shown = inbox.show_sent_copy(thread, message);
-            inbox.request_threads(
-                ReadIntent {
-                    refresh_open: true,
-                    ..ReadIntent::default()
-                },
-                cx,
-            );
-            cx.notify();
-            if !shown {
-                return None;
-            }
-            let (painted, ready) = futures::channel::oneshot::channel();
-            window.on_next_frame(move |_, _| {
-                let _ = painted.send(());
-            });
-            Some(ready)
-        })
-        .ok()
-        .flatten()
+    rich: Rich,
+) {
+    let Some(inbox) = cx.try_global::<InboxWindow>().map(|inbox| inbox.0) else {
+        return;
+    };
+    let _ = inbox.update(cx, |inbox, _, cx| {
+        if message.account_id != inbox.account_id {
+            return;
+        }
+        inbox.show_sent_copy(thread, message, rich);
+        inbox.request_threads(
+            ReadIntent {
+                refresh_open: true,
+                ..ReadIntent::default()
+            },
+            cx,
+        );
+        cx.notify();
+    });
+}
+
+fn compose_open(cx: &App) -> bool {
+    cx.windows()
+        .iter()
+        .any(|handle| handle.downcast::<ComposeView>().is_some())
 }
 
 pub(crate) fn wake_sent_copy_sync(cx: &mut App) {
@@ -491,6 +501,7 @@ fn not_sent_detail(session: &Session, write: &DroppedWrite, count: usize) -> Str
         DropReason::NotFound => format!("{messages} not found in {folder} on the server"),
         DropReason::NoMove => "This server can't move mail; archive stays in Fell".to_string(),
         DropReason::Abandoned => format!("{messages} left half moved in {folder} on the server"),
+        DropReason::UnconfirmedAppend => "Sent · server copy unconfirmed".to_string(),
     }
 }
 
@@ -2456,7 +2467,7 @@ impl Inbox {
         .detach();
     }
 
-    fn show_sent_copy(&mut self, thread: ThreadId, mut message: fell_core::Message) -> bool {
+    fn show_sent_copy(&mut self, thread: ThreadId, mut message: fell_core::Message, rich: Rich) {
         if self.open_thread.as_deref() != Some(thread.as_str())
             || self.session.cursor_id != self.open_thread
             || !self.search_preview_current()
@@ -2466,7 +2477,7 @@ impl Inbox {
                 .iter()
                 .any(|shown| shown.id == message.headers.message_id.as_str())
         {
-            return false;
+            return;
         }
         let viewing = self
             .session
@@ -2481,6 +2492,7 @@ impl Inbox {
             viewing,
         )
         .remove(0);
+        shown.rich = rich;
         if let Some(parts) = parts {
             shown.attachments = attachments::visible_parts(parts.mime_parts);
         }
@@ -2509,7 +2521,6 @@ impl Inbox {
         } else if at <= self.session.message_cursor && messages.len() > 1 {
             self.session.message_cursor += 1;
         }
-        true
     }
 
     /// Reload the theme when Omarchy, GTK, or Alacritty settings change.
@@ -4267,17 +4278,19 @@ impl Render for Inbox {
             });
         self.want_bodies(cx);
         self.motion.narrow_status = width < present::NARROW_WIDTH;
-        // Closing compose reveals the inbox even without keyboard
-        // activation, as on a Wayland seat with no keyboard attached.
-        if panes.1
-            && self.motion.has_pending_messages()
-            && (window.is_window_active()
-                || !cx
-                    .windows()
-                    .iter()
-                    .any(|handle| handle.downcast::<ComposeView>().is_some()))
-        {
-            self.motion.reveal_arriving_messages(now);
+        if panes.1 && self.motion.has_pending_messages() && !compose_open(cx) {
+            // Start in the compositor's frame callback, even if a resize
+            // drew a scene while compose still covered the window.
+            let this = cx.weak_entity();
+            window.on_next_frame(move |_, cx| {
+                if !compose_open(cx) {
+                    let _ = this.update(cx, |inbox, cx| {
+                        let now = inbox.motion.clock.now();
+                        inbox.motion.reveal_arriving_messages(now);
+                        cx.notify();
+                    });
+                }
+            });
         }
         self.motion.observe(&self.session, panes, now);
         let reflow = self.motion.reading_reflow(now);

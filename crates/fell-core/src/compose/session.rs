@@ -54,7 +54,7 @@ impl SentCopy {
         mime: &[u8],
         append: bool,
     ) -> crate::Result<(crate::ThreadId, crate::Message)> {
-        crate::Store::open(&self.store)?.record_sent_message(
+        crate::store::retry_sent_write(|| crate::Store::open(&self.store))?.record_sent_message(
             &self.account_id,
             &self.draft_id,
             &self.message_id,
@@ -70,11 +70,13 @@ impl SentCopy {
         if self.bcc.is_empty() {
             return Ok(());
         }
-        crate::Store::open(&self.store)?.record_sent_bcc(
-            &self.account_id,
-            &self.message_id,
-            &self.bcc,
-        )
+        crate::store::retry_sent_write(|| {
+            crate::Store::open(&self.store)?.record_sent_bcc(
+                &self.account_id,
+                &self.message_id,
+                &self.bcc,
+            )
+        })
     }
 }
 

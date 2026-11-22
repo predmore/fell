@@ -1015,14 +1015,8 @@ impl ComposeView {
                 })
                 .await;
             let copy_saved = copy.as_ref().map(Result::is_ok);
-            if let Some(Ok((thread, message))) = copy
-                && let Ok(Some(ready)) =
-                    cx.update(|cx| crate::view::present_sent_copy(cx, thread, message))
-            {
-                // Give the inbox its first paint before revealing it. A
-                // compositor may withhold frames from an occluded inbox.
-                let occluded = cx.background_executor().timer(Duration::from_millis(120));
-                let _ = futures::future::select(ready, occluded).await;
+            if let Some(Ok((thread, message, rich))) = copy {
+                let _ = cx.update(|cx| crate::view::present_sent_copy(cx, thread, message, rich));
             }
             let current = cx
                 .update_global::<SendAttempts, _>(|attempts, _| {
@@ -2417,7 +2411,11 @@ pub fn prepare_from_editor(
 /// file's login and SMTP settings for this account id. Resolves the account
 /// password, so call it off the UI thread.
 type SendBackend = (Box<dyn MailBackend + Send>, bool);
-type StoredSentCopy = fell_core::Result<(fell_core::ThreadId, fell_core::Message)>;
+type StoredSentCopy = fell_core::Result<(
+    fell_core::ThreadId,
+    fell_core::Message,
+    crate::present::Rich,
+)>;
 
 fn account_backend(account: &AccountId) -> Result<SendBackend, SendFailure> {
     let config = crate::mailbox::send_account_config(account).map_err(SendFailure::Unavailable)?;
@@ -2479,15 +2477,9 @@ fn log_send_result(result: &Result<fell_core::SentMessage, SendFailure>) {
 /// went out, so a busy mailbox must neither hold up the send nor lose this.
 fn remember_bcc(record: fell_core::compose::SentCopy) {
     std::thread::spawn(move || {
-        for attempt in 0..4 {
-            if attempt > 0 {
-                std::thread::sleep(std::time::Duration::from_secs(2 * attempt));
-            }
-            if record.remember_bcc().is_ok() {
-                return;
-            }
+        if record.remember_bcc().is_err() {
+            fell_core::diagnostic!(WARN, "Could not record Bcc for a send");
         }
-        fell_core::diagnostic!(WARN, "Could not record Bcc for a send");
     });
 }
 
@@ -2519,9 +2511,12 @@ impl PreparedSend {
         if let Some((record, mime)) = sent_copy {
             match &result {
                 Ok(_) => {
-                    let stored = record.save(&mime, append);
-                    if let Err(err) = &stored {
-                        eprintln!("fell: could not save the local Sent copy: {err}");
+                    let stored = record.save(&mime, append).map(|(thread, message)| {
+                        let rich = crate::mail_body::prepare_sent(&message);
+                        (thread, message, rich)
+                    });
+                    if stored.is_err() {
+                        fell_core::diagnostic!(WARN, "Could not save local Sent copy");
                         remember_bcc(record);
                     }
                     saved(stored);
