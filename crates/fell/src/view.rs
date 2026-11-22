@@ -10942,8 +10942,10 @@ mod tests {
         assert!(preview.take());
     }
 
-    fn with_pending_inbox(test: impl FnOnce(&mut super::Inbox, &mut gpui::Context<super::Inbox>)) {
-        use gpui::{AppContext, TestAppContext};
+    pub(super) fn with_pending_inbox(
+        test: impl FnOnce(&mut super::Inbox, &mut gpui::Context<super::Inbox>),
+    ) {
+        use gpui::TestAppContext;
 
         let store = fell_core::Store::open_in_memory().unwrap();
         let account = crate::fixtures::fixture_account();
@@ -10973,8 +10975,8 @@ mod tests {
         messages[0].body_state = fell_core::BodyState::Pending;
 
         let mut app = TestAppContext::single();
-        let inbox = app.new(|cx| {
-            super::Inbox::new(
+        let inbox = app.add_window(|window, cx| {
+            super::Inbox::with_startup(
                 crate::mailbox::Startup {
                     keymap: Default::default(),
                     split: 0.4,
@@ -10985,20 +10987,23 @@ mod tests {
                     path: Err("in-memory test".into()),
                 },
                 false,
+                Some(window),
                 cx,
             )
         });
-        inbox.update(&mut app, |inbox, cx| {
-            inbox.motion = super::InboxMotion::new(motion::Motion::new(true));
-            inbox.session.set_messages(messages);
-            inbox.session.cursor_id = Some(row.id.clone());
-            inbox.mark_open(row.id.clone(), None);
-            inbox.session.set_threads(vec![row]);
-            inbox.pending_bodies.wait_for_read(0);
-            inbox.conv_gen.store(1, std::sync::atomic::Ordering::SeqCst);
-            test(inbox, cx);
-            assert!(!inbox.pending_bodies.downloading(&inbox.session.sync));
-        });
+        inbox
+            .update(&mut app, |inbox, _, cx| {
+                inbox.motion = super::InboxMotion::new(motion::Motion::new(true));
+                inbox.session.set_messages(messages);
+                inbox.session.cursor_id = Some(row.id.clone());
+                inbox.mark_open(row.id.clone(), None);
+                inbox.session.set_threads(vec![row]);
+                inbox.pending_bodies.wait_for_read(0);
+                inbox.conv_gen.store(1, std::sync::atomic::Ordering::SeqCst);
+                test(inbox, cx);
+                assert!(!inbox.pending_bodies.downloading(&inbox.session.sync));
+            })
+            .unwrap();
     }
 
     #[test]

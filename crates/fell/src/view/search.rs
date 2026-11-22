@@ -41,6 +41,7 @@ pub(super) struct SearchView {
     pub(super) refresh_open_after_reply: bool,
     quiet_preview: Option<u64>,
     match_line: MatchLineMotion,
+    match_frame: MatchLineFrame,
 }
 
 #[derive(PartialEq)]
@@ -94,6 +95,19 @@ impl CachedPreview {
     pub(super) fn new(inbox: gpui::WeakEntity<Inbox>) -> Self {
         Self(inbox)
     }
+
+    fn frame(inbox: &mut Inbox) -> ConvFrame {
+        ConvFrame {
+            agent_note: inbox.note_view.frame(inbox.frame_now),
+            anchor: inbox.hold_landing(),
+            frames: inbox.frames.clone(),
+            syncing: inbox.pending_bodies.downloading(&inbox.session.sync),
+            // The outer pane owns the shield when the preview is stale.
+            preview_current: true,
+            match_line: inbox.search_view.match_frame.clone(),
+            ..ConvFrame::default()
+        }
+    }
 }
 
 impl Render for CachedPreview {
@@ -102,15 +116,7 @@ impl Render for CachedPreview {
             .update(cx, |inbox, cx| {
                 let width = f32::from(window.viewport_size().width);
                 let width = width - list_width(width, inbox.split) - SPLITTER_PX;
-                let frame = ConvFrame {
-                    agent_note: inbox.note_view.frame(inbox.frame_now),
-                    anchor: inbox.hold_landing(),
-                    frames: inbox.frames.clone(),
-                    syncing: inbox.pending_bodies.downloading(&inbox.session.sync),
-                    // The outer pane owns the shield when the preview is stale.
-                    preview_current: true,
-                    ..ConvFrame::default()
-                };
+                let frame = Self::frame(inbox);
                 conversation(
                     &inbox.theme,
                     &inbox.session,
@@ -162,9 +168,10 @@ impl Inbox {
         now: Instant,
         preview_current: bool,
     ) -> MatchLineFrame {
-        let message = (self.session.pane == Pane::Conversation && self.session.search.is_some())
-            .then(|| self.session.messages.get(self.session.message_cursor))
-            .flatten();
+        let message = (self.session.search.is_some()
+            && (self.session.pane == Pane::Conversation || self.session.search_editing()))
+        .then(|| self.session.messages.get(self.session.message_cursor))
+        .flatten();
         let retain = !preview_current
             && self.open_thread == self.session.cursor_id
             && (self.quiet_search_preview()
@@ -177,13 +184,15 @@ impl Inbox {
         let line = message
             .filter(|_| preview_current)
             .and_then(|message| MatchLine::for_message(&self.session, message));
-        self.search_view.match_line.update(
+        let frame = self.search_view.match_line.update(
             message.map(|message| message.id.as_str()),
             line,
             retain,
             self.motion.motion,
             now,
-        )
+        );
+        self.search_view.match_frame = frame.clone();
+        frame
     }
 
     pub(super) fn settle_search_match(&mut self) {
@@ -1869,7 +1878,7 @@ struct MatchLineMotion {
     from_height: f32,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct MatchLineFrame {
     message: Option<String>,
     current: Option<MatchLine>,
@@ -1966,6 +1975,49 @@ impl MatchLineFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_search_preview_keeps_the_match_line_after_the_fade() {
+        super::super::tests::with_pending_inbox(|inbox, _| {
+            inbox.settle_pending_bodies();
+            let thread = inbox.session.cursor_id.clone().unwrap();
+            let message = MessageId::new(&inbox.session.messages[inbox.session.message_cursor].id);
+            inbox.session.pane = Pane::List;
+            let search = inbox.session.search.insert(Search::default());
+            search.editing = true;
+            search.hits.insert(
+                thread,
+                crate::model::search::Hit {
+                    message: message.clone(),
+                    related: false,
+                    preview: None,
+                    folder: Some("INBOX".into()),
+                },
+            );
+            search.matches.push(fell_core::SearchMatch {
+                message,
+                preview: None,
+            });
+
+            let now = Instant::now();
+            assert!(inbox.search_match_frame(now, false).current.is_none());
+            assert!(inbox.search_match_frame(now, true).animating);
+            assert!(!inbox.search_match_frame(now + motion::FADE, true).animating);
+            assert!(
+                inbox
+                    .search_preview_for((true, true), false, "Subject")
+                    .is_some()
+            );
+
+            let frame = CachedPreview::frame(inbox).match_line;
+            assert_eq!(
+                frame.current.map(|line| (line.position, line.total)),
+                Some((1, 1))
+            );
+            assert_eq!(frame.height, 1.);
+            assert!(frame.outgoing.is_none());
+        });
+    }
 
     #[test]
     fn search_details_use_spare_width_and_reserve_room_for_the_subject() {
