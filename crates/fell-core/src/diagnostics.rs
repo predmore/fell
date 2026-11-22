@@ -1,18 +1,21 @@
 //! Shared file diagnostics for the inbox and the MCP process.
 
-use std::backtrace::Backtrace;
-use std::cell::Cell;
+use std::cell::RefCell;
+use std::cmp::Reverse;
 use std::collections::VecDeque;
 use std::env;
 use std::fmt::{self, Write as _};
 use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::panic::PanicHookInfo;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Once, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use backtrace::Backtrace;
+use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 #[doc(hidden)]
 pub use tracing;
 use tracing::field::{Field, Visit};
@@ -22,12 +25,14 @@ use tracing_subscriber::{Registry, filter::LevelFilter};
 
 const TARGET: &str = "fell.diagnostics";
 const LOG_FILES: usize = 5;
+const CRASH_FILES: usize = 10;
 const LOG_BYTES: u64 = 5 * 1024 * 1024;
 const EVENT_BYTES: usize = 1024;
 const RECENT_LINES: usize = 200;
 const LOG_TAIL_BYTES: u64 = ((RECENT_LINES + 1) * EVENT_BYTES) as u64;
 
 static PATHS: OnceLock<Paths> = OnceLock::new();
+static PANIC_HOOK: Once = Once::new();
 static SERIAL: AtomicU64 = AtomicU64::new(0);
 
 /// Diagnostic event names are literals. The file subscriber only records
@@ -64,14 +69,17 @@ impl Paths {
 
     fn directory(&self, name: &str) -> io::Result<PathBuf> {
         let dir = self.0.join(name);
-        DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
+        let mut builder = DirBuilder::new();
+        builder.recursive(true).mode(0o700);
         for private in [&self.0, &dir] {
-            let metadata = private.symlink_metadata()?;
-            if !metadata.is_dir() || metadata.mode() & 0o022 != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "diagnostics directory must be writable only by its owner",
-                ));
+            builder.create(private)?;
+            let handle = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                .open(private)?;
+            let mode = handle.metadata()?.mode() & 0o7777;
+            if mode != 0o700 {
+                handle.set_permissions(Permissions::from_mode(0o700))?;
             }
         }
         Ok(dir)
@@ -91,11 +99,7 @@ impl Paths {
             .filter_map(|entry| {
                 let name = entry.file_name();
                 let key = crash_key(name.to_str()?)?;
-                entry
-                    .file_type()
-                    .ok()?
-                    .is_file()
-                    .then(|| (key, entry.path()))
+                is_crash_file(&entry).then(|| (key, entry.path()))
             })
             .max_by_key(|(key, _)| *key)
             .map(|(_, path)| path)
@@ -112,18 +116,11 @@ fn crash_key(name: &str) -> Option<(u128, u32, u64)> {
 /// Install before launching any workers. The application can still start
 /// if its state directory is unavailable.
 pub fn init() -> io::Result<()> {
+    PANIC_HOOK.call_once(|| std::panic::set_hook(Box::new(handle_panic)));
     let paths = Paths::from_env()?;
     if PATHS.set(paths.clone()).is_err() {
         return Ok(());
     }
-    let crashes = paths.clone();
-    std::panic::set_hook(Box::new(move |_| {
-        let recovered = RECOVERABLE.get();
-        if write_crash(&crashes, recovered).is_err() {
-            let _ = writeln!(io::stderr(), "Fell could not write a crash report");
-        }
-    }));
-
     let directory = paths.directory("logs")?;
     let writer = RollingLog {
         directory,
@@ -139,19 +136,35 @@ pub fn init() -> io::Result<()> {
     tracing::subscriber::set_global_default(subscriber).map_err(io::Error::other)
 }
 
+fn handle_panic(info: &PanicHookInfo<'_>) {
+    let mut panic = Some(Crash::capture(info));
+    let _ = WORKER_PANIC.try_with(|slot| {
+        if let Some(worker) = slot.borrow_mut().as_mut() {
+            *worker = panic.take();
+        }
+    });
+    if let Some(panic) = panic {
+        record_crash(panic, false);
+    }
+}
+
 thread_local! {
-    static RECOVERABLE: Cell<bool> = const { Cell::new(false) };
+    // The outer option marks an active catch scope, the inner holds its panic.
+    static WORKER_PANIC: RefCell<Option<Option<Crash>>> = const { RefCell::new(None) };
 }
 
 /// Mark a panic in this scope as recoverable for the hook. The caller owns
 /// the recovery and can report it to whichever UI started the worker.
 pub fn catch_worker<T>(work: impl FnOnce() -> T) -> std::thread::Result<T> {
-    RECOVERABLE.with(|recoverable| {
-        let previous = recoverable.replace(true);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
-        recoverable.set(previous);
-        result
-    })
+    let previous = WORKER_PANIC.replace(Some(None));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+    // Work locals have unwound. In particular, SQLite has released any
+    // write transaction before we resolve symbols and touch the filesystem.
+    let panic = WORKER_PANIC.replace(previous).flatten();
+    if let (Err(_), Some(panic)) = (&result, panic) {
+        record_crash(panic, true);
+    }
+    result
 }
 
 pub fn take_crash_notice() -> Option<PathBuf> {
@@ -165,7 +178,9 @@ pub fn take_crash_notice() -> Option<PathBuf> {
     let _ = fs::remove_file(claimed);
     read.ok()?;
     crash_key(&name)?;
-    Some(dir.join(name))
+    let path = dir.join(name);
+    read_private(&path).ok()?;
+    Some(path)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -205,41 +220,141 @@ pub fn write_report() -> io::Result<PathBuf> {
     Ok(path)
 }
 
-fn write_crash(paths: &Paths, recovered: bool) -> io::Result<PathBuf> {
+struct Crash {
+    thread: &'static str,
+    id: std::thread::ThreadId,
+    location: String,
+    backtrace: Backtrace,
+}
+
+impl Crash {
+    fn capture(info: &PanicHookInfo<'_>) -> Self {
+        let current = std::thread::current();
+        let thread = match current.name() {
+            Some("main") => "main",
+            Some("fell-sync") => "fell-sync",
+            Some("fell-store") => "fell-store",
+            Some("fell-store-background") => "fell-store-background",
+            _ => "other",
+        };
+        let location = info.location().map_or_else(
+            || "unknown location".into(),
+            |location| {
+                let file = location.file();
+                let name = Path::new(file)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("unknown");
+                format!("{name}:{}", location.line())
+            },
+        );
+        Self {
+            thread,
+            id: current.id(),
+            location,
+            backtrace: Backtrace::new_unresolved(),
+        }
+    }
+}
+
+fn record_crash(mut panic: Crash, recovered: bool) {
+    match PATHS
+        .get()
+        .and_then(|paths| write_crash(paths, &mut panic, recovered).ok())
+    {
+        Some(path) if !recovered => {
+            let _ = writeln!(
+                io::stderr(),
+                "Fell panicked on {} at {}. Crash report: {path:?}",
+                panic.thread,
+                panic.location
+            );
+        }
+        None => {
+            let _ = writeln!(
+                io::stderr(),
+                "Fell panicked on {} at {}. Could not write a crash report.",
+                panic.thread,
+                panic.location
+            );
+        }
+        Some(_) => {}
+    }
+}
+
+fn write_crash(paths: &Paths, panic: &mut Crash, recovered: bool) -> io::Result<PathBuf> {
     let dir = paths.directory("crashes")?;
-    let current = std::thread::current();
-    let name = current
-        .name()
-        .filter(|name| {
-            matches!(
-                *name,
-                "main" | "fell-sync" | "fell-store" | "fell-store-background"
-            )
-        })
-        .unwrap_or("other");
     let mut report = format!(
-        "{}\nThread: {name} ({:?})\nRecovered by worker: {recovered}\n\nBacktrace\n",
+        "{}\nThread: {} ({:?})\nLocation: {}\nRecovered by worker: {recovered}\n\nBacktrace\n",
         fell_version::VERSION,
-        current.id()
+        panic.thread,
+        panic.id,
+        panic.location
     );
     // Backtrace symbols identify the code. Source paths can contain the
     // user's home directory, and panic payloads can contain message data.
-    for line in Backtrace::force_capture().to_string().lines() {
-        if let Some((frame, _)) = line.trim().split_once(':')
-            && frame.parse::<usize>().is_ok()
-        {
-            let _ = writeln!(report, "{line}");
+    panic.backtrace.resolve();
+    for (index, frame) in panic.backtrace.frames().iter().enumerate() {
+        for symbol in frame.symbols() {
+            if let Some(name) = symbol.name() {
+                let _ = writeln!(report, "{index:4}: {name}");
+            }
         }
     }
     report.push_str("\nRecent log\n");
     append_recent_log(&mut report, paths);
+    // Both Fell and Fell MCP can publish here. Serializing the publish and
+    // prune keeps another writer's staging file from looking abandoned.
+    let lock = private_file(&dir.join(".lock"), false)?;
+    lock.lock()?;
     let name = format!("{}.txt", report_name());
     let path = dir.join(&name);
-    publish(&path, report.as_bytes())?;
-    if !recovered {
-        publish(&dir.join("pending"), name.as_bytes())?;
+    let written = publish(&path, report.as_bytes());
+    if written.is_ok() && !recovered {
+        let _ = publish(&dir.join("pending"), name.as_bytes());
     }
-    Ok(path)
+    prune_crashes(&dir, &path);
+    written.map(|()| path)
+}
+
+fn is_crash_file(entry: &fs::DirEntry) -> bool {
+    entry
+        .metadata()
+        .is_ok_and(|meta| meta.is_file() && meta.nlink() == 1 && meta.mode() & 0o7777 == 0o600)
+}
+
+fn prune_crashes(dir: &Path, published: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    // Keep the last uncaught crash until the next inbox launch can show it.
+    let mut pending = String::new();
+    if read_private(&dir.join("pending"))
+        .and_then(|file| file.take(128).read_to_string(&mut pending))
+        .is_err()
+    {
+        pending.clear();
+    }
+    let mut reports = Vec::new();
+    let mut keep = CRASH_FILES;
+    for entry in entries.flatten().filter(is_crash_file) {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if let Some(key) = crash_key(name) {
+            let path = entry.path();
+            if path == published || name == pending {
+                keep -= 1;
+            } else {
+                reports.push((key, path));
+            }
+        } else if name.ends_with(".part") {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    reports.sort_unstable_by_key(|(key, _)| Reverse(*key));
+    for (_, path) in reports.into_iter().skip(keep) {
+        let _ = fs::remove_file(path);
+    }
 }
 
 fn report_name() -> String {
@@ -346,7 +461,7 @@ impl<S: Subscriber> Layer<S> for RollingLog {
         }
         let mut line = format!(
             "{} {:5} {} {}",
-            now().as_secs(),
+            log_timestamp(),
             metadata.level(),
             std::process::id(),
             metadata.name()
@@ -357,6 +472,19 @@ impl<S: Subscriber> Layer<S> for RollingLog {
             let _ = self.append(line.as_bytes());
         }
     }
+}
+
+fn log_timestamp() -> String {
+    let now = OffsetDateTime::now_utc();
+    let now = now.replace_nanosecond(0).unwrap_or(now);
+    let local = UtcOffset::local_offset_at(now)
+        .ok()
+        .and_then(|offset| now.checked_to_offset(offset))
+        .unwrap_or(now);
+    local
+        .format(&Rfc3339)
+        .or_else(|_| now.format(&Rfc3339))
+        .unwrap_or_default()
 }
 
 /// Allowlist typed fields. In particular, never call Display or Debug on
@@ -497,12 +625,141 @@ mod tests {
         for secret in SECRETS {
             assert!(!log.contains(secret));
         }
-        let report = write_crash(&paths, true).unwrap();
+        let stamp = log.split_ascii_whitespace().next().unwrap();
+        assert_eq!(&stamp[10..11], "T");
+        assert!(stamp.ends_with('Z') || matches!(stamp.as_bytes().get(19), Some(b'+' | b'-')));
+        let report = write_crash(&paths, &mut synthetic_crash(), true).unwrap();
         let crash = fs::read_to_string(report).unwrap();
         assert!(crash.contains("Private input was discarded error=backend"));
         for secret in SECRETS {
             assert!(!crash.contains(secret));
         }
+    }
+
+    fn synthetic_crash() -> Crash {
+        Crash {
+            thread: "other",
+            id: std::thread::current().id(),
+            location: "diagnostics.rs:1".into(),
+            backtrace: Backtrace::from(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn crash_retention_preserves_the_pending_report_and_skips_other_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths(dir.path().join("fell"));
+        let crashes = paths.directory("crashes").unwrap();
+        let create = |name: &str| private_file(&crashes.join(name), true).unwrap();
+        for serial in 0..12 {
+            create(&format!("1-1-{serial}.txt"));
+        }
+        create("orphan.part");
+        let public = crashes.join("1-3-4.txt");
+        fs::write(&public, b"not a private report").unwrap();
+        fs::set_permissions(&public, Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink("1-1-0.txt", crashes.join("symlink.part")).unwrap();
+        fs::create_dir(crashes.join("dir.part")).unwrap();
+        create("pending").write_all(b"1-1-0.txt").unwrap();
+        let report = write_crash(&paths, &mut synthetic_crash(), true).unwrap();
+        assert_eq!(paths.latest_crash().unwrap(), report);
+        assert!(crashes.join("1-1-0.txt").is_file(), "pending report");
+        for serial in 1..4 {
+            assert!(!crashes.join(format!("1-1-{serial}.txt")).exists());
+        }
+        for serial in 4..12 {
+            assert!(crashes.join(format!("1-1-{serial}.txt")).is_file());
+        }
+        assert!(!crashes.join("orphan.part").exists());
+        assert!(crashes.join("symlink.part").is_symlink());
+        assert!(crashes.join("dir.part").is_dir());
+        assert!(public.is_file());
+    }
+
+    #[test]
+    fn existing_diagnostics_directories_become_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths(dir.path().join("fell"));
+        let logs = paths.logs();
+        fs::create_dir_all(&logs).unwrap();
+        fs::set_permissions(&paths.0, Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&logs, Permissions::from_mode(0o775)).unwrap();
+        paths.directory("logs").unwrap();
+        for directory in [&paths.0, &logs] {
+            assert_eq!(fs::metadata(directory).unwrap().mode() & 0o777, 0o700);
+        }
+    }
+
+    #[test]
+    fn worker_releases_sqlite_write_lock_before_publishing_crash() {
+        // Use a fresh process so the panic hook and state path are isolated
+        // from the other tests in this binary.
+        const CHILD: &str = "FELL_TEST_DIAGNOSTICS_WORKER";
+        if env::var_os(CHILD).is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "diagnostics::tests::worker_releases_sqlite_write_lock_before_publishing_crash",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("XDG_STATE_HOME", dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        use rusqlite::{Connection, TransactionBehavior};
+        use std::{sync::mpsc, time::Duration};
+
+        init().unwrap();
+        let paths = PATHS.get().unwrap();
+        let crashes = paths.directory("crashes").unwrap();
+        let db = paths.0.join("test.db");
+        let mut reader = Connection::open(&db).unwrap();
+        reader.execute("CREATE TABLE test (value)", []).unwrap();
+        let lock = private_file(&crashes.join(".lock"), false).unwrap();
+        lock.lock().unwrap();
+        let (dropped, unwound) = mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            // Drop order rolls back the write before dropping the sender.
+            assert!(
+                catch_worker(move || {
+                    let _dropped = dropped;
+                    let mut conn = Connection::open(db).unwrap();
+                    let tx = conn
+                        .transaction_with_behavior(TransactionBehavior::Immediate)
+                        .unwrap();
+                    tx.execute("INSERT INTO test VALUES (1)", []).unwrap();
+                    panic!("synthetic interrupted write");
+                })
+                .is_err()
+            );
+        });
+        let unwind_result = unwound.recv_timeout(Duration::from_secs(10));
+        let report_before_unlock = paths.latest_crash();
+        let transaction = reader.transaction_with_behavior(TransactionBehavior::Immediate);
+        drop(lock);
+        worker.join().unwrap();
+        assert_eq!(unwind_result, Err(mpsc::RecvTimeoutError::Disconnected));
+        assert!(report_before_unlock.is_err());
+        let tx = transaction.unwrap();
+        assert_eq!(
+            tx.query_row("SELECT count(*) FROM test", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let report = fs::read_to_string(paths.latest_crash().unwrap()).unwrap();
+        assert!(report.contains("Recovered by worker: true"));
+        assert!(!report.contains("synthetic interrupted write"));
+        assert!(take_crash_notice().is_none());
     }
 
     #[test]

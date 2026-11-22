@@ -27,7 +27,7 @@ use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use futures::channel::oneshot;
 
 use crate::model::{SyncFailure, SyncKind};
-use crate::worker::{Restart, Worker};
+use crate::worker::{Restart, Worker, WorkerEvent};
 
 /// Longest time between passes after a pass succeeds. IDLE on INBOX starts
 /// one sooner when mail arrives; other folders are caught up on this timer.
@@ -61,7 +61,7 @@ const BODIES_BETWEEN_PASSES: usize = 48;
 /// What the sync thread tells the window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncEvent {
-    Restarting,
+    Worker(WorkerEvent),
     /// The status to show. `Syncing`, and `Synced` with `changed`, can also
     /// refresh mail that has just been written.
     Status(SyncKind),
@@ -258,12 +258,12 @@ fn start_with(
     std::thread::Builder::new()
         .name("fell-sync".into())
         .spawn(move || {
-            let mut restart = Restart::new(Worker::Sync, |_| {
-                events_tx.unbounded_send(SyncEvent::Restarting).is_ok()
+            let mut restart = Restart::new(Worker::Sync, |event| {
+                events_tx.unbounded_send(SyncEvent::Worker(event)).is_ok()
             });
-            restart.run(|| {
+            restart.run(|recovered| {
                 before_run();
-                run(&config, &store_path, &events_tx, &wake_rx);
+                run(&config, &store_path, &events_tx, &wake_rx, recovered);
             });
         })
         .expect("spawn sync thread");
@@ -275,6 +275,7 @@ fn run(
     store_path: &std::path::Path,
     events: &UnboundedSender<SyncEvent>,
     wake: &Receiver<Request>,
+    recovered: &mut dyn FnMut(),
 ) {
     let bridge = config.backend == BackendKind::Bridge;
     let send = |kind: SyncKind| events.unbounded_send(SyncEvent::Status(kind)).is_ok();
@@ -373,6 +374,7 @@ fn run(
         let synced = result.is_ok();
         let delay = match result {
             Ok(report) => {
+                recovered();
                 diagnostic!(
                     INFO,
                     "Sync pass completed",
@@ -804,7 +806,7 @@ mod restart_tests {
         let mut restarting = false;
         loop {
             match events.try_recv() {
-                Ok(SyncEvent::Restarting) => restarting = true,
+                Ok(SyncEvent::Worker(WorkerEvent::Restarted(Worker::Sync))) => restarting = true,
                 Ok(SyncEvent::Status(SyncKind::Failed(failure))) => {
                     assert!(restarting);
                     assert_eq!(failure.kind, SyncFailureKind::Password);

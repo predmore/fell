@@ -59,6 +59,7 @@ use crate::text_cut;
 use crate::text_render::BodyBlock;
 use crate::theme::{self, Theme};
 use crate::ui_trace::UiTrace;
+use crate::worker::Worker;
 
 use self::disclosure::disclosure;
 
@@ -299,6 +300,7 @@ struct Inbox {
     /// The mailbox connection's own thread. The window never calls SQLite.
     store: StoreClient,
     startup_crash: Option<std::path::PathBuf>,
+    worker_restart_notice: Option<(Worker, u64)>,
     /// Cursor observed before the first inbox read, consumed after it paints.
     cid_repair: Option<futures::channel::oneshot::Receiver<fell_core::Result<CidRepairProgress>>>,
     account_id: AccountId,
@@ -462,6 +464,7 @@ impl Inbox {
             session,
             store,
             startup_crash: None,
+            worker_restart_notice: None,
             cid_repair: None,
             theme,
             list_scroll: UniformListScrollHandle::new(),
@@ -700,8 +703,8 @@ impl Inbox {
                     .update(cx, |inbox, cx| {
                         let kind = match event {
                             SyncEvent::Status(kind) => kind,
-                            SyncEvent::Restarting => {
-                                inbox.show_worker_restart(crate::worker::Worker::Sync, cx);
+                            SyncEvent::Worker(event) => {
+                                inbox.apply_worker_event(event, cx);
                                 return;
                             }
                             SyncEvent::ReplyTo(progress) => {
@@ -7097,34 +7100,42 @@ fn status_bar(
     let ui = theme.ui_family.as_ref();
     let mono = theme.mono_family.as_ref();
     let hint_opacity = status.hints;
-    let (sync_label, sync_color) = match reply_check {
-        Some(ReplyCheck::Waiting) => ("Reply-To unverified".into(), theme.dimmed),
-        Some(ReplyCheck::Checking) => ("Checking Reply-To…".into(), theme.dimmed),
-        Some(ReplyCheck::Unavailable) => {
-            let key = keymap::binding_text(&session.keymap, Action::SyncNow);
-            let label = if width < present::NARROW_WIDTH {
-                format!("Retry Reply-To · {key}")
-            } else {
-                format!("Reply-To unavailable · {key} to retry")
-            };
-            (label, theme.error)
-        }
-        Some(ReplyCheck::Verified) => (
-            format!(
-                "Reply-To verified · {} to reply",
-                keymap::binding_text(&session.keymap, Action::Reply)
+    let outage = session.worker_outage();
+    let sync_hint =
+        outage.map(|_| keymap::binding_text(&session.keymap, Action::OpenDiagnosticLog));
+    let (sync_label, sync_color) = if let Some(worker) = outage {
+        (worker.outage_notice().to_string(), theme.error)
+    } else {
+        match reply_check {
+            Some(ReplyCheck::Waiting) => ("Reply-To unverified".into(), theme.dimmed),
+            Some(ReplyCheck::Checking) => ("Checking Reply-To…".into(), theme.dimmed),
+            Some(ReplyCheck::Unavailable) => {
+                let key = keymap::binding_text(&session.keymap, Action::SyncNow);
+                let label = if width < present::NARROW_WIDTH {
+                    format!("Retry Reply-To · {key}")
+                } else {
+                    format!("Reply-To unavailable · {key} to retry")
+                };
+                (label, theme.error)
+            }
+            Some(ReplyCheck::Verified) => (
+                format!(
+                    "Reply-To verified · {} to reply",
+                    keymap::binding_text(&session.keymap, Action::Reply)
+                ),
+                theme.accent,
             ),
-            theme.accent,
-        ),
-        None => (
-            session.sync.status(),
-            if session.sync.is_error() {
-                theme.error
-            } else {
-                theme.dimmed
-            },
-        ),
+            None => (
+                session.sync.status(),
+                if session.sync.is_error() {
+                    theme.error
+                } else {
+                    theme.dimmed
+                },
+            ),
+        }
     };
+    let details = outage.is_none() && session.detail_text().is_some();
     // What the bar spends before the notice, measured as drawn: the
     // padding, the mode in mono, sync, the dots, the gaps between the
     // children. No typed keys show beside a notice, so no air after it.
@@ -7132,14 +7143,27 @@ fn status_bar(
     used += bar_px(window, session.mode_label(), size, mono)
         + bar_px(window, &sync_label, size, ui)
         + 2.0 * bar_px(window, "·", size, ui);
-    if session.detail_text().is_some() {
+    if let Some(key) = &sync_hint {
+        used += bar_px(window, &format!(" · {key} for log"), size, ui);
+    }
+    if details {
         used += 12.0 + bar_px(window, "· ? details", size, ui);
     }
     let scale = window.scale_factor();
     let notice_text = |toast: &Toast, opacity: f32, dy: f32| {
-        let text = present::fit_notice(&toast.text, (width - used).max(80.0), |text| {
-            bar_px(window, text, size, ui)
+        let hint = toast
+            .hint
+            .as_ref()
+            .map(|(key, suffix)| (key.as_str(), *suffix));
+        let tail_width = hint.map_or(0.0, |(key, suffix)| {
+            bar_px(window, &format!(" · {key}{suffix}"), size, ui)
         });
+        let min_width = if hint.is_some() { 0.0 } else { 80.0 };
+        let text = present::fit_notice(
+            &toast.text,
+            (width - used - tail_width).max(min_width),
+            |text| bar_px(window, text, size, ui),
+        );
         div()
             .overflow_hidden()
             .whitespace_nowrap()
@@ -7153,7 +7177,7 @@ fn status_bar(
             .when(dy.abs() >= 0.01, |text| {
                 text.relative().top(px(motion::snap(dy, scale)))
             })
-            .child(text)
+            .child(status_text(text, hint, theme))
     };
     let (notice_dy, leaving_dy) = (status.notice_dy, status.leaving_dy);
     let hints = (!count.is_empty() || !hint.is_empty()).then(|| {
@@ -7191,8 +7215,19 @@ fn status_bar(
                 .child(session.mode_label().to_string()),
         )
         .child(div().text_color(rgb(theme.dimmed)).child("·"))
-        .child(div().text_color(rgb(sync_color)).child(sync_label))
-        .when(session.detail_text().is_some(), |bar| {
+        .child(
+            div()
+                .text_color(rgb(sync_color))
+                .when(status.sync_opacity < 1.0, |label| {
+                    label.opacity(status.sync_opacity)
+                })
+                .child(status_text(
+                    sync_label,
+                    sync_hint.as_deref().map(|key| (key, " for log")),
+                    theme,
+                )),
+        )
+        .when(details, |bar| {
             bar.child(div().text_color(rgb(theme.error)).child("· ? details"))
         })
         // The dot before a notice comes and goes with it.
@@ -7252,6 +7287,24 @@ fn status_bar(
             ),
             _ => bar,
         })
+}
+
+fn status_text(mut text: String, hint: Option<(&str, &str)>, theme: &Theme) -> StyledText {
+    let highlight = hint.map(|(key, suffix)| {
+        text.push_str(" · ");
+        let start = text.len();
+        text.push_str(key);
+        let end = text.len();
+        text.push_str(suffix);
+        (
+            start..end,
+            HighlightStyle {
+                color: Some(rgb(theme.accent).into()),
+                ..HighlightStyle::default()
+            },
+        )
+    });
+    StyledText::new(text).with_highlights(highlight)
 }
 
 /// `(opacity, rise)`: the popup fades in as it rises the last few pixels.

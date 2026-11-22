@@ -14,6 +14,7 @@ use crate::keymap::KeyId;
 use crate::model::{FolderIntent, Overlay, Session, Toast};
 use crate::motion::{self, Ghost, Glide, ListShift, Motion, Transition};
 use crate::present::{ConvMessage, Pane, ThreadRow};
+use crate::worker::Worker;
 
 /// The old selection's highlight starts its fade from this much, so on a
 /// slow frame two rows never look selected.
@@ -71,6 +72,7 @@ impl FolderHeaderFade {
 
 /// The status bar's notice and key hints as this frame draws them.
 pub struct StatusMotion {
+    pub sync_opacity: f32,
     /// The notice on screen and its opacity.
     pub notice: Option<(Toast, f32)>,
     /// A notice leaving, fading where it was: a key cleared it, or another
@@ -174,6 +176,8 @@ pub struct InboxMotion {
     pub list_glide: Option<Glide>,
     /// The conversation gliding to a page or a message.
     pub conv_glide: Option<Glide>,
+    last_worker_outage: Option<Worker>,
+    sync_in: Option<Transition>,
     toast_in: Option<Transition>,
     /// The opacity a notice fading in starts from: what a notice still
     /// leaving has already lost, so the two never show less than one.
@@ -303,6 +307,8 @@ impl InboxMotion {
             list: None,
             list_glide: None,
             conv_glide: None,
+            last_worker_outage: None,
+            sync_in: None,
             toast_in: None,
             toast_from: 0.0,
             toast_out: None,
@@ -348,6 +354,11 @@ impl InboxMotion {
         let start = |duration| self.motion.start(duration, now);
         if std::mem::take(&mut self.arrival_pending) {
             self.arrival = start(motion::QUICK);
+        }
+        let outage = session.worker_outage();
+        if outage != self.last_worker_outage {
+            self.last_worker_outage = outage;
+            self.sync_in = start(motion::QUICK);
         }
         let notice = session.status_notice();
         if notice != self.last_toast.as_ref() {
@@ -582,6 +593,7 @@ impl InboxMotion {
         self.list_from = list.map(|glide| glide.value(now));
         self.conv_from = conversation.map(|glide| glide.value(now));
         self.toast_in = None;
+        self.sync_in = None;
         self.hints_out = None;
         self.which = None;
         self.overlay = None;
@@ -644,6 +656,7 @@ impl InboxMotion {
             fade.is_some()
         }
         let mut running = false;
+        running |= keep(&mut self.sync_in, now);
         running |= keep(&mut self.toast_in, now);
         running |= keep_with(&mut self.toast_out, now);
         running |= keep(&mut self.hints_out, now);
@@ -789,6 +802,11 @@ impl InboxMotion {
             (None, None) => 1.0,
         };
         StatusMotion {
+            sync_opacity: motion::lerp(
+                motion::ARRIVE_FROM,
+                1.0,
+                motion::progress(self.sync_in.as_ref(), now),
+            ),
             notice,
             leaving,
             notice_dy: motion::NOTICE_RISE_PX * (1.0 - rising),

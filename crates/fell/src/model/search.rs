@@ -587,6 +587,7 @@ impl Session {
             search.error = Some(Toast {
                 text: one_line(&error),
                 alert: true,
+                hint: None,
             });
             return true;
         }

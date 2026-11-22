@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use fell_core::{Store, diagnostic};
 use futures::channel::{mpsc::UnboundedSender, oneshot};
 
-use crate::worker::{Restart, Worker};
+use crate::worker::{Restart, Worker, WorkerEvent};
 
 type Job = Box<dyn FnOnce(&Store) + Send>;
 
@@ -35,7 +35,7 @@ impl StoreClient {
     /// file-backed mailbox then gets its background connection.
     pub fn spawn<T: Send + 'static>(
         open: impl Fn() -> (Store, T) + Send + 'static,
-        notices: UnboundedSender<Worker>,
+        notices: UnboundedSender<WorkerEvent>,
     ) -> (Self, oneshot::Receiver<T>) {
         let (jobs, rx) = mpsc::channel::<Job>();
         let (ready_tx, ready) = oneshot::channel();
@@ -50,7 +50,11 @@ impl StoreClient {
                 let mut restart = Restart::new(Worker::Store, |worker| {
                     notices.unbounded_send(worker).is_ok()
                 });
-                let Some((store, info)) = restart.run(open) else {
+                let Some((store, info)) = restart.run(|recovered| {
+                    let opened = open();
+                    recovered();
+                    opened
+                }) else {
                     return;
                 };
                 diagnostic!(INFO, "Mailbox worker opened the store");
@@ -66,9 +70,10 @@ impl StoreClient {
                 // Do not replay an interrupted job. Unwinding rolls back its
                 // SQLite transaction and drops its sender (an Err to the caller).
                 // The channel still owns all jobs we have not started.
-                restart.run(|| {
+                restart.run(|recovered| {
                     for job in &rx {
                         job(&store);
+                        recovered();
                     }
                 });
             })
@@ -180,7 +185,7 @@ fn spawn_background(
     path: std::path::PathBuf,
     ready: Arc<AtomicBool>,
     jobs: mpsc::Receiver<Job>,
-    notices: UnboundedSender<Worker>,
+    notices: UnboundedSender<WorkerEvent>,
 ) {
     let _ = std::thread::Builder::new()
         .name("fell-store-background".into())
@@ -188,12 +193,13 @@ fn spawn_background(
             let mut restart = Restart::new(Worker::BackgroundStore, |worker| {
                 notices.unbounded_send(worker).is_ok()
             });
-            let Some(Some(store)) = restart.run(|| {
+            let Some(Some(store)) = restart.run(|recovered| {
                 let mut waits = BACKGROUND_RETRIES.iter();
                 loop {
                     match Store::open(&path) {
                         Ok(store) => {
                             store.warm_search();
+                            recovered();
                             break Some(store);
                         }
                         Err(err) => {
@@ -217,11 +223,11 @@ fn spawn_background(
             diagnostic!(DEBUG, "Mailbox background connection opened");
             ready.store(true, Ordering::Release);
             drop(ready);
-            restart.run(|| run_background(&store, &jobs));
+            restart.run(|recovered| run_background(&store, &jobs, recovered));
         });
 }
 
-fn run_background(store: &Store, jobs: &mpsc::Receiver<Job>) {
+fn run_background(store: &Store, jobs: &mpsc::Receiver<Job>, recovered: &mut dyn FnMut()) {
     // Sweep after startup and between jobs, even while working offline or
     // when nobody has opened an attachment in this window.
     let mut next_sweep = Instant::now();
@@ -244,7 +250,10 @@ fn run_background(store: &Store, jobs: &mpsc::Receiver<Job>) {
             next_sweep = Instant::now() + PART_CACHE_SWEEP_INTERVAL;
         }
         match jobs.recv_timeout(next_sweep.saturating_duration_since(Instant::now())) {
-            Ok(job) => job(store),
+            Ok(job) => {
+                job(store);
+                recovered();
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 let _ = store.clean_default_part_cache();
@@ -282,12 +291,15 @@ mod tests {
             let complete = |store: &Store| store.testing_with_uncommitted_write(|| ());
             // A concurrent SQLite connection sees neither interrupted write.
             assert!(client.call(job).await.is_err());
-            assert!(matches!(restarts.next().await, Some(Worker::Store)));
-            assert!(client.call_maintenance(job).await.is_err());
-            assert!(matches!(
+            assert_eq!(
                 restarts.next().await,
-                Some(Worker::BackgroundStore)
-            ));
+                Some(WorkerEvent::Restarted(Worker::Store))
+            );
+            assert!(client.call_maintenance(job).await.is_err());
+            assert_eq!(
+                restarts.next().await,
+                Some(WorkerEvent::Restarted(Worker::BackgroundStore))
+            );
             client.call(complete).await.unwrap().unwrap();
             let connection = rusqlite::Connection::open(path).unwrap();
             let value: String = connection
