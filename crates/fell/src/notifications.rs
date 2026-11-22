@@ -5,7 +5,7 @@ use std::future::pending;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use async_io::Timer;
@@ -131,7 +131,7 @@ impl Queue {
                 self.send(Command::Committed(Instant::now(), arrivals));
             }
             Ok(_) => {}
-            Err(err) => report_failure(&err),
+            Err(err) => report_failure(Failure::Lookup, &err),
         }
     }
 
@@ -182,10 +182,10 @@ pub(crate) fn start(
     if let Err(err) = std::thread::Builder::new()
         .name("fell-notifications".into())
         .spawn(move || {
-            futures::executor::block_on(run(incoming, actions, focused, mode, store, account))
+            futures::executor::block_on(run(None, incoming, actions, focused, mode, store, account))
         })
     {
-        report_failure(&err);
+        report_failure(Failure::Start, &err);
     }
     (
         Queue {
@@ -196,9 +196,19 @@ pub(crate) fn start(
     )
 }
 
-fn report_failure(err: &(impl std::error::Error + 'static)) {
-    static LOGGED: AtomicBool = AtomicBool::new(false);
-    if !LOGGED.swap(true, Ordering::Relaxed) {
+#[repr(u8)]
+enum Failure {
+    Start = 1 << 0,
+    Lookup = 1 << 1,
+    Connect = 1 << 2,
+    Post = 1 << 3,
+    Close = 1 << 4,
+}
+
+fn report_failure(kind: Failure, err: &(impl std::error::Error + 'static)) {
+    static LOGGED: AtomicU8 = AtomicU8::new(0);
+    let bit = kind as u8;
+    if LOGGED.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
         diagnostic!(
             WARN,
             "Desktop notification failed",
@@ -257,6 +267,7 @@ async fn next_post(posts: &mut FuturesUnordered<BoxFuture<'static, PostResult>>)
 }
 
 async fn run(
+    mut bus: Option<Bus>,
     mut incoming: UnboundedReceiver<Command>,
     actions: UnboundedSender<Invoked>,
     viewing: Arc<AtomicBool>,
@@ -264,7 +275,6 @@ async fn run(
     store: StoreClient,
     account: AccountId,
 ) {
-    let mut bus = None;
     let mut batch = Vec::new();
     let mut deadline = None;
     let mut mode_generation = 0;
@@ -279,7 +289,11 @@ async fn run(
                     batch.append(&mut arrivals);
                 }
             }
-            Event::Command(Some(Command::Refresh)) => {
+            Event::Command(Some(command @ (Command::Refresh | Command::PassEnded))) => {
+                if matches!(command, Command::PassEnded) && deadline.is_some() {
+                    deadline = Some(Instant::now());
+                }
+                // A pass can remove or change mail without reporting any arrivals.
                 if let Some(bus) = &mut bus {
                     refresh_after_post |= !bus.posts.is_empty();
                     refresh_notices(&store, &account, bus).await;
@@ -330,11 +344,6 @@ async fn run(
                     bus.close(|notice| notice.receipt == receipt).await;
                 }
             }
-            Event::Command(Some(Command::PassEnded)) => {
-                if deadline.is_some() {
-                    deadline = Some(Instant::now());
-                }
-            }
             Event::Command(None) => break,
             Event::Bus(BusEvent::Owner(Some(owner))) => {
                 if let Some(bus) = &mut bus {
@@ -344,7 +353,7 @@ async fn run(
             Event::Bus(BusEvent::Signal(None) | BusEvent::Owner(None)) => bus = None,
             Event::Bus(BusEvent::Signal(Some(signal))) => {
                 if let Some(bus) = &mut bus {
-                    bus.on_signal(signal, &actions);
+                    bus.on_signal(signal, &actions, mode_generation);
                 }
             }
             Event::Bus(BusEvent::Posted(post)) => {
@@ -355,7 +364,7 @@ async fn run(
                         refresh_notices(&store, &account, bus).await;
                     }
                     for signal in std::mem::take(&mut bus.early_signals) {
-                        bus.on_signal(signal, &actions);
+                        bus.on_signal(signal, &actions, mode_generation);
                     }
                 }
             }
@@ -366,7 +375,7 @@ async fn run(
                 {
                     Ok(unread) => unread,
                     Err(err) => {
-                        report_failure(&err);
+                        report_failure(Failure::Lookup, &err);
                         continue;
                     }
                 };
@@ -391,7 +400,7 @@ async fn run(
                 }
                 .await;
                 if let Err(err) = result {
-                    report_failure(&err);
+                    report_failure(Failure::Connect, &err);
                 }
             }
         }
@@ -404,7 +413,7 @@ async fn run(
 async fn refresh_notices(store: &StoreClient, account: &AccountId, bus: &mut Bus) {
     match unread_messages(store, account, Some(bus), &[]).await {
         Ok(unread) => bus.close_stale(&unread).await,
-        Err(err) => report_failure(&err),
+        Err(err) => report_failure(Failure::Lookup, &err),
     }
 }
 
@@ -603,7 +612,7 @@ struct Active {
     kind: Kind,
     messages: Vec<InboxArrival>,
     token: Option<String>,
-    closing: bool,
+    close_pending: bool,
     invoked: bool,
 }
 
@@ -738,8 +747,8 @@ impl Bus {
     async fn close(&mut self, should_close: impl Fn(&Active) -> bool) {
         let mut closing = Vec::new();
         for notice in &mut self.active {
-            if notice.closing || should_close(notice) {
-                notice.closing = true;
+            if notice.close_pending || should_close(notice) {
+                notice.close_pending = true;
                 closing.push(notice.receipt.clone());
             }
         }
@@ -752,7 +761,7 @@ impl Bus {
         for (receipt, result) in closing.into_iter().zip(results) {
             match result {
                 Ok(()) => self.active.retain(|old| old.receipt != receipt),
-                Err(err) => report_failure(&err),
+                Err(err) => report_failure(Failure::Close, &err),
             }
         }
     }
@@ -802,7 +811,7 @@ impl Bus {
                 } else {
                     fold.push(old.receipt.id);
                 }
-                if old.closing {
+                if old.close_pending {
                     continue;
                 }
                 arrivals.extend(
@@ -855,7 +864,7 @@ impl Bus {
         let active = match post.result {
             Ok(active) => active,
             Err(err) => {
-                report_failure(&err);
+                report_failure(Failure::Post, &err);
                 // A failed feedback replacement leaves the acted-on popup to close.
                 self.close(|old| old.receipt.id == post.replaces && old.invoked)
                     .await;
@@ -879,7 +888,12 @@ impl Bus {
         .await;
     }
 
-    fn on_signal(&mut self, signal: Message, actions: &UnboundedSender<Invoked>) {
+    fn on_signal(
+        &mut self,
+        signal: Message,
+        actions: &UnboundedSender<Invoked>,
+        mode_generation: u64,
+    ) {
         let header = signal.header();
         let Some(owner) = header.sender().map(|owner| owner.as_str()) else {
             return;
@@ -918,7 +932,11 @@ impl Bus {
                 self.active.remove(index);
             }
             "ActivationToken" => active.token = Some(value),
-            "ActionInvoked" if !active.closing && !active.invoked => {
+            // Signals are handled after close() returns. If it failed, the
+            // visible notice still works while its close is queued for retry.
+            "ActionInvoked"
+                if !active.invoked && active.receipt.mode_generation == mode_generation =>
+            {
                 if let Some(action) = active.kind.action(&value) {
                     active.invoked = true;
                     let _ = actions.unbounded_send(Invoked {
@@ -978,7 +996,7 @@ async fn post(
         kind: notice.kind,
         messages: notice.messages,
         token: None,
-        closing: false,
+        close_pending: false,
         invoked: false,
     })
 }

@@ -307,6 +307,82 @@ mod daemon {
     }
 
     #[test]
+    fn a_pass_without_new_mail_closes_a_notice_for_mail_that_disappeared() {
+        let (_daemon, address) = TestBus::start();
+        futures::executor::block_on(async {
+            let calls = Arc::new(Calls::default());
+            let (_service, mut bus) = setup(&address, calls.clone()).await;
+            let account = crate::fixtures::fixture_account();
+            let account_id = account.id.clone();
+            let (notices, _worker_events) = unbounded();
+            let (store, ready) = StoreClient::spawn(
+                move || {
+                    let store = fell_core::Store::open_in_memory().unwrap();
+                    crate::fixtures::seed_if_empty(&store, &account).unwrap();
+                    (store, ())
+                },
+                notices,
+            );
+            ready.await.unwrap();
+            let id = MessageId::new("dispatch-42@fell.test");
+            let mail = InboxArrival {
+                id: id.clone(),
+                ..arrival(1)
+            };
+            bus.prepare_delivery().await.unwrap();
+            bus.deliver(
+                vec![mail],
+                &HashSet::from([id.clone()]),
+                NotificationMode::On,
+                0,
+                0,
+            );
+            flush_posts(&mut bus).await;
+            let account_for_write = account_id.clone();
+            assert!(
+                store
+                    .call(move |store| store.delete_message(&account_for_write, &id))
+                    .await
+                    .unwrap()
+                    .unwrap()
+            );
+
+            let (commands, incoming) = unbounded();
+            let (actions, _invoked) = unbounded();
+            let viewing = Arc::new(AtomicBool::new(false));
+            let queue = Queue {
+                commands,
+                viewing_inbox: viewing.clone(),
+            };
+            let verify = async move {
+                queue.pass_ended();
+                bus_timeout(async {
+                    while calls.closed.lock().unwrap().is_empty() {
+                        Timer::after(Duration::from_millis(10)).await;
+                    }
+                    Ok(())
+                })
+                .await
+                .expect("the active notice should close while the worker is running");
+                assert_eq!(*calls.closed.lock().unwrap(), [1]);
+                drop(queue);
+            };
+            futures::join!(
+                run(
+                    Some(bus),
+                    incoming,
+                    actions,
+                    viewing,
+                    NotificationMode::On,
+                    store,
+                    account_id
+                ),
+                verify,
+            );
+        });
+    }
+
+    #[test]
     fn a_late_notify_reply_is_kept_and_a_group_folds_in_unread_singles_and_groups() {
         let (_daemon, address) = TestBus::start();
         futures::executor::block_on(async {
@@ -372,7 +448,7 @@ mod daemon {
         let (_daemon, address) = TestBus::start();
         futures::executor::block_on(async {
             let calls = Arc::new(Calls::default());
-            let (_service, mut bus) = setup(&address, calls.clone()).await;
+            let (service, mut bus) = setup(&address, calls.clone()).await;
             let unread = (1..=2).map(|n| arrival(n).id).collect::<HashSet<_>>();
             bus.prepare_delivery().await.unwrap();
             for n in 1..=2 {
@@ -391,7 +467,30 @@ mod daemon {
             bus.close(|_| true).await;
             assert_eq!(*calls.closed.lock().unwrap(), [1, 1]);
             assert_eq!(bus.active[0].receipt.id, 1);
-            assert!(bus.active[0].closing);
+            assert!(bus.active[0].close_pending);
+
+            service
+                .emit_signal(
+                    None::<&str>,
+                    PATH,
+                    SERVICE,
+                    "ActionInvoked",
+                    &(1_u32, "default"),
+                )
+                .await
+                .unwrap();
+            let signal = bus.signals.next().await.unwrap();
+            let (actions, mut invoked) = unbounded();
+            bus.on_signal(signal.clone(), &actions, 1);
+            assert!(
+                invoked.try_recv().is_err(),
+                "discard actions from an old privacy mode"
+            );
+            bus.on_signal(signal, &actions, 0);
+            assert!(matches!(
+                invoked.try_recv().unwrap().action,
+                Action::OpenInbox
+            ));
 
             calls.fail_close.store(1, Relaxed);
             bus.close(|_| false).await;

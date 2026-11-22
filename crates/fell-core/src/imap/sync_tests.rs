@@ -374,6 +374,55 @@ fn inbox_arrivals_skip_history_copies_seen_sent_muted_and_junk() {
 }
 
 #[test]
+fn notice_recheck_excludes_mail_that_became_junk_muted_or_copied_elsewhere() {
+    let server = TestServer::spawn(sample_state());
+    let acct = account("notification-recheck", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    let ids = [crate::MessageId::new("reply@x")];
+    let recheck = || store.unread_inbox_messages(&acct.id, &ids).unwrap();
+    assert_eq!(recheck(), ids);
+
+    let set_folders = |folders: &str| {
+        store
+            .connection()
+            .execute(
+                "UPDATE messages SET folders = ?1 WHERE account_id = ?2 AND message_id = 'reply@x'",
+                rusqlite::params![folders, acct.id.as_str()],
+            )
+            .unwrap();
+    };
+    for folder in ["Sent", "Spam", "Trash"] {
+        set_folders(&format!("INBOX\u{1e}{folder}"));
+        assert!(recheck().is_empty(), "also in {folder}");
+    }
+    set_folders("INBOX");
+    assert_eq!(recheck(), ids);
+
+    let set_keywords = |id: &str, keywords: &str| {
+        store
+            .connection()
+            .execute(
+                "UPDATE message_copies SET keywords = ?1
+                 WHERE account_id = ?2 AND message_id = ?3 AND mailbox = 'INBOX'",
+                rusqlite::params![keywords, acct.id.as_str(), id],
+            )
+            .unwrap();
+    };
+    set_keywords("reply@x", "Project\u{1e}$JuNk");
+    assert!(recheck().is_empty());
+    set_keywords("reply@x", "Project");
+    assert_eq!(recheck(), ids);
+    set_keywords("root@x", "Work\u{1e}$MuTeD");
+    assert!(recheck().is_empty(), "a different message muted the thread");
+}
+
+#[test]
 fn delivery_keywords_do_not_replace_an_imap_copys_labels() {
     let mut state = sample_state();
     state.condstore = true;
