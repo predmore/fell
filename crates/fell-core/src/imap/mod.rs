@@ -1812,10 +1812,24 @@ fn flag_update(
                     .into_iter()
                     .collect(),
             ),
-            _ => (mode.keywords && item.flags_present).then(|| rfc822::keywords(&item.flags)),
+            _ if mode.keywords => item.flags_present.then(|| rfc822::keywords(&item.flags)),
+            _ => None,
         },
+        delivery_keywords: (!mode.keywords && mode.view.is_none() && item.flags_present).then(
+            || {
+                item.flags
+                    .iter()
+                    .filter(|flag| is_delivery_keyword(flag))
+                    .cloned()
+                    .collect()
+            },
+        ),
         modseq: item.modseq,
     }
+}
+
+pub(crate) fn is_delivery_keyword(flag: &str) -> bool {
+    flag.eq_ignore_ascii_case("$Muted") || flag.eq_ignore_ascii_case("$Junk")
 }
 
 /// Reserved IMAP flags and keywords, matched as whole, case-insensitive atoms.
@@ -1879,6 +1893,7 @@ fn arrival_flags(
     if item.modseq.is_none()
         && update.flagged.is_none()
         && update.keywords.is_none()
+        && update.delivery_keywords.is_none()
         && !matches!(mode.view, Some(MailboxViewKind::Starred))
     {
         return None;

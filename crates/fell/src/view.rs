@@ -6,6 +6,7 @@ mod attachment_chips;
 mod diagnostics;
 pub(crate) mod disclosure;
 mod help;
+mod notification_actions;
 mod search;
 
 use std::cell::OnceCell;
@@ -108,7 +109,7 @@ pub fn run(trace_start: Option<Instant>) {
                 if let Some(trace) = &trace {
                     trace.window_created(window);
                 }
-                let view = cx.new(Inbox::new);
+                let view = cx.new(|cx| Inbox::new(window, cx));
                 let focus = view.read(cx).focus.clone();
                 window.focus(&focus);
                 view
@@ -146,6 +147,8 @@ struct ReadIntent {
     /// Undo: select this thread when it is back in the folder, loading the
     /// rows around it if they are not loaded.
     select: Option<ListKey>,
+    /// What the notification opens once its row lands.
+    notification_pane: Option<Pane>,
     /// Rows the list asked for beyond the ones it holds.
     fetch: Fetch,
 }
@@ -155,7 +158,13 @@ impl ReadIntent {
         self.switch |= later.switch;
         self.refresh_open |= later.refresh_open;
         self.changed |= later.changed;
-        self.select = later.select.or(self.select);
+        if later.select.is_some() {
+            self.select = later.select;
+            self.notification_pane = later.notification_pane;
+        } else if later.switch && self.notification_pane.is_some() {
+            self.select = None;
+            self.notification_pane = None;
+        }
         self.fetch = self.fetch.merge(later.fetch);
         self
     }
@@ -443,6 +452,10 @@ const LONG_GLIDE_PX: f32 = 4.0 * ROW_PX;
 
 struct Inbox {
     focus: FocusHandle,
+    notifications: Option<crate::notifications::Queue>,
+    pending_activation: Option<crate::notifications::Activation>,
+    notification_toast: Option<(String, bool)>,
+    window_active: bool,
     /// The mailbox connection's own thread. The window never calls SQLite.
     store: StoreClient,
     startup_crash: Option<std::path::PathBuf>,
@@ -568,7 +581,7 @@ struct Warm {
 const WARM_ROWS: usize = 2;
 
 impl Inbox {
-    fn new(cx: &mut Context<Self>) -> Self {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let startup = mailbox::startup();
         let theme = theme::load();
         let config = startup.config.clone();
@@ -598,12 +611,29 @@ impl Inbox {
         let mut session = Session::new(name, email, initial, startup.keymap);
         session.loading = true;
         session.read_dwell_ms = startup.read_dwell_ms;
+        session.notification_mode = config.as_ref().map(|config| config.notifications);
         if let Some(error) = startup.error {
             session.record_startup_error(error);
         }
         let reader = cx.entity().downgrade();
+        let notifications = config.as_ref().map(|config| {
+            let (queue, invoked) = crate::notifications::start(
+                window.is_window_active(),
+                config.notifications,
+                store.clone(),
+                config.account().id,
+            );
+            Self::watch_notifications(window.window_handle(), invoked, cx);
+            cx.observe_window_activation(window, Self::notification_window_activation)
+                .detach();
+            queue
+        });
         let mut inbox = Self {
             focus: cx.focus_handle(),
+            notifications,
+            pending_activation: None,
+            notification_toast: None,
+            window_active: window.is_window_active(),
             account_id: config
                 .as_ref()
                 .map(|config| config.account().id)
@@ -749,7 +779,7 @@ impl Inbox {
         // Sync opens its own connection only after this one finished opening
         // and migrating the file, so the two never race for the first lock.
         if !store_failed && let Some((config, path)) = sync_with {
-            let (handle, events) = sync_worker::start(config, path);
+            let (handle, events) = sync_worker::start(config, path, self.notifications.clone());
             self.sync = Some(handle);
             self.watch_sync(events, cx);
         }
@@ -990,7 +1020,18 @@ impl Inbox {
         let refresh_labels = self.session.loading || intent.changed || intent.is_refresh();
         let same_scope = folder == self.list_folder && label == self.list_label;
         // A folder the rows on screen do not come from opens at its top.
-        let span = if !same_scope || self.session.threads.is_empty() {
+        let span = if let Some(key) = intent
+            .select
+            .as_ref()
+            .filter(|_| intent.notification_pane.is_some())
+        {
+            FolderSpan::Window {
+                first: Some(key.clone()),
+                last: key.clone(),
+                before: self.session.load_rows / 2,
+                after: self.session.load_rows / 2,
+            }
+        } else if !same_scope || self.session.threads.is_empty() {
             FolderSpan::Top {
                 rows: self.session.load_rows,
             }
@@ -1376,6 +1417,12 @@ impl Inbox {
         }
         // A cursor move that waited for these rows may need more.
         self.issue_fetch(cx);
+        if intent.notification_pane == Some(Pane::Conversation)
+            && let Some(key) = intent.select
+            && self.session.cursor_id.as_deref() == Some(key.thread_id.as_str())
+        {
+            self.open_notification_selection(cx);
+        }
         cx.notify();
     }
 
@@ -2212,6 +2259,11 @@ impl Inbox {
         cx.spawn(async move |this, cx| {
             finish_mailbox_change(reply, |result| {
                 let _ = this.update(cx, |inbox, cx| {
+                    if result.is_ok()
+                        && let Some(queue) = &inbox.notifications
+                    {
+                        queue.refresh();
+                    }
                     let after = done(inbox, result, cx);
                     if inbox.session.search.is_some() {
                         let select = after
@@ -2597,13 +2649,25 @@ impl Inbox {
     }
 
     fn apply_undo(&mut self, cx: &mut Context<Self>) {
+        self.undo_mailbox(None, cx);
+    }
+
+    fn undo_mailbox(
+        &mut self,
+        notice: Option<(crate::notifications::Receipt, i64)>,
+        cx: &mut Context<Self>,
+    ) {
         let account = self.account_id.clone();
         let folder = self.session.folder.clone();
         let reading = folder.clone();
+        let expected = notice.as_ref().map(|(_, action_id)| *action_id);
         self.undos_in_flight += 1;
         self.change_mailbox(
             move |store| {
-                let (action, restored) = store.undo_with_threads(&account)?;
+                let (action, restored) = match expected {
+                    Some(id) => store.undo_notification(&account, id),
+                    None => store.undo_with_threads(&account),
+                }?;
                 let select = restored_folder_key(store, &account, &reading, &restored);
                 Ok((action, restored, select))
             },
@@ -2618,7 +2682,18 @@ impl Inbox {
                                 ..ReadIntent::default()
                             });
                         }
-                        if let Some(target) = action.label_undo_target {
+                        let text = match action.kind {
+                            fell_core::ActionKind::Read => "Marked unread",
+                            fell_core::ActionKind::Unread => "Marked read",
+                            fell_core::ActionKind::Archive if notice.is_some() => {
+                                "Moved back to Inbox"
+                            }
+                            fell_core::ActionKind::Archive => "Moved back",
+                            _ => "Undone",
+                        };
+                        if let Some((receipt, _)) = notice {
+                            inbox.notification_feedback(receipt, text.into(), None, false);
+                        } else if let Some(target) = action.label_undo_target {
                             let (count, subject) = match target {
                                 LabelUndoTarget::Conversation(subject) => {
                                     (1, Some(present::display_safe(&subject)))
@@ -2648,7 +2723,7 @@ impl Inbox {
                                 undo: false,
                             });
                         } else {
-                            inbox.session.show_toast("Undone", false);
+                            inbox.session.show_toast(text, false);
                         }
                         inbox.expire_action_notice(cx);
                         inbox.send_to_server();
@@ -2664,10 +2739,15 @@ impl Inbox {
                     }
                     Err(err) => {
                         let raw = err.to_string();
-                        if raw == "nothing to undo" {
-                            inbox.session.show_toast("Nothing to undo", false);
+                        let (text, alert) = if raw == "nothing to undo" {
+                            ("Nothing to undo".into(), false)
                         } else {
-                            inbox.session.show_toast(raw, true);
+                            (raw, true)
+                        };
+                        if let Some((receipt, _)) = notice {
+                            inbox.notification_feedback(receipt, text, None, alert);
+                        } else {
+                            inbox.session.show_toast(text, alert);
                         }
                         // Resume any folder read held while the undo ran.
                         (inbox.undos_in_flight == 0 && !inbox.read_in_flight)
@@ -3421,6 +3501,9 @@ impl Inbox {
                     .show_toast("No account is set up · run fell account setup", true),
             }
         }
+        if let Some(mode) = step.notification_mode {
+            self.set_notification_mode(mode, cx);
+        }
         // Reads go to the store thread. The list moves on this frame; the
         // conversation follows when its read lands.
         if step.reload_threads
@@ -3852,6 +3935,7 @@ impl Inbox {
 
 impl Render for Inbox {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.track_inbox_visibility(window);
         if !self.session.loading
             && let Some(start) = self.cid_repair.take()
         {
@@ -8449,10 +8533,12 @@ fn palette(
                 .py(px(4.))
                 .children(items.iter().enumerate().map(|(index, item)| {
                     let is_about = item.action == Action::About;
-                    let detail = if is_about {
-                        fell_version::VERSION
-                    } else {
-                        item.binding.as_str()
+                    let detail = match item.action {
+                        Action::About => fell_version::VERSION,
+                        Action::Notifications(mode) if session.notification_mode == Some(mode) => {
+                            "✓"
+                        }
+                        _ => item.binding.as_str(),
                     };
                     let choice = item.clone();
                     div()
@@ -8504,7 +8590,9 @@ fn palette(
                         )
                         .child(
                             div()
-                                .font_family_opt(theme.mono_family.clone())
+                                .when(detail != "✓", |slot| {
+                                    slot.font_family_opt(theme.mono_family.clone())
+                                })
                                 .text_size(px(theme.mono_px.max(12.0)))
                                 .when(is_about, |stamp| {
                                     stamp

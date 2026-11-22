@@ -3,7 +3,11 @@ use std::collections::HashMap;
 use crate::Result;
 use crate::account::{Account, AccountId};
 use crate::backend::MailBackend;
+use crate::folders::FolderRole;
+use crate::imap::decode_cursor;
 use crate::message::{MessageId, MessageParts, RemoteId};
+pub use crate::store::inbox_arrivals::InboxArrival;
+use crate::store::inbox_arrivals::Observer;
 use crate::store::{BodyRequest, ReplyToVerification, Store};
 
 /// Messages per backfill batch. Each batch is one fetch and one commit.
@@ -57,14 +61,38 @@ pub fn sync_with_progress(
     store: &Store,
     progress: &mut dyn FnMut(&SyncReport),
 ) -> Result<SyncReport> {
+    sync_with_arrivals(account, backend, store, progress, None)
+}
+
+/// Like [`sync_with_progress`], with an optional observer of new unread
+/// Inbox messages. The observer runs after each delta's final commit,
+/// even when the pass later fails. A lookup failure only reaches the observer.
+pub fn sync_with_arrivals(
+    account: &Account,
+    backend: &dyn MailBackend,
+    store: &Store,
+    progress: &mut dyn FnMut(&SyncReport),
+    arrivals: Option<&mut dyn FnMut(Result<Vec<InboxArrival>>)>,
+) -> Result<SyncReport> {
     store.upsert_account(account)?;
     let cursor = store.sync_cursor(&account.id)?;
+    let mut observer = arrivals.and_then(|send| {
+        let inbox = FolderRole::Inbox.default_name();
+        let (_, checkpoint) = decode_cursor(cursor.as_ref())
+            .into_iter()
+            .find(|(mailbox, _)| mailbox.eq_ignore_ascii_case(inbox))?;
+        Some(Observer {
+            account,
+            checkpoint,
+            send,
+        })
+    });
     let mut report = SyncReport::default();
     let known = |mailbox: &str, uidvalidity: u32, range: (u32, u32)| {
         store.stored_uids(&account.id, mailbox, uidvalidity, range)
     };
     backend.sync_changes(cursor.as_ref(), &known, &mut |delta| {
-        let writes = store.apply_sync_delta(&account.id, &delta)?;
+        let writes = store.apply_sync_delta_observed(&account.id, &delta, observer.as_mut())?;
         report.changed |= writes.changed;
         let advances_walk = delta.progress.is_some();
         if let Some(folder_progress) = delta.progress {

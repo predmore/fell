@@ -26,6 +26,7 @@ use crate::threading::{ThreadId, resolve_thread_id};
 pub(crate) mod bodies;
 pub(crate) mod copies;
 mod dates;
+pub(crate) mod inbox_arrivals;
 pub(crate) mod intents;
 pub(crate) mod keywords;
 mod part_cache;
@@ -744,6 +745,15 @@ impl Store {
         account_id: &AccountId,
         delta: &MailboxDelta,
     ) -> Result<DeltaWrites> {
+        self.apply_sync_delta_observed(account_id, delta, None)
+    }
+
+    pub(crate) fn apply_sync_delta_observed(
+        &self,
+        account_id: &AccountId,
+        delta: &MailboxDelta,
+        observer: Option<&mut inbox_arrivals::Observer<'_>>,
+    ) -> Result<DeltaWrites> {
         let mut tx = self.begin_sync_write()?;
         let mut merge_roles = MergeRoles::new(delta.roles.as_ref());
         let bridge = (!delta.flags.is_empty() || !delta.links.is_empty())
@@ -754,6 +764,7 @@ impl Store {
             false
         };
         let mut new_messages = 0;
+        let mut inbox_arrivals = Vec::new();
         let keyword_copies: HashSet<_> = if delta.messages.is_empty() {
             HashSet::new()
         } else {
@@ -782,7 +793,14 @@ impl Store {
                 message.labels.clear();
             }
             // A combined delta can carry the listing for these messages.
-            new_messages += usize::from(insert_message(&tx, &message, &mut merge_roles)?);
+            if insert_message(&tx, &message, &mut merge_roles)? {
+                new_messages += 1;
+                if let Some(watch) = &observer
+                    && watch.is_arrival(&message)
+                {
+                    inbox_arrivals.push(message.headers.message_id.clone());
+                }
+            }
             if let Some(date) = delta.deferred_dates.get(&message.remote_id)
                 && message.headers.date_unix == 0
                 && let Some(id) = canonical_id_on(&tx, account_id, &message.headers.message_id)?
@@ -843,6 +861,9 @@ impl Store {
             set_sync_cursor_on(&tx, account_id, cursor)?;
         }
         tx.commit()?;
+        if let Some(watch) = observer {
+            watch.committed(self, &inbox_arrivals);
+        }
         self.seal_private_files()?;
         Ok(DeltaWrites {
             new_messages,
@@ -1058,6 +1079,15 @@ impl Store {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    /// Resolve a message or collapsed alias to its current conversation.
+    pub fn thread_for_message(
+        &self,
+        account: &AccountId,
+        id: &MessageId,
+    ) -> Result<Option<ThreadId>> {
+        thread_id_for_message_id(&self.conn, account, id)
     }
 
     /// The list snippet for a canonical message ID from a search hit.
@@ -3513,8 +3543,12 @@ fn apply_flag(
     bridge: bool,
 ) -> Result<()> {
     let copy = crate::imap::parse_remote_id(&flag.remote_id.0);
-    if let (Some(copy), Some(keywords)) = (&copy, &flag.keywords) {
-        keywords::observe(conn, account_id, copy, flag.modseq, keywords, bridge)?;
+    if let Some(copy) = &copy {
+        if let Some(keywords) = &flag.keywords {
+            keywords::observe(conn, account_id, copy, flag.modseq, keywords, bridge, false)?;
+        } else if let Some(keywords) = &flag.delivery_keywords {
+            keywords::observe(conn, account_id, copy, flag.modseq, keywords, bridge, true)?;
+        }
     }
     let fresh = if let Some(copy) = &copy
         && ((flag.unread.is_some() && flag.modseq.is_some()) || (bridge && flag.flagged.is_some()))
@@ -8476,6 +8510,7 @@ mod tests {
                         unread: Some(false),
                         flagged: None,
                         keywords: None,
+                        delivery_keywords: None,
                         modseq: None,
                     }],
                     cursor: None,

@@ -119,6 +119,12 @@ impl std::fmt::Display for AccountConfigError {
 }
 
 fn read_account_config(path: &Path) -> Result<Option<AccountConfig>, AccountConfigError> {
+    Ok(read_account_config_text(path)?.map(|(config, _)| config))
+}
+
+fn read_account_config_text(
+    path: &Path,
+) -> Result<Option<(AccountConfig, String)>, AccountConfigError> {
     let shown = path.display();
     let unreadable = |err: std::io::Error| {
         AccountConfigError::new(
@@ -142,12 +148,40 @@ fn read_account_config(path: &Path) -> Result<Option<AccountConfig>, AccountConf
         ));
     }
     let text = fs::read_to_string(path).map_err(unreadable)?;
-    AccountConfig::parse(&text).map(Some).map_err(|err| {
+    let config = AccountConfig::parse(&text).map_err(|err| {
         AccountConfigError::new(
             format!("{shown}: {err}"),
             "Fix the settings in account.toml.",
         )
-    })
+    })?;
+    Ok(Some((config, text)))
+}
+
+pub(crate) fn save_notification_mode(
+    account: &AccountId,
+    mode: fell_core::NotificationMode,
+) -> Result<(), String> {
+    let path = account_config_path().ok_or_else(|| "No account is set up".to_string())?;
+    let (config, text) = read_account_config_text(&path)
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| "No account is set up".to_string())?;
+    if config.id != account.as_str() {
+        return Err("The configured account has changed; restart Fell".into());
+    }
+
+    let mut updated = String::with_capacity(text.len() + 30);
+    for line in text.lines() {
+        let key = line.split_once('=').map(|(key, _)| key.trim());
+        if matches!(key, Some("notifications" | "notification_content")) {
+            continue;
+        }
+        updated.push_str(line);
+        updated.push('\n');
+    }
+    use std::fmt::Write as _;
+    let _ = writeln!(updated, "notifications = \"{}\"", mode.as_str());
+    stage_account_text_at(path, &updated)?.publish()?;
+    Ok(())
 }
 
 /// The account file a send from `account` takes its login and SMTP settings
@@ -226,6 +260,10 @@ pub(crate) fn stage_account_config_at(
     path: PathBuf,
     config: &AccountConfig,
 ) -> Result<StagedAccountConfig, String> {
+    stage_account_text_at(path, &config.render())
+}
+
+fn stage_account_text_at(path: PathBuf, config: &str) -> Result<StagedAccountConfig, String> {
     use std::io::Write;
 
     let dir = path.parent().expect("account file has a parent directory");
@@ -234,7 +272,7 @@ pub(crate) fn stage_account_config_at(
     // attempt its own path, so concurrent setup attempts cannot reuse it.
     let mut file =
         tempfile::NamedTempFile::new_in(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
-    file.write_all(config.render().as_bytes())
+    file.write_all(config.as_bytes())
         .and_then(|()| file.as_file().sync_all())
         .map_err(|err| format!("{}: {err}", file.path().display()))?;
     Ok(StagedAccountConfig { path, file })

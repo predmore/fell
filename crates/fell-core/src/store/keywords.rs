@@ -5,7 +5,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::account::AccountId;
-use crate::imap::{RemoteCopy, is_reserved_keyword};
+use crate::imap::{RemoteCopy, is_delivery_keyword, is_reserved_keyword};
 use crate::message::MessageId;
 use crate::search::{IndexedText, sync_terms, terms_for_indexed};
 use crate::{Error, Result};
@@ -19,6 +19,7 @@ pub(super) fn observe(
     modseq: Option<u64>,
     keywords: &[String],
     bridge: bool,
+    delivery_only: bool,
 ) -> Result<()> {
     let mut unique = Vec::new();
     for keyword in keywords {
@@ -49,9 +50,27 @@ pub(super) fn observe(
         return Ok(());
     };
     let before = split_field(&previous);
+    let encoded = if delivery_only {
+        let mut merged: Vec<_> = before
+            .iter()
+            .filter(|keyword| !is_delivery_keyword(keyword))
+            .cloned()
+            .collect();
+        merged.append(&mut unique);
+        let encoded = join_tokens(&merged);
+        if encoded == previous {
+            return Ok(());
+        }
+        unique = merged;
+        encoded
+    } else {
+        encoded
+    };
     // A Bridge observation carries a label mailbox's name. Generic IMAP
     // observations carry raw FLAGS keywords, which we keep on the copy.
-    let is_label = |keyword: &str| bridge || !is_reserved_keyword(keyword);
+    let bridge_view =
+        !delivery_only && bridge && super::views::has_view(conn, account_id, &copy.mailbox)?;
+    let is_label = |keyword: &str| bridge_view || !is_reserved_keyword(keyword);
     let removed = before
         .iter()
         .any(|keyword| is_label(keyword) && !contains(&unique, keyword));

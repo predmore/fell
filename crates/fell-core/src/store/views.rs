@@ -165,13 +165,14 @@ pub(super) fn is_bridge(conn: &Connection, account_id: &AccountId) -> Result<boo
         .query_row([account_id.as_str()], |row| row.get(0))?)
 }
 
-pub(super) fn project_arrival(conn: &Connection, message: &mut Message) -> Result<()> {
+pub(super) fn project_arrival(conn: &Connection, message: &mut Message) -> Result<bool> {
     if let Some(copy) = crate::imap::parse_remote_id(&message.remote_id.0)
         && has_view(conn, &message.account_id, &copy.mailbox)?
     {
         message.folders.retain(|folder| folder != &copy.folder);
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 pub(super) fn refresh_message(conn: &Connection, account_id: &AccountId, id: &str) -> Result<()> {

@@ -22,6 +22,7 @@ fell-core = { workspace = true, features = ["ui-confirm"] }
 fell-render.workspace = true
 fell-version.workspace = true
 gpui.workspace = true
+async-io = "2"
 futures = "0.3"
 gtk = "0.18"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
@@ -38,12 +39,14 @@ smallvec = "1"
 tempfile = "3"
 ureq = { version = "3.5.2", default-features = false, features = ["rustls-no-provider"] }
 unicode-linebreak = "0.1"
+unicode-properties = { version = "0.1.3", default-features = false, features = ["general-category"] }
 unicode-segmentation = "1"
 url = "2.5"
 wayland-client = { version = "0.31", features = ["system"] }
-wayland-protocols = { version = "0.32", features = ["client"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
 wry = { version = "0.57.2", default-features = false, features = ["os-webview"] }
+zbus = "5.19"
 
 [dev-dependencies]
 # Tests check the store starts loading search (`Store::testing_*`). Dev only.

@@ -17,6 +17,7 @@ mod mail_body;
 mod mailbox;
 mod model;
 mod motion;
+mod notifications;
 mod png;
 mod present;
 mod reply_check;

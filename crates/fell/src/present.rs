@@ -1387,6 +1387,7 @@ mod tests {
                             "Travel".into(),
                             "$Projects".into(),
                         ]),
+                        delivery_keywords: None,
                         modseq: None,
                     }],
                     messages: vec![message],

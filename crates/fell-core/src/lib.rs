@@ -35,7 +35,9 @@ pub mod threading;
 pub const MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 
 pub use account::{Account, AccountId, BackendKind};
-pub use account_config::{AccountConfig, PasswordSource, SyncFailureKind, classify_sync_error};
+pub use account_config::{
+    AccountConfig, NotificationMode, PasswordSource, SyncFailureKind, classify_sync_error,
+};
 pub use actions::{ActionKind, FlagChange, LabelChange, LocalAction};
 pub use agent::{
     AgentGrant, AgentSummary, RecordedAction, ReviewDraft, ReviewDraftInput, SavedDraft,
@@ -73,8 +75,8 @@ pub use store::{
     folder_aliases,
 };
 pub use sync::{
-    ReplyToBackfill, ReplyToProgress, SyncReport, fetch_message_bodies, fetch_message_body,
-    fetch_missing_bodies, sync_once, sync_with_progress,
+    InboxArrival, ReplyToBackfill, ReplyToProgress, SyncReport, fetch_message_bodies,
+    fetch_message_body, fetch_missing_bodies, sync_once, sync_with_arrivals, sync_with_progress,
 };
 pub use threading::{ThreadId, header_parent_thread_id, resolve_thread_id};
 

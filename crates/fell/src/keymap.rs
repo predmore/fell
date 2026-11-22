@@ -6,6 +6,8 @@
 
 use std::fmt::Write as _;
 
+use fell_core::NotificationMode;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum KeyId {
     Char(char),
@@ -65,6 +67,7 @@ pub enum Action {
     Spam,
     Undo,
     SyncNow,
+    Notifications(NotificationMode),
     ToggleSelect,
     Visual,
     FullWidth,
@@ -119,6 +122,11 @@ impl Action {
             Self::Spam => "Spam / not spam",
             Self::Undo => "Undo",
             Self::SyncNow => "Sync now",
+            Self::Notifications(NotificationMode::On) => "Notifications: Show sender and subject",
+            Self::Notifications(NotificationMode::Private) => {
+                "Notifications: Hide sender and subject"
+            }
+            Self::Notifications(NotificationMode::Off) => "Notifications: Off",
             Self::ToggleSelect => "Toggle select",
             Self::Visual => "Visual select",
             Self::FullWidth => "Full-width conversation",
@@ -140,7 +148,7 @@ impl Action {
     }
 }
 
-const ALL_ACTIONS: [Action; 47] = [
+const ALL_ACTIONS: [Action; 50] = [
     Action::Next,
     Action::Prev,
     Action::First,
@@ -177,6 +185,9 @@ const ALL_ACTIONS: [Action; 47] = [
     Action::Spam,
     Action::Undo,
     Action::SyncNow,
+    Action::Notifications(NotificationMode::On),
+    Action::Notifications(NotificationMode::Private),
+    Action::Notifications(NotificationMode::Off),
     Action::ToggleSelect,
     Action::Visual,
     Action::FullWidth,
@@ -399,6 +410,22 @@ fn default_bindings() -> Vec<Binding> {
         Action::ToggleQuotes,
         Some("Toggles"),
     );
+    for (key, mode) in [
+        ('o', NotificationMode::On),
+        ('p', NotificationMode::Private),
+        ('f', NotificationMode::Off),
+    ] {
+        bind(
+            &[
+                KeyId::Leader,
+                KeyId::Char('t'),
+                KeyId::Char('n'),
+                KeyId::Char(key),
+            ],
+            Action::Notifications(mode),
+            Some("Notifications"),
+        );
+    }
     bindings
 }
 

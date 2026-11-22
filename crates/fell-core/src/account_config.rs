@@ -19,6 +19,7 @@
 //! # smtp_security = "starttls"  # "plain" only for a loopback address
 //! # sent_folder = "Sent Items"  # only for a server that does not mark its folders
 //! # write_back = true           # send moves and flag changes to the server (off by default)
+//! # notifications = "on"       # "on", "private", or "off"
 //! ```
 //!
 //! Sync learns which folder is Sent, Drafts, Trash and so on from the
@@ -86,6 +87,45 @@ pub struct AccountConfig {
     pub folders: Vec<(FolderRole, String)>,
     /// `write_back = true` sends moves and read and star changes to the server.
     pub write_back: bool,
+    pub notifications: NotificationMode,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NotificationMode {
+    #[default]
+    On,
+    Private,
+    Off,
+}
+
+impl NotificationMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Private => "private",
+            Self::Off => "off",
+        }
+    }
+
+    fn parse(value: Option<Value>, content: Option<Value>) -> Result<Self> {
+        let show_content = content
+            .map(|value| value.flag("notification_content"))
+            .transpose()?
+            .unwrap_or(true);
+        match value {
+            Some(Value::Flag(false)) => Ok(Self::Off),
+            None | Some(Value::Flag(true)) if show_content => Ok(Self::On),
+            None | Some(Value::Flag(true)) => Ok(Self::Private),
+            Some(value) => match value.text("notifications")?.as_str() {
+                "on" => Ok(Self::On),
+                "private" => Ok(Self::Private),
+                "off" => Ok(Self::Off),
+                _ => Err(invalid(
+                    "notifications must be \"on\", \"private\", or \"off\"",
+                )),
+            },
+        }
+    }
 }
 
 impl AccountConfig {
@@ -111,6 +151,7 @@ impl AccountConfig {
             smtp_security: None,
             folders: Vec::new(),
             write_back: false,
+            notifications: NotificationMode::On,
         }
     }
 
@@ -233,6 +274,8 @@ impl AccountConfig {
             .map(|value| value.flag("write_back"))
             .transpose()?
             .unwrap_or(false);
+        let notifications =
+            NotificationMode::parse(get("notifications"), get("notification_content"))?;
         if let Some((key, _)) = fields.first() {
             return Err(invalid(format!("unknown key {key}")));
         }
@@ -252,6 +295,7 @@ impl AccountConfig {
             smtp_security,
             folders,
             write_back,
+            notifications,
         };
         config.validate()?;
         Ok(config)
@@ -343,6 +387,9 @@ impl AccountConfig {
         }
         if self.write_back {
             out.push_str("write_back = true\n");
+        }
+        if self.notifications != NotificationMode::On {
+            push(&mut out, "notifications", self.notifications.as_str());
         }
         out
     }
@@ -757,6 +804,35 @@ mod tests {
             let err = AccountConfig::parse(&format!("{base}{line}")).unwrap_err();
             assert!(err.to_string().contains(message), "{line}: {err}");
         }
+    }
+
+    #[test]
+    fn notifications_default_to_showing_content_and_round_trip() {
+        let base = "email = \"a@b\"\npassword = \"x\"\n";
+        for (setting, expected) in [
+            ("", NotificationMode::On),
+            ("notification_content = false", NotificationMode::Private),
+            (
+                "notifications = true\nnotification_content = false",
+                NotificationMode::Private,
+            ),
+            (
+                "notifications = false\nnotification_content = false",
+                NotificationMode::Off,
+            ),
+            (
+                "notifications = \"on\"\nnotification_content = false",
+                NotificationMode::On,
+            ),
+            ("notifications = \"private\"", NotificationMode::Private),
+            ("notifications = \"off\"", NotificationMode::Off),
+        ] {
+            let config = AccountConfig::parse(&format!("{base}{setting}\n")).unwrap();
+            assert_eq!(config.notifications, expected);
+            assert_eq!(AccountConfig::parse(&config.render()).unwrap(), config);
+            assert!(!config.render().contains("notification_content"));
+        }
+        assert!(AccountConfig::parse(&format!("{base}notifications = \"sometimes\"")).is_err());
     }
 
     #[test]

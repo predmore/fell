@@ -13,7 +13,7 @@ use fell_core::diagnostics::DiagnosticFile;
 use fell_core::onboarding::connection_recovery;
 use fell_core::{
     AccountConfig, BackendKind, Error, FlagChange, FolderRole, FolderRoles, FolderSpan, ListKey,
-    SyncFailureKind, ThreadId, classify_sync_error,
+    NotificationMode, SyncFailureKind, ThreadId, classify_sync_error,
 };
 
 use crate::attachments::{Request as AttachmentRequest, Target as AttachmentTarget};
@@ -369,6 +369,7 @@ pub struct Step {
     pub purge: bool,
     /// Start a sync pass now instead of waiting for the next one.
     pub sync_now: bool,
+    pub notification_mode: Option<NotificationMode>,
     /// Bring back the agent review window that closed last.
     pub reopen_review: bool,
     pub open_diagnostic: Option<DiagnosticFile>,
@@ -473,6 +474,7 @@ pub struct Session {
     pub search_generation: u64,
     folder_list: Option<std::sync::Arc<search::FolderList>>,
     recent_searches: Vec<String>,
+    pub notification_mode: Option<NotificationMode>,
     pub palette_query: String,
     pub palette_index: usize,
     pub folder_query: String,
@@ -562,6 +564,7 @@ impl Session {
             search_generation: 0,
             folder_list: None,
             recent_searches: Vec::new(),
+            notification_mode: None,
             palette_query: String::new(),
             palette_index: 0,
             label_scope: None,
@@ -2292,6 +2295,7 @@ impl Session {
                     | Action::About
                     | Action::Compose
                     | Action::SyncNow
+                    | Action::Notifications(_)
                     | Action::Undo
                     | Action::ReopenReview
                     | Action::Agents
@@ -2578,6 +2582,10 @@ impl Session {
                     sync_now: true,
                     ..Step::default()
                 };
+            }
+            Action::Notifications(mode) => {
+                self.count.clear();
+                step.notification_mode = Some(mode);
             }
             Action::ToggleSelect => {
                 self.count.clear();

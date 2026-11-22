@@ -27,6 +27,9 @@ pub struct FlagUpdate {
     pub flagged: Option<bool>,
     /// A generic IMAP copy's complete keyword list. `None` means no keyword evidence.
     pub keywords: Option<Vec<String>>,
+    /// Replace just the delivery keywords when the backend omits other keywords.
+    /// `Some(Vec::new())` clears `$Muted` and `$Junk` from this copy.
+    pub delivery_keywords: Option<Vec<String>>,
     /// The revision of this copy's flags, when the server supports CONDSTORE.
     pub modseq: Option<u64>,
 }

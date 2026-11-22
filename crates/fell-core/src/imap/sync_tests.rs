@@ -277,6 +277,239 @@ fn local_server_syncs_into_the_store() {
 }
 
 #[test]
+fn inbox_arrivals_skip_history_copies_seen_sent_muted_and_junk() {
+    let mut state = sample_state();
+    let inbox = state
+        .mailboxes
+        .iter_mut()
+        .find(|m| m.name == "INBOX")
+        .unwrap();
+    inbox.messages[1].flags.push("$MuTeD".into());
+    for name in ["Spam", "Trash"] {
+        state.mailboxes.push(FixtureMailbox {
+            name: name.into(),
+            list_flags: String::new(),
+            uidvalidity: 1,
+            uidnext: None,
+            omit_uidnext: false,
+            reject_examine: false,
+            reject_fetch: false,
+            vanished: Vec::new(),
+            messages: Vec::new(),
+        });
+    }
+    let server = TestServer::spawn(state);
+    let acct = account("notifications", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let store = Store::open_in_memory().unwrap();
+    let sync = |arrivals: &mut Vec<_>| {
+        crate::sync_with_arrivals(
+            &acct,
+            &backend,
+            &store,
+            &mut |_| {},
+            Some(&mut |batch| {
+                for arrival in batch.unwrap() {
+                    assert!(store.message(&acct.id, &arrival.id).unwrap().is_some());
+                    arrivals.push(arrival);
+                }
+            }),
+        )
+        .unwrap();
+    };
+    let mut arrivals = Vec::new();
+    sync(&mut arrivals);
+    assert!(arrivals.is_empty());
+
+    {
+        let mut state = server.state.lock().unwrap();
+        for (folder, uid, id, parent, from, flags) in [
+            ("INBOX", 6, "valid@x", None, "Avery <avery@x>", &[][..]),
+            ("INBOX", 7, "seen@x", None, "avery@x", &["\\Seen"][..]),
+            ("INBOX", 8, "mine@x", None, "C@X", &[][..]),
+            ("INBOX", 9, "muted@x", Some("reply@x"), "avery@x", &[][..]),
+            ("INBOX", 10, "junk@x", None, "avery@x", &["$Junk"][..]),
+            ("INBOX", 11, "root@x", None, "avery@x", &[][..]),
+            ("Spam", 1, "spam@x", None, "avery@x", &[][..]),
+            ("Trash", 1, "trash@x", None, "avery@x", &[][..]),
+            ("Sent", 2, "sent@x", None, "avery@x", &[][..]),
+        ] {
+            state
+                .mailboxes
+                .iter_mut()
+                .find(|m| m.name == folder)
+                .unwrap()
+                .messages
+                .push(FixtureMessage {
+                    uid,
+                    flags: flags.iter().map(|flag| (*flag).into()).collect(),
+                    modseq: 2,
+                    body_form: BodyForm::Literal,
+                    raw: raw_message(
+                        id,
+                        parent,
+                        "New",
+                        from,
+                        "Hi Robin,\r\n\r\nThe route map is ready for review.",
+                        "",
+                    ),
+                });
+        }
+    }
+    sync(&mut arrivals);
+    assert_eq!(arrivals.len(), 1);
+    assert_eq!(arrivals[0].id.as_str(), "valid@x");
+    assert_eq!(arrivals[0].sender, "Avery");
+    assert_eq!(
+        arrivals[0].snippet,
+        "Hi Robin, The route map is ready for review."
+    );
+    arrivals.clear();
+    sync(&mut arrivals);
+    assert!(arrivals.is_empty());
+}
+
+#[test]
+fn notice_recheck_excludes_mail_that_became_junk_muted_or_copied_elsewhere() {
+    let server = TestServer::spawn(sample_state());
+    let acct = account("notification-recheck", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    let ids = [crate::MessageId::new("reply@x")];
+    let recheck = || store.unread_inbox_messages(&acct.id, &ids).unwrap();
+    assert_eq!(recheck(), ids);
+
+    let set_folders = |folders: &str| {
+        store
+            .connection()
+            .execute(
+                "UPDATE messages SET folders = ?1 WHERE account_id = ?2 AND message_id = 'reply@x'",
+                rusqlite::params![folders, acct.id.as_str()],
+            )
+            .unwrap();
+    };
+    for folder in ["Sent", "Spam", "Trash"] {
+        set_folders(&format!("INBOX\u{1e}{folder}"));
+        assert!(recheck().is_empty(), "also in {folder}");
+    }
+    set_folders("INBOX");
+    assert_eq!(recheck(), ids);
+
+    let set_keywords = |id: &str, keywords: &str| {
+        store
+            .connection()
+            .execute(
+                "UPDATE message_copies SET keywords = ?1
+                 WHERE account_id = ?2 AND message_id = ?3 AND mailbox = 'INBOX'",
+                rusqlite::params![keywords, acct.id.as_str(), id],
+            )
+            .unwrap();
+    };
+    set_keywords("reply@x", "Project\u{1e}$JuNk");
+    assert!(recheck().is_empty());
+    set_keywords("reply@x", "Project");
+    assert_eq!(recheck(), ids);
+    set_keywords("root@x", "Work\u{1e}$MuTeD");
+    assert!(recheck().is_empty(), "a different message muted the thread");
+}
+
+#[test]
+fn delivery_keywords_do_not_replace_an_imap_copys_labels() {
+    let mut state = sample_state();
+    state.condstore = true;
+    state
+        .mailboxes
+        .iter_mut()
+        .find(|mailbox| mailbox.name == "INBOX")
+        .unwrap()
+        .messages[1]
+        .flags
+        .push("Travel".into());
+    let server = TestServer::spawn(state);
+    let acct = account("delivery-labels", BackendKind::Imap);
+    let full = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let partial = BridgeBackend {
+        account_id: acct.id.clone(),
+        imap: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let store = Store::open_in_memory().unwrap();
+    let message = |id| {
+        store
+            .message(&acct.id, &crate::MessageId::new(id))
+            .unwrap()
+            .unwrap()
+    };
+    let copy_keywords = |uid| {
+        store.connection().query_row(
+            "SELECT keywords FROM message_copies WHERE account_id = ?1 AND mailbox = 'INBOX' AND uid = ?2",
+            rusqlite::params![acct.id.as_str(), uid],
+            |row| row.get::<_, String>(0),
+        ).unwrap()
+    };
+    sync_once(&acct, &full, &store).unwrap();
+    assert_eq!(message("reply@x").labels, ["Travel"]);
+    {
+        let mut state = server.state.lock().unwrap();
+        let inbox = state
+            .mailboxes
+            .iter_mut()
+            .find(|mailbox| mailbox.name == "INBOX")
+            .unwrap();
+        inbox.messages[1].modseq = 2;
+        inbox.messages[1].flags = vec!["\\Seen".into(), "$Muted".into()];
+        inbox.messages.push(FixtureMessage {
+            uid: 6,
+            flags: vec!["Project".into(), "$Junk".into()],
+            modseq: 2,
+            body_form: BodyForm::Literal,
+            raw: raw_message(
+                "new@x",
+                None,
+                "Route notes",
+                "Avery <avery@x>",
+                "See attached notes.",
+                "",
+            ),
+        });
+    }
+    sync_once(&acct, &partial, &store).unwrap();
+    let reply = message("reply@x");
+    assert!(!reply.unread);
+    assert_eq!(reply.labels, ["Travel"]);
+    assert_eq!(copy_keywords(2), "Travel\u{1e}$Muted");
+    assert_eq!(message("new@x").labels, ["Project"]);
+    assert_eq!(copy_keywords(6), "$Junk");
+
+    {
+        let mut state = server.state.lock().unwrap();
+        let inbox = state
+            .mailboxes
+            .iter_mut()
+            .find(|mailbox| mailbox.name == "INBOX")
+            .unwrap();
+        inbox.messages[1].modseq = 3;
+        inbox.messages[1].flags = vec!["\\Seen".into()];
+    }
+    sync_once(&acct, &partial, &store).unwrap();
+    assert_eq!(message("reply@x").labels, ["Travel"]);
+    assert_eq!(copy_keywords(2), "Travel");
+}
+
+#[test]
 fn second_sync_fetches_only_new_uids() {
     let server = TestServer::spawn(sample_state());
     let acct = account("a1", BackendKind::Imap);
