@@ -2744,6 +2744,8 @@ impl Inbox {
                         };
                         if let Some((receipt, _)) = notice {
                             inbox.notification_feedback(receipt, text.into(), None, false);
+                        } else if let Some(notice) = note_notice {
+                            inbox.session.show_toast(notice, false);
                         } else if let Some(target) = action.label_undo_target {
                             let (count, subject) = match target {
                                 LabelUndoTarget::Conversation(subject) => {
@@ -2774,7 +2776,7 @@ impl Inbox {
                                 undo: false,
                             });
                         } else {
-                            inbox.session.show_toast(note_notice.unwrap_or(text), false);
+                            inbox.session.show_toast(text, false);
                         }
                         inbox.expire_action_notice(cx);
                         inbox.send_to_server();
@@ -5566,7 +5568,11 @@ fn thread_list(
                                         frame: still_frame(row, window),
                                         previous_labels: None,
                                         label_scope: inbox.list_label.clone(),
-                                        unread_note: inbox.session.agent_notes.unread.contains(&row.id),
+                                        unread_note: inbox
+                                            .session
+                                            .agent_notes
+                                            .unread
+                                            .contains(&row.id),
                                     };
                                     Some(slot_layer(dy, 1.0).child(thread_row(
                                         &theme_for_rows,

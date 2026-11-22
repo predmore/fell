@@ -442,6 +442,7 @@ pub(crate) enum NoteUndo {
     Annotation,
     Dismissal { restored: bool },
     Acceptance { snoozed: bool },
+    SnoozeChanged,
 }
 
 impl NoteUndo {
@@ -450,6 +451,7 @@ impl NoteUndo {
             Self::Annotation => "Note removed",
             Self::Dismissal { restored: true } => "Note restored",
             Self::Dismissal { restored: false } => "Note no longer current",
+            Self::SnoozeChanged => "Snooze already changed",
             Self::Acceptance { snoozed: true } => "Snooze undone · suggestion restored",
             Self::Acceptance { snoozed: false } => match action.kind {
                 ActionKind::Archive => "Unarchived · suggestion restored",
@@ -478,8 +480,12 @@ pub(crate) fn undo_local(
         if operation == ANNOTATION {
             crate::agent::undo_recorded(conn, account, note)?;
         }
-        if let Some(id) = related {
-            crate::agent::undo_recorded(conn, account, id)?;
+        if let Some(id) = related
+            && crate::agent::undo_recorded(conn, account, id)?
+                == crate::agent::UndoEffect::SnoozeChanged
+        {
+            // The mailbox action was retired, but the suggestion stays accepted.
+            return Ok(Some(NoteUndo::SnoozeChanged));
         }
         conn.execute(
             "UPDATE local_thread_note_actions SET undone = 1 WHERE action_id = ?1",

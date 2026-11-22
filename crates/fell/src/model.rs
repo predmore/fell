@@ -3888,7 +3888,10 @@ mod tests {
         session
             .agent_notes
             .update(Some(thread.clone()), vec![shown.clone()]);
-        assert!(session.on_key(KeyId::Char('l'), 10).note.is_none());
+        let picker = session.on_key(KeyId::Char('l'), 10);
+        assert!(picker.note.is_none());
+        assert!(picker.read_label_targets);
+        session.on_key(KeyId::Escape, 10);
         session.pane = Pane::Conversation;
         let first = session.on_key(KeyId::Char('l'), 10).note.unwrap();
         assert_eq!(
@@ -3902,7 +3905,10 @@ mod tests {
         session.agent_notes.resolved(&first);
         assert_eq!(session.note().unwrap().suggestions.len(), 2);
         session.perform(Action::ToggleAgentNote, 10);
-        assert!(session.on_key(KeyId::Char('l'), 10).note.is_none());
+        let picker = session.on_key(KeyId::Char('l'), 10);
+        assert!(picker.note.is_none());
+        assert!(picker.read_label_targets);
+        session.on_key(KeyId::Escape, 10);
         let dismiss = session.perform(Action::DismissAgentNote, 10).note.unwrap();
         assert_eq!(dismiss.decision, NoteDecision::Dismiss);
         session.agent_notes.resolved(&dismiss);

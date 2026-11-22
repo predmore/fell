@@ -1254,7 +1254,7 @@ impl Inbox {
             move |store| {
                 store.resolve_thread_note(&account, &thread, &folder, id, decision, scoped)
             },
-            move |inbox, result| match result {
+            move |inbox, result, _| match result {
                 Ok(_) => {
                     inbox.agent_note_resolved(&note);
                     inbox.send_to_server();

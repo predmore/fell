@@ -119,8 +119,8 @@ impl Session {
         self.note_request(NoteDecision::Accept(position))
     }
 
-    /// Keep mnemonic keys when possible and give additional labels or snoozes
-    /// distinct shortcuts. Leave configured actions and chord prefixes intact.
+    /// Reuse shortcuts for the matching mail actions. Give extra suggestions
+    /// distinct keys without taking unrelated bindings or chord prefixes.
     pub fn note_shortcuts(&self, note: &ThreadNote) -> Vec<(i64, Option<KeyId>)> {
         let mut used = HashSet::new();
         let mut keys: Vec<_> = note
@@ -132,7 +132,9 @@ impl Session {
                     Suggestion::Reply => self.single_key(Action::Reply),
                     Suggestion::MarkRead => self.single_key(Action::ToggleUnread),
                     Suggestion::Star => self.single_key(Action::ToggleStar),
-                    Suggestion::Label(_) => self.free_key('l'),
+                    Suggestion::Label(_) => self
+                        .single_key(Action::Label)
+                        .or_else(|| self.free_key('l')),
                     Suggestion::Snooze(_) => self.free_key('Z'),
                 }
                 .filter(|key| used.insert(*key));
