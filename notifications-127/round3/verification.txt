@@ -1,0 +1,32 @@
+Fell issue #127, round 3
+
+Mako 1.11.0 on isolated headless Sway with a private D-Bus session.
+A synthetic IMAP mailbox on loopback supplied all mail.
+Tokyo Night and Catppuccin Latte used 1200×780 logical windows. The narrow run used 620×780.
+
+Dark
+  A burst of five replaced group 1, taking its count from four to nine.
+  Two single popups closed when they folded into a six-message group.
+  Private mode replaced popup 1, changing New mail to 2 new messages.
+  Open Inbox left a single private message unread.
+  Mark as read replaced popup 5 with Marked read and an Undo action.
+  The confirmation carried transient=true and a 5000 ms timeout.
+  Undo restored the unread flag in SQLite and on the synthetic IMAP server.
+
+Light
+  A burst of five replaced group 1, taking its count from four to nine.
+  Two single popups closed when they folded into a six-message group.
+  Private mode replaced popup 1, changing New mail to 2 new messages.
+  Open Inbox left a single private message unread.
+  Mark as read replaced popup 5 with Marked read and an Undo action.
+  The confirmation carried transient=true and a 5000 ms timeout.
+  Undo restored the unread flag in SQLite and on the synthetic IMAP server.
+
+Narrow
+  A burst of five replaced group 1, taking its count from four to nine.
+  Two single popups closed when they folded into a six-message group.
+  Private mode replaced popup 1, changing New mail to 2 new messages.
+  Open Inbox left a single private message unread.
+  Mark as read replaced popup 5 with Marked read and an Undo action.
+  The confirmation carried transient=true and a 5000 ms timeout.
+  Undo restored the unread flag in SQLite and on the synthetic IMAP server.
