@@ -263,11 +263,17 @@ fn record_crash(mut panic: Crash, recovered: bool) {
         .and_then(|paths| write_crash(paths, &mut panic, recovered).ok())
     {
         Some(path) if !recovered => {
+            // Name the report relative to Fell's state directory: the full
+            // path contains the user's home directory, and this line is
+            // likely to be pasted into an issue.
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
             let _ = writeln!(
                 io::stderr(),
-                "Fell panicked on {} at {}. Crash report: {path:?}",
-                panic.thread,
-                panic.location
+                "{}",
+                fatal_line(panic.thread, &panic.location, &name)
             );
         }
         None => {
@@ -280,6 +286,13 @@ fn record_crash(mut panic: Crash, recovered: bool) {
         }
         Some(_) => {}
     }
+}
+
+fn fatal_line(thread: &str, location: &str, report: &str) -> String {
+    format!(
+        "Fell panicked on {thread} at {location}. Crash report: crashes/{report} \
+         in Fell's state directory (`fell --report` bundles it)."
+    )
 }
 
 fn write_crash(paths: &Paths, panic: &mut Crash, recovered: bool) -> io::Result<PathBuf> {
@@ -578,6 +591,19 @@ fn append_recent_log(report: &mut String, paths: &Paths) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_fatal_line_names_the_report_without_a_home_path() {
+        let line = fatal_line("main", "compose.rs:120", "1730000000000000000-4242-0.txt");
+        assert_eq!(
+            line,
+            "Fell panicked on main at compose.rs:120. Crash report: \
+             crashes/1730000000000000000-4242-0.txt in Fell's state directory \
+             (`fell --report` bundles it)."
+        );
+        assert!(!line.contains("/home"));
+        assert!(!line.contains(".local"));
+    }
 
     const SECRETS: [&str; 5] = [
         "pass-example-81234",
