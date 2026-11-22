@@ -49,6 +49,20 @@ pub(crate) fn reflow(
     layered(width, layers, frame.alpha, frame.height, [true; 2])
 }
 
+/// Reveal a measured child at its natural width while its slot grows or closes.
+pub(super) fn reveal(width: f32, height: f32, alpha: f32, child: AnyElement) -> AnyElement {
+    if height >= 1.0 {
+        return div().opacity(alpha).child(child).into_any_element();
+    }
+    layered(
+        width,
+        [div().into_any_element(), child],
+        [0.0, alpha],
+        height,
+        [false, true],
+    )
+}
+
 /// Keep the child's layout width and mask it at the moving padded edge.
 pub(crate) fn clip_column(inset: f32, width: f32, right: f32, child: gpui::Div) -> gpui::Div {
     if inset + width <= right {

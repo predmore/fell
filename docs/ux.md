@@ -51,6 +51,8 @@ Decided with Jon on 2026-11-16. This is the bar the UX judges score against (eve
 - `j`/`k` move between messages when the conversation has focus; `Ctrl-d`/`Ctrl-u` page (Space is the leader).
 - Attachments wrap beneath each expanded message. `a` focuses its files, `h`/`l` move between them, and `Esc` returns to the message. `Enter` or `o` opens the focused file in the desktop's default app. `S` saves it to Downloads, and `Space a s` saves all files on the current message. `Space a R` retries a failed attachment action.
 
+- Agent notes sit above the messages. Open the conversation to see a note's suggestion keys, use `Space a n` to expand or collapse it, and `Space a x` to dismiss it. `Space a t` opens Threads with suggestions. An outlined marker in the list shows a note you haven't seen.
+
 ## Theme: follow Omarchy
 - Read the active Omarchy theme and map its palette (background, foreground, accent, selection, dimmed, error) to Fell's tokens.
 - Live-reload when the Omarchy theme changes, with no restart and no flicker.

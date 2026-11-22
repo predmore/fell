@@ -194,46 +194,57 @@ impl Store {
     ) -> Result<Option<LocalAction>> {
         self.require_account(account_id)?;
         let tx = crate::store::immediate_transaction(self.connection())?;
-        super::ensure_action_schema(&tx)?;
         let roles = scoped.then(|| self.folder_roles(account_id)).transpose()?;
-        let mut writes: Vec<(Row, bool, bool)> = Vec::new();
-        let mut touched = 0;
-        let mut found = false;
-        for (thread, folder) in threads {
-            let mut rows = load_flags(&tx, account_id, thread)?;
-            let is_here = |row: &Row| match &roles {
-                Some(roles) => in_source_folder(row, folder, roles.name(crate::FolderRole::Inbox)),
-                None => in_folder(row, folder),
-            };
-            if scoped {
-                // Search uses stored folder identities. Role aliases may
-                // name different folders, and a sync can remove this scope.
-                rows.retain(&is_here);
-                if rows.is_empty() {
-                    return Err(Error::Action(format!("no messages in {folder}")));
-                }
-            }
-            found |= !rows.is_empty();
-            let before = writes.len();
-            plan(rows, is_here, change, &mut writes);
-            if writes.len() > before {
-                touched += 1;
-            }
-        }
-        if !found {
-            return Err(Error::Action("no such thread".into()));
-        }
-        if writes.is_empty() {
-            return Ok(None);
-        }
-        let action = write_flags(&tx, account_id, change, touched, writes)?;
+        let action = apply_flags_in(&tx, account_id, threads, change, roles.as_ref())?;
         tx.commit()?;
-        Ok(Some(action))
+        Ok(action)
     }
 }
 
+pub(crate) fn apply_flags_in<'a>(
+    conn: &Connection,
+    account_id: &AccountId,
+    threads: impl IntoIterator<Item = (&'a ThreadId, &'a str)>,
+    change: FlagChange,
+    roles: Option<&crate::FolderRoles>,
+) -> Result<Option<LocalAction>> {
+    super::ensure_action_schema(conn)?;
+
+    let mut writes: Vec<(Row, bool, bool)> = Vec::new();
+    let mut touched = 0;
+    let mut found = false;
+    for (thread, folder) in threads {
+        let mut rows = load_flags(conn, account_id, thread)?;
+        let is_here = |row: &Row| match roles {
+            Some(roles) => in_source_folder(row, folder, roles.name(crate::FolderRole::Inbox)),
+            None => in_folder(row, folder),
+        };
+        if roles.is_some() {
+            // Search uses stored folder identities. Role aliases may
+            // name different folders, and a sync can remove this scope.
+            rows.retain(&is_here);
+            if rows.is_empty() {
+                return Err(Error::Action(format!("no messages in {folder}")));
+            }
+        }
+        found |= !rows.is_empty();
+        let before = writes.len();
+        plan(rows, is_here, change, &mut writes);
+        if writes.len() > before {
+            touched += 1;
+        }
+    }
+    if !found {
+        return Err(Error::Action("no such thread".into()));
+    }
+    if writes.is_empty() {
+        return Ok(None);
+    }
+    write_flags(conn, account_id, change, touched, writes).map(Some)
+}
+
 fn write_flags(
-    tx: &Connection,
+    conn: &Connection,
     account_id: &AccountId,
     change: FlagChange,
     touched: usize,
@@ -241,14 +252,14 @@ fn write_flags(
 ) -> Result<LocalAction> {
     let kind = change.kind();
     let summary = change.summary(touched);
-    tx.execute(
+    conn.execute(
         "INSERT INTO local_actions (account_id, kind, summary, undone, created_unix)
              VALUES (?1, ?2, ?3, 0, ?4)",
         params![account_id.as_str(), kind.as_str(), summary, now_unix()],
     )?;
-    let id = tx.last_insert_rowid();
+    let id = conn.last_insert_rowid();
     for (row, unread, starred) in &writes {
-        tx.execute(
+        conn.execute(
             "INSERT INTO local_action_flags (action_id, message_id, unread, starred)
                  VALUES (?1, ?2, ?3, ?4)",
             params![
@@ -258,9 +269,9 @@ fn write_flags(
                 i64::from(row.starred)
             ],
         )?;
-        set_flags(tx, account_id, &row.message_id, *unread, *starred)?;
+        set_flags(conn, account_id, &row.message_id, *unread, *starred)?;
         intents::record(
-            tx,
+            conn,
             account_id,
             &row.message_id,
             (row.unread != *unread).then_some(*unread),

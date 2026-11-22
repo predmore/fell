@@ -11,18 +11,25 @@ pub enum Control {
     Read,
     Triage,
     Draft,
+    Annotate,
     Revoke,
 }
 
 impl Control {
-    // Add Annotate here and to the scope accessors when #129 adds the grant.
-    pub const ALL: [Self; 4] = [Self::Read, Self::Triage, Self::Draft, Self::Revoke];
+    pub const ALL: [Self; 5] = [
+        Self::Read,
+        Self::Triage,
+        Self::Draft,
+        Self::Annotate,
+        Self::Revoke,
+    ];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::Read => "Read",
             Self::Triage => "Triage",
             Self::Draft => "Draft",
+            Self::Annotate => "Annotate",
             Self::Revoke => "Revoke",
         }
     }
@@ -32,6 +39,7 @@ impl Control {
             Self::Read => "Toggle agent read access",
             Self::Triage => "Toggle agent triage access",
             Self::Draft => "Toggle agent draft access",
+            Self::Annotate => "Toggle agent annotation access",
             Self::Revoke => "Revoke agent access",
         }
     }
@@ -41,6 +49,7 @@ impl Control {
             Self::Read => "Read mail and threads.",
             Self::Triage => "Archive, label, star, snooze, mark read. No deletes.",
             Self::Draft => "Write drafts for review. Only you can send.",
+            Self::Annotate => "Leave thread notes and suggest actions.",
             Self::Revoke => "Remove all access to this account.",
         }
     }
@@ -50,6 +59,7 @@ impl Control {
             Self::Read => 'r',
             Self::Triage => 't',
             Self::Draft => 'd',
+            Self::Annotate => 'a',
             Self::Revoke => 'x',
         }
     }
@@ -59,6 +69,7 @@ impl Control {
             Self::Read => grant.read,
             Self::Triage => grant.triage,
             Self::Draft => grant.draft,
+            Self::Annotate => grant.annotate,
             Self::Revoke => return None,
         };
         Some(grant.enabled && granted)
@@ -74,10 +85,11 @@ impl Control {
             Self::Read => &mut grant.read,
             Self::Triage => &mut grant.triage,
             Self::Draft => &mut grant.draft,
+            Self::Annotate => &mut grant.annotate,
             Self::Revoke => return grant,
         };
         *scope = !*scope;
-        grant.enabled = grant.read || grant.triage || grant.draft;
+        grant.enabled = grant.read || grant.triage || grant.draft || grant.annotate;
         grant
     }
 }

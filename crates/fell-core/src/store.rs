@@ -142,6 +142,7 @@ CREATE TABLE IF NOT EXISTS agent_grants (
     can_read INTEGER NOT NULL,
     can_triage INTEGER NOT NULL,
     can_draft INTEGER NOT NULL,
+    can_annotate INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (agent_id, account_id),
     FOREIGN KEY(account_id) REFERENCES accounts(id)
 );
@@ -538,6 +539,7 @@ impl Store {
         ensure_compose_columns(&conn)?;
         ensure_alias_columns(&conn)?;
         ensure_agent_action_columns(&conn)?;
+        crate::notes::ensure_schema(&conn)?;
         copies::ensure_copies(&conn)?;
         conn.execute_batch(views::SCHEMA)?;
         conn.execute_batch(crate::actions::FOLDER_TOMBSTONE_SCHEMA)?;
@@ -4137,9 +4139,10 @@ fn ensure_agent_grant_revision(conn: &Connection) -> Result<()> {
     ensure_triggers(
         conn,
         "agent_grant_revision",
-        "1",
-        "CREATE TRIGGER bump_agent_grant_revision
-         AFTER UPDATE OF enabled, can_read, can_triage, can_draft ON agent_grants
+        "2",
+        "DROP TRIGGER IF EXISTS bump_agent_grant_revision;
+         CREATE TRIGGER bump_agent_grant_revision
+         AFTER UPDATE OF enabled, can_read, can_triage, can_draft, can_annotate ON agent_grants
          BEGIN
              UPDATE agent_grants SET revision = revision + 1
              WHERE agent_id = NEW.agent_id AND account_id = NEW.account_id;
@@ -4426,7 +4429,7 @@ fn fts_is_current(conn: &Connection) -> Result<bool> {
     Ok(stored == wanted)
 }
 
-fn duplicate_column(err: &rusqlite::Error) -> bool {
+pub(crate) fn duplicate_column(err: &rusqlite::Error) -> bool {
     err.to_string()
         .to_ascii_lowercase()
         .contains("duplicate column")

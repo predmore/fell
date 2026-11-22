@@ -385,6 +385,8 @@ pub(super) fn refresh_dirty(conn: &Connection) -> Result<()> {
                     summary.last_date,
                 ])?;
             }
+        } else {
+            crate::notes::drop_thread(conn, account, thread)?;
         }
         unqueue.execute(params![account, thread])?;
     }

@@ -4,7 +4,7 @@ use std::{cell::Cell, rc::Rc};
 
 use gpui::{AnyElement, App, Bounds, IntoElement, LayoutId, Pixels, ScrollHandle, Window, px};
 
-use crate::{frame_log::SharedFrameLog, present};
+use crate::{frame_log::SharedFrameLog, motion, present};
 
 /// A message's index and its top relative to the scroll viewport.
 #[derive(Clone, Copy)]
@@ -38,7 +38,20 @@ impl ReaderLanding {
 
 impl ScrollAnchor {
     /// Capture the first message with a visible part, including a clipped top.
-    pub fn capture(scroll: &ScrollHandle) -> Option<Self> {
+    pub fn capture(scroll: &ScrollHandle, first_message: usize) -> Option<Self> {
+        Self::capture_where(scroll, first_message, |_| true)
+    }
+
+    /// Capture the first message whose header starts inside the viewport.
+    pub fn capture_header(scroll: &ScrollHandle, first_message: usize) -> Option<Self> {
+        Self::capture_where(scroll, first_message, |y| y >= px(0.))
+    }
+
+    fn capture_where(
+        scroll: &ScrollHandle,
+        first_message: usize,
+        visible: impl Fn(Pixels) -> bool,
+    ) -> Option<Self> {
         let view = scroll.bounds();
         // GPUI clamps wheel deltas during prepaint. Capture the position
         // the wheel would have drawn with the old content.
@@ -51,15 +64,24 @@ impl ScrollAnchor {
         } else {
             scroll.top_item()
         };
-        (start..scroll.children_count()).find_map(|index| {
+        (start.max(first_message)..scroll.children_count()).find_map(|index| {
             let item = scroll.bounds_for_item(index)?;
-            visible_top(view, offset, item).map(|y| Self { index, y })
+            visible_top(view, offset, item)
+                .filter(|y| visible(*y))
+                .map(|y| Self {
+                    index: index - first_message,
+                    y,
+                })
         })
     }
 
     /// Capture a selected message, which can be below the first visible one.
-    pub fn capture_message(scroll: &ScrollHandle, index: usize) -> Option<Self> {
-        let item = scroll.bounds_for_item(index)?;
+    pub fn capture_message(
+        scroll: &ScrollHandle,
+        index: usize,
+        first_message: usize,
+    ) -> Option<Self> {
+        let item = scroll.bounds_for_item(first_message + index)?;
         visible_top(scroll.bounds(), clamped_offset(scroll), item).map(|y| Self { index, y })
     }
 }
@@ -110,18 +132,25 @@ impl Reveal {
         }
     }
 
-    pub fn body_anchor(self, scroll: &ScrollHandle, cursor: usize) -> Option<ScrollAnchor> {
+    pub fn body_anchor(
+        self,
+        scroll: &ScrollHandle,
+        cursor: usize,
+        first_message: usize,
+    ) -> Option<ScrollAnchor> {
         if self.pending() {
             return None;
         }
         if let Self::Reading { selected } = self {
-            if selected && let Some(anchor) = ScrollAnchor::capture_message(scroll, cursor) {
+            if selected
+                && let Some(anchor) = ScrollAnchor::capture_message(scroll, cursor, first_message)
+            {
                 return Some(anchor);
             }
         } else if present::conversation_fits(f32::from(scroll.max_offset().height)) {
             return None;
         }
-        ScrollAnchor::capture(scroll)
+        ScrollAnchor::capture(scroll, first_message)
     }
 }
 
@@ -160,8 +189,16 @@ pub(super) struct LandingHold {
     /// Relative viewport position to hold. None reveals a focused chip
     /// with the smallest scroll that brings its bounds into view.
     pub y: Option<Pixels>,
+    pub glide: Option<LandingGlide>,
     /// `FELL_FRAME_LOG`: each offset set here is a `landing` note.
     pub frames: Option<SharedFrameLog>,
+}
+
+/// Interpolate toward a destination measured from each frame's fresh layout.
+#[derive(Clone, Copy)]
+pub(super) struct LandingGlide {
+    pub from: Pixels,
+    pub progress: f32,
 }
 
 impl IntoElement for LandingHold {
@@ -210,7 +247,14 @@ impl gpui::Element for LandingHold {
             let item = window.layout_bounds(item);
             let mut offset = before;
             offset.y = match self.y {
-                Some(y) => offset_to_hold(bounds, item, y),
+                Some(y) => {
+                    let target = offset_to_hold(bounds, item, y);
+                    self.glide.map_or(target, |glide| {
+                        let moving =
+                            motion::lerp(f32::from(glide.from), f32::from(target), glide.progress);
+                        px(motion::snap(moving, window.scale_factor()))
+                    })
+                }
                 None => offset_to_reveal(bounds, item, before.y),
             };
             self.scroll.set_offset(offset);

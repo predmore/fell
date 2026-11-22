@@ -952,6 +952,13 @@ fn append_filters(sql: &mut String, params: &mut Vec<Value>, parsed: &ParsedQuer
     if parsed.has_attachment {
         sql.push_str(" AND m.has_attachment = 1");
     }
+    if parsed.has_suggestions {
+        sql.push_str(
+            " AND m.thread_id IN (
+            SELECT thread_id FROM pending_thread_note_suggestions WHERE account_id = m.account_id
+        )",
+        );
+    }
     if let Some(after) = parsed.after {
         sql.push_str(" AND m.date_unix >= ?");
         params.push(Value::Integer(after));
@@ -1022,6 +1029,7 @@ fn has_filters(parsed: &ParsedQuery) -> bool {
         || !parsed.folders.is_empty()
         || !parsed.labels.is_empty()
         || parsed.has_attachment
+        || parsed.has_suggestions
         || parsed.is_unread
         || parsed.before.is_some()
         || parsed.after.is_some()
@@ -1321,6 +1329,7 @@ struct ParsedQuery {
     folder_keys: Vec<Vec<(String, bool)>>,
     labels: Vec<String>,
     has_attachment: bool,
+    has_suggestions: bool,
     is_unread: bool,
     before: Option<i64>,
     after: Option<i64>,
@@ -1455,13 +1464,15 @@ fn apply_operator(
         "has" => {
             if value.eq_ignore_ascii_case("attachment") {
                 parsed.has_attachment = true;
+            } else if value.eq_ignore_ascii_case("suggestions") {
+                parsed.has_suggestions = true;
             } else {
                 parsed.unmatched_flag = true;
             }
             parsed.corrections.push(Correction {
                 start: value_start,
                 end: value_end,
-                kind: CorrectionKind::Flag(&["attachment"]),
+                kind: CorrectionKind::Flag(&["attachment", "suggestions"]),
             });
         }
         "is" => {

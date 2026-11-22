@@ -44,8 +44,8 @@ pub use session::{
     AddressView, AttachmentView, DraftSession, HunkView, ReplyContext, SendLock, SentBcc, Snapshot,
 };
 pub use workspace::{
-    MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_FILES, draft_file_is_symlink, draft_folder, draft_root,
-    draft_socket_path, image_file, materialize_in, materialize_workspace, read_account, read_owner,
-    require_owner, resolve_inside, write_owner, write_store_link,
+    MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_FILES, control_dir, draft_file_is_symlink, draft_folder,
+    draft_root, draft_socket_path, image_file, materialize_in, materialize_workspace, read_account,
+    read_owner, require_owner, resolve_inside, write_owner, write_store_link,
 };
 pub use writer::SaveWaiter;

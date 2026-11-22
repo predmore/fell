@@ -322,7 +322,7 @@ impl Session {
 
     fn instructions(&self) -> String {
         let mut text = format!(
-            "Fell agent `{}` on account `{}`. This server speaks stdio only. Tools search and read the local mailbox, list folders, threads and labels, triage (label, move, archive, star, mark read or unread, snooze, unsnooze), and save drafts for a person to review in Fell. Triage tools stay off unless that scope is granted. Mailbox changes are rate-limited. request_send only opens the compose editor. There is no send tool that transmits. Mail leaves the machine only from the Fell window. {} ",
+            "Fell agent `{}` on account `{}`. This server speaks stdio only. Tools search and read the local mailbox, list folders, threads and labels, triage (label, move, archive, star, mark read or unread, snooze, unsnooze), leave notes and suggestions, and save drafts for a person to review in Fell. Triage and annotation each require their own scope. Mailbox changes are rate-limited. request_send only opens the compose editor. There is no send tool that transmits. Mail leaves the machine only from the Fell window. {} ",
             self.agent_id,
             self.account_id.as_str(),
             crate::untrusted::UNTRUSTED_NOTE
@@ -338,6 +338,9 @@ impl Session {
                 }
                 if grant.draft {
                     scopes.push("draft");
+                }
+                if grant.annotate {
+                    scopes.push("annotate");
                 }
                 if scopes.is_empty() {
                     text.push_str("The agent is enabled with no scopes.");
@@ -769,6 +772,81 @@ mod tests {
             assert_eq!(response["error"]["message"], "unknown tool", "{name}");
             assert!(response.get("result").is_none());
         }
+    }
+
+    #[test]
+    fn annotation_scope_validation_and_live_revocation() {
+        let (mut session, thread) = session_with(AgentGrant::enabled(true, true, true), "bot");
+        init(&mut session);
+        let args = |summary: String, suggestions: Value| {
+            json!({
+                "thread_id": thread.as_str(), "summary": summary,
+                "suggested_actions": suggestions, "reason": "Reviewed the invoice",
+            })
+        };
+        let valid = args(
+            "Invoice for March".into(),
+            json!(["label:Work", "reply", "mark_read"]),
+        );
+        assert!(!tool_names(&mut session).contains(&"annotate_thread".to_string()));
+        assert!(
+            tool_text(&call(&mut session, "annotate_thread", valid.clone()))
+                .contains("lacks the annotate scope")
+        );
+        session
+            .store
+            .set_agent_grant(
+                &session.account_id,
+                "bot",
+                AgentGrant::enabled(false, false, false).with_annotation(true),
+            )
+            .unwrap();
+        assert_eq!(tool_names(&mut session), ["annotate_thread", "undo"]);
+        for bad in [
+            args("é".repeat(513), json!([])),
+            args("March".into(), json!(["archive", "send"])),
+            args("March".into(), json!(["snooze:tomorrow"])),
+            args("March".into(), json!(["label: "])),
+            args("March".into(), json!([false])),
+        ] {
+            assert_eq!(
+                call(&mut session, "annotate_thread", bad)["result"]["isError"],
+                true
+            );
+        }
+        assert!(
+            session
+                .store
+                .thread_notes(&session.account_id, &thread)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            tool_json(&call(&mut session, "annotate_thread", valid))["kind"],
+            "annotate"
+        );
+        assert_eq!(
+            session
+                .store
+                .thread_notes(&session.account_id, &thread)
+                .unwrap()[0]
+                .actor,
+            "bot"
+        );
+        let undo = tool_json(&call(&mut session, "undo", json!({})));
+        assert_eq!(undo["kind"], "annotate");
+        assert!(
+            session
+                .store
+                .thread_notes(&session.account_id, &thread)
+                .unwrap()
+                .is_empty()
+        );
+        session
+            .store
+            .set_agent_grant(&session.account_id, "bot", AgentGrant::DISABLED)
+            .unwrap();
+        assert!(tool_names(&mut session).is_empty());
     }
 
     #[test]
@@ -1847,7 +1925,10 @@ mod tests {
     /// Mail leaves only from the editor's own send action.
     #[test]
     fn no_tool_transmits_whatever_it_is_given() {
-        let (mut session, thread) = session_with(AgentGrant::enabled(true, true, true), "bot");
+        let (mut session, thread) = session_with(
+            AgentGrant::enabled(true, true, true).with_annotation(true),
+            "bot",
+        );
         init(&mut session);
         let listed = tool_names(&mut session);
         let names = crate::tools::all_tool_names();

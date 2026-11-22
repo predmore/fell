@@ -60,6 +60,10 @@ struct Fonts {
 }
 
 impl Theme {
+    pub(crate) fn note_rule(&self) -> u32 {
+        self.accent
+    }
+
     pub fn is_light(&self) -> bool {
         luminance(self.background) > 0.4
     }
@@ -261,6 +265,12 @@ pub fn strong_border(theme: &Theme) -> u32 {
     }
 }
 
+const NOTE_TEXT_CONTRAST: f64 = 4.7;
+
+pub(crate) fn note_text(color: u32, background: u32) -> u32 {
+    ensure(color, background, NOTE_TEXT_CONTRAST)
+}
+
 pub fn contrast_ok(theme: &Theme) -> bool {
     let surfaces = [theme.background, theme.surface];
     for bg in surfaces {
@@ -285,7 +295,11 @@ pub fn contrast_ok(theme: &Theme) -> bool {
             >= contrast(theme.dimmed, theme.background) + 0.8
         && contrast(theme.on_selection, theme.selection)
             >= contrast(theme.on_selection_dim, theme.selection) + 0.8
-        && contrast(theme.accent, theme.background) >= MARK_CONTRAST
+        && contrast(theme.note_rule(), theme.background) >= MARK_CONTRAST
+        && [theme.dimmed, theme.accent].into_iter().all(|color| {
+            contrast(note_text(color, theme.background), theme.background) >= NOTE_TEXT_CONTRAST
+        })
+        && contrast(strong_border(theme), theme.background) >= MARK_CONTRAST
 }
 
 /// A thread watching the Omarchy theme, GTK settings, and Alacritty config.

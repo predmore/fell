@@ -9,7 +9,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use fs4::fs_std::FileExt;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::store::Store;
 use crate::{AccountId, Result};
@@ -237,6 +237,69 @@ const UPSERT_COMPOSE: &str = "INSERT INTO compose_drafts (
         reply_to_unverified = compose_drafts.reply_to_unverified OR excluded.reply_to_unverified
      WHERE compose_drafts.discarded_action_id IS NULL";
 
+fn save_compose_in(
+    conn: &rusqlite::Connection,
+    draft: &StoredCompose,
+    files: Option<&[ResolvedFile]>,
+    review: Option<&StoredReview>,
+) -> Result<()> {
+    let written = conn.execute(
+        UPSERT_COMPOSE,
+        params![
+            draft.id,
+            draft.account_id.as_str(),
+            draft.fields.from,
+            join_list(&draft.fields.to),
+            join_list(&draft.fields.cc),
+            join_list(&draft.fields.bcc),
+            draft.fields.subject,
+            draft.body,
+            draft.fields.in_reply_to,
+            join_list(&draft.identities),
+            draft.owner,
+            now_unix(),
+            join_list(&draft.reply.references),
+            draft.reply.quote_text,
+            draft.reply.quote_html,
+            draft.reply.reply_to_unverified,
+        ],
+    )?;
+    if written == 0 {
+        return Err(crate::Error::Action("Draft was discarded".into()));
+    }
+    if let Some(files) = files {
+        conn.execute(
+            "DELETE FROM compose_attachments WHERE draft_id = ?1",
+            params![draft.id],
+        )?;
+        for file in files {
+            conn.execute(
+                "INSERT INTO compose_attachments (draft_id, path, name, bytes)
+                     VALUES (?1, ?2, ?3, ?4)",
+                params![draft.id, file.path, file.display_name, file.bytes],
+            )?;
+        }
+    }
+    if let Some(review) = review {
+        conn.execute_batch(REVIEW_SCHEMA)?;
+        conn.execute(
+            "INSERT INTO compose_review (draft_id, text, hunks, next_hunk)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(draft_id) DO UPDATE SET
+                    text = excluded.text,
+                    hunks = excluded.hunks,
+                    next_hunk = excluded.next_hunk",
+            params![
+                draft.id,
+                review.text,
+                review.hunks,
+                i64::try_from(review.next_hunk).unwrap_or(i64::MAX),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 impl Store {
     pub fn save_compose(&self, draft: &StoredCompose) -> Result<()> {
         self.save_compose_parts(draft, Some(&draft.files), None)
@@ -256,62 +319,53 @@ impl Store {
         review: Option<&StoredReview>,
     ) -> Result<()> {
         let tx = crate::store::begin_immediate(&self.conn)?;
-        let written = tx.execute(
-            UPSERT_COMPOSE,
-            params![
-                draft.id,
-                draft.account_id.as_str(),
-                draft.fields.from,
-                join_list(&draft.fields.to),
-                join_list(&draft.fields.cc),
-                join_list(&draft.fields.bcc),
-                draft.fields.subject,
-                draft.body,
-                draft.fields.in_reply_to,
-                join_list(&draft.identities),
-                draft.owner,
-                now_unix(),
-                join_list(&draft.reply.references),
-                draft.reply.quote_text,
-                draft.reply.quote_html,
-                draft.reply.reply_to_unverified,
-            ],
-        )?;
-        if written == 0 {
-            return Err(crate::Error::Action("Draft was discarded".into()));
-        }
-        if let Some(files) = files {
-            tx.execute(
-                "DELETE FROM compose_attachments WHERE draft_id = ?1",
-                params![draft.id],
-            )?;
-            for file in files {
-                tx.execute(
-                    "INSERT INTO compose_attachments (draft_id, path, name, bytes)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![draft.id, file.path, file.display_name, file.bytes],
-                )?;
-            }
-        }
-        if let Some(review) = review {
-            tx.execute_batch(REVIEW_SCHEMA)?;
-            tx.execute(
-                "INSERT INTO compose_review (draft_id, text, hunks, next_hunk)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(draft_id) DO UPDATE SET
-                    text = excluded.text,
-                    hunks = excluded.hunks,
-                    next_hunk = excluded.next_hunk",
-                params![
-                    draft.id,
-                    review.text,
-                    review.hunks,
-                    i64::try_from(review.next_hunk).unwrap_or(i64::MAX),
-                ],
-            )?;
-        }
+        save_compose_in(&tx, draft, files, review)?;
         tx.commit()?;
         self.seal_private_files()?;
+        Ok(())
+    }
+
+    /// Save a normal reply draft and consume the exact suggestion in one write.
+    pub fn save_suggested_reply(
+        &self,
+        draft: &StoredCompose,
+        thread: &crate::ThreadId,
+        note: i64,
+        position: i64,
+    ) -> Result<i64> {
+        let tx = crate::store::begin_immediate(&self.conn)?;
+        let action = crate::notes::accept_reply(&tx, &draft.account_id, thread, note, position)?;
+        save_compose_in(&tx, draft, Some(&draft.files), None)?;
+        self.seal_private_files()?;
+        tx.commit()?;
+        Ok(action)
+    }
+
+    /// Remove a reply that failed to open and restore its exact suggestion.
+    pub fn rollback_suggested_reply(
+        &self,
+        account: &AccountId,
+        draft: &str,
+        action: i64,
+    ) -> Result<()> {
+        let tx = crate::store::begin_immediate(&self.conn)?;
+        let changed = tx.execute(
+            "UPDATE local_actions SET undone = 1
+             WHERE id = ?1 AND account_id = ?2 AND kind = 'accept_suggestion' AND undone = 0",
+            params![action, account.as_str()],
+        )?;
+        if changed > 0 {
+            crate::notes::undo_local(&tx, account, action)?;
+        }
+        let belongs_to_account = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM compose_drafts WHERE id = ?1 AND account_id = ?2)",
+            params![draft, account.as_str()],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if belongs_to_account {
+            delete_compose_in(&tx, draft)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -820,20 +874,19 @@ impl Store {
     /// Forget draft `id`: its row, attachments, review and send record.
     pub(crate) fn delete_compose(&self, id: &str) -> Result<()> {
         let tx = crate::store::begin_immediate(&self.conn)?;
-        tx.execute_batch(REVIEW_SCHEMA)?;
-        tx.execute(
-            "DELETE FROM compose_review WHERE draft_id = ?1",
-            params![id],
-        )?;
-        tx.execute(
-            "DELETE FROM compose_attachments WHERE draft_id = ?1",
-            params![id],
-        )?;
-        tx.execute("DELETE FROM compose_send WHERE draft_id = ?1", params![id])?;
-        tx.execute("DELETE FROM compose_drafts WHERE id = ?1", params![id])?;
+        delete_compose_in(&tx, id)?;
         tx.commit()?;
         Ok(())
     }
+}
+
+fn delete_compose_in(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute_batch(REVIEW_SCHEMA)?;
+    conn.execute("DELETE FROM compose_review WHERE draft_id = ?1", [id])?;
+    conn.execute("DELETE FROM compose_attachments WHERE draft_id = ?1", [id])?;
+    conn.execute("DELETE FROM compose_send WHERE draft_id = ?1", [id])?;
+    conn.execute("DELETE FROM compose_drafts WHERE id = ?1", [id])?;
+    Ok(())
 }
 
 /// Write `stored` out as draft `id`'s folder, attachments included.

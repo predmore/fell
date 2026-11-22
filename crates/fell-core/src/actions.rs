@@ -39,7 +39,7 @@ use crate::store::{Store, ThreadSummary, views};
 use crate::threading::ThreadId;
 use crate::{Error, Result};
 
-mod flags;
+pub(crate) mod flags;
 pub use flags::FlagChange;
 
 /// IMAP inbox (RFC 3501 fixes this name). Matching a folder ignores ASCII case.
@@ -179,6 +179,9 @@ pub enum ActionKind {
     Label,
     Delete,
     DiscardDrafts,
+    AnnotateThread,
+    AcceptSuggestion,
+    DismissNote,
     Read,
     Unread,
     Star,
@@ -194,6 +197,9 @@ pub enum ActionKind {
 impl ActionKind {
     fn as_str(self) -> &'static str {
         match self {
+            Self::AnnotateThread => "annotate_thread",
+            Self::AcceptSuggestion => "accept_suggestion",
+            Self::DismissNote => "dismiss_note",
             Self::Archive => "archive",
             Self::Move => "move",
             Self::Label => "label",
@@ -211,6 +217,9 @@ impl ActionKind {
 
     fn parse(raw: &str) -> Result<Self> {
         match raw {
+            "annotate_thread" => Ok(Self::AnnotateThread),
+            "accept_suggestion" => Ok(Self::AcceptSuggestion),
+            "dismiss_note" => Ok(Self::DismissNote),
             "archive" => Ok(Self::Archive),
             "move" => Ok(Self::Move),
             "label" => Ok(Self::Label),
@@ -311,11 +320,26 @@ impl Store {
         threads: &[ThreadId],
         from_folder: &str,
     ) -> Result<LocalAction> {
+        self.require_account(account_id)?;
+        let tx = crate::store::immediate_transaction(self.connection())?;
+        let action = self.archive_threads_in(&tx, account_id, threads, from_folder)?;
+        tx.commit()?;
+        Ok(action)
+    }
+
+    pub(crate) fn archive_threads_in(
+        &self,
+        conn: &Connection,
+        account_id: &AccountId,
+        threads: &[ThreadId],
+        from_folder: &str,
+    ) -> Result<LocalAction> {
         let from_folder = canonical_folder(from_folder)?;
         let roles = self.folder_roles(account_id)?;
         let archive = roles.archive_name();
         check_archive_route(&roles, &from_folder)?;
-        self.apply_threads(
+        apply_threads_in(
+            conn,
             account_id,
             threads,
             ActionKind::Archive,
@@ -390,12 +414,37 @@ impl Store {
         threads: &[ThreadId],
         change: LabelChange,
     ) -> Result<LocalAction> {
+        self.require_account(account_id)?;
+        let tx = crate::store::immediate_transaction(self.connection())?;
+        let action = self.label_threads_in(&tx, account_id, threads, change)?;
+        tx.commit()?;
+        Ok(action)
+    }
+
+    pub(crate) fn label_thread_in(
+        &self,
+        conn: &Connection,
+        account_id: &AccountId,
+        thread_id: &ThreadId,
+        change: LabelChange,
+    ) -> Result<LocalAction> {
+        self.label_threads_in(conn, account_id, std::slice::from_ref(thread_id), change)
+    }
+
+    fn label_threads_in(
+        &self,
+        conn: &Connection,
+        account_id: &AccountId,
+        threads: &[ThreadId],
+        change: LabelChange,
+    ) -> Result<LocalAction> {
         let (adding, raw) = match &change {
             LabelChange::Add(label) => (true, label.as_str()),
             LabelChange::Remove(label) => (false, label.as_str()),
         };
         let label = canonical_label(raw)?;
-        self.apply_threads(
+        apply_threads_in(
+            conn,
             account_id,
             threads,
             ActionKind::Label,
@@ -737,7 +786,8 @@ impl Store {
         &self,
         account_id: &AccountId,
     ) -> Result<(LocalAction, Vec<ThreadId>)> {
-        self.undo_latest_with_threads(account_id, None)
+        self.undo_with_note(account_id)
+            .map(|(action, _, threads)| (action, threads))
     }
 
     /// Undo the given action only while it is still the account's next undo.
@@ -746,14 +796,23 @@ impl Store {
         account_id: &AccountId,
         action_id: i64,
     ) -> Result<(LocalAction, Vec<ThreadId>)> {
-        self.undo_latest_with_threads(account_id, Some(action_id))
+        self.undo_latest_with_note(account_id, Some(action_id))
+            .map(|(action, _, threads)| (action, threads))
     }
 
-    fn undo_latest_with_threads(
+    /// Undo the latest action with its note feedback and restored thread ids.
+    pub fn undo_with_note(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<(LocalAction, Option<&'static str>, Vec<ThreadId>)> {
+        self.undo_latest_with_note(account_id, None)
+    }
+
+    fn undo_latest_with_note(
         &self,
         account_id: &AccountId,
         expected: Option<i64>,
-    ) -> Result<(LocalAction, Vec<ThreadId>)> {
+    ) -> Result<(LocalAction, Option<&'static str>, Vec<ThreadId>)> {
         self.require_account(account_id)?;
         let tx = crate::store::immediate_transaction(self.connection())?;
         ensure_action_schema(&tx)?;
@@ -775,6 +834,11 @@ impl Store {
                 (0, n) => format!("{n} confirmed in Sent"),
                 (restored, confirmed) => format!("{restored} restored · {confirmed} in Sent"),
             };
+        } else if matches!(
+            action.kind,
+            ActionKind::AnnotateThread | ActionKind::AcceptSuggestion | ActionKind::DismissNote
+        ) {
+            // The note and any linked snooze are restored below.
         } else if action.kind.is_flag() {
             flags::undo(&tx, account_id, &action)?;
         } else if action.kind == ActionKind::Label {
@@ -837,8 +901,11 @@ impl Store {
             params![action.id, account_id.as_str()],
         )?;
         expect_one(changed, "undo")?;
+        // Undoing an annotation also closes its mirror in the agent log.
+        let note =
+            crate::notes::undo_local(&tx, account_id, action.id)?.map(|note| note.notice(&action));
         tx.commit()?;
-        Ok((action, restored_threads))
+        Ok((action, note, restored_threads))
     }
 
     /// Threads with at least one message in `folder`, newest activity first.
@@ -937,36 +1004,48 @@ impl Store {
     ) -> Result<LocalAction> {
         self.require_account(account_id)?;
         let tx = crate::store::immediate_transaction(self.connection())?;
-        ensure_action_schema(&tx)?;
-        let mut rows = Vec::new();
-        let mut seen = HashSet::new();
-        for thread_id in threads {
-            if seen.insert(thread_id.as_str()) {
-                rows.extend(load_thread(&tx, account_id, thread_id)?);
-            }
-        }
-        if rows.is_empty() {
-            return Err(Error::Action("no such thread".into()));
-        }
-        if let Some((to, roles)) = server
-            && roles.is_view(to)
-            && (kind != ActionKind::Archive || roles.get(FolderRole::Archive).is_some())
-        {
-            return Err(Error::Action(format!("{} is a view", roles.label(to))));
-        }
-        let (summary, plans) = plans_for(&tx, &rows)?;
-        if plans.is_empty() {
-            return Err(Error::Action("nothing to change".into()));
-        }
-        let action = record_and_apply(&tx, account_id, kind, &summary, &plans)?;
-        if let Some((to, roles)) = server {
-            let mut routes = BTreeMap::new();
-            add_routes(&mut routes, to, &plans);
-            queue_routes(&tx, account_id, &action, routes, roles)?;
-        }
+        let action = apply_threads_in(&tx, account_id, threads, kind, server, plans_for)?;
         tx.commit()?;
         Ok(action)
     }
+}
+
+fn apply_threads_in(
+    conn: &Connection,
+    account_id: &AccountId,
+    threads: &[ThreadId],
+    kind: ActionKind,
+    server: Option<(&str, &crate::folders::FolderRoles)>,
+    plans_for: impl FnOnce(&Connection, &[SavedRow]) -> Result<(String, Vec<Planned>)>,
+) -> Result<LocalAction> {
+    ensure_action_schema(conn)?;
+    let mut rows = Vec::new();
+    let mut seen = HashSet::new();
+    for thread_id in threads {
+        if seen.insert(thread_id.as_str()) {
+            rows.extend(load_thread(conn, account_id, thread_id)?);
+        }
+    }
+    if rows.is_empty() {
+        return Err(Error::Action("no such thread".into()));
+    }
+    if let Some((to, roles)) = server
+        && roles.is_view(to)
+        && (kind != ActionKind::Archive || roles.get(FolderRole::Archive).is_some())
+    {
+        return Err(Error::Action(format!("{} is a view", roles.label(to))));
+    }
+    let (summary, plans) = plans_for(conn, &rows)?;
+    if plans.is_empty() {
+        return Err(Error::Action("nothing to change".into()));
+    }
+    let action = record_and_apply(conn, account_id, kind, &summary, &plans)?;
+    if let Some((to, roles)) = server {
+        let mut routes = BTreeMap::new();
+        add_routes(&mut routes, to, &plans);
+        queue_routes(conn, account_id, &action, routes, roles)?;
+    }
+    Ok(action)
 }
 
 fn check_archive_route(roles: &FolderRoles, from: &str) -> Result<()> {
@@ -1044,7 +1123,7 @@ fn plan_archive(
     Ok(plans)
 }
 
-fn ensure_action_schema(conn: &Connection) -> Result<()> {
+pub(crate) fn ensure_action_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(ACTION_SCHEMA)?;
     conn.execute_batch(flags::FLAG_SCHEMA)?;
     ensure_snapshot_columns(conn)?;
@@ -1145,7 +1224,7 @@ fn record_and_apply(
     Ok(action)
 }
 
-fn insert_local_action(
+pub(crate) fn insert_local_action(
     conn: &Connection,
     account_id: &AccountId,
     kind: ActionKind,
@@ -1259,6 +1338,7 @@ fn latest_open_action(conn: &Connection, account_id: &AccountId) -> Result<Optio
                AND (
                    EXISTS (SELECT 1 FROM local_action_messages s WHERE s.action_id = a.id)
                    OR EXISTS (SELECT 1 FROM local_action_flags f WHERE f.action_id = a.id)
+                   OR EXISTS (SELECT 1 FROM local_thread_note_actions n WHERE n.action_id = a.id)
                    OR (a.kind = 'discard_drafts' AND EXISTS (
                        SELECT 1 FROM compose_drafts d
                        WHERE d.account_id = a.account_id AND d.discarded_action_id = a.id

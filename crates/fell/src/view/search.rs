@@ -97,6 +97,7 @@ impl Render for CachedPreview {
                 let width = f32::from(window.viewport_size().width);
                 let width = width - list_width(width, inbox.split) - SPLITTER_PX;
                 let frame = ConvFrame {
+                    agent_note: inbox.note_view.frame(inbox.frame_now),
                     anchor: inbox.hold_landing(),
                     frames: inbox.frames.clone(),
                     // The outer pane owns the shield when the preview is stale.
@@ -1493,6 +1494,12 @@ fn row(
         .folder
         .as_ref()
         .map(|folder| inbox.session.roles.label(folder));
+    let unread_note = inbox.session.agent_notes.unread.contains(&row.id);
+    let marker_room = if unread_note {
+        super::agent_notes::MARKER_SLOT + ROW_GAP
+    } else {
+        0.0
+    };
     let RowLine {
         sender_width,
         sender,
@@ -1503,7 +1510,7 @@ fn row(
         detail,
     } = fit_row_line(
         row,
-        list_width,
+        list_width - marker_room,
         folder.as_deref(),
         hit.related,
         [&dates[0], &dates[1]],
@@ -1632,7 +1639,10 @@ fn row(
                         let width = line.width.ceil();
                         shaped_text(line, window).w(width)
                     }),
-                )),
+                ))
+                .when(unread_note, |line| {
+                    line.child(super::agent_notes::marker(theme, selected))
+                }),
         )
         .child(
             div()

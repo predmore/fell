@@ -15,6 +15,8 @@ use crate::threading::ThreadId;
 use crate::{Error, Result};
 
 const ACTION_COLS: &str = "id, account_id, actor, kind, summary, undone, created_unix";
+const SNOOZE_SUMMARY_PREFIX: &str = "snoozed thread until ";
+pub(crate) const SNOOZE_CHANGED_NOTICE: &str = "Snooze already changed";
 
 /// Per-agent access to one account. Missing rows are [`AgentGrant::DISABLED`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +25,7 @@ pub struct AgentGrant {
     pub read: bool,
     pub triage: bool,
     pub draft: bool,
+    pub annotate: bool,
 }
 
 impl AgentGrant {
@@ -31,7 +34,13 @@ impl AgentGrant {
         read: false,
         triage: false,
         draft: false,
+        annotate: false,
     };
+
+    pub const fn with_annotation(mut self, annotate: bool) -> Self {
+        self.annotate = annotate;
+        self
+    }
 
     /// An enabled grant. Scopes that are false stay closed.
     pub const fn enabled(read: bool, triage: bool, draft: bool) -> Self {
@@ -40,6 +49,7 @@ impl AgentGrant {
             read,
             triage,
             draft,
+            annotate: false,
         }
     }
 }
@@ -135,9 +145,10 @@ struct Snap {
 pub const MAX_REVIEW_DRAFT_BODY_CHARS: usize = 100_000;
 
 #[derive(Clone, Copy)]
-enum WriteScope {
+pub(crate) enum WriteScope {
     Triage,
     Draft,
+    Annotate,
 }
 
 impl crate::Store {
@@ -152,13 +163,14 @@ impl crate::Store {
         require_account(&tx, account_id)?;
         tx.execute(
             "INSERT INTO agent_grants (
-                agent_id, account_id, enabled, can_read, can_triage, can_draft
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                agent_id, account_id, enabled, can_read, can_triage, can_draft, can_annotate
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(agent_id, account_id) DO UPDATE SET
                 enabled = excluded.enabled,
                 can_read = excluded.can_read,
                 can_triage = excluded.can_triage,
-                can_draft = excluded.can_draft",
+                can_draft = excluded.can_draft,
+                can_annotate = excluded.can_annotate",
             params![
                 agent_id,
                 account_id.as_str(),
@@ -166,6 +178,7 @@ impl crate::Store {
                 i64::from(grant.read),
                 i64::from(grant.triage),
                 i64::from(grant.draft),
+                i64::from(grant.annotate),
             ],
         )?;
         tx.commit()?;
@@ -174,11 +187,10 @@ impl crate::Store {
     }
 
     /// Every stored grant, revoked ones included, by agent then account.
-    /// `last_action_unix` is the newest logged triage or draft action; reads
-    /// are not logged.
+    /// `last_action_unix` is the newest logged action. Reads are not logged.
     pub fn list_agent_grants(&self) -> Result<Vec<AgentSummary>> {
         let mut stmt = self.conn.prepare(
-            "SELECT g.agent_id, g.account_id, g.enabled, g.can_read, g.can_triage, g.can_draft,
+            "SELECT g.agent_id, g.account_id, g.enabled, g.can_read, g.can_triage, g.can_draft, g.can_annotate,
                     (SELECT MAX(a.created_unix) FROM agent_actions a
                      WHERE a.account_id = g.account_id AND a.actor = 'agent:' || g.agent_id),
                     g.revision
@@ -194,9 +206,10 @@ impl crate::Store {
                     read: row.get::<_, i64>(3)? != 0,
                     triage: row.get::<_, i64>(4)? != 0,
                     draft: row.get::<_, i64>(5)? != 0,
+                    annotate: row.get::<_, i64>(6)? != 0,
                 },
-                last_action_unix: row.get(6)?,
-                revision: row.get(7)?,
+                last_action_unix: row.get(7)?,
+                revision: row.get(8)?,
             })
         })?;
         let mut out = Vec::new();
@@ -216,13 +229,14 @@ impl crate::Store {
     ) -> Result<Option<AgentSummary>> {
         let tx = crate::store::immediate_transaction(&self.conn)?;
         let changed = tx.execute(
-            "UPDATE agent_grants SET enabled = ?1, can_read = ?2, can_triage = ?3, can_draft = ?4
-             WHERE agent_id = ?5 AND account_id = ?6 AND revision = ?7",
+            "UPDATE agent_grants SET enabled = ?1, can_read = ?2, can_triage = ?3, can_draft = ?4, can_annotate = ?5
+             WHERE agent_id = ?6 AND account_id = ?7 AND revision = ?8",
             params![
                 grant.enabled,
                 grant.read,
                 grant.triage,
                 grant.draft,
+                grant.annotate,
                 row.agent_id,
                 row.account_id.as_str(),
                 row.revision,
@@ -490,15 +504,14 @@ impl crate::Store {
         until_unix: i64,
         actor: &str,
     ) -> Result<Option<RecordedAction>> {
-        if until_unix <= 0 {
-            return Err(Error::Invalid(
-                "until_unix must be a positive unix timestamp".into(),
-            ));
-        }
-        let summary = format!("snoozed thread until {until_unix}");
-        self.mutate_thread(account_id, thread_id, actor, "snooze", summary, |message| {
-            message.snooze_until = Some(until_unix);
-        })
+        let actor = require_token(actor, "actor")?;
+        let tx = crate::store::immediate_transaction(&self.conn)?;
+        require_account(&tx, account_id)?;
+        check_actor_grant(&tx, account_id, actor, WriteScope::Triage)?;
+        let result = snooze_in(&tx, account_id, thread_id, until_unix, actor)?;
+        tx.commit()?;
+        self.seal_private_files()?;
+        Ok(result)
     }
 
     /// Save a draft for review. Does not submit or send it.
@@ -639,29 +652,53 @@ impl crate::Store {
         self.undo_inner(account_id, Some(actor))
     }
 
+    /// Undo only the action whose scope the caller checked.
+    pub fn undo_actor_action(
+        &self,
+        account_id: &AccountId,
+        actor: &str,
+        expected: i64,
+    ) -> Result<RecordedAction> {
+        self.undo_checked(
+            account_id,
+            Some(require_token(actor, "actor")?),
+            Some(expected),
+        )
+    }
+
     fn undo_inner(&self, account_id: &AccountId, actor: Option<&str>) -> Result<RecordedAction> {
+        self.undo_checked(account_id, actor, None)
+    }
+
+    fn undo_checked(
+        &self,
+        account_id: &AccountId,
+        actor: Option<&str>,
+        expected: Option<i64>,
+    ) -> Result<RecordedAction> {
         let tx = crate::store::immediate_transaction(&self.conn)?;
         require_account(&tx, account_id)?;
         let Some(mut action) = find_open_action(&tx, account_id, actor)? else {
             return Err(Error::NothingToUndo);
         };
+        if expected.is_some_and(|id| id != action.id) {
+            return Err(Error::Action(
+                "The latest action changed; retry undo".into(),
+            ));
+        }
         if let Some(actor) = actor {
-            let scope = if action.kind == "draft" {
-                WriteScope::Draft
-            } else {
-                WriteScope::Triage
+            let scope = match action.kind.as_str() {
+                "draft" => WriteScope::Draft,
+                "annotate" => WriteScope::Annotate,
+                _ => WriteScope::Triage,
             };
             check_actor_grant(&tx, account_id, actor, scope)?;
         }
-        if action.kind == "draft" {
-            undo_draft(&tx, account_id, action.id)?;
-        } else {
-            undo_messages(&tx, account_id, &action)?;
+        if undo_action(&tx, account_id, &action)? == UndoEffect::SnoozeChanged {
+            action.summary = SNOOZE_CHANGED_NOTICE.into();
+        } else if action.kind == "snooze" {
+            crate::notes::undo_snooze_acceptance(&tx, action.id)?;
         }
-        tx.execute(
-            "UPDATE agent_actions SET undone = 1 WHERE id = ?1",
-            params![action.id],
-        )?;
         tx.commit()?;
         self.seal_private_files()?;
         action.undone = true;
@@ -675,109 +712,192 @@ impl crate::Store {
         actor: &str,
         kind: &str,
         summary: String,
-        mut mutate: impl FnMut(&mut Message),
+        mutate: impl FnMut(&mut Message),
     ) -> Result<Option<RecordedAction>> {
         let actor = require_token(actor, "actor")?;
         let tx = crate::store::immediate_transaction(&self.conn)?;
         require_account(&tx, account_id)?;
         check_actor_grant(&tx, account_id, actor, WriteScope::Triage)?;
-        let label_edit = matches!(kind, "label" | "unlabel")
-            .then(|| LabelEdit::from_summary(&summary))
-            .transpose()?;
-        if let Some(edit) = label_edit {
-            keywords::validate_label(&tx, account_id, edit.label())?;
-        }
-        let mut messages = load_thread(&tx, account_id, thread_id)?;
-        if messages.is_empty() {
-            return Err(Error::UnknownThread);
-        }
-        let before: Vec<Snap> = messages.iter().map(Snap::from_message).collect();
-        for message in &mut messages {
-            mutate(message);
-        }
-        let writes: Vec<(Snap, Snap)> = before
-            .into_iter()
-            .zip(messages.iter().map(Snap::from_message))
-            .filter(|(old, new)| old.differs(new))
-            .collect();
-        if writes.is_empty() {
-            return Ok(None);
-        }
-        let action = insert_action(&tx, account_id, actor, kind, &summary)?;
-        for (old, new) in &writes {
-            let was_keyword = label_edit
-                .map(|edit| {
-                    keywords::record_edit(&tx, account_id, &new.message_id, edit, &old.labels)
-                })
-                .transpose()?;
-            tx.execute(
-                "INSERT INTO agent_action_messages (
-                    action_id, message_id, labels, folders, unread, archived, snooze_until,
-                    starred, label_was_keyword
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    action.id,
-                    old.message_id,
-                    old.labels,
-                    old.folders,
-                    old.unread,
-                    old.archived,
-                    old.snooze_until,
-                    old.starred,
-                    was_keyword,
-                ],
-            )?;
-            if let Some(edit) = label_edit {
-                crate::outbox::labels::queue(&tx, account_id, -action.id, &new.message_id, edit)?;
-                keywords::set_message_labels(&tx, account_id, &new.message_id, &new.labels)?;
-                continue;
-            }
-            tx.execute(
-                "UPDATE messages
-                 SET labels = ?1, folders = ?2, unread = ?3, archived = ?4, snooze_until = ?5,
-                     starred = ?6
-                 WHERE account_id = ?7 AND message_id = ?8",
-                params![
-                    new.labels,
-                    new.folders,
-                    new.unread,
-                    new.archived,
-                    new.snooze_until,
-                    new.starred,
-                    account_id.as_str(),
-                    new.message_id,
-                ],
-            )?;
-        }
-        // Sync keeps a read state an agent set until the server agrees, and
-        // a star until write-back sends it.
-        for (old, new) in &writes {
-            crate::store::intents::record(
-                &tx,
-                account_id,
-                &new.message_id,
-                (old.unread != new.unread).then_some(new.unread != 0),
-                (old.starred != new.starred).then_some(new.starred != 0),
-            )?;
-        }
+        let result = mutate_thread_in(&tx, account_id, thread_id, actor, kind, &summary, mutate)?;
         tx.commit()?;
         self.seal_private_files()?;
-        Ok(Some(action))
+        Ok(result)
     }
 }
 
-fn read_grant(conn: &Connection, account: &AccountId, agent_id: &str) -> Result<AgentGrant> {
+pub(crate) fn snooze_in(
+    conn: &Connection,
+    account_id: &AccountId,
+    thread_id: &ThreadId,
+    until: i64,
+    actor: &str,
+) -> Result<Option<RecordedAction>> {
+    if until <= 0 {
+        return Err(Error::Invalid(
+            "until_unix must be a positive unix timestamp".into(),
+        ));
+    }
+    mutate_thread_in(
+        conn,
+        account_id,
+        thread_id,
+        actor,
+        "snooze",
+        &format!("{SNOOZE_SUMMARY_PREFIX}{until}"),
+        |message| message.snooze_until = Some(until),
+    )
+}
+
+fn mutate_thread_in(
+    conn: &Connection,
+    account_id: &AccountId,
+    thread_id: &ThreadId,
+    actor: &str,
+    kind: &str,
+    summary: &str,
+    mut mutate: impl FnMut(&mut Message),
+) -> Result<Option<RecordedAction>> {
+    let label_edit = matches!(kind, "label" | "unlabel")
+        .then(|| LabelEdit::from_summary(summary))
+        .transpose()?;
+    if let Some(edit) = label_edit {
+        keywords::validate_label(conn, account_id, edit.label())?;
+    }
+    let mut messages = load_thread(conn, account_id, thread_id)?;
+    if messages.is_empty() {
+        return Err(Error::UnknownThread);
+    }
+    let before: Vec<Snap> = messages.iter().map(Snap::from_message).collect();
+    for message in &mut messages {
+        mutate(message);
+    }
+    let writes: Vec<(Snap, Snap)> = before
+        .into_iter()
+        .zip(messages.iter().map(Snap::from_message))
+        .filter(|(old, new)| old.differs(new))
+        .collect();
+    if writes.is_empty() {
+        return Ok(None);
+    }
+    let action = insert_action(conn, account_id, actor, kind, summary)?;
+    for (old, new) in &writes {
+        let was_keyword = label_edit
+            .map(|edit| keywords::record_edit(conn, account_id, &new.message_id, edit, &old.labels))
+            .transpose()?;
+        conn.execute(
+            "INSERT INTO agent_action_messages (
+                    action_id, message_id, labels, folders, unread, archived, snooze_until,
+                    starred, label_was_keyword
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                action.id,
+                old.message_id,
+                old.labels,
+                old.folders,
+                old.unread,
+                old.archived,
+                old.snooze_until,
+                old.starred,
+                was_keyword,
+            ],
+        )?;
+        if let Some(edit) = label_edit {
+            crate::outbox::labels::queue(conn, account_id, -action.id, &new.message_id, edit)?;
+            keywords::set_message_labels(conn, account_id, &new.message_id, &new.labels)?;
+            continue;
+        }
+        conn.execute(
+            "UPDATE messages
+                 SET labels = ?1, folders = ?2, unread = ?3, archived = ?4, snooze_until = ?5,
+                     starred = ?6
+                 WHERE account_id = ?7 AND message_id = ?8",
+            params![
+                new.labels,
+                new.folders,
+                new.unread,
+                new.archived,
+                new.snooze_until,
+                new.starred,
+                account_id.as_str(),
+                new.message_id,
+            ],
+        )?;
+    }
+    // Sync keeps a read state an agent set until the server agrees, and
+    // a star until write-back sends it.
+    for (old, new) in &writes {
+        crate::store::intents::record(
+            conn,
+            account_id,
+            &new.message_id,
+            (old.unread != new.unread).then_some(new.unread != 0),
+            (old.starred != new.starred).then_some(new.starred != 0),
+        )?;
+    }
+    Ok(Some(action))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UndoEffect {
+    Restored,
+    SnoozeChanged,
+}
+
+fn undo_action(
+    conn: &Connection,
+    account_id: &AccountId,
+    action: &RecordedAction,
+) -> Result<UndoEffect> {
+    let effect = if action.kind == "snooze" && !check_snooze_undo(conn, account_id, action)? {
+        UndoEffect::SnoozeChanged
+    } else {
+        match action.kind.as_str() {
+            "draft" => undo_draft(conn, account_id, action.id)?,
+            "annotate" => crate::notes::undo_annotation(conn, action.id)?,
+            _ => undo_messages(conn, account_id, action)?,
+        }
+        UndoEffect::Restored
+    };
+    conn.execute(
+        "UPDATE agent_actions SET undone = 1 WHERE id = ?1",
+        [action.id],
+    )?;
+    Ok(effect)
+}
+
+pub(crate) fn undo_recorded(
+    conn: &Connection,
+    account_id: &AccountId,
+    id: i64,
+) -> Result<UndoEffect> {
+    let action = conn.query_row(
+        &format!("SELECT {ACTION_COLS} FROM agent_actions WHERE id = ?1 AND account_id = ?2"),
+        params![id, account_id.as_str()],
+        map_action,
+    )?;
+    if action.undone {
+        return Ok(UndoEffect::Restored);
+    }
+    undo_action(conn, account_id, &action)
+}
+
+pub(crate) fn read_grant(
+    conn: &Connection,
+    account_id: &AccountId,
+    agent_id: &str,
+) -> Result<AgentGrant> {
     Ok(conn
         .query_row(
-            "SELECT enabled, can_read, can_triage, can_draft
-             FROM agent_grants WHERE agent_id = ?1 AND account_id = ?2",
-            params![agent_id, account.as_str()],
+            "SELECT enabled, can_read, can_triage, can_draft, can_annotate
+         FROM agent_grants WHERE agent_id = ?1 AND account_id = ?2",
+            params![agent_id, account_id.as_str()],
             |row| {
                 Ok(AgentGrant {
                     enabled: row.get(0)?,
                     read: row.get(1)?,
                     triage: row.get(2)?,
                     draft: row.get(3)?,
+                    annotate: row.get(4)?,
                 })
             },
         )
@@ -799,7 +919,7 @@ fn check_actor_grant(
     Ok(())
 }
 
-fn check_write_grant(
+pub(crate) fn check_write_grant(
     conn: &Connection,
     account: &AccountId,
     agent_id: &str,
@@ -812,6 +932,7 @@ fn check_write_grant(
     let (allowed, name) = match scope {
         WriteScope::Triage => (grant.triage, "triage"),
         WriteScope::Draft => (grant.draft, "draft"),
+        WriteScope::Annotate => (grant.annotate, "annotate"),
     };
     if !allowed {
         return Err(Error::Invalid(format!(
@@ -936,7 +1057,7 @@ fn same_folder(a: &str, b: &str) -> bool {
     !aliases.is_empty() && aliases.iter().any(|alias| alias.eq_ignore_ascii_case(b))
 }
 
-fn canonical_label(label: &str) -> Result<String> {
+pub(crate) fn canonical_label(label: &str) -> Result<String> {
     let label = label.trim();
     if label.is_empty() || label.chars().any(|c| c.is_control() || c == '\u{1e}') {
         return Err(Error::Invalid(
@@ -1028,7 +1149,7 @@ fn body_ok(body: &str) -> Result<()> {
     Ok(())
 }
 
-fn now_unix() -> i64 {
+pub(crate) fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
@@ -1058,7 +1179,7 @@ fn load_thread(
     Ok(out)
 }
 
-fn insert_action(
+pub(crate) fn insert_action(
     conn: &Connection,
     account_id: &AccountId,
     actor: &str,
@@ -1180,6 +1301,50 @@ fn undo_messages(conn: &Connection, account_id: &AccountId, action: &RecordedAct
         crate::store::intents::record(conn, account_id, &message_id, unread, starred)?;
     }
     Ok(())
+}
+
+fn check_snooze_undo(
+    conn: &Connection,
+    account_id: &AccountId,
+    action: &RecordedAction,
+) -> Result<bool> {
+    // Existing log entries already record the written timestamp in the summary.
+    let Some(until) = action
+        .summary
+        .strip_prefix(SNOOZE_SUMMARY_PREFIX)
+        .and_then(|value| value.parse::<i64>().ok())
+    else {
+        return Ok(false);
+    };
+    // A missing row needs no restore. Prefer a mismatch with a newer
+    // undoable write over one that can only be retired.
+    let newer_write: Option<bool> = conn
+        .query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM agent_actions AS newer
+                JOIN agent_action_messages AS saved ON saved.action_id = newer.id
+                WHERE newer.account_id = ?2 AND newer.id > ?1 AND newer.undone = 0
+                  AND saved.message_id = m.message_id
+                  AND ((newer.kind = 'unsnooze' AND m.snooze_until IS NULL)
+                    OR (newer.kind = 'snooze' AND newer.summary = ?4 || m.snooze_until))
+             )
+             FROM agent_action_messages AS s
+             JOIN messages AS m ON m.account_id = ?2 AND m.message_id = s.message_id
+             WHERE s.action_id = ?1 AND m.snooze_until IS NOT ?3
+             ORDER BY 1 DESC LIMIT 1",
+            params![action.id, account_id.as_str(), until, SNOOZE_SUMMARY_PREFIX],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match newer_write {
+        Some(true) => Err(snooze_changed_error()),
+        Some(false) => Ok(false),
+        None => Ok(true),
+    }
+}
+
+fn snooze_changed_error() -> Error {
+    Error::Action("Cannot undo snooze · snooze changed".into())
 }
 
 /// Messages whose read state or star undo of `action_id` changes, as
@@ -1396,6 +1561,11 @@ mod tests {
                 "triage scope",
             );
             denied(
+                mcp.snooze_thread(&account, &thread, now_unix() + 3600, "agent:bot")
+                    .unwrap_err(),
+                "triage scope",
+            );
+            denied(
                 mcp.create_review_draft(draft.clone(), "agent:bot")
                     .unwrap_err(),
                 "draft scope",
@@ -1407,7 +1577,7 @@ mod tests {
             assert!(
                 only_message(&mcp, &account, &thread)
                     .iter()
-                    .all(|message| !message.archived)
+                    .all(|message| !message.archived && message.snooze_until.is_none())
             );
             assert_eq!(mcp.list_review_drafts(&account).unwrap().len(), 1);
             let actions = mcp.list_actions(&account).unwrap();
@@ -1416,6 +1586,852 @@ mod tests {
         }
         // The person can undo an existing draft action after revoking.
         assert_eq!(settings.agent_undo(&account).unwrap().kind, "draft");
+    }
+
+    #[test]
+    fn annotation_and_its_agent_undo_recheck_a_scope_changed_by_settings() {
+        let root =
+            std::env::temp_dir().join(format!("fell-annotation-revoke-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("mail.db");
+        let (mcp, account, thread) = seed(Store::open(&path).unwrap());
+        let settings = Store::open(&path).unwrap();
+        let grant = AgentGrant::enabled(true, false, false).with_annotation(true);
+        settings.set_agent_grant(&account, "bot", grant).unwrap();
+        let annotate =
+            || mcp.annotate_thread(&account, &thread, "bot", Some("Summary"), &[], "Reviewed");
+        let action = annotate().unwrap();
+        assert_eq!(mcp.agent_grant(&account, "bot").unwrap(), grant);
+        let before = settings.list_agent_grants().unwrap().remove(0);
+        let after = settings
+            .update_agent_grant(&before, grant.with_annotation(false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(mcp.list_agent_grants().unwrap(), [after]);
+        assert!(
+            settings
+                .update_agent_grant(&before, grant)
+                .unwrap()
+                .is_none()
+        );
+
+        assert!(
+            annotate()
+                .unwrap_err()
+                .to_string()
+                .contains("annotate scope")
+        );
+        assert!(
+            mcp.undo_actor(&account, "agent:bot")
+                .unwrap_err()
+                .to_string()
+                .contains("annotate scope")
+        );
+        assert_eq!(
+            mcp.thread_notes(&account, &thread).unwrap()[0].id,
+            action.id
+        );
+        assert_eq!(settings.agent_undo(&account).unwrap().id, action.id);
+    }
+
+    #[test]
+    fn undoing_a_dismissal_restores_the_latest_withdrawn_note() {
+        let (store, account, thread) = seeded();
+        store
+            .set_agent_grant(
+                &account,
+                "bot",
+                AgentGrant::enabled(false, false, false).with_annotation(true),
+            )
+            .unwrap();
+        let annotate = |summary| {
+            store
+                .annotate_thread(&account, &thread, "bot", Some(summary), &[], "Reviewed")
+                .unwrap()
+        };
+        let older = annotate("Earlier");
+        let latest = annotate("Latest");
+        store
+            .resolve_thread_note(
+                &account,
+                &thread,
+                "INBOX",
+                latest.id,
+                crate::notes::NoteDecision::Dismiss,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            store.undo_actor(&account, "agent:bot").unwrap().id,
+            latest.id
+        );
+        assert_eq!(
+            store.thread_notes(&account, &thread).unwrap()[0].id,
+            older.id
+        );
+        assert_eq!(
+            store.undo_with_note(&account).unwrap().1,
+            Some("Note restored")
+        );
+        assert_eq!(
+            store.thread_notes(&account, &thread).unwrap()[0].id,
+            latest.id
+        );
+        assert_eq!(
+            store.undo_with_note(&account).unwrap().1,
+            Some("Note removed")
+        );
+        assert_eq!(
+            store.thread_notes(&account, &thread).unwrap()[0].id,
+            older.id
+        );
+    }
+
+    #[test]
+    fn undoing_a_superseded_dismissal_keeps_the_replacement() {
+        let (store, account, thread) = seeded();
+        store
+            .set_agent_grant(
+                &account,
+                "bot",
+                AgentGrant::enabled(false, false, false).with_annotation(true),
+            )
+            .unwrap();
+        let annotate = |summary| {
+            store
+                .annotate_thread(&account, &thread, "bot", Some(summary), &[], "Reviewed")
+                .unwrap()
+        };
+        let older = annotate("Earlier");
+        let dismissal = store
+            .resolve_thread_note(
+                &account,
+                &thread,
+                "INBOX",
+                older.id,
+                crate::notes::NoteDecision::Dismiss,
+                false,
+            )
+            .unwrap();
+        store.undo_actor(&account, "agent:bot").unwrap();
+        let newer = annotate("Latest");
+        let tx = crate::store::immediate_transaction(&store.conn).unwrap();
+        let undo = crate::notes::undo_local(&tx, &account, dismissal.id)
+            .unwrap()
+            .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(undo.notice(&dismissal), "Note no longer current");
+        assert_eq!(
+            store.thread_notes(&account, &thread).unwrap()[0].id,
+            newer.id
+        );
+    }
+
+    #[test]
+    fn notes_keep_one_version_per_actor_and_recover_previous_on_undo() {
+        use crate::notes::NoteDecision;
+
+        let (store, account, thread) = seeded();
+        let annotate = |agent: &str, summary: &str, suggestions: &[String]| {
+            store.annotate_thread(
+                &account,
+                &thread,
+                agent,
+                Some(summary),
+                suggestions,
+                "Reviewed",
+            )
+        };
+        assert!(annotate("ada", "No scope", &[]).is_err());
+        let grant = AgentGrant::enabled(false, false, false).with_annotation(true);
+        for actor in ["ada", "bo"] {
+            store.set_agent_grant(&account, actor, grant).unwrap();
+        }
+        assert!(annotate("ada", &"é".repeat(513), &[]).is_err());
+        assert!(annotate("ada", "Invalid", &["trash".into()]).is_err());
+        let first = annotate("ada", &"é".repeat(512), &["archive".into()]).unwrap();
+        let second = annotate("bo", "Another perspective", &[]).unwrap();
+        let latest = annotate("ada", "Newer summary", &["star".into()]).unwrap();
+        let notes = || store.thread_notes(&account, &thread).unwrap();
+        assert_eq!(
+            notes().iter().map(|note| note.id).collect::<Vec<_>>(),
+            [latest.id, second.id]
+        );
+        assert_eq!(notes()[0].summary, "Newer summary");
+        assert!(
+            store
+                .resolve_thread_note(
+                    &account,
+                    &thread,
+                    "INBOX",
+                    first.id,
+                    NoteDecision::Accept(0),
+                    false
+                )
+                .is_err()
+        );
+        store
+            .undo_actor_action(&account, "agent:ada", latest.id)
+            .unwrap();
+        assert_eq!(
+            notes().iter().map(|note| note.id).collect::<Vec<_>>(),
+            [second.id, first.id]
+        );
+        assert_eq!(notes()[1].summary.len(), 1024);
+        store.undo(&account).unwrap();
+        assert_eq!(
+            notes().iter().map(|note| note.id).collect::<Vec<_>>(),
+            [first.id]
+        );
+    }
+
+    #[test]
+    fn purging_the_last_message_removes_note_history_and_reasons() {
+        let store = Store::open_in_memory().unwrap();
+        let account = account("a1");
+        store.upsert_account(&account).unwrap();
+        let mut trash = message(
+            "a1",
+            "old@x",
+            None,
+            "Old mail",
+            "old",
+            false,
+            &["Trash"],
+            &[],
+            10,
+        );
+        trash.headers.proton_conversation_id = Some("123".into());
+        let thread = store.upsert_message(&trash).unwrap();
+        store
+            .set_agent_grant(
+                &account.id,
+                "reviewer",
+                AgentGrant::enabled(false, false, false).with_annotation(true),
+            )
+            .unwrap();
+        let annotate = |summary| {
+            store
+                .annotate_thread(
+                    &account.id,
+                    &thread,
+                    "reviewer",
+                    Some(summary),
+                    &[],
+                    "Private reason",
+                )
+                .unwrap()
+        };
+        annotate("Previous summary");
+        let current = annotate("Latest summary");
+
+        store
+            .resolve_thread_note(
+                &account.id,
+                &thread,
+                "Trash",
+                current.id,
+                crate::notes::NoteDecision::Dismiss,
+                false,
+            )
+            .unwrap();
+        store
+            .purge_threads(&account.id, std::slice::from_ref(&thread), "Trash")
+            .unwrap();
+        for table in [
+            "thread_summary",
+            "thread_notes",
+            "local_thread_note_actions",
+            "agent_actions",
+        ] {
+            let count: i64 = store
+                .conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table}");
+        }
+        assert!(store.undo(&account.id).is_err());
+
+        let mut later = message(
+            "a1",
+            "later@x",
+            None,
+            "New mail",
+            "new",
+            false,
+            &["INBOX"],
+            &[],
+            20,
+        );
+        later.headers.proton_conversation_id = trash.headers.proton_conversation_id;
+        assert_eq!(store.upsert_message(&later).unwrap(), thread);
+        assert!(store.thread_notes(&account.id, &thread).unwrap().is_empty());
+    }
+
+    #[test]
+    fn annotations_filter_invisible_text_and_reject_obscured_labels_and_authors() {
+        let (store, account, thread) = seeded();
+        let grant = AgentGrant::enabled(false, false, false).with_annotation(true);
+        for name in ["reviewer", "reviewer\u{200b}"] {
+            store.set_agent_grant(&account, name, grant).unwrap();
+        }
+        let annotate = |actor: &str, summary: &str, suggestions: &[String]| {
+            store.annotate_thread(
+                &account,
+                &thread,
+                actor,
+                Some(summary),
+                suggestions,
+                "Re\u{061c}viewed",
+            )
+        };
+        let marks =
+            "\u{061c}\u{200b}\u{200c}\u{200d}\u{200f}\u{202e}\u{2060}\u{2064}\u{2069}\u{feff}";
+        let action = annotate("reviewer", &format!("One{marks}\nTwo"), &[]).unwrap();
+        assert_eq!(action.summary, "Reviewed");
+        let note = &store.thread_notes(&account, &thread).unwrap()[0];
+        assert_eq!(note.summary, "One\nTwo");
+        assert_eq!(note.actor, "reviewer");
+        for mark in marks.chars() {
+            assert!(annotate("reviewer", "summary", &[format!("label:$Important{mark}")]).is_err());
+        }
+        assert!(annotate("reviewer\u{200b}", "summary", &[]).is_err());
+    }
+
+    #[test]
+    fn a_suggested_reply_saves_a_draft_only_for_the_exact_pending_note() {
+        use crate::compose::{DraftFields, ReplyParts, StoredCompose};
+
+        let (store, account, thread) = seeded();
+        store
+            .set_agent_grant(
+                &account,
+                "ada",
+                AgentGrant::enabled(false, false, false).with_annotation(true),
+            )
+            .unwrap();
+        let annotation = store
+            .annotate_thread(
+                &account,
+                &thread,
+                "ada",
+                None,
+                &["reply".into()],
+                "Reviewed",
+            )
+            .unwrap();
+        let draft = StoredCompose {
+            id: "c129".into(),
+            account_id: account.clone(),
+            fields: DraftFields {
+                subject: "Re: Invoice March".into(),
+                ..Default::default()
+            },
+            body: String::new(),
+            files: Vec::new(),
+            identities: Vec::new(),
+            owner: String::new(),
+            reply: ReplyParts::default(),
+        };
+        assert!(
+            store
+                .save_suggested_reply(&draft, &thread, annotation.id, 1)
+                .is_err()
+        );
+        assert!(store.load_compose(&draft.id).unwrap().is_none());
+        store
+            .save_suggested_reply(&draft, &thread, annotation.id, 0)
+            .unwrap();
+        assert!(store.load_compose(&draft.id).unwrap().is_some());
+        assert!(
+            store.thread_notes(&account, &thread).unwrap()[0]
+                .suggestions
+                .is_empty()
+        );
+        assert!(
+            store
+                .save_suggested_reply(&draft, &thread, annotation.id, 0)
+                .is_err()
+        );
+        assert_eq!(
+            store.undo_with_note(&account).unwrap().1,
+            Some("Reply draft kept · suggestion restored")
+        );
+        assert_eq!(
+            store.thread_notes(&account, &thread).unwrap()[0]
+                .suggestions
+                .len(),
+            1
+        );
+        assert!(store.load_compose(&draft.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn accepting_and_dismissing_a_note_share_the_normal_undo_stack() {
+        use crate::notes::NoteDecision;
+
+        let (store, account, thread) = seeded();
+        store
+            .set_agent_grant(
+                &account,
+                "ada",
+                AgentGrant::enabled(false, false, false).with_annotation(true),
+            )
+            .unwrap();
+        let annotation = store
+            .annotate_thread(
+                &account,
+                &thread,
+                "ada",
+                Some("Read when ready"),
+                &["star".into(), "label:Follow up".into()],
+                "Reviewed",
+            )
+            .unwrap();
+        let notes = || store.thread_notes(&account, &thread).unwrap();
+        let resolve = |decision| {
+            store.resolve_thread_note(&account, &thread, "INBOX", annotation.id, decision, false)
+        };
+        let messages = || store.thread_messages(&account, &thread).unwrap();
+        assert!(
+            store
+                .unread_note_threads(&account)
+                .unwrap()
+                .contains(thread.as_str())
+        );
+        assert!(!notes()[0].seen);
+        store.see_thread_note(&account, annotation.id).unwrap();
+        assert!(notes()[0].seen);
+        assert!(store.unread_note_threads(&account).unwrap().is_empty());
+        assert_eq!(
+            store
+                .search(&account, "has:suggestions")
+                .unwrap()
+                .hits
+                .len(),
+            1
+        );
+        assert!(!messages().iter().any(|msg| msg.starred));
+        assert_eq!(
+            resolve(NoteDecision::Accept(0)).unwrap().kind,
+            crate::ActionKind::Star
+        );
+        assert!(messages().iter().any(|msg| msg.starred));
+        assert_eq!(notes()[0].suggestions.len(), 1);
+        assert!(resolve(NoteDecision::Accept(0)).is_err());
+        assert_eq!(
+            resolve(NoteDecision::Dismiss).unwrap().kind,
+            crate::ActionKind::DismissNote
+        );
+        assert!(notes().is_empty());
+        assert_eq!(
+            store.latest_thread_note_id(&account, &thread).unwrap(),
+            Some(annotation.id)
+        );
+        assert!(
+            store
+                .search(&account, "has:suggestions")
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+        assert_eq!(
+            store.undo_with_note(&account).unwrap().1,
+            Some("Note restored")
+        );
+        assert_eq!(notes()[0].suggestions.len(), 1);
+        assert_eq!(
+            store.undo_with_note(&account).unwrap().1,
+            Some("Unstarred · restored")
+        );
+        assert_eq!(notes()[0].suggestions.len(), 2);
+        assert!(!messages().iter().any(|msg| msg.starred));
+        store.undo(&account).unwrap();
+        assert!(notes().is_empty());
+        assert!(store.list_actions(&account).unwrap()[0].undone);
+    }
+
+    #[test]
+    fn either_undo_entry_point_restores_a_snooze_suggestion_once() {
+        use crate::notes::NoteDecision;
+
+        for mailbox_undo in [false, true] {
+            let (store, account, thread) = seeded();
+            let prior = now_unix() + 1800;
+            let until = prior + 1800;
+            let prior_action = store
+                .snooze_thread(&account, &thread, prior, "user")
+                .unwrap()
+                .unwrap();
+            store
+                .set_agent_grant(
+                    &account,
+                    "ada",
+                    AgentGrant::enabled(false, false, false).with_annotation(true),
+                )
+                .unwrap();
+            let annotation = store
+                .annotate_thread(
+                    &account,
+                    &thread,
+                    "ada",
+                    None,
+                    &[format!("snooze:{until}")],
+                    "Reviewed",
+                )
+                .unwrap();
+            store
+                .resolve_thread_note(
+                    &account,
+                    &thread,
+                    "INBOX",
+                    annotation.id,
+                    NoteDecision::Accept(0),
+                    false,
+                )
+                .unwrap();
+            let notes = || store.thread_notes(&account, &thread).unwrap();
+            let snoozed_until = || only_message(&store, &account, &thread)[0].snooze_until;
+            assert_eq!(snoozed_until(), Some(until));
+            assert!(notes()[0].suggestions.is_empty());
+
+            if mailbox_undo {
+                assert_eq!(
+                    store.undo_with_note(&account).unwrap().1,
+                    Some("Snooze undone · suggestion restored")
+                );
+            } else {
+                assert_eq!(store.agent_undo(&account).unwrap().kind, "snooze");
+            }
+            assert_eq!(
+                store
+                    .latest_open_action(&account, "user")
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                prior_action.id
+            );
+            assert_eq!(snoozed_until(), Some(prior));
+            assert_eq!(notes()[0].suggestions.len(), 1);
+            assert_eq!(
+                store.undo_with_note(&account).unwrap().1,
+                Some("Note removed")
+            );
+            assert!(store.undo_with_note(&account).is_err());
+            assert_eq!(snoozed_until(), Some(prior));
+        }
+    }
+
+    #[test]
+    fn note_authors_and_labels_reject_invisible_unicode() {
+        let (store, account, thread) = seeded();
+        let grant = AgentGrant::enabled(false, false, false).with_annotation(true);
+        store.set_agent_grant(&account, "ada", grant).unwrap();
+        for ch in ('\u{206a}'..='\u{206f}').chain([
+            '\u{00ad}',
+            '\u{180e}',
+            '\u{034f}',
+            '\u{fe0f}',
+            '\u{e0100}',
+        ]) {
+            let actor = format!("ada{ch}");
+            store.set_agent_grant(&account, &actor, grant).unwrap();
+            let annotate = |actor, suggestions: &[String]| {
+                store.annotate_thread(
+                    &account,
+                    &thread,
+                    actor,
+                    Some("Reviewed"),
+                    suggestions,
+                    "Reviewed",
+                )
+            };
+            assert_eq!(
+                annotate(&actor, &[]).unwrap_err().to_string(),
+                "invalid note author",
+                "U+{:04X}",
+                ch as u32
+            );
+            assert_eq!(
+                annotate("ada", &[format!("label:Work{ch}")])
+                    .unwrap_err()
+                    .to_string(),
+                "invalid suggestion label",
+                "U+{:04X}",
+                ch as u32
+            );
+        }
+        assert!(store.thread_notes(&account, &thread).unwrap().is_empty());
+    }
+
+    fn accept_snooze(store: &Store, account: &AccountId, thread: &ThreadId, until: i64) {
+        use crate::notes::NoteDecision;
+
+        store
+            .set_agent_grant(
+                account,
+                "ada",
+                AgentGrant::enabled(false, true, false).with_annotation(true),
+            )
+            .unwrap();
+        let annotation = store
+            .annotate_thread(
+                account,
+                thread,
+                "ada",
+                None,
+                &[format!("snooze:{until}")],
+                "Reviewed",
+            )
+            .unwrap();
+        store
+            .resolve_thread_note(
+                account,
+                thread,
+                "INBOX",
+                annotation.id,
+                NoteDecision::Accept(0),
+                false,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn mailbox_undo_restores_the_remaining_snoozed_message_after_a_purge() {
+        let (store, account, thread) = seeded();
+        let other = store
+            .upsert_message(&message(
+                "a1",
+                "other@x",
+                None,
+                "Other mail",
+                "separate",
+                true,
+                &["INBOX"],
+                &[],
+                30,
+            ))
+            .unwrap();
+        let older = store
+            .label_thread(&account, &other, crate::LabelChange::Add("Work".into()))
+            .unwrap();
+        let until = now_unix() + 3600;
+        accept_snooze(&store, &account, &thread, until);
+        store.delete_thread(&account, &thread, "INBOX").unwrap();
+        store
+            .purge_threads(&account, std::slice::from_ref(&thread), "Trash")
+            .unwrap();
+        let messages = only_message(&store, &account, &thread);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].snooze_until, Some(until));
+        assert_eq!(
+            store.undo_with_note(&account).unwrap().1,
+            Some("Snooze undone · suggestion restored")
+        );
+        let messages = only_message(&store, &account, &thread);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].snooze_until, None);
+        // Undo of the note publication lies between the snooze and the label.
+        assert_eq!(
+            store.undo_with_note(&account).unwrap().1,
+            Some("Note removed")
+        );
+        assert_eq!(store.undo_with_note(&account).unwrap().0.id, older.id);
+        assert!(only_message(&store, &account, &other)[0].labels.is_empty());
+    }
+
+    #[test]
+    fn mailbox_undo_retires_a_snooze_changed_by_a_duplicate_fold() {
+        let (store, account, thread) = seeded();
+        let until = now_unix() + 3600;
+        accept_snooze(&store, &account, &thread, until);
+        let mut echo = message(
+            "a1",
+            "echo@x",
+            None,
+            "Invoice March",
+            "please pay",
+            true,
+            &["INBOX"],
+            &[],
+            10,
+        );
+        echo.list_id = Some("list.example".into());
+        echo.snooze_until = Some(until + 3600);
+        store.upsert_message(&echo).unwrap();
+        let messages = only_message(&store, &account, &thread);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].snooze_until, echo.snooze_until);
+        assert_eq!(messages[1].snooze_until, Some(until));
+
+        assert_eq!(
+            store.undo_with_note(&account).unwrap().1,
+            Some("Snooze already changed")
+        );
+        assert_eq!(only_message(&store, &account, &thread), messages);
+        assert!(
+            store
+                .latest_open_action(&account, "user")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store.thread_notes(&account, &thread).unwrap()[0]
+                .suggestions
+                .is_empty()
+        );
+        assert_eq!(
+            store.undo_with_note(&account).unwrap().1,
+            Some("Note removed")
+        );
+    }
+
+    #[test]
+    fn agent_undo_retires_a_snooze_changed_by_a_duplicate_fold() {
+        let (store, account, thread) = seeded();
+        store
+            .set_agent_grant(&account, "ada", AgentGrant::enabled(false, true, false))
+            .unwrap();
+        let older = store
+            .mark_thread_read(&account, &thread, "agent:ada")
+            .unwrap()
+            .unwrap();
+        let until = now_unix() + 3600;
+        let snooze = store
+            .snooze_thread(&account, &thread, until, "agent:ada")
+            .unwrap()
+            .unwrap();
+        let mut echo = message(
+            "a1",
+            "echo@x",
+            None,
+            "Invoice March",
+            "please pay",
+            false,
+            &["INBOX"],
+            &[],
+            10,
+        );
+        echo.list_id = Some("list.example".into());
+        echo.snooze_until = Some(until + 3600);
+        store.upsert_message(&echo).unwrap();
+        let folded = only_message(&store, &account, &thread);
+        assert_eq!(folded.len(), 2);
+        assert_eq!(folded[0].snooze_until, echo.snooze_until);
+        assert_eq!(folded[1].snooze_until, Some(until));
+
+        let retired = store.agent_undo(&account).unwrap();
+        assert_eq!(retired.id, snooze.id);
+        assert_eq!(retired.summary, "Snooze already changed");
+        assert!(retired.undone);
+        assert_eq!(only_message(&store, &account, &thread), folded);
+
+        let undone = store.agent_undo(&account).unwrap();
+        assert_eq!(undone.id, older.id);
+        assert_eq!(undone.kind, "mark_read");
+        let restored = only_message(&store, &account, &thread);
+        assert!(restored[0].unread);
+        assert_eq!(restored[0].snooze_until, echo.snooze_until);
+    }
+
+    #[test]
+    fn agent_undo_keeps_the_entry_when_a_newer_agent_changed_the_snooze() {
+        for unsnooze in [false, true] {
+            let (store, account, thread) = seeded();
+            for agent in ["ada", "bo"] {
+                store
+                    .set_agent_grant(&account, agent, AgentGrant::enabled(false, true, false))
+                    .unwrap();
+            }
+            let until = now_unix() + 3600;
+            let older = store
+                .snooze_thread(&account, &thread, until, "agent:ada")
+                .unwrap()
+                .unwrap();
+            let expected = (!unsnooze).then_some(until + 3600);
+            match expected {
+                Some(until) => store.snooze_thread(&account, &thread, until, "agent:bo"),
+                None => store.unsnooze_thread(&account, &thread, "agent:bo"),
+            }
+            .unwrap()
+            .unwrap();
+
+            let err = store
+                .undo_actor_action(&account, "agent:ada", older.id)
+                .unwrap_err();
+            assert_eq!(err.to_string(), "Cannot undo snooze · snooze changed");
+            assert_eq!(
+                store.latest_open_action(&account, "agent:ada").unwrap(),
+                Some(older.clone())
+            );
+            assert!(
+                only_message(&store, &account, &thread)
+                    .iter()
+                    .all(|message| message.snooze_until == expected)
+            );
+            store.undo_actor(&account, "agent:bo").unwrap();
+            assert_eq!(
+                store.undo_actor(&account, "agent:ada").unwrap().id,
+                older.id
+            );
+            assert!(
+                only_message(&store, &account, &thread)
+                    .iter()
+                    .all(|message| message.snooze_until.is_none())
+            );
+        }
+    }
+
+    #[test]
+    fn mailbox_undo_leaves_newer_agent_snoozes_and_unsnoozes_and_can_be_retried() {
+        for unsnooze in [false, true] {
+            let (store, account, thread) = seeded();
+            let until = now_unix() + 3600;
+            accept_snooze(&store, &account, &thread, until);
+            let accepted = store.latest_open_action(&account, "user").unwrap().unwrap();
+            let newer_until = (!unsnooze).then_some(until + 3600);
+            let newer = match newer_until {
+                Some(timestamp) => store.snooze_thread(&account, &thread, timestamp, "agent:ada"),
+                None => store.unsnooze_thread(&account, &thread, "agent:ada"),
+            }
+            .unwrap()
+            .unwrap();
+            let check_snooze = |expected| {
+                assert!(
+                    only_message(&store, &account, &thread)
+                        .iter()
+                        .all(|message| message.snooze_until == expected)
+                );
+            };
+            let pending = || {
+                store.thread_notes(&account, &thread).unwrap()[0]
+                    .suggestions
+                    .len()
+            };
+
+            let err = store.undo_with_note(&account).unwrap_err();
+            assert_eq!(err.to_string(), "Cannot undo snooze · snooze changed");
+            check_snooze(newer_until);
+            assert_eq!(pending(), 0);
+            assert_eq!(
+                store.latest_open_action(&account, "user").unwrap(),
+                Some(accepted)
+            );
+            assert_eq!(
+                store.undo_actor(&account, "agent:ada").unwrap().id,
+                newer.id
+            );
+            check_snooze(Some(until));
+            assert_eq!(pending(), 0);
+            assert_eq!(
+                store.undo_with_note(&account).unwrap().1,
+                Some("Snooze undone · suggestion restored")
+            );
+            check_snooze(None);
+            assert_eq!(pending(), 1);
+        }
     }
 
     #[test]
@@ -1481,6 +2497,7 @@ mod tests {
                     read: true,
                     triage: true,
                     draft: true,
+                    annotate: true,
                 },
             )
             .unwrap();
