@@ -34,7 +34,7 @@ pub enum ThemeKind {
     Light,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Palette {
     bg: u32,
     fg: u32,
@@ -282,8 +282,8 @@ pub struct ComposeView {
     cc_line: String,
     bcc_line: String,
     subject_line: String,
-    field_col: usize,
     recipients: recipients::Completion,
+    styled_cache: Option<(StyledBodyKey, gpui::Entity<CachedStyledBody>)>,
     frames: Option<crate::frame_log::SharedFrameLog>,
     theme: ThemeKind,
     /// The Omarchy theme this window follows, live. `None` uses the
@@ -332,6 +332,39 @@ pub struct ComposeView {
     send_detail_scroll: gpui::ScrollHandle,
 }
 
+#[derive(PartialEq, Eq)]
+struct StyledBodyKey {
+    draft_id: SharedString,
+    revision: u64,
+    hunk: Option<u64>,
+    colors: Palette,
+    family: String,
+}
+
+struct CachedStyledBody {
+    compose: gpui::WeakEntity<ComposeView>,
+    colors: Palette,
+    family: String,
+}
+
+impl Render for CachedStyledBody {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.compose
+            .update(cx, |compose, cx| {
+                let snap = compose
+                    .hub
+                    .with_session(compose.draft_id.as_ref(), |session| session.snapshot());
+                snap.map(|snap| {
+                    compose
+                        .body_area(&snap, self.colors, window, &self.family, cx)
+                        .into_any_element()
+                })
+                .unwrap_or_else(|| div().into_any_element())
+            })
+            .unwrap_or_else(|_| div().into_any_element())
+    }
+}
+
 impl ComposeView {
     pub fn new(
         hub: Arc<DraftHub>,
@@ -367,8 +400,8 @@ impl ComposeView {
             cc_line: join_addrs(&snap.cc),
             bcc_line: join_addrs(&snap.bcc),
             subject_line: snap.subject,
-            field_col: 0,
             recipients: recipients::Completion::default(),
+            styled_cache: None,
             frames: crate::frame_log::FrameLog::from_env(),
             theme: ThemeKind::Dark,
             look: None,
@@ -1242,6 +1275,9 @@ impl ComposeView {
         }
         if key == "escape" {
             if self.field != Field::Body {
+                if self.dismiss_recipient_menu() {
+                    return;
+                }
                 let field = self.field;
                 let committed = self.commit_field(field);
                 if !committed {
@@ -1531,7 +1567,6 @@ impl ComposeView {
                 }
             }
         }
-        let _ = self.field_col;
     }
 
     fn insert_key(&mut self, key: &str, typed: Option<&str>) {
@@ -1831,7 +1866,10 @@ impl Render for ComposeView {
             .and_then(|theme| theme.ui_family.clone())
             .unwrap_or_else(|| "Liberation Sans".into());
         let wide = window.viewport_size().width > px(640.);
-        let overlay = self.recipient_overlay(window, cx, colors);
+        let recipient_theme = self.look.as_ref().unwrap_or_else(|| {
+            crate::theme::builtin_for_compose(matches!(self.theme, ThemeKind::Dark))
+        });
+        let overlay = self.recipient_overlay(window, cx, recipient_theme);
         let feedback = self.send_feedback.feedback(lock, attempt.as_ref());
         if (self.send_panel == SendPanel::ConfirmUnlock && lock != Some(SendLock::MaybeSent))
             || (self.send_panel == SendPanel::Details
@@ -1878,10 +1916,14 @@ impl Render for ComposeView {
             .look
             .as_ref()
             .and_then(|theme| theme.mono_family.clone());
+        let feedback = feedback.map(|feedback| {
+            send_feedback_view(feedback, self.send_panel, &self.send_detail_scroll, colors)
+        });
+        let body = self.body_view(&snap, colors, window, &ui_family, cx);
         div()
             .id("compose")
             .track_focus(&self.focus)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 if let Some(frames) = &this.frames {
                     frames
                         .borrow_mut()
@@ -1889,9 +1931,6 @@ impl Render for ComposeView {
                 }
                 this.on_key(event, cx);
                 this.update_recipient_completion(cx);
-                if matches!(this.field, Field::To | Field::Cc | Field::Bcc) {
-                    window.defer(cx, |window, cx| window.draw(cx).clear());
-                }
                 // Every key can change what is on screen (cursor, focused
                 // edit, status), not only the ones that touch the draft.
                 cx.notify();
@@ -1939,7 +1978,7 @@ impl Render for ComposeView {
                         )
                         .flex_shrink_0(),
                     )
-                    .child(self.body_view(&snap, colors, window, &ui_family, cx))
+                    .child(body)
                     .children(
                         self.quote_view(&snap, colors)
                             .map(|quote| quote.flex_shrink_0()),
@@ -1947,9 +1986,7 @@ impl Render for ComposeView {
                     .children(self.preview.then(|| preview_panel(&snap, colors))),
             )
             .child(attachment_row(&snap, colors, wide).flex_shrink_0())
-            .children(feedback.map(|feedback| {
-                send_feedback_view(feedback, self.send_panel, &self.send_detail_scroll, colors)
-            }))
+            .children(feedback)
             .children(show_status.then(|| {
                 status_bar(
                     mode,
@@ -2132,46 +2169,44 @@ impl ComposeView {
     }
 
     fn body_view(
-        &self,
+        &mut self,
         snap: &Snapshot,
         colors: Palette,
         window: &Window,
         family: &str,
-        cx: &Context<Self>,
+        cx: &mut Context<Self>,
     ) -> gpui::Div {
-        // Room for an agent edit's "was" text: the body, less its padding,
-        // the "was" label and its gap, and a margin for the shaped width
-        // running under the painted.
-        let measure = |text: &str| text_px(window, text, 16.0, family);
-        let was_room = f32::from(window.viewport_size().width) - 40.0 - measure("was") - 8.0 - 8.0;
-        let was_lines = |text: &str| break_lines(text, was_room, &measure);
-        let paint = SourcePaint {
-            colors,
-            font: gpui::font(if self.raw { "monospace" } else { family }.to_owned()),
-            view: cx.weak_entity(),
-            row: self.editor.row,
-            window,
+        let body = if !self.raw && self.field != Field::Body {
+            let key = StyledBodyKey {
+                draft_id: self.draft_id.clone(),
+                revision: snap.revision,
+                hunk: self.focused_hunk,
+                colors,
+                family: family.to_owned(),
+            };
+            if self
+                .styled_cache
+                .as_ref()
+                .is_none_or(|(previous, _)| *previous != key)
+            {
+                let compose = cx.weak_entity();
+                let view = cx.new(|_| CachedStyledBody {
+                    compose,
+                    colors,
+                    family: family.to_owned(),
+                });
+                self.styled_cache = Some((key, view));
+            }
+            let view = self.styled_cache.as_ref().unwrap().1.clone();
+            let mut style = div().flex_1().min_h_0().min_w_0();
+            gpui::AnyView::from(view)
+                .cached(style.style().clone())
+                .into_any_element()
+        } else {
+            self.styled_cache = None;
+            self.body_area(snap, colors, window, family, cx)
+                .into_any_element()
         };
-        let body = div()
-            .id("compose-body")
-            .flex_1()
-            .min_h(px(0.))
-            .overflow_y_scroll()
-            .px_5()
-            .py_2()
-            .child(if self.raw {
-                raw_body(&self.editor, &paint)
-            } else {
-                styled_body(
-                    &self.editor,
-                    &self.folder,
-                    &body_edit_ranges(snap),
-                    self.focused_hunk,
-                    draft_links(snap),
-                    &paint,
-                    &was_lines,
-                )
-            });
         let mut column = div()
             .flex()
             .flex_col()
@@ -2197,6 +2232,49 @@ impl ComposeView {
             );
         }
         column.child(body)
+    }
+
+    fn body_area(
+        &self,
+        snap: &Snapshot,
+        colors: Palette,
+        window: &Window,
+        family: &str,
+        cx: &Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        // Room for an agent edit's "was" text: the body, less its padding,
+        // the "was" label and its gap, and a margin for the shaped width
+        // running under the painted.
+        let measure = |text: &str| text_px(window, text, 16.0, family);
+        let was_room = f32::from(window.viewport_size().width) - 40.0 - measure("was") - 8.0 - 8.0;
+        let was_lines = |text: &str| break_lines(text, was_room, &measure);
+        let paint = SourcePaint {
+            colors,
+            font: gpui::font(if self.raw { "monospace" } else { family }.to_owned()),
+            view: cx.weak_entity(),
+            row: self.editor.row,
+            window,
+        };
+        div()
+            .id("compose-body")
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .px_5()
+            .py_2()
+            .child(if self.raw {
+                raw_body(&self.editor, &paint)
+            } else {
+                styled_body(
+                    &self.editor,
+                    &self.folder,
+                    &body_edit_ranges(snap),
+                    self.focused_hunk,
+                    draft_links(snap),
+                    &paint,
+                    &was_lines,
+                )
+            })
     }
 
     /// The quoted part stored on the draft. Absent when nothing is quoted.
@@ -2748,12 +2826,12 @@ fn field_row(
                     .child(marked(address, index < last))
             }))
     };
+    let inset = crate::recipient_menu::TEXT_INSET;
     parent.child(
         div()
-            .relative()
             .flex()
-            .gap_3()
-            .px_1()
+            .gap(px(12. - inset))
+            .pl_1()
             .py_1()
             .border_l(px(2.))
             .border_color(rgb(if active { colors.accent } else { colors.panel }))
@@ -2765,8 +2843,14 @@ fn field_row(
                     .text_color(rgb(colors.fg))
                     .child(label.to_string()),
             )
-            .child(shown.flex_1().min_w(px(0.)))
-            .children(overlay),
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_w_0()
+                    .child(shown.pl(px(inset)).pr_1())
+                    .children(overlay),
+            ),
     )
 }
 

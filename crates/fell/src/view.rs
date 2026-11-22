@@ -3688,7 +3688,6 @@ impl Inbox {
             self.reader_took_over(false);
             cx.notify();
         }
-        self.settle_correspondent_menu();
         if self.session.search_editing() && self.search_edit_key(event, started, cx) {
             cx.stop_propagation();
             // Prepare the edited field as soon as input dispatch has
@@ -4946,7 +4945,7 @@ impl Render for Inbox {
         let cached_search_rows = self.search_rows_for(animating);
         let background = theme.background;
         let leaving_banner = self.motion.leaving_banner(now);
-        let recipient_popup = self.search_recipient_popup(window, cx, real);
+        let recipient_popup = self.search_recipient_popup(window, cx);
         let root = shell(
             theme,
             &self.session,

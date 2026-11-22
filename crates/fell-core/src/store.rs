@@ -25,7 +25,7 @@ use crate::threading::{ThreadId, resolve_thread_id};
 
 pub(crate) mod bodies;
 pub(crate) mod copies;
-mod correspondents;
+pub(crate) mod correspondents;
 mod dates;
 pub(crate) mod inbox_arrivals;
 pub(crate) mod intents;
@@ -3367,6 +3367,8 @@ fn absorb_duplicate(
         &doomed.canonical_id,
         &keeper.canonical_id,
     )?;
+    // A duplicate still has a live copy. Its alias keeps pending send
+    // recipients attached until the surviving row is indexed as Sent.
     conn.execute(
         "DELETE FROM messages WHERE account_id = ?1 AND message_id = ?2",
         params![message.account_id.as_str(), doomed.canonical_id],
@@ -4438,7 +4440,7 @@ impl<'a> std::ops::Deref for WriteTx<'a> {
 impl WriteTx<'_> {
     pub(crate) fn commit(self) -> Result<()> {
         summaries::refresh_dirty(&self.0)?;
-        correspondents::refresh_dirty(&self.0)?;
+        correspondents::refresh_dirty(&self.0, correspondents::WRITE_BATCH)?;
         self.0.commit().map_err(Into::into)
     }
 
@@ -6253,8 +6255,19 @@ mod tests {
         sent.folders = vec!["Sent Items".into()];
         sent.to = vec![ari.clone()];
         sent.cc = vec![person("Ari", "ARI@example.test")];
+        store
+            .record_sent_bcc(&account.id, &id, std::slice::from_ref(&hidden))
+            .unwrap();
         store.upsert_message(&sent).unwrap();
         store.upsert_message(&sent).unwrap();
+        let pending: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM correspondent_sends", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(pending, 0);
+        assert_eq!(suggest("bf").as_slice(), std::slice::from_ref(&hidden));
         let counts: (i64, i64, i64) = store.conn.query_row(
             "SELECT sent_to, received_from, last_contacted FROM correspondents WHERE address = 'ari@example.test'",
             [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -6272,6 +6285,42 @@ mod tests {
             [spam.headers.message_id.as_str()]).unwrap();
         tx.commit().unwrap();
         assert!(suggest("spam").is_empty());
+    }
+
+    #[test]
+    fn purging_the_last_copy_removes_pending_send_suggestions() {
+        let store = Store::open_in_memory().unwrap();
+        let account = account();
+        store.upsert_account(&account).unwrap();
+        let id = MessageId::new("pending@example.test");
+        let people = [Address {
+            name: None,
+            email: "pending-recipient@example.test".into(),
+        }];
+        store
+            .record_sent_correspondents(&account.id, &id, &people, 600)
+            .unwrap();
+        // An Inbox echo can arrive before the Sent copy.
+        let mut message = msg(id.as_str(), None, None, "A local send", "Synthetic reply");
+        message.headers.from.email = account.email.clone();
+        message.folders = vec!["INBOX".into()];
+        let thread = store.upsert_message(&message).unwrap();
+        store.delete_thread(&account.id, &thread, "INBOX").unwrap();
+        let suggest = || {
+            store
+                .correspondent_suggestions(&account.id, "pending-recipient")
+                .unwrap()
+        };
+        assert_eq!(suggest(), people);
+        store
+            .purge_threads(&account.id, &[thread], "Trash")
+            .unwrap();
+        assert!(suggest().is_empty());
+        // A delayed send callback cannot restore a purged row.
+        store
+            .record_sent_correspondents(&account.id, &id, &people, 600)
+            .unwrap();
+        assert!(suggest().is_empty());
     }
 
     #[test]

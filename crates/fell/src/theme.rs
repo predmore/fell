@@ -160,6 +160,23 @@ fn builtin(dark: bool, fonts: Fonts) -> Theme {
     }
 }
 
+pub(crate) fn builtin_for_compose(dark: bool) -> &'static Theme {
+    static DARK: std::sync::OnceLock<Theme> = std::sync::OnceLock::new();
+    static LIGHT: std::sync::OnceLock<Theme> = std::sync::OnceLock::new();
+    let theme = if dark { &DARK } else { &LIGHT };
+    theme.get_or_init(|| {
+        builtin(
+            dark,
+            Fonts {
+                ui_family: None,
+                ui_px: 16.,
+                mono_family: None,
+                mono_px: 16.,
+            },
+        )
+    })
+}
+
 fn map_palette(
     name: String,
     kind: ThemeKind,

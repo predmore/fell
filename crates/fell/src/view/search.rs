@@ -30,6 +30,9 @@ pub(super) struct SearchView {
     accepted: Arc<AtomicU64>,
     completion_revision: Arc<AtomicU64>,
     correspondent_menu: Menu,
+    correspondent_field: Option<CompletionField>,
+    completion_pending: bool,
+    accept_pending: bool,
     pub(super) folder_revision: u64,
     pub(super) prefer: Vec<ThreadId>,
     preview_key: Option<PreviewKey>,
@@ -139,6 +142,12 @@ impl Render for CachedPreview {
 }
 
 impl SearchView {
+    fn correspondent_rows_current(&self, shown: u64) -> bool {
+        self.correspondent_menu.is_open()
+            && !self.completion_pending
+            && self.completion_revision.load(Ordering::Relaxed) == shown
+    }
+
     pub(super) fn animating(&self, now: Instant) -> bool {
         self.arrival
             .as_ref()
@@ -282,6 +291,17 @@ impl Inbox {
 
     pub(super) fn search_store_ready(&mut self, cx: &mut Context<Self>) {
         self.search_view.ready = true;
+        let address = self
+            .session
+            .search
+            .as_ref()
+            .and_then(|search| search.completion_key())
+            .is_some_and(|(field, _)| field.is_address());
+        if self.session.search_editing() && (!address || self.search_view.completion_pending) {
+            let accept = self.search_view.accept_pending;
+            self.request_search_completion(cx);
+            self.search_view.accept_pending = accept;
+        }
         if self
             .session
             .search
@@ -289,9 +309,6 @@ impl Inbox {
             .is_some_and(|search| search.pending)
         {
             self.request_search(cx);
-        }
-        if self.session.search.is_some() {
-            self.request_search_completion(cx);
         }
     }
 
@@ -302,6 +319,16 @@ impl Inbox {
         cx: &mut Context<Self>,
     ) -> bool {
         let stroke = &event.keystroke;
+        if self.session.overlay == Overlay::None
+            && let Some(key) = key_from(stroke)
+            && self.correspondent_key(key)
+        {
+            if let Some(log) = &self.frames {
+                log.borrow_mut().key(started, stroke.unparse());
+            }
+            cx.notify();
+            return true;
+        }
         let text = if key_from(stroke) == Some(KeyId::Ctrl('v')) {
             cx.read_from_clipboard().and_then(|item| item.text())
         } else if !stroke.modifiers.control && !stroke.modifiers.platform {
@@ -416,7 +443,7 @@ impl Inbox {
         {
             self.request_messages(true, cx);
         }
-        if step.search_completion && self.search_view.ready {
+        if step.search_completion {
             self.request_search_completion(cx);
         }
         switched || cleared
@@ -962,14 +989,34 @@ impl Inbox {
     }
 
     fn request_search_completion(&mut self, cx: &mut Context<Self>) {
-        let latest = Arc::clone(&self.search_view.completion_revision);
+        let view = &mut self.search_view;
+        let latest = Arc::clone(&view.completion_revision);
         let revision = latest.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-        let Some((field, prefix)) = self
+        let next = self
             .session
             .search
             .as_ref()
             .and_then(|search| search.completion_key())
-            .cloned()
+            .cloned();
+        let field = next.as_ref().and_then(|(field, prefix)| {
+            (field.is_address() && !prefix.is_empty()).then_some(*field)
+        });
+        let now = Instant::now();
+        let motion = self.motion.motion;
+        if view.correspondent_field != field {
+            view.correspondent_menu.dismiss(motion, now);
+            view.correspondent_field = field;
+            if let Some(search) = self.session.search.as_mut() {
+                search.suggestion_index = 0;
+            }
+        }
+        view.completion_pending = field.is_some();
+        view.accept_pending = false;
+        if field.is_some() {
+            view.correspondent_menu.loading(motion, now);
+        }
+        let Some((field, prefix)) = next
+            .filter(|(field, prefix)| view.ready && (!field.is_address() || !prefix.is_empty()))
         else {
             return;
         };
@@ -977,6 +1024,14 @@ impl Inbox {
         let store = self.store.clone();
         cx.spawn(async move |this, cx| {
             let address = field.is_address();
+            if address {
+                cx.background_executor()
+                    .timer(recipient_menu::QUERY_DELAY)
+                    .await;
+                if latest.load(Ordering::Relaxed) != revision {
+                    return;
+                }
+            }
             let job = move |store: &Store| {
                 if latest.load(Ordering::Relaxed) == revision {
                     search_suggestions(store, &account, field, &prefix)
@@ -984,7 +1039,7 @@ impl Inbox {
                     Vec::new()
                 }
             };
-            let suggestions = if address {
+            let mut suggestions = if address {
                 store.call(job).await
             } else {
                 store.call_search_completion(job).await
@@ -996,29 +1051,47 @@ impl Inbox {
                     .completion_revision
                     .load(Ordering::Relaxed)
                     == revision
-                    && let Some(search) = inbox.session.search.as_mut()
+                    && let Some(search) = inbox
+                        .session
+                        .search
+                        .as_mut()
+                        .filter(|search| search.editing)
                 {
+                    let mut accept = false;
                     if address {
-                        let rows: Vec<_> = suggestions
-                            .iter()
+                        let rows = suggestions
+                            .into_iter()
                             .filter_map(|suggestion| match suggestion {
-                                Suggestion::Correspondent(person) => Some(person.clone()),
+                                Suggestion::Correspondent(person) => Some(person),
                                 Suggestion::Value(_) => None,
                             })
                             .collect();
-                        let menu = &mut inbox.search_view.correspondent_menu;
-                        let current = menu.rows().get(search.suggestion_index);
-                        search.suggestion_index = current
-                            .and_then(|person| {
-                                rows.iter()
-                                    .position(|row| row.email.eq_ignore_ascii_case(&person.email))
-                            })
-                            .unwrap_or(0);
-                        menu.update(rows, inbox.motion.motion, Instant::now());
+                        let view = &mut inbox.search_view;
+                        let menu = &mut view.correspondent_menu;
+                        search.suggestion_index = menu.show(
+                            rows,
+                            search.suggestion_index,
+                            inbox.motion.motion,
+                            Instant::now(),
+                        );
+                        suggestions = menu
+                            .rows()
+                            .iter()
+                            .cloned()
+                            .map(Suggestion::Correspondent)
+                            .collect();
+                        view.completion_pending = false;
+                        accept =
+                            std::mem::take(&mut view.accept_pending) && !suggestions.is_empty();
                     } else {
                         search.suggestion_index = 0;
                     }
                     search.suggestions = suggestions;
+                    if accept {
+                        let before = inbox.before_step();
+                        let step = inbox.session.accept_search_suggestion();
+                        inbox.apply_step(step, before, cx);
+                    }
                     cx.notify();
                 }
             });
@@ -1026,15 +1099,43 @@ impl Inbox {
         .detach();
     }
 
-    pub(super) fn settle_correspondent_menu(&mut self) {
-        self.search_view.correspondent_menu.finish_opening();
+    fn correspondent_key(&mut self, key: KeyId) -> bool {
+        let view = &mut self.search_view;
+        let now = Instant::now();
+        let motion = self.motion.motion;
+        if !view.correspondent_menu.is_open() {
+            return false;
+        }
+        match key {
+            KeyId::Escape => {
+                view.correspondent_menu.dismiss(motion, now);
+                view.completion_revision.fetch_add(1, Ordering::Relaxed);
+                view.completion_pending = false;
+                view.accept_pending = false;
+                if let Some(search) = self.session.search.as_mut() {
+                    search.suggestions.clear();
+                }
+            }
+            KeyId::Tab | KeyId::Enter if view.completion_pending => view.accept_pending = true,
+            KeyId::Tab if view.correspondent_menu.rows().is_empty() => {}
+            KeyId::Up | KeyId::Down | KeyId::Ctrl('n' | 'p')
+                if !view.completion_pending && !view.correspondent_menu.rows().is_empty() =>
+            {
+                let from = self.session.search.as_ref().unwrap().suggestion_index;
+                self.session.search_key(key);
+                let to = self.session.search.as_ref().unwrap().suggestion_index;
+                view.correspondent_menu
+                    .move_selection(from, to, motion, now);
+            }
+            _ => return false,
+        }
+        true
     }
 
     pub(super) fn search_recipient_popup(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
-        now: Instant,
     ) -> Option<gpui::Deferred> {
         let active = self
             .session
@@ -1046,58 +1147,62 @@ impl Inbox {
                     .completion_key()
                     .is_some_and(|(field, prefix)| field.is_address() && !prefix.is_empty())
             });
-        let menu = &mut self.search_view.correspondent_menu;
         if active.is_none() {
-            menu.update(Vec::new(), self.motion.motion, now);
+            self.search_view
+                .correspondent_menu
+                .dismiss(self.motion.motion, Instant::now());
         }
-        let selected = active
-            .filter(|search| !search.suggestions.is_empty())
-            .map(|search| search.suggestion_index);
-        let (people, opacity, inset) = menu.visible(window, now);
-        if people.is_empty() || self.session.overlay != Overlay::None {
+        if self.session.overlay != Overlay::None {
             return None;
         }
+        let selected = self
+            .session
+            .search
+            .as_ref()
+            .map_or(0, |search| search.suggestion_index);
+        let revision = self.search_view.completion_revision.load(Ordering::Relaxed);
+        let interactive = active.is_some() && self.search_view.correspondent_rows_current(revision);
         let theme = &self.theme;
         let width = (window.viewport_size().width - px(28.)).min(px(460.));
+        let popup = self.search_view.correspondent_menu.popup(
+            window,
+            selected,
+            interactive,
+            theme,
+            |index, row| {
+                row.id(("search-recipient", index))
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |inbox, _, _, cx| {
+                            if !inbox.search_view.correspondent_rows_current(revision) {
+                                return;
+                            }
+                            let before = inbox.before_step();
+                            let Some(search) = inbox.session.search.as_mut().filter(|search| {
+                                search.editing
+                                    && matches!(
+                                        search.suggestions.get(index),
+                                        Some(Suggestion::Correspondent(_))
+                                    )
+                            }) else {
+                                return;
+                            };
+                            search.suggestion_index = index;
+                            let step = inbox.session.accept_search_suggestion();
+                            inbox.apply_step(step, before, cx);
+                        }),
+                    )
+                    .into_any_element()
+            },
+        )?;
         Some(gpui::deferred(
             div()
                 .absolute()
                 .left(px(14.))
-                .top(px(38. + inset))
-                .child(recipient_menu::popup(
-                    people,
-                    selected,
-                    recipient_menu::Colors {
-                        surface: theme.surface,
-                        border: theme.border,
-                        text: theme.foreground,
-                        dim: theme.dimmed,
-                        selection: theme.selection,
-                        accent: theme.accent,
-                    },
-                    opacity,
-                    width,
-                    |index, row| {
-                        if selected.is_some() {
-                            row.id(("search-recipient", index))
-                                .cursor_pointer()
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |inbox, _, _, cx| {
-                                        let before = inbox.before_step();
-                                        if let Some(search) = inbox.session.search.as_mut() {
-                                            search.suggestion_index = index;
-                                        }
-                                        let step = inbox.session.accept_search_suggestion();
-                                        inbox.apply_step(step, before, cx);
-                                    }),
-                                )
-                                .into_any_element()
-                        } else {
-                            row.into_any_element()
-                        }
-                    },
-                )),
+                .top(px(38.))
+                .w(width)
+                .child(popup),
         ))
     }
 
@@ -2231,4 +2336,28 @@ mod tests {
             assert!(f32::from(subject.width) + detail_width <= room);
         }
     }
+}
+#[test]
+fn old_correspondent_rows_cannot_accept_during_or_after_a_new_query() {
+    let mut view = SearchView::default();
+    let motion = motion::Motion::new(false);
+    let now = Instant::now();
+    view.correspondent_menu.show(
+        vec![fell_core::Address {
+            name: None,
+            email: "demo@example.test".into(),
+        }],
+        0,
+        motion,
+        now,
+    );
+    let shown = view.completion_revision.load(Ordering::Relaxed);
+    assert!(view.correspondent_rows_current(shown));
+    view.completion_pending = true;
+    let latest = view.completion_revision.fetch_add(1, Ordering::Relaxed) + 1;
+    assert!(!view.correspondent_rows_current(shown));
+    assert!(!view.correspondent_rows_current(latest));
+    view.completion_pending = false;
+    assert!(!view.correspondent_rows_current(shown));
+    assert!(view.correspondent_rows_current(latest));
 }

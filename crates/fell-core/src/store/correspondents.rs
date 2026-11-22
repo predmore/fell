@@ -5,12 +5,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rusqlite::{Connection, OptionalExtension, params};
+use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
 
 use super::{Store, begin_immediate, immediate_transaction, roles, split_field};
 use crate::message::{Address, MessageId, decode_addresses, encode_addresses};
 use crate::{AccountId, FolderRole, FolderRoles, Result};
 
 const VERSION: &str = "correspondents_v1";
+const BACKFILL: &str = "correspondents_next_row";
+pub(super) const WRITE_BATCH: usize = 32;
+const MAINTENANCE_BATCH: usize = 128;
 const PREFIX_CHARS: usize = 24;
 const LIMIT: usize = 6;
 
@@ -118,10 +122,9 @@ pub(super) fn ensure(conn: &Connection) -> Result<()> {
     if !installed(&tx)? {
         tx.execute_batch(SCHEMA)?;
         tx.execute(
-            "INSERT OR IGNORE INTO correspondent_dirty SELECT account_id, message_id FROM messages",
-            [],
+            "INSERT INTO meta SELECT ?1, rowid FROM messages ORDER BY rowid LIMIT 1",
+            [BACKFILL],
         )?;
-        refresh_dirty(&tx)?;
         tx.execute("INSERT INTO meta VALUES (?1, '1')", [VERSION])?;
     }
     tx.commit()?;
@@ -163,7 +166,7 @@ pub(super) fn dirty(conn: &Connection, account: &AccountId, id: &MessageId) -> R
     Ok(())
 }
 
-pub(super) fn forget_send(conn: &Connection, account: &AccountId, id: &str) -> Result<()> {
+pub(crate) fn forget_send(conn: &Connection, account: &AccountId, id: &str) -> Result<()> {
     conn.execute(
         "DELETE FROM correspondent_sends
          WHERE account_id = ?1 AND message_id IN (
@@ -176,6 +179,33 @@ pub(super) fn forget_send(conn: &Connection, account: &AccountId, id: &str) -> R
 }
 
 impl Store {
+    /// Bring one batch of correspondent history up to date. The bootstrap
+    /// cursor and the index advance together so a restart can resume here.
+    /// Returns whether to try another batch before idling.
+    pub fn maintain_correspondents(&self) -> Result<bool> {
+        let pending = self
+            .conn
+            .prepare_cached(
+                "SELECT EXISTS (SELECT 1 FROM correspondent_dirty)
+                 OR EXISTS (SELECT 1 FROM meta WHERE key = ?1)",
+            )?
+            .query_row([BACKFILL], |row| row.get::<_, bool>(0))?;
+        if !pending {
+            return Ok(false);
+        }
+        let tx = begin_immediate(&self.conn)?;
+        let refreshed = refresh_dirty(&tx, MAINTENANCE_BATCH)?;
+        let more = if refreshed == MAINTENANCE_BATCH {
+            true
+        } else {
+            let remaining = MAINTENANCE_BATCH - refreshed;
+            queue_backfill(&tx, remaining)?;
+            refresh_dirty(&tx, remaining)? == remaining
+        };
+        tx.commit()?;
+        Ok(more)
+    }
+
     pub(crate) fn record_sent_correspondents(
         &self,
         account: &AccountId,
@@ -184,6 +214,9 @@ impl Store {
         date_unix: i64,
     ) -> Result<()> {
         let tx = immediate_transaction(&self.conn)?;
+        if crate::actions::message_was_purged(&tx, account, message_id.as_str())? {
+            return tx.commit();
+        }
         tx.execute(
             "INSERT INTO correspondent_sends VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT (account_id, message_id) DO NOTHING",
@@ -234,7 +267,11 @@ pub(super) fn suggest(
             email: row.get(0)?,
             name: row.get(1)?,
         };
-        if indexed_end.is_none() || terms(&person).iter().any(|term| term.starts_with(&prefix)) {
+        if safe_email(&person.email)
+            && !person.email.chars().any(char::is_whitespace)
+            && (indexed_end.is_none()
+                || terms(&person).iter().any(|term| term.starts_with(&prefix)))
+        {
             result.push(person);
         }
     }
@@ -279,14 +316,52 @@ struct Mailbox {
     roles: FolderRoles,
 }
 
-pub(super) fn refresh_dirty(conn: &Connection) -> Result<()> {
-    let queue = conn.prepare_cached(
-        "SELECT account_id, message_id FROM correspondent_dirty ORDER BY account_id, message_id",
-    )?.query_map([], |row| Ok((AccountId(row.get(0)?), row.get::<_, String>(1)?)))?
+fn queue_backfill(conn: &Connection, limit: usize) -> Result<()> {
+    let next = conn
+        .prepare_cached("SELECT CAST(value AS INTEGER) FROM meta WHERE key = ?1")?
+        .query_row([BACKFILL], |row| row.get::<_, i64>(0))
+        .optional()?;
+    let Some(next) = next else { return Ok(()) };
+    let batch = conn
+        .prepare_cached(
+            "SELECT rowid, account_id, message_id FROM messages
+         WHERE rowid >= ?1 ORDER BY rowid LIMIT ?2",
+        )?
+        .query_map(params![next, limit as i64], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    if queue.is_empty() {
-        return Ok(());
+    let mut enqueue =
+        conn.prepare_cached("INSERT OR IGNORE INTO correspondent_dirty VALUES (?1, ?2)")?;
+    for (_, account, id) in &batch {
+        enqueue.execute(params![account, id])?;
     }
+    if batch.len() == limit
+        && let Some(next) = batch.last().and_then(|(rowid, _, _)| rowid.checked_add(1))
+    {
+        conn.execute(
+            "UPDATE meta SET value = ?2 WHERE key = ?1",
+            params![BACKFILL, next],
+        )?;
+    } else {
+        conn.execute("DELETE FROM meta WHERE key = ?1", [BACKFILL])?;
+    }
+    Ok(())
+}
+
+pub(super) fn refresh_dirty(conn: &Connection, limit: usize) -> Result<usize> {
+    let queue = conn.prepare_cached(
+        "SELECT account_id, message_id FROM correspondent_dirty ORDER BY account_id, message_id LIMIT ?1",
+    )?.query_map([limit as i64], |row| Ok((AccountId(row.get(0)?), row.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let count = queue.len();
+    let mut dequeue = conn.prepare_cached(
+        "DELETE FROM correspondent_dirty WHERE account_id = ?1 AND message_id = ?2",
+    )?;
     let mut queue = queue.as_slice();
     while let Some(((account, _), _)) = queue.split_first() {
         let end = queue.partition_point(|(id, _)| id == account);
@@ -306,14 +381,14 @@ pub(super) fn refresh_dirty(conn: &Connection) -> Result<()> {
         let mut affected = BTreeMap::new();
         for (_, id) in &queue[..end] {
             refresh_message(conn, account, id, &mailbox, &mut affected)?;
+            dequeue.execute(params![account.as_str(), id])?;
         }
         for (address, counts) in affected {
             refresh_contact(conn, account, &address, &counts)?;
         }
         queue = &queue[end..];
     }
-    conn.execute("DELETE FROM correspondent_dirty", [])?;
-    Ok(())
+    Ok(count)
 }
 
 fn refresh_message(
@@ -443,20 +518,10 @@ fn message_sightings(
     if alias {
         return Ok(Sightings::new());
     }
-    let mut local = conn.prepare_cached(
-        "SELECT recipients, date_unix FROM correspondent_sends
-         WHERE account_id = ?1 AND message_id IN (
-             SELECT ?2 UNION ALL SELECT message_id FROM message_aliases
-             WHERE account_id = ?1 AND canonical_message_id = ?2
-         )",
-    )?;
-    let mut rows = local.query(params![account.as_str(), id])?;
-    while let Some(row) = rows.next()? {
-        for person in decode_addresses(&row.get::<_, String>(0)?) {
-            add(&mut seen, mailbox, person, row.get(1)?, Direction::Sent);
-        }
-    }
     if let Some(date) = stored_sent {
+        // The Sent copy and the separately recorded Bcc now own this
+        // sighting, including when the Sent id was merged into a list echo.
+        forget_send(conn, account, id)?;
         let mut legacy = conn.prepare_cached(
             "SELECT bcc_addrs FROM sent_bcc
              WHERE account_id = ?1 AND message_id IN (
@@ -468,6 +533,20 @@ fn message_sightings(
         while let Some(row) = rows.next()? {
             for person in decode_addresses(&row.get::<_, String>(0)?) {
                 add(&mut seen, mailbox, person, date, Direction::Sent);
+            }
+        }
+    } else {
+        let mut local = conn.prepare_cached(
+            "SELECT recipients, date_unix FROM correspondent_sends
+             WHERE account_id = ?1 AND message_id IN (
+                 SELECT ?2 UNION ALL SELECT message_id FROM message_aliases
+                 WHERE account_id = ?1 AND canonical_message_id = ?2
+             )",
+        )?;
+        let mut rows = local.query(params![account.as_str(), id])?;
+        while let Some(row) = rows.next()? {
+            for person in decode_addresses(&row.get::<_, String>(0)?) {
+                add(&mut seen, mailbox, person, row.get(1)?, Direction::Sent);
             }
         }
     }
@@ -498,6 +577,16 @@ enum Direction {
     Mentioned,
 }
 
+fn safe_email(email: &str) -> bool {
+    !email.chars().any(|ch| {
+        ch.is_control()
+            || (!ch.is_ascii()
+                && (ch.general_category() == GeneralCategory::Format
+                // Reserved in the bidi formatting range and stripped by display_safe.
+                || ch == '\u{2065}'))
+    })
+}
+
 fn add(
     seen: &mut Sightings,
     mailbox: &Mailbox,
@@ -505,13 +594,14 @@ fn add(
     date: i64,
     direction: Direction,
 ) {
+    if !safe_email(&person.email) {
+        return;
+    }
     person.email = person.email.trim().to_owned();
     let address = person.email.to_lowercase();
     if address == mailbox.own
         || !address.contains('@')
-        || address
-            .chars()
-            .any(|ch| ch.is_control() || ch.is_whitespace())
+        || address.chars().any(char::is_whitespace)
         || address.contains(['<', '>'])
     {
         return;
@@ -543,7 +633,7 @@ fn add(
         prior.date = prior.date.max(date);
         prior.sent |= sent;
         prior.received |= received;
-        prior.list &= list;
+        prior.list = (prior.list || list) && !prior.sent;
     } else {
         seen.insert(
             address,
@@ -767,6 +857,7 @@ mod tests {
         drop(legacy);
         for _ in 0..2 {
             let store = Store::open(&path).unwrap();
+            while store.maintain_correspondents().unwrap() {}
             for prefix in ["ÉLO", "ÉM", "mart", "elodie@"] {
                 assert_eq!(
                     store
@@ -785,6 +876,135 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 1);
         }
+    }
+
+    #[test]
+    fn large_upgrade_opens_before_backfilling_and_resumes_in_batches() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("mail.db");
+        let store = Store::open(&path).unwrap();
+        let tx = super::super::immediate_transaction(&store.conn).unwrap();
+        tx.execute_batch(
+            "INSERT INTO accounts VALUES ('a', 'Demo', 'me@example.test', 'bridge');
+             INSERT INTO messages (account_id, message_id, remote_id, thread_id, references_header,
+                         from_name, from_email, subject, date_unix, snippet, folders)
+             WITH RECURSIVE counter(i) AS (VALUES (1) UNION ALL SELECT i + 1 FROM counter WHERE i < 100000)
+             SELECT 'a', 'msg:' || i, 'remote:' || i, 'one', '',
+                    'Demo Sender', 'demo@example.test', 'Notes', 210, '', 'INBOX' FROM counter;
+             INSERT INTO search_terms VALUES ('a', 'notes', 100000);",
+        ).unwrap();
+        tx.commit().unwrap();
+        let count = |conn: &Connection, sql: &str| {
+            conn.query_row(sql, [], |row| row.get::<_, u32>(0)).unwrap() as usize
+        };
+        assert_eq!(
+            count(&store.conn, "SELECT COUNT(*) FROM correspondent_dirty"),
+            100_000 - WRITE_BATCH
+        );
+        // Leave a current mailbox with only the autocomplete schema absent.
+        store
+            .conn
+            .execute_batch(
+                "DROP TRIGGER correspondents_message_insert;
+             DROP TRIGGER correspondents_message_delete;
+             DROP TRIGGER correspondents_message_change;
+             DROP TRIGGER correspondents_alias_insert;
+             DROP TRIGGER correspondents_alias_delete;
+             DROP TRIGGER correspondents_alias_change;
+             DROP TABLE correspondent_sightings;
+             DROP TABLE correspondent_prefixes;
+             DROP TABLE correspondents;
+             DELETE FROM correspondent_dirty;
+             DELETE FROM meta WHERE key = 'correspondents_v1';",
+            )
+            .unwrap();
+        drop(store);
+        let started = Instant::now();
+        let store = Store::open(&path).unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "store open took {elapsed:?}"
+        );
+        let sightings = "SELECT COUNT(*) FROM correspondent_sightings";
+        assert_eq!(count(&store.conn, sightings), 0);
+        assert!(store.maintain_correspondents().unwrap());
+        assert_eq!(count(&store.conn, sightings), MAINTENANCE_BATCH);
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert!(store.maintain_correspondents().unwrap());
+        assert_eq!(count(&store.conn, sightings), MAINTENANCE_BATCH * 2);
+    }
+
+    #[test]
+    fn a_list_sender_mentioned_in_its_own_mail_still_ranks_below_other_contacts() {
+        let store = Store::open_in_memory().unwrap();
+        let account = AccountId("a".into());
+        let tx = immediate_transaction(&store.conn).unwrap();
+        tx.execute_batch(
+            "INSERT INTO accounts VALUES ('a', 'Demo', 'me@example.test', 'bridge');
+             INSERT INTO messages (account_id, message_id, remote_id, thread_id, references_header,
+                         from_name, from_email, subject, date_unix, snippet, folders, list_id)
+             VALUES ('a', 'list', 'remote:list', 'list', '', 'Demo Digest', 'digest@example.test',
+                     'Digest', 800000, '', 'INBOX', 'list.example.test'),
+                    ('a', 'human', 'remote:human', 'human', '', 'Demo Sender', 'demo@example.test',
+                     'Notes', 210, '', 'INBOX', NULL);",
+        )
+        .unwrap();
+        tx.execute(
+            "UPDATE messages SET to_line = ?1 WHERE message_id = 'list'",
+            [encode_addresses(&[person(
+                "Demo Digest",
+                "digest@example.test",
+            )])],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            store.correspondent_suggestions(&account, "demo").unwrap(),
+            [
+                person("Demo Sender", "demo@example.test"),
+                person("Demo Digest", "digest@example.test")
+            ],
+        );
+    }
+
+    #[test]
+    fn addresses_with_controls_or_format_characters_never_enter_the_index() {
+        let store = Store::open_in_memory().unwrap();
+        let account = AccountId("a".into());
+        let tx = immediate_transaction(&store.conn).unwrap();
+        tx.execute(
+            "INSERT INTO accounts VALUES ('a', 'Demo', 'me@example.test', 'bridge')",
+            [],
+        )
+        .unwrap();
+        for (i, mark) in [
+            '\n',
+            '\u{00ad}',
+            '\u{061c}',
+            '\u{200d}',
+            '\u{202e}',
+            '\u{2065}',
+            '\u{e0001}',
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            tx.execute(
+                "INSERT INTO messages (account_id, message_id, remote_id, thread_id, references_header,
+                            from_name, from_email, subject, date_unix, snippet, folders)
+                 VALUES ('a', ?1, ?1, ?1, '', 'Demo Sender', ?2, 'Notes', 210, '', 'INBOX')",
+                params![i.to_string(), format!("demo{mark}@example.test")],
+            ).unwrap();
+        }
+        tx.commit().unwrap();
+        assert!(
+            store
+                .correspondent_suggestions(&account, "demo")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

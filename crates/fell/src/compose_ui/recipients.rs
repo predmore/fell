@@ -6,7 +6,7 @@ use fell_core::Address;
 use fell_core::compose::email_of;
 use gpui::{Context, Deferred, MouseButton, Window, deferred, div, prelude::*, px};
 
-use super::{ComposeView, Field, Palette};
+use super::{ComposeView, Field};
 use crate::motion::Motion;
 use crate::recipient_menu::{self, Menu};
 use crate::store_actor::StoreClient;
@@ -23,6 +23,7 @@ pub(super) struct Completion {
     selected: usize,
     anchor: Field,
     ready: bool,
+    accept_pending: bool,
 }
 
 impl Default for Completion {
@@ -35,6 +36,7 @@ impl Default for Completion {
             selected: 0,
             anchor: Field::To,
             ready: false,
+            accept_pending: false,
         }
     }
 }
@@ -77,12 +79,12 @@ impl ComposeView {
             .map(|(draft, field, _)| (draft, field))
             != next.as_ref().map(|(draft, field, _)| (draft, field))
         {
-            completion
-                .menu
-                .update(Vec::new(), completion.motion, Instant::now());
+            completion.menu.dismiss(completion.motion, Instant::now());
+            completion.selected = 0;
         }
         completion.key = next.clone();
-        completion.ready = false;
+        completion.ready = true;
+        completion.accept_pending = false;
         let generation = Arc::clone(&completion.generation);
         let revision = generation.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         let Some((draft, field, prefix)) = next else {
@@ -106,41 +108,49 @@ impl ComposeView {
         else {
             return;
         };
-        let latest = Arc::clone(&generation);
-        let reply = store.call(move |store| {
-            if latest.load(Ordering::Relaxed) != revision {
-                return Vec::new();
-            }
-            let mut people = store
-                .correspondent_suggestions(&account, &prefix)
-                .unwrap_or_default();
-            if people
-                .iter()
-                .any(|person| person.email.eq_ignore_ascii_case(&prefix))
-            {
-                people.clear();
-            }
-            people
-        });
+        completion.anchor = field;
+        completion.ready = false;
+        completion.menu.loading(completion.motion, Instant::now());
         cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(recipient_menu::QUERY_DELAY)
+                .await;
+            if generation.load(Ordering::Relaxed) != revision {
+                return;
+            }
+            let latest = Arc::clone(&generation);
+            let reply = store.call(move |store| {
+                if latest.load(Ordering::Relaxed) != revision {
+                    return Vec::new();
+                }
+                let mut people = store
+                    .correspondent_suggestions(&account, &prefix)
+                    .unwrap_or_default();
+                if people
+                    .iter()
+                    .any(|person| person.email.eq_ignore_ascii_case(&prefix))
+                {
+                    people.clear();
+                }
+                people
+            });
             let rows = reply.await.unwrap_or_default();
             let _ = this.update(cx, |compose, cx| {
                 if generation.load(Ordering::Relaxed) != revision {
                     return;
                 }
                 let completion = &mut compose.recipients;
-                let previous = completion.menu.rows().get(completion.selected);
-                completion.selected = previous
-                    .and_then(|person| {
-                        rows.iter()
-                            .position(|row| row.email.eq_ignore_ascii_case(&person.email))
-                    })
-                    .unwrap_or(0);
-                completion.anchor = field;
-                completion
-                    .menu
-                    .update(rows, completion.motion, Instant::now());
+                let accept = std::mem::take(&mut completion.accept_pending);
+                completion.selected = completion.menu.show(
+                    rows,
+                    completion.selected,
+                    completion.motion,
+                    Instant::now(),
+                );
                 completion.ready = true;
+                if accept && compose.accept_recipient(compose.recipients.selected) {
+                    compose.update_recipient_completion(cx);
+                }
                 cx.notify();
             });
         })
@@ -148,12 +158,23 @@ impl ComposeView {
     }
 
     pub(super) fn recipient_key(&mut self, key: &str, modifiers: &gpui::Modifiers) -> bool {
-        self.recipients.menu.finish_opening();
         let completion = &mut self.recipients;
+        if matches!(key, "tab" | "enter")
+            && !modifiers.control
+            && !modifiers.shift
+            && !modifiers.platform
+            && !modifiers.alt
+            && !completion.ready
+            && completion.menu.is_open()
+        {
+            completion.accept_pending = true;
+            return true;
+        }
         let len = completion.menu.rows().len();
-        if !completion.ready || len == 0 {
+        if !completion.ready || len == 0 || modifiers.platform || modifiers.alt {
             return false;
         }
+        let previous = completion.selected;
         match (key, modifiers.control, modifiers.shift) {
             ("n", true, false) => completion.selected = (completion.selected + 1) % len,
             ("p", true, false) => completion.selected = (completion.selected + len - 1) % len,
@@ -162,6 +183,23 @@ impl ComposeView {
             }
             _ => return false,
         }
+        completion.menu.move_selection(
+            previous,
+            completion.selected,
+            completion.motion,
+            Instant::now(),
+        );
+        true
+    }
+
+    pub(super) fn dismiss_recipient_menu(&mut self) -> bool {
+        let completion = &mut self.recipients;
+        if !completion.menu.dismiss(completion.motion, Instant::now()) {
+            return false;
+        }
+        completion.generation.fetch_add(1, Ordering::Relaxed);
+        completion.accept_pending = false;
+        completion.ready = true;
         true
     }
 
@@ -188,63 +226,55 @@ impl ComposeView {
         }
         line.push_str(&mailbox(person));
         line.push_str(", ");
+        // The header edits at the end of the line. Keep the accepted
+        // recipient in the draft even if the next token is unfinished.
+        self.commit_field(self.field);
         true
     }
 
     pub(super) fn recipient_overlay(
-        &mut self,
+        &self,
         window: &mut Window,
         cx: &mut Context<Self>,
-        colors: Palette,
+        theme: &crate::theme::Theme,
     ) -> Option<(Field, Deferred)> {
-        let width = window.viewport_size().width;
-        let completion = &mut self.recipients;
-        let selected = completion.ready.then_some(completion.selected);
-        let (people, alpha, inset) = completion.menu.visible(window, Instant::now());
-        if people.is_empty() || self.preview || self.palette.is_some() {
+        if self.preview || self.palette.is_some() {
             return None;
         }
-        let left = if width < px(520.) { 6. } else { 118. };
+        let completion = &self.recipients;
+        let revision = completion.generation.load(Ordering::Relaxed);
+        let popup = completion.menu.popup(
+            window,
+            completion.selected,
+            completion.ready,
+            theme,
+            |index, row| {
+                row.id(("recipient", index))
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |compose, _, _, cx| {
+                            if compose.recipients.generation.load(Ordering::Relaxed) == revision
+                                && compose.accept_recipient(index)
+                            {
+                                compose.update_recipient_completion(cx);
+                                cx.notify();
+                            }
+                        }),
+                    )
+                    .into_any_element()
+            },
+        )?;
         Some((
             completion.anchor,
             deferred(
                 div()
                     .absolute()
-                    .left(px(left))
+                    .left_0()
                     .top(gpui::relative(1.))
-                    .mt(px(inset))
-                    .child(recipient_menu::popup(
-                        people,
-                        selected,
-                        recipient_menu::Colors {
-                            surface: colors.panel,
-                            border: colors.rule,
-                            text: colors.fg,
-                            dim: colors.dim,
-                            selection: colors.hunk_focus,
-                            accent: colors.accent,
-                        },
-                        alpha,
-                        (width - px(left + 38.)).min(px(480.)),
-                        |index, row| {
-                            if selected.is_some() {
-                                row.id(("recipient", index))
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |compose, _, _, cx| {
-                                            if compose.accept_recipient(index) {
-                                                compose.update_recipient_completion(cx);
-                                                cx.notify();
-                                            }
-                                        }),
-                                    )
-                                    .into_any_element()
-                            } else {
-                                row.into_any_element()
-                            }
-                        },
-                    )),
+                    .mt(px(4.))
+                    .w_full()
+                    .child(popup),
             ),
         ))
     }
@@ -295,4 +325,43 @@ fn mailbox(person: &Address) -> String {
         }
     }
     person.email.clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compose_ui::{ThemeKind, open_demo};
+
+    #[test]
+    fn accepting_a_recipient_saves_it_and_typing_starts_after_it() {
+        let root = tempfile::tempdir().unwrap();
+        let (hub, id, folder) = open_demo(root.path().to_owned(), ThemeKind::Dark).unwrap();
+        let mut app = gpui::TestAppContext::single();
+        let (view, cx) =
+            app.add_window_view(|_, cx| ComposeView::new(hub.clone(), id.clone(), folder, cx));
+        view.update(cx, |compose, _| {
+            compose.field = Field::To;
+            compose.to_line = "ar".into();
+            compose.recipients.ready = true;
+            compose.recipients.menu.show(
+                vec![Address {
+                    name: Some("Ari Wynn".into()),
+                    email: "ari@example.test".into(),
+                }],
+                0,
+                Motion::new(false),
+                Instant::now(),
+            );
+            assert!(compose.accept_recipient(0));
+            compose.field_key("b", Some("b"));
+            assert_eq!(compose.to_line, "Ari Wynn <ari@example.test>, b");
+            let snap = hub.with_session(&id, |session| session.snapshot()).unwrap();
+            assert_eq!(snap.to.len(), 1);
+            assert_eq!(snap.to[0].email, "ari@example.test");
+            compose.field_key("e", Some("ea@example.test"));
+            assert!(compose.commit_field(Field::To));
+            let snap = hub.with_session(&id, |session| session.snapshot()).unwrap();
+            assert_eq!(snap.to[1].email, "bea@example.test");
+        });
+    }
 }
