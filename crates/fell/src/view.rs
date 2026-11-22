@@ -2682,8 +2682,17 @@ impl Inbox {
                                 ..ReadIntent::default()
                             });
                         }
+                        let text = match action.kind {
+                            fell_core::ActionKind::Read => "Marked unread",
+                            fell_core::ActionKind::Unread => "Marked read",
+                            fell_core::ActionKind::Archive if notice.is_some() => {
+                                "Moved back to Inbox"
+                            }
+                            fell_core::ActionKind::Archive => "Moved back",
+                            _ => "Undone",
+                        };
                         if let Some((receipt, _)) = notice {
-                            inbox.notification_feedback(receipt, "Undone".into(), None, false);
+                            inbox.notification_feedback(receipt, text.into(), None, false);
                         } else if let Some(target) = action.label_undo_target {
                             let (count, subject) = match target {
                                 LabelUndoTarget::Conversation(subject) => {
@@ -2714,7 +2723,7 @@ impl Inbox {
                                 undo: false,
                             });
                         } else {
-                            inbox.session.show_toast("Undone", false);
+                            inbox.session.show_toast(text, false);
                         }
                         inbox.expire_action_notice(cx);
                         inbox.send_to_server();

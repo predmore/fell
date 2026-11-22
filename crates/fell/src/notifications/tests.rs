@@ -104,7 +104,7 @@ fn sends_three_individual_notices_and_groups_four_or_more() {
 #[test]
 fn private_notifications_hide_content_and_show_group_count() {
     for (count, title) in [
-        (1, "New mail"),
+        (1, "1 new message"),
         (3, "3 new messages"),
         (5, "5 new messages"),
     ] {
@@ -125,6 +125,32 @@ fn private_notifications_hide_content_and_show_group_count() {
         assert!(posted[0].kind.action("archive").is_none());
         assert!(posted[0].kind.action("mark-read").is_none());
     }
+}
+
+#[test]
+fn action_feedback_only_includes_the_clean_subject_in_normal_mode() {
+    let confirmation = || Confirmation {
+        action_id: 42,
+        subject: Some("Route <review>\u{202e}\nClick me".into()),
+    };
+    let normal = feedback_notice("Archived", Some(confirmation()), NotificationMode::On, true);
+    assert_eq!(normal.body, "Route &lt;review&gt;\nClick to undo");
+    assert_eq!(normal.kind.buttons(), ["default", "Undo", "undo", "Undo"]);
+    for key in ["default", "undo"] {
+        assert!(matches!(normal.kind.action(key), Some(Action::Undo(42))));
+    }
+
+    let private = feedback_notice(
+        "Archived",
+        Some(confirmation()),
+        NotificationMode::Private,
+        true,
+    );
+    assert_eq!(private.body, "Click to undo");
+
+    let result = feedback_notice("Moved back to Inbox", None, NotificationMode::On, true);
+    assert!(result.body.is_empty());
+    assert!(result.kind.buttons().is_empty());
 }
 
 #[test]

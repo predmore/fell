@@ -148,7 +148,7 @@ impl Action {
     }
 }
 
-const ALL_ACTIONS: [Action; 48] = [
+const ALL_ACTIONS: [Action; 50] = [
     Action::Next,
     Action::Prev,
     Action::First,

@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use async_io::Timer;
-use fell_core::{AccountId, InboxArrival, MessageId, NotificationMode};
+use fell_core::{AccountId, InboxArrival, MessageId, NotificationMode, diagnostic};
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use futures::future::{BoxFuture, join_all};
 use futures::stream::FuturesUnordered;
@@ -46,6 +46,7 @@ pub(crate) enum Action {
 pub(crate) struct Invoked {
     pub action: Action,
     pub messages: Vec<MessageId>,
+    pub subject: Option<String>,
     pub token: Option<String>,
     pub receipt: Receipt,
 }
@@ -70,7 +71,7 @@ impl Kind {
                 "Mark as read",
             ],
             Self::Group | Self::Private => &["default", "Open Inbox"],
-            Self::Feedback(Some(_)) => &["undo", "Undo"],
+            Self::Feedback(Some(_)) => &["default", "Undo", "undo", "Undo"],
             Self::Feedback(None) => &[],
         }
     }
@@ -81,7 +82,7 @@ impl Kind {
             (Self::Single, "default") => Some(Action::Open),
             (Self::Single, "archive") => Some(Action::Archive),
             (Self::Single, "mark-read") => Some(Action::Read),
-            (Self::Feedback(Some(id)), "undo") => Some(Action::Undo(id)),
+            (Self::Feedback(Some(id)), "default" | "undo") => Some(Action::Undo(id)),
             _ => None,
         }
     }
@@ -93,6 +94,11 @@ struct Notice {
     title: String,
     body: String,
     messages: Vec<InboxArrival>,
+}
+
+pub(crate) struct Confirmation {
+    pub action_id: i64,
+    pub subject: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -108,7 +114,7 @@ enum Command {
     Focused,
     Refresh,
     SetMode(NotificationMode),
-    Feedback(Receipt, String, Option<i64>),
+    Feedback(Receipt, String, Option<Confirmation>),
     Dismiss(Receipt),
 }
 
@@ -150,8 +156,8 @@ impl Queue {
         self.send(Command::SetMode(mode));
     }
 
-    pub fn feedback(&self, receipt: Receipt, text: String, undo: Option<i64>) {
-        self.send(Command::Feedback(receipt, text, undo));
+    pub fn feedback(&self, receipt: Receipt, text: String, confirmation: Option<Confirmation>) {
+        self.send(Command::Feedback(receipt, text, confirmation));
     }
 
     pub fn dismiss(&self, receipt: Receipt) {
@@ -190,10 +196,14 @@ pub(crate) fn start(
     )
 }
 
-fn report_failure(err: &impl std::fmt::Display) {
+fn report_failure(err: &(impl std::error::Error + 'static)) {
     static LOGGED: AtomicBool = AtomicBool::new(false);
     if !LOGGED.swap(true, Ordering::Relaxed) {
-        eprintln!("fell: desktop notification failed: {err}");
+        diagnostic!(
+            WARN,
+            "Desktop notification failed",
+            error = err as &dyn std::error::Error
+        );
     }
 }
 
@@ -294,18 +304,18 @@ async fn run(
                     .await;
                 }
             }
-            Event::Command(Some(Command::Feedback(receipt, title, undo))) => {
+            Event::Command(Some(Command::Feedback(receipt, title, confirmation))) => {
                 if receipt.mode_generation == mode_generation
                     && let Some(bus) = &mut bus
                     && bus.is_owner(&receipt.owner)
                 {
                     bus.enqueue(
-                        Notice {
-                            kind: Kind::Feedback(undo),
-                            title: clean_line(&title, 160),
-                            body: String::new(),
-                            messages: Vec::new(),
-                        },
+                        feedback_notice(
+                            &title,
+                            confirmation,
+                            mode,
+                            bus.daemon.as_ref().is_some_and(|daemon| daemon.markup),
+                        ),
                         receipt.id,
                         Vec::new(),
                         mode_generation,
@@ -435,6 +445,32 @@ fn aggregate(mode: NotificationMode, count: usize) -> bool {
     mode == NotificationMode::Private || count > 3
 }
 
+fn feedback_notice(
+    title: &str,
+    confirmation: Option<Confirmation>,
+    mode: NotificationMode,
+    markup: bool,
+) -> Notice {
+    let mut body = String::new();
+    if let Some(confirmation) = &confirmation {
+        if mode == NotificationMode::On
+            && let Some(subject) = &confirmation.subject
+        {
+            body = body_text(&clean_line(subject, 160), markup);
+            if !body.is_empty() {
+                body.push('\n');
+            }
+        }
+        body.push_str("Click to undo");
+    }
+    Notice {
+        kind: Kind::Feedback(confirmation.map(|value| value.action_id)),
+        title: clean_line(title, 160),
+        body,
+        messages: Vec::new(),
+    }
+}
+
 fn notices(mut arrivals: Vec<InboxArrival>, mode: NotificationMode, markup: bool) -> Vec<Notice> {
     if aggregate(mode, arrivals.len()) {
         let private = mode == NotificationMode::Private;
@@ -443,7 +479,7 @@ fn notices(mut arrivals: Vec<InboxArrival>, mode: NotificationMode, markup: bool
         return vec![Notice {
             kind: if private { Kind::Private } else { Kind::Group },
             title: if count == 1 {
-                "New mail".into()
+                "1 new message".into()
             } else {
                 format!("{count} new messages")
             },
@@ -888,6 +924,7 @@ impl Bus {
                     let _ = actions.unbounded_send(Invoked {
                         action,
                         messages: active.messages.iter().map(|mail| mail.id.clone()).collect(),
+                        subject: active.messages.first().map(|mail| mail.subject.clone()),
                         token: active.token.take(),
                         receipt: active.receipt.clone(),
                     });

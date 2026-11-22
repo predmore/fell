@@ -9,7 +9,7 @@ use gpui::{AnyWindowHandle, Context, Window};
 use super::{Inbox, ReadIntent, archive_failure};
 use crate::keymap::Action;
 use crate::model::Overlay;
-use crate::notifications::{self, Invoked, Receipt};
+use crate::notifications::{self, Confirmation, Invoked, Receipt};
 use crate::present::Pane;
 
 const GONE: &str = "Conversation is no longer in the Inbox";
@@ -27,6 +27,8 @@ impl Inbox {
         };
         let viewing = window.is_window_active()
             && self.session.search.is_none()
+            && self.session.label_scope.is_none()
+            && self.list_label.is_none()
             && self.session.roles.is(FolderRole::Inbox, &self.list_folder)
             && self.session.folder == self.list_folder;
         queue.set_viewing(viewing);
@@ -51,17 +53,17 @@ impl Inbox {
         &mut self,
         receipt: Receipt,
         text: String,
-        undo: Option<i64>,
+        confirmation: Option<Confirmation>,
         alert: bool,
     ) {
-        if let Some(queue) = &self.notifications {
-            queue.feedback(receipt, text.clone(), undo);
-        }
-        let toast = if undo.is_some() {
+        let toast = if confirmation.is_some() {
             format!("{text} · u")
         } else {
-            text
+            text.clone()
         };
+        if let Some(queue) = &self.notifications {
+            queue.feedback(receipt, text, confirmation);
+        }
         self.notification_toast = (!self.window_active).then(|| (toast.clone(), alert));
         self.session.show_toast(toast, alert);
     }
@@ -210,12 +212,16 @@ impl Inbox {
         let archive = matches!(invoked.action, notifications::Action::Archive);
         self.change_mailbox(
             move |store| edit_notification(store, &account, &folder, invoked.messages, archive),
-            move |inbox, result| {
+            move |inbox, result, _| {
                 let (title, undo, alert) = match result {
                     Ok(Edit::Changed(action_id)) => {
                         inbox.send_to_server();
                         let title = if archive { "Archived" } else { "Marked read" };
-                        (title.into(), Some(action_id), false)
+                        let confirmation = Confirmation {
+                            action_id,
+                            subject: invoked.subject,
+                        };
+                        (title.into(), Some(confirmation), false)
                     }
                     Ok(Edit::Gone) => (GONE.into(), None, false),
                     Ok(Edit::Unchanged) => ("Already read".into(), None, false),
