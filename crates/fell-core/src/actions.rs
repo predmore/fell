@@ -1366,6 +1366,7 @@ fn apply_plan(conn: &Connection, account_id: &AccountId, plan: &Planned) -> Resu
         sync_terms(conn, account_id.as_str(), &old_terms, &HashSet::new())?;
         remove_message_embedding(conn, account_id.as_str(), &plan.before.message_id)?;
         dequeue_message(conn, account_id.as_str(), &plan.before.message_id)?;
+        crate::store::correspondents::forget_send(conn, account_id, &plan.before.message_id)?;
         let changed = conn.execute(
             "DELETE FROM messages WHERE account_id = ?1 AND message_id = ?2",
             params![account_id.as_str(), plan.before.message_id],
@@ -2371,6 +2372,27 @@ pub(crate) fn remove_account_actions(conn: &Connection, account_id: &str) -> Res
         [account_id],
     )?;
     Ok(())
+}
+
+pub(crate) fn message_was_purged(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_id: &str,
+) -> Result<bool> {
+    if !action_table_exists(conn, "local_actions")? {
+        return Ok(false);
+    }
+    Ok(conn.query_row(
+        "SELECT EXISTS (
+             SELECT 1 FROM local_folder_tombstones t
+             JOIN local_actions a ON a.id = t.action_id
+             WHERE t.account_id = ?1 AND t.message_id = ?2 AND a.kind = 'purge'
+               AND NOT EXISTS (SELECT 1 FROM messages WHERE account_id = ?1 AND message_id = ?2)
+               AND NOT EXISTS (SELECT 1 FROM message_aliases WHERE account_id = ?1 AND message_id = ?2)
+         )",
+        params![account_id.as_str(), message_id],
+        |row| row.get(0),
+    )?)
 }
 
 fn action_table_exists(conn: &Connection, table: &str) -> Result<bool> {

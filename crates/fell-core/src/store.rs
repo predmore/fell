@@ -25,6 +25,7 @@ use crate::threading::{ThreadId, resolve_thread_id};
 
 pub(crate) mod bodies;
 pub(crate) mod copies;
+pub(crate) mod correspondents;
 mod dates;
 pub(crate) mod inbox_arrivals;
 pub(crate) mod intents;
@@ -537,6 +538,7 @@ impl Store {
         // file after a checkpoint but never shrinks it; this trims it back.
         conn.pragma_update(None, "journal_size_limit", 64 * 1024 * 1024)?;
         conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(correspondents::QUEUE)?;
         ensure_message_columns(&conn)?;
         ensure_compose_columns(&conn)?;
         ensure_alias_columns(&conn)?;
@@ -619,6 +621,7 @@ impl Store {
         dates::ensure_date_repair(&conn)?;
         crate::actions::migrate_purge_snapshots(&conn)?;
         keywords::migrate_reserved_labels(&conn)?;
+        correspondents::ensure(&conn)?;
         Ok(Self {
             indexer: None,
             semantic: std::cell::RefCell::new(crate::search::semantic::Semantic::new(
@@ -877,6 +880,7 @@ impl Store {
             tx = self.begin_sync_write()?;
         }
         let repaired = if let Some(found) = &delta.roles {
+            correspondents::roles_changed(&tx, account_id, found)?;
             roles::replace(&tx, account_id, found)?;
             let sent_changed = sent::on_listing(&tx, account_id, found)?;
             sent_echo_repair::on_listing(&tx, account_id, found)? || sent_changed
@@ -1547,7 +1551,12 @@ impl Store {
             Folder => crate::search::folder_suggestions(&self.conn, account, prefix, limit),
             Label => crate::search::label_suggestions(&self.conn, account, prefix, limit),
             Sender | Recipient => {
-                crate::search::address_suggestions(&self.conn, account, field, prefix, limit)
+                Ok(
+                    correspondents::suggest(&self.conn, account, prefix, limit, &HashSet::new())?
+                        .into_iter()
+                        .map(|person| person.email)
+                        .collect(),
+                )
             }
         }
     }
@@ -2512,6 +2521,11 @@ fn delete_demo_account(conn: &Connection, id: &str) -> Result<()> {
         "review_drafts",
         "compose_drafts",
         "compose_send",
+        "correspondent_prefixes",
+        "correspondent_sightings",
+        "correspondents",
+        "correspondent_sends",
+        "correspondent_dirty",
     ] {
         conn.execute(&format!("DELETE FROM {table} WHERE account_id = ?1"), [id])?;
     }
@@ -3147,6 +3161,7 @@ fn delete_stored(
         remove_message_embedding(conn, account_id.as_str(), id)?;
         dequeue_message(conn, account_id.as_str(), id)?;
     }
+    correspondents::forget_send(conn, account_id, &stored.canonical_id)?;
     let removed = conn.execute(
         "DELETE FROM messages WHERE account_id = ?1 AND message_id = ?2",
         params![account_id.as_str(), stored.canonical_id],
@@ -3361,6 +3376,8 @@ fn absorb_duplicate(
         &doomed.canonical_id,
         &keeper.canonical_id,
     )?;
+    // A duplicate still has a live copy. Its alias keeps pending send
+    // recipients attached until the surviving row is indexed as Sent.
     conn.execute(
         "DELETE FROM messages WHERE account_id = ?1 AND message_id = ?2",
         params![message.account_id.as_str(), doomed.canonical_id],
@@ -4432,6 +4449,7 @@ impl<'a> std::ops::Deref for WriteTx<'a> {
 impl WriteTx<'_> {
     pub(crate) fn commit(self) -> Result<()> {
         summaries::refresh_dirty(&self.0)?;
+        correspondents::refresh_dirty(&self.0, correspondents::WRITE_BATCH)?;
         self.0.commit().map_err(Into::into)
     }
 
@@ -4686,10 +4704,31 @@ mod tests {
 
         let store = Store::open(&path).unwrap();
         assert!(!store.list_threads(&demo.id).unwrap().is_empty());
+        while store.maintain_correspondents().unwrap() {}
+        let indexed = store.correspondent_suggestions(&demo.id, "from").unwrap();
+        assert!(!indexed.is_empty());
         let configured = account_b();
         store.configure_account(&configured, true).unwrap();
         assert!(store.get_account(&demo.id).unwrap().is_none());
         assert!(store.list_threads(&demo.id).unwrap().is_empty());
+        for table in [
+            "correspondent_prefixes",
+            "correspondent_sightings",
+            "correspondents",
+            "correspondent_sends",
+            "correspondent_dirty",
+        ] {
+            assert!(
+                !store
+                    .conn
+                    .query_row(
+                        &format!("SELECT EXISTS (SELECT 1 FROM {table} WHERE account_id = ?1)"),
+                        [demo.id.as_str()],
+                        |row| row.get::<_, bool>(0)
+                    )
+                    .unwrap()
+            );
+        }
         assert!(store.write_back(&configured.id).unwrap());
         drop(store);
         std::fs::remove_file(&path).unwrap();
@@ -6131,6 +6170,187 @@ mod tests {
         assert!(location("Archive").starred);
         assert!(location("INBOX").starred);
         assert!(location("Archived").starred);
+    }
+
+    #[test]
+    fn correspondent_completion_ranks_and_updates_canonical_history() {
+        let store = Store::open_in_memory().unwrap();
+        let account = account();
+        store.upsert_account(&account).unwrap();
+        store.upsert_account(&account_b()).unwrap();
+        let person = |name: &str, email: &str| Address {
+            name: Some(name.into()),
+            email: email.into(),
+        };
+        let incoming = |id: &str, name, email, date, folder: &str, list: bool| {
+            let mut message = msg(id, None, None, id, "Synthetic update");
+            message.headers.from = person(name, email);
+            message.headers.date_unix = date;
+            message.folders = vec![folder.into()];
+            message.list_id = list.then(|| "bulletin.example.test".into());
+            store
+                .apply_delta(
+                    &account.id,
+                    &MailboxDelta {
+                        messages: vec![message.clone()],
+                        ..MailboxDelta::default()
+                    },
+                )
+                .unwrap();
+            message
+        };
+        let suggest = |prefix| {
+            store
+                .correspondent_suggestions(&account.id, prefix)
+                .unwrap()
+        };
+        let email = |rows: Vec<Address>| rows.into_iter().map(|row| row.email).collect::<Vec<_>>();
+        let ari = person("Ari Wynn", "ari@example.test");
+        incoming("a1", "Ari Wynn", "ARI@example.test", 200, "INBOX", false);
+        incoming("a2", "Ari", "ari@example.test", 500, "INBOX", false);
+        incoming(
+            "b",
+            "Avery Park",
+            "avery@example.test",
+            900_000,
+            "INBOX",
+            false,
+        );
+        incoming(
+            "c",
+            "Avery Town",
+            "town@example.test",
+            1_000_000,
+            "INBOX",
+            false,
+        );
+        incoming(
+            "d",
+            "Ari Bulletin",
+            "bulletin@example.test",
+            2_000_000,
+            "INBOX",
+            true,
+        );
+        incoming(
+            "e",
+            "Ari Updates",
+            "no-reply@example.test",
+            3_000_000,
+            "INBOX",
+            false,
+        );
+        let spam = incoming(
+            "f",
+            "Ari Offer",
+            "spammer@example.test",
+            4_000_000,
+            "Junk Email",
+            false,
+        );
+
+        assert_eq!(
+            email(suggest("a")),
+            [
+                "town@example.test",
+                "avery@example.test",
+                "ARI@example.test",
+                "no-reply@example.test",
+                "bulletin@example.test",
+            ]
+        );
+        assert_eq!(suggest("AW"), [person("Ari Wynn", "ARI@example.test")]);
+        assert!(suggest("spam").is_empty());
+        assert!(
+            store
+                .correspondent_suggestions(&account_b().id, "a")
+                .unwrap()
+                .is_empty()
+        );
+
+        let id = MessageId::new("sent@compose.example.test");
+        let hidden = person("Bea Finch", "bea@example.test");
+        let recipients = [ari.clone(), hidden.clone()];
+        for _ in 0..2 {
+            store
+                .record_sent_correspondents(&account.id, &id, &recipients, 600)
+                .unwrap();
+        }
+        assert_eq!(email(suggest("a"))[0], "ARI@example.test");
+        assert_eq!(suggest("bf").as_slice(), std::slice::from_ref(&hidden));
+
+        let mut sent = msg(id.as_str(), None, None, "A local send", "Synthetic reply");
+        sent.headers.from.email = account.email.clone();
+        sent.headers.date_unix = 800;
+        sent.folders = vec!["Sent Items".into()];
+        sent.to = vec![ari.clone()];
+        sent.cc = vec![person("Ari", "ARI@example.test")];
+        store
+            .record_sent_bcc(&account.id, &id, std::slice::from_ref(&hidden))
+            .unwrap();
+        store.upsert_message(&sent).unwrap();
+        store.upsert_message(&sent).unwrap();
+        let pending: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM correspondent_sends", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(pending, 0);
+        assert_eq!(suggest("bf").as_slice(), std::slice::from_ref(&hidden));
+        let counts: (i64, i64, i64) = store.conn.query_row(
+            "SELECT sent_to, received_from, last_contacted FROM correspondents WHERE address = 'ari@example.test'",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(counts, (1, 2, 800));
+        assert!(store.delete_message(&account.id, &id).unwrap());
+        assert!(suggest("bf").is_empty());
+
+        let mut delivered = spam.clone();
+        delivered.folders = vec!["INBOX".into()];
+        store.upsert_message(&delivered).unwrap();
+        assert_eq!(email(suggest("spam")), ["spammer@example.test"]);
+        let tx = immediate_transaction(&store.conn).unwrap();
+        tx.execute("UPDATE messages SET folders = 'Junk Email' WHERE account_id = 'a1' AND message_id = ?1",
+            [spam.headers.message_id.as_str()]).unwrap();
+        tx.commit().unwrap();
+        assert!(suggest("spam").is_empty());
+    }
+
+    #[test]
+    fn purging_the_last_copy_removes_pending_send_suggestions() {
+        let store = Store::open_in_memory().unwrap();
+        let account = account();
+        store.upsert_account(&account).unwrap();
+        let id = MessageId::new("pending@example.test");
+        let people = [Address {
+            name: None,
+            email: "pending-recipient@example.test".into(),
+        }];
+        store
+            .record_sent_correspondents(&account.id, &id, &people, 600)
+            .unwrap();
+        // An Inbox echo can arrive before the Sent copy.
+        let mut message = msg(id.as_str(), None, None, "A local send", "Synthetic reply");
+        message.headers.from.email = account.email.clone();
+        message.folders = vec!["INBOX".into()];
+        let thread = store.upsert_message(&message).unwrap();
+        store.delete_thread(&account.id, &thread, "INBOX").unwrap();
+        let suggest = || {
+            store
+                .correspondent_suggestions(&account.id, "pending-recipient")
+                .unwrap()
+        };
+        assert_eq!(suggest(), people);
+        store
+            .purge_threads(&account.id, &[thread], "Trash")
+            .unwrap();
+        assert!(suggest().is_empty());
+        // A delayed send callback cannot restore a purged row.
+        store
+            .record_sent_correspondents(&account.id, &id, &people, 600)
+            .unwrap();
+        assert!(suggest().is_empty());
     }
 
     #[test]

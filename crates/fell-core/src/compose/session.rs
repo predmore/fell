@@ -45,6 +45,7 @@ pub struct SentCopy {
     account_id: AccountId,
     message_id: crate::MessageId,
     bcc: Vec<crate::Address>,
+    visible: Vec<crate::Address>,
 }
 
 impl SentCopy {
@@ -64,18 +65,28 @@ impl SentCopy {
         )
     }
 
-    /// Write the record. Opens the mailbox for this one write, like a draft
-    /// save, so no connection outlives the send.
-    pub fn remember_bcc(&self) -> crate::Result<()> {
-        if self.bcc.is_empty() {
+    /// Remember the envelope's Bcc and, for confirmed sends without a
+    /// local Sent copy, keep the recipients available for autocomplete.
+    pub fn remember_recipients(&self, confirmed: bool) -> crate::Result<()> {
+        if !confirmed && self.bcc.is_empty() {
             return Ok(());
         }
+        let recipients: Vec<_> = self.visible.iter().chain(&self.bcc).cloned().collect();
+        let sent_at = crate::outbox::now_unix();
         crate::store::retry_sent_write(|| {
-            crate::Store::open(&self.store)?.record_sent_bcc(
-                &self.account_id,
-                &self.message_id,
-                &self.bcc,
-            )
+            let store = crate::Store::open(&self.store)?;
+            if !self.bcc.is_empty() {
+                store.record_sent_bcc(&self.account_id, &self.message_id, &self.bcc)?;
+            }
+            if confirmed {
+                store.record_sent_correspondents(
+                    &self.account_id,
+                    &self.message_id,
+                    &recipients,
+                    sent_at,
+                )?;
+            }
+            Ok(())
         })
     }
 }
@@ -1230,23 +1241,27 @@ impl DraftSession {
 
     /// Where to save `outgoing` once SMTP confirms delivery.
     pub fn sent_copy(&self, outgoing: &Outgoing) -> Option<SentCopy> {
-        let bcc: Vec<crate::Address> = outgoing
-            .draft
-            .bcc
-            .iter()
-            .filter_map(|raw| super::frontmatter::mailbox_parts(raw))
-            .map(|(name, email)| crate::Address { name, email })
-            .collect();
         let store = self
             .store_path
             .clone()
             .or_else(|| persist::remembered_store_path(&self.id))?;
+        let address = |raw: &String| {
+            super::frontmatter::mailbox_parts(raw)
+                .map(|(name, email)| crate::Address { name, email })
+        };
         Some(SentCopy {
             store,
             draft_id: self.id.clone(),
             account_id: outgoing.draft.account_id.clone(),
             message_id: outgoing.message_id.clone(),
-            bcc,
+            bcc: outgoing.draft.bcc.iter().filter_map(address).collect(),
+            visible: outgoing
+                .draft
+                .to
+                .iter()
+                .chain(&outgoing.draft.cc)
+                .filter_map(address)
+                .collect(),
         })
     }
 

@@ -24,6 +24,10 @@ pub struct Theme {
     pub kind: ThemeKind,
     pub background: u32,
     pub surface: u32,
+    pub recipient_surface: u32,
+    pub recipient_text: (u32, u32),
+    pub recipient_selection: u32,
+    pub recipient_selected_text: (u32, u32),
     pub foreground: u32,
     pub dimmed: u32,
     pub accent: u32,
@@ -160,6 +164,23 @@ fn builtin(dark: bool, fonts: Fonts) -> Theme {
     }
 }
 
+pub(crate) fn builtin_for_compose(dark: bool) -> &'static Theme {
+    static DARK: std::sync::OnceLock<Theme> = std::sync::OnceLock::new();
+    static LIGHT: std::sync::OnceLock<Theme> = std::sync::OnceLock::new();
+    let theme = if dark { &DARK } else { &LIGHT };
+    theme.get_or_init(|| {
+        builtin(
+            dark,
+            Fonts {
+                ui_family: None,
+                ui_px: 16.,
+                mono_family: None,
+                mono_px: 16.,
+            },
+        )
+    })
+}
+
 fn map_palette(
     name: String,
     kind: ThemeKind,
@@ -168,12 +189,18 @@ fn map_palette(
     foreground_raw: u32,
     fonts: &Fonts,
 ) -> Theme {
-    let _mode = raw.mode.as_deref();
+    let dark = match raw.mode.as_deref() {
+        Some("dark") => true,
+        Some("light") => false,
+        _ => luminance(background) <= 0.4,
+    };
     let dim_raw = color(raw, &["dark_foreground", "muted", "color8"])
         .unwrap_or_else(|| mix(foreground_raw, background, 0.55));
     let (foreground, dimmed) = text_pair(foreground_raw, dim_raw, background);
     let surface = mix(background, foreground, 0.045);
     let (foreground, dimmed) = text_pair(foreground, dimmed, surface);
+    let recipient_surface = mix(surface, foreground, 0.05);
+    let recipient_text = text_pair(foreground, dimmed, recipient_surface);
     let accent_raw = color(raw, &["accent", "blue", "color4", "color12"]).unwrap_or(foreground);
     let error_raw = color(raw, &["red", "bright_red", "color1"]).unwrap_or(0xcc3333);
     let success_raw = color(raw, &["green", "bright_green", "color2"]).unwrap_or(0x31935d);
@@ -188,6 +215,21 @@ fn map_palette(
     let on_selection_raw = color(raw, &["selection_foreground"]).unwrap_or(foreground);
     let (on_selection, on_selection_dim) = text_pair(on_selection_raw, on_selection_raw, selection);
     let accent = ensure_all(accent_raw, &[background, surface], TEXT_CONTRAST);
+    let recipient_fill = if dark {
+        mix(selection, accent, 0.14)
+    } else {
+        selection
+    };
+    let recipient_selection = ensure(recipient_fill, recipient_surface, 1.25);
+    let recipient_selected_text = if dark {
+        let bright = color(raw, &["bright_foreground"]).unwrap_or(foreground);
+        (
+            ensure(bright, recipient_selection, TEXT_CONTRAST),
+            fade_toward(dimmed, recipient_selection),
+        )
+    } else {
+        text_pair(on_selection_raw, on_selection_raw, recipient_selection)
+    };
     let on_selection_accent = if contrast(accent, selection) >= TEXT_CONTRAST {
         accent
     } else {
@@ -204,6 +246,10 @@ fn map_palette(
         kind,
         background,
         surface,
+        recipient_surface,
+        recipient_text,
+        recipient_selection,
+        recipient_selected_text,
         foreground,
         dimmed,
         accent,
@@ -301,6 +347,11 @@ pub fn contrast_ok(theme: &Theme) -> bool {
         && contrast(theme.star, theme.selection) >= TEXT_CONTRAST
         && contrast(theme.on_selection_dim, theme.selection) >= TEXT_CONTRAST
         && contrast(theme.on_selection_accent, theme.selection) >= TEXT_CONTRAST
+        && contrast(theme.recipient_text.0, theme.recipient_surface) >= TEXT_CONTRAST
+        && contrast(theme.recipient_text.1, theme.recipient_surface) >= TEXT_CONTRAST
+        && contrast(theme.recipient_selection, theme.recipient_surface) >= 1.25
+        && contrast(theme.recipient_selected_text.0, theme.recipient_selection) >= TEXT_CONTRAST
+        && contrast(theme.recipient_selected_text.1, theme.recipient_selection) >= TEXT_CONTRAST
         && contrast(theme.error, theme.selection) >= TEXT_CONTRAST
         && contrast(theme.foreground, theme.background)
             >= contrast(theme.dimmed, theme.background) + 0.8
@@ -883,6 +934,9 @@ mod tests {
             let name = path.file_stem().unwrap().to_string_lossy().into_owned();
             let theme = theme_from_palette(&text, &fonts, name.clone())
                 .unwrap_or_else(|| panic!("palette {name}"));
+            if name == "tokyo-night" {
+                assert_eq!(theme.recipient_selected_text.0, 0xc0caf5);
+            }
             assert!(
                 contrast_ok(&theme),
                 "{name} fg {:06x}/{:.2} dim {:06x}/{:.2}/{:.2} accent {:06x}/{:.2} sel {:06x}/{:.2} on {:06x}/{:.2} err {:06x}/{:.2}/sel {:.2} star {:06x}/{:.2}/sel {:.2} bg {:06x} surface {:06x}",

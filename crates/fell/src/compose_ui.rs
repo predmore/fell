@@ -1,6 +1,9 @@
 //! Compose window. The buffer is plain markdown. Styling is a view of that
 //! text, through the same document model the conversation renderer uses.
 
+mod recipients;
+pub(crate) use recipients::RecipientStore;
+
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv6Addr;
 use std::ops::Range;
@@ -31,7 +34,7 @@ pub enum ThemeKind {
     Light,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Palette {
     bg: u32,
     fg: u32,
@@ -279,7 +282,9 @@ pub struct ComposeView {
     cc_line: String,
     bcc_line: String,
     subject_line: String,
-    field_col: usize,
+    recipients: recipients::Completion,
+    styled_cache: Option<(StyledBodyKey, gpui::Entity<CachedStyledBody>)>,
+    frames: Option<crate::frame_log::SharedFrameLog>,
     theme: ThemeKind,
     /// The Omarchy theme this window follows, live. `None` uses the
     /// built-in palette for `theme`.
@@ -327,6 +332,39 @@ pub struct ComposeView {
     send_detail_scroll: gpui::ScrollHandle,
 }
 
+#[derive(PartialEq, Eq)]
+struct StyledBodyKey {
+    draft_id: SharedString,
+    revision: u64,
+    hunk: Option<u64>,
+    colors: Palette,
+    family: String,
+}
+
+struct CachedStyledBody {
+    compose: gpui::WeakEntity<ComposeView>,
+    colors: Palette,
+    family: String,
+}
+
+impl Render for CachedStyledBody {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.compose
+            .update(cx, |compose, cx| {
+                let snap = compose
+                    .hub
+                    .with_session(compose.draft_id.as_ref(), |session| session.snapshot());
+                snap.map(|snap| {
+                    compose
+                        .body_area(&snap, self.colors, window, &self.family, cx)
+                        .into_any_element()
+                })
+                .unwrap_or_else(|| div().into_any_element())
+            })
+            .unwrap_or_else(|_| div().into_any_element())
+    }
+}
+
 impl ComposeView {
     pub fn new(
         hub: Arc<DraftHub>,
@@ -362,7 +400,9 @@ impl ComposeView {
             cc_line: join_addrs(&snap.cc),
             bcc_line: join_addrs(&snap.bcc),
             subject_line: snap.subject,
-            field_col: 0,
+            recipients: recipients::Completion::default(),
+            styled_cache: None,
+            frames: crate::frame_log::FrameLog::from_env(),
             theme: ThemeKind::Dark,
             look: None,
             raw: false,
@@ -917,6 +957,10 @@ impl ComposeView {
         let Some(snap) = self.hub.with_session(&id, |session| session.snapshot()) else {
             return;
         };
+        self.set_header_row(field, &snap);
+    }
+
+    fn set_header_row(&mut self, field: Field, snap: &Snapshot) {
         match field {
             Field::To => self.to_line = join_addrs(&snap.to),
             Field::Cc => self.cc_line = join_addrs(&snap.cc),
@@ -1082,9 +1126,14 @@ impl ComposeView {
             .unwrap_or_default();
         if self.hub.with_session(&id, |session| session.undo()) == Some(true) {
             self.applied_revision = 0;
+            let snap = self.hub.with_session(&id, |session| session.snapshot());
+            // Ordinary sync preserves the active line while it is being typed.
+            // Undo replaces it too. Header carets are drawn at the line's end.
+            if let Some(snap) = &snap {
+                self.set_header_row(self.field, snap);
+            }
             self.sync_from_hub();
             // An edit that came back (a keep or reject undone) takes focus.
-            let snap = self.hub.with_session(&id, |session| session.snapshot());
             let returned = snap.as_ref().and_then(|snap| {
                 let order = ordered_hunks(snap);
                 let at = order.iter().position(|(hunk, _)| !before.contains(hunk))?;
@@ -1235,6 +1284,9 @@ impl ComposeView {
         }
         if key == "escape" {
             if self.field != Field::Body {
+                if self.dismiss_recipient_menu() {
+                    return;
+                }
                 let field = self.field;
                 let committed = self.commit_field(field);
                 if !committed {
@@ -1256,7 +1308,11 @@ impl ComposeView {
             return;
         }
         if self.field != Field::Body {
-            self.field_key(key, typed);
+            if palette_shortcut {
+                self.palette = Some(String::new());
+            } else if !self.recipient_key(key, &event.keystroke.modifiers) {
+                self.field_key(key, typed);
+            }
             return;
         }
         if event.keystroke.modifiers.control && key == "enter" {
@@ -1334,6 +1390,9 @@ impl ComposeView {
                     .clear(self.draft_id.as_ref());
             }
             "send" => self.send(cx),
+            "complete recipient" if locked.is_none() => {
+                self.accept_recipient(self.recipients.selected());
+            }
             "discard" => self.discard(cx),
             "preview" => {
                 self.preview = !self.preview;
@@ -1517,7 +1576,6 @@ impl ComposeView {
                 }
             }
         }
-        let _ = self.field_col;
     }
 
     fn insert_key(&mut self, key: &str, typed: Option<&str>) {
@@ -1735,7 +1793,13 @@ impl ComposeView {
 
 impl Render for ComposeView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(frames) = &self.frames {
+            frames
+                .borrow_mut()
+                .render_started(std::time::Instant::now(), self.recipients.animating());
+        }
         self.sync_from_hub();
+        self.update_recipient_completion(cx);
         if self.closing {
             window.remove_window();
         }
@@ -1811,6 +1875,10 @@ impl Render for ComposeView {
             .and_then(|theme| theme.ui_family.clone())
             .unwrap_or_else(|| "Liberation Sans".into());
         let wide = window.viewport_size().width > px(640.);
+        let recipient_theme = self.look.as_ref().unwrap_or_else(|| {
+            crate::theme::builtin_for_compose(matches!(self.theme, ThemeKind::Dark))
+        });
+        let overlay = self.recipient_overlay(window, cx, recipient_theme);
         let feedback = self.send_feedback.feedback(lock, attempt.as_ref());
         if (self.send_panel == SendPanel::ConfirmUnlock && lock != Some(SendLock::MaybeSent))
             || (self.send_panel == SendPanel::Details
@@ -1857,11 +1925,21 @@ impl Render for ComposeView {
             .look
             .as_ref()
             .and_then(|theme| theme.mono_family.clone());
+        let feedback = feedback.map(|feedback| {
+            send_feedback_view(feedback, self.send_panel, &self.send_detail_scroll, colors)
+        });
+        let body = self.body_view(&snap, colors, window, &ui_family, cx);
         div()
             .id("compose")
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if let Some(frames) = &this.frames {
+                    frames
+                        .borrow_mut()
+                        .key(std::time::Instant::now(), event.keystroke.unparse());
+                }
                 this.on_key(event, cx);
+                this.update_recipient_completion(cx);
                 // Every key can change what is on screen (cursor, focused
                 // edit, status), not only the ones that touch the draft.
                 cx.notify();
@@ -1875,6 +1953,17 @@ impl Render for ComposeView {
             .text_size(px(16.))
             .font_weight(FontWeight(400.))
             .font_family(ui_family.clone())
+            .when_some(self.frames.clone(), |root, frames| {
+                let paint = frames.clone();
+                root.child(
+                    gpui::canvas(
+                        move |_, _, _| frames.borrow_mut().mark(0, std::time::Instant::now()),
+                        move |_, _, _, _| paint.borrow_mut().mark(2, std::time::Instant::now()),
+                    )
+                    .absolute()
+                    .size_0(),
+                )
+            })
             .child(header(&snap, colors).flex_shrink_0())
             // Everything between the header and the Attachments divider:
             // the HTML preview panel covers exactly this, so it never ends
@@ -1887,10 +1976,18 @@ impl Render for ComposeView {
                     .flex_1()
                     .min_h(px(0.))
                     .child(
-                        self.fields_view(&snap, colors, wide, window, &ui_family, reply_check)
-                            .flex_shrink_0(),
+                        self.fields_view(
+                            &snap,
+                            colors,
+                            wide,
+                            window,
+                            &ui_family,
+                            reply_check,
+                            overlay,
+                        )
+                        .flex_shrink_0(),
                     )
-                    .child(self.body_view(&snap, colors, window, &ui_family, cx))
+                    .child(body)
                     .children(
                         self.quote_view(&snap, colors)
                             .map(|quote| quote.flex_shrink_0()),
@@ -1898,9 +1995,7 @@ impl Render for ComposeView {
                     .children(self.preview.then(|| preview_panel(&snap, colors))),
             )
             .child(attachment_row(&snap, colors, wide).flex_shrink_0())
-            .children(feedback.map(|feedback| {
-                send_feedback_view(feedback, self.send_panel, &self.send_detail_scroll, colors)
-            }))
+            .children(feedback)
             .children(show_status.then(|| {
                 status_bar(
                     mode,
@@ -1924,12 +2019,28 @@ impl Render for ComposeView {
                     matches!(lock, None | Some(SendLock::MaybeSent)),
                     colors,
                 )
+                .when(self.recipients.has_matches(), |panel| {
+                    panel.child(div().text_sm().child("Complete recipient"))
+                })
             }))
             .children(self.preview.then(|| preview_scrim(colors)))
+            .when_some(self.frames.clone(), |root, frames| {
+                frames.borrow_mut().built(std::time::Instant::now());
+                let prepaint = frames.clone();
+                root.child(
+                    gpui::canvas(
+                        move |_, _, _| prepaint.borrow_mut().mark(1, std::time::Instant::now()),
+                        move |_, _, _, _| frames.borrow_mut().painted(std::time::Instant::now()),
+                    )
+                    .absolute()
+                    .size_0(),
+                )
+            })
     }
 }
 
 impl ComposeView {
+    #[allow(clippy::too_many_arguments)]
     fn fields_view(
         &self,
         snap: &Snapshot,
@@ -1938,7 +2049,16 @@ impl ComposeView {
         window: &Window,
         family: &str,
         reply_check: Option<ReplyCheck>,
+        overlay: Option<(Field, gpui::Deferred)>,
     ) -> gpui::Div {
+        let mut overlay = overlay;
+        let mut overlay_for = |field| {
+            if overlay.as_ref().is_some_and(|(anchor, _)| *anchor == field) {
+                overlay.take().map(|(_, popup)| popup)
+            } else {
+                None
+            }
+        };
         let mut column = div().flex().flex_col().bg(rgb(colors.panel)).px_4().py_1();
         let redirects = redirects(snap);
         // A context row's subject gives way, with an ellipsis, so who and
@@ -1970,6 +2090,7 @@ impl ComposeView {
             wide,
             &redirects,
             Some(to_hint),
+            overlay_for(Field::To),
         );
         // Cc and Bcc always keep a row each, so tabbing into them never
         // moves the body.
@@ -1983,6 +2104,7 @@ impl ComposeView {
             wide,
             &none,
             Some(("none", colors.dim)),
+            overlay_for(Field::Cc),
         );
         column = field_row(
             column,
@@ -1994,6 +2116,7 @@ impl ComposeView {
             wide,
             &none,
             Some(("none", colors.dim)),
+            overlay_for(Field::Bcc),
         );
         column
             .child(subject_row(
@@ -2055,46 +2178,44 @@ impl ComposeView {
     }
 
     fn body_view(
-        &self,
+        &mut self,
         snap: &Snapshot,
         colors: Palette,
         window: &Window,
         family: &str,
-        cx: &Context<Self>,
+        cx: &mut Context<Self>,
     ) -> gpui::Div {
-        // Room for an agent edit's "was" text: the body, less its padding,
-        // the "was" label and its gap, and a margin for the shaped width
-        // running under the painted.
-        let measure = |text: &str| text_px(window, text, 16.0, family);
-        let was_room = f32::from(window.viewport_size().width) - 40.0 - measure("was") - 8.0 - 8.0;
-        let was_lines = |text: &str| break_lines(text, was_room, &measure);
-        let paint = SourcePaint {
-            colors,
-            font: gpui::font(if self.raw { "monospace" } else { family }.to_owned()),
-            view: cx.weak_entity(),
-            row: self.editor.row,
-            window,
+        let body = if !self.raw && self.field != Field::Body {
+            let key = StyledBodyKey {
+                draft_id: self.draft_id.clone(),
+                revision: snap.revision,
+                hunk: self.focused_hunk,
+                colors,
+                family: family.to_owned(),
+            };
+            if self
+                .styled_cache
+                .as_ref()
+                .is_none_or(|(previous, _)| *previous != key)
+            {
+                let compose = cx.weak_entity();
+                let view = cx.new(|_| CachedStyledBody {
+                    compose,
+                    colors,
+                    family: family.to_owned(),
+                });
+                self.styled_cache = Some((key, view));
+            }
+            let view = self.styled_cache.as_ref().unwrap().1.clone();
+            let mut style = div().flex_1().min_h_0().min_w_0();
+            gpui::AnyView::from(view)
+                .cached(style.style().clone())
+                .into_any_element()
+        } else {
+            self.styled_cache = None;
+            self.body_area(snap, colors, window, family, cx)
+                .into_any_element()
         };
-        let body = div()
-            .id("compose-body")
-            .flex_1()
-            .min_h(px(0.))
-            .overflow_y_scroll()
-            .px_5()
-            .py_2()
-            .child(if self.raw {
-                raw_body(&self.editor, &paint)
-            } else {
-                styled_body(
-                    &self.editor,
-                    &self.folder,
-                    &body_edit_ranges(snap),
-                    self.focused_hunk,
-                    draft_links(snap),
-                    &paint,
-                    &was_lines,
-                )
-            });
         let mut column = div()
             .flex()
             .flex_col()
@@ -2120,6 +2241,49 @@ impl ComposeView {
             );
         }
         column.child(body)
+    }
+
+    fn body_area(
+        &self,
+        snap: &Snapshot,
+        colors: Palette,
+        window: &Window,
+        family: &str,
+        cx: &Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        // Room for an agent edit's "was" text: the body, less its padding,
+        // the "was" label and its gap, and a margin for the shaped width
+        // running under the painted.
+        let measure = |text: &str| text_px(window, text, 16.0, family);
+        let was_room = f32::from(window.viewport_size().width) - 40.0 - measure("was") - 8.0 - 8.0;
+        let was_lines = |text: &str| break_lines(text, was_room, &measure);
+        let paint = SourcePaint {
+            colors,
+            font: gpui::font(if self.raw { "monospace" } else { family }.to_owned()),
+            view: cx.weak_entity(),
+            row: self.editor.row,
+            window,
+        };
+        div()
+            .id("compose-body")
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .px_5()
+            .py_2()
+            .child(if self.raw {
+                raw_body(&self.editor, &paint)
+            } else {
+                styled_body(
+                    &self.editor,
+                    &self.folder,
+                    &body_edit_ranges(snap),
+                    self.focused_hunk,
+                    draft_links(snap),
+                    &paint,
+                    &was_lines,
+                )
+            })
     }
 
     /// The quoted part stored on the draft. Absent when nothing is quoted.
@@ -2473,14 +2637,14 @@ fn log_send_result(result: &Result<fell_core::SentMessage, SendFailure>) {
     }
 }
 
-/// Keep the Bcc of a message the server has, or may have, so the Sent copy
-/// shows it once it syncs. A message that was not sent leaves no record.
+/// Keep confirmed recipients for completion and Bcc for the Sent copy.
+/// A draft whose transmission failed leaves no record.
 /// The write runs on its own thread with a few retries: the mail already
 /// went out, so a busy mailbox must neither hold up the send nor lose this.
-fn remember_bcc(record: fell_core::compose::SentCopy) {
+fn remember_sent_recipients(record: fell_core::compose::SentCopy, confirmed: bool) {
     std::thread::spawn(move || {
-        if record.remember_bcc().is_err() {
-            fell_core::diagnostic!(WARN, "Could not record Bcc for a send");
+        if record.remember_recipients(confirmed).is_err() {
+            fell_core::diagnostic!(WARN, "Could not record recipients for a send");
         }
     });
 }
@@ -2521,11 +2685,11 @@ impl PreparedSend {
                             });
                     if stored.is_err() {
                         fell_core::diagnostic!(WARN, "Could not save local Sent copy");
-                        remember_bcc(record);
+                        remember_sent_recipients(record, true);
                     }
                     saved(stored);
                 }
-                Err(SendFailure::MaybeSent(_)) => remember_bcc(record),
+                Err(SendFailure::MaybeSent(_)) => remember_sent_recipients(record, false),
                 Err(_) => {}
             }
         }
@@ -2588,6 +2752,7 @@ fn field_row(
     wide: bool,
     redirects: &HashSet<String>,
     placeholder: Option<(&str, u32)>,
+    overlay: Option<gpui::Deferred>,
 ) -> gpui::Div {
     // While a field is being edited it shows the raw line. Otherwise each
     // address stands alone, with its note beside it: "(first time)" for one
@@ -2670,11 +2835,12 @@ fn field_row(
                     .child(marked(address, index < last))
             }))
     };
+    let inset = crate::recipient_menu::TEXT_INSET;
     parent.child(
         div()
             .flex()
-            .gap_3()
-            .px_1()
+            .gap(px(12. - inset))
+            .pl_1()
             .py_1()
             .border_l(px(2.))
             .border_color(rgb(if active { colors.accent } else { colors.panel }))
@@ -2686,7 +2852,14 @@ fn field_row(
                     .text_color(rgb(colors.fg))
                     .child(label.to_string()),
             )
-            .child(shown.flex_1().min_w(px(0.))),
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_w_0()
+                    .child(shown.pl(px(inset)).pr_1())
+                    .children(overlay),
+            ),
     )
 }
 
@@ -5968,6 +6141,7 @@ fn palette_action(query: &str) -> Option<&'static str> {
         return Some("unlock");
     }
     match query.as_str() {
+        "complete recipient" | "complete" => return Some("complete recipient"),
         "details" => return Some("details"),
         "dismiss" => return Some("dismiss"),
         _ => {}

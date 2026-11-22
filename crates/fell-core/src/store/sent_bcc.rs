@@ -66,7 +66,7 @@ pub(super) fn record(
              ON CONFLICT(account_id, message_id) DO UPDATE SET bcc_addrs = excluded.bcc_addrs",
         params![account_id.as_str(), message_id.as_str(), recorded],
     )?;
-    Ok(())
+    super::correspondents::dirty(conn, account_id, message_id)
 }
 
 /// Add each message's recorded Bcc, found by its own id or any id that

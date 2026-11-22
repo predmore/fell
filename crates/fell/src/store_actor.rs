@@ -178,6 +178,8 @@ const BACKGROUND_RETRIES: [Duration; 4] = [
 ];
 
 const PART_CACHE_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+const CORRESPONDENT_RECHECK: Duration = Duration::from_secs(1);
+const CORRESPONDENT_BATCH_GAP: Duration = Duration::from_millis(2);
 
 /// Open the second connection on its own thread, retrying a few times. If
 /// it never opens, background jobs keep using the interactive lane.
@@ -231,6 +233,7 @@ fn run_background(store: &Store, jobs: &mpsc::Receiver<Job>, recovered: &mut dyn
     // Sweep after startup and between jobs, even while working offline or
     // when nobody has opened an attachment in this window.
     let mut next_sweep = Instant::now();
+    let mut next_correspondents = next_sweep;
     let mut failed = false;
     loop {
         if Instant::now() >= next_sweep {
@@ -249,12 +252,35 @@ fn run_background(store: &Store, jobs: &mpsc::Receiver<Job>, recovered: &mut dyn
             }
             next_sweep = Instant::now() + PART_CACHE_SWEEP_INTERVAL;
         }
-        match jobs.recv_timeout(next_sweep.saturating_duration_since(Instant::now())) {
+        let due = next_sweep.min(next_correspondents);
+        match jobs.recv_timeout(due.saturating_duration_since(Instant::now())) {
             Ok(job) => {
                 job(store);
                 recovered();
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if Instant::now() >= next_correspondents {
+                    // A queued read gets a turn between batches, and a
+                    // waiting writer gets time to take SQLite's lock.
+                    let more = match store.maintain_correspondents() {
+                        Ok(more) => more,
+                        Err(err) => {
+                            diagnostic!(
+                                DEBUG,
+                                "Could not refresh correspondents",
+                                error = &err as &dyn std::error::Error
+                            );
+                            false
+                        }
+                    };
+                    let wait = if more {
+                        CORRESPONDENT_BATCH_GAP
+                    } else {
+                        CORRESPONDENT_RECHECK
+                    };
+                    next_correspondents = Instant::now() + wait;
+                }
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 let _ = store.clean_default_part_cache();
                 return;

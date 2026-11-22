@@ -28,7 +28,7 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params_from_iter};
 
 use crate::account::AccountId;
-use crate::message::{MessageId, decode_addresses};
+use crate::message::MessageId;
 use crate::store::views;
 use crate::threading::ThreadId;
 use crate::{Error, Result};
@@ -409,62 +409,6 @@ fn matching_rows(
     }
     append_filters(sql, &mut params, parsed);
     params
-}
-
-pub(crate) fn address_suggestions(
-    conn: &Connection,
-    account: &AccountId,
-    field: SearchField,
-    prefix: &str,
-    limit: usize,
-) -> Result<Vec<String>> {
-    let prefix = prefix.to_lowercase();
-    let mut values = Vec::new();
-    let mut seen = HashSet::new();
-    let mut add = |email: String, name: Option<String>| {
-        let folded = email.to_lowercase();
-        if !email.is_empty()
-            && (folded.starts_with(&prefix)
-                || name.is_some_and(|name| name.to_lowercase().starts_with(&prefix)))
-            && seen.insert(folded)
-        {
-            values.push(email);
-        }
-        values.len() >= limit
-    };
-    match field {
-        SearchField::Sender => {
-            let mut stmt = conn.prepare_cached(
-                "SELECT from_email, from_name FROM messages
-                 WHERE account_id = ?1 ORDER BY date_unix DESC LIMIT ?2",
-            )?;
-            let mut rows = stmt.query(rusqlite::params![account.as_str(), COMPLETION_MESSAGES])?;
-            while let Some(row) = rows.next()? {
-                if add(row.get(0)?, row.get(1)?) {
-                    break;
-                }
-            }
-        }
-        SearchField::Recipient => {
-            let mut stmt = conn.prepare_cached(
-                "SELECT to_line, cc_line, bcc_line FROM messages
-                 WHERE account_id = ?1 ORDER BY date_unix DESC LIMIT ?2",
-            )?;
-            let mut rows = stmt.query(rusqlite::params![account.as_str(), COMPLETION_MESSAGES])?;
-            'messages: while let Some(row) = rows.next()? {
-                for column in 0..3 {
-                    let encoded: String = row.get(column)?;
-                    for address in decode_addresses(&encoded) {
-                        if add(address.email, address.name) {
-                            break 'messages;
-                        }
-                    }
-                }
-            }
-        }
-        _ => unreachable!("address completions require a sender or recipient"),
-    }
-    Ok(values)
 }
 
 pub(crate) fn label_suggestions(
@@ -1960,29 +1904,6 @@ fn damerau_levenshtein(left: &str, right: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn unicode_recipient_completion_checks_only_the_newest_messages() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE messages (account_id TEXT, date_unix INTEGER, to_line TEXT, cc_line TEXT, bcc_line TEXT);
-             CREATE INDEX by_date ON messages(account_id, date_unix DESC);
-             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 4096)
-             INSERT INTO messages SELECT 'a', i, '', '', '' FROM n;
-             INSERT INTO messages VALUES ('a', 0, 'Àlost' || char(31) || 'old@example.test', '', '');
-             INSERT INTO messages VALUES ('a', 4097, '', 'Élodie' || char(31) || 'new@example.test', '');"
-        ).unwrap();
-        let account = AccountId("a".into());
-        assert_eq!(
-            address_suggestions(&conn, &account, SearchField::Recipient, "Él", 4).unwrap(),
-            ["new@example.test"]
-        );
-        assert!(
-            address_suggestions(&conn, &account, SearchField::Recipient, "Àl", 4)
-                .unwrap()
-                .is_empty()
-        );
-    }
 
     #[test]
     fn escapes_quotes() {
