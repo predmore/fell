@@ -266,7 +266,14 @@ fn start_with(
             });
             restart.run(|recovered| {
                 before_run();
-                run(&config, &store_path, &events_tx, &wake_rx, recovered, notifications.as_ref());
+                run(
+                    &config,
+                    &store_path,
+                    &events_tx,
+                    &wake_rx,
+                    recovered,
+                    notifications.as_ref(),
+                );
             });
         })
         .expect("spawn sync thread");

@@ -454,6 +454,8 @@ struct Inbox {
     focus: FocusHandle,
     notifications: Option<crate::notifications::Queue>,
     pending_activation: Option<crate::notifications::Activation>,
+    notification_toast: Option<(String, bool)>,
+    window_active: bool,
     /// The mailbox connection's own thread. The window never calls SQLite.
     store: StoreClient,
     startup_crash: Option<std::path::PathBuf>,
@@ -609,6 +611,7 @@ impl Inbox {
         let mut session = Session::new(name, email, initial, startup.keymap);
         session.loading = true;
         session.read_dwell_ms = startup.read_dwell_ms;
+        session.notification_mode = config.as_ref().map(|config| config.notifications);
         if let Some(error) = startup.error {
             session.record_startup_error(error);
         }
@@ -621,16 +624,16 @@ impl Inbox {
                 config.account().id,
             );
             Self::watch_notifications(window.window_handle(), invoked, cx);
-            cx.observe_window_activation(window, |inbox, window, _| {
-                inbox.track_inbox_visibility(window)
-            })
-            .detach();
+            cx.observe_window_activation(window, Self::notification_window_activation)
+                .detach();
             queue
         });
         let mut inbox = Self {
             focus: cx.focus_handle(),
             notifications,
             pending_activation: None,
+            notification_toast: None,
+            window_active: window.is_window_active(),
             account_id: config
                 .as_ref()
                 .map(|config| config.account().id)
@@ -2646,13 +2649,25 @@ impl Inbox {
     }
 
     fn apply_undo(&mut self, cx: &mut Context<Self>) {
+        self.undo_mailbox(None, cx);
+    }
+
+    fn undo_mailbox(
+        &mut self,
+        notice: Option<(crate::notifications::Receipt, i64)>,
+        cx: &mut Context<Self>,
+    ) {
         let account = self.account_id.clone();
         let folder = self.session.folder.clone();
         let reading = folder.clone();
+        let expected = notice.as_ref().map(|(_, action_id)| *action_id);
         self.undos_in_flight += 1;
         self.change_mailbox(
             move |store| {
-                let (action, restored) = store.undo_with_threads(&account)?;
+                let (action, restored) = match expected {
+                    Some(id) => store.undo_notification(&account, id),
+                    None => store.undo_with_threads(&account),
+                }?;
                 let select = restored_folder_key(store, &account, &reading, &restored);
                 Ok((action, restored, select))
             },
@@ -2667,7 +2682,9 @@ impl Inbox {
                                 ..ReadIntent::default()
                             });
                         }
-                        if let Some(target) = action.label_undo_target {
+                        if let Some((receipt, _)) = notice {
+                            inbox.notification_feedback(receipt, "Undone".into(), None, false);
+                        } else if let Some(target) = action.label_undo_target {
                             let (count, subject) = match target {
                                 LabelUndoTarget::Conversation(subject) => {
                                     (1, Some(present::display_safe(&subject)))
@@ -2713,10 +2730,15 @@ impl Inbox {
                     }
                     Err(err) => {
                         let raw = err.to_string();
-                        if raw == "nothing to undo" {
-                            inbox.session.show_toast("Nothing to undo", false);
+                        let (text, alert) = if raw == "nothing to undo" {
+                            ("Nothing to undo".into(), false)
                         } else {
-                            inbox.session.show_toast(raw, true);
+                            (raw, true)
+                        };
+                        if let Some((receipt, _)) = notice {
+                            inbox.notification_feedback(receipt, text, None, alert);
+                        } else {
+                            inbox.session.show_toast(text, alert);
                         }
                         // Resume any folder read held while the undo ran.
                         (inbox.undos_in_flight == 0 && !inbox.read_in_flight)
@@ -8502,10 +8524,12 @@ fn palette(
                 .py(px(4.))
                 .children(items.iter().enumerate().map(|(index, item)| {
                     let is_about = item.action == Action::About;
-                    let detail = if is_about {
-                        fell_version::VERSION
-                    } else {
-                        item.binding.as_str()
+                    let detail = match item.action {
+                        Action::About => fell_version::VERSION,
+                        Action::Notifications(mode) if session.notification_mode == Some(mode) => {
+                            "✓"
+                        }
+                        _ => item.binding.as_str(),
                     };
                     let choice = item.clone();
                     div()
@@ -8557,7 +8581,9 @@ fn palette(
                         )
                         .child(
                             div()
-                                .font_family_opt(theme.mono_family.clone())
+                                .when(detail != "✓", |slot| {
+                                    slot.font_family_opt(theme.mono_family.clone())
+                                })
                                 .text_size(px(theme.mono_px.max(12.0)))
                                 .when(is_about, |stamp| {
                                     stamp

@@ -737,12 +737,34 @@ impl Store {
         &self,
         account_id: &AccountId,
     ) -> Result<(LocalAction, Vec<ThreadId>)> {
+        self.undo_latest_with_threads(account_id, None)
+    }
+
+    /// Undo the given action only while it is still the account's next undo.
+    pub fn undo_notification(
+        &self,
+        account_id: &AccountId,
+        action_id: i64,
+    ) -> Result<(LocalAction, Vec<ThreadId>)> {
+        self.undo_latest_with_threads(account_id, Some(action_id))
+    }
+
+    fn undo_latest_with_threads(
+        &self,
+        account_id: &AccountId,
+        expected: Option<i64>,
+    ) -> Result<(LocalAction, Vec<ThreadId>)> {
         self.require_account(account_id)?;
         let tx = crate::store::immediate_transaction(self.connection())?;
         ensure_action_schema(&tx)?;
         let Some(mut action) = latest_open_action(&tx, account_id)? else {
             return Err(Error::Action("nothing to undo".into()));
         };
+        if expected.is_some_and(|id| id != action.id) {
+            return Err(Error::Action(
+                "A newer mailbox action is available to undo".into(),
+            ));
+        }
         let mut restored_threads = Vec::new();
         if action.kind == ActionKind::DiscardDrafts {
             let (restored, confirmed) = crate::compose::undo_discard(&tx, account_id, action.id)?;

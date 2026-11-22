@@ -89,12 +89,13 @@ Use `--imap --host imap.example.com` for an IMAP account other than Bridge. Setu
 
 ### New mail notifications
 
-Fell shows desktop notifications for new unread Inbox mail. Use **Notifications: on**,
-**Notifications: New mail only**, or **Notifications: off** in the command
-palette to change the account's setting immediately. You can also set
-`notifications = "on"` (the default), `"private"`, or `"off"` in
-`account.toml` and restart Fell. Private notifications show “New mail” or
-the number of messages in a burst, with no sender, subject, or preview.
+Fell shows desktop notifications for new unread Inbox mail. The command palette's
+**Notifications: Show sender and subject**, **Notifications: Hide sender and subject**,
+and **Notifications: Off** actions apply immediately, and a check mark shows the
+current mode. You can also set `notifications = "on"` (the default), `"private"`,
+or `"off"` in `account.toml` and restart Fell. Private mode keeps one notice with
+an unread count and an **Open Inbox** action. When you mark a conversation read or
+archive it from a notice, the confirmation offers **Undo** for five seconds.
 
 ## Agents
 

@@ -6,10 +6,10 @@ use futures::StreamExt;
 use futures::channel::mpsc::UnboundedReceiver;
 use gpui::{AnyWindowHandle, Context, Window};
 
-use super::{Inbox, ReadIntent, archive_failure, archived_notice};
+use super::{Inbox, ReadIntent, archive_failure};
 use crate::keymap::Action;
 use crate::model::Overlay;
-use crate::notifications::{self, Invoked};
+use crate::notifications::{self, Invoked, Receipt};
 use crate::present::Pane;
 
 const GONE: &str = "Conversation is no longer in the Inbox";
@@ -17,7 +17,7 @@ const GONE: &str = "Conversation is no longer in the Inbox";
 enum Edit {
     Gone,
     Unchanged,
-    Changed(String),
+    Changed(i64),
 }
 
 impl Inbox {
@@ -30,6 +30,40 @@ impl Inbox {
             && self.session.roles.is(FolderRole::Inbox, &self.list_folder)
             && self.session.folder == self.list_folder;
         queue.set_viewing(viewing);
+    }
+
+    pub(super) fn notification_window_activation(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.window_active = window.is_window_active();
+        self.track_inbox_visibility(window);
+        if self.window_active
+            && let Some((text, alert)) = self.notification_toast.take()
+        {
+            self.session.show_toast(text, alert);
+            cx.notify();
+        }
+    }
+
+    pub(super) fn notification_feedback(
+        &mut self,
+        receipt: Receipt,
+        text: String,
+        undo: Option<i64>,
+        alert: bool,
+    ) {
+        if let Some(queue) = &self.notifications {
+            queue.feedback(receipt, text.clone(), undo);
+        }
+        let toast = if undo.is_some() {
+            format!("{text} · u")
+        } else {
+            text
+        };
+        self.notification_toast = (!self.window_active).then(|| (toast.clone(), alert));
+        self.session.show_toast(toast, alert);
     }
 
     pub(super) fn set_notification_mode(&mut self, mode: NotificationMode, cx: &mut Context<Self>) {
@@ -49,9 +83,12 @@ impl Inbox {
             };
             let _ = this.update(cx, |inbox, cx| {
                 match result {
-                    Ok(()) => inbox
-                        .session
-                        .show_toast(Action::Notifications(mode).label(), false),
+                    Ok(()) => {
+                        inbox.session.notification_mode = Some(mode);
+                        inbox
+                            .session
+                            .show_toast(Action::Notifications(mode).label(), false);
+                    }
                     Err(err) => inbox
                         .session
                         .show_toast(format!("Could not save notifications · {err}"), true),
@@ -88,8 +125,13 @@ impl Inbox {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let notifications::Action::Undo(id) = invoked.action {
+            self.undo_mailbox(Some((invoked.receipt, id)), cx);
+            return;
+        }
         let account = self.account_id.clone();
         let folder = self.session.roles.name(FolderRole::Inbox).to_owned();
+        let receipt = invoked.receipt;
         if matches!(
             invoked.action,
             notifications::Action::Open | notifications::Action::OpenInbox
@@ -114,7 +156,24 @@ impl Inbox {
             cx.spawn(async move |this, cx| {
                 let result = reply.await;
                 let _ = this.update(cx, |inbox, cx| {
-                    let key = result.ok().and_then(Result::ok).flatten();
+                    let key = match result {
+                        Ok(Ok(key)) => key,
+                        Ok(Err(err)) => {
+                            inbox.notification_feedback(receipt, err.to_string(), None, true);
+                            cx.notify();
+                            return;
+                        }
+                        Err(_) => {
+                            inbox.notification_feedback(
+                                receipt,
+                                "Could not open the Inbox".into(),
+                                None,
+                                true,
+                            );
+                            cx.notify();
+                            return;
+                        }
+                    };
                     if key.is_some() || pane == Pane::List {
                         let before = inbox.before_step();
                         inbox.session.overlay = Overlay::None;
@@ -127,6 +186,9 @@ impl Inbox {
                         inbox.apply_step(step, before, cx);
                     }
                     if let Some(key) = key {
+                        if let Some(queue) = &inbox.notifications {
+                            queue.dismiss(receipt);
+                        }
                         inbox.request_threads(
                             ReadIntent {
                                 select: Some(key),
@@ -136,7 +198,7 @@ impl Inbox {
                             cx,
                         );
                     } else {
-                        inbox.session.show_toast(GONE, false);
+                        inbox.notification_feedback(receipt, GONE.into(), None, false);
                         cx.notify();
                     }
                 });
@@ -149,22 +211,24 @@ impl Inbox {
         self.change_mailbox(
             move |store| edit_notification(store, &account, &folder, invoked.messages, archive),
             move |inbox, result| {
-                match result {
-                    Ok(Edit::Changed(notice)) => {
-                        inbox.session.show_toast(notice, false);
+                let (title, undo, alert) = match result {
+                    Ok(Edit::Changed(action_id)) => {
                         inbox.send_to_server();
+                        let title = if archive { "Archived" } else { "Marked read" };
+                        (title.into(), Some(action_id), false)
                     }
-                    Ok(Edit::Gone) => inbox.session.show_toast(GONE, false),
-                    Ok(Edit::Unchanged) => {}
+                    Ok(Edit::Gone) => (GONE.into(), None, false),
+                    Ok(Edit::Unchanged) => ("Already read".into(), None, false),
                     Err(err) => {
                         let text = if archive {
                             archive_failure(&err)
                         } else {
                             err.to_string()
                         };
-                        inbox.session.show_toast(text, true);
+                        (text, None, true)
                     }
-                }
+                };
+                inbox.notification_feedback(receipt, title, undo, alert);
                 Some(ReadIntent {
                     changed: true,
                     ..Default::default()
@@ -243,12 +307,12 @@ fn edit_notification(
         return Ok(Edit::Gone);
     }
     if archive {
-        let (_, changed) = store.archive_scoped_threads(account, &threads)?;
-        Ok(Edit::Changed(archived_notice(threads.len(), changed)))
+        let (action, _) = store.archive_scoped_threads(account, &threads)?;
+        Ok(Edit::Changed(action.id))
     } else {
         Ok(
             match store.flag_scoped_threads(account, &threads, FlagChange::Read)? {
-                Some(_) => Edit::Changed("Marked read · u".to_owned()),
+                Some(action) => Edit::Changed(action.id),
                 None => Edit::Unchanged,
             },
         )
@@ -302,17 +366,19 @@ mod tests {
                 )
                 .is_err()
         );
-        assert!(matches!(
-            edit_notification(&store, &account, folder, messages, false).unwrap(),
-            Edit::Changed(text) if text == "Marked read · u"
-        ));
+        let Edit::Changed(action_id) =
+            edit_notification(&store, &account, folder, messages, false).unwrap()
+        else {
+            panic!("expected an undoable read");
+        };
         assert!(
             store
                 .unread_inbox_messages(&account, std::slice::from_ref(&current))
                 .unwrap()
                 .is_empty()
         );
-        store.undo(&account).unwrap();
+        assert!(store.undo_notification(&account, action_id - 1).is_err());
+        store.undo_notification(&account, action_id).unwrap();
         assert_eq!(
             store
                 .unread_inbox_messages(&account, &[stale.clone(), current.clone()])

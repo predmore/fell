@@ -122,9 +122,11 @@ impl Action {
             Self::Spam => "Spam / not spam",
             Self::Undo => "Undo",
             Self::SyncNow => "Sync now",
-            Self::Notifications(NotificationMode::On) => "Notifications: on",
-            Self::Notifications(NotificationMode::Private) => "Notifications: New mail only",
-            Self::Notifications(NotificationMode::Off) => "Notifications: off",
+            Self::Notifications(NotificationMode::On) => "Notifications: Show sender and subject",
+            Self::Notifications(NotificationMode::Private) => {
+                "Notifications: Hide sender and subject"
+            }
+            Self::Notifications(NotificationMode::Off) => "Notifications: Off",
             Self::ToggleSelect => "Toggle select",
             Self::Visual => "Visual select",
             Self::FullWidth => "Full-width conversation",
@@ -146,7 +148,7 @@ impl Action {
     }
 }
 
-const ALL_ACTIONS: [Action; 47] = [
+const ALL_ACTIONS: [Action; 48] = [
     Action::Next,
     Action::Prev,
     Action::First,
