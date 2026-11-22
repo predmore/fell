@@ -44,6 +44,9 @@ pub struct Search {
     accepted: Option<(u64, String)>,
     dirty: bool,
     pub refresh_started: Option<Instant>,
+    /// The notice on screen when the pending query was sent. An error reply
+    /// replaces only that notice, never one shown while the query ran.
+    toast_at_request: Option<u64>,
     pub matches: Vec<SearchMatch>,
     matches_for: Option<(u64, String)>,
 }
@@ -381,6 +384,7 @@ impl Session {
         let query = query_key(&search.query);
         if query != search.requested {
             self.search_generation = self.search_generation.wrapping_add(1);
+            search.toast_at_request = Some(self.toast_generation);
             search.requested = query;
             search.error = None;
             search.refresh_started = None;
@@ -419,6 +423,7 @@ impl Session {
             return false;
         };
         self.search_generation = self.search_generation.wrapping_add(1);
+        search.toast_at_request = Some(self.toast_generation);
         // Keep the count for a short same-query refresh. A second request
         // after a mailbox write inherits the time spent waiting for it.
         if search.error.is_none()
@@ -584,8 +589,12 @@ impl Session {
         }
         if let Some(error) = reply.error.take() {
             // An invalid query has no result set of its own. Keep the last
-            // valid rows, cursor and reader while presenting the error.
-            self.clear_toast();
+            // valid rows, cursor and reader while presenting the error. It
+            // replaces the notice that was up when the query was sent; a
+            // newer one (an undo, a sync) stays until its own timer ends.
+            if let Some(generation) = self.search.as_ref().unwrap().toast_at_request {
+                self.clear_toast_if(generation);
+            }
             let search = self.search.as_mut().unwrap();
             self.deferred_read = None;
             search.pending = false;
@@ -1230,6 +1239,37 @@ mod tests {
         assert!(notice.alert);
         session.on_key(KeyId::Escape, 10);
         assert!(session.status_notice().is_none());
+    }
+
+    #[test]
+    fn a_search_error_keeps_a_notice_shown_while_the_query_ran() {
+        let mut session = session();
+        session.on_key(KeyId::Char('/'), 10);
+        session.type_search("after:not-a-date");
+        session.on_key(KeyId::Enter, 10);
+        // An undo lands while the query is still pending.
+        session.show_toast("Undone", false);
+        let undone = session.toast_generation();
+
+        let store = fell_core::Store::open_in_memory().unwrap();
+        let account = crate::fixtures::fixture_account();
+        let result = store.search(&account.id, "after:not-a-date");
+        land(
+            &mut session,
+            SearchReply::new(
+                result,
+                HashMap::new(),
+                HashMap::new(),
+                "reader@example.test",
+            ),
+        );
+        assert_eq!(session.status_notice().unwrap().text, "Undone");
+
+        assert!(session.clear_toast_if(undone));
+        assert_eq!(
+            session.status_notice().unwrap().text,
+            "expected YYYY-MM-DD, got not-a-date"
+        );
     }
 
     #[test]
