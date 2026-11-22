@@ -3723,12 +3723,9 @@ impl Inbox {
     }
 
     fn note_in_view(&self) -> bool {
-        self.conv_note_slot
-            && self.conv_scroll.bounds_for_item(0).is_some_and(|note| {
-                let view = self.conv_scroll.bounds();
-                let bottom = note.bottom() + clamped_offset(&self.conv_scroll);
-                bottom > view.top() + px(self.theme.ui_px + 5.0) && bottom <= view.bottom()
-            })
+        self.session
+            .note()
+            .is_some_and(|note| self.note_view.visible(note.id))
     }
 
     fn search_preview_current(&self) -> bool {
@@ -4233,7 +4230,7 @@ impl Render for Inbox {
             .note_visit
             .as_ref()
             .is_some_and(|visit| note.is_some_and(|note| note.id == visit.note));
-        let band = if panes.1 {
+        let target_band = if panes.1 {
             self.note_pin.band(
                 pinnable,
                 visiting,
@@ -4244,17 +4241,13 @@ impl Render for Inbox {
             px(0.)
         };
         let pin = self.note_pin.paint(
-            band > px(0.),
-            panes.1 && self.note_band > px(0.),
+            target_band,
+            if panes.1 { self.note_band } else { px(0.) },
             agent_note.as_ref(),
             &self.motion.motion,
             now,
         );
-        let band = if pin.is_some() {
-            agent_notes::pinned_header_height(self.theme.ui_px)
-        } else {
-            px(0.)
-        };
+        let band = pin.map_or(px(0.), |pin| pin.height);
         let band_delta = band - self.note_band;
         self.note_band = band;
         let verify_pin = panes.1 && !self.conv_layout_current && self.note_pin.matches(pinnable);
@@ -4270,7 +4263,9 @@ impl Render for Inbox {
             };
             self.conv_scroll.set_offset(offset);
         }
-        let arrival_anchor = self.note_pin.keep_reader_clear(band, selected, now);
+        let arrival_anchor = self
+            .note_pin
+            .arrival_anchor(target_band, band, selected, now);
         if arrival_anchor.is_some() || agent_note.as_ref().is_some_and(|frame| frame.leaving) {
             self.release_landing();
         }

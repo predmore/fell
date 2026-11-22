@@ -1,10 +1,11 @@
 use std::time::{Duration, Instant};
+use std::{cell::Cell, rc::Rc};
 
 use fell_core::notes::{NoteDecision, Suggestion, ThreadNote, display_safe};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, Context, FontWeight, InteractiveElement, IntoElement, ParentElement, Pixels,
-    ScrollHandle, StatefulInteractiveElement, Styled, Window, div, point, px, rgb,
+    ScrollHandle, StatefulInteractiveElement, Styled, Window, canvas, div, point, px, rgb,
 };
 
 use super::{
@@ -97,6 +98,7 @@ pub(super) struct NoteView {
     fold: Option<((f32, f32), Transition)>,
     previous_suggestions: Option<(ThreadNote, Transition)>,
     scroll: ScrollHandle,
+    visible: Rc<Cell<Option<i64>>>,
 }
 
 pub(super) struct NoteFrame {
@@ -108,6 +110,7 @@ pub(super) struct NoteFrame {
     pub(super) leaving: bool,
     suggestions: Option<(ThreadNote, f32)>,
     scroll: ScrollHandle,
+    visible: Rc<Cell<Option<i64>>>,
 }
 
 impl NoteView {
@@ -222,6 +225,7 @@ impl NoteView {
     }
 
     pub(super) fn frame(&self, now: Instant) -> Option<NoteFrame> {
+        self.visible.set(None);
         let (height, alpha) = self.visibility.map_or((1.0, 1.0), |v| v.sample(now));
         Some(NoteFrame {
             note: self.painted.clone()?,
@@ -235,7 +239,12 @@ impl NoteView {
                 .as_ref()
                 .map(|(note, t)| (note.clone(), t.linear(now))),
             scroll: self.scroll.clone(),
+            visible: self.visible.clone(),
         })
+    }
+
+    pub(super) fn visible(&self, note: i64) -> bool {
+        self.visible.get() == Some(note)
     }
 
     pub(super) fn running(&self) -> bool {
@@ -247,6 +256,26 @@ impl NoteView {
         let y = (offset.y - px(f32::from(direction) * 30.))
             .clamp(-self.scroll.max_offset().height, px(0.));
         self.scroll.set_offset(point(offset.x, y));
+    }
+}
+
+impl NoteFrame {
+    /// Use this frame's clip, including any disclosure and scrollport.
+    fn visibility_probe(&self) -> impl IntoElement + use<> {
+        let visible = self.visible.clone();
+        let id = self.note.id;
+        canvas(
+            move |bounds, window, _| {
+                let clip = window.content_mask().bounds;
+                if clip.size.height > px(0.) && clip.size.width > px(0.) && bounds.intersects(&clip)
+                {
+                    visible.set(Some(id));
+                }
+            },
+            |_, (), _, _| {},
+        )
+        .absolute()
+        .inset_0()
     }
 }
 
@@ -268,12 +297,14 @@ pub(super) struct NotePin {
     newest: Option<i64>,
     arrival: Option<Transition>,
     new_arrival: bool,
+    arrival_band: Pixels,
     reader: Option<ScrollAnchor>,
     divider: Option<Transition>,
 }
 
 #[derive(Clone, Copy)]
 pub(super) struct PinnedFrame {
+    pub height: Pixels,
     pub alpha: f32,
     pub divider: f32,
 }
@@ -336,51 +367,60 @@ impl NotePin {
 
     pub(super) fn paint(
         &mut self,
-        active: bool,
-        was_pinned: bool,
+        target: Pixels,
+        previous: Pixels,
         note: Option<&NoteFrame>,
         motion: &Motion,
         now: Instant,
     ) -> Option<PinnedFrame> {
-        if active && !was_pinned {
+        if self.new_arrival {
+            self.arrival_band = previous;
+            self.divider = None;
+        } else if target > px(0.) && previous == px(0.) && self.arrival.is_none() {
             self.divider = motion.start(motion::QUICK, now);
         }
         self.divider = self.divider.filter(|fade| fade.running(now));
-        let alpha = if active {
-            motion::progress(self.arrival.as_ref(), now)
-        } else {
-            // The inline dismissal already fades for 120 ms before shrinking.
-            // Keep the band until that fade has finished.
-            let leaving = note.filter(|note| {
-                was_pinned && note.leaving && self.id == Some(note.note.id) && note.alpha > 0.
-            })?;
-            leaving.alpha * motion::progress(self.arrival.as_ref(), now)
-        };
+        let progress = motion::progress(self.arrival.as_ref(), now);
+        if target > px(0.) {
+            return Some(PinnedFrame {
+                height: self.arrival_band + (target - self.arrival_band) * progress,
+                alpha: progress,
+                divider: progress * motion::progress(self.divider.as_ref(), now),
+            });
+        }
+        // Keep the last height until the inline dismissal finishes fading.
+        let leaving = note.filter(|note| {
+            previous > px(0.) && note.leaving && self.id == Some(note.note.id) && note.alpha > 0.
+        })?;
+        let alpha = leaving.alpha * progress;
         Some(PinnedFrame {
+            height: previous,
             alpha,
             divider: alpha * motion::progress(self.divider.as_ref(), now),
         })
     }
 
-    pub(super) fn keep_reader_clear(
+    pub(super) fn arrival_anchor(
         &mut self,
+        target: Pixels,
         band: Pixels,
         selected: Option<ScrollAnchor>,
         now: Instant,
     ) -> Option<ScrollAnchor> {
-        if std::mem::take(&mut self.new_arrival) && band > px(0.) {
-            self.reader = selected.filter(|anchor| anchor.y < band);
+        if std::mem::take(&mut self.new_arrival) && target > px(0.) {
+            self.reader = selected
+                .map(|mut anchor| {
+                    anchor.y += self.arrival_band;
+                    anchor
+                })
+                .filter(|anchor| anchor.y < target);
         }
-        let progress = motion::progress(self.arrival.as_ref(), now);
         let anchor = self.reader.map(|mut anchor| {
-            anchor.y = px(motion::lerp(
-                f32::from(anchor.y - band),
-                f32::from(anchor.y.max(px(0.))),
-                progress,
-            ));
+            // Keep the window position until the band's edge reaches it.
+            anchor.y = (anchor.y - band).max(px(0.));
             anchor
         });
-        if progress >= 1. {
+        if self.arrival.is_none_or(|fade| !fade.running(now)) {
             self.arrival = None;
             self.reader = None;
         }
@@ -428,6 +468,7 @@ fn note_header(
     let age = present::compact_relative_date(super::now_unix(), frame.note.created_unix);
     div()
         .id(id)
+        .relative()
         .flex()
         .items_center()
         .gap(px(7.0))
@@ -461,23 +502,34 @@ fn note_header(
         })
         .child(div().flex_none().text_color(dimmed).child(age))
         .when(active, |row| {
-            row.cursor_pointer()
-                .on_click(cx.listener(|inbox, _, _, cx| {
-                    let before = inbox.before_step();
-                    let step = inbox.session.perform(Action::ToggleAgentNote, 1);
-                    inbox.apply_step(step, before, cx);
-                }))
+            row.when(id == "toggle-agent-note", |row| {
+                row.child(frame.visibility_probe())
+            })
+            .cursor_pointer()
+            .on_click(cx.listener(|inbox, _, _, cx| {
+                let before = inbox.before_step();
+                let step = inbox.session.perform(Action::ToggleAgentNote, 1);
+                inbox.apply_step(step, before, cx);
+            }))
         })
 }
 
-fn note_column(theme: &Theme, columns: ReaderColumns, content: impl IntoElement) -> gpui::Div {
+fn note_column(
+    theme: &Theme,
+    columns: ReaderColumns,
+    stripe: bool,
+    content: impl IntoElement,
+) -> gpui::Div {
     div().flex_none().pl(px(MESSAGE_PAD_PX)).child(
         columns.card.place(
             div()
                 .w_full()
-                .border_l(px(2.0))
-                .border_color(rgb(theme.note_rule()))
-                .pl(px(11.0))
+                .when(stripe, |column| {
+                    column
+                        .border_l(px(2.0))
+                        .border_color(rgb(theme.note_rule()))
+                })
+                .pl(px(if stripe { 11.0 } else { 13.0 }))
                 .text_color(rgb(theme.foreground))
                 .text_size(px(theme.ui_px - 1.0))
                 .line_height(px(theme.ui_px + 3.0))
@@ -551,7 +603,13 @@ pub(super) fn slot(
         columns.card.inset + columns.card.width + MESSAGE_PAD_PX,
         frame.height,
         frame.alpha,
-        note_column(theme, columns, div().children(header).children(detail)).into_any_element(),
+        note_column(
+            theme,
+            columns,
+            true,
+            div().children(header).children(detail),
+        )
+        .into_any_element(),
     ))
 }
 
@@ -575,11 +633,12 @@ pub(super) fn pinned_header(
         "toggle-pinned-note",
         cx,
     );
+    let gap = px(PINNED_HEADER_GAP) * (paint.height / pinned_header_height(theme.ui_px));
     div()
         .id("pinned-agent-note-band")
         .flex_none()
-        .h(pinned_header_height(theme.ui_px))
-        .pb(px(PINNED_HEADER_GAP))
+        .h(paint.height)
+        .overflow_hidden()
         .when(live.0, |band| {
             band.on_scroll_wheel(cx.listener(
                 |inbox, event: &gpui::ScrollWheelEvent, window, cx| {
@@ -601,8 +660,10 @@ pub(super) fn pinned_header(
         })
         .child(
             div()
+                .h((paint.height - gap - px(PINNED_BORDER)).max(px(0.)))
+                .overflow_hidden()
                 .px(px(super::CONVERSATION_PAD_PX))
-                .child(note_column(theme, columns, header))
+                .child(note_column(theme, columns, false, header))
                 .opacity(paint.alpha),
         )
         .child(
@@ -785,7 +846,8 @@ fn suggestions(
         let element = draw_chip(theme, &chip, line)
             .id(("agent-suggestion", id))
             .when(clickable && alpha > 0.0, |chip| {
-                chip.cursor_pointer()
+                chip.child(frame.visibility_probe())
+                    .cursor_pointer()
                     .on_click(cx.listener(move |inbox, _, _, cx| {
                         if let Some(request) = inbox.session.note_request(decision)
                             && request.id == note_id
@@ -1273,6 +1335,58 @@ mod tests {
     }
 
     #[test]
+    fn a_header_or_chip_counts_even_when_the_note_cannot_fit() {
+        use gpui::Render;
+
+        struct Reader {
+            note: NoteView,
+            scroll: ScrollHandle,
+        }
+
+        impl Render for Reader {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let note = self.note.frame(Instant::now()).unwrap();
+                div()
+                    .id("short-reader")
+                    .h(px(32.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
+                    .child(div().relative().h(px(26.)).child(note.visibility_probe()))
+                    .child(div().h(px(75.)))
+                    .child(div().relative().h(px(20.)).child(note.visibility_probe()))
+                    .child(div().h(px(80.)))
+            }
+        }
+
+        let mut app = TestAppContext::single();
+        let (reader, cx) = app.add_window_view(|_, _| {
+            let mut view = NoteView::default();
+            view.observe(
+                Some("thread"),
+                Some(&note(1, false)),
+                false,
+                &Motion::new(false),
+                Instant::now(),
+            );
+            Reader {
+                note: view,
+                scroll: ScrollHandle::new(),
+            }
+        });
+        cx.run_until_parked();
+        let visible = |cx: &mut _| reader.read_with(cx, |reader, _| reader.note.visible(1));
+        assert!(visible(cx), "the header fits above the fold");
+        for (offset, expected) in [(55., false), (75., true), (145., false)] {
+            reader.update(cx, |reader, cx| {
+                reader.scroll.set_offset(point(px(0.), px(-offset)));
+                cx.notify();
+            });
+            cx.run_until_parked();
+            assert_eq!(visible(cx), expected, "scroll offset {offset}");
+        }
+    }
+
+    #[test]
     fn a_dismissed_open_note_cannot_pin_a_seen_or_already_known_replacement() {
         let start = Instant::now();
         let motion = Motion::new(true);
@@ -1294,7 +1408,11 @@ mod tests {
         // A genuinely new, unseen annotation can pin while reading.
         pin.observe(Some(&note(7, false)), Some(7), true, &motion, start);
         assert!(pin.matches(Some(&note(7, false))));
-        let mut paint = |now| pin.paint(true, false, None, &motion, now).unwrap().alpha;
+        let mut paint = |now| {
+            pin.paint(pinned_header_height(14.), px(0.), None, &motion, now)
+                .unwrap()
+                .alpha
+        };
         assert_eq!(paint(start), 0.);
         assert!(paint(start + Duration::from_millis(60)) > 0.);
         assert_eq!(paint(start + motion::FADE), 1.);
@@ -1444,7 +1562,13 @@ mod tests {
         view.observe(Some("thread"), None, false, &motion, now);
         let paint = |pin: &mut NotePin, elapsed| {
             let frame = view.frame(now + elapsed);
-            pin.paint(false, true, frame.as_ref(), &motion, now + elapsed)
+            pin.paint(
+                px(0.),
+                pinned_header_height(14.),
+                frame.as_ref(),
+                &motion,
+                now + elapsed,
+            )
         };
         assert_eq!(paint(&mut pin, Duration::ZERO).unwrap().alpha, 1.);
         let halfway = paint(&mut pin, Duration::from_millis(60)).unwrap();
@@ -1453,36 +1577,44 @@ mod tests {
     }
 
     #[test]
-    fn a_live_note_moves_only_the_selection_that_its_band_would_cover() {
+    fn a_live_note_grows_in_without_covering_the_selected_message() {
         let now = Instant::now();
         let note = note(1, false);
-        let band = pinned_header_height(14.);
+        let target = pinned_header_height(14.);
         let motion = Motion::new(true);
-        let mut pin = NotePin::default();
-        let anchor = |y| ScrollAnchor { index: 4, y };
-        assert!(pin.observe(Some(&note), Some(1), true, &motion, now));
-        assert!(
-            pin.keep_reader_clear(band, Some(anchor(band)), now)
-                .is_none()
-        );
+        for selected_y in [None, Some(px(-3.)), Some(px(3.)), Some(target)] {
+            let mut pin = NotePin::default();
+            assert!(pin.observe(Some(&note), Some(1), true, &motion, now));
+            let mut previous = px(0.);
+            // Sample every millisecond, including the first and settled frames.
+            for ms in 0..=motion::FADE.as_millis() as u64 {
+                let time = now + Duration::from_millis(ms);
+                let paint = pin.paint(target, previous, None, &motion, time).unwrap();
+                assert_eq!(paint.height, target * paint.alpha);
+                assert_eq!(paint.divider, paint.alpha);
+                assert!(paint.height >= previous);
+                let selected = selected_y.map(|y| ScrollAnchor { index: 4, y });
+                let hold = pin.arrival_anchor(target, paint.height, selected, time);
+                match selected_y {
+                    Some(y) if y < target => {
+                        let hold = hold.unwrap();
+                        assert_eq!(hold.index, 4);
+                        let row_top = paint.height + hold.y;
+                        assert!(row_top >= paint.height);
+                        assert_eq!(row_top, y.max(paint.height));
+                    }
+                    _ => assert!(hold.is_none()),
+                }
+                previous = paint.height;
+            }
+            assert_eq!(previous, target);
+        }
 
-        let mut pin = NotePin::default();
-        pin.observe(Some(&note), Some(1), true, &motion, now);
-        let y = px(3.);
-        assert_eq!(
-            pin.keep_reader_clear(band, Some(anchor(y)), now).unwrap().y,
-            y - band
-        );
-        let halfway = pin
-            .keep_reader_clear(band, None, now + Duration::from_millis(60))
-            .unwrap();
-        assert!(halfway.y > y - band && halfway.y < y);
-        assert_eq!(
-            pin.keep_reader_clear(band, None, now + motion::SLIDE)
-                .unwrap()
-                .y,
-            y
-        );
+        let mut pin = NotePin::opened(Some(1), Some(1));
+        let replacement = self::note(2, false);
+        assert!(pin.observe(Some(&replacement), Some(2), true, &motion, now));
+        let paint = pin.paint(target, target, None, &motion, now).unwrap();
+        assert_eq!(paint.height, target, "an existing band keeps its space");
     }
 
     #[test]

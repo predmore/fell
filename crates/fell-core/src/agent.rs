@@ -505,6 +505,7 @@ impl crate::Store {
         let actor = require_token(actor, "actor")?;
         let tx = crate::store::immediate_transaction(&self.conn)?;
         require_account(&tx, account_id)?;
+        check_actor_grant(&tx, account_id, actor, WriteScope::Triage)?;
         let result = snooze_in(&tx, account_id, thread_id, until_unix, actor)?;
         tx.commit()?;
         self.seal_private_files()?;
@@ -692,6 +693,9 @@ impl crate::Store {
             check_actor_grant(&tx, account_id, actor, scope)?;
         }
         undo_action(&tx, account_id, &action)?;
+        if action.kind == "snooze" {
+            crate::notes::undo_snooze_acceptance(&tx, action.id)?;
+        }
         tx.commit()?;
         self.seal_private_files()?;
         action.undone = true;
@@ -1495,6 +1499,11 @@ mod tests {
                 "triage scope",
             );
             denied(
+                mcp.snooze_thread(&account, &thread, now_unix() + 3600, "agent:bot")
+                    .unwrap_err(),
+                "triage scope",
+            );
+            denied(
                 mcp.create_review_draft(draft.clone(), "agent:bot")
                     .unwrap_err(),
                 "draft scope",
@@ -1506,7 +1515,7 @@ mod tests {
             assert!(
                 only_message(&mcp, &account, &thread)
                     .iter()
-                    .all(|message| !message.archived)
+                    .all(|message| !message.archived && message.snooze_until.is_none())
             );
             assert_eq!(mcp.list_review_drafts(&account).unwrap().len(), 1);
             let actions = mcp.list_actions(&account).unwrap();
@@ -1980,6 +1989,77 @@ mod tests {
         store.undo(&account).unwrap();
         assert!(notes().is_empty());
         assert!(store.list_actions(&account).unwrap()[0].undone);
+    }
+
+    #[test]
+    fn either_undo_entry_point_restores_a_snooze_suggestion_once() {
+        use crate::notes::NoteDecision;
+
+        for mailbox_undo in [false, true] {
+            let (store, account, thread) = seeded();
+            let prior = now_unix() + 1800;
+            let until = prior + 1800;
+            let prior_action = store
+                .snooze_thread(&account, &thread, prior, "user")
+                .unwrap()
+                .unwrap();
+            store
+                .set_agent_grant(
+                    &account,
+                    "ada",
+                    AgentGrant::enabled(false, false, false).with_annotation(true),
+                )
+                .unwrap();
+            let annotation = store
+                .annotate_thread(
+                    &account,
+                    &thread,
+                    "ada",
+                    None,
+                    &[format!("snooze:{until}")],
+                    "Reviewed",
+                )
+                .unwrap();
+            store
+                .resolve_thread_note(
+                    &account,
+                    &thread,
+                    "INBOX",
+                    annotation.id,
+                    NoteDecision::Accept(0),
+                    false,
+                )
+                .unwrap();
+            let notes = || store.thread_notes(&account, &thread).unwrap();
+            let snoozed_until = || only_message(&store, &account, &thread)[0].snooze_until;
+            assert_eq!(snoozed_until(), Some(until));
+            assert!(notes()[0].suggestions.is_empty());
+
+            if mailbox_undo {
+                assert_eq!(
+                    store.undo_with_note(&account).unwrap().1,
+                    Some("Snooze undone · suggestion restored")
+                );
+            } else {
+                assert_eq!(store.agent_undo(&account).unwrap().kind, "snooze");
+            }
+            assert_eq!(
+                store
+                    .latest_open_action(&account, "user")
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                prior_action.id
+            );
+            assert_eq!(snoozed_until(), Some(prior));
+            assert_eq!(notes()[0].suggestions.len(), 1);
+            assert_eq!(
+                store.undo_with_note(&account).unwrap().1,
+                Some("Note removed")
+            );
+            assert!(store.undo_with_note(&account).is_err());
+            assert_eq!(snoozed_until(), Some(prior));
+        }
     }
 
     #[test]

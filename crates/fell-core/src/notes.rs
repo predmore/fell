@@ -497,6 +497,26 @@ pub(crate) fn undo_local(
     Ok(None)
 }
 
+/// Account-wide agent undo can reach the snooze snapshot. Retire the same
+/// mailbox acceptance in that transaction so its suggestion is restored once.
+pub(crate) fn undo_snooze_acceptance(conn: &Connection, snooze: i64) -> Result<()> {
+    let action = conn
+        .query_row(
+            "UPDATE local_thread_note_actions SET undone = 1
+             WHERE related_agent_action = ?1 AND undone = 0 RETURNING action_id",
+            [snooze],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    if let Some(action) = action {
+        conn.execute(
+            "UPDATE local_actions SET undone = 1 WHERE id = ?1",
+            [action],
+        )?;
+    }
+    Ok(())
+}
+
 fn restore_dismissed(conn: &Connection, account: &AccountId, note: i64) -> Result<bool> {
     let withdrawn = conn
         .query_row(
