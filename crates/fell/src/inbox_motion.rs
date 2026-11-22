@@ -271,6 +271,7 @@ pub struct InboxMotion {
     /// A label scope changes its heading in the same frame as its rows.
     label_header_in: Option<Transition>,
     last_banner: Option<Banner>,
+    banner_out: Option<(Banner, Transition)>,
     /// The rows and reader leave before the empty message comes in.
     empty_list: Option<EmptyList>,
     label_marks: Option<Transition>,
@@ -400,6 +401,7 @@ impl InboxMotion {
             folder_out: None,
             label_header_in: None,
             last_banner: None,
+            banner_out: None,
             empty_list: None,
             label_marks: None,
         }
@@ -627,6 +629,7 @@ impl InboxMotion {
         self.recipients.transitions.clear();
         self.unread_fade = motion::NumberFade::default();
         self.label_header_in = None;
+        self.banner_out = None;
         Settled {
             list: list.map(|glide| glide.to),
             conversation: conversation.map(|glide| glide.to),
@@ -713,6 +716,7 @@ impl InboxMotion {
             self.folder_out = None;
         }
         running |= self.folder_out.is_some();
+        running |= keep_with(&mut self.banner_out, now);
         running |= keep(&mut self.label_header_in, now);
         running |= keep(&mut self.label_marks, now);
         if self
@@ -883,7 +887,14 @@ impl InboxMotion {
 
     /// Keep an empty banner in step with the scope the header is showing.
     pub fn list_banner(&mut self, banner: Option<Banner>, now: Instant) -> Option<(Banner, f32)> {
-        self.last_banner.clone_from(&banner);
+        if self.last_banner != banner {
+            let old = std::mem::replace(&mut self.last_banner, banner.clone());
+            self.banner_out = old
+                .filter(|_| {
+                    banner.is_some() && self.folder_out.is_none() && self.empty_list.is_none()
+                })
+                .zip(self.motion.start(motion::FADE, now));
+        }
         let banner = banner?;
         if let Some(fade) = &self.folder_out {
             let (leaving, opacity) = fade.phase(now);
@@ -895,6 +906,12 @@ impl InboxMotion {
             }
             return Some((banner, opacity));
         }
+        if let Some((_, fade)) = &self.banner_out {
+            return Some((
+                banner,
+                motion::lerp(motion::ARRIVE_FROM, 1., fade.progress(now)),
+            ));
+        }
         Some((
             banner,
             self.empty_list
@@ -903,6 +920,12 @@ impl InboxMotion {
                 .and_then(|list| list.enter)
                 .map_or(1.0, |enter| enter.progress(now)),
         ))
+    }
+
+    pub fn leaving_banner(&self, now: Instant) -> Option<(Banner, f32)> {
+        let (banner, fade) = self.banner_out.as_ref()?;
+        fade.running(now)
+            .then(|| (banner.clone(), 1. - fade.progress(now)))
     }
 
     /// The header's unread count being replaced: the old count and how far
@@ -1531,8 +1554,8 @@ mod tests {
         assert_eq!(motion.unread_count(now + motion::FADE), None);
 
         let burst = later(now, 300);
-        motion.observe_header("INBOX", Some(127), burst);
-        motion.observe_header("INBOX", Some(207), later(burst, 40));
+        motion.observe_header("INBOX", None, Some(127), burst);
+        motion.observe_header("INBOX", None, Some(207), later(burst, 40));
         assert_eq!(motion.header_unread(), Some(207));
         assert_eq!(
             motion.unread_count(later(burst, 60)),
@@ -1560,14 +1583,24 @@ mod tests {
         assert_eq!(motion.unread_count(later(now, 120)), None);
         // A key mid-fade shows the new count alone.
         session.unread_count = 1;
-        motion.observe_header(&session.folder, None, Some(session.unread_count), later(now, 200));
+        motion.observe_header(
+            &session.folder,
+            None,
+            Some(session.unread_count),
+            later(now, 200),
+        );
         assert!(motion.unread_count(later(now, 210)).is_some());
         motion.settle(later(now, 210));
         assert_eq!(motion.unread_count(later(now, 210)), None);
         // On a folder switch the old name and its count fade as a pair.
         session.folder = "Archive".into();
         session.unread_count = 7;
-        motion.observe_header(&session.folder, None, Some(session.unread_count), later(now, 300));
+        motion.observe_header(
+            &session.folder,
+            None,
+            Some(session.unread_count),
+            later(now, 300),
+        );
         assert_eq!(motion.unread_count(later(now, 300)), None);
         let fade = motion.folder_header().unwrap();
         assert_eq!((fade.folder.as_str(), fade.unread), ("INBOX", Some(1)));

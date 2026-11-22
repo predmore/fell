@@ -47,8 +47,8 @@ use crate::mail_body::{
 };
 use crate::mailbox;
 use crate::model::{
-    Banner, DRAFT_NOT_THREAD, DownloadStatus, Fetch, FlagEdit, FolderIntent, LabelEdit, Overlay, PickerChoice,
-    QueryFault, ReadDwell, Session, Step, SyncKind, Toast, grouped, row_key,
+    Banner, DRAFT_NOT_THREAD, DownloadStatus, Fetch, FlagEdit, FolderIntent, LabelEdit, Overlay,
+    PickerChoice, QueryFault, ReadDwell, Session, Step, SyncKind, Toast, grouped, row_key,
 };
 use crate::motion::{self, Glide, LayerSwap, ListShift, Motion, RowMotion, SwapFrame, Transition};
 use crate::onboarding::Onboarding;
@@ -220,7 +220,9 @@ pub(crate) fn finish_onboarding(
         inbox.waiting_for_first_rows = true;
         inbox.waiting_for_inbox_total = true;
         let now = inbox.motion.clock.now();
-        inbox.motion.observe_header(&inbox.list_folder, None, None, now);
+        inbox
+            .motion
+            .observe_header(&inbox.list_folder, None, None, now);
         inbox.setup_exit = LayerSwap::start(inbox.motion.motion, now, motion::QUICK, motion::FADE)
             .map(|swap| (setup, swap));
         inbox
@@ -2136,6 +2138,7 @@ impl Inbox {
         let settled = self.motion.settle(now);
         self.row_widths.settle();
         self.agents_motion.settle();
+        self.settle_search_match();
         if let Some(y) = settled.list {
             self.set_list_offset(y);
         }
@@ -2366,10 +2369,17 @@ impl Inbox {
                     }
                     false
                 };
+                let landing = if inbox.quiet_search_preview() {
+                    crate::model::search::MatchLanding::KeepReader
+                } else if same {
+                    crate::model::search::MatchLanding::CurrentMatch
+                } else {
+                    crate::model::search::MatchLanding::Best
+                };
                 if let Some((accepted, matches)) = matches
                     && inbox
                         .session
-                        .set_search_matches(accepted, &id, matches, !same)
+                        .set_search_matches(accepted, &id, matches, landing)
                 {
                     inbox.land_on_reader();
                 }
@@ -4599,12 +4609,8 @@ impl Render for Inbox {
             && self.session.roles.is(FolderRole::Inbox, &self.list_folder);
         let unread = (!self.waiting_for_first_rows && !waiting_for_total)
             .then(|| self.session.unread_threads());
-        self.motion.observe_header(
-            &self.list_folder,
-            self.list_label.as_deref(),
-            unread,
-            now,
-        );
+        self.motion
+            .observe_header(&self.list_folder, self.list_label.as_deref(), unread, now);
         let banner = self
             .session
             .search
@@ -4775,6 +4781,7 @@ impl Render for Inbox {
             },
             newest_height: self.preview_card_height.clone(),
         });
+        let preview_current = self.search_preview_current();
         let conv = ConvFrame {
             syncing: self.pending_bodies.downloading(&self.session.sync),
             missing_fade: self.pending_bodies.fade(now),
@@ -4795,7 +4802,9 @@ impl Render for Inbox {
             attachment_download: self.attachment_download.clone(),
             reveal_attachment,
             spin_attachment,
-            preview_current: self.search_preview_current(),
+            preview_current,
+            quiet_preview: self.quiet_search_preview(),
+            match_line: self.search_match_frame(now, preview_current),
             leaving: self.leaving_reader.clone().map(|reader| (reader, exit)),
         };
         self.conv_layout_current = panes.1;
@@ -4826,6 +4835,7 @@ impl Render for Inbox {
             | status_labels.count_fade.is_some()
             | self.body_landing.is_some()
             | conv.missing_fade.is_some()
+            | conv.match_line.animating
             | self.row_widths.running(now)
             | spin_attachment
             | agents_animating
@@ -4921,6 +4931,7 @@ impl Render for Inbox {
         let cached_preview = self.search_preview_for(panes, animating || refreshing_body, &subject);
         let cached_search_rows = self.search_rows_for(animating);
         let background = theme.background;
+        let leaving_banner = self.motion.leaving_banner(now);
         let root = shell(
             theme,
             &self.session,
@@ -4938,6 +4949,7 @@ impl Render for Inbox {
                 cached_preview,
                 list: ListContent {
                     banner,
+                    leaving_banner,
                     leaving: self.leaving_rows.clone().map(|rows| (rows, exit)),
                     cached_results: cached_search_rows,
                 },
@@ -5056,6 +5068,7 @@ struct LeavingRow {
 #[derive(Default)]
 struct ListContent {
     banner: Option<(Banner, f32)>,
+    leaving_banner: Option<(Banner, f32)>,
     leaving: Option<(Arc<[LeavingRow]>, f32)>,
     cached_results: Option<(u64, gpui::AnyView)>,
 }
@@ -5085,6 +5098,8 @@ struct ConvFrame {
     reveal_attachment: bool,
     spin_attachment: bool,
     preview_current: bool,
+    quiet_preview: bool,
+    match_line: search::MatchLineFrame,
     leaving: Option<(Arc<LeavingReader>, f32)>,
 }
 
@@ -5414,7 +5429,7 @@ fn shell(
                                     |pane| {
                                         pane.child(preview_shield(
                                             &theme,
-                                            session.search_results_current(),
+                                            session.search_results_current() && !conv.quiet_preview,
                                         ))
                                     },
                                 );
@@ -5796,26 +5811,27 @@ fn header(
             })
             .child(text)
     };
-    let folder_group =
-        |(folder, label): (&str, Option<&str>), unread: Option<usize>, count_fade: Option<(Option<usize>, f32)>| {
-            let drafts = label.is_none() && session.roles.is(FolderRole::Drafts, folder);
-            let (old, shown) = count_fade.unwrap_or((None, 1.));
-            let inbox = label.is_none() && session.roles.is(FolderRole::Inbox, folder);
-            let measure = |unread| count_width(&count_text(unread));
-            let count_room = if inbox {
-                inbox_count_room(count_width)
-            } else {
-                measure(888)
-                    .max(unread.map_or(0., measure))
-                    .max(old.map_or(0., measure))
-            };
-            let count_space = if drafts { 0. } else { COUNT_GAP + count_room };
-            let name_room = (room - ACCOUNT_MIN - count_space).max(0.);
-            let title = label.map_or_else(|| session.roles.label(folder), present::display_safe);
-            let name = if label.is_some() {
-                fit(&title, name_room, FontWeight::SEMIBOLD)
-            } else {
-                fit_folder_path(
+    let folder_group = |(folder, label): (&str, Option<&str>),
+                        unread: Option<usize>,
+                        count_fade: Option<(Option<usize>, f32)>| {
+        let drafts = label.is_none() && session.roles.is(FolderRole::Drafts, folder);
+        let (old, shown) = count_fade.unwrap_or((None, 1.));
+        let inbox = label.is_none() && session.roles.is(FolderRole::Inbox, folder);
+        let measure = |unread| count_width(&count_text(unread));
+        let count_room = if inbox {
+            inbox_count_room(count_width)
+        } else {
+            measure(888)
+                .max(unread.map_or(0., measure))
+                .max(old.map_or(0., measure))
+        };
+        let count_space = if drafts { 0. } else { COUNT_GAP + count_room };
+        let name_room = (room - ACCOUNT_MIN - count_space).max(0.);
+        let title = label.map_or_else(|| session.roles.label(folder), present::display_safe);
+        let name = if label.is_some() {
+            fit(&title, name_room, FontWeight::SEMIBOLD)
+        } else {
+            fit_folder_path(
                 &title,
                 FolderFit::Header,
                 |path| {
@@ -5829,76 +5845,76 @@ fn header(
                     )
                 },
                 |line| &line.text,
-                )
-            };
-            let name_width = name
-                .as_ref()
-                .map_or(0., |line| f32::from(line.width).ceil());
-            let detail = label
-                .map(|_| "Label".into())
-                .or_else(|| session.folder_detail(folder))
-                .and_then(|text| fit(&text, name_room - name_width - 6., FontWeight::NORMAL));
-            let detail_space = detail
-                .as_ref()
-                .map_or(0., |line| 6. + f32::from(line.width).ceil());
-            let group = div()
-                .flex_none()
-                .flex()
-                .items_center()
-                .gap(px(COUNT_GAP))
-                .child(
-                    div()
-                        .flex_none()
-                        .flex()
-                        .items_baseline()
-                        .gap(px(6.))
-                        .children(name.map(|line| {
-                            #[cfg(test)]
-                            let text = line.text.clone();
-                            let label = div()
-                                .flex_none()
-                                .whitespace_nowrap()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(line.text);
-                            #[cfg(test)]
-                            let label = label.when(inbox, |label| {
-                                label.on_children_prepainted(move |bounds, _, _| {
-                                    tests::INBOX_LABEL_X.with_borrow_mut(|positions| {
-                                        positions.push((bounds[0].left(), text.clone()));
-                                    });
-                                })
-                            });
-                            label
-                        }))
-                        .children(detail.map(|line| {
-                            div()
-                                .flex_none()
-                                .whitespace_nowrap()
-                                .text_color(rgb(theme.dimmed))
-                                .child(line.text)
-                        })),
-                )
-                .when(!drafts, |row| {
-                    row.child(
+            )
+        };
+        let name_width = name
+            .as_ref()
+            .map_or(0., |line| f32::from(line.width).ceil());
+        let detail = label
+            .map(|_| "Label".into())
+            .or_else(|| session.folder_detail(folder))
+            .and_then(|text| fit(&text, name_room - name_width - 6., FontWeight::NORMAL));
+        let detail_space = detail
+            .as_ref()
+            .map_or(0., |line| 6. + f32::from(line.width).ceil());
+        let group = div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(COUNT_GAP))
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_baseline()
+                    .gap(px(6.))
+                    .children(name.map(|line| {
+                        #[cfg(test)]
+                        let text = line.text.clone();
+                        let label = div()
+                            .flex_none()
+                            .whitespace_nowrap()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(line.text);
+                        #[cfg(test)]
+                        let label = label.when(inbox, |label| {
+                            label.on_children_prepainted(move |bounds, _, _| {
+                                tests::INBOX_LABEL_X.with_borrow_mut(|positions| {
+                                    positions.push((bounds[0].left(), text.clone()));
+                                });
+                            })
+                        });
+                        label
+                    }))
+                    .children(detail.map(|line| {
                         div()
                             .flex_none()
-                            .relative()
-                            .flex()
-                            .when(!inbox, |count| count.justify_end())
-                            .w(px(count_room))
-                            .children(unread.map(|unread| count(unread, count_room).opacity(shown)))
-                            .children(old.map(|old| {
-                                count(old, count_room)
-                                    .absolute()
-                                    .when(inbox, |count| count.left_0())
-                                    .when(!inbox, |count| count.right_0())
-                                    .top_0()
-                                    .opacity(1. - shown)
-                            })),
-                    )
-                });
-            (group, name_width + detail_space + count_space)
-        };
+                            .whitespace_nowrap()
+                            .text_color(rgb(theme.dimmed))
+                            .child(line.text)
+                    })),
+            )
+            .when(!drafts, |row| {
+                row.child(
+                    div()
+                        .flex_none()
+                        .relative()
+                        .flex()
+                        .when(!inbox, |count| count.justify_end())
+                        .w(px(count_room))
+                        .children(unread.map(|unread| count(unread, count_room).opacity(shown)))
+                        .children(old.map(|old| {
+                            count(old, count_room)
+                                .absolute()
+                                .when(inbox, |count| count.left_0())
+                                .when(!inbox, |count| count.right_0())
+                                .top_0()
+                                .opacity(1. - shown)
+                        })),
+                )
+            });
+        (group, name_width + detail_space + count_space)
+    };
 
     let (current, current_width) =
         folder_group(scope, motion.header_unread(), motion.unread_count(now));
@@ -6032,6 +6048,12 @@ fn thread_list(
                     .banner
                     .map(|(banner, opacity)| empty_state(theme, banner).opacity(opacity)),
             )
+            .children(content.leaving_banner.map(|(banner, opacity)| {
+                empty_state(theme, banner)
+                    .absolute()
+                    .inset_0()
+                    .opacity(opacity)
+            }))
             .when_some(content.leaving, |pane, (rows, opacity)| {
                 pane.child(leaving_label_rows(
                     theme.clone(),
@@ -7752,12 +7774,11 @@ fn conversation(
                 .into_any_element(),
                 _ => block,
             };
-            let block =
-                if let Some(padding) = padding.filter(|_| index + 1 == shown.len()) {
-                    padding.wrap_newest(block)
-                } else {
-                    block
-                };
+            let block = if let Some(padding) = padding.filter(|_| index + 1 == shown.len()) {
+                padding.wrap_newest(block)
+            } else {
+                block
+            };
             match &hold {
                 Some(probes) => probes.wrap(index, block),
                 None => block,
@@ -7871,7 +7892,7 @@ fn conversation(
         .when(retained, |pane| {
             pane.child(preview_shield(
                 theme,
-                leaving.is_none() && session.search_results_current(),
+                leaving.is_none() && session.search_results_current() && !frame.quiet_preview,
             ))
         })
 }
@@ -7928,7 +7949,7 @@ fn conversation_body(
     }
 }
 
-fn preview_shield(theme: &Theme, results_current: bool) -> impl IntoElement {
+fn preview_shield(theme: &Theme, show_feedback: bool) -> impl IntoElement {
     div()
         .id("retained-preview")
         .absolute()
@@ -7936,7 +7957,7 @@ fn preview_shield(theme: &Theme, results_current: bool) -> impl IntoElement {
         .top_0()
         .left_0()
         .occlude()
-        .when(results_current, |shield| {
+        .when(show_feedback, |shield| {
             shield.child(
                 div()
                     .absolute()
@@ -8379,11 +8400,7 @@ fn expanded_message(
         .child(
             columns.card.place(
                 div()
-                    .children(
-                        live.0
-                            .then(|| search::match_reason(theme, session, message))
-                            .flatten(),
-                    )
+                    .children(frame.match_line.render(theme, message))
                     // What a draft answers, under who it goes to, as in its window.
                     .children(message.context.as_ref().map(|line| {
                         div()
@@ -9395,7 +9412,12 @@ fn status_bar(
         (label, sync_width)
     };
     let shared_width = 2. * padding + 2. * gap + mode_width + dot_width + details_width;
-    let used = shared_width + if narrow { 0. } else { sync_width + 2. * gap + dot_width };
+    let used = shared_width
+        + if narrow {
+            0.
+        } else {
+            sync_width + 2. * gap + dot_width
+        };
     let scale = window.scale_factor();
     let notice_text = |toast: &Toast, opacity: f32, dy: f32| {
         let hint = toast
@@ -9427,7 +9449,11 @@ fn status_bar(
             .child(status_text(text, hint, theme))
     };
     let label = label.opacity(status.sync_opacity);
-    let (wide_sync, narrow_sync) = if narrow { (None, Some(label)) } else { (Some(label), None) };
+    let (wide_sync, narrow_sync) = if narrow {
+        (None, Some(label))
+    } else {
+        (Some(label), None)
+    };
     let (notice_dy, leaving_dy) = (status.notice_dy, status.leaving_dy);
     let hints = (!count.is_empty() || !hint.is_empty()).then(|| {
         div()
@@ -11025,6 +11051,9 @@ mod tests {
             let id = inbox.open_thread.clone().unwrap();
             inbox.read_in_flight = true;
             let reply = super::ConversationRead {
+                notes: None,
+                latest_note: None,
+                note_generation: 0,
                 view: Vec::new(),
                 reads: Default::default(),
                 matches: None,
@@ -11039,6 +11068,9 @@ mod tests {
             );
             let id = inbox.open_thread.clone().unwrap();
             let reply = super::ConversationRead {
+                notes: None,
+                latest_note: None,
+                note_generation: 0,
                 view: inbox.session.messages.clone(),
                 reads: Default::default(),
                 matches: None,
@@ -11053,7 +11085,7 @@ mod tests {
     fn pending_bodies_fade_when_the_folder_read_fails() {
         with_pending_inbox(|inbox, cx| {
             inbox.show_threads(
-                inbox.session.folder.clone(),
+                (inbox.session.folder.clone(), None),
                 Err("failed to read folder".into()),
                 super::ReadIntent::default(),
                 false,
@@ -11128,6 +11160,9 @@ mod tests {
                 row.id,
                 before + 1,
                 Ok(Some(super::ConversationRead {
+                    notes: None,
+                    latest_note: None,
+                    note_generation: 0,
                     view,
                     reads: Default::default(),
                     matches: None,
@@ -11172,6 +11207,113 @@ mod tests {
                     .fade(inbox.motion.clock.now())
                     .is_some()
             );
+        });
+    }
+
+    #[test]
+    fn open_search_match_holds_its_height_through_the_post_sync_reread() {
+        use crate::model::search::{Hit, MatchLanding, SearchReply};
+        use fell_core::{MessageId, SearchMatch, SearchPreview};
+
+        with_pending_inbox(|inbox, cx| {
+            let row = inbox.session.threads[0].clone();
+            let message = MessageId(inbox.session.messages[0].id.clone());
+            let reply = || SearchReply {
+                rows: vec![row.clone()],
+                hits: [(
+                    row.id.clone(),
+                    Hit {
+                        message: message.clone(),
+                        related: false,
+                        preview: None,
+                        folder: Some("INBOX".into()),
+                    },
+                )]
+                .into(),
+                correction: None,
+                error: None,
+            };
+            let hit = |text: &str| SearchMatch {
+                message: message.clone(),
+                preview: Some(SearchPreview {
+                    text: format!("Harbor {text}"),
+                    highlights: std::iter::once(0..6).collect(),
+                }),
+            };
+            let now = Instant::now();
+            inbox.session.on_key(KeyId::Char('/'), 10);
+            inbox.session.type_search("Harbor");
+            let generation = inbox.session.search_generation;
+            assert!(inbox.session.apply_search_reply(generation, &mut reply()));
+            inbox.session.search.as_mut().unwrap().editing = false;
+            inbox.session.pane = super::Pane::Conversation;
+            inbox.session.set_search_matches(
+                generation,
+                &row.id,
+                vec![hit("checkpoint")],
+                MatchLanding::Best,
+            );
+            let line = |inbox: &mut super::Inbox, at| {
+                let frame = inbox.search_match_frame(at, inbox.search_preview_current());
+                (frame.reserved_height(&inbox.theme), frame.animating)
+            };
+            let (height, animating) = line(inbox, now);
+            assert!(height > 0.);
+            assert!(!animating);
+
+            let mut previous_height = height;
+            for (step, (matches, target_height, changes)) in [
+                (vec![hit("checkpoint")], height, false),
+                (vec![hit("checkpoint revised")], height, true),
+                (Vec::new(), 0., true),
+                (vec![hit("checkpoint")], height, true),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let now = now + Duration::from_secs(step as u64 + 1);
+                if step == 0 {
+                    inbox.session.search.as_mut().unwrap().editing = true;
+                    inbox.session.type_search(" checkpoint");
+                    inbox.session.search.as_mut().unwrap().editing = false;
+                    inbox.read_selected_messages(true, cx);
+                    assert!(inbox.search_view.refresh_open_after_reply);
+                } else {
+                    assert!(inbox.session.refresh_search(now));
+                }
+                assert_eq!(line(inbox, now), (previous_height, false));
+                let generation = inbox.session.search_generation;
+                inbox.show_search_reply(generation, reply(), cx);
+                assert!(!inbox.search_preview_current());
+                assert!(inbox.quiet_search_preview());
+                assert_eq!(line(inbox, now), (previous_height, false));
+
+                let read = inbox.conv_gen.load(std::sync::atomic::Ordering::SeqCst);
+                inbox.receive_conversation(
+                    row.id.clone(),
+                    read,
+                    Ok(Some(super::ConversationRead {
+                        notes: None,
+                        latest_note: None,
+                        note_generation: 0,
+                        view: inbox.session.messages.clone(),
+                        reads: Default::default(),
+                        matches: Some((generation, matches)),
+                    })),
+                    cx,
+                );
+                inbox.apply_body_refresh(now);
+                assert!(inbox.search_preview_current());
+                assert_eq!(line(inbox, now), (previous_height, changes));
+                let (halfway, _) = line(inbox, now + motion::FADE / 2);
+                if previous_height != target_height {
+                    assert!(halfway > 0. && halfway < height);
+                } else {
+                    assert_eq!(halfway, height);
+                }
+                assert_eq!(line(inbox, now + motion::FADE), (target_height, false));
+                previous_height = target_height;
+            }
         });
     }
 
@@ -11302,11 +11444,11 @@ mod tests {
                         .enumerate()
                         .map(|(step, unread)| {
                             let at = now + Duration::from_millis(step as u64 * 140);
-                            motion.observe_header("INBOX", unread, at);
+                            motion.observe_header("INBOX", None, unread, at);
                             super::header(
                                 &self.1,
                                 &self.0,
-                                "INBOX",
+                                ("INBOX", None),
                                 &mut motion,
                                 at + Duration::from_millis(60),
                                 width,

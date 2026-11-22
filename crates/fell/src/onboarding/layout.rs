@@ -981,7 +981,8 @@ impl Onboarding {
                                     .flex()
                                     .justify_between()
                                     .items_center()
-                                    .px_2()
+                                    .gap(px(6.))
+                                    .px(px(5.))
                                     .py_1p5()
                                     .h(px(self.theme.ui_px + 20.))
                                     .border_1()
@@ -990,9 +991,16 @@ impl Onboarding {
                                     .bg(rgb(self.theme.surface))
                                     .when(focused, |el| el.relative().child(focus_ring(border, 7.)))
                                     .child(
-                                        div().text_size(px(self.theme.ui_px - 1.)).child(security),
+                                        div()
+                                            .flex_none()
+                                            .text_size(px(self.theme.ui_px - 2.))
+                                            .child(security),
                                     )
-                                    .child(self.meta("↻")),
+                                    .child(
+                                        self.meta("↻")
+                                            .flex_none()
+                                            .text_size(px(self.theme.ui_px - 2.)),
+                                    ),
                             ),
                     ),
             )
