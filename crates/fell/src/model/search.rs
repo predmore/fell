@@ -41,6 +41,7 @@ pub struct Search {
     pub suggestions: Vec<Suggestion>,
     pub suggestion_index: usize,
     completion_key: Option<(CompletionField, String)>,
+    completion_exclusions: HashSet<String>,
     pub hits: HashMap<String, Hit>,
     requested: String,
     accepted: Option<(u64, String)>,
@@ -261,6 +262,31 @@ impl Search {
     pub fn completion_key(&self) -> Option<&(CompletionField, String)> {
         self.completion_key.as_ref()
     }
+
+    pub fn completion_exclusions(&self) -> &HashSet<String> {
+        &self.completion_exclusions
+    }
+}
+
+fn address_filters(query: &str) -> HashSet<String> {
+    let mut quoted = false;
+    query
+        .split(|ch: char| {
+            if ch == '"' {
+                quoted = !quoted;
+            }
+            !quoted && ch.is_ascii_whitespace()
+        })
+        .filter_map(|token| {
+            let (field, value) = token.split_once(':')?;
+            if field.eq_ignore_ascii_case("from") || field.eq_ignore_ascii_case("to") {
+                let value = value.trim_matches('"');
+                fell_core::compose::email_of(value).map(|email| email.to_lowercase())
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Whitespace outside quoted phrases separates search tokens. Keep bytes
@@ -575,10 +601,22 @@ impl Session {
     fn update_search_completion(&mut self) -> Step {
         let search = self.search.as_mut().unwrap();
         let key = completion(&search.query, search.caret).map(|c| (c.field, c.prefix.to_owned()));
-        if key == search.completion_key {
+        let excluded = if let Some((field, prefix)) = &key
+            && field.is_address()
+        {
+            let mut excluded = address_filters(&search.query);
+            if prefix.contains('@') {
+                excluded.insert(prefix.to_lowercase());
+            }
+            excluded
+        } else {
+            HashSet::new()
+        };
+        if key == search.completion_key && excluded == search.completion_exclusions {
             return Step::default();
         }
         search.completion_key = key;
+        search.completion_exclusions = excluded;
         search.suggestions.clear();
         Step {
             search_completion: true,
@@ -1354,6 +1392,25 @@ mod tests {
             r#"invoice in:"Archive 2025" "#
         );
         assert!(completion(r#""note from:ada""#, 13).is_none());
+    }
+
+    #[test]
+    fn address_completion_tracks_filters_elsewhere_in_the_query() {
+        let mut session = session();
+        session.on_key(KeyId::Char('/'), 10);
+        session.type_search(r#"FROM:"RUBEN@EXAMPLE.TEST" subject:"to:ignored@example.test" to:ru"#);
+        let search = session.search.as_ref().unwrap();
+        assert_eq!(
+            search.completion_exclusions(),
+            &HashSet::from(["ruben@example.test".into()])
+        );
+        let search = session.search.as_mut().unwrap();
+        search.query.push_str(" from:ruth@example.test");
+        assert!(session.update_search_completion().search_completion);
+        assert_eq!(
+            session.search.as_ref().unwrap().completion_exclusions(),
+            &HashSet::from(["ruben@example.test".into(), "ruth@example.test".into()])
+        );
     }
 
     #[test]

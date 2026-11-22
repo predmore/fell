@@ -957,6 +957,10 @@ impl ComposeView {
         let Some(snap) = self.hub.with_session(&id, |session| session.snapshot()) else {
             return;
         };
+        self.set_header_row(field, &snap);
+    }
+
+    fn set_header_row(&mut self, field: Field, snap: &Snapshot) {
         match field {
             Field::To => self.to_line = join_addrs(&snap.to),
             Field::Cc => self.cc_line = join_addrs(&snap.cc),
@@ -1122,9 +1126,14 @@ impl ComposeView {
             .unwrap_or_default();
         if self.hub.with_session(&id, |session| session.undo()) == Some(true) {
             self.applied_revision = 0;
+            let snap = self.hub.with_session(&id, |session| session.snapshot());
+            // Ordinary sync preserves the active line while it is being typed.
+            // Undo replaces it too. Header carets are drawn at the line's end.
+            if let Some(snap) = &snap {
+                self.set_header_row(self.field, snap);
+            }
             self.sync_from_hub();
             // An edit that came back (a keep or reject undone) takes focus.
-            let snap = self.hub.with_session(&id, |session| session.snapshot());
             let returned = snap.as_ref().and_then(|snap| {
                 let order = ordered_hunks(snap);
                 let at = order.iter().position(|(hunk, _)| !before.contains(hunk))?;

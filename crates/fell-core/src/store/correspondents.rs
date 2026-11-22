@@ -2,7 +2,7 @@
 //! sends. A message contributes at most one sighting per address, even when
 //! multiple folders or the local send and its Sent copy report it.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
@@ -237,7 +237,25 @@ impl Store {
         account: &AccountId,
         prefix: &str,
     ) -> Result<Vec<Address>> {
-        suggest(&self.conn, account, prefix, LIMIT)
+        self.correspondent_suggestions_excluding(account, prefix, &HashSet::new())
+    }
+
+    /// Keeps up to six matches after skipping the given lowercase addresses.
+    pub fn correspondent_suggestions_excluding(
+        &self,
+        account: &AccountId,
+        prefix: &str,
+        excluded: &HashSet<String>,
+    ) -> Result<Vec<Address>> {
+        let mut result = suggest(
+            &self.conn,
+            account,
+            prefix,
+            LIMIT.saturating_add(excluded.len()),
+        )?;
+        result.retain(|person| !excluded.contains(&person.email.to_lowercase()));
+        result.truncate(LIMIT);
+        Ok(result)
     }
 }
 
@@ -261,7 +279,7 @@ pub(super) fn suggest(
     )?;
     let mut rows = select.query(params![account.as_str(), indexed])?;
     let mut result = Vec::with_capacity(limit.min(LIMIT));
-    while result.len() < limit.min(LIMIT) {
+    while result.len() < limit {
         let Some(row) = rows.next()? else { break };
         let person = Address {
             email: row.get(0)?,
@@ -467,6 +485,7 @@ fn message_sightings(
     if let Some(row) = row.next()? {
         let folders = split_field(&row.get::<_, String>(3)?);
         let date = row.get::<_, i64>(2)?;
+        let list = row.get(4)?;
         let sent = folders
             .iter()
             .any(|folder| is_folder(mailbox, FolderRole::Sent, folder));
@@ -489,7 +508,7 @@ fn message_sightings(
                     name: row.get(1)?,
                 },
                 date,
-                Direction::Received { list: row.get(4)? },
+                Direction::Received { list },
             );
         }
         if sent || normal || folders.is_empty() {
@@ -503,7 +522,7 @@ fn message_sightings(
                         if sent {
                             Direction::Sent
                         } else {
-                            Direction::Mentioned
+                            Direction::Mentioned { list }
                         },
                     );
                 }
@@ -574,7 +593,7 @@ fn is_folder(mailbox: &Mailbox, role: FolderRole, folder: &str) -> bool {
 enum Direction {
     Sent,
     Received { list: bool },
-    Mentioned,
+    Mentioned { list: bool },
 }
 
 fn safe_email(email: &str) -> bool {
@@ -612,7 +631,10 @@ fn add(
     });
     let sent = matches!(direction, Direction::Sent);
     let received = matches!(direction, Direction::Received { .. });
-    let list = matches!(direction, Direction::Received { list: true });
+    let list = matches!(
+        direction,
+        Direction::Received { list: true } | Direction::Mentioned { list: true }
+    );
     let quality = person.name.as_deref().map_or(0, |name| {
         let full = name.split_whitespace().nth(1).is_some();
         1 + 2 * i64::from(full) + i64::from(received && !list)
@@ -970,6 +992,49 @@ mod tests {
     }
 
     #[test]
+    fn to_and_cc_on_list_mail_need_an_ordinary_sighting_for_normal_rank() {
+        let store = Store::open_in_memory().unwrap();
+        let account = AccountId("a".into());
+        let tx = immediate_transaction(&store.conn).unwrap();
+        tx.execute_batch(
+            "INSERT INTO accounts VALUES ('a', 'Demo', 'me@example.test', 'bridge');
+             INSERT INTO messages (account_id, message_id, remote_id, thread_id, references_header,
+                         from_name, from_email, subject, date_unix, snippet, folders, list_id)
+             VALUES ('a', 'list', 'remote:list', 'list', '', 'Postmaster', 'post@example.test',
+                     'Digest', 800000, '', 'INBOX', 'list.example.test'),
+                    ('a', 'human', 'remote:human', 'human', '', 'Demo Sender', 'demo@example.test',
+                     'Notes', 210, '', 'INBOX', NULL);",
+        )
+        .unwrap();
+        let only_list = person("Demo List", "list@example.test");
+        let mixed = person("Demo Reader", "reader@example.test");
+        tx.execute(
+            "UPDATE messages SET to_line = ?1, cc_line = ?2 WHERE message_id = 'list'",
+            [
+                encode_addresses(std::slice::from_ref(&only_list)),
+                encode_addresses(std::slice::from_ref(&mixed)),
+            ],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            store.correspondent_suggestions(&account, "demo").unwrap()[0].email,
+            "demo@example.test"
+        );
+        let tx = immediate_transaction(&store.conn).unwrap();
+        tx.execute(
+            "UPDATE messages SET cc_line = ?1 WHERE message_id = 'human'",
+            [encode_addresses(std::slice::from_ref(&mixed))],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            store.correspondent_suggestions(&account, "demo").unwrap(),
+            [mixed, person("Demo Sender", "demo@example.test"), only_list]
+        );
+    }
+
+    #[test]
     fn addresses_with_controls_or_format_characters_never_enter_the_index() {
         let store = Store::open_in_memory().unwrap();
         let account = AccountId("a".into());
@@ -1033,6 +1098,18 @@ mod tests {
         }
         drop(insert);
         tx.commit().unwrap();
+
+        let ranked = suggest(&store.conn, &account, "alex", LIMIT + 2).unwrap();
+        let excluded = ranked[..2]
+            .iter()
+            .map(|person| person.email.to_lowercase())
+            .collect();
+        assert_eq!(
+            store
+                .correspondent_suggestions_excluding(&account, "alex", &excluded)
+                .unwrap(),
+            ranked[2..]
+        );
 
         // Include a one-letter prefix that matches every row, initials, a
         // single address, and a miss. Warm the cached prepared statement.

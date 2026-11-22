@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -16,7 +17,7 @@ pub(crate) struct RecipientStore(pub StoreClient);
 impl gpui::Global for RecipientStore {}
 
 pub(super) struct Completion {
-    key: Option<(gpui::SharedString, Field, String)>,
+    key: Option<Lookup>,
     generation: Arc<AtomicU64>,
     motion: Motion,
     menu: Menu,
@@ -24,6 +25,14 @@ pub(super) struct Completion {
     anchor: Field,
     ready: bool,
     accept_pending: bool,
+}
+
+#[derive(Clone, PartialEq)]
+struct Lookup {
+    draft: gpui::SharedString,
+    field: Field,
+    prefix: String,
+    excluded: HashSet<String>,
 }
 
 impl Default for Completion {
@@ -35,7 +44,7 @@ impl Default for Completion {
             menu: Menu::default(),
             selected: 0,
             anchor: Field::To,
-            ready: false,
+            ready: true,
             accept_pending: false,
         }
     }
@@ -68,7 +77,12 @@ impl ComposeView {
             .recipient_line()
             .filter(|_| !self.closing && !self.discarding && !self.preview)
             .and_then(prefix)
-            .map(|prefix| (self.draft_id.clone(), self.field, prefix.to_owned()));
+            .map(|prefix| Lookup {
+                draft: self.draft_id.clone(),
+                field: self.field,
+                prefix: prefix.to_owned(),
+                excluded: self.excluded_recipients(),
+            });
         let completion = &mut self.recipients;
         if completion.key == next {
             return;
@@ -76,8 +90,8 @@ impl ComposeView {
         if completion
             .key
             .as_ref()
-            .map(|(draft, field, _)| (draft, field))
-            != next.as_ref().map(|(draft, field, _)| (draft, field))
+            .map(|lookup| (&lookup.draft, lookup.field))
+            != next.as_ref().map(|lookup| (&lookup.draft, lookup.field))
         {
             completion.menu.dismiss(completion.motion, Instant::now());
             completion.selected = 0;
@@ -87,7 +101,13 @@ impl ComposeView {
         completion.accept_pending = false;
         let generation = Arc::clone(&completion.generation);
         let revision = generation.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-        let Some((draft, field, prefix)) = next else {
+        let Some(Lookup {
+            draft,
+            field,
+            prefix,
+            excluded,
+        }) = next
+        else {
             return;
         };
         let Some(store) = cx
@@ -110,7 +130,6 @@ impl ComposeView {
         };
         completion.anchor = field;
         completion.ready = false;
-        completion.menu.loading(completion.motion, Instant::now());
         cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(recipient_menu::QUERY_DELAY)
@@ -124,7 +143,7 @@ impl ComposeView {
                     return Vec::new();
                 }
                 let mut people = store
-                    .correspondent_suggestions(&account, &prefix)
+                    .correspondent_suggestions_excluding(&account, &prefix, &excluded)
                     .unwrap_or_default();
                 if people
                     .iter()
@@ -134,7 +153,24 @@ impl ComposeView {
                 }
                 people
             });
-            let rows = reply.await.unwrap_or_default();
+            let timer = cx
+                .background_executor()
+                .timer(recipient_menu::LOADING_DELAY);
+            let rows = recipient_menu::wait_for_lookup(reply, timer, || {
+                let _ = this.update(cx, |compose, cx| {
+                    if generation.load(Ordering::Relaxed) == revision {
+                        let completion = &mut compose.recipients;
+                        completion.menu.loading(
+                            completion.selected,
+                            completion.motion,
+                            Instant::now(),
+                        );
+                        cx.notify();
+                    }
+                });
+            })
+            .await
+            .unwrap_or_default();
             let _ = this.update(cx, |compose, cx| {
                 if generation.load(Ordering::Relaxed) != revision {
                     return;
@@ -157,6 +193,26 @@ impl ComposeView {
         .detach();
     }
 
+    fn excluded_recipients(&self) -> HashSet<String> {
+        [
+            (Field::To, self.to_line.as_str()),
+            (Field::Cc, self.cc_line.as_str()),
+            (Field::Bcc, self.bcc_line.as_str()),
+        ]
+        .into_iter()
+        .flat_map(|(field, line)| {
+            let completed = if field == self.field {
+                &line[..token_start(line)]
+            } else {
+                line
+            };
+            recipient_tokens(completed)
+        })
+        .filter_map(email_of)
+        .map(|email| email.to_lowercase())
+        .collect()
+    }
+
     pub(super) fn recipient_key(&mut self, key: &str, modifiers: &gpui::Modifiers) -> bool {
         let completion = &mut self.recipients;
         if matches!(key, "tab" | "enter")
@@ -165,7 +221,6 @@ impl ComposeView {
             && !modifiers.platform
             && !modifiers.alt
             && !completion.ready
-            && completion.menu.is_open()
         {
             completion.accept_pending = true;
             return true;
@@ -194,7 +249,7 @@ impl ComposeView {
 
     pub(super) fn dismiss_recipient_menu(&mut self) -> bool {
         let completion = &mut self.recipients;
-        if !completion.menu.dismiss(completion.motion, Instant::now()) {
+        if !completion.menu.dismiss(completion.motion, Instant::now()) && completion.ready {
             return false;
         }
         completion.generation.fetch_add(1, Ordering::Relaxed);
@@ -282,22 +337,24 @@ impl ComposeView {
 
 /// The last top-level comma. A comma in a quoted name belongs to that name.
 fn token_start(line: &str) -> usize {
-    let mut start = 0;
+    line.len() - recipient_tokens(line).last().unwrap_or_default().len()
+}
+
+fn recipient_tokens(line: &str) -> impl Iterator<Item = &str> {
     let mut quoted = false;
     let mut escaped = false;
-    for (i, ch) in line.char_indices() {
-        if escaped {
-            escaped = false;
-        } else {
-            match ch {
-                '\\' if quoted => escaped = true,
-                '"' => quoted = !quoted,
-                ',' if !quoted => start = i + 1,
-                _ => {}
-            }
+    line.split(move |ch| {
+        if std::mem::take(&mut escaped) {
+            return false;
         }
-    }
-    start
+        match ch {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            ',' if !quoted => return true,
+            _ => {}
+        }
+        false
+    })
 }
 
 fn prefix(line: &str) -> Option<&str> {
@@ -363,5 +420,94 @@ mod tests {
             let snap = hub.with_session(&id, |session| session.snapshot()).unwrap();
             assert_eq!(snap.to[1].email, "bea@example.test");
         });
+    }
+
+    #[test]
+    fn completion_excludes_addresses_across_the_three_recipient_lines() {
+        let root = tempfile::tempdir().unwrap();
+        let (hub, id, folder) = open_demo(root.path().to_owned(), ThemeKind::Dark).unwrap();
+        let mut app = gpui::TestAppContext::single();
+        let (view, cx) = app.add_window_view(|_, cx| ComposeView::new(hub, id, folder, cx));
+        view.update(cx, |compose, _| {
+            compose.field = Field::To;
+            compose.to_line = r#""Ruben, Test" <RUBEN@example.test>, ru"#.into();
+            compose.cc_line = "Rhea <rhea@EXAMPLE.test>".into();
+            compose.bcc_line = "ravi@example.test".into();
+            assert_eq!(
+                compose.excluded_recipients(),
+                [
+                    "ruben@example.test",
+                    "rhea@example.test",
+                    "ravi@example.test"
+                ]
+                .map(str::to_owned)
+                .into_iter()
+                .collect()
+            );
+        });
+    }
+
+    #[test]
+    fn palette_undo_restores_focused_to_before_sending() {
+        let root = tempfile::tempdir().unwrap();
+        let (hub, id, folder) = open_demo(root.path().to_owned(), ThemeKind::Dark).unwrap();
+        hub.with_session(&id, |session| {
+            session.set_body_from_user("See you Thursday.\n".into());
+            session.end_user_change();
+        });
+        let mut app = gpui::TestAppContext::single();
+        let (view, cx) =
+            app.add_window_view(|_, cx| ComposeView::new(hub.clone(), id.clone(), folder, cx));
+        view.update(cx, |compose, cx| {
+            compose.field = Field::To;
+            compose.to_line = "ar".into();
+            compose.recipients.menu.show(
+                vec![Address {
+                    name: Some("Ari Wynn".into()),
+                    email: "ari@example.test".into(),
+                }],
+                0,
+                Motion::new(false),
+                Instant::now(),
+            );
+            for key in [
+                "enter",
+                "ctrl-shift-p",
+                "u->u",
+                "n->n",
+                "d->d",
+                "o->o",
+                "enter",
+            ] {
+                compose.on_key(
+                    &gpui::KeyDownEvent {
+                        keystroke: gpui::Keystroke::parse(key).unwrap(),
+                        is_held: false,
+                    },
+                    cx,
+                );
+            }
+            assert!(compose.field == Field::To);
+            assert_eq!(compose.to_line, "Ada <ada@example.com>");
+            compose.send(cx);
+            assert_eq!(
+                compose.sending.as_deref(),
+                Some(id.as_str()),
+                "{}",
+                compose.status
+            );
+        });
+        cx.run_until_parked();
+        let store = fell_core::Store::open(root.path().join("mail.db")).unwrap();
+        while store.maintain_correspondents().unwrap() {}
+        let account = fell_core::AccountId("local".into());
+        let sent_to = store.correspondent_suggestions(&account, "ada").unwrap();
+        assert_eq!(sent_to[0].email, "ada@example.com");
+        assert!(
+            store
+                .correspondent_suggestions(&account, "ari")
+                .unwrap()
+                .is_empty()
+        );
     }
 }

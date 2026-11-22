@@ -291,16 +291,10 @@ impl Inbox {
 
     pub(super) fn search_store_ready(&mut self, cx: &mut Context<Self>) {
         self.search_view.ready = true;
-        let address = self
-            .session
-            .search
-            .as_ref()
-            .and_then(|search| search.completion_key())
-            .is_some_and(|(field, _)| field.is_address());
-        if self.session.search_editing() && (!address || self.search_view.completion_pending) {
+        if self.session.search_editing() {
             let accept = self.search_view.accept_pending;
             self.request_search_completion(cx);
-            self.search_view.accept_pending = accept;
+            self.search_view.accept_pending = accept && self.search_view.completion_pending;
         }
         if self
             .session
@@ -1012,9 +1006,6 @@ impl Inbox {
         }
         view.completion_pending = field.is_some();
         view.accept_pending = false;
-        if field.is_some() {
-            view.correspondent_menu.loading(motion, now);
-        }
         let Some((field, prefix)) = next
             .filter(|(field, prefix)| view.ready && (!field.is_address() || !prefix.is_empty()))
         else {
@@ -1022,6 +1013,12 @@ impl Inbox {
         };
         let account = self.account_id.clone();
         let store = self.store.clone();
+        let excluded = self
+            .session
+            .search
+            .as_ref()
+            .map(|search| search.completion_exclusions().clone())
+            .unwrap_or_default();
         cx.spawn(async move |this, cx| {
             let address = field.is_address();
             if address {
@@ -1032,15 +1029,35 @@ impl Inbox {
                     return;
                 }
             }
+            let current = Arc::clone(&latest);
             let job = move |store: &Store| {
-                if latest.load(Ordering::Relaxed) == revision {
-                    search_suggestions(store, &account, field, &prefix)
+                if current.load(Ordering::Relaxed) == revision {
+                    search_suggestions(store, &account, field, &prefix, &excluded)
                 } else {
                     Vec::new()
                 }
             };
             let mut suggestions = if address {
-                store.call(job).await
+                let reply = store.call(job);
+                let timer = cx
+                    .background_executor()
+                    .timer(recipient_menu::LOADING_DELAY);
+                recipient_menu::wait_for_lookup(reply, timer, || {
+                    let _ = this.update(cx, |inbox, cx| {
+                        if latest.load(Ordering::Relaxed) == revision
+                            && let Some(search) =
+                                inbox.session.search.as_ref().filter(|s| s.editing)
+                        {
+                            inbox.search_view.correspondent_menu.loading(
+                                search.suggestion_index,
+                                inbox.motion.motion,
+                                Instant::now(),
+                            );
+                            cx.notify();
+                        }
+                    });
+                })
+                .await
             } else {
                 store.call_search_completion(job).await
             }
@@ -1103,7 +1120,7 @@ impl Inbox {
         let view = &mut self.search_view;
         let now = Instant::now();
         let motion = self.motion.motion;
-        if !view.correspondent_menu.is_open() {
+        if !view.correspondent_menu.is_open() && !view.completion_pending {
             return false;
         }
         match key {
@@ -1327,13 +1344,13 @@ fn search_suggestions(
     account: &AccountId,
     field: CompletionField,
     prefix: &str,
+    excluded: &HashSet<String>,
 ) -> Vec<Suggestion> {
     if field.is_address() {
         return store
-            .correspondent_suggestions(account, prefix)
+            .correspondent_suggestions_excluding(account, prefix, excluded)
             .unwrap_or_default()
             .into_iter()
-            .filter(|person| !person.email.eq_ignore_ascii_case(prefix))
             .map(Suggestion::Correspondent)
             .collect();
     }
@@ -2360,4 +2377,41 @@ fn old_correspondent_rows_cannot_accept_during_or_after_a_new_query() {
     view.completion_pending = false;
     assert!(!view.correspondent_rows_current(shown));
     assert!(view.correspondent_rows_current(latest));
+}
+
+#[test]
+fn tab_before_the_store_is_ready_accepts_the_first_correspondent_reply() {
+    let root = tempfile::tempdir().unwrap();
+    let mut app = gpui::TestAppContext::single();
+    let view = app.new(|cx| {
+        let startup = crate::mailbox::Startup {
+            keymap: Default::default(),
+            split: 0.42,
+            read_dwell_ms: 0,
+            error: None,
+            config: None,
+            path: Ok(root.path().join("mail.db")),
+        };
+        let mut inbox = Inbox::with_startup(startup, None, cx);
+        inbox.session.on_key(KeyId::Char('/'), 10);
+        assert!(inbox.session.type_search("from:ru").search_completion);
+        inbox.request_search_completion(cx);
+        assert!(inbox.correspondent_key(KeyId::Tab));
+        assert!(inbox.search_view.accept_pending);
+        inbox
+    });
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        app.run_until_parked();
+        app.executor().advance_clock(recipient_menu::QUERY_DELAY);
+        app.run_until_parked();
+        let query = view.read_with(&app, |inbox, _| {
+            inbox.session.search.as_ref().unwrap().query.clone()
+        });
+        if query == "from:ruben@harbor.test " {
+            break;
+        }
+        assert!(Instant::now() < deadline, "lookup ended with {query:?}");
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }

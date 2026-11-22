@@ -24,6 +24,8 @@ pub struct Theme {
     pub kind: ThemeKind,
     pub background: u32,
     pub surface: u32,
+    pub recipient_surface: u32,
+    pub recipient_text: (u32, u32),
     pub foreground: u32,
     pub dimmed: u32,
     pub accent: u32,
@@ -191,6 +193,8 @@ fn map_palette(
     let (foreground, dimmed) = text_pair(foreground_raw, dim_raw, background);
     let surface = mix(background, foreground, 0.045);
     let (foreground, dimmed) = text_pair(foreground, dimmed, surface);
+    let recipient_surface = mix(surface, foreground, 0.05);
+    let recipient_text = text_pair(foreground, dimmed, recipient_surface);
     let accent_raw = color(raw, &["accent", "blue", "color4", "color12"]).unwrap_or(foreground);
     let error_raw = color(raw, &["red", "bright_red", "color1"]).unwrap_or(0xcc3333);
     let success_raw = color(raw, &["green", "bright_green", "color2"]).unwrap_or(0x31935d);
@@ -221,6 +225,8 @@ fn map_palette(
         kind,
         background,
         surface,
+        recipient_surface,
+        recipient_text,
         foreground,
         dimmed,
         accent,
@@ -318,6 +324,8 @@ pub fn contrast_ok(theme: &Theme) -> bool {
         && contrast(theme.star, theme.selection) >= TEXT_CONTRAST
         && contrast(theme.on_selection_dim, theme.selection) >= TEXT_CONTRAST
         && contrast(theme.on_selection_accent, theme.selection) >= TEXT_CONTRAST
+        && contrast(theme.recipient_text.0, theme.recipient_surface) >= TEXT_CONTRAST
+        && contrast(theme.recipient_text.1, theme.recipient_surface) >= TEXT_CONTRAST
         && contrast(theme.error, theme.selection) >= TEXT_CONTRAST
         && contrast(theme.foreground, theme.background)
             >= contrast(theme.dimmed, theme.background) + 0.8
