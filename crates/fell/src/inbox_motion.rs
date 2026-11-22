@@ -8,10 +8,10 @@
 //! positions from before the change.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::keymap::KeyId;
-use crate::model::{FolderIntent, Overlay, Session, Toast};
+use crate::model::{Banner, FolderIntent, Overlay, PickerChoice, Session, Toast};
 use crate::motion::{self, Ghost, Glide, ListShift, Motion, Transition};
 use crate::present::{ConvMessage, Pane, ThreadRow};
 use crate::worker::Worker;
@@ -20,10 +20,13 @@ use crate::worker::Worker;
 /// slow frame two rows never look selected.
 pub const SELECTION_FROM: f32 = 0.6;
 
+const STATUS_SWAP_OUT: Duration = Duration::from_millis(60);
+
 /// The folder label and count leaving the header as a pair.
 pub struct FolderHeaderFade {
     pub folder: String,
     pub unread: usize,
+    banner: Option<Banner>,
     fade: Transition,
     folder_from: f32,
     /// The account name and email can keep different opacities.
@@ -85,6 +88,8 @@ pub struct StatusMotion {
     /// How much of the key hints shows. A notice takes their room, so they
     /// fade out as it comes and back in as it leaves.
     pub hints: f32,
+    /// Sync text shares the notice's space on a narrow window.
+    pub sync: f32,
 }
 
 /// What an overlay or which-key showed, kept from the frame before it
@@ -101,12 +106,20 @@ pub struct Layer {
     folder_intent: FolderIntent,
     agents: Option<crate::model::agents::Agents>,
     palette_from_agents: bool,
+    pub label_target: Option<String>,
+    pub picker_choices: Vec<PickerChoice>,
+    pub label_marks: f32,
 }
 
 impl Layer {
-    fn of(session: &Session) -> Self {
+    fn of(session: &Session, overlay: Overlay, label_marks: f32) -> Self {
+        let picker_choices = if overlay == Overlay::Folders {
+            session.picker_choices()
+        } else {
+            Vec::new()
+        };
         Self {
-            overlay: session.overlay.clone(),
+            overlay,
             chord: session.chord.clone(),
             palette_query: session.palette_query.clone(),
             palette_index: session.palette_index,
@@ -115,6 +128,9 @@ impl Layer {
             folder_intent: session.folder_intent,
             agents: (session.overlay == Overlay::Agents).then(|| session.agents.clone()),
             palette_from_agents: session.palette_from_agents,
+            label_target: session.label_target(),
+            picker_choices,
+            label_marks,
         }
     }
 
@@ -178,13 +194,13 @@ pub struct InboxMotion {
     pub conv_glide: Option<Glide>,
     last_worker_outage: Option<Worker>,
     sync_in: Option<Transition>,
+    /// Sync and notices share a cell in a narrow status bar.
+    pub narrow_status: bool,
     toast_in: Option<Transition>,
-    /// The opacity a notice fading in starts from: what a notice still
-    /// leaving has already lost, so the two never show less than one.
-    toast_from: f32,
     /// The notice that is leaving and its fade.
-    toast_out: Option<(Toast, Transition)>,
+    toast_out: Option<((Toast, f32), Transition)>,
     last_toast: Option<Toast>,
+    sync_fade: Option<(f32, Transition)>,
     /// The key hints fading out as a notice takes their room, and how
     /// much of them showed when it started.
     hints_out: Option<Transition>,
@@ -230,12 +246,24 @@ pub struct InboxMotion {
     card_to: Option<f32>,
     card_glide: Option<Glide>,
     /// The folder and unread count from the last observed page.
-    last_unread: Option<(String, usize)>,
+    last_unread: Option<(String, Option<String>, usize)>,
     /// The count it replaced in the same folder, fading out under the new one.
     unread_out: Option<(usize, Transition)>,
     folder_out: Option<FolderHeaderFade>,
+    /// A label scope changes its heading in the same frame as its rows.
+    label_header_in: Option<Transition>,
+    last_banner: Option<Banner>,
+    /// The rows and reader leave before the empty message comes in.
+    empty_list: Option<EmptyList>,
+    label_marks: Option<Transition>,
     quotes: DisclosureMotion,
     recipients: DisclosureMotion,
+}
+
+struct EmptyList {
+    exit: Transition,
+    enter: Option<Transition>,
+    replaces_reader: bool,
 }
 
 /// How open each moving disclosure is, from 0 to 1, by message id.
@@ -309,10 +337,11 @@ impl InboxMotion {
             conv_glide: None,
             last_worker_outage: None,
             sync_in: None,
+            narrow_status: false,
             toast_in: None,
-            toast_from: 0.0,
             toast_out: None,
             last_toast: None,
+            sync_fade: None,
             hints_out: None,
             hints_from: 1.0,
             last_chord: false,
@@ -345,12 +374,17 @@ impl InboxMotion {
             last_unread: None,
             unread_out: None,
             folder_out: None,
+            label_header_in: None,
+            last_banner: None,
+            empty_list: None,
+            label_marks: None,
         }
     }
 
     /// Start the transitions for what changed since the last frame.
     /// `panes`: which panes this frame shows (list, conversation).
     pub fn observe(&mut self, session: &Session, panes: (bool, bool), now: Instant) {
+        self.observe_notice(session.status_notice(), now);
         let start = |duration| self.motion.start(duration, now);
         if std::mem::take(&mut self.arrival_pending) {
             self.arrival = start(motion::QUICK);
@@ -360,61 +394,6 @@ impl InboxMotion {
             self.last_worker_outage = outage;
             self.sync_in = start(motion::QUICK);
         }
-        let notice = session.status_notice();
-        if notice != self.last_toast.as_ref() {
-            match (notice, self.last_toast.take()) {
-                (Some(toast), old) => {
-                    // The same notice again (a second `e` in a burst): it
-                    // stays up instead of blinking out and back.
-                    let returning = self
-                        .toast_out
-                        .as_ref()
-                        .is_some_and(|(leaving, _)| leaving == toast);
-                    if returning {
-                        self.toast_in = None;
-                        self.toast_out = None;
-                    } else {
-                        self.toast_in = start(motion::FADE);
-                        self.toast_from = 0.0;
-                        match old {
-                            // Another notice replaced this one: cross-fade,
-                            // out as fast as the new one comes in.
-                            Some(old) => {
-                                self.toast_out = start(motion::FADE).map(|fade| (old, fade));
-                            }
-                            // The hints make room as the notice comes, from
-                            // what shows of them now. A notice still leaving
-                            // keeps fading under the new one.
-                            // A chord's prefix held the hints' place: the
-                            // hints were not showing, so they stay hidden.
-                            None => {
-                                // A notice that comes a few frames after the
-                                // key cleared the last one (an archive is
-                                // shown when the store has it) picks up
-                                // where that one fades.
-                                if let Some((_, fade)) = &self.toast_out {
-                                    self.toast_from = 1.0 - fade.remaining(now);
-                                }
-                                self.hints_from = match &self.toast_out {
-                                    _ if self.last_chord => 0.0,
-                                    Some((_, fade)) => 1.0 - fade.remaining(now),
-                                    None => 1.0,
-                                };
-                                self.hints_out = start(motion::FADE);
-                            }
-                        }
-                    }
-                }
-                (None, Some(old)) => {
-                    self.toast_in = None;
-                    self.hints_out = None;
-                    self.toast_out = start(motion::FADE).map(|fade| (old, fade));
-                }
-                (None, None) => {}
-            }
-            self.last_toast = notice.cloned();
-        }
-
         let which =
             session.which_visible && session.overlay == Overlay::None && !session.chord.is_empty();
         if which != self.last_which {
@@ -433,10 +412,13 @@ impl InboxMotion {
         self.last_which = which;
         self.last_chord = !session.chord.is_empty();
 
-        if session.overlay != self.last_overlay {
-            if session.overlay == Overlay::None {
+        let overlay = session.visible_overlay();
+        if overlay != self.last_overlay {
+            if overlay == Overlay::None {
                 // Gone for input at once; only its pixels fade.
                 self.overlay = None;
+                self.card_to = self.card_height(now);
+                self.card_glide = None;
                 self.overlay_out = self
                     .last_layer
                     .clone()
@@ -449,16 +431,18 @@ impl InboxMotion {
                 self.card_to = None;
                 self.card_glide = None;
             }
-            self.last_overlay = session.overlay.clone();
+            self.last_overlay = overlay.clone();
         }
-        self.last_layer = (which || session.overlay != Overlay::None).then(|| Layer::of(session));
+        self.last_layer = (which || overlay != Overlay::None)
+            .then(|| Layer::of(session, overlay, self.label_marks(now)));
 
         // Only a key moves the panes; a window resized across the narrow
         // threshold shows its panes at once.
         let layout = (session.pane, session.full_width);
         if layout != self.last_layout {
-            if (layout == (Pane::Conversation, true))
-                != (self.last_layout == (Pane::Conversation, true))
+            if self.empty_list.is_none()
+                && ((layout == (Pane::Conversation, true))
+                    != (self.last_layout == (Pane::Conversation, true)))
             {
                 self.reading_slide =
                     start(motion::SLIDE).map(|slide| (self.reading_progress(now), slide));
@@ -476,7 +460,7 @@ impl InboxMotion {
                 );
                 self.reading_reflow = start(motion::READING_REFLOW).map(|fade| (alpha, fade));
             }
-            if panes != self.last_panes {
+            if panes != self.last_panes && self.empty_list.is_none() {
                 let entering = match (self.last_panes, panes) {
                     ((_, false), (_, true)) => Some(Pane::Conversation),
                     // The conversation and list already move with the
@@ -592,7 +576,11 @@ impl InboxMotion {
         let conversation = self.conv_glide.take();
         self.list_from = list.map(|glide| glide.value(now));
         self.conv_from = conversation.map(|glide| glide.value(now));
-        self.toast_in = None;
+        let sync_leaving =
+            self.narrow_status && self.last_toast.is_some() && self.sync_opacity(now) > 0.0;
+        if self.toast_out.is_none() && !sync_leaving {
+            self.toast_in = None;
+        }
         self.sync_in = None;
         self.hints_out = None;
         self.which = None;
@@ -603,10 +591,12 @@ impl InboxMotion {
         self.selection_out = None;
         self.arrival = None;
         self.arrival_pending = false;
+        self.finish_empty_list_entry();
         self.bodies.clear();
         self.quotes.transitions.clear();
         self.recipients.transitions.clear();
         self.unread_out = None;
+        self.label_header_in = None;
         Settled {
             list: list.map(|glide| glide.to),
             conversation: conversation.map(|glide| glide.to),
@@ -657,8 +647,14 @@ impl InboxMotion {
         }
         let mut running = false;
         running |= keep(&mut self.sync_in, now);
-        running |= keep(&mut self.toast_in, now);
-        running |= keep_with(&mut self.toast_out, now);
+        // Keep the outgoing marker through a replacement so a key cannot
+        // finish the incoming fade early.
+        if keep(&mut self.toast_in, now) {
+            running = true;
+        } else {
+            running |= keep_with(&mut self.toast_out, now);
+        }
+        running |= keep_with(&mut self.sync_fade, now);
         running |= keep(&mut self.hints_out, now);
         running |= keep(&mut self.which, now);
         running |= keep_with(&mut self.which_out, now);
@@ -684,6 +680,16 @@ impl InboxMotion {
             self.folder_out = None;
         }
         running |= self.folder_out.is_some();
+        running |= keep(&mut self.label_header_in, now);
+        running |= keep(&mut self.label_marks, now);
+        if self
+            .empty_list
+            .as_ref()
+            .is_some_and(|list| !list.enter.unwrap_or(list.exit).running(now))
+        {
+            self.empty_list = None;
+        }
+        running |= self.empty_list.is_some();
         if self.pane.is_some_and(|(t, _)| !t.running(now)) {
             self.pane = None;
         }
@@ -729,18 +735,33 @@ impl InboxMotion {
     }
 
     /// Observe the folder whose page actually supplied the count.
-    pub fn observe_header(&mut self, folder: &str, unread: usize, now: Instant) {
-        let Some((previous, count)) = &mut self.last_unread else {
-            self.last_unread = Some((folder.to_owned(), unread));
+    pub fn observe_header(
+        &mut self,
+        folder: &str,
+        label: Option<&str>,
+        unread: usize,
+        now: Instant,
+    ) {
+        let Some((previous, previous_label, count)) = &mut self.last_unread else {
+            self.last_unread = Some((folder.to_owned(), label.map(str::to_owned), unread));
             return;
         };
-        if previous != folder {
+        if previous != folder || previous_label.as_deref() != label {
             let old_folder = std::mem::replace(previous, folder.to_owned());
+            let old_label = std::mem::replace(previous_label, label.map(str::to_owned));
             let old = self.folder_out.take();
+            if old_label.is_some() || label.is_some() {
+                self.label_header_in = self.motion.start(motion::FADE, now);
+                self.unread_out = None;
+                *count = unread;
+                return;
+            }
+            self.label_header_in = None;
             self.folder_out = self.motion.start(motion::FADE, now).map(|fade| {
                 let mut next = FolderHeaderFade {
                     folder: old_folder,
                     unread: *count,
+                    banner: self.last_banner.clone(),
                     fade,
                     folder_from: 1.0,
                     account_from: [1.0; 2],
@@ -753,6 +774,7 @@ impl InboxMotion {
                     if leaving {
                         next.folder = old.folder;
                         next.unread = old.unread;
+                        next.banner = old.banner;
                         next.folder_from *= old.folder_from;
                     }
                 }
@@ -772,6 +794,87 @@ impl InboxMotion {
         self.folder_out.as_mut()
     }
 
+    pub fn label_header_opacity(&self, now: Instant) -> f32 {
+        self.label_header_in.map_or(1.0, |fade| {
+            motion::lerp(motion::ARRIVE_FROM, 1.0, fade.progress(now))
+        })
+    }
+
+    /// Start the last-row exit and report whether the reader occupied the window.
+    pub fn list_emptied(&mut self, now: Instant) -> bool {
+        self.pane = None;
+        self.pane_out = None;
+        self.reading_slide = None;
+        self.reading_list_fade = None;
+        self.reading_reflow = None;
+        // The snapshot owns the exit. A key arriving before the next paint
+        // can land the list without starting the usual reading-mode slide.
+        self.last_layout = (Pane::List, false);
+        let replaces_reader = self.last_panes == (false, true);
+        self.empty_list = self.motion.start(motion::FADE, now).map(|exit| EmptyList {
+            exit,
+            enter: self.motion.start(motion::FADE, now + motion::FADE),
+            replaces_reader,
+        });
+        replaces_reader
+    }
+
+    pub fn finish_empty_list_entry(&mut self) {
+        if let Some(list) = &mut self.empty_list {
+            list.enter = None;
+        }
+    }
+
+    pub fn empty_list_exit(&self, now: Instant) -> f32 {
+        self.empty_list
+            .as_ref()
+            .map_or(0.0, |list| list.exit.remaining(now))
+    }
+
+    pub fn empty_list_pane(&self, same_scope: bool, now: Instant) -> f32 {
+        self.empty_list
+            .as_ref()
+            .filter(|list| list.replaces_reader && same_scope)
+            .and_then(|list| list.enter)
+            .map_or(1.0, |enter| enter.progress(now))
+    }
+
+    pub fn reset_label_marks(&mut self) {
+        self.label_marks = None;
+    }
+
+    pub fn fade_label_marks(&mut self, now: Instant) {
+        self.label_marks = self.motion.start(motion::FADE, now);
+    }
+
+    pub fn label_marks(&self, now: Instant) -> f32 {
+        self.label_marks.map_or(1.0, |fade| fade.progress(now))
+    }
+
+    /// Keep an empty banner in step with the scope the header is showing.
+    pub fn list_banner(&mut self, banner: Option<Banner>, now: Instant) -> Option<(Banner, f32)> {
+        self.last_banner.clone_from(&banner);
+        let banner = banner?;
+        if let Some(fade) = &self.folder_out {
+            let (leaving, opacity) = fade.phase(now);
+            if leaving {
+                return fade
+                    .banner
+                    .clone()
+                    .map(|old| (old, opacity * fade.folder_from));
+            }
+            return Some((banner, opacity));
+        }
+        Some((
+            banner,
+            self.empty_list
+                .as_ref()
+                .filter(|list| !list.replaces_reader)
+                .and_then(|list| list.enter)
+                .map_or(1.0, |enter| enter.progress(now)),
+        ))
+    }
+
     /// The header's unread count being replaced: the old count and how far
     /// the new one has faded in over it.
     pub fn unread_count(&self, now: Instant) -> Option<(usize, f32)> {
@@ -780,16 +883,82 @@ impl InboxMotion {
             .map(|(old, fade)| (*old, fade.progress(now)))
     }
 
+    fn observe_notice(&mut self, notice: Option<&Toast>, now: Instant) {
+        if notice == self.last_toast.as_ref() {
+            return;
+        }
+        let sync = self.sync_opacity(now);
+        let incoming = motion::progress(self.toast_in.as_ref(), now);
+        let old = self
+            .last_toast
+            .take()
+            .map(|toast| (toast, incoming))
+            .filter(|&(_, opacity)| opacity > 0.0)
+            .or_else(|| {
+                self.toast_out.take().and_then(|((toast, from), fade)| {
+                    let opacity = from * fade.remaining(now);
+                    (opacity > 0.0).then_some((toast, opacity))
+                })
+            });
+        self.toast_in = None;
+        self.toast_out = None;
+        self.sync_fade = None;
+        let start = |duration| self.motion.start(duration, now);
+        match (notice, old) {
+            (Some(toast), Some(old)) if *toast != old.0 => {
+                // Narrow layouts share one cell. Finish the old text before
+                // the next can rise into it, and keep sync out of the handoff.
+                self.toast_out = start(STATUS_SWAP_OUT).map(|fade| (old, fade));
+                self.toast_in = self.motion.start(motion::QUICK, now + STATUS_SWAP_OUT);
+            }
+            (Some(_), Some(_)) => {
+                // Repeating the same notice keeps it visible.
+            }
+            (Some(_), None) => {
+                let (sync_out, notice_delay, notice_in) = if self.narrow_status && sync > 0.0 {
+                    (STATUS_SWAP_OUT, STATUS_SWAP_OUT, motion::QUICK)
+                } else {
+                    (motion::FADE, Duration::ZERO, motion::FADE)
+                };
+                self.sync_fade = start(sync_out).map(|fade| (sync, fade));
+                self.toast_in = self.motion.start(notice_in, now + notice_delay);
+                self.hints_from = if self.last_chord { 0.0 } else { 1.0 };
+                self.hints_out = start(motion::FADE);
+            }
+            (None, old) => {
+                self.hints_out = None;
+                let delay = if let Some(old) = old {
+                    self.toast_out = start(motion::FADE).map(|fade| (old, fade));
+                    motion::FADE
+                } else {
+                    Duration::ZERO
+                };
+                self.sync_fade = self
+                    .motion
+                    .start(motion::FADE, now + delay)
+                    .map(|fade| (sync, fade));
+            }
+        }
+        self.last_toast = notice.cloned();
+    }
+
+    fn sync_opacity(&self, now: Instant) -> f32 {
+        let target = if self.last_toast.is_some() { 0.0 } else { 1.0 };
+        self.sync_fade.map_or(target, |(from, fade)| {
+            motion::lerp(from, target, fade.progress(now))
+        })
+    }
+
     pub fn status(&self, session: &Session, now: Instant) -> StatusMotion {
         let rising = motion::progress(self.toast_in.as_ref(), now);
         let notice = session
             .status_notice()
             .cloned()
-            .map(|toast| (toast, motion::lerp(self.toast_from, 1.0, rising)));
+            .map(|toast| (toast, rising));
         let leaving = self
             .toast_out
             .as_ref()
-            .map(|(toast, fade)| (toast.clone(), fade.remaining(now)));
+            .map(|((toast, from), fade)| (toast.clone(), from * fade.remaining(now)));
         let gone = self
             .toast_out
             .as_ref()
@@ -812,6 +981,7 @@ impl InboxMotion {
             notice_dy: motion::NOTICE_RISE_PX * (1.0 - rising),
             leaving_dy: -motion::NOTICE_RISE_PX * gone,
             hints,
+            sync: self.sync_opacity(now),
         }
     }
 
@@ -978,6 +1148,184 @@ mod tests {
         now + Duration::from_millis(ms)
     }
 
+    #[test]
+    fn the_last_label_rows_leave_before_the_empty_message_fades_in() {
+        let now = Instant::now();
+        let mut motions = InboxMotion::new(Motion::new(true));
+        let mut session = session();
+        session.pane = Pane::Conversation;
+        session.full_width = true;
+        motions.observe(&session, (false, true), now);
+        assert!(motions.reading_sliding());
+        assert!(motions.list_emptied(now));
+        session.pane = Pane::List;
+        session.full_width = false;
+        motions.observe(&session, (true, true), now);
+        assert!(!motions.reading_sliding());
+        assert!(motions.pane_swap((true, true), now).is_none());
+        let banner = Banner {
+            title: "No conversations in Work".into(),
+            hint: String::new(),
+        };
+        let half = now + motion::FADE / 2;
+        let entered = now + motion::FADE;
+        assert_eq!(motions.empty_list_exit(now), 1.0);
+        assert!(motions.empty_list_exit(half) > 0.0);
+        assert_eq!(motions.empty_list_pane(true, half), 0.0);
+        assert_eq!(motions.empty_list_pane(false, half), 1.0);
+        assert_eq!(motions.empty_list_exit(entered), 0.0);
+        assert_eq!(motions.empty_list_pane(true, entered), 0.0);
+        let halfway_in = entered + motion::FADE / 2;
+        assert!((0.0..1.0).contains(&motions.empty_list_pane(true, halfway_in)));
+        assert_eq!(
+            motions
+                .list_banner(Some(banner.clone()), halfway_in)
+                .unwrap()
+                .1,
+            1.0
+        );
+        assert!(motions.tick(halfway_in));
+        let done = entered + motion::FADE;
+        assert!(!motions.tick(done));
+        assert_eq!(motions.list_banner(Some(banner), done).unwrap().1, 1.0);
+    }
+
+    #[test]
+    fn slash_during_the_last_reader_exit_shows_search_immediately() {
+        let now = Instant::now();
+        let mut motions = InboxMotion::new(Motion::new(true));
+        let mut session = session();
+        session.label_scope = Some("Work".into());
+        session.pane = Pane::Conversation;
+        session.full_width = true;
+        motions.observe(&session, (false, true), now);
+        motions.list_emptied(now);
+        session.pane = Pane::List;
+        session.full_width = false;
+
+        let halfway = now + motion::FADE / 2;
+        let opacity = motions.empty_list_exit(halfway);
+        assert!(opacity > 0.0);
+        motions.settle(halfway);
+        session.on_key(KeyId::Char('/'), 10);
+        motions.observe(&session, (true, true), halfway);
+
+        assert!(session.search_editing());
+        assert_eq!(motions.empty_list_exit(halfway), opacity);
+        assert!(motions.empty_list_exit(halfway + motion::FADE / 4) < opacity);
+        assert_eq!(motions.empty_list_exit(now + motion::FADE), 0.0);
+        assert_eq!(motions.empty_list_pane(false, halfway), 1.0);
+        assert_eq!(motions.reading_progress(halfway), 0.0);
+        assert_eq!(motions.reading_list_opacity(halfway), 1.0);
+    }
+
+    #[test]
+    fn enter_during_the_last_reader_exit_leaves_the_empty_list_focused() {
+        let now = Instant::now();
+        let mut motions = InboxMotion::new(Motion::new(true));
+        let mut session = session();
+        session.label_scope = Some("Work".into());
+        session.pane = Pane::Conversation;
+        session.full_width = true;
+        motions.observe(&session, (false, true), now);
+        motions.list_emptied(now);
+        session.pane = Pane::List;
+        session.full_width = false;
+        motions.observe(&session, (true, true), now);
+
+        let halfway = now + motion::FADE / 2;
+        let opacity = motions.empty_list_exit(halfway);
+        assert!(opacity > 0.0);
+        motions.settle(halfway);
+        session.on_key(KeyId::Enter, 10);
+
+        assert_eq!(session.pane, Pane::List);
+        assert!(!session.full_width);
+        assert_eq!(motions.empty_list_exit(halfway), opacity);
+        assert!(motions.empty_list_exit(halfway + motion::FADE / 4) < opacity);
+        assert_eq!(motions.empty_list_exit(now + motion::FADE), 0.0);
+        assert_eq!(motions.empty_list_pane(true, halfway), 1.0);
+    }
+
+    #[test]
+    fn late_picker_marks_fade_for_the_shared_duration() {
+        let now = Instant::now();
+        let mut motions = InboxMotion::new(Motion::new(true));
+        assert_eq!(motions.label_marks(now), 1.0);
+        motions.fade_label_marks(now);
+        assert_eq!(motions.label_marks(now), 0.0);
+        let halfway = now + motion::FADE / 2;
+        motions.settle(halfway);
+        assert!((0.0..1.0).contains(&motions.label_marks(halfway)));
+        assert!(motions.tick(halfway));
+        assert_eq!(motions.label_marks(now + motion::FADE), 1.0);
+        assert!(!motions.tick(now + motion::FADE));
+
+        let mut reduced = InboxMotion::new(Motion::new(false));
+        reduced.fade_label_marks(now);
+        assert_eq!(reduced.label_marks(now), 1.0);
+    }
+
+    #[test]
+    fn narrow_sync_text_fades_out_before_the_first_notice_rises() {
+        let now = Instant::now();
+        let mut motions = InboxMotion::new(Motion::new(true));
+        motions.narrow_status = true;
+        let mut session = session();
+        session.show_toast("Archived · u", false);
+        motions.observe(&session, (true, false), now);
+
+        let halfway = later(now, 30);
+        motions.settle(halfway);
+        for ms in [0, 17, 30, 59, 60, 61, 77, 139, 140] {
+            let status = motions.status(&session, later(now, ms));
+            let (_, opacity) = status.notice.unwrap();
+            assert_eq!(status.sync > 0.0, ms < 60, "{ms} ms");
+            assert_eq!(opacity > 0.0, ms > 60, "{ms} ms");
+            assert_eq!(status.notice_dy == motion::NOTICE_RISE_PX, ms <= 60);
+        }
+        assert_eq!(
+            notice_opacity(&motions, &session, later(now, 140)),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn narrow_sync_text_returns_after_the_last_notice_fades_out() {
+        let now = Instant::now();
+        let mut motions = InboxMotion::new(Motion::new(true));
+        motions.narrow_status = true;
+        let mut session = session();
+        assert_eq!(motions.status(&session, now).sync, 1.0);
+        session.show_toast("Removed a label", false);
+        motions.observe(&session, (true, false), now);
+        assert_eq!(motions.status(&session, now).sync, 1.0);
+
+        let entered = now + STATUS_SWAP_OUT + motion::QUICK;
+        assert_eq!(motions.status(&session, entered).sync, 0.0);
+
+        session.clear_toast();
+        motions.observe(&session, (true, false), entered);
+        assert_eq!(motions.status(&session, entered).sync, 0.0);
+        let fading = motions.status(&session, entered + motion::FADE / 2);
+        assert_eq!(fading.sync, 0.0);
+        assert!(fading.leaving.unwrap().1 > 0.0);
+        let gone = entered + motion::FADE;
+        assert_eq!(motions.status(&session, gone).sync, 0.0);
+        let returning = motions.status(&session, gone + motion::FADE / 2);
+        assert!(returning.sync > 0.5 && returning.sync < 1.0);
+        assert_eq!(motions.status(&session, gone + motion::FADE).sync, 1.0);
+
+        let mut reduced = InboxMotion::new(Motion::new(false));
+        reduced.narrow_status = true;
+        session.show_toast("Removed a label", false);
+        reduced.observe(&session, (true, false), now);
+        assert_eq!(reduced.status(&session, now).sync, 0.0);
+        session.clear_toast();
+        reduced.observe(&session, (true, false), now);
+        assert_eq!(reduced.status(&session, now).sync, 1.0);
+    }
+
     fn notice_opacity(motion: &InboxMotion, session: &Session, now: Instant) -> Option<f32> {
         motion
             .status(session, now)
@@ -991,11 +1339,11 @@ mod tests {
         let mut session = session();
         session.unread_count = 3;
         let now = Instant::now();
-        motion.observe_header(&session.folder, session.unread_count, now);
+        motion.observe_header(&session.folder, None, session.unread_count, now);
         assert_eq!(motion.unread_count(now), None);
         // Opened a thread: 3 → 2 in the same folder.
         session.unread_count = 2;
-        motion.observe_header(&session.folder, session.unread_count, now);
+        motion.observe_header(&session.folder, None, session.unread_count, now);
         assert_eq!(motion.unread_count(now), Some((3, 0.0)));
         let (old, mid) = motion.unread_count(later(now, 60)).unwrap();
         assert_eq!(old, 3);
@@ -1004,14 +1352,14 @@ mod tests {
         assert_eq!(motion.unread_count(later(now, 120)), None);
         // A key mid-fade shows the new count alone.
         session.unread_count = 1;
-        motion.observe_header(&session.folder, session.unread_count, later(now, 200));
+        motion.observe_header(&session.folder, None, session.unread_count, later(now, 200));
         assert!(motion.unread_count(later(now, 210)).is_some());
         motion.settle(later(now, 210));
         assert_eq!(motion.unread_count(later(now, 210)), None);
         // On a folder switch the old name and its count fade as a pair.
         session.folder = "Archive".into();
         session.unread_count = 7;
-        motion.observe_header(&session.folder, session.unread_count, later(now, 300));
+        motion.observe_header(&session.folder, None, session.unread_count, later(now, 300));
         assert_eq!(motion.unread_count(later(now, 300)), None);
         let fade = motion.folder_header().unwrap();
         assert_eq!((fade.folder.as_str(), fade.unread), ("INBOX", 1));
@@ -1020,18 +1368,32 @@ mod tests {
         assert!(motion.folder_header().is_none());
         // Nor with motion reduced.
         let mut reduced = InboxMotion::new(Motion::new(false));
-        reduced.observe_header(&session.folder, session.unread_count, now);
+        reduced.observe_header(&session.folder, None, session.unread_count, now);
         session.unread_count = 6;
-        reduced.observe_header(&session.folder, session.unread_count, now);
+        reduced.observe_header(&session.folder, None, session.unread_count, now);
         assert_eq!(reduced.unread_count(now), None);
+    }
+
+    #[test]
+    fn a_label_scope_hands_the_header_to_the_arriving_rows() {
+        let mut motion = InboxMotion::new(Motion::new(true));
+        let now = Instant::now();
+        motion.observe_header("INBOX", Some("Work"), 0, now);
+        motion.observe_header("INBOX", None, 5, now);
+
+        assert!(motion.folder_header().is_none());
+        assert_eq!(motion.label_header_opacity(now), motion::ARRIVE_FROM);
+        let midway = motion.label_header_opacity(now + motion::FADE / 2);
+        assert!(midway > motion::ARRIVE_FROM && midway < 1.0);
+        assert_eq!(motion.label_header_opacity(now + motion::FADE), 1.0);
     }
 
     #[test]
     fn a_switch_during_the_header_exit_keeps_the_outgoing_folder() {
         let mut motion = InboxMotion::new(Motion::new(true));
         let now = Instant::now();
-        motion.observe_header("INBOX", 3, now);
-        motion.observe_header("Archive", 7, now);
+        motion.observe_header("INBOX", None, 3, now);
+        motion.observe_header("Archive", None, 7, now);
 
         let interrupted = now + motion::FADE / 4;
         let fade = motion.folder_header().unwrap();
@@ -1041,7 +1403,7 @@ mod tests {
         let account = fade.account_frame([false, true], interrupted);
         assert_eq!(account, (true, [1.0, before.0]));
 
-        motion.observe_header("Spam", 5, interrupted);
+        motion.observe_header("Spam", None, 5, interrupted);
         let fade = motion.folder_header().unwrap();
         assert_eq!((fade.folder.as_str(), fade.unread), ("INBOX", 3));
         assert_eq!(fade.label_opacities(interrupted), before);
@@ -1055,8 +1417,8 @@ mod tests {
     fn a_switch_during_the_header_arrival_fades_out_the_arriving_folder() {
         let mut motion = InboxMotion::new(Motion::new(true));
         let now = Instant::now();
-        motion.observe_header("INBOX", 3, now);
-        motion.observe_header("Archive", 7, now);
+        motion.observe_header("INBOX", None, 3, now);
+        motion.observe_header("Archive", None, 7, now);
 
         let interrupted = now + 3 * motion::FADE / 4;
         let fade = motion.folder_header().unwrap();
@@ -1066,7 +1428,7 @@ mod tests {
         let account = fade.account_frame([true, true], interrupted);
         assert_eq!(account, (false, [before.1; 2]));
 
-        motion.observe_header("Spam", 5, interrupted);
+        motion.observe_header("Spam", None, 5, interrupted);
         let fade = motion.folder_header().unwrap();
         assert_eq!((fade.folder.as_str(), fade.unread), ("Archive", 7));
         assert_eq!(fade.label_opacities(interrupted), (before.1, 0.0));
@@ -1105,8 +1467,9 @@ mod tests {
             mid.hints > 0.0 && mid.hints < 1.0,
             "hints come back as it leaves"
         );
-        assert!(!motion.tick(later(shown, 200)));
-        let gone = motion.status(&session, later(shown, 200));
+        let gone_at = shown + 2 * motion::FADE;
+        assert!(!motion.tick(gone_at));
+        let gone = motion.status(&session, gone_at);
         assert!(gone.leaving.is_none());
         assert_eq!(gone.hints, 1.0);
     }
@@ -1144,76 +1507,43 @@ mod tests {
     }
 
     #[test]
-    fn a_notice_replacing_another_cross_fades() {
-        let mut motion = InboxMotion::new(Motion::new(true));
-        let mut session = session();
-        let now = Instant::now();
-        session.show_toast("Undone", false);
-        motion.observe(&session, (true, true), now);
-        motion.settle(now);
-        session.show_toast("Archived · u", false);
-        let swap = later(now, 300);
-        motion.observe(&session, (true, true), swap);
-        let status = motion.status(&session, swap);
-        assert_eq!(status.notice.as_ref().unwrap().0.text, "Archived · u");
-        assert_eq!(status.notice.unwrap().1, 0.0);
-        let (old, opacity) = status.leaving.unwrap();
-        assert_eq!(old.text, "Undone");
-        assert_eq!(opacity, 1.0);
-        assert_eq!(status.hints, 0.0);
-        // A true cross-fade: one goes as the other comes, never a cut.
-        for ms in [17, 33, 50, 80] {
-            let mid = motion.status(&session, later(swap, ms));
-            let (old, new) = (mid.leaving.unwrap().1, mid.notice.unwrap().1);
-            assert!((1.0..1.2).contains(&(old + new)), "{ms} ms: {old} + {new}");
-        }
-        assert!(motion.status(&session, later(swap, 17)).leaving.unwrap().1 > 0.7);
-        // A swap, not a smear: the new one rises in from just below its
-        // place as the old one rises out above it, over the same fade.
-        assert_eq!(
-            (status.notice_dy, status.leaving_dy),
-            (motion::NOTICE_RISE_PX, 0.0)
-        );
-        let mut last = (status.notice_dy, status.leaving_dy);
-        for ms in [17, 33, 50, 80] {
-            let mid = motion.status(&session, later(swap, ms));
-            assert!(mid.notice_dy < last.0 && mid.notice_dy > 0.0, "{ms} ms");
-            assert!(mid.leaving_dy < last.1 && mid.leaving_dy > -motion::NOTICE_RISE_PX);
-            last = (mid.notice_dy, mid.leaving_dy);
-        }
-        let after = motion.status(&session, later(swap, 120));
-        assert!(after.leaving.is_none_or(|(_, o)| o == 0.0), "out over FADE");
-        assert_eq!(after.notice.unwrap().1, 1.0);
-        assert_eq!(after.notice_dy, 0.0, "in its place");
-    }
+    fn replacement_notices_use_the_status_cell_in_sequence() {
+        for gap in [None, Some(50)] {
+            let mut motion = InboxMotion::new(Motion::new(true));
+            let mut session = session();
+            let now = Instant::now();
+            session.show_toast("Archived · u", false);
+            motion.observe(&session, (true, true), now);
 
-    #[test]
-    fn a_notice_that_comes_late_picks_up_where_the_last_one_fades() {
-        let mut motion = InboxMotion::new(Motion::new(true));
-        let mut session = session();
-        let now = Instant::now();
-        session.show_toast("Undone", false);
-        motion.observe(&session, (true, true), now);
-        motion.settle(now);
-        // `e`: the key clears "Undone" at once ...
-        let key = later(now, 300);
-        session.clear_toast();
-        motion.observe(&session, (true, true), key);
-        // ... and the store has the archive three frames later.
-        let shown = later(key, 50);
-        session.show_toast("Archived · u", false);
-        motion.observe(&session, (true, true), shown);
-        for ms in [0, 17, 33, 60] {
-            let status = motion.status(&session, later(shown, ms));
-            let new = status.notice.unwrap().1;
-            let old = status.leaving.map_or(0.0, |(_, o)| o);
-            // Within a few percent of one whole notice: no visible dip.
-            assert!(old + new >= 0.95, "{ms} ms: {old} + {new}");
+            let key = later(now, 300);
+            let swap = if let Some(gap) = gap {
+                session.clear_toast();
+                motion.observe(&session, (true, true), key);
+                let reply = later(key, gap);
+                assert_eq!(motion.status(&session, reply).sync, 0.0);
+                reply
+            } else {
+                key
+            };
+            session.show_toast("Undone", false);
+            motion.observe(&session, (true, true), swap);
+
+            for ms in [0, 17, 33, 59, 60, 61, 77, 139, 140, 300] {
+                let status = motion.status(&session, later(swap, ms));
+                let (incoming, opacity) = status.notice.unwrap();
+                assert_eq!(incoming.text, "Undone");
+                let leaving = status.leaving.map_or(0.0, |(old, opacity)| {
+                    assert_eq!(old.text, "Archived · u");
+                    opacity
+                });
+                assert_eq!(leaving > 0.0, ms < 60, "{ms} ms");
+                assert_eq!(opacity > 0.0, ms > 60, "{ms} ms");
+                assert_eq!(opacity == 1.0, ms >= 140, "{ms} ms");
+                assert_eq!(status.sync, 0.0, "{ms} ms");
+                assert_eq!(status.notice_dy == motion::NOTICE_RISE_PX, ms <= 60);
+                assert_eq!(status.notice_dy == 0.0, ms >= 140);
+            }
         }
-        assert_eq!(
-            motion.status(&session, later(shown, 120)).notice.unwrap().1,
-            1.0
-        );
     }
 
     #[test]

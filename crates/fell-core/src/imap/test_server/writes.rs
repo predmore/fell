@@ -7,8 +7,8 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use super::{
-    Counted, FixtureMessage, TestState, mailbox_name, message_id_header, strip_prefix_ignore,
-    uid_in_range,
+    Counted, FixtureMailbox, FixtureMessage, TestState, mailbox_name, message_id_header,
+    strip_prefix_ignore, uid_in_range,
 };
 
 /// What the server offers and how it answers writes.
@@ -66,6 +66,7 @@ pub(super) fn handle(
             writes.lock().expect("writes").nomodseq,
         ),
         "STATUS" => status(tag, rest, &state.lock().expect("state")),
+        "CREATE" => create_label(tag, rest, &mut state.lock().expect("state")),
         "UID" => {
             let rest = rest.trim();
             let mut state = state.lock().expect("state");
@@ -104,7 +105,7 @@ pub(super) fn handle(
                 if !writes.moves {
                     format!("{tag} BAD MOVE not offered\r\n")
                 } else {
-                    let reply = place(tag, args, &mut state, &writes);
+                    let reply = place(tag, args, &mut state, &writes, true);
                     if let Some(left) = writes.close_after_moves.as_mut() {
                         *left = left.saturating_sub(1);
                         if *left == 0 {
@@ -117,11 +118,18 @@ pub(super) fn handle(
                     }
                     reply
                 }
-            } else if ["COPY ", "EXPUNGE"]
-                .iter()
-                .any(|verb| strip_prefix_ignore(rest, verb).is_some())
-            {
-                format!("{tag} BAD write-back never sends this\r\n")
+            } else if let Some(args) = strip_prefix_ignore(rest, "COPY ") {
+                if !selected_write {
+                    format!("{tag} BAD COPY requires SELECT\r\n")
+                } else {
+                    place(tag, args, &mut state, &writes, false)
+                }
+            } else if let Some(args) = strip_prefix_ignore(rest, "EXPUNGE ") {
+                if !selected_write || !writes.uidplus {
+                    format!("{tag} BAD UID EXPUNGE unavailable\r\n")
+                } else {
+                    expunge_uid(tag, args, &mut state)
+                }
             } else {
                 return false;
             };
@@ -231,12 +239,16 @@ fn store_flag(tag: &str, args: &str, state: &mut TestState, writes: &WriteFixtur
     } else {
         (None, rest)
     };
-    let (add, flag) = match rest {
-        "+FLAGS.SILENT (\\Seen)" => (true, "\\Seen"),
-        "-FLAGS.SILENT (\\Seen)" => (false, "\\Seen"),
-        "+FLAGS.SILENT (\\Flagged)" => (true, "\\Flagged"),
-        "-FLAGS.SILENT (\\Flagged)" => (false, "\\Flagged"),
-        _ => return format!("{tag} BAD expected one supported system flag\r\n"),
+    let (add, flag) = match (
+        rest.strip_prefix("+FLAGS.SILENT ("),
+        rest.strip_prefix("-FLAGS.SILENT ("),
+    ) {
+        (Some(flag), _) => (true, flag),
+        (_, Some(flag)) => (false, flag),
+        _ => return format!("{tag} BAD expected incremental STORE\r\n"),
+    };
+    let Some(flag) = flag.strip_suffix(')').filter(|flag| !flag.contains(' ')) else {
+        return format!("{tag} BAD expected one flag\r\n");
     };
     let Some(mailbox) =
         selected(state).and_then(|name| state.mailboxes.iter_mut().find(|m| m.name == name))
@@ -323,8 +335,14 @@ fn fetch_message_ids(tag: &str, args: &str, state: &TestState) -> String {
     reply
 }
 
-/// `UID MOVE <set> <mailbox>`.
-fn place(tag: &str, args: &str, state: &mut TestState, writes: &WriteFixture) -> String {
+/// `UID MOVE` or `UID COPY` of a set into a target mailbox.
+fn place(
+    tag: &str,
+    args: &str,
+    state: &mut TestState,
+    writes: &WriteFixture,
+    moving: bool,
+) -> String {
     if let Some(text) = &writes.refuse {
         return format!("{tag} NO {text}\r\n");
     }
@@ -401,11 +419,75 @@ fn place(tag: &str, args: &str, state: &mut TestState, writes: &WriteFixture) ->
     } else {
         String::new()
     };
-    if !copyuid.is_empty() {
-        reply.push_str(&format!("* OK {copyuid}moved\r\n"));
+    if moving {
+        if !copyuid.is_empty() {
+            reply.push_str(&format!("* OK {copyuid}moved\r\n"));
+        }
+        reply.push_str(&take_out(state, from, &picked));
+        reply.push_str(&format!("{tag} OK MOVE completed\r\n"));
+    } else {
+        reply.push_str(&format!("{tag} OK {copyuid}COPY completed\r\n"));
     }
-    reply.push_str(&take_out(state, from, &picked));
-    reply.push_str(&format!("{tag} OK MOVE completed\r\n"));
+    reply
+}
+
+fn create_label(tag: &str, rest: &str, state: &mut TestState) -> String {
+    let name = mailbox_name(rest);
+    if !name.starts_with("Labels/") || state.mailboxes.iter().any(|m| m.name == name) {
+        return format!("{tag} NO cannot create mailbox\r\n");
+    }
+    let validity = state
+        .mailboxes
+        .iter()
+        .map(|m| m.uidvalidity)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    state.mailboxes.push(FixtureMailbox {
+        name,
+        uidvalidity: validity,
+        uidnext: Some(1),
+        list_flags: String::new(),
+        omit_uidnext: false,
+        reject_examine: false,
+        reject_fetch: false,
+        vanished: Vec::new(),
+        messages: Vec::new(),
+    });
+    format!("{tag} OK CREATE completed\r\n")
+}
+
+fn expunge_uid(tag: &str, args: &str, state: &mut TestState) -> String {
+    let Some(name) = selected(state) else {
+        return format!("{tag} BAD no mailbox selected\r\n");
+    };
+    let Some(index) = state
+        .mailboxes
+        .iter()
+        .position(|mailbox| mailbox.name == name)
+    else {
+        return format!("{tag} NO mailbox is gone\r\n");
+    };
+    let messages = &state.mailboxes[index].messages;
+    let highest = messages
+        .iter()
+        .map(|message| message.uid)
+        .max()
+        .unwrap_or(0);
+    let picked: Vec<_> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| {
+            uid_in_range(message.uid, args, highest)
+                && message
+                    .flags
+                    .iter()
+                    .any(|flag| flag.eq_ignore_ascii_case("\\Deleted"))
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let mut reply = take_out(state, index, &picked);
+    reply.push_str(&format!("{tag} OK UID EXPUNGE completed\r\n"));
     reply
 }
 

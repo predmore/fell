@@ -74,7 +74,7 @@ impl ReadingReflow {
 pub const RISE_PX: f32 = 6.0;
 /// How far a notice rises as it comes in, and again as it leaves, in
 /// pixels: a notice replacing another reads as a swap, not a smear.
-pub const NOTICE_RISE_PX: f32 = 2.0;
+pub const NOTICE_RISE_PX: f32 = 3.0;
 /// How far a pane that comes into view slides in from its side, in pixels.
 pub const PANE_SLIDE_PX: f32 = 24.0;
 /// Another thread's messages, and another folder's rows, arrive at this
@@ -574,9 +574,10 @@ impl<R: Clone> ListShift<R> {
                     // Arriving in a slot nothing slides into (another
                     // folder, a `G` landing): softened, never blinked
                     // through empty.
+                    let duration = if self.replaced { FADE } else { QUICK };
                     let arrive = *self
                         .arrive
-                        .get_or_insert_with(|| Transition::new(now, QUICK));
+                        .get_or_insert_with(|| Transition::new(now, duration));
                     RowMotion {
                         dy: 0.0,
                         opacity: lerp(ARRIVE_FROM, 1.0, arrive.progress(now)),
@@ -946,7 +947,7 @@ mod tests {
         );
         let rows = [("x", 0.0), ("y", 68.0), ("z", 136.0)];
         let mut last = [0.0f32; 3];
-        for ms in [0, 1, 16, 33, 50, 66, 80] {
+        for ms in [0, 1, 16, 33, 50, 66, 80, 120] {
             let now = at(start, ms);
             for (i, (id, top)) in rows.iter().enumerate() {
                 let below = rows.get(i + 1).map(|(id, top)| (*id, *top));
@@ -957,7 +958,7 @@ mod tests {
                 last[i] = drawn.opacity;
             }
         }
-        assert_eq!(last, [1.0; 3], "full after QUICK");
+        assert_eq!(last, [1.0; 3], "full after FADE");
     }
 
     #[test]
@@ -1078,10 +1079,10 @@ mod tests {
             mid
         );
         assert_eq!(
-            switched.row("x", 0.0, 68.0, None, at(start, 170)).opacity,
+            switched.row("x", 0.0, 68.0, None, at(start, 210)).opacity,
             1.0
         );
-        assert!(!switched.running(at(start, 170)));
+        assert!(!switched.running(at(start, 210)));
     }
 
     #[test]

@@ -26,14 +26,15 @@
 //! both rows are retired without a notice.
 //!
 //! Moves go out only as `UID MOVE` (RFC 6851). A server without MOVE keeps
-//! the change in Fell: Fell never copies, flags `\Deleted`, or expunges.
+//! the move in Fell. Bridge labeling separately copies to a label mailbox
+//! and uses UID EXPUNGE only inside that mailbox.
 //!
 //! Turning write-back off starts a new generation, and rows not sent yet
 //! are deleted. No row from an earlier generation is ever sent or
 //! reversed, even when write-back is turned on again or a command on the
 //! wire when it went off is answered late.
 //!
-//! Read and star intents share the queue, with one pending value per copy
+//! Label, read, and star edits share the queue. Read and star keep one pending value per copy
 //! and flag. A permanent delete from Trash is never queued.
 //!
 //! [`WriteTx`]: crate::store::WriteTx
@@ -46,6 +47,7 @@ use crate::store::Store;
 use crate::{Error, Result};
 
 pub(crate) mod flags;
+pub(crate) mod labels;
 
 const OUTBOX_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS write_back_accounts (
@@ -62,7 +64,8 @@ CREATE TABLE IF NOT EXISTS server_outbox (
     account_id TEXT NOT NULL,
     kind TEXT NOT NULL,
     state TEXT NOT NULL,
-    -- The local_actions row undo reverses; NULL for undo's own reverse moves.
+    -- The local action undo reverses; agent label actions use negative IDs.
+    -- NULL for undo's own writes.
     action_id INTEGER,
     -- The stored row this server copy backs.
     message_id TEXT NOT NULL,
@@ -101,7 +104,9 @@ CREATE TABLE IF NOT EXISTS server_outbox (
     flag_base INTEGER,
     -- An earlier flag write may have reached the server. Recover its result
     -- before replaying the replacement, without sending the old value again.
-    flag_superseded INTEGER NOT NULL DEFAULT 0
+    flag_superseded INTEGER NOT NULL DEFAULT 0,
+    -- Extra copies bound from an early keyword edit replay with that edit.
+    keyword_parent INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_server_outbox_state ON server_outbox(account_id, state, id);
@@ -111,6 +116,7 @@ CREATE INDEX IF NOT EXISTS idx_server_outbox_message ON server_outbox(account_id
 
 /// Columns added after the tables first shipped on a branch build.
 const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
+    ("server_outbox", "keyword_parent", "INTEGER"),
     (
         "write_back_accounts",
         "generation",
@@ -156,6 +162,8 @@ pub enum OutboxKind {
     Move,
     Seen,
     Flagged,
+    Keyword,
+    BridgeLabel,
 }
 
 impl OutboxKind {
@@ -164,6 +172,8 @@ impl OutboxKind {
             Self::Move => "move",
             Self::Seen => "seen",
             Self::Flagged => "flagged",
+            Self::Keyword => "keyword",
+            Self::BridgeLabel => "bridge_label",
         }
     }
 
@@ -172,13 +182,15 @@ impl OutboxKind {
             "move" => Ok(Self::Move),
             "seen" => Ok(Self::Seen),
             "flagged" => Ok(Self::Flagged),
+            "keyword" => Ok(Self::Keyword),
+            "bridge_label" => Ok(Self::BridgeLabel),
             other => Err(Error::Action(format!("unknown outbox action {other}"))),
         }
     }
 
     pub(crate) fn flag_name(self) -> Option<&'static str> {
         match self {
-            Self::Move => None,
+            Self::Move | Self::Keyword | Self::BridgeLabel => None,
             Self::Seen => Some("\\Seen"),
             Self::Flagged => Some("\\Flagged"),
         }
@@ -249,7 +261,7 @@ pub struct OutboxEntry {
     /// Undo's reverse of the row with this id, which was sent but not yet
     /// settled: this row moves the copy that one places.
     pub reverses: Option<i64>,
-    /// Desired presence of the system flag, for Seen and Flagged rows.
+    /// Desired presence of the flag or label.
     pub flag_value: Option<bool>,
     pub(crate) flag_modseq: Option<u64>,
     pub(crate) flag_base: Option<bool>,
@@ -832,13 +844,14 @@ pub(crate) fn unfinished(store: &Store, account_id: &AccountId) -> Result<Vec<Ou
         params![account_id.as_str(), now_unix() - KEEP_SETTLED_SECS],
     )?;
     let generation = generation(&tx, account_id)?;
+    labels::bind_keyword_copies(&tx, account_id, generation)?;
     let entries = select_entries(
         &tx,
         &format!(
             "SELECT {ENTRY_COLS} FROM server_outbox
              WHERE account_id = ?1 AND state = 'pending'
                AND generation = {generation}
-             ORDER BY id"
+             ORDER BY COALESCE(keyword_parent, id), id"
         ),
         account_id,
     )?;
@@ -1358,6 +1371,23 @@ fn move_copy(conn: &Connection, account_id: &AccountId, sent: &OutboxEntry) -> R
             seen,
             flagged,
             keywords,
+        ],
+    )?;
+    conn.execute(
+        "UPDATE server_outbox
+         SET source_mailbox = ?6, uidvalidity = ?7, uid = ?8, source_folder = ?9
+         WHERE account_id = ?1 AND message_id = ?2 AND source_mailbox = ?3
+           AND uidvalidity = ?4 AND uid = ?5 AND kind = 'keyword' AND state IN ('pending', 'done')",
+        params![
+            account_id.as_str(),
+            sent.message_id,
+            source,
+            uidvalidity,
+            uid,
+            target,
+            placed_uidvalidity,
+            placed_uid,
+            sent.target_folder
         ],
     )?;
     flags::follow_move(conn, account_id, sent)?;

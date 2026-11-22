@@ -12,10 +12,9 @@
 //! ([`Store::folder_roles`]), not fixed names.
 //!
 //! With write-back on for the account (`write_back` in `account.toml`),
-//! archive, move, delete to Trash, spam, and not spam also queue the server
-//! move in the same transaction, and undo takes it back (see
-//! [`crate::outbox`]). Labels stay local, and so does a permanent delete from
-//! Trash ([`Store::purge_threads`]): the server keeps its copy in Trash.
+//! moves and label edits also queue the server change in the same
+//! transaction, and undo takes it back (see [`crate::outbox`]). A permanent
+//! delete from Trash ([`Store::purge_threads`]) stays local.
 //!
 //! A folder those calls remove is recorded on that message. A later
 //! [`Store::apply_delta`] still unions other folders and labels, and leaves
@@ -162,6 +161,14 @@ pub struct LocalAction {
     pub id: i64,
     pub kind: ActionKind,
     pub summary: String,
+    /// Set by undo for a label edit, from the message snapshots it restores.
+    pub label_undo_target: Option<LabelUndoTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LabelUndoTarget {
+    Conversation(String),
+    Conversations(usize),
 }
 
 /// What [`LocalAction`] changed.
@@ -373,14 +380,24 @@ impl Store {
         thread_id: &ThreadId,
         change: LabelChange,
     ) -> Result<LocalAction> {
+        self.label_threads(account_id, std::slice::from_ref(thread_id), change)
+    }
+
+    /// Apply one label edit to a selection as one undoable action.
+    pub fn label_threads(
+        &self,
+        account_id: &AccountId,
+        threads: &[ThreadId],
+        change: LabelChange,
+    ) -> Result<LocalAction> {
         let (adding, raw) = match &change {
             LabelChange::Add(label) => (true, label.as_str()),
             LabelChange::Remove(label) => (false, label.as_str()),
         };
         let label = canonical_label(raw)?;
-        self.apply_thread(
+        self.apply_threads(
             account_id,
-            thread_id,
+            threads,
             ActionKind::Label,
             None,
             |conn, rows| {
@@ -606,6 +623,17 @@ impl Store {
         threads: &[ThreadId],
         trash_folder: &str,
     ) -> Result<LocalAction> {
+        self.purge_threads_counted(account_id, threads, trash_folder)
+            .map(|(action, _)| action)
+    }
+
+    /// Purge from a single Trash folder and count the conversations changed.
+    pub fn purge_threads_counted(
+        &self,
+        account_id: &AccountId,
+        threads: &[ThreadId],
+        trash_folder: &str,
+    ) -> Result<(LocalAction, usize)> {
         let trash_folder = canonical_folder(trash_folder)?;
         let roles = self.folder_roles(account_id)?;
         if !roles.is(FolderRole::Trash, &trash_folder) {
@@ -613,14 +641,22 @@ impl Store {
                 "permanent delete only removes mail from Trash".into(),
             ));
         }
-        self.apply_threads(account_id, threads, ActionKind::Purge, None, |_, rows| {
-            let plans = plan_expunge(rows, &trash_folder);
-            if plans.is_empty() {
-                return Err(Error::Action(format!("no messages in {trash_folder}")));
-            }
-            let summary = format!("deleted {} from {trash_folder} for good", plans.len());
-            Ok((summary, plans))
-        })
+        let mut count = 0;
+        let action =
+            self.apply_threads(account_id, threads, ActionKind::Purge, None, |_, rows| {
+                let plans = plan_expunge(rows, &trash_folder);
+                if plans.is_empty() {
+                    return Err(Error::Action(format!("no messages in {trash_folder}")));
+                }
+                count = plans
+                    .iter()
+                    .map(|plan| plan.before.thread_id.as_str())
+                    .collect::<HashSet<_>>()
+                    .len();
+                let summary = format!("deleted {} from {trash_folder} for good", plans.len());
+                Ok((summary, plans))
+            })?;
+        Ok((action, count))
     }
 
     /// Permanently remove each search hit from its own Trash scope.
@@ -720,6 +756,19 @@ impl Store {
         } else if action.kind.is_flag() {
             flags::undo(&tx, account_id, &action)?;
         } else if action.kind == ActionKind::Label {
+            let (count, subject): (i64, String) = tx.query_row(
+                "SELECT COUNT(DISTINCT thread_id), COALESCE((
+                     SELECT subject FROM local_action_messages
+                     WHERE action_id = ?1 ORDER BY date_unix, message_id LIMIT 1
+                 ), '') FROM local_action_messages WHERE action_id = ?1",
+                [action.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            action.label_undo_target = Some(if count == 1 {
+                LabelUndoTarget::Conversation(subject)
+            } else {
+                LabelUndoTarget::Conversations(count as usize)
+            });
             keywords::undo_label_action(
                 &tx,
                 account_id,
@@ -1050,6 +1099,9 @@ fn record_and_apply(
                 })
                 .transpose()?;
             insert_snapshot(conn, id, account_id, plan, was_keyword)?;
+            if let Some(edit) = label_edit {
+                crate::outbox::labels::queue(conn, account_id, id, &plan.before.message_id, edit)?;
+            }
         }
         record_tombstones(conn, id, account_id, plan)?;
         if plan.view.clear_star || (plan.remove_row && !plan.view.hidden.is_empty()) {
@@ -1086,6 +1138,7 @@ fn insert_local_action(
         id: conn.last_insert_rowid(),
         kind,
         summary: summary.to_string(),
+        label_undo_target: None,
     })
 }
 
@@ -1199,6 +1252,7 @@ fn latest_open_action(conn: &Connection, account_id: &AccountId) -> Result<Optio
             id,
             kind: ActionKind::parse(&kind)?,
             summary,
+            label_undo_target: None,
         })
     })
     .transpose()
@@ -2939,7 +2993,12 @@ mod tests {
         assert!(subjects(&store, "a1", "label:keep").is_empty());
         assert_eq!(term_df(&store, "a1", "keep"), 0);
 
-        assert_eq!(store.undo(&account("a1")).unwrap().summary, removed.summary);
+        let restored = store.undo(&account("a1")).unwrap();
+        assert_eq!(restored.summary, removed.summary);
+        assert_eq!(
+            restored.label_undo_target,
+            Some(LabelUndoTarget::Conversation("Hello".into()))
+        );
         let rows = messages(&store, "a1", &thread);
         assert_eq!(rows[0].labels, vec!["keep", "work"]);
         assert_eq!(rows[1].labels, vec!["work"]);
@@ -3331,8 +3390,17 @@ mod tests {
             "permanent delete only removes mail from Trash"
         );
 
-        let purged = store.purge_threads(&account("a1"), &both, "trash").unwrap();
+        let targets = [
+            first.clone(),
+            second.clone(),
+            unrelated.clone(),
+            first.clone(),
+        ];
+        let (purged, count) = store
+            .purge_threads_counted(&account("a1"), &targets, "trash")
+            .unwrap();
         assert_eq!(purged.kind, ActionKind::Purge);
+        assert_eq!(count, 2);
         assert_eq!(purged.summary, "deleted 2 from trash for good");
         // The Sent reply is not in Trash and stays; the rest is gone.
         assert_eq!(

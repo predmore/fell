@@ -3,7 +3,7 @@
 pub mod agents;
 pub mod search;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use std::ops::Range;
@@ -18,7 +18,7 @@ use fell_core::{
 
 use crate::attachments::{Request as AttachmentRequest, Target as AttachmentTarget};
 use crate::keymap::{self, Action, KeyId, Keymap, PaletteItem, SeqMatch, WhichItem};
-use crate::present::{ConvMessage, NOTICE_DOT, Pane, ThreadRow, display_safe, merge_folders};
+use crate::present::{self, ConvMessage, NOTICE_DOT, Pane, ThreadRow, display_safe, merge_folders};
 use crate::worker::Worker;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -168,14 +168,17 @@ pub enum FolderIntent {
     Go,
     /// `m` moves the open thread out of the folder on screen.
     Move,
+    Label,
+    LabelList,
 }
 
-/// One-line result of the last move or undo. The next key clears it.
+/// One-line result of the last move or undo.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Toast {
     pub text: String,
     pub alert: bool,
     pub hint: Option<(String, &'static str)>,
+    pub label: Option<present::LabelNotice>,
 }
 
 impl Toast {
@@ -184,6 +187,7 @@ impl Toast {
             text: text.into(),
             alert: false,
             hint: Some((key, suffix)),
+            label: None,
         }
     }
 }
@@ -272,8 +276,50 @@ fn step_index(cursor: usize, len: usize, motion: Motion) -> usize {
     }
 }
 
-/// Read, unread, or star on threads. The rows already show it; the view
-/// writes it to the store.
+/// One label change on the selected threads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LabelEdit {
+    pub ids: Vec<String>,
+    pub name: String,
+    pub add: bool,
+}
+
+impl LabelEdit {
+    pub fn include_name(&self, names: &mut Vec<String>) {
+        if self.add && !names.contains(&self.name) {
+            names.push(self.name.clone());
+        }
+    }
+
+    pub fn apply(&self, rows: &mut [ThreadRow]) {
+        for row in rows.iter_mut().filter(|row| self.ids.contains(&row.id)) {
+            if self.add && !row.labels.contains(&self.name) {
+                row.labels.push(self.name.clone());
+            } else if !self.add {
+                row.labels.retain(|label| label != &self.name);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PickerChoice {
+    pub name: String,
+    pub title: String,
+    pub detail: Option<String>,
+    pub mark: Option<&'static str>,
+    pub divider: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct LabelSelection {
+    ids: Vec<String>,
+    subject: Option<String>,
+    counts: Option<HashMap<String, usize>>,
+    waiting_to_open: bool,
+    pending_choice: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FlagEdit {
     /// Thread ids, in list order.
@@ -304,6 +350,10 @@ pub struct Step {
     pub message_disclosure_changed: bool,
     /// The view moves the thread to [`Session::pending_move`].
     pub apply_move: bool,
+    pub read_label_targets: bool,
+    pub labels: Option<LabelEdit>,
+    /// Resolve a flag toggle against marked conversations outside the loaded page.
+    pub off_page_flags: Option<(Vec<String>, bool)>,
     /// `u` restores the latest local action.
     pub undo: bool,
     /// `e` archives the open thread out of the folder on screen.
@@ -362,6 +412,8 @@ pub struct Session {
     pub account_email: String,
     pub folder: String,
     pub folders: Vec<String>,
+    pub label_scope: Option<String>,
+    pub labels: Vec<String>,
     /// Which folder is Sent, Drafts, Archive and the rest on this account.
     pub roles: FolderRoles,
     /// The loaded part of the folder list: a run of rows in list order.
@@ -426,6 +478,7 @@ pub struct Session {
     pub folder_query: String,
     pub folder_index: usize,
     pub folder_intent: FolderIntent,
+    label_selection: LabelSelection,
     pub toast: Option<Toast>,
     pub startup_crash_notice: Option<Toast>,
     /// Counts notices shown; see [`Session::toast_generation`].
@@ -511,9 +564,12 @@ impl Session {
             recent_searches: Vec::new(),
             palette_query: String::new(),
             palette_index: 0,
+            label_scope: None,
+            labels: Vec::new(),
             folder_query: String::new(),
             folder_index: 0,
             folder_intent: FolderIntent::Go,
+            label_selection: LabelSelection::default(),
             toast: None,
             startup_crash_notice: None,
             worker_outages: HashSet::new(),
@@ -535,6 +591,16 @@ impl Session {
             text: text.into(),
             alert,
             hint: None,
+            label: None,
+        });
+    }
+
+    pub fn show_label_toast(&mut self, notice: present::LabelNotice) {
+        self.set_toast(Toast {
+            text: notice.fit(f32::INFINITY, |_| 0.0),
+            alert: false,
+            hint: None,
+            label: Some(notice),
         });
     }
 
@@ -552,6 +618,17 @@ impl Session {
 
     pub fn clear_toast(&mut self) {
         self.toast = None;
+    }
+
+    pub fn dismiss_key_notice(&mut self, generation: u64, undo_pending: bool) {
+        if !undo_pending
+            && self
+                .toast
+                .as_ref()
+                .is_some_and(|toast| toast.label.is_none())
+        {
+            self.clear_toast_if(generation);
+        }
     }
 
     pub fn show_sync_requested(&mut self) {
@@ -594,6 +671,87 @@ impl Session {
         match self.folder_intent {
             FolderIntent::Move => "Move to",
             FolderIntent::Go => "Folder",
+            FolderIntent::Label => "Label",
+            FolderIntent::LabelList => "Go to label",
+        }
+    }
+
+    pub fn label_target(&self) -> Option<String> {
+        if self.overlay != Overlay::Folders || self.folder_intent != FolderIntent::Label {
+            return None;
+        }
+        match self.label_selection.ids.as_slice() {
+            [] => None,
+            [_] => self.label_selection.subject.clone(),
+            ids => Some(format!("{} conversations", ids.len())),
+        }
+    }
+
+    pub fn label_target_ids(&self) -> &[String] {
+        &self.label_selection.ids
+    }
+
+    pub fn label_target_subject(&self) -> Option<&str> {
+        self.label_selection.subject.as_deref()
+    }
+
+    pub fn visible_overlay(&self) -> Overlay {
+        if self.label_picker_active() && self.label_selection.waiting_to_open {
+            Overlay::None
+        } else {
+            self.overlay.clone()
+        }
+    }
+
+    pub fn label_picker_active(&self) -> bool {
+        self.overlay == Overlay::Folders && self.folder_intent == FolderIntent::Label
+    }
+
+    pub fn open_label_picker(&mut self) {
+        if self.label_picker_active() {
+            self.label_selection.waiting_to_open = false;
+        }
+    }
+
+    pub fn load_label_targets(
+        &mut self,
+        result: Result<HashMap<String, fell_core::store::ThreadLabels>, String>,
+    ) -> Step {
+        if !self.label_picker_active() {
+            return Step::default();
+        }
+        let targets = match result {
+            Ok(targets) => targets,
+            Err(error) => {
+                self.overlay = Overlay::None;
+                self.folder_intent = FolderIntent::Go;
+                self.show_toast(format!("Could not read labels · {error}"), true);
+                return Step::default();
+            }
+        };
+        let selection = &mut self.label_selection;
+        selection.waiting_to_open = false;
+        selection.ids.retain(|id| targets.contains_key(id));
+        if selection.ids.is_empty() {
+            self.overlay = Overlay::None;
+            self.folder_intent = FolderIntent::Go;
+            self.show_toast("A selected conversation is no longer available", true);
+            return Step::default();
+        }
+        if let [id] = selection.ids.as_slice() {
+            selection.subject = Some(targets[id].subject.clone());
+        }
+        let mut counts = HashMap::new();
+        for id in &selection.ids {
+            for label in &targets[id].labels {
+                *counts.entry(label.clone()).or_insert(0) += 1;
+            }
+        }
+        selection.counts = Some(counts);
+        if let Some(name) = selection.pending_choice.take() {
+            self.apply_picker_choice(name)
+        } else {
+            Step::default()
         }
     }
 
@@ -636,7 +794,9 @@ impl Session {
     }
 
     pub fn folder_title(&self) -> String {
-        self.roles.label(&self.folder)
+        self.label_scope
+            .clone()
+            .unwrap_or_else(|| self.roles.label(&self.folder))
     }
 
     /// `folder`'s own name, shown dimmed beside its title in the header,
@@ -657,7 +817,7 @@ impl Session {
 
     /// The folder on screen is the account's drafts folder.
     pub fn in_drafts(&self) -> bool {
-        self.roles.is(FolderRole::Drafts, &self.folder)
+        self.label_scope.is_none() && self.roles.is(FolderRole::Drafts, &self.folder)
     }
 
     /// The compose draft the selected row stands for, in the drafts list.
@@ -811,6 +971,122 @@ impl Session {
             .collect()
     }
 
+    pub fn picker_choices(&self) -> Vec<PickerChoice> {
+        if matches!(
+            self.folder_intent,
+            FolderIntent::Label | FolderIntent::LabelList
+        ) {
+            return self.label_choices();
+        }
+        let mut last_view = None;
+        self.folder_choices()
+            .into_iter()
+            .map(|name| {
+                let is_view = matches!(
+                    self.roles.role_of(&name),
+                    Some(FolderRole::All | FolderRole::Flagged)
+                );
+                let divider = last_view
+                    .replace(is_view)
+                    .is_some_and(|last| last != is_view);
+                PickerChoice {
+                    title: self.roles.label(&name),
+                    detail: self.folder_detail(&name),
+                    mark: None,
+                    name,
+                    divider,
+                }
+            })
+            .collect()
+    }
+
+    fn label_choices(&self) -> Vec<PickerChoice> {
+        let query = self.folder_query.trim();
+        let applying = self.folder_intent == FolderIntent::Label;
+        let folded = keymap::fuzzy_query(query);
+        let mut names: Vec<_> = self
+            .labels
+            .iter()
+            .filter_map(|name| Some((keymap::fuzzy_score(&folded, name)?, name)))
+            .collect();
+        names.sort_by(|(a, name_a), (b, name_b)| b.cmp(a).then_with(|| name_a.cmp(name_b)));
+        let mut choices: Vec<_> = names
+            .into_iter()
+            .map(|(_, name)| {
+                let count = self
+                    .label_selection
+                    .counts
+                    .as_ref()
+                    .filter(|_| applying)
+                    .and_then(|counts| counts.get(name))
+                    .copied()
+                    .unwrap_or(0);
+                PickerChoice {
+                    name: name.clone(),
+                    title: name.clone(),
+                    detail: None,
+                    mark: match count {
+                        0 => None,
+                        n if n == self.label_selection.ids.len() => Some("✓"),
+                        _ => Some("−"),
+                    },
+                    divider: false,
+                }
+            })
+            .collect();
+        if applying
+            && !query.is_empty()
+            && !self
+                .labels
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(query))
+        {
+            choices.push(PickerChoice {
+                name: query.to_string(),
+                title: format!("Create label “{query}”"),
+                detail: None,
+                mark: Some("+"),
+                divider: !choices.is_empty(),
+            });
+        }
+        choices
+    }
+
+    pub fn set_labels(&mut self, labels: Vec<String>) {
+        if self.labels == labels {
+            return;
+        }
+        let picker_open = self.overlay == Overlay::Folders
+            && matches!(
+                self.folder_intent,
+                FolderIntent::Label | FolderIntent::LabelList
+            );
+        let selected = picker_open
+            .then(|| {
+                self.label_choices()
+                    .get(self.folder_index)
+                    .map(|choice| choice.name.clone())
+            })
+            .flatten();
+        self.labels = labels;
+        if picker_open {
+            self.folder_index = selected
+                .and_then(|name| {
+                    self.label_choices()
+                        .iter()
+                        .position(|choice| choice.name == name)
+                })
+                .unwrap_or(0);
+        }
+    }
+
+    pub fn label_rows(&mut self, edit: &LabelEdit, leaving_scope: bool) {
+        edit.include_name(&mut self.labels);
+        if !leaving_scope {
+            edit.apply(&mut self.threads);
+        }
+    }
+
     pub fn highlighted(&self) -> HashSet<String> {
         if let Some(prompt) = &self.confirm_purge
             && prompt.notice == self.toast_generation
@@ -844,8 +1120,8 @@ impl Session {
         Some(&self.threads[anchor.min(cursor)..=anchor.max(cursor)])
     }
 
-    /// What `#` and `!` act on, in list order. A visual range takes
-    /// precedence over picks. The cursor supplies a target for single-row use.
+    /// A visual range takes precedence over marks. Marks keep their IDs across
+    /// pages. With neither, the cursor supplies the single-row target.
     pub fn action_targets(&self) -> Vec<String> {
         if self.visual {
             return self
@@ -855,17 +1131,31 @@ impl Session {
                 .map(|row| row.id.clone())
                 .collect();
         }
-        self.threads
+        if self.picked.is_empty() {
+            return self
+                .threads
+                .iter()
+                .find(|thread| Some(&thread.id) == self.cursor_id.as_ref())
+                .map(|thread| thread.id.clone())
+                .into_iter()
+                .collect();
+        }
+        let mut targets: Vec<_> = self
+            .threads
             .iter()
-            .filter(|thread| {
-                if self.picked.is_empty() {
-                    Some(&thread.id) == self.cursor_id.as_ref()
-                } else {
-                    self.picked.contains(&thread.id)
-                }
-            })
+            .filter(|thread| self.picked.contains(&thread.id))
             .map(|thread| thread.id.clone())
-            .collect()
+            .collect();
+        let loaded: HashSet<_> = targets.iter().collect();
+        let mut off_page: Vec<_> = self
+            .picked
+            .iter()
+            .filter(|id| !loaded.contains(id))
+            .cloned()
+            .collect();
+        off_page.sort_unstable();
+        targets.extend(off_page);
+        targets
     }
 
     /// The selected conversation row IDs and local draft IDs, in order.
@@ -874,11 +1164,13 @@ impl Session {
     pub fn split_removal_targets(&self, mut ids: Vec<String>) -> (Vec<String>, Vec<String>) {
         let mut drafts = Vec::new();
         ids.retain(|id| {
-            let Some(row) = self.threads.iter().find(|row| &row.id == id) else {
-                return false;
-            };
-            if let Some(draft) = &row.draft {
-                drafts.push(draft.clone());
+            let loaded_draft = self
+                .threads
+                .iter()
+                .find(|row| &row.id == id)
+                .and_then(|row| row.draft.as_deref());
+            if let Some(draft) = loaded_draft.or_else(|| present::draft_id_from_row(id)) {
+                drafts.push(draft.to_owned());
                 return false;
             }
             true
@@ -928,10 +1220,11 @@ impl Session {
         self.threads = threads;
         if self.confirm_purge.as_ref().is_some_and(|prompt| {
             prompt.folder != self.folder
-                || !prompt
-                    .ids
-                    .iter()
-                    .all(|id| self.threads.iter().any(|row| &row.id == id))
+                || ((!self.more_before && !self.more_after)
+                    && !prompt
+                        .ids
+                        .iter()
+                        .all(|id| self.threads.iter().any(|row| &row.id == id)))
         }) {
             self.withdraw_purge();
         }
@@ -951,8 +1244,10 @@ impl Session {
             // selected when it does (see [`Session::settle`]).
             self.cursor_id = self.threads.first().map(|thread| thread.id.clone());
         }
-        self.picked
-            .retain(|id| self.threads.iter().any(|thread| &thread.id == id));
+        if !self.more_before && !self.more_after {
+            self.picked
+                .retain(|id| self.threads.iter().any(|thread| &thread.id == id));
+        }
         if self.visual && !self.visual_span_survived(&old_ids, previous.as_deref()) {
             self.visual = false;
             self.anchor_id = None;
@@ -1258,16 +1553,12 @@ impl Session {
         }
     }
 
-    pub fn is_open(&self, index: usize) -> bool {
-        self.messages
-            .get(index)
-            .is_some_and(|message| self.quotes_open.contains(&message.id))
+    pub fn is_open(&self, message_id: &str) -> bool {
+        self.quotes_open.contains(message_id)
     }
 
-    pub fn recipients_are_open(&self, index: usize) -> bool {
-        self.messages
-            .get(index)
-            .is_some_and(|message| self.recipients_open.contains(&message.id))
+    pub fn recipients_are_open(&self, message_id: &str) -> bool {
+        self.recipients_open.contains(message_id)
     }
 
     fn select_index(&mut self, index: usize) -> bool {
@@ -1848,7 +2139,6 @@ impl Session {
     }
 
     fn folder_key(&mut self, key: KeyId) -> Step {
-        let len = self.folder_choices().len();
         match key {
             KeyId::Escape => {
                 self.overlay = Overlay::None;
@@ -1862,6 +2152,7 @@ impl Session {
                 Step::default()
             }
             KeyId::Up | KeyId::Ctrl('p') | KeyId::Ctrl('k') => {
+                let len = self.picker_choices().len();
                 if len > 0 {
                     self.folder_index = if self.folder_index == 0 {
                         len - 1
@@ -1872,6 +2163,7 @@ impl Session {
                 Step::default()
             }
             KeyId::Down | KeyId::Ctrl('n') | KeyId::Ctrl('j') => {
+                let len = self.picker_choices().len();
                 if len > 0 {
                     self.folder_index = (self.folder_index + 1) % len;
                 }
@@ -1893,27 +2185,67 @@ impl Session {
 
     /// Enter or a click on the highlighted folder.
     pub fn confirm_folder(&mut self) -> Step {
-        let choices = self.folder_choices();
-        let Some(chosen) = choices.get(self.folder_index).cloned() else {
+        let Some(chosen) = self.picker_choices().into_iter().nth(self.folder_index) else {
+            if matches!(
+                self.folder_intent,
+                FolderIntent::Label | FolderIntent::LabelList
+            ) {
+                return Step::default();
+            }
             self.overlay = Overlay::None;
             self.folder_query.clear();
             self.folder_intent = FolderIntent::Go;
             return Step::default();
         };
+        if self.label_picker_active() && self.label_selection.counts.is_none() {
+            self.label_selection.pending_choice = Some(chosen.name);
+            return Step::default();
+        }
+        self.apply_picker_choice(chosen.name)
+    }
+
+    fn apply_picker_choice(&mut self, name: String) -> Step {
         let intent = self.folder_intent;
         self.overlay = Overlay::None;
         self.folder_query.clear();
         self.folder_intent = FolderIntent::Go;
         match intent {
             FolderIntent::Move => {
-                self.pending_move = Some(chosen);
+                self.pending_move = Some(name);
                 Step {
                     apply_move: true,
                     ..Step::default()
                 }
             }
+            FolderIntent::Label => {
+                let labeled = self
+                    .label_selection
+                    .counts
+                    .as_ref()
+                    .and_then(|counts| counts.get(&name))
+                    .copied();
+                let edit = LabelEdit {
+                    ids: self.label_selection.ids.clone(),
+                    name,
+                    add: labeled != Some(self.label_selection.ids.len()),
+                };
+                if edit.add || self.label_scope.as_deref() != Some(&edit.name) {
+                    self.visual = false;
+                    self.anchor_id = None;
+                }
+                // When rows leave their own label list, keep its visual
+                // range until the new page lands so it fades with the rows.
+                Step {
+                    labels: Some(edit),
+                    ..Step::default()
+                }
+            }
+            FolderIntent::LabelList => Step {
+                reload_threads: self.go_label(&name),
+                ..Step::default()
+            },
             FolderIntent::Go => Step {
-                reload_threads: self.go_folder(&chosen),
+                reload_threads: self.go_folder(&name),
                 ..Step::default()
             },
         }
@@ -1954,6 +2286,7 @@ impl Session {
                     | Action::Sent
                     | Action::Drafts
                     | Action::FolderPicker
+                    | Action::LabelList
                     | Action::Palette
                     | Action::Help
                     | Action::About
@@ -1995,6 +2328,16 @@ impl Session {
             self.count.clear();
             return step;
         }
+        if self.label_scope.is_some()
+            && matches!(
+                action,
+                Action::Move | Action::Archive | Action::Delete | Action::Spam
+            )
+        {
+            self.count.clear();
+            self.show_toast("Choose a folder to move mail", false);
+            return step;
+        }
         match action {
             Action::Search => return self.start_search(None),
             Action::NextHit | Action::PreviousHit => {
@@ -2022,11 +2365,11 @@ impl Session {
                 if self.cursor_draft().is_some() {
                     // A draft row opens in the editor, not the reading pane.
                     step.open_draft = true;
-                } else if self.pane == Pane::List
-                    && (self.search.is_none() || self.cursor_id.is_some())
-                {
-                    self.pane = Pane::Conversation;
-                    self.opened(&mut step);
+                } else if self.pane == Pane::List {
+                    if self.cursor_id.is_some() {
+                        self.pane = Pane::Conversation;
+                        self.opened(&mut step);
+                    }
                 } else if let Some(message) = self.messages.get_mut(self.message_cursor) {
                     message.expanded = !message.expanded;
                     step.message_disclosure_changed = true;
@@ -2072,6 +2415,40 @@ impl Session {
                     .position(|name| name.eq_ignore_ascii_case(&self.folder))
                     .unwrap_or(0);
             }
+            Action::Label | Action::LabelList => {
+                self.count.clear();
+                if action == Action::Label {
+                    let targets = self.action_targets();
+                    if targets.is_empty() {
+                        self.show_toast("No conversation", true);
+                        return step;
+                    }
+                    let (targets, _) = self.split_removal_targets(targets);
+                    if targets.is_empty() {
+                        self.show_toast(DRAFT_NOT_THREAD, true);
+                        return step;
+                    }
+                    let subject = (targets.len() == 1)
+                        .then(|| self.threads.iter().find(|row| row.id == targets[0]))
+                        .flatten()
+                        .map(|row| row.subject.clone());
+                    self.label_selection = LabelSelection {
+                        ids: targets,
+                        subject,
+                        waiting_to_open: true,
+                        ..LabelSelection::default()
+                    };
+                    step.read_label_targets = true;
+                }
+                self.folder_intent = if action == Action::Label {
+                    FolderIntent::Label
+                } else {
+                    FolderIntent::LabelList
+                };
+                self.overlay = Overlay::Folders;
+                self.folder_query.clear();
+                self.folder_index = 0;
+            }
             Action::Move => {
                 self.count.clear();
                 if self.cursor_id.is_none() {
@@ -2099,7 +2476,7 @@ impl Session {
             }
             Action::Archive => {
                 self.count.clear();
-                if self.cursor_id.is_none() {
+                if self.action_targets().is_empty() {
                     self.show_toast("No conversation", true);
                     return Step::default();
                 }
@@ -2162,19 +2539,17 @@ impl Session {
                 }
                 // Destructive and not undoable: ask, and show the answer key.
                 let target = match targets.as_slice() {
-                    [id] => {
-                        let subject = self
-                            .threads
-                            .iter()
-                            .find(|row| &row.id == id)
-                            .map_or("", |row| &row.subject);
-                        let subject = display_safe(subject).replace(['“', '”'], "'");
-                        if subject.trim().is_empty() {
-                            "“(no subject)”".to_string()
-                        } else {
-                            format!("“{subject}”")
-                        }
-                    }
+                    [id] => self.threads.iter().find(|row| &row.id == id).map_or_else(
+                        || "1 marked".into(),
+                        |row| {
+                            let subject = display_safe(&row.subject).replace(['“', '”'], "'");
+                            if subject.trim().is_empty() {
+                                "“(no subject)”".to_string()
+                            } else {
+                                format!("“{subject}”")
+                            }
+                        },
+                    ),
                     ids => format!("{} marked", ids.len()),
                 };
                 self.show_toast(
@@ -2446,23 +2821,14 @@ impl Session {
         self.read_after_dwell(read)
     }
 
-    /// Threads `U` and `s` act on: the visual range or picked rows plus the
-    /// cursor, in list order. Draft rows are not threads.
-    fn flag_targets(&self) -> Vec<String> {
-        let ids = self.highlighted();
-        self.threads
-            .iter()
-            .filter(|row| row.draft.is_none() && ids.contains(&row.id))
-            .map(|row| row.id.clone())
-            .collect()
-    }
-
     /// `U` (`star` false) or `s` on the targets. All already unread (or
     /// starred) turns it off; otherwise every target gets it.
     fn toggle_flag(&mut self, star: bool) -> Step {
-        let mut ids = self.flag_targets();
+        let targets = self.action_targets();
+        let multiple_selected = targets.len() > 1;
+        let (mut ids, drafts) = self.split_removal_targets(targets);
         if ids.is_empty() {
-            let text = if self.cursor_draft().is_some() {
+            let text = if !drafts.is_empty() {
                 DRAFT_NOT_THREAD
             } else {
                 "No conversation"
@@ -2470,7 +2836,6 @@ impl Session {
             self.show_toast(text, true);
             return Step::default();
         }
-        let multiple_selected = ids.len() > 1;
         if self.search.is_some() {
             ids.retain(|id| self.search_source(id).is_some());
             if ids.is_empty() {
@@ -2483,6 +2848,7 @@ impl Session {
             .iter()
             .filter(|row| ids.contains(&row.id))
             .collect();
+        let off_page = rows.len() != ids.len();
         let change = if star {
             if rows.iter().all(|row| row.starred) {
                 FlagChange::Unstar
@@ -2494,43 +2860,53 @@ impl Session {
         } else {
             FlagChange::Unread
         };
-        let count = ids.len();
         // The selection was the operand: it is used up, as in vim.
         if multiple_selected {
             self.visual = false;
             self.anchor_id = None;
             self.picked.clear();
         }
+        if !star {
+            self.cancel_read_delay();
+        }
+        if off_page {
+            return Step {
+                off_page_flags: Some((ids, star)),
+                ..Step::default()
+            };
+        }
+        let count = ids.len();
+        // Quiet: a single row on screen with the list focused shows the
+        // change itself. Say it only when the reader cannot see it there.
+        let toast = count > 1 || !self.flag_targets_in_view(&ids);
+        let flags = self.mark_rows(ids, change);
+        if toast {
+            // A selection counts the rows that changed, not the ones that
+            // already had it.
+            let changed = flags.as_ref().map_or(0, |edit| edit.ids.len());
+            self.show_flag_notice(change, count, changed);
+        }
+        Step {
+            flags,
+            ..Step::default()
+        }
+    }
+
+    pub fn show_flag_notice(&mut self, change: FlagChange, selected: usize, changed: usize) {
         let what = match change {
             FlagChange::Read => "marked read",
             FlagChange::Unread => "marked unread",
             FlagChange::Star => "starred",
             FlagChange::Unstar => "unstarred",
         };
-        // Quiet: a single row on screen with the list focused shows the
-        // change itself. Say it only when the reader cannot see it there.
-        let toast = count > 1 || !self.flag_targets_in_view(&ids);
-        let flags = self.mark_rows(ids, change);
-        if !star {
-            self.cancel_read_delay();
-        }
-        if toast {
-            // A selection counts the rows that changed, not the ones that
-            // already had it.
-            let changed = flags.as_ref().map_or(0, |edit| edit.ids.len());
-            let text = if count == 1 {
-                let mut text = what.to_string();
-                text[..1].make_ascii_uppercase();
-                text
-            } else {
-                format!("{changed} {what}")
-            };
-            self.show_toast(text, false);
-        }
-        Step {
-            flags,
-            ..Step::default()
-        }
+        let text = if selected == 1 {
+            let mut text = what.to_string();
+            text[..1].make_ascii_uppercase();
+            text
+        } else {
+            format!("{changed} {what}")
+        };
+        self.show_toast(text, false);
     }
 
     /// The list has focus and every row in `ids` is on screen.
@@ -2549,7 +2925,7 @@ impl Session {
 
     /// Show `change` on the loaded rows `ids` now, in this frame, and
     /// return the store write for the view. `None` when no row changes.
-    fn mark_rows(&mut self, ids: Vec<String>, change: FlagChange) -> Option<FlagEdit> {
+    pub(crate) fn mark_rows(&mut self, ids: Vec<String>, change: FlagChange) -> Option<FlagEdit> {
         let mut changed = Vec::new();
         for row in self.threads.iter_mut().filter(|row| ids.contains(&row.id)) {
             let (unread, starred) = match change {
@@ -2580,10 +2956,21 @@ impl Session {
     fn go_folder(&mut self, folder: &str) -> bool {
         self.count.clear();
         self.end_search();
-        if self.folder == folder {
+        let was_label = self.label_scope.take().is_some();
+        if self.folder == folder && !was_label {
             return false;
         }
         self.folder = folder.to_string();
+        self.forget_window();
+        true
+    }
+
+    fn go_label(&mut self, label: &str) -> bool {
+        self.end_search();
+        if self.label_scope.as_deref() == Some(label) {
+            return false;
+        }
+        self.label_scope = Some(label.into());
         self.forget_window();
         true
     }
@@ -2688,7 +3075,7 @@ impl Session {
         self.which_visible = self.keymap.which_key_ms == 0 && !self.chord.is_empty();
     }
 
-    pub fn list_banner(&self) -> Option<Banner> {
+    pub fn list_banner(&self, folder: &str, label: Option<&str>) -> Option<Banner> {
         if !self.threads.is_empty() {
             return None;
         }
@@ -2704,6 +3091,11 @@ impl Session {
                 hint: String::new(),
             });
         }
+        let title = || {
+            label
+                .map(str::to_owned)
+                .unwrap_or_else(|| self.roles.label(folder))
+        };
         let retry = keymap::binding_text(&self.keymap, Action::SyncNow);
         Some(match &self.sync {
             SyncKind::FirstSync => Banner {
@@ -2718,7 +3110,7 @@ impl Session {
                 hint: "? details".into(),
             },
             SyncKind::Connecting | SyncKind::Syncing { .. } => Banner {
-                title: format!("Syncing {}", self.folder_title()),
+                title: format!("Syncing {}", title()),
                 hint: match &self.sync {
                     SyncKind::Syncing {
                         new_messages: Some(count),
@@ -2752,7 +3144,7 @@ impl Session {
                 }
             }
             SyncKind::FixtureOffline | SyncKind::LocalOffline | SyncKind::Synced { .. }
-                if self.in_drafts() =>
+                if label.is_none() && self.roles.is(FolderRole::Drafts, folder) =>
             {
                 Banner {
                     title: "No drafts".into(),
@@ -2763,7 +3155,7 @@ impl Session {
                 }
             }
             SyncKind::FixtureOffline | SyncKind::LocalOffline | SyncKind::Synced { .. } => Banner {
-                title: format!("No conversations in {}", self.folder_title()),
+                title: format!("No conversations in {}", title()),
                 hint: String::new(),
             },
         })
@@ -2908,7 +3300,9 @@ mod tests {
             ),
         ] {
             session.apply_sync_status(SyncKind::Failed(SyncFailure::connection(&config, &error)));
-            let banner = session.list_banner().unwrap();
+            let banner = session
+                .list_banner(&session.folder, session.label_scope.as_deref())
+                .unwrap();
             assert_eq!(banner.title, title);
             assert_eq!(banner.hint, hint);
         }
@@ -3036,9 +3430,9 @@ mod tests {
             session.messages[0].body_state,
             fell_core::BodyState::Pending
         );
-        assert!(session.is_open(0));
+        assert!(session.is_open(&session.messages[0].id));
         assert!(!session.refresh_messages(session.messages.clone(), true));
-        assert!(session.is_open(0));
+        assert!(session.is_open(&session.messages[0].id));
     }
 
     #[test]
@@ -3102,6 +3496,327 @@ mod tests {
             Session::new("Caleb", "me@x", SyncKind::FixtureOffline, Keymap::default());
         session.set_threads(vec![row("a"), row("b"), row("c"), row("d"), row("e")]);
         session
+    }
+
+    fn type_picker(session: &mut Session, text: &str) {
+        for ch in text.chars() {
+            let key = if ch == ' ' {
+                KeyId::Space
+            } else {
+                KeyId::Char(ch)
+            };
+            session.on_key(key, 10);
+        }
+    }
+
+    fn load_test_label_targets(session: &mut Session) -> Step {
+        let ids = session.label_target_ids();
+        session.load_label_targets(Ok(session
+            .threads
+            .iter()
+            .filter(|row| ids.contains(&row.id))
+            .map(|row| {
+                (
+                    row.id.clone(),
+                    fell_core::store::ThreadLabels {
+                        subject: row.subject.clone(),
+                        labels: row.labels.iter().cloned().collect(),
+                    },
+                )
+            })
+            .collect()))
+    }
+
+    #[test]
+    fn label_picker_opens_with_checks_if_counts_arrive_before_the_deadline() {
+        let mut session = session();
+        session.labels = vec!["Work".into()];
+        session.threads[0].labels = vec!["Work".into()];
+        assert!(session.on_key(KeyId::Char('l'), 10).read_label_targets);
+        assert_eq!(session.visible_overlay(), Overlay::None);
+
+        assert!(load_test_label_targets(&mut session).labels.is_none());
+        assert_eq!(session.visible_overlay(), Overlay::Folders);
+        assert_eq!(session.picker_choices()[0].mark, Some("✓"));
+    }
+
+    #[test]
+    fn the_label_picker_can_open_before_late_counts_arrive() {
+        let mut session = session();
+        session.labels = vec!["Work".into()];
+        session.threads[0].labels = vec!["Work".into()];
+        session.on_key(KeyId::Char('l'), 10);
+        session.open_label_picker();
+        assert_eq!(session.visible_overlay(), Overlay::Folders);
+        assert_eq!(session.picker_choices()[0].mark, None);
+
+        assert!(load_test_label_targets(&mut session).labels.is_none());
+        assert_eq!(session.picker_choices()[0].mark, Some("✓"));
+    }
+
+    #[test]
+    fn enter_queued_during_label_lookup_uses_the_choice_at_the_time_of_the_key() {
+        for timed_out in [false, true] {
+            let mut session = session();
+            session.labels = vec!["Travel".into(), "Work".into()];
+            session.threads[0].labels = vec!["Work".into()];
+            session.on_key(KeyId::Char('l'), 10);
+            if timed_out {
+                session.open_label_picker();
+            }
+            type_picker(&mut session, "work");
+            assert!(session.on_key(KeyId::Enter, 10).labels.is_none());
+            session.on_key(KeyId::Backspace, 10);
+
+            let edit = load_test_label_targets(&mut session).labels.unwrap();
+            assert_eq!(edit.name, "Work");
+            assert_eq!(edit.ids, ["a"]);
+            assert!(!edit.add);
+            assert_eq!(session.visible_overlay(), Overlay::None);
+        }
+    }
+
+    #[test]
+    fn failing_label_lookup_drops_the_queued_enter_and_explains_why() {
+        let mut session = session();
+        session.labels = vec!["Work".into()];
+        session.on_key(KeyId::Char('l'), 10);
+        session.open_label_picker();
+        session.on_key(KeyId::Enter, 10);
+
+        let step = session.load_label_targets(Err("Store unavailable".into()));
+        assert!(step.labels.is_none());
+        assert_eq!(session.visible_overlay(), Overlay::None);
+        let toast = session.toast.as_ref().unwrap();
+        assert_eq!(toast.text, "Could not read labels · Store unavailable");
+        assert!(toast.alert);
+        assert!(load_test_label_targets(&mut session).labels.is_none());
+    }
+
+    #[test]
+    fn label_picker_creates_adds_and_removes_through_the_palette_and_keys() {
+        let mut session = session();
+        session.labels = vec!["Design review".into(), "Travel".into()];
+        let item = keymap::palette_items(&session.keymap, "apply label", &[])
+            .into_iter()
+            .find(|item| item.action == Action::Label)
+            .unwrap();
+        session.confirm_palette(item, 10);
+        load_test_label_targets(&mut session);
+        type_picker(&mut session, "drev");
+        assert_eq!(session.picker_choices()[0].name, "Design review");
+        let add = session.on_key(KeyId::Enter, 10).labels.unwrap();
+        assert_eq!(
+            add,
+            LabelEdit {
+                ids: vec!["a".into()],
+                name: "Design review".into(),
+                add: true
+            }
+        );
+        session.label_rows(&add, false);
+
+        session.on_key(KeyId::Char('l'), 10);
+        load_test_label_targets(&mut session);
+        assert_eq!(session.picker_choices()[0].mark, Some("✓"));
+        let remove = session.on_key(KeyId::Enter, 10).labels.unwrap();
+        assert_eq!(remove, LabelEdit { add: false, ..add });
+        session.label_rows(&remove, false);
+        assert!(session.threads[0].labels.is_empty());
+
+        session.on_key(KeyId::Char('l'), 10);
+        load_test_label_targets(&mut session);
+        type_picker(&mut session, "Client notes");
+        assert_eq!(
+            session.picker_choices()[0].title,
+            "Create label “Client notes”"
+        );
+        let create = session.on_key(KeyId::Enter, 10).labels.unwrap();
+        assert!(create.add);
+        session.label_rows(&create, false);
+        assert_eq!(session.threads[0].labels, ["Client notes"]);
+
+        session.on_key(KeyId::Char('g'), 10);
+        assert!(session.which_items().iter().any(|item| item.key == "l"));
+        session.on_key(KeyId::Char('l'), 10);
+        assert!(session.on_key(KeyId::Enter, 10).reload_threads);
+        assert_eq!(session.label_scope.as_deref(), Some("Client notes"));
+        assert!(session.perform(Action::Inbox, 10).reload_threads);
+        assert_eq!(session.label_scope, None);
+    }
+
+    #[test]
+    fn label_picker_fills_a_mixed_visual_range_and_removes_from_marked_rows() {
+        let mut session = session();
+        session.labels = vec!["review".into()];
+        session.threads[0].labels.push("review".into());
+        for key in ['V', 'j', 'j', 'l'] {
+            session.on_key(KeyId::Char(key), 10);
+        }
+        load_test_label_targets(&mut session);
+        assert_eq!(session.picker_choices()[0].mark, Some("−"));
+        let add = session.on_key(KeyId::Enter, 10).labels.unwrap();
+        assert_eq!(add.ids, ["a", "b", "c"]);
+        assert!(add.add);
+        assert!(!session.visual);
+        session.label_rows(&add, false);
+        for row in &session.threads[..3] {
+            assert_eq!(row.labels, ["review"]);
+        }
+
+        session.on_key(KeyId::Escape, 10);
+        for key in ['x', 'k', 'k', 'x', 'j', 'l'] {
+            session.on_key(KeyId::Char(key), 10);
+        }
+        load_test_label_targets(&mut session);
+        assert_eq!(session.picker_choices()[0].mark, Some("✓"));
+        let remove = session.on_key(KeyId::Enter, 10).labels.unwrap();
+        assert_eq!(remove.ids, ["a", "c"]);
+        assert!(!remove.add);
+        session.label_rows(&remove, false);
+        assert!(session.threads[0].labels.is_empty());
+        assert_eq!(session.threads[1].labels, ["review"]);
+        assert!(session.threads[2].labels.is_empty());
+        assert!(session.on_key(KeyId::Char('u'), 10).undo);
+    }
+
+    #[test]
+    fn label_picker_toggles_a_selection_across_loaded_pages() {
+        let store = fell_core::Store::open_in_memory().unwrap();
+        let account = crate::fixtures::fixture_account();
+        crate::fixtures::seed_if_empty(&store, &account).unwrap();
+        let threads = store.list_threads(&account.id).unwrap();
+        let first = &threads[0].thread_id;
+        let last = &threads.last().unwrap().thread_id;
+        store
+            .label_thread(
+                &account.id,
+                first,
+                fell_core::LabelChange::Add("Review".into()),
+            )
+            .unwrap();
+        let mut session = session();
+        session.labels = vec!["Review".into()];
+        session.set_page(vec![row(first.as_str())], false, true, 2);
+        session.on_key(KeyId::Char('x'), 10);
+        session.set_page(vec![row(last.as_str())], true, false, 2);
+        session.on_key(KeyId::Char('x'), 10);
+
+        for (mark, add) in [(Some("−"), true), (Some("✓"), false)] {
+            assert!(session.on_key(KeyId::Char('l'), 10).read_label_targets);
+            let ids = session.label_target_ids();
+            assert_eq!(ids, [last.as_str(), first.as_str()]);
+            session.load_label_targets(Ok(store.thread_labels(&account.id, ids).unwrap()));
+            assert_eq!(session.picker_choices()[0].mark, mark);
+            let edit = session.on_key(KeyId::Enter, 10).labels.unwrap();
+            assert_eq!(edit.ids, [last.as_str(), first.as_str()]);
+            assert_eq!(edit.add, add);
+            let change = if add {
+                fell_core::LabelChange::Add(edit.name)
+            } else {
+                fell_core::LabelChange::Remove(edit.name)
+            };
+            store
+                .label_threads(&account.id, &[first.clone(), last.clone()], change)
+                .unwrap();
+        }
+        assert!(
+            store
+                .thread_labels(&account.id, session.label_target_ids())
+                .unwrap()
+                .values()
+                .all(|thread| !thread.labels.contains("Review"))
+        );
+    }
+
+    #[test]
+    fn label_picker_skips_an_off_page_draft_in_a_mixed_selection() {
+        let mut session = session();
+        let draft_id = present::draft_row_id("local");
+        let mut draft = row(&draft_id);
+        draft.draft = Some("local".into());
+        session.set_page(vec![draft], false, true, 0);
+        assert!(!session.on_key(KeyId::Char('l'), 10).read_label_targets);
+        assert_eq!(session.toast.as_ref().unwrap().text, DRAFT_NOT_THREAD);
+        session.on_key(KeyId::Char('x'), 10);
+        session.set_page(vec![row("a")], true, false, 0);
+        assert!(session.picked.contains(&draft_id));
+        assert!(!session.on_key(KeyId::Char('l'), 10).read_label_targets);
+        assert_eq!(session.toast.as_ref().unwrap().text, DRAFT_NOT_THREAD);
+
+        session.on_key(KeyId::Char('x'), 10);
+        session.labels = vec!["Review".into()];
+        assert!(session.on_key(KeyId::Char('l'), 10).read_label_targets);
+        assert_eq!(session.label_target_ids(), ["a"]);
+        load_test_label_targets(&mut session);
+        assert_eq!(session.on_key(KeyId::Enter, 10).labels.unwrap().ids, ["a"]);
+    }
+
+    #[test]
+    fn label_picker_uses_the_remaining_target_when_a_marked_thread_is_gone() {
+        let store = fell_core::Store::open_in_memory().unwrap();
+        let account = crate::fixtures::fixture_account();
+        crate::fixtures::seed_if_empty(&store, &account).unwrap();
+        let threads = store.list_threads(&account.id).unwrap();
+        let remaining = &threads[0];
+        let mut session = session();
+        session.labels = vec!["Review".into()];
+        session.set_page(vec![row("purged")], false, true, 0);
+        session.on_key(KeyId::Char('x'), 10);
+        session.set_page(vec![row(remaining.thread_id.as_str())], true, false, 0);
+        session.on_key(KeyId::Char('x'), 10);
+        assert!(session.on_key(KeyId::Char('l'), 10).read_label_targets);
+        let targets = store
+            .thread_labels(&account.id, session.label_target_ids())
+            .unwrap();
+        let subject = targets[remaining.thread_id.as_str()].subject.clone();
+        assert_eq!(targets.len(), 1);
+        session.load_label_targets(Ok(targets));
+        assert_eq!(session.label_target_subject(), Some(subject.as_str()));
+        let edit = session.on_key(KeyId::Enter, 10).labels.unwrap();
+        assert_eq!(edit.ids, [remaining.thread_id.as_str()]);
+        assert!(edit.add);
+    }
+
+    #[test]
+    fn a_closing_label_picker_keeps_its_checked_row() {
+        let mut motion = crate::inbox_motion::InboxMotion::new(crate::motion::Motion::new(true));
+        let mut session = session();
+        session.labels.push("work".into());
+        session.threads[0].labels.push("work".into());
+        session.perform(Action::Label, 10);
+        load_test_label_targets(&mut session);
+        type_picker(&mut session, "work");
+        let now = std::time::Instant::now();
+        motion.observe(&session, (true, true), now);
+        assert!(!session.confirm_folder().labels.unwrap().add);
+        session.set_labels(Vec::new());
+        motion.observe(&session, (true, true), now);
+
+        let (layer, _) = motion.closing_overlay(now).unwrap();
+        layer.swap(&mut session);
+        assert_eq!(session.folder_query, "work");
+        assert_eq!(session.folder_index, 0);
+        assert_eq!(layer.picker_choices.len(), 1);
+        assert_eq!(layer.picker_choices[0].title, "work");
+        assert_eq!(layer.picker_choices[0].mark, Some("✓"));
+    }
+
+    #[test]
+    fn label_picker_filters_five_hundred_names() {
+        let mut session = session();
+        session.labels = (0..500).map(|i| format!("Project {i:03}")).collect();
+        session.on_key(KeyId::Char('l'), 10);
+        load_test_label_targets(&mut session);
+        let mut slowest = std::time::Duration::ZERO;
+        for key in "p427".chars() {
+            let start = std::time::Instant::now();
+            session.on_key(KeyId::Char(key), 10);
+            std::hint::black_box(session.picker_choices());
+            slowest = slowest.max(start.elapsed());
+        }
+        eprintln!("500 labels, slowest model keystroke: {slowest:?}");
+        assert_eq!(session.picker_choices()[0].name, "Project 427");
     }
 
     fn attachment_message(expanded: bool) -> ConvMessage {
@@ -3613,8 +4328,61 @@ mod tests {
         session.picked.insert("a".into());
         session.cursor_id = Some("e".into());
         let edit = session.on_key(KeyId::Char('s'), 10).flags.unwrap();
-        assert_eq!(edit.ids, vec!["a", "e"]);
+        assert_eq!(edit.ids, vec!["a"]);
         assert!(session.picked.is_empty());
+    }
+
+    #[test]
+    fn flags_follow_marks_out_of_the_loaded_page_and_skip_missing_threads() {
+        let store = fell_core::Store::open_in_memory().unwrap();
+        let account = crate::fixtures::fixture_account();
+        crate::fixtures::seed_if_empty(&store, &account).unwrap();
+        let inbox = store.folder_threads(&account.id, "INBOX").unwrap();
+        let marked = inbox
+            .iter()
+            .find(|row| !row.unread && !row.starred)
+            .unwrap();
+        let other = inbox
+            .iter()
+            .find(|row| row.thread_id != marked.thread_id)
+            .unwrap();
+        let rows = |row: &fell_core::store::FolderThread| {
+            present::thread_rows(std::slice::from_ref(row), &account.email)
+        };
+        let mut session = session();
+        session.set_page(rows(marked), false, true, 0);
+        session.on_key(KeyId::Char('x'), 10);
+        session.set_page(rows(other), true, false, 0);
+        for (key, expected) in [
+            ('U', FlagChange::Unread),
+            ('U', FlagChange::Read),
+            ('s', FlagChange::Star),
+            ('s', FlagChange::Unstar),
+        ] {
+            let step = session.on_key(KeyId::Char(key), 10);
+            assert!(step.flags.is_none());
+            let (mut ids, star) = step.off_page_flags.unwrap();
+            assert_eq!(ids, [marked.thread_id.as_str()]);
+            ids.push("missing".into());
+            let actual = store
+                .toggle_selected_flags(
+                    &account.id,
+                    &ids,
+                    fell_core::store::ListSource::Folder("INBOX"),
+                    star,
+                )
+                .unwrap();
+            assert_eq!(actual, (expected, 1));
+            let refreshed = store.folder_threads(&account.id, "INBOX").unwrap();
+            let unchanged = refreshed
+                .iter()
+                .find(|row| row.thread_id == other.thread_id)
+                .unwrap();
+            assert_eq!(
+                (unchanged.unread, unchanged.starred),
+                (other.unread, other.starred)
+            );
+        }
     }
 
     #[test]
@@ -4166,17 +4934,32 @@ mod tests {
         let mut session = session();
         session.threads.clear();
         session.folder = "Archive".into();
-        let banner = session.list_banner().unwrap();
+        let banner = session
+            .list_banner(&session.folder, session.label_scope.as_deref())
+            .unwrap();
         assert!(banner.title.contains("Archive"));
         assert!(banner.hint.is_empty());
+        // A navigation key can change the requested scope before its page lands.
+        assert_eq!(
+            session
+                .list_banner("INBOX", Some("field notes"))
+                .unwrap()
+                .title,
+            "No conversations in field notes"
+        );
+
         // An empty drafts list says how to start one.
         session.folder = "Drafts".into();
-        let banner = session.list_banner().unwrap();
+        let banner = session
+            .list_banner(&session.folder, session.label_scope.as_deref())
+            .unwrap();
         assert_eq!(banner.title, "No drafts");
         assert!(banner.hint.starts_with("c compose"), "{}", banner.hint);
         assert!(banner.hint.contains("gi"));
         session.sync = SyncKind::FirstSync;
-        let banner = session.list_banner().unwrap();
+        let banner = session
+            .list_banner(&session.folder, session.label_scope.as_deref())
+            .unwrap();
         assert!(banner.hint.contains("fell account setup"));
     }
 
@@ -4241,7 +5024,9 @@ mod tests {
         session.threads.clear();
         session.sync = SyncKind::LocalOffline;
         session.fail_query(QueryFault::Folder, "database is locked".into());
-        let banner = session.list_banner().unwrap();
+        let banner = session
+            .list_banner(&session.folder, session.label_scope.as_deref())
+            .unwrap();
         assert_eq!(banner.title, "database is locked");
         assert!(!banner.title.contains("No conversations"));
     }
@@ -4301,8 +5086,8 @@ mod tests {
         // disclosures while the reader is at the bottom of the same message.
         assert!(!session.refresh_messages(vec![first.clone(), last.clone()], true));
         assert_eq!(session.message_cursor, 1);
-        assert!(session.is_open(1));
-        assert!(session.recipients_are_open(1));
+        assert!(session.is_open(&session.messages[1].id));
+        assert!(session.recipients_are_open(&session.messages[1].id));
         assert!(!session.messages[0].expanded);
 
         let reply = empty_message(true);
@@ -4326,15 +5111,15 @@ mod tests {
         session.set_messages(vec![first.clone(), second.clone()]);
         session.message_cursor = 0;
         session.toggle_open(0);
-        assert!(session.is_open(0));
+        assert!(session.is_open(&session.messages[0].id));
         // Sync puts a new message before the one that was opened.
         let newcomer = empty_message(true);
         session.refresh_messages(vec![newcomer, first.clone(), second], false);
-        assert!(!session.is_open(0));
-        assert!(session.is_open(1));
+        assert!(!session.is_open(&session.messages[0].id));
+        assert!(session.is_open(&session.messages[1].id));
         // The opened message leaves the thread: nothing else opens in its place.
         session.refresh_messages(vec![empty_message(true)], false);
-        assert!(!session.is_open(0));
+        assert!(!session.is_open(&session.messages[0].id));
     }
 
     #[test]
@@ -4343,13 +5128,22 @@ mod tests {
             Session::new("Caleb", "me@x", SyncKind::FixtureOffline, Keymap::default());
         session.set_messages(vec![empty_message(true)]);
         session.toggle_recipients(0);
-        assert!(session.recipients_are_open(0));
-        assert!(!session.is_open(0), "quoted text stays closed");
+        assert!(session.recipients_are_open(&session.messages[0].id));
+        assert!(
+            !session.is_open(&session.messages[0].id),
+            "quoted text stays closed"
+        );
         session.toggle_recipients(0);
         session.toggle_open(0);
-        assert!(session.recipients_are_open(0) && session.is_open(0));
+        assert!(
+            session.recipients_are_open(&session.messages[0].id)
+                && session.is_open(&session.messages[0].id)
+        );
         session.toggle_open(0);
-        assert!(!session.recipients_are_open(0) && !session.is_open(0));
+        assert!(
+            !session.recipients_are_open(&session.messages[0].id)
+                && !session.is_open(&session.messages[0].id)
+        );
     }
 
     #[test]
@@ -5003,6 +5797,37 @@ mod tests {
         assert_eq!(session.status_notice(), Some(&crash));
         session.on_key(KeyId::Escape, 10);
         assert!(session.status_notice().is_none());
+    }
+
+    #[test]
+    fn label_notices_survive_keys_and_undo_keeps_the_notice_it_replaces() {
+        let mut session = session();
+        session.show_label_toast(present::LabelNotice {
+            verb: "Removed",
+            label: "travel".into(),
+            relation: "from",
+            subject: None,
+            count: 1,
+            undo: true,
+        });
+        let removal = session.toast_generation();
+        for key in [KeyId::Char('/'), KeyId::Enter] {
+            let step = session.on_key(key, 10);
+            session.dismiss_key_notice(removal, step.undo);
+            assert_eq!(
+                session.status_notice().unwrap().text,
+                "Removed “travel” from 1 conversation · u"
+            );
+        }
+        assert!(session.clear_toast_if(removal));
+
+        session.end_search();
+        session.show_toast("Archived · u", false);
+        let archive = session.toast_generation();
+        let step = session.on_key(KeyId::Char('u'), 10);
+        assert!(step.undo);
+        session.dismiss_key_notice(archive, step.undo);
+        assert_eq!(session.status_notice().unwrap().text, "Archived · u");
     }
 
     fn empty_message(expanded: bool) -> ConvMessage {

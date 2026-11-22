@@ -44,6 +44,9 @@ pub struct Search {
     accepted: Option<(u64, String)>,
     dirty: bool,
     pub refresh_started: Option<Instant>,
+    /// The notice on screen when the pending query was sent. An error reply
+    /// replaces only that notice, never one shown while the query ran.
+    toast_at_request: Option<u64>,
     pub matches: Vec<SearchMatch>,
     matches_for: Option<(u64, String)>,
 }
@@ -102,7 +105,12 @@ impl SearchReply {
                         date_unix,
                         subject: one_line(&subject),
                         snippet: one_line(&snippet),
-                        labels: Vec::new(),
+                        labels: location.as_ref().map_or_else(Vec::new, |hit| {
+                            let mut labels = hit.labels.clone();
+                            labels.sort();
+                            labels.dedup();
+                            labels
+                        }),
                         warn: false,
                         unread: location.as_ref().is_some_and(|hit| hit.unread),
                         draft: None,
@@ -376,6 +384,7 @@ impl Session {
         let query = query_key(&search.query);
         if query != search.requested {
             self.search_generation = self.search_generation.wrapping_add(1);
+            search.toast_at_request = Some(self.toast_generation);
             search.requested = query;
             search.error = None;
             search.refresh_started = None;
@@ -414,6 +423,7 @@ impl Session {
             return false;
         };
         self.search_generation = self.search_generation.wrapping_add(1);
+        search.toast_at_request = Some(self.toast_generation);
         // Keep the count for a short same-query refresh. A second request
         // after a mailbox write inherits the time spent waiting for it.
         if search.error.is_none()
@@ -579,7 +589,12 @@ impl Session {
         }
         if let Some(error) = reply.error.take() {
             // An invalid query has no result set of its own. Keep the last
-            // valid rows, cursor and reader while presenting the error.
+            // valid rows, cursor and reader while presenting the error. It
+            // replaces the notice that was up when the query was sent; a
+            // newer one (an undo, a sync) stays until its own timer ends.
+            if let Some(generation) = self.search.as_ref().unwrap().toast_at_request {
+                self.clear_toast_if(generation);
+            }
             let search = self.search.as_mut().unwrap();
             self.deferred_read = None;
             search.pending = false;
@@ -588,6 +603,7 @@ impl Session {
                 text: one_line(&error),
                 alert: true,
                 hint: None,
+                label: None,
             });
             return true;
         }
@@ -888,6 +904,7 @@ mod tests {
                         starred: false,
                         sender_name: Some("Ada".into()),
                         message_count: 3,
+                        labels: vec![],
                         has_attachment: true,
                     },
                 )
@@ -1186,6 +1203,76 @@ mod tests {
     }
 
     #[test]
+    fn a_search_error_replaces_a_label_notice_that_survived_typing() {
+        let mut session = session();
+        session.show_label_toast(crate::present::LabelNotice {
+            verb: "Removed",
+            label: "travel".into(),
+            relation: "from",
+            subject: None,
+            count: 1,
+            undo: true,
+        });
+        let removal = session.toast_generation();
+
+        session.on_key(KeyId::Char('/'), 10);
+        session.dismiss_key_notice(removal, false);
+        session.type_search("after:not-a-date");
+        session.on_key(KeyId::Enter, 10);
+        session.dismiss_key_notice(removal, false);
+        assert!(session.status_notice().unwrap().label.is_some());
+
+        let store = fell_core::Store::open_in_memory().unwrap();
+        let account = crate::fixtures::fixture_account();
+        let result = store.search(&account.id, "after:not-a-date");
+        land(
+            &mut session,
+            SearchReply::new(
+                result,
+                HashMap::new(),
+                HashMap::new(),
+                "reader@example.test",
+            ),
+        );
+        let notice = session.status_notice().unwrap();
+        assert_eq!(notice.text, "expected YYYY-MM-DD, got not-a-date");
+        assert!(notice.alert);
+        session.on_key(KeyId::Escape, 10);
+        assert!(session.status_notice().is_none());
+    }
+
+    #[test]
+    fn a_search_error_keeps_a_notice_shown_while_the_query_ran() {
+        let mut session = session();
+        session.on_key(KeyId::Char('/'), 10);
+        session.type_search("after:not-a-date");
+        session.on_key(KeyId::Enter, 10);
+        // An undo lands while the query is still pending.
+        session.show_toast("Undone", false);
+        let undone = session.toast_generation();
+
+        let store = fell_core::Store::open_in_memory().unwrap();
+        let account = crate::fixtures::fixture_account();
+        let result = store.search(&account.id, "after:not-a-date");
+        land(
+            &mut session,
+            SearchReply::new(
+                result,
+                HashMap::new(),
+                HashMap::new(),
+                "reader@example.test",
+            ),
+        );
+        assert_eq!(session.status_notice().unwrap().text, "Undone");
+
+        assert!(session.clear_toast_if(undone));
+        assert_eq!(
+            session.status_notice().unwrap().text,
+            "expected YYYY-MM-DD, got not-a-date"
+        );
+    }
+
+    #[test]
     fn tab_replaces_the_active_operator_value_and_quotes_spaces() {
         let mut session = session();
         session.on_key(KeyId::Char('/'), 10);
@@ -1322,7 +1409,7 @@ mod tests {
                 .contains("venue-2@fell.test")
         );
         assert!(
-            session.is_open(session.message_cursor),
+            session.is_open(&session.messages[session.message_cursor].id),
             "the only hall match here is folded"
         );
         session.on_key(KeyId::Char('N'), 10);

@@ -272,17 +272,7 @@ impl crate::Store {
 
     pub fn list_labels(&self, account_id: &AccountId) -> Result<Vec<String>> {
         require_account(&self.conn, account_id)?;
-        let mut stmt = self
-            .conn
-            .prepare("SELECT labels FROM messages WHERE account_id = ?1")?;
-        let rows = stmt.query_map(params![account_id.as_str()], |row| row.get::<_, String>(0))?;
-        let mut labels = std::collections::BTreeSet::new();
-        for row in rows {
-            for label in split_field(&row?) {
-                labels.insert(label);
-            }
-        }
-        Ok(labels.into_iter().collect())
+        crate::store::label_names(&self.conn, account_id)
     }
 
     pub fn add_thread_label(
@@ -737,7 +727,8 @@ impl crate::Store {
                     was_keyword,
                 ],
             )?;
-            if label_edit.is_some() {
+            if let Some(edit) = label_edit {
+                crate::outbox::labels::queue(&tx, account_id, -action.id, &new.message_id, edit)?;
                 keywords::set_message_labels(&tx, account_id, &new.message_id, &new.labels)?;
                 continue;
             }

@@ -55,12 +55,16 @@ pub(super) fn observe(
     let removed = before
         .iter()
         .any(|keyword| is_label(keyword) && !contains(&unique, keyword));
-    let added: Vec<_> = unique
+    let mut added: Vec<_> = unique
         .into_iter()
         .filter(|keyword| is_label(keyword) && !contains(&before, keyword))
         .collect();
     if !added.is_empty() {
-        expire_readd_suppression(conn, account_id, &message_id, &added)?;
+        let unsettled = crate::outbox::labels::unsettled_labels(conn, account_id, &message_id)?;
+        added.retain(|keyword| !contains(&unsettled, keyword));
+        if !added.is_empty() {
+            expire_readd_suppression(conn, account_id, &message_id, &added)?;
+        }
     }
     conn.prepare_cached(
         "UPDATE message_copies SET keywords = ?5
@@ -89,8 +93,9 @@ pub(super) fn reconcile(
     let mut managed = managed_labels(conn, account_id, message_id)?;
     let before = managed.clone();
     if check_removed && !managed.is_empty() {
+        let unsettled = crate::outbox::labels::unsettled_labels(conn, account_id, message_id)?;
         let supported = supported_keywords(conn, account_id, message_id)?;
-        managed.retain(|keyword| contains(&supported, keyword));
+        managed.retain(|keyword| contains(&supported, keyword) || contains(&unsettled, keyword));
     }
     if added.is_empty() && managed == before {
         return Ok(false);
@@ -444,6 +449,10 @@ pub(crate) fn undo_label_action(
     if is_reserved_keyword(edit.label()) && is_imap(conn, account_id)? {
         return Ok(());
     }
+    let outbox_action = match history {
+        LabelHistory::Local => action_id,
+        LabelHistory::Agent => -action_id,
+    };
     let (_, snapshots, _) = history.tables();
     let mut stmt = conn.prepare(&format!(
         "SELECT message_id, labels, label_was_keyword FROM {snapshots}
@@ -458,8 +467,21 @@ pub(crate) fn undo_label_action(
     })?;
     for row in rows {
         let (id, before, was_keyword) = row?;
-        if let Some((stored, _)) = find_stored(conn, account_id, &MessageId(id))? {
-            undo_edit(conn, account_id, &stored, edit, &before, was_keyword)?;
+        if let Some((stored, _)) = find_stored(conn, account_id, &MessageId(id.clone()))? {
+            if crate::outbox::labels::undo(conn, account_id, outbox_action, &id)? {
+                let label = edit.label();
+                let mut visible = split_field(&stored.labels);
+                if let LabelEdit::Removed(_) = edit {
+                    if !visible.iter().any(|name| name == label) {
+                        visible.push(label.to_owned());
+                    }
+                } else {
+                    visible.retain(|name| name != label);
+                }
+                write_labels(conn, account_id, &stored, &join_tokens(&visible))?;
+            } else {
+                undo_edit(conn, account_id, &stored, edit, &before, was_keyword)?;
+            }
         }
     }
     Ok(())

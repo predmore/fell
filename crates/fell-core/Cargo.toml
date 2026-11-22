@@ -20,6 +20,7 @@ test-utils = []
 
 [dependencies]
 backtrace = "0.3"
+base64 = "0.22"
 fell-confirm = { workspace = true, optional = true }
 fell-render.workspace = true
 fell-version.workspace = true
