@@ -221,8 +221,12 @@ impl Agents {
         let commands = Control::ALL.map(|control| (Action::AgentControl(control), control.key()));
         let mut items = commands
             .into_iter()
-            .chain([(Action::UndoAgentRevoke, 'u')])
-            .filter_map(|(action, key)| {
+            .map(|(action, key)| (action, key.to_string()))
+            .chain([
+                (Action::UndoAgentRevoke, "u".into()),
+                (Action::AgentActivity, "Enter".into()),
+            ])
+            .filter_map(|(action, binding)| {
                 let label = action.label();
                 fuzzy(query, label).map(|score| {
                     (
@@ -230,7 +234,7 @@ impl Agents {
                         PaletteItem {
                             action,
                             label: label.into(),
-                            binding: key.to_string(),
+                            binding,
                             search: None,
                         },
                     )
@@ -257,7 +261,7 @@ impl Agents {
                 self.column = (self.column + 1).min(self.controls() - 1);
             }
             KeyId::Left | KeyId::Char('h') => self.column = self.column.saturating_sub(1),
-            KeyId::Enter | KeyId::Space => return self.activate(self.selected, self.control()),
+            KeyId::Space => return self.activate(self.selected, self.control()),
             KeyId::Char('u') => return self.undo(),
             KeyId::Char(key) => {
                 if let Some(control) = Control::ALL

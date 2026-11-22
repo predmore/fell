@@ -187,15 +187,25 @@ impl Store {
                 crate::store::keywords::validate_label(&tx, account, label)?;
             }
         }
-        let exists = tx.query_row(
-            "SELECT EXISTS (SELECT 1 FROM messages WHERE account_id = ?1 AND thread_id = ?2)",
-            params![account.as_str(), thread.as_str()],
-            |row| row.get::<_, bool>(0),
-        )?;
-        if !exists {
+        let subject: Option<String> = tx
+            .query_row(
+                "SELECT subject FROM messages WHERE account_id = ?1 AND thread_id = ?2
+             ORDER BY date_unix ASC, rowid ASC LIMIT 1",
+                params![account.as_str(), thread.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(subject) = subject else {
             return Err(Error::UnknownThread);
-        }
-        let action = insert_action(&tx, account, &format!("agent:{agent}"), "annotate", &reason)?;
+        };
+        let action = insert_action(
+            &tx,
+            account,
+            &format!("agent:{agent}"),
+            "annotate",
+            &reason,
+            Some(&subject),
+        )?;
         tx.execute(
             "UPDATE thread_notes SET active = 0
              WHERE account_id = ?1 AND thread_id = ?2 AND actor = ?3 AND active = 1",

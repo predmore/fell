@@ -157,7 +157,9 @@ CREATE TABLE IF NOT EXISTS agent_actions (
     kind TEXT NOT NULL,
     summary TEXT NOT NULL,
     undone INTEGER NOT NULL DEFAULT 0,
-    created_unix INTEGER NOT NULL
+    created_unix INTEGER NOT NULL,
+    target_subject TEXT,
+    conversation_count INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_agent_actions_account ON agent_actions(account_id, id);
@@ -178,11 +180,15 @@ CREATE TABLE IF NOT EXISTS agent_action_messages (
     FOREIGN KEY(action_id) REFERENCES agent_actions(id)
 );
 
+CREATE INDEX IF NOT EXISTS idx_agent_action_messages_action ON agent_action_messages(action_id);
+
 CREATE TABLE IF NOT EXISTS agent_action_drafts (
     action_id INTEGER NOT NULL,
     draft_id INTEGER NOT NULL,
     FOREIGN KEY(action_id) REFERENCES agent_actions(id)
 );
+
+CREATE INDEX IF NOT EXISTS idx_agent_action_drafts_action ON agent_action_drafts(action_id);
 
 CREATE TABLE IF NOT EXISTS review_drafts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4348,6 +4354,21 @@ fn ensure_compose_columns(conn: &Connection) -> Result<()> {
 }
 
 fn ensure_agent_action_columns(conn: &Connection) -> Result<()> {
+    let actions = column_names(conn, "agent_actions")?;
+    for (name, kind) in [
+        ("target_subject", "TEXT"),
+        ("conversation_count", "INTEGER"),
+    ] {
+        if !actions.iter().any(|column| column == name)
+            && let Err(err) = conn.execute(
+                &format!("ALTER TABLE agent_actions ADD COLUMN {name} {kind}"),
+                [],
+            )
+            && !duplicate_column(&err)
+        {
+            return Err(err.into());
+        }
+    }
     let have = column_names(conn, "agent_action_messages")?;
     if have.iter().any(|column| column == "starred") {
         return Ok(());

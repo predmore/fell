@@ -14,9 +14,21 @@ use crate::store::{SELECT_MESSAGE_COLS, join_tokens, row_to_message, split_field
 use crate::threading::ThreadId;
 use crate::{Error, Result};
 
+mod activity;
+pub use activity::{ActivityDirection, AgentActivity, AgentActivityPage, BULK_UNDO_THRESHOLD};
+
 const ACTION_COLS: &str = "id, account_id, actor, kind, summary, undone, created_unix";
 const SNOOZE_SUMMARY_PREFIX: &str = "snoozed thread until ";
-pub(crate) const SNOOZE_CHANGED_NOTICE: &str = "Snooze already changed";
+pub const SNOOZE_CHANGED_NOTICE: &str = "Snooze already changed";
+
+enum UndoSelection {
+    Latest,
+    Expected(i64),
+    Activity {
+        id: i64,
+        confirmed_bulk: Option<u32>,
+    },
+}
 
 /// Per-agent access to one account. Missing rows are [`AgentGrant::DISABLED`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -557,7 +569,14 @@ impl crate::Store {
         )?;
         let draft_id = tx.last_insert_rowid();
         let summary = format!("saved review draft {draft_id}");
-        let action = insert_action(&tx, &input.account_id, actor, "draft", &summary)?;
+        let action = insert_action(
+            &tx,
+            &input.account_id,
+            actor,
+            "draft",
+            &summary,
+            Some(&input.subject),
+        )?;
         tx.execute(
             "INSERT INTO agent_action_drafts (action_id, draft_id) VALUES (?1, ?2)",
             params![action.id, draft_id],
@@ -662,37 +681,45 @@ impl crate::Store {
         self.undo_checked(
             account_id,
             Some(require_token(actor, "actor")?),
-            Some(expected),
+            UndoSelection::Expected(expected),
         )
     }
 
     fn undo_inner(&self, account_id: &AccountId, actor: Option<&str>) -> Result<RecordedAction> {
-        self.undo_checked(account_id, actor, None)
+        self.undo_checked(account_id, actor, UndoSelection::Latest)
     }
 
     fn undo_checked(
         &self,
         account_id: &AccountId,
         actor: Option<&str>,
-        expected: Option<i64>,
+        selection: UndoSelection,
     ) -> Result<RecordedAction> {
         let tx = crate::store::immediate_transaction(&self.conn)?;
         require_account(&tx, account_id)?;
-        let Some(mut action) = find_open_action(&tx, account_id, actor)? else {
-            return Err(Error::NothingToUndo);
+        let (mut action, check_grant) = match selection {
+            UndoSelection::Activity { id, confirmed_bulk } => (
+                activity::check_undo(&tx, account_id, id, confirmed_bulk)?,
+                true,
+            ),
+            UndoSelection::Latest | UndoSelection::Expected(_) => {
+                let action =
+                    find_open_action(&tx, account_id, actor)?.ok_or(Error::NothingToUndo)?;
+                if matches!(selection, UndoSelection::Expected(id) if id != action.id) {
+                    return Err(Error::Action(
+                        "The latest action changed; retry undo".into(),
+                    ));
+                }
+                (action, actor.is_some())
+            }
         };
-        if expected.is_some_and(|id| id != action.id) {
-            return Err(Error::Action(
-                "The latest action changed; retry undo".into(),
-            ));
-        }
-        if let Some(actor) = actor {
+        if check_grant {
             let scope = match action.kind.as_str() {
                 "draft" => WriteScope::Draft,
                 "annotate" => WriteScope::Annotate,
                 _ => WriteScope::Triage,
             };
-            check_actor_grant(&tx, account_id, actor, scope)?;
+            check_actor_grant(&tx, account_id, &action.actor, scope)?;
         }
         if undo_action(&tx, account_id, &action)? == UndoEffect::SnoozeChanged {
             action.summary = SNOOZE_CHANGED_NOTICE.into();
@@ -779,7 +806,10 @@ fn mutate_thread_in(
     if writes.is_empty() {
         return Ok(None);
     }
-    let action = insert_action(conn, account_id, actor, kind, summary)?;
+    let subject = messages
+        .first()
+        .map(|message| message.headers.subject.as_str());
+    let action = insert_action(conn, account_id, actor, kind, summary, subject)?;
     for (old, new) in &writes {
         let was_keyword = label_edit
             .map(|edit| keywords::record_edit(conn, account_id, &new.message_id, edit, &old.labels))
@@ -1185,13 +1215,14 @@ pub(crate) fn insert_action(
     actor: &str,
     kind: &str,
     summary: &str,
+    subject: Option<&str>,
 ) -> Result<RecordedAction> {
     let created_unix = now_unix();
     conn.execute(
         "INSERT INTO agent_actions (
-            account_id, actor, kind, summary, undone, created_unix
-         ) VALUES (?1, ?2, ?3, ?4, 0, ?5)",
-        params![account_id.as_str(), actor, kind, summary, created_unix],
+            account_id, actor, kind, summary, undone, created_unix, target_subject, conversation_count
+         ) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, 1)",
+        params![account_id.as_str(), actor, kind, summary, created_unix, subject],
     )?;
     Ok(RecordedAction {
         id: conn.last_insert_rowid(),
@@ -1423,6 +1454,213 @@ mod tests {
     use crate::Store;
     use crate::account::{Account, BackendKind};
     use crate::message::{Address, MessageHeaders, RemoteId};
+
+    #[test]
+    fn activity_lists_and_pages_agent_rows_by_account_and_actor() {
+        let (store, account, thread) = seeded();
+        for agent in ["fern", "reed"] {
+            store
+                .set_agent_grant(&account, agent, AgentGrant::enabled(false, true, false))
+                .unwrap();
+        }
+        let first = store
+            .mark_thread_read(&account, &thread, "agent:fern")
+            .unwrap()
+            .unwrap();
+        let second = store
+            .star_thread(&account, &thread, true, "agent:reed")
+            .unwrap()
+            .unwrap();
+        let last = store
+            .agent_archive_thread(&account, &thread, "agent:fern")
+            .unwrap()
+            .unwrap();
+        store.mark_thread_unread(&account, &thread, "user").unwrap();
+        // Simulate a row written before activity began storing targets.
+        store
+            .conn
+            .execute(
+                "UPDATE agent_actions SET target_subject = NULL, conversation_count = NULL
+                            WHERE id = ?1",
+                [first.id],
+            )
+            .unwrap();
+        let read = |agent, direction| store.agent_activity(&account, agent, direction, 2).unwrap();
+        let ids = |page: &AgentActivityPage| {
+            page.entries
+                .iter()
+                .map(|entry| entry.action.id)
+                .collect::<Vec<_>>()
+        };
+        let latest = read(None, ActivityDirection::Latest);
+        assert_eq!(ids(&latest), [last.id, second.id]);
+        assert!(!latest.has_newer && latest.has_older);
+        let older = read(None, ActivityDirection::Older(second.id));
+        assert_eq!(ids(&older), [first.id]);
+        assert!(older.has_newer && !older.has_older);
+        assert_eq!(older.entries[0].subject.as_deref(), Some("Invoice March"));
+        assert_eq!(older.entries[0].conversations, 1);
+        assert_eq!(
+            ids(&read(None, ActivityDirection::Newer(first.id))),
+            ids(&latest)
+        );
+        assert_eq!(
+            ids(&read(Some("fern"), ActivityDirection::Latest)),
+            [last.id, first.id]
+        );
+        assert!(
+            store
+                .agent_activity(
+                    &AccountId("other".into()),
+                    None,
+                    ActivityDirection::Latest,
+                    2
+                )
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn activity_undo_targets_the_id_and_rechecks_the_grant() {
+        let (store, account, thread) = seeded();
+        let grant = AgentGrant::enabled(false, true, false);
+        store.set_agent_grant(&account, "fern", grant).unwrap();
+        store.set_agent_grant(&account, "reed", grant).unwrap();
+        let read = store
+            .mark_thread_read(&account, &thread, "agent:fern")
+            .unwrap()
+            .unwrap();
+        let starred = store
+            .star_thread(&account, &thread, true, "agent:reed")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .undo_agent_activity(&account, read.id, None)
+                .unwrap_err()
+                .to_string(),
+            "Undo the newer action first"
+        );
+        store
+            .set_agent_grant(&account, "reed", AgentGrant::DISABLED)
+            .unwrap();
+        assert_eq!(
+            store
+                .undo_agent_activity(&account, starred.id, None)
+                .unwrap_err()
+                .to_string(),
+            "agent reed is disabled"
+        );
+        assert!(only_message(&store, &account, &thread)[0].starred);
+        store.set_agent_grant(&account, "reed", grant).unwrap();
+        assert_eq!(
+            store
+                .undo_agent_activity(&account, starred.id, None)
+                .unwrap()
+                .id,
+            starred.id
+        );
+        let messages = only_message(&store, &account, &thread);
+        assert!(!messages[0].starred && !messages[0].unread);
+        assert_eq!(
+            store
+                .undo_agent_activity(&account, starred.id, None)
+                .unwrap_err()
+                .to_string(),
+            "Action already undone"
+        );
+        assert_eq!(
+            store
+                .undo_agent_activity(&account, read.id, None)
+                .unwrap()
+                .id,
+            read.id
+        );
+        assert!(only_message(&store, &account, &thread)[0].unread);
+    }
+
+    #[test]
+    fn activity_bulk_undo_requires_confirmation_for_the_displayed_count() {
+        let (store, account, _) = seeded();
+        store
+            .set_agent_grant(&account, "fern", AgentGrant::enabled(false, true, false))
+            .unwrap();
+        let mut threads = Vec::new();
+        let mut actions = Vec::new();
+        for index in 0..=BULK_UNDO_THRESHOLD {
+            let thread = store
+                .upsert_message(&message(
+                    account.as_str(),
+                    &format!("bulk-{index}@example.test"),
+                    None,
+                    &format!("Item {index}"),
+                    "Demo body",
+                    false,
+                    &["INBOX"],
+                    &[],
+                    10,
+                ))
+                .unwrap();
+            let action = store
+                .agent_archive_thread(&account, &thread, "agent:fern")
+                .unwrap()
+                .unwrap();
+            threads.push(thread);
+            actions.push(action.id);
+        }
+        // The public tools only accept one thread. Group snapshots in a fixture
+        // to exercise the bulk path through the real archive undo.
+        let id = actions.pop().unwrap();
+        for other in actions {
+            store
+                .conn
+                .execute(
+                    "UPDATE agent_action_messages SET action_id = ?1 WHERE action_id = ?2",
+                    params![id, other],
+                )
+                .unwrap();
+            store
+                .conn
+                .execute("DELETE FROM agent_actions WHERE id = ?1", [other])
+                .unwrap();
+        }
+        store
+            .conn
+            .execute(
+                "UPDATE agent_actions SET target_subject = NULL, conversation_count = NULL
+                            WHERE id = ?1",
+                [id],
+            )
+            .unwrap();
+        let page = store
+            .agent_activity(&account, None, ActivityDirection::Latest, 2)
+            .unwrap();
+        assert_eq!(page.entries[0].conversations, BULK_UNDO_THRESHOLD + 1);
+        for confirmed in [None, Some(BULK_UNDO_THRESHOLD)] {
+            assert_eq!(
+                store
+                    .undo_agent_activity(&account, id, confirmed)
+                    .unwrap_err()
+                    .to_string(),
+                "Confirm undo for this bulk action"
+            );
+        }
+        assert!(
+            threads
+                .iter()
+                .all(|thread| only_message(&store, &account, thread)[0].archived)
+        );
+        store
+            .undo_agent_activity(&account, id, Some(BULK_UNDO_THRESHOLD + 1))
+            .unwrap();
+        assert!(
+            threads
+                .iter()
+                .all(|thread| !only_message(&store, &account, thread)[0].archived)
+        );
+    }
 
     fn account(id: &str) -> Account {
         Account {
@@ -2322,7 +2560,9 @@ mod tests {
         assert_eq!(folded[0].snooze_until, echo.snooze_until);
         assert_eq!(folded[1].snooze_until, Some(until));
 
-        let retired = store.agent_undo(&account).unwrap();
+        let retired = store
+            .undo_agent_activity(&account, snooze.id, None)
+            .unwrap();
         assert_eq!(retired.id, snooze.id);
         assert_eq!(retired.summary, "Snooze already changed");
         assert!(retired.undone);

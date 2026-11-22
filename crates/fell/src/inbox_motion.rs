@@ -114,7 +114,8 @@ pub struct Layer {
     folder_index: usize,
     folder_intent: FolderIntent,
     agents: Option<crate::model::agents::Agents>,
-    palette_from_agents: bool,
+    activity: Option<crate::model::activity::Activity>,
+    palette_origin: Overlay,
     pub label_target: Option<String>,
     pub picker_choices: Vec<PickerChoice>,
     pub label_marks: f32,
@@ -135,8 +136,13 @@ impl Layer {
             folder_query: session.folder_query.clone(),
             folder_index: session.folder_index,
             folder_intent: session.folder_intent,
-            agents: (session.overlay == Overlay::Agents).then(|| session.agents.clone()),
-            palette_from_agents: session.palette_from_agents,
+            agents: (session.overlay == Overlay::Agents
+                || session.palette_origin == Overlay::Agents)
+                .then(|| session.agents.clone()),
+            activity: (session.overlay == Overlay::AgentActivity
+                || session.palette_origin == Overlay::AgentActivity)
+                .then(|| session.activity.clone()),
+            palette_origin: session.palette_origin.clone(),
             label_target: session.label_target(),
             picker_choices,
             label_marks,
@@ -156,10 +162,10 @@ impl Layer {
         if let Some(agents) = &mut self.agents {
             std::mem::swap(agents, &mut session.agents);
         }
-        std::mem::swap(
-            &mut self.palette_from_agents,
-            &mut session.palette_from_agents,
-        );
+        if let Some(activity) = &mut self.activity {
+            std::mem::swap(activity, &mut session.activity);
+        }
+        std::mem::swap(&mut self.palette_origin, &mut session.palette_origin);
     }
 }
 

@@ -463,6 +463,32 @@ fn agent_row(
                         .text_size(px(theme.ui_px - 2.))
                         .text_color(rgb(dim))
                         .child(last_action),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(theme.ui_px - 2.))
+                        .text_color(rgb(fg))
+                        .child("Activity")
+                        .when_some(cx.as_deref_mut(), |button, cx| {
+                            button.cursor_pointer().on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |inbox, _, _, cx| {
+                                    cx.stop_propagation();
+                                    if inbox.session.overlay == Overlay::Agents
+                                        && inbox.session.agents.confirm.is_none()
+                                    {
+                                        inbox.session.agents.select(index);
+                                        let before = inbox.before_step();
+                                        let step = inbox.session.perform(
+                                            crate::keymap::Action::AgentActivity,
+                                            inbox.page_rows(),
+                                        );
+                                        inbox.apply_step(step, before, cx);
+                                    }
+                                }),
+                            )
+                        }),
                 ),
         )
         .child(

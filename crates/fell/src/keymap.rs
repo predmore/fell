@@ -77,6 +77,8 @@ pub enum Action {
     About,
     ReopenReview,
     Agents,
+    AgentActivity,
+    UndoAgentActivity,
     AgentControl(crate::model::agents::Control),
     UndoAgentRevoke,
     OpenDiagnosticLog,
@@ -143,6 +145,8 @@ impl Action {
             Self::About => "About Fell",
             Self::ReopenReview => "Reopen agent review",
             Self::Agents => "Agents",
+            Self::AgentActivity => "Agent activity",
+            Self::UndoAgentActivity => "Undo selected agent action",
             Self::AgentControl(control) => control.command(),
             Self::UndoAgentRevoke => "Undo agent revoke",
             Self::OpenDiagnosticLog => "Open diagnostic log",
@@ -210,6 +214,7 @@ const ALL_ACTIONS: &[Action] = &[
     Action::Help,
     Action::ReopenReview,
     Action::Agents,
+    Action::AgentActivity,
     Action::OpenDiagnosticLog,
     Action::OpenCrashReport,
     Action::ToggleAgentNote,
@@ -422,6 +427,7 @@ fn default_bindings() -> Vec<Binding> {
         Some("Agents"),
     );
     for (key, action) in [
+        ('l', Action::AgentActivity),
         ('n', Action::ToggleAgentNote),
         ('x', Action::DismissAgentNote),
         ('j', Action::NextAgentNote),
