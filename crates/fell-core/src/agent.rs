@@ -15,8 +15,10 @@ use crate::threading::ThreadId;
 use crate::{Error, Result};
 
 mod activity;
+mod undo_conflicts;
 pub use activity::{
-    ActivityBlocker, ActivityDirection, AgentActivity, AgentActivityPage, BULK_UNDO_THRESHOLD,
+    ActivityBlocker, ActivityDirection, ActivityGrant, AgentActivity, AgentActivityPage,
+    BLOCKER_MAILBOX_CHANGED, BULK_UNDO_THRESHOLD,
 };
 
 const ACTION_COLS: &str = "id, account_id, actor, kind, summary, undone, created_unix";
@@ -167,6 +169,14 @@ pub(crate) enum WriteScope {
 }
 
 impl WriteScope {
+    fn for_undo(kind: &str) -> Self {
+        match kind {
+            "draft" => Self::Draft,
+            "annotate" => Self::Annotate,
+            _ => Self::Triage,
+        }
+    }
+
     fn permission(self, grant: AgentGrant) -> (bool, &'static str) {
         match self {
             Self::Triage => (grant.triage, "Triage"),
@@ -487,33 +497,19 @@ impl crate::Store {
         }
         let roles = self.folder_roles(account_id)?;
         check_agent_move(&roles, &from, &to)?;
-        let to_inbox = same_folder(&to, "INBOX");
         let to_archive = role_with_alias(&roles, &to) == Some(FolderRole::Archive)
             || same_folder(&to, "Archive");
-        let from_inbox = same_folder(&from, "INBOX");
         let summary = format!("moved thread from {from} to {to}");
         let mut found = false;
         let action =
             self.mutate_thread(account_id, thread_id, actor, "move", summary, |message| {
-                let implied_inbox = from_inbox && message.folders.is_empty() && !message.archived;
-                let before = message.folders.len();
-                message.folders.retain(|folder| !same_folder(folder, &from));
-                if message.folders.len() == before && !implied_inbox {
-                    return;
-                }
-                found = true;
-                if !message
-                    .folders
-                    .iter()
-                    .any(|folder| same_folder(folder, &to))
-                {
-                    message.folders.push(to.clone());
-                }
-                if to_inbox {
-                    message.archived = false;
-                } else if to_archive {
-                    message.archived = true;
-                }
+                found |= move_folders(
+                    &mut message.folders,
+                    &mut message.archived,
+                    &from,
+                    &to,
+                    to_archive,
+                );
             })?;
         if !found {
             return Err(Error::Invalid(format!("no messages in {from}")));
@@ -728,18 +724,23 @@ impl crate::Store {
             }
         };
         if check_grant {
-            let scope = match action.kind.as_str() {
-                "draft" => WriteScope::Draft,
-                "annotate" => WriteScope::Annotate,
-                _ => WriteScope::Triage,
-            };
+            let scope = WriteScope::for_undo(&action.kind);
             if interactive {
                 activity::check_grant(&tx, account_id, &action.actor, scope)?;
             } else {
                 check_actor_grant(&tx, account_id, &action.actor, scope)?;
             }
         }
-        if undo_action(&tx, account_id, &action)? == UndoEffect::SnoozeChanged {
+        let result = undo_action(&tx, account_id, &action);
+        let result = match result {
+            Err(Error::AgentActivityBlocked(_))
+                if !interactive && matches!(action.kind.as_str(), "snooze" | "unsnooze") =>
+            {
+                Err(snooze_changed_error())
+            }
+            result => result,
+        };
+        if result? == UndoEffect::SnoozeChanged {
             action.summary = SNOOZE_CHANGED_NOTICE.into();
         } else if action.kind == "snooze" {
             crate::notes::undo_snooze_acceptance(&tx, action.id)?;
@@ -835,8 +836,8 @@ fn mutate_thread_in(
         conn.execute(
             "INSERT INTO agent_action_messages (
                     action_id, message_id, labels, folders, unread, archived, snooze_until,
-                    starred, label_was_keyword
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    starred, label_was_keyword, after_folders, after_archived
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 action.id,
                 old.message_id,
@@ -847,6 +848,8 @@ fn mutate_thread_in(
                 old.snooze_until,
                 old.starred,
                 was_keyword,
+                matches!(kind, "archive" | "move").then_some(&new.folders),
+                matches!(kind, "archive" | "move").then_some(new.archived),
             ],
         )?;
         if let Some(edit) = label_edit {
@@ -896,7 +899,14 @@ fn undo_action(
     account_id: &AccountId,
     action: &RecordedAction,
 ) -> Result<UndoEffect> {
-    let effect = if action.kind == "snooze" && !check_snooze_undo(conn, account_id, action)? {
+    if matches!(action.kind.as_str(), "archive" | "move")
+        && let Some(blocker) = undo_conflicts::folder_blocker(conn, action)?
+    {
+        return Err(Error::AgentActivityBlocked(blocker));
+    }
+    let effect = if matches!(action.kind.as_str(), "snooze" | "unsnooze")
+        && !check_snooze_undo(conn, account_id, action)?
+    {
         UndoEffect::SnoozeChanged
     } else {
         match action.kind.as_str() {
@@ -933,7 +943,15 @@ pub(crate) fn undo_recorded(
     if action.undone {
         return Ok(UndoEffect::Restored);
     }
-    undo_action(conn, account_id, &action)
+    undo_action(conn, account_id, &action).map_err(|err| {
+        if matches!(err, Error::AgentActivityBlocked(_))
+            && matches!(action.kind.as_str(), "snooze" | "unsnooze")
+        {
+            snooze_changed_error()
+        } else {
+            err
+        }
+    })
 }
 
 pub(crate) fn read_grant(
@@ -1101,6 +1119,30 @@ fn canonical_folder(folder: &str) -> Result<String> {
 }
 
 /// Same folder, ignoring ASCII case and folder aliases (Archive/Archived).
+fn move_folders(
+    folders: &mut Vec<String>,
+    archived: &mut bool,
+    from: &str,
+    to: &str,
+    to_archive: bool,
+) -> bool {
+    let implied_inbox = same_folder(from, "INBOX") && folders.is_empty() && !*archived;
+    let before = folders.len();
+    folders.retain(|folder| !same_folder(folder, from));
+    if folders.len() == before && !implied_inbox {
+        return false;
+    }
+    if !folders.iter().any(|folder| same_folder(folder, to)) {
+        folders.push(to.to_owned());
+    }
+    if same_folder(to, "INBOX") {
+        *archived = false;
+    } else if to_archive {
+        *archived = true;
+    }
+    true
+}
+
 fn same_folder(a: &str, b: &str) -> bool {
     if a.eq_ignore_ascii_case(b) {
         return true;
@@ -1242,8 +1284,13 @@ pub(crate) fn insert_action(
     let created_unix = now_unix();
     conn.execute(
         "INSERT INTO agent_actions (
-            account_id, actor, kind, summary, undone, created_unix, target_subject, conversation_count
-         ) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, 1)",
+            account_id, actor, kind, summary, undone, created_unix, target_subject, conversation_count,
+            local_action_floor, outbox_floor
+         ) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, 1,
+                   CASE WHEN ?3 IN ('archive', 'move') THEN
+                       COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'local_actions'), 0) END,
+                   CASE WHEN ?3 IN ('archive', 'move') THEN
+                       COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'server_outbox'), 0) END)",
         params![account_id.as_str(), actor, kind, summary, created_unix, subject],
     )?;
     Ok(RecordedAction {
@@ -1361,39 +1408,41 @@ fn check_snooze_undo(
     account_id: &AccountId,
     action: &RecordedAction,
 ) -> Result<bool> {
-    // Existing log entries already record the written timestamp in the summary.
-    let Some(until) = action
+    let until = if action.kind == "unsnooze" {
+        None
+    } else if let Some(until) = action
         .summary
         .strip_prefix(SNOOZE_SUMMARY_PREFIX)
         .and_then(|value| value.parse::<i64>().ok())
-    else {
+    {
+        Some(until)
+    } else {
         return Ok(false);
     };
-    // A missing row needs no restore. Prefer a mismatch with a newer
-    // undoable write over one that can only be retired.
-    let newer_write: Option<bool> = conn
-        .query_row(
-            "SELECT EXISTS (
-                SELECT 1 FROM agent_actions AS newer
-                JOIN agent_action_messages AS saved ON saved.action_id = newer.id
-                WHERE newer.account_id = ?2 AND newer.id > ?1 AND newer.undone = 0
-                  AND saved.message_id = m.message_id
-                  AND ((newer.kind = 'unsnooze' AND m.snooze_until IS NULL)
-                    OR (newer.kind = 'snooze' AND newer.summary = ?4 || m.snooze_until))
-             )
-             FROM agent_action_messages AS s
-             JOIN messages AS m ON m.account_id = ?2 AND m.message_id = s.message_id
-             WHERE s.action_id = ?1 AND m.snooze_until IS NOT ?3
-             ORDER BY 1 DESC LIMIT 1",
-            params![action.id, account_id.as_str(), until, SNOOZE_SUMMARY_PREFIX],
-            |row| row.get(0),
-        )
-        .optional()?;
-    match newer_write {
-        Some(true) => Err(snooze_changed_error()),
-        Some(false) => Ok(false),
-        None => Ok(true),
+    let blocker = conn.query_row(
+        "SELECT n.id, n.actor, n.kind, n.created_unix
+         FROM agent_action_messages s
+         JOIN messages m ON m.account_id = ?2 AND m.message_id = s.message_id
+         JOIN agent_action_messages saved ON saved.message_id = m.message_id AND saved.action_id > ?1
+         JOIN agent_actions n ON n.id = saved.action_id AND n.account_id = ?2 AND n.undone = 0
+         WHERE s.action_id = ?1 AND m.snooze_until IS NOT ?3
+           AND ((n.kind = 'unsnooze' AND m.snooze_until IS NULL)
+                OR (n.kind = 'snooze' AND n.summary = ?4 || m.snooze_until))
+         ORDER BY n.id DESC LIMIT 1",
+        params![action.id, account_id.as_str(), until, SNOOZE_SUMMARY_PREFIX],
+        |row| activity::map_blocker(row, 0),
+    ).optional()?.flatten();
+    if let Some(blocker) = blocker {
+        return Err(Error::AgentActivityBlocked(blocker));
     }
+    // A missing row needs no restore.
+    Ok(!conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM agent_action_messages s
+         JOIN messages m ON m.account_id = ?2 AND m.message_id = s.message_id
+         WHERE s.action_id = ?1 AND m.snooze_until IS NOT ?3)",
+        params![action.id, account_id.as_str(), until],
+        |row| row.get::<_, bool>(0),
+    )?)
 }
 
 fn snooze_changed_error() -> Error {
@@ -1701,6 +1750,133 @@ mod tests {
             read.id
         );
         assert!(!page().entries[0].action.undone);
+    }
+
+    #[test]
+    fn activity_folder_undo_preserves_a_newer_agents_move() {
+        let (store, account, thread) = seeded();
+        for agent in ["fern", "reed"] {
+            store
+                .set_agent_grant(&account, agent, AgentGrant::enabled(false, true, false))
+                .unwrap();
+        }
+        let fern = store
+            .agent_move_thread(&account, &thread, "INBOX", "Work", "agent:fern")
+            .unwrap()
+            .unwrap();
+        let reed = store
+            .agent_move_thread(&account, &thread, "Work", "Later", "agent:reed")
+            .unwrap()
+            .unwrap();
+        let live = only_message(&store, &account, &thread);
+        let page = store
+            .agent_activity(&account, Some("fern"), ActivityDirection::Latest, 10)
+            .unwrap();
+        assert_eq!(page.entries[0].blocker.as_ref().unwrap().id, reed.id);
+        assert!(matches!(store.undo_agent_activity(&account, fern.id, None),
+            Err(Error::AgentActivityBlocked(blocker)) if blocker.id == reed.id && blocker.actor == "agent:reed"));
+        assert_eq!(only_message(&store, &account, &thread), live);
+        store.undo_agent_activity(&account, reed.id, None).unwrap();
+        store.undo_agent_activity(&account, fern.id, None).unwrap();
+    }
+
+    #[test]
+    fn activity_folder_undo_preserves_a_newer_local_move() {
+        let (store, account, thread) = seeded();
+        store
+            .set_agent_grant(&account, "fern", AgentGrant::enabled(false, true, false))
+            .unwrap();
+        let fern = store
+            .agent_move_thread(&account, &thread, "INBOX", "Work", "agent:fern")
+            .unwrap()
+            .unwrap();
+        let local = store
+            .move_thread(&account, &thread, "Work", "Later")
+            .unwrap();
+        let live = only_message(&store, &account, &thread);
+        assert!(matches!(store.undo_agent_activity(&account, fern.id, None),
+            Err(Error::AgentActivityBlocked(blocker)) if blocker.id == local.id && blocker.actor == "local"));
+        assert_eq!(only_message(&store, &account, &thread), live);
+        store.undo(&account).unwrap();
+        store.undo_agent_activity(&account, fern.id, None).unwrap();
+    }
+
+    #[test]
+    fn activity_archive_undo_checks_pending_moves_and_changes_without_history() {
+        let (store, account, thread) = seeded();
+        store
+            .set_agent_grant(&account, "fern", AgentGrant::enabled(false, true, false))
+            .unwrap();
+        let archive = store
+            .agent_archive_thread(&account, &thread, "agent:fern")
+            .unwrap()
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO server_outbox
+             (account_id, kind, state, message_id, source_folder, target_folder, created_unix)
+             SELECT ?2, 'move', 'pending', message_id, 'Work', 'Later', ?3
+             FROM agent_action_messages WHERE action_id = ?1 LIMIT 1",
+                params![archive.id, account.as_str(), archive.created_unix],
+            )
+            .unwrap();
+        assert!(
+            matches!(store.undo_agent_activity(&account, archive.id, None),
+            Err(Error::AgentActivityBlocked(blocker)) if blocker.actor == "outbox")
+        );
+        store
+            .conn
+            .execute("UPDATE server_outbox SET state = 'done'", [])
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE messages SET archived = 0 WHERE account_id = ?1",
+                [account.as_str()],
+            )
+            .unwrap();
+        let live = only_message(&store, &account, &thread);
+        assert!(
+            matches!(store.undo_agent_activity(&account, archive.id, None),
+            Err(Error::AgentActivityBlocked(blocker)) if blocker.kind == BLOCKER_MAILBOX_CHANGED)
+        );
+        assert_eq!(only_message(&store, &account, &thread), live);
+    }
+
+    #[test]
+    fn activity_unsnooze_undo_preserves_a_newer_agents_snooze() {
+        let (store, account, thread) = seeded();
+        for agent in ["ada", "bo"] {
+            store
+                .set_agent_grant(&account, agent, AgentGrant::enabled(false, true, false))
+                .unwrap();
+        }
+        let before = now_unix() + 3600;
+        store
+            .snooze_thread(&account, &thread, before, "agent:ada")
+            .unwrap();
+        let cleared = store
+            .unsnooze_thread(&account, &thread, "agent:ada")
+            .unwrap()
+            .unwrap();
+        let newer = store
+            .snooze_thread(&account, &thread, before + 3600, "agent:bo")
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(store.undo_agent_activity(&account, cleared.id, None),
+            Err(Error::AgentActivityBlocked(blocker)) if blocker.id == newer.id && blocker.actor == "agent:bo")
+        );
+        assert!(
+            only_message(&store, &account, &thread)
+                .iter()
+                .all(|mail| mail.snooze_until == Some(before + 3600))
+        );
+        store.undo_agent_activity(&account, newer.id, None).unwrap();
+        store
+            .undo_agent_activity(&account, cleared.id, None)
+            .unwrap();
     }
 
     #[test]

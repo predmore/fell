@@ -160,7 +160,9 @@ CREATE TABLE IF NOT EXISTS agent_actions (
     undone INTEGER NOT NULL DEFAULT 0,
     created_unix INTEGER NOT NULL,
     target_subject TEXT,
-    conversation_count INTEGER
+    conversation_count INTEGER,
+    local_action_floor INTEGER,
+    outbox_floor INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_agent_actions_account ON agent_actions(account_id, id);
@@ -180,10 +182,13 @@ CREATE TABLE IF NOT EXISTS agent_action_messages (
     -- NULL on rows logged before star was undoable: undo leaves the star.
     starred INTEGER,
     label_was_keyword INTEGER,
+    after_folders TEXT,
+    after_archived INTEGER,
     FOREIGN KEY(action_id) REFERENCES agent_actions(id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_agent_action_messages_action ON agent_action_messages(action_id);
+CREATE INDEX IF NOT EXISTS idx_agent_action_messages_message ON agent_action_messages(message_id, action_id);
 
 CREATE TABLE IF NOT EXISTS agent_action_drafts (
     action_id INTEGER NOT NULL,
@@ -4361,6 +4366,8 @@ fn ensure_agent_action_columns(conn: &Connection) -> Result<()> {
     for (name, kind) in [
         ("target_subject", "TEXT"),
         ("conversation_count", "INTEGER"),
+        ("local_action_floor", "INTEGER"),
+        ("outbox_floor", "INTEGER"),
     ] {
         if !actions.iter().any(|column| column == name)
             && let Err(err) = conn.execute(
@@ -4373,15 +4380,20 @@ fn ensure_agent_action_columns(conn: &Connection) -> Result<()> {
         }
     }
     let have = column_names(conn, "agent_action_messages")?;
-    if have.iter().any(|column| column == "starred") {
-        return Ok(());
-    }
-    if let Err(err) = conn.execute(
-        "ALTER TABLE agent_action_messages ADD COLUMN starred INTEGER",
-        [],
-    ) && !duplicate_column(&err)
-    {
-        return Err(err.into());
+    for (name, kind) in [
+        ("starred", "INTEGER"),
+        ("after_folders", "TEXT"),
+        ("after_archived", "INTEGER"),
+    ] {
+        if !have.iter().any(|column| column == name)
+            && let Err(err) = conn.execute(
+                &format!("ALTER TABLE agent_action_messages ADD COLUMN {name} {kind}"),
+                [],
+            )
+            && !duplicate_column(&err)
+        {
+            return Err(err.into());
+        }
     }
     Ok(())
 }

@@ -2,7 +2,9 @@
 
 use std::time::{Duration, Instant};
 
-use fell_core::agent::{AgentActivity, SNOOZE_CHANGED_NOTICE};
+use fell_core::agent::{
+    ActivityBlocker, ActivityGrant, AgentActivity, BLOCKER_MAILBOX_CHANGED, SNOOZE_CHANGED_NOTICE,
+};
 use gpui::{
     Context, Div, FontWeight, InteractiveElement, MouseButton, ParentElement, ScrollHandle,
     StatefulInteractiveElement, Styled, div, point, prelude::FluentBuilder, px, rgb,
@@ -16,12 +18,12 @@ use crate::model::{
     activity::{Activity, Request},
 };
 use crate::motion::{self, Motion, Transition};
-use crate::present::{absolute_date, display_safe, relative_date};
+use crate::present::{activity_time, compact_relative_date, display_safe, relative_date};
 use crate::theme::{Theme, ensure_all};
 
 const ROW_HEIGHT: f32 = 54.;
 const TITLE_HEIGHT: f32 = 48.;
-const FOOTER_HEIGHT: f32 = 84.;
+const FOOTER_HEIGHT: f32 = 64.;
 const LOADING_DELAY: Duration = Duration::from_millis(150);
 
 pub(super) fn card_height(available_height: f32) -> f32 {
@@ -35,11 +37,19 @@ struct PageFade {
 }
 
 #[derive(PartialEq, Eq)]
-enum FooterState {
-    Confirm(i64),
-    Undo,
-    Notice,
-    Idle,
+struct Footer {
+    text: String,
+    consequence: Option<&'static str>,
+    confirm: bool,
+    undo: bool,
+    newer: bool,
+    older: bool,
+    pending: bool,
+}
+
+struct FooterFade {
+    before: Footer,
+    fade: Transition,
 }
 
 #[derive(Default)]
@@ -49,8 +59,8 @@ pub(super) struct ActivityMotion {
     arrival: Option<Transition>,
     selection: Option<i64>,
     selection_fade: Option<(Option<i64>, Transition)>,
-    footer_state: Option<FooterState>,
-    footer: Option<Transition>,
+    footer: Option<Footer>,
+    footer_fade: Option<FooterFade>,
     undone: Option<(i64, Transition)>,
 }
 
@@ -58,7 +68,6 @@ impl ActivityMotion {
     pub(super) fn settle(&mut self) {
         self.arrival = None;
         self.selection_fade = None;
-        self.footer = None;
     }
 
     pub(super) fn frame(&mut self, activity: &Activity, motion: &Motion, now: Instant) -> bool {
@@ -71,23 +80,21 @@ impl ActivityMotion {
             let before = std::mem::replace(&mut self.selection, selected);
             self.selection_fade = motion.start(motion::FADE, now).map(|fade| (before, fade));
         }
-        let footer = if let Some(prompt) = &activity.confirmation {
-            FooterState::Confirm(prompt.id)
-        } else if activity.blocker_notice.is_some() || activity.load_failed {
-            FooterState::Notice
-        } else if can_undo(activity) {
-            FooterState::Undo
-        } else {
-            FooterState::Idle
-        };
-        if self.footer_state.as_ref() != Some(&footer) {
-            self.footer_state = Some(footer);
-            self.footer = motion.start(motion::FADE, now);
+        let footer = Footer::of(activity, now_unix());
+        if self.footer.as_ref() != Some(&footer) {
+            let before = self.footer.replace(footer);
+            self.footer_fade = before
+                .zip(motion.start(motion::FADE, now))
+                .map(|(before, fade)| FooterFade { before, fade });
         }
+        self.footer_fade = self
+            .footer_fade
+            .take()
+            .filter(|footer| footer.fade.running(now));
         self.page = self.page.take().filter(|page| page.fade.running(now));
         self.page.is_some()
             || self.arrival.is_some_and(|fade| fade.running(now))
-            || self.footer.is_some_and(|fade| fade.running(now))
+            || self.footer_fade.is_some()
             || self
                 .selection_fade
                 .is_some_and(|(_, fade)| fade.running(now))
@@ -108,7 +115,12 @@ impl Inbox {
     pub(super) fn request_agent_activity(&mut self, request: Request, cx: &mut Context<Self>) {
         let generation = self.session.activity.generation;
         match request {
-            Request::Load { direction, .. } => {
+            Request::Load {
+                direction,
+                ref filter,
+                ..
+            } => {
+                let account_wide = filter.is_none();
                 let account = self.account_id.clone();
                 let delay = cx.background_executor().timer(LOADING_DELAY);
                 cx.spawn(async move |this, cx| {
@@ -135,6 +147,19 @@ impl Inbox {
                         activity.loading_slow = false;
                         match reply {
                             Ok(Ok(page)) => {
+                                if let fell_core::agent::ActivityDirection::At(id) = direction {
+                                    let (show, retry) =
+                                        activity.finish_jump(&page, id, account_wide);
+                                    if !show {
+                                        if let Some(request) = retry
+                                            && inbox.session.overlay == Overlay::AgentActivity
+                                        {
+                                            inbox.request_agent_activity(request, cx);
+                                        }
+                                        cx.notify();
+                                        return;
+                                    }
+                                }
                                 activity.loaded(page, direction);
                                 if before.page_revision != activity.page_revision {
                                     let now = inbox.motion.clock.now();
@@ -181,35 +206,38 @@ impl Inbox {
                                     .motion
                                     .start(motion::FADE, now)
                                     .map(|fade| (action.id, fade));
-                                inbox.activity_motion.footer =
-                                    inbox.motion.motion.start(motion::FADE, now);
                                 if viewing_account {
                                     inbox.note_generation = inbox.note_generation.wrapping_add(1);
                                     inbox.send_to_server();
                                 }
                                 let notice = if retired {
-                                    "Undone · snooze was already changed, left as is."
+                                    "Snooze changed since — left as is"
                                 } else {
                                     "Agent action undone"
                                 };
                                 (notice.into(), false, viewing_account)
                             }
                             Err(fell_core::Error::AgentActivityBlocked(blocker)) if current => {
-                                activity.record_blocker(id, blocker);
+                                let request = activity.record_blocker(id, blocker);
+                                inbox.activity_scroll.scroll_to_item(activity.selected);
+                                if let Some(request) = request
+                                    && inbox.session.overlay == Overlay::AgentActivity
+                                {
+                                    inbox.request_agent_activity(request, cx);
+                                }
+                                return None;
+                            }
+                            Err(fell_core::Error::AgentActivityAlreadyUndone {
+                                snooze_retired,
+                            }) => {
+                                activity.mark_undone(id, snooze_retired);
                                 return None;
                             }
                             Err(fell_core::Error::AgentActivityGrant {
-                                agent_id,
-                                enabled,
-                                scope,
+                                enabled, scope, ..
                             }) => {
-                                let name = agent_name(&agent_id);
-                                let reason = if enabled {
-                                    format!("{scope} is off for {name}.")
-                                } else {
-                                    format!("{name} is turned off.")
-                                };
-                                (format!("{reason} Turn on {scope} to undo."), true, false)
+                                activity.mark_grant_missing(id, ActivityGrant { enabled, scope });
+                                return None;
                             }
                             Err(
                                 fell_core::Error::Action(message)
@@ -246,6 +274,7 @@ pub(super) fn card(
     activity: &Activity,
     scroll: Option<&ScrollHandle>,
     height: f32,
+    compact: bool,
     frame: Option<(&ActivityMotion, Instant)>,
     cx: &mut Context<Inbox>,
 ) -> Div {
@@ -256,13 +285,8 @@ pub(super) fn card(
     let arrival = frame.map_or(1., |(motion, time)| {
         motion::progress(motion.arrival.as_ref(), time)
     });
-    let footer_alpha = frame.map_or(1., |(motion, time)| {
-        motion::lerp(
-            motion::ARRIVE_FROM,
-            1.,
-            motion::progress(motion.footer.as_ref(), time),
-        )
-    });
+    let footer = Footer::of(activity, now);
+    let footer_fade = frame.and_then(|(motion, time)| Some((motion.footer_fade.as_ref()?, time)));
     let rows = div()
         .relative()
         .flex_1()
@@ -278,7 +302,7 @@ pub(super) fn card(
                     .opacity(old.fade.remaining(time))
                     .children(
                         (0..old.activity.page.entries.len())
-                            .map(|index| row(theme, &old.activity, index, now, None)),
+                            .map(|index| row(theme, &old.activity, index, now, compact, None)),
                     ),
             )
         })
@@ -292,7 +316,7 @@ pub(super) fn card(
                 .opacity(motion::lerp(motion::ARRIVE_FROM, 1., arrival))
                 .when_some(scroll, |list, scroll| list.track_scroll(scroll))
                 .children((0..activity.page.entries.len()).map(|index| {
-                    row(theme, activity, index, now, frame).when(live, |row| {
+                    row(theme, activity, index, now, compact, frame).when(live, |row| {
                         row.on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |inbox, _, _, cx| {
@@ -375,137 +399,188 @@ pub(super) fn card(
                 .h(px(FOOTER_HEIGHT))
                 .border_t(px(1.))
                 .border_color(rgb(theme.border))
-                .when_some(leaving, |bottom, (old, time)| {
+                .when_some(footer_fade, |bottom, (old, time)| {
                     bottom.child(
-                        footer(theme, &old.activity, false, now, cx)
+                        old.before
+                            .render(theme, false, cx)
                             .absolute()
                             .inset_0()
                             .opacity(old.fade.remaining(time)),
                     )
                 })
                 .child(
-                    footer(theme, activity, live, now, cx)
-                        .opacity(footer_alpha * motion::lerp(motion::ARRIVE_FROM, 1., arrival)),
+                    footer
+                        .render(theme, live, cx)
+                        .opacity(footer_fade.map_or(1., |(old, time)| old.fade.progress(time))),
                 ),
         )
 }
 
-fn can_undo(activity: &Activity) -> bool {
-    !activity.pending
-        && activity.selected_entry().is_some_and(|entry| {
-            !entry.action.undone && !entry.draft_discarded && entry.blocker.is_none()
-        })
+impl Footer {
+    fn of(activity: &Activity, now: i64) -> Self {
+        let mut footer = Self {
+            text: String::new(),
+            consequence: None,
+            confirm: false,
+            undo: false,
+            pending: activity.pending,
+            newer: activity.page.has_newer,
+            older: activity.page.has_older,
+        };
+        if let Some(prompt) = &activity.confirmation
+            && let Some(entry) = activity.selected_entry()
+        {
+            let (effect, consequence) = match entry.action.kind.as_str() {
+                "archive" => ("Unarchive", "They return to Inbox"),
+                "move" => ("Move back", "They return to their previous folders"),
+                "label" | "unlabel" => ("Restore labels on", "Their previous label state returns"),
+                "star" | "unstar" => ("Restore stars on", "Their previous star state returns"),
+                "mark_read" | "mark_unread" => (
+                    "Restore read status on",
+                    "Their previous read state returns",
+                ),
+                "snooze" | "unsnooze" => {
+                    ("Restore snooze on", "Their previous snooze state returns")
+                }
+                _ => ("Undo the change to", "Their previous state returns"),
+            };
+            footer.text = format!(
+                "{effect} {} conversations from {}?",
+                prompt.conversations,
+                actor_name(&entry.action.actor)
+            );
+            footer.consequence = Some(consequence);
+            footer.confirm = true;
+            return footer;
+        }
+        let entry = activity.selected_entry();
+        footer.undo = !activity.pending
+            && entry.is_some_and(|entry| {
+                !entry.action.undone
+                    && !entry.draft_discarded
+                    && entry.blocker.is_none()
+                    && entry.missing_grant.is_none()
+            });
+        footer.text = if let Some(blocker) = &activity.blocker_notice {
+            blocker_notice(blocker, now)
+        } else if activity.load_failed && !activity.page.entries.is_empty() {
+            "Could not load agent activity".into()
+        } else if activity.pending && activity.loading_slow && !activity.page.entries.is_empty() {
+            "Loading activity…".into()
+        } else if let Some((entry, grant)) = entry.and_then(|e| Some((e, e.missing_grant?))) {
+            let name = actor_name(&entry.action.actor);
+            let scope = grant.scope;
+            if grant.enabled {
+                format!("{scope} is off for {name}. Turn on {scope} to undo.")
+            } else {
+                format!("{name} is turned off. Turn on {scope} to undo.")
+            }
+        } else {
+            entry
+                .filter(|e| e.action.created_unix > 0)
+                .map_or_else(String::new, |entry| {
+                    activity_time(now, entry.action.created_unix)
+                })
+        };
+        footer
+    }
+
+    fn render(&self, theme: &Theme, live: bool, cx: &mut Context<Inbox>) -> Div {
+        let dim = ensure_all(theme.dimmed, &[theme.surface], 4.65);
+        let mut controls = div().flex_none().flex().items_center().gap(px(6.));
+        if self.confirm {
+            controls = controls
+                .child(button(theme, "Cancel", KeyId::Escape, live, cx))
+                .child(button(theme, "Undo · y", KeyId::Char('y'), live, cx));
+        } else {
+            controls = controls
+                .when(self.newer, |line| {
+                    line.child(button(
+                        theme,
+                        "Newer",
+                        KeyId::Ctrl('u'),
+                        live && !self.pending,
+                        cx,
+                    ))
+                })
+                .when(self.older, |line| {
+                    line.child(button(
+                        theme,
+                        "Older",
+                        KeyId::Ctrl('d'),
+                        live && !self.pending,
+                        cx,
+                    ))
+                })
+                .when(self.undo, |line| {
+                    line.child(button(theme, "Undo action", KeyId::Char('u'), live, cx))
+                });
+        }
+        div()
+            .size_full()
+            .px(px(14.))
+            .pb(px(10.))
+            .flex()
+            .items_end()
+            .gap(px(8.))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .line_clamp(2)
+                            .text_ellipsis()
+                            .when_else(
+                                self.confirm,
+                                |text| text.font_weight(FontWeight::SEMIBOLD),
+                                |text| text.text_color(rgb(dim)),
+                            )
+                            .child(self.text.clone()),
+                    )
+                    .when_some(self.consequence, |text, consequence| {
+                        text.child(
+                            div()
+                                .line_clamp(1)
+                                .text_ellipsis()
+                                .text_color(rgb(dim))
+                                .child(consequence),
+                        )
+                    }),
+            )
+            .child(controls)
+    }
 }
 
-fn footer(
-    theme: &Theme,
-    activity: &Activity,
-    live: bool,
-    now: i64,
-    cx: &mut Context<Inbox>,
-) -> Div {
-    let dim = ensure_all(theme.dimmed, &[theme.surface], 4.65);
-    let base = div()
-        .size_full()
-        .px(px(14.))
-        .flex()
-        .flex_col()
-        .justify_center()
-        .gap(px(3.));
-    if let Some(prompt) = activity.confirmation.as_ref()
-        && let Some(entry) = activity.selected_entry()
-    {
-        let (effect, consequence) = match entry.action.kind.as_str() {
-            "archive" => ("Unarchive", "They return to Inbox"),
-            "move" => ("Move back", "They return to their previous folders"),
-            "label" | "unlabel" => ("Restore labels on", "Their previous label state returns"),
-            "star" | "unstar" => ("Restore stars on", "Their previous star state returns"),
-            "mark_read" | "mark_unread" => (
-                "Restore read status on",
-                "Their previous read state returns",
-            ),
-            "snooze" | "unsnooze" => ("Restore snooze on", "Their previous snooze state returns"),
-            _ => ("Undo the change to", "Their previous state returns"),
-        };
-        return base
-            .child(
-                div()
-                    .line_clamp(1)
-                    .text_ellipsis()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(format!(
-                        "{effect} {} conversations from {}?",
-                        prompt.conversations,
-                        actor_name(&entry.action.actor),
-                    )),
-            )
-            .child(
-                div()
-                    .line_clamp(1)
-                    .text_ellipsis()
-                    .text_color(rgb(dim))
-                    .child(consequence),
-            )
-            .child(
-                div()
-                    .flex()
-                    .justify_end()
-                    .gap(px(6.))
-                    .child(button(theme, "Cancel", KeyId::Escape, live, cx))
-                    .child(button(theme, "Undo · y", KeyId::Char('y'), live, cx)),
-            );
-    }
-    let notice = if let Some((actor, blocker)) = &activity.blocker_notice {
-        Some(format!(
-            "Undo {}’s {} ({}) first",
-            actor_name(actor),
-            action_name(&blocker.kind),
-            relative_date(now, blocker.created_unix)
-        ))
-    } else if activity.load_failed && !activity.page.entries.is_empty() {
-        Some("Could not load agent activity".into())
-    } else if activity.pending && activity.loading_slow && !activity.page.entries.is_empty() {
-        Some("Loading activity…".into())
-    } else {
-        None
+fn blocker_notice(blocker: &ActivityBlocker, now: i64) -> String {
+    let kind = match blocker.kind.as_str() {
+        "star" => "star",
+        "unstar" => "unstar",
+        "archive" => "archive",
+        "move" => "move",
+        "draft" => "draft",
+        "mark_read" | "mark_unread" => "read change",
+        "snooze" | "unsnooze" => "snooze change",
+        "label" | "unlabel" => "label change",
+        "annotate" => "note",
+        _ => "action",
     };
-    base.when_some(notice, |base, text| {
-        base.child(
-            div()
-                .line_clamp(1)
-                .text_ellipsis()
-                .text_color(rgb(dim))
-                .child(text),
-        )
-    })
-    .child(
-        div()
-            .flex()
-            .items_center()
-            .gap(px(6.))
-            .when(activity.page.has_newer, |line| {
-                line.child(button(
-                    theme,
-                    "Newer",
-                    KeyId::Ctrl('u'),
-                    live && !activity.pending,
-                    cx,
-                ))
-            })
-            .when(activity.page.has_older, |line| {
-                line.child(button(
-                    theme,
-                    "Older",
-                    KeyId::Ctrl('d'),
-                    live && !activity.pending,
-                    cx,
-                ))
-            })
-            .child(div().flex_1())
-            .when(can_undo(activity), |line| {
-                line.child(button(theme, "Undo action", KeyId::Char('u'), live, cx))
-            }),
-    )
+    match blocker.actor.as_str() {
+        "local" => format!("Undo your newer {kind} in the mailbox first"),
+        "outbox" => "A newer move is waiting to sync".into(),
+        _ if blocker.kind == BLOCKER_MAILBOX_CHANGED => {
+            "Mail folders changed since this action".into()
+        }
+        actor if actor.starts_with("agent:") => format!(
+            "Undo {}’s newer {kind} first · {}",
+            actor_name(actor),
+            relative_date(now, blocker.created_unix)
+        ),
+        _ => format!("Undo the newer {kind} in the mailbox first"),
+    }
 }
 
 fn button(
@@ -539,6 +614,7 @@ fn row(
     activity: &Activity,
     index: usize,
     now: i64,
+    compact: bool,
     frame: Option<(&ActivityMotion, Instant)>,
 ) -> Div {
     let entry = &activity.page.entries[index];
@@ -557,11 +633,17 @@ fn row(
         &[bg],
         4.65,
     );
-    let date = if selected && entry.action.created_unix > 0 {
-        absolute_date(entry.action.created_unix)
-    } else {
-        relative_date(now, entry.action.created_unix)
-    };
+    let mut date = div()
+        .w(px(88.))
+        .flex_none()
+        .text_right()
+        .text_color(rgb(dim))
+        .line_clamp(1)
+        .text_ellipsis()
+        .child(compact_relative_date(now, entry.action.created_unix));
+    date.text_style()
+        .get_or_insert_with(Default::default)
+        .font_features = Some(super::tabular_figures());
     let status_alpha = frame
         .and_then(|(motion, time)| {
             let (id, fade) = motion.undone?;
@@ -569,6 +651,7 @@ fn row(
         })
         .unwrap_or(1.);
     div()
+        .relative()
         .h(px(ROW_HEIGHT))
         .px(px(16.))
         .flex()
@@ -581,13 +664,25 @@ fn row(
         .border_color(rgb(theme.border))
         .bg(rgb(bg))
         .text_color(rgb(fg))
+        .when(selection > 0., |row| {
+            row.child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(2.))
+                    .bg(rgb(theme.accent))
+                    .opacity(selection),
+            )
+        })
         .child(
             div()
                 .flex()
                 .items_center()
                 .gap(px(6.))
                 .when(activity.filter.is_none(), |line| {
-                    line.child(super::agent_notes::marker(theme, selected))
+                    line.child(super::agent_notes::marker(theme, false))
                         .child(
                             div()
                                 .min_w_0()
@@ -604,7 +699,7 @@ fn row(
                         .child(action_name(&entry.action.kind)),
                 )
                 .child(div().flex_1())
-                .child(div().flex_none().text_color(rgb(dim)).child(date)),
+                .child(date),
         )
         .child(
             div()
@@ -640,7 +735,7 @@ fn row(
                             },
                         ),
                 )
-                .when_some(row_status(entry), |line, status| {
+                .when_some(row_status(entry, compact), |line, status| {
                     line.child(
                         div()
                             .flex_none()
@@ -665,15 +760,35 @@ fn agent_name(name: &str) -> String {
     first.to_uppercase().chain(chars).collect()
 }
 
-fn row_status(entry: &AgentActivity) -> Option<&'static str> {
+fn row_status(entry: &AgentActivity, compact: bool) -> Option<&'static str> {
     if entry.snooze_retired {
-        Some("Retired · snooze had changed")
+        Some(if compact {
+            "Skipped"
+        } else {
+            "Skipped · snooze changed since"
+        })
     } else if entry.action.undone {
         Some("Undone")
     } else if entry.draft_discarded {
         Some("Draft discarded")
-    } else if entry.blocker.is_some() {
-        Some("Undo newer first")
+    } else if let Some(grant) = entry.missing_grant {
+        Some(if !grant.enabled {
+            "Agent off"
+        } else {
+            match grant.scope {
+                "Draft" => "Draft off",
+                "Annotate" => "Annotate off",
+                _ => "Triage off",
+            }
+        })
+    } else if let Some(blocker) = &entry.blocker {
+        Some(if blocker.kind == BLOCKER_MAILBOX_CHANGED {
+            "Folders changed"
+        } else if compact {
+            "Blocked"
+        } else {
+            "Undo newer first"
+        })
     } else {
         None
     }
@@ -729,6 +844,7 @@ mod tests {
             blocker: None,
             draft_discarded: false,
             snooze_retired: false,
+            missing_grant: None,
         };
         assert_eq!(
             agent_name(entry.action.actor.strip_prefix("agent:").unwrap()),
@@ -738,9 +854,12 @@ mod tests {
         let mut snooze = entry.clone();
         snooze.action.kind = "snooze".into();
         snooze.action.undone = true;
-        assert_eq!(row_status(&snooze), Some("Undone"));
+        assert_eq!(row_status(&snooze, false), Some("Undone"));
         snooze.snooze_retired = true;
-        assert_eq!(row_status(&snooze), Some("Retired · snooze had changed"));
+        assert_eq!(
+            row_status(&snooze, false),
+            Some("Skipped · snooze changed since")
+        );
         assert_eq!(
             target_name(&AgentActivity {
                 conversations: 12,

@@ -2146,7 +2146,7 @@ impl Session {
             Overlay::AgentActivity if self.activity.confirmation.take().is_some() => {
                 Overlay::AgentActivity
             }
-            Overlay::AgentActivity if self.activity.filter.is_some() => Overlay::Agents,
+            Overlay::AgentActivity if self.activity.opened_from_agents => Overlay::Agents,
             _ => {
                 self.agents.confirm_revoke(false);
                 Overlay::None

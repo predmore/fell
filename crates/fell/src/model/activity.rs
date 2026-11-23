@@ -3,7 +3,8 @@
 use std::sync::Arc;
 
 use fell_core::agent::{
-    ActivityBlocker, ActivityDirection, AgentActivity, AgentActivityPage, BULK_UNDO_THRESHOLD,
+    ActivityBlocker, ActivityDirection, ActivityGrant, AgentActivity, AgentActivityPage,
+    BULK_UNDO_THRESHOLD,
 };
 use fell_core::{AccountId, AgentSummary, Store};
 
@@ -14,6 +15,7 @@ const PAGE_SIZE: usize = 16;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request {
     Load {
+        account: Option<AccountId>,
         filter: Option<AgentSummary>,
         direction: ActivityDirection,
     },
@@ -30,18 +32,27 @@ impl Request {
         store: &Store,
         current_account: &AccountId,
     ) -> fell_core::Result<AgentActivityPage> {
-        let Self::Load { filter, direction } = self else {
+        let Self::Load {
+            account,
+            filter,
+            direction,
+        } = self
+        else {
             unreachable!("activity load request")
         };
-        let (account, agent) = filter.as_ref().map_or((current_account, None), |agent| {
-            (&agent.account_id, Some(agent.agent_id.as_str()))
-        });
-        store.agent_activity(account, agent, direction, PAGE_SIZE)
+        let agent = filter.as_ref().map(|agent| agent.agent_id.as_str());
+        store.agent_activity(
+            account.as_ref().unwrap_or(current_account),
+            agent,
+            direction,
+            PAGE_SIZE,
+        )
     }
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct Activity {
+    account: Option<AccountId>,
     pub filter: Option<AgentSummary>,
     pub page: Arc<AgentActivityPage>,
     pub selected: usize,
@@ -51,7 +62,9 @@ pub struct Activity {
     pub loading_slow: bool,
     pub load_failed: bool,
     pub confirmation: Option<Confirmation>,
-    pub blocker_notice: Option<(String, ActivityBlocker)>,
+    pub blocker_notice: Option<ActivityBlocker>,
+    pub opened_from_agents: bool,
+    jump_from: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -63,7 +76,10 @@ pub struct Confirmation {
 
 impl Activity {
     pub fn open(&mut self, filter: Option<AgentSummary>) -> Request {
+        self.opened_from_agents = filter.is_some();
+        self.account = filter.as_ref().map(|agent| agent.account_id.clone());
         self.filter = filter;
+        self.jump_from = None;
         self.page = Arc::default();
         self.selected = 0;
         self.confirmation = None;
@@ -81,6 +97,7 @@ impl Activity {
         self.load_failed = false;
         self.loading_slow = false;
         self.start(Request::Load {
+            account: self.account.clone(),
             filter: self.filter.clone(),
             direction,
         })
@@ -151,23 +168,22 @@ impl Activity {
         }
         self.blocker_notice = None;
         let entry = self.selected_entry()?;
-        if entry.action.undone || entry.draft_discarded {
+        if entry.action.undone || entry.draft_discarded || entry.missing_grant.is_some() {
             return None;
         }
         if let Some(blocker) = entry.blocker.clone() {
-            let actor = entry.action.actor.clone();
-            self.blocker_notice = Some((actor, blocker.clone()));
-            if let Some(index) = self
-                .page
-                .entries
-                .iter()
-                .position(|entry| entry.action.id == blocker.id)
+            let id = entry.action.id;
+            if blocker.actor.starts_with("agent:")
+                && self.page.entries.iter().any(|entry| {
+                    entry.action.id == blocker.id && (entry.action.undone || entry.draft_discarded)
+                })
             {
-                self.selected = index;
-                return None;
+                self.clear_blocker(blocker.id);
+            } else {
+                return self.follow_blocker(id, blocker);
             }
-            return Some(self.load(ActivityDirection::At(blocker.id)));
         }
+        let entry = self.selected_entry()?;
         let target = Confirmation {
             account: entry.action.account_id.clone(),
             id: entry.action.id,
@@ -197,48 +213,108 @@ impl Activity {
     }
 
     pub fn mark_undone(&mut self, id: i64, snooze_retired: bool) {
-        let entries = &mut Arc::make_mut(&mut self.page).entries;
-        let Some(index) = entries.iter().position(|entry| entry.action.id == id) else {
-            return;
-        };
-        let (undone, older) = entries[index..].split_first_mut().expect("found entry");
-        undone.action.undone = true;
-        undone.snooze_retired = snooze_retired;
-        let mut next = None;
-        for entry in older {
+        if let Some(entry) = Arc::make_mut(&mut self.page)
+            .entries
+            .iter_mut()
+            .find(|entry| entry.action.id == id)
+        {
+            entry.action.undone = true;
+            entry.snooze_retired = snooze_retired;
+            entry.blocker = None;
+        }
+        self.clear_blocker(id);
+    }
+
+    fn clear_blocker(&mut self, id: i64) {
+        for entry in &mut Arc::make_mut(&mut self.page).entries {
             if entry
                 .blocker
                 .as_ref()
-                .is_some_and(|blocker| blocker.id == id)
+                .is_some_and(|blocker| blocker.actor.starts_with("agent:") && blocker.id == id)
             {
-                entry.blocker = next.clone();
-                next.get_or_insert_with(|| ActivityBlocker {
-                    id: entry.action.id,
-                    kind: entry.action.kind.clone(),
-                    created_unix: entry.action.created_unix,
-                });
+                entry.blocker = None;
             }
         }
     }
 
-    pub fn record_blocker(&mut self, id: i64, blocker: ActivityBlocker) {
-        if let Some(actor) = self
-            .page
+    pub fn record_blocker(&mut self, id: i64, blocker: ActivityBlocker) -> Option<Request> {
+        let entry = Arc::make_mut(&mut self.page)
             .entries
-            .iter()
-            .find(|entry| entry.action.id == id)
-            .map(|entry| entry.action.actor.clone())
+            .iter_mut()
+            .find(|entry| entry.action.id == id)?;
+        entry.blocker = Some(blocker.clone());
+        if self
+            .selected_entry()
+            .is_some_and(|entry| entry.action.id == id)
         {
-            for entry in &mut Arc::make_mut(&mut self.page).entries {
-                if entry.action.actor == actor
-                    && entry.action.id < blocker.id
-                    && !entry.action.undone
-                    && !entry.draft_discarded
-                {
-                    entry.blocker = Some(blocker.clone());
-                }
+            self.follow_blocker(id, blocker)
+        } else {
+            None
+        }
+    }
+
+    fn follow_blocker(&mut self, id: i64, blocker: ActivityBlocker) -> Option<Request> {
+        self.blocker_notice = Some(blocker.clone());
+        if !blocker.actor.starts_with("agent:") {
+            return None;
+        }
+        if let Some(index) = self.page.entries.iter().position(|entry| {
+            entry.action.id == blocker.id && !entry.action.undone && !entry.draft_discarded
+        }) {
+            self.selected = index;
+            return None;
+        }
+        self.jump_from = Some(id);
+        let direction = ActivityDirection::At(blocker.id);
+        let mut request = self.load(direction);
+        if let Request::Load { filter, .. } = &mut request
+            && filter.as_ref().is_some_and(|agent| {
+                blocker.actor.strip_prefix("agent:") != Some(agent.agent_id.as_str())
+            })
+        {
+            *filter = None;
+        }
+        Some(request)
+    }
+
+    /// An off-page blocker can have been undone or discarded since the log
+    /// was read. Keep the original page in that case and retry its selection.
+    pub fn finish_jump(
+        &mut self,
+        page: &AgentActivityPage,
+        id: i64,
+        account_wide: bool,
+    ) -> (bool, Option<Request>) {
+        let Some(from) = self.jump_from.take() else {
+            return (true, None);
+        };
+        if page.entries.first().is_some_and(|entry| {
+            entry.action.id == id && !entry.action.undone && !entry.draft_discarded
+        }) {
+            if account_wide {
+                self.filter = None;
             }
-            self.blocker_notice = Some((actor, blocker));
+            return (true, None);
+        }
+        self.clear_blocker(id);
+        let retry = if self
+            .selected_entry()
+            .is_some_and(|entry| entry.action.id == from)
+        {
+            self.undo()
+        } else {
+            None
+        };
+        (false, retry)
+    }
+
+    pub fn mark_grant_missing(&mut self, id: i64, grant: ActivityGrant) {
+        if let Some(entry) = Arc::make_mut(&mut self.page)
+            .entries
+            .iter_mut()
+            .find(|entry| entry.action.id == id)
+        {
+            entry.missing_grant = Some(grant);
         }
     }
 
@@ -252,9 +328,11 @@ impl Activity {
                 Action::UndoAgentActivity,
                 "u",
                 !self.pending
-                    && self
-                        .selected_entry()
-                        .is_some_and(|entry| !entry.action.undone && !entry.draft_discarded),
+                    && self.selected_entry().is_some_and(|entry| {
+                        !entry.action.undone
+                            && !entry.draft_discarded
+                            && entry.missing_grant.is_none()
+                    }),
             ),
             (Action::PageDown, "Ctrl-d", self.page.has_older),
             (Action::PageUp, "Ctrl-u", self.page.has_newer),
@@ -423,6 +501,7 @@ mod tests {
             blocker: None,
             draft_discarded: false,
             snooze_retired: false,
+            missing_grant: None,
         };
         activity.loaded(
             AgentActivityPage {
@@ -466,12 +545,47 @@ mod tests {
             star.id
         );
         assert_eq!(
-            session.activity.blocker_notice.as_ref().unwrap().1.id,
+            session.activity.blocker_notice.as_ref().unwrap().id,
             star.id
         );
         session.activity.mark_undone(star.id, false);
         session.activity.select(1);
         let step = session.on_key(KeyId::Char('u'), 10);
         assert!(matches!(step.activity, Some(Request::Undo { id, .. }) if id == read.id));
+    }
+
+    #[test]
+    fn an_off_page_blocker_undone_elsewhere_retries_the_original_row() {
+        let (store, account, mut session) = session();
+        let thread = store.list_threads(&account).unwrap().remove(0).thread_id;
+        store
+            .set_agent_grant(&account, "reed", AgentGrant::enabled(false, true, false))
+            .unwrap();
+        let read = store
+            .mark_thread_read(&account, &thread, "agent:reed")
+            .unwrap()
+            .unwrap();
+        let star = store
+            .star_thread(&account, &thread, true, "agent:reed")
+            .unwrap()
+            .unwrap();
+        session.activity.loaded(
+            store
+                .agent_activity(&account, None, ActivityDirection::Older(star.id), 1)
+                .unwrap(),
+            ActivityDirection::Older(star.id),
+        );
+        let request = session.activity.undo().unwrap();
+        assert!(
+            matches!(request, Request::Load { direction: ActivityDirection::At(id), .. } if id == star.id)
+        );
+
+        store.undo_agent_activity(&account, star.id, None).unwrap();
+        let page = request.load(&store, &account).unwrap();
+        session.activity.pending = false;
+        let (show, retry) = session.activity.finish_jump(&page, star.id, true);
+        assert!(!show);
+        assert!(matches!(retry, Some(Request::Undo { id, .. }) if id == read.id));
+        assert!(session.activity.selected_entry().unwrap().blocker.is_none());
     }
 }

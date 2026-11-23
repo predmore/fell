@@ -5237,6 +5237,7 @@ impl Render for Inbox {
                             card.unwrap_or_else(|| {
                                 activity::card_height(viewport_height - CARD_TOP_PX - 16.0)
                             }),
+                            width < 460.,
                             live.then_some((&self.activity_motion, now)),
                             cx,
                         )),
@@ -7586,12 +7587,16 @@ fn paint_shaped_text(
 }
 
 fn tabular_style(window: &Window, theme: &Theme, size: f32) -> TextStyle {
-    static FEATURES: OnceLock<gpui::FontFeatures> = OnceLock::new();
     let mut style = conversation_line_style(window, theme, px(size));
-    style.font_features = FEATURES
-        .get_or_init(|| gpui::FontFeatures(Arc::new(vec![("tnum".into(), 1)])))
-        .clone();
+    style.font_features = tabular_figures();
     style
+}
+
+fn tabular_figures() -> gpui::FontFeatures {
+    static FEATURES: OnceLock<gpui::FontFeatures> = OnceLock::new();
+    FEATURES
+        .get_or_init(|| gpui::FontFeatures(Arc::new(vec![("tnum".into(), 1)])))
+        .clone()
 }
 
 /// The width of `text` as the status bar draws it: its size and family.

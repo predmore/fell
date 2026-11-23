@@ -104,6 +104,8 @@ pub enum Error {
     DraftMessageLimit,
     #[error("Undo the newer action first")]
     AgentActivityBlocked(agent::ActivityBlocker),
+    #[error("Action already undone")]
+    AgentActivityAlreadyUndone { snooze_retired: bool },
     #[error("agent {agent_id} does not have {scope} access")]
     AgentActivityGrant {
         agent_id: String,
