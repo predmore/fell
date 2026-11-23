@@ -2419,8 +2419,10 @@ impl Session {
             }
             Action::Open => {
                 self.count.clear();
-                if self.cursor_draft().is_some() {
-                    // A draft row opens in the editor, not the reading pane.
+                if self.cursor_draft().is_some()
+                    || (self.in_drafts() && self.pane == Pane::List && self.cursor_id.is_some())
+                {
+                    // Local and synced Drafts rows both open in the editor.
                     step.open_draft = true;
                 } else if self.pane == Pane::List {
                     if self.cursor_id.is_some() {
@@ -3411,6 +3413,7 @@ mod tests {
             warn: false,
             unread: false,
             draft: None,
+            server_draft: None,
         }
     }
 
@@ -5432,6 +5435,7 @@ mod tests {
             .into_iter()
             .map(|(id, date)| ThreadRow {
                 draft: Some(id.into()),
+                server_draft: None,
                 ..dated(id, date)
             })
             .collect();

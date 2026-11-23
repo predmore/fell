@@ -9,11 +9,11 @@ use std::net::Ipv6Addr;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use fell_core::compose::{
-    BlockBody, DraftHub, HunkKind, SendLock, Snapshot, StyleKind, StyleSpan, StyledDoc,
-    html_to_doc, line_styles, markdown_to_doc,
+    BlockBody, DraftHub, DraftSaveStatus, HunkKind, SaveReceipt, SendLock, Snapshot, StyleKind,
+    StyleSpan, StyledDoc, html_to_doc, line_styles, markdown_to_doc,
 };
 use fell_core::{AccountId, MailBackend};
 use gpui::{
@@ -25,6 +25,7 @@ use smallvec::SmallVec;
 
 use crate::confirmation_from_ui;
 use crate::mailbox::AccountConfigError;
+use crate::motion::{self, Motion, Transition};
 use crate::present::display_safe;
 use crate::reply_check::{ReplyCheck, ReplyChecks};
 
@@ -305,6 +306,10 @@ pub struct ComposeView {
     watching: bool,
     flush_pending: bool,
     flush_gen: u64,
+    draft_save: Option<(u64, DraftSaveStatus, Option<Transition>)>,
+    draft_save_exit: Option<Transition>,
+    announced_shown: Option<SharedString>,
+    motion: Motion,
     /// `:q` asked to close this window. The next frame removes it.
     closing: bool,
     discarding: bool,
@@ -387,8 +392,13 @@ impl ComposeView {
         })
         .detach();
         // A closed window no longer counts as showing its draft.
-        cx.on_release(|this: &mut Self, _| this.hub.note_hidden(this.draft_id.as_ref()))
-            .detach();
+        cx.on_release(|this: &mut Self, cx| {
+            this.hub.note_hidden(this.draft_id.as_ref());
+            if !this.closing {
+                crate::view::compose_draft_closing(this.draft_id.as_ref(), cx);
+            }
+        })
+        .detach();
         let mut view = Self {
             hub,
             draft_id: draft_id.into(),
@@ -419,6 +429,10 @@ impl ComposeView {
             watching: false,
             flush_pending: false,
             flush_gen: 0,
+            draft_save: None,
+            draft_save_exit: None,
+            announced_shown: None,
+            motion: Motion::from_env(),
             closing: false,
             discarding: false,
             close_on_send: false,
@@ -481,8 +495,84 @@ impl ComposeView {
     }
 
     pub fn watch_live(&self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
+                let Ok(Some((id, account, revision, receipt, store))) =
+                    this.update(cx, |this, cx| {
+                        let id = this.draft_id.clone();
+                        if matches!(this.field, Field::Subject | Field::Body)
+                            || fell_core::compose::parse_address_line(this.header_text()).is_ok()
+                        {
+                            this.hub.poll_server_draft(id.as_ref(), now_ms());
+                        }
+                        let (account, revision, receipt) =
+                            this.hub.with_session(id.as_ref(), |session| {
+                                Some((
+                                    session.account_id().clone(),
+                                    session.revision(),
+                                    session.save_receipt()?,
+                                ))
+                            })??;
+                        if this.draft_save.is_some_and(|(saved, status, _)| {
+                            saved == revision && status.warning().is_none()
+                        }) {
+                            return None;
+                        }
+                        let store = cx
+                            .try_global::<RecipientStore>()
+                            .map(|store| store.0.clone());
+                        Some((id, account, revision, receipt, store))
+                    })
+                else {
+                    if this.upgrade().is_none() {
+                        break;
+                    }
+                    continue;
+                };
+                let status = match receipt {
+                    SaveReceipt::Local => Some(DraftSaveStatus::Local),
+                    SaveReceipt::Pending => None,
+                    SaveReceipt::ServerFailed => Some(DraftSaveStatus::ServerFailed),
+                    SaveReceipt::Server(digest) => {
+                        let Some(store) = store else { continue };
+                        let draft = id.clone();
+                        store
+                            .call_background(move |store| {
+                                store.server_draft_save_status(&account, draft.as_ref(), &digest)
+                            })
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .flatten()
+                    }
+                };
+                if let Some(status) = status {
+                    let _ = this.update(cx, |this, cx| {
+                        if this.draft_id == id
+                            && this
+                                .hub
+                                .with_session(id.as_ref(), |session| session.revision())
+                                == Some(revision)
+                            && !this.draft_save.is_some_and(|(saved, previous, _)| {
+                                (saved, previous) == (revision, status)
+                            })
+                        {
+                            let fade = this.motion.start(motion::FADE, Instant::now());
+                            this.draft_save = Some((revision, status, fade));
+                            this.draft_save_exit = None;
+                            cx.notify();
+                        }
+                    });
+                }
+            }
+        })
+        .detach();
         cx.observe_window_activation(window, |this, window, cx| {
             if window.is_window_active() && !this.closing {
+                crate::view::compose_draft_shown(&this.draft_id, cx);
                 this.refresh_send_availability(cx);
             }
         })
@@ -817,6 +907,8 @@ impl ComposeView {
         }
         self.folder = folder;
         self.draft_id = id.into();
+        self.draft_save = None;
+        self.draft_save_exit = None;
         self.discarding = false;
         self.editor = Editor::from_body(&snap.body);
         self.applied_revision = snap.revision;
@@ -970,18 +1062,23 @@ impl ComposeView {
         }
     }
 
+    fn record_field(&self, field: Field) -> Option<Result<(), String>> {
+        self.hub
+            .with_session(self.draft_id.as_ref(), |session| match field {
+                Field::To => session.set_addresses_from_user("to", &self.to_line),
+                Field::Cc => session.set_addresses_from_user("cc", &self.cc_line),
+                Field::Bcc => session.set_addresses_from_user("bcc", &self.bcc_line),
+                Field::Subject => {
+                    session.set_subject_from_user(self.subject_line.clone());
+                    Ok(())
+                }
+                Field::Body => Ok(()),
+            })
+    }
+
     fn commit_field(&mut self, field: Field) -> bool {
         let id = self.draft_id.to_string();
-        let result = self.hub.with_session(&id, |session| match field {
-            Field::To => session.set_addresses_from_user("to", &self.to_line),
-            Field::Cc => session.set_addresses_from_user("cc", &self.cc_line),
-            Field::Bcc => session.set_addresses_from_user("bcc", &self.bcc_line),
-            Field::Subject => {
-                session.set_subject_from_user(self.subject_line.clone());
-                Ok(())
-            }
-            Field::Body => Ok(()),
-        });
+        let result = self.record_field(field);
         match result {
             Some(Ok(())) => {
                 let _ = self.hub.with_session(&id, |session| session.flush());
@@ -1313,6 +1410,7 @@ impl ComposeView {
             } else if !self.recipient_key(key, &event.keystroke.modifiers) {
                 self.field_key(key, typed);
             }
+            self.arm_debounced_flush(cx);
             return;
         }
         if event.keystroke.modifiers.control && key == "enter" {
@@ -1424,7 +1522,12 @@ impl ComposeView {
                 self.closing = true;
                 // From now on a request_send must wait for a new window.
                 self.hub.note_hidden(self.draft_id.as_ref());
+                crate::view::compose_draft_closing(self.draft_id.as_ref(), cx);
                 cx.notify();
+            }
+            "diagnostic log" => {
+                self.status = "".into();
+                crate::view::open_compose_diagnostic_log(cx);
             }
             _ => {}
         }
@@ -1502,7 +1605,11 @@ impl ComposeView {
                 self.status = "agent: k keep · x reject".into();
                 return;
             }
-            "d" | "s" | "p" | "r" | "q" | "t" | "k" | "x" => {}
+            "?" => {
+                self.status = "help: l diagnostic log".into();
+                return;
+            }
+            "d" | "s" | "p" | "r" | "q" | "t" | "k" | "x" | "l" => {}
             "escape" => {
                 self.leader = false;
                 self.which_visible = false;
@@ -1531,6 +1638,8 @@ impl ComposeView {
                 "x" => "reject",
                 _ => "",
             }
+        } else if status.starts_with("help:") && key == "l" {
+            "diagnostic log"
         } else {
             ""
         };
@@ -1548,6 +1657,31 @@ impl ComposeView {
         self.status = "space".into();
     }
 
+    fn header_matches(&self, snap: &Snapshot) -> bool {
+        let addresses = match self.field {
+            Field::Body => return true,
+            Field::Subject => return self.subject_line == snap.subject,
+            Field::To => &snap.to,
+            Field::Cc => &snap.cc,
+            Field::Bcc => &snap.bcc,
+        };
+        fell_core::compose::parse_address_line(self.header_text()).is_ok_and(|line| {
+            line.iter()
+                .map(String::as_str)
+                .eq(addresses.iter().map(|address| address.raw.as_str()))
+        })
+    }
+
+    fn header_text(&self) -> &str {
+        match self.field {
+            Field::To => &self.to_line,
+            Field::Cc => &self.cc_line,
+            Field::Bcc => &self.bcc_line,
+            Field::Subject => &self.subject_line,
+            Field::Body => "",
+        }
+    }
+
     fn field_key(&mut self, key: &str, typed: Option<&str>) {
         let line = match self.field {
             Field::To => &mut self.to_line,
@@ -1557,9 +1691,6 @@ impl ComposeView {
             Field::Body => return,
         };
         match key {
-            "backspace" => {
-                line.pop();
-            }
             "tab" | "enter" => {
                 let field = self.field;
                 if self.commit_field(field) {
@@ -1568,13 +1699,23 @@ impl ComposeView {
                         self.status = "insert".into();
                     }
                 }
+                return;
             }
-            "j" | "k" if typed.is_none() => {}
+            "backspace" => {
+                line.pop();
+            }
             _ => {
-                if let Some(ch) = typed {
-                    line.push_str(ch);
-                }
+                let Some(ch) = typed else { return };
+                line.push_str(ch);
             }
+        }
+        // Recipient completion owns unfinished tokens. Only committed
+        // recipients are eligible for a server save.
+        if self.field == Field::Subject && self.record_field(self.field) == Some(Ok(())) {
+            self.hub.with_session(self.draft_id.as_ref(), |session| {
+                session.arm_outbound(now_ms())
+            });
+            self.flush_pending = true;
         }
     }
 
@@ -1903,12 +2044,16 @@ impl Render for ComposeView {
             (Some(SendLock::MaybeSent), false) => "unlock · q close",
             (Some(_), _) => "q close",
             (None, true) if attempt.is_some() => "details · dismiss · send · q close",
-            (None, true) => "details · send · preview · raw · quote · theme · keep · reject · undo",
-            (None, false) => "send · preview · raw · quote · theme · keep · reject · undo",
+            (None, true) => {
+                "details · send · preview · raw · quote · theme · keep · reject · undo · diagnostic log"
+            }
+            (None, false) => {
+                "send · preview · raw · quote · theme · keep · reject · undo · diagnostic log"
+            }
         };
         let mode = match self.editor.mode {
             // A locked draft has no editing mode.
-            _ if lock.is_some() => "",
+            _ if matches!(lock, Some(SendLock::MaybeSent | SendLock::Sent)) => "",
             // A header field takes typing as insert mode does.
             _ if self.field != Field::Body => "insert",
             Mode::Normal => "normal",
@@ -1921,6 +2066,42 @@ impl Render for ComposeView {
         } else {
             self.status.clone()
         };
+        let header_matches = self.header_matches(&snap);
+        let save_exit = &mut self.draft_save_exit;
+        let motion = self.motion;
+        let draft_save = self.draft_save.and_then(|(revision, status, fade)| {
+            if lock.is_some() {
+                return None;
+            }
+            let now = Instant::now();
+            if revision == snap.revision && header_matches {
+                *save_exit = None;
+                let opacity = fade.map_or(1., |fade| {
+                    if fade.running(now) {
+                        window.request_animation_frame();
+                    }
+                    fade.progress(now)
+                });
+                return Some((status, opacity));
+            }
+            if status.warning().is_some() {
+                return Some((DraftSaveStatus::ServerRetrying, 1.));
+            }
+            if !motion.enabled() {
+                return None;
+            }
+            let exit = save_exit.get_or_insert_with(|| Transition::new(now, motion::FADE));
+            if exit.running(now) {
+                window.request_animation_frame();
+                return Some((status, exit.remaining(now)));
+            }
+            None
+        });
+        if !self.closing && self.announced_shown.as_ref() != Some(&self.draft_id) {
+            let draft = self.draft_id.clone();
+            self.announced_shown = Some(draft.clone());
+            window.on_next_frame(move |_, cx| crate::view::compose_draft_shown(&draft, cx));
+        }
         let mono = self
             .look
             .as_ref()
@@ -1998,8 +2179,11 @@ impl Render for ComposeView {
             .children(feedback)
             .children(show_status.then(|| {
                 status_bar(
-                    mode,
-                    &hint,
+                    ComposeStatus {
+                        mode,
+                        note: &hint,
+                        draft_save,
+                    },
                     &snap,
                     self.send_tried,
                     colors,
@@ -2007,6 +2191,9 @@ impl Render for ComposeView {
                     &|text, size| {
                         text_px(window, text, size, mono.as_deref().unwrap_or(&ui_family))
                     },
+                    (&ui_family, &|text, size| {
+                        text_px(window, text, size, &ui_family)
+                    }),
                 )
                 .flex_shrink_0()
                 .when_some(mono, |bar, family| bar.font_family(family))
@@ -4671,7 +4858,11 @@ fn render_doc(doc: &StyledDoc, folder: &Path, paint: Paint, colors: Palette) -> 
     for block in &doc.blocks {
         let mut painted = render_block(block, folder, paint, colors);
         if previous.is_some() && !joins_previous(previous, Some(&block.body)) {
-            painted = painted.mt_2();
+            painted = if matches!(block.body, BlockBody::Heading { .. }) {
+                painted.mt_4()
+            } else {
+                painted.mt_2()
+            };
         }
         previous = Some(&block.body);
         column = column.child(painted);
@@ -5387,18 +5578,26 @@ fn idle_status(status: &str) -> bool {
     matches!(status, "" | "normal" | "insert")
 }
 
+struct ComposeStatus<'a> {
+    mode: &'a str,
+    note: &'a str,
+    draft_save: Option<(DraftSaveStatus, f32)>,
+}
+
 /// One line, in the inbox's style: mode and hints on the left, send on
 /// the right, `key action` pairs separated by ` · `, in the mono face.
 /// `measure` gives a text's width at a size, in the bar's face, so a long
 /// message is cut at a word with `…` and keeps 16px clear of the right.
+type StatusMeasure<'a> = &'a dyn Fn(&str, f32) -> f32;
+
 fn status_bar(
-    mode: &str,
-    status: &SharedString,
+    status: ComposeStatus<'_>,
     snap: &Snapshot,
     send_tried: bool,
     colors: Palette,
     width: f32,
-    measure: &dyn Fn(&str, f32) -> f32,
+    measure: StatusMeasure<'_>,
+    (warning_font, measure_warning): (&str, StatusMeasure<'_>),
 ) -> gpui::Div {
     let wide = width > 640.;
     let size = if wide { 14. } else { 13. };
@@ -5409,18 +5608,30 @@ fn status_bar(
         .chain(&snap.bcc)
         .filter(|item| item.fresh)
         .count();
-    let idle = idle_status(status);
+    let ComposeStatus {
+        mode,
+        note,
+        draft_save,
+    } = status;
+    let idle = idle_status(note);
+    let saved = draft_save.filter(|_| idle);
     // The header tags each first-time address; the count only fills an
     // idle bar, so it never crowds out a message or reads as a count of
     // edits. Narrow: short enough to sit beside the mode and send.
     let fresh_label = match fresh {
-        _ if !idle || snap.send_block.as_deref() == Some(SEND_UNAVAILABLE) => None,
+        _ if !idle || saved.is_some() || snap.send_block.as_deref() == Some(SEND_UNAVAILABLE) => {
+            None
+        }
         0 => None,
         count if !wide => Some(format!("first-time: {count}")),
         1 => Some("1 first-time recipient".to_string()),
         count => Some(format!("{count} first-time recipients")),
     };
-    let right = status_right(snap, status, send_tried, wide);
+    let right = if saved.is_some_and(|(status, _)| status.warning().is_some()) && !wide {
+        Vec::new()
+    } else {
+        status_right(snap, note, send_tried, wide)
+    };
     let gap = 8.;
     let dot_px = measure("·", size);
     let parts_px = |parts: &[(String, Tone, bool)]| -> f32 {
@@ -5437,11 +5648,16 @@ fn status_bar(
         measure(mode, size) + dot_px + 2. * gap
     };
     let room = width - 32. - parts_px(&right) - 16. - mode_px - 4.;
-    let message = if idle {
-        String::new()
-    } else {
-        fit_words(status, room, &|text| measure(text, size))
+    let (message, color, opacity) = match saved {
+        Some((DraftSaveStatus::Local, alpha)) => ("saved", colors.dim, alpha),
+        Some((DraftSaveStatus::Server, alpha)) => ("saved to Drafts", colors.dim, alpha),
+        Some((status, alpha)) => (status.warning().unwrap_or_default(), colors.error, alpha),
+        None if idle => ("", colors.fg, 1.),
+        None => (note, colors.fg, 1.),
     };
+    let warning = saved.is_some_and(|(status, _)| status.warning().is_some());
+    let message_measure = if warning { measure_warning } else { measure };
+    let message = fit_words(message, room, &|text| message_measure(text, size));
     let dot = || div().text_color(rgb(colors.dim)).child("·");
     let mut left = div()
         .flex()
@@ -5459,14 +5675,18 @@ fn status_bar(
     }
     if !message.is_empty() {
         if !mode.is_empty() {
-            left = left.child(dot());
+            left = left.child(dot().opacity(opacity));
         }
         left = left.child(
             div()
                 .min_w(px(0.))
                 .whitespace_nowrap()
                 .overflow_hidden()
-                .text_color(rgb(colors.fg))
+                .text_color(rgb(color))
+                .when(warning, |message| {
+                    message.font_family(warning_font.to_owned())
+                })
+                .opacity(opacity)
                 .child(message),
         );
     }
@@ -5674,6 +5894,8 @@ fn which_key(colors: Palette) -> gpui::Div {
         )
         .child("space a  agent edit")
         .child(div().text_color(rgb(colors.dim)).child("k keep   x reject"))
+        .child("space ?  help")
+        .child(div().text_color(rgb(colors.dim)).child("l diagnostic log"))
 }
 
 const DISCARD_DRAFT_LABEL: &str = "Discard draft";
@@ -6144,6 +6366,7 @@ fn palette_action(query: &str) -> Option<&'static str> {
         "complete recipient" | "complete" => return Some("complete recipient"),
         "details" => return Some("details"),
         "dismiss" => return Some("dismiss"),
+        "diagnostic log" | "open diagnostic log" => return Some("diagnostic log"),
         _ => {}
     }
     let mut found = None;

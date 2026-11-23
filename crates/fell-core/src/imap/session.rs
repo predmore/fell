@@ -487,15 +487,25 @@ impl Session {
         section: &str,
         offset: usize,
         len: usize,
+        draft_budget: Option<usize>,
     ) -> Result<Option<PartWindow>, Error> {
         self.tag += 1;
         let tag = format!("a{}", self.tag);
-        let cmd = format!("UID FETCH {uid} (UID BODY.PEEK[{section}]<{offset}.{len}>)");
+        let size = if draft_budget.is_some() && offset == 0 {
+            " RFC822.SIZE"
+        } else {
+            ""
+        };
+        let cmd = format!("UID FETCH {uid} (UID{size} BODY.PEEK[{section}]<{offset}.{len}>)");
         self.write_all(format!("{tag} {cmd}\r\n").as_bytes())?;
         let mut found: Option<Result<PartWindow, Error>> = None;
         let mut seen = 0usize;
         loop {
-            let (text, literals) = self.read_logical()?;
+            let (text, literals) = self.read_logical_with_draft_budget(draft_budget)?;
+            if draft_budget.is_some() && draft_size_exceeded(text.as_bytes()) {
+                self.disconnect();
+                return Err(Error::DraftMessageLimit);
+            }
             if text_starts_with_tag(&text, &tag) {
                 let rest = text[tag.len()..].trim_start();
                 if !rest.to_ascii_uppercase().starts_with("OK") {
@@ -865,6 +875,13 @@ impl Session {
     }
 
     fn read_logical(&mut self) -> Result<(String, Vec<LiteralBytes>), Error> {
+        self.read_logical_with_draft_budget(None)
+    }
+
+    fn read_logical_with_draft_budget(
+        &mut self,
+        draft_budget: Option<usize>,
+    ) -> Result<(String, Vec<LiteralBytes>), Error> {
         let mut text = Vec::new();
         let mut literals = Vec::new();
         let mut retained = 0usize;
@@ -886,6 +903,12 @@ impl Session {
                     ));
                 }
                 LiteralMarker::Length(len) => {
+                    if draft_budget.is_some_and(|budget| {
+                        retained.saturating_add(len) > budget || draft_size_exceeded(&line)
+                    }) {
+                        self.disconnect();
+                        return Err(Error::DraftMessageLimit);
+                    }
                     let too_big = len > literal_limit();
                     let over = text.len().saturating_add(line.len()) > response_text_limit()
                         || literals.len() >= response_literal_limit()
@@ -1092,6 +1115,19 @@ struct Reply {
 /// Largest RFC 822 payload this client will store. A bigger literal is discarded
 /// and that message is skipped; the rest of the response is still read.
 const MAX_LITERAL: usize = crate::MAX_MESSAGE_BYTES;
+
+fn draft_size_exceeded(line: &[u8]) -> bool {
+    String::from_utf8_lossy(line)
+        .to_ascii_uppercase()
+        .split_once(" RFC822.SIZE ")
+        .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .is_some_and(|number| {
+            !number.is_empty()
+                && number
+                    .parse::<usize>()
+                    .map_or(true, |size| size > crate::MAX_MESSAGE_BYTES)
+        })
+}
 const DISCARD_CHUNK: usize = 64 * 1024;
 /// Protocol text before a newline, not including a `{n}` literal that follows.
 const MAX_LINE: usize = 1024 * 1024;

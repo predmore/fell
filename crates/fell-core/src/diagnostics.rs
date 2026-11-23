@@ -532,6 +532,11 @@ fn error_kind(error: &(dyn std::error::Error + 'static)) -> &'static str {
         match error {
             Error::Store(_) => "sqlite",
             Error::Backend(_) => "backend",
+            Error::DraftBodyUnavailable => "draft-body-unavailable",
+            Error::DraftFormattingUnavailable => "draft-formatting-unavailable",
+            Error::DraftNoLongerInFolder | Error::DraftUnavailable => "draft-copy-unavailable",
+            Error::DraftAttachmentLimit => "draft-attachment-limit",
+            Error::DraftMessageLimit => "draft-message-limit",
             Error::Keyring(_) => "keyring",
             Error::Tls(_) => "tls",
             Error::SmtpCredentialsRejected(_) => "credentials-rejected",

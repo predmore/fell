@@ -401,6 +401,14 @@ pub struct Store {
 #[cfg(test)]
 type SyncCommitHook = Box<dyn FnMut() -> Result<()> + Send>;
 
+/// The latest synced draft in a list thread.
+pub struct SyncedDraftPreview {
+    pub source: Option<RemoteId>,
+    pub recipients: Vec<Address>,
+    pub subject: String,
+    pub body: String,
+}
+
 /// One page of FTS hits. `next_cursor` is passed back to [`Store::search_page`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchPage {
@@ -743,6 +751,31 @@ impl Store {
         sync_cursor_on(&self.conn, account_id)
     }
 
+    /// Consume a request to revisit Drafts with the cursor change it needs.
+    /// Each later delta can advance this cursor, even when the walk is cut short.
+    pub(crate) fn sync_cursor_for_pass(
+        &self,
+        account: &AccountId,
+    ) -> Result<Option<crate::SyncCursor>> {
+        use crate::outbox::drafts;
+        if drafts::rescan_mailboxes(&self.conn, account)?.is_empty() {
+            return self.sync_cursor(account);
+        }
+        let tx = immediate_transaction(&self.conn)?;
+        let cursor = sync_cursor_on(&tx, account)?;
+        let mailboxes = drafts::rescan_mailboxes(&tx, account)?;
+        if mailboxes.is_empty() {
+            return Ok(cursor);
+        }
+        let mut checkpoints = crate::imap::decode_cursor(cursor.as_ref());
+        checkpoints.retain(|(mailbox, _)| !mailboxes.contains(mailbox));
+        let cursor = crate::imap::encode_cursor(account.as_str(), &checkpoints);
+        set_sync_cursor_on(&tx, account, &cursor)?;
+        drafts::consume_rescans(&tx, account)?;
+        tx.commit()?;
+        Ok(Some(cursor))
+    }
+
     /// Read and star changes made in Fell that sync has not seen the server
     /// agree with yet. Sync keeps these values over the server's.
     pub fn pending_flag_changes(&self, account_id: &AccountId) -> Result<Vec<PendingFlags>> {
@@ -808,6 +841,14 @@ impl Store {
                 .map(|flag| &flag.remote_id.0)
                 .collect()
         };
+        let drafts_mailbox = if delta.messages.is_empty() {
+            None
+        } else {
+            merge_roles
+                .listed(&tx, account_id)?
+                .get(FolderRole::Drafts)
+                .map(|folder| crate::imap::escape_mailbox(&folder.raw))
+        };
         for message in &delta.messages {
             if &message.account_id != account_id {
                 return Err(crate::Error::Backend(format!(
@@ -815,6 +856,18 @@ impl Store {
                     account_id.as_str(),
                     message.account_id.as_str()
                 )));
+            }
+            if let Some(mailbox) = &drafts_mailbox
+                && let Some(copy) = crate::imap::parse_remote_id(&message.remote_id.0)
+                && &copy.mailbox == mailbox
+                && crate::outbox::drafts::hides(
+                    &tx,
+                    account_id,
+                    &copy,
+                    &message.headers.message_id,
+                )?
+            {
+                continue;
             }
             // Skip a folder archive or delete already took off this message.
             let Some(mut message) = crate::actions::message_for_delta(&tx, message)? else {
@@ -961,6 +1014,18 @@ impl Store {
     }
 
     /// Re-resolve the threads this transaction's writes touched.
+    pub(crate) fn hide_server_draft_copy(
+        &self,
+        tx: &Connection,
+        account: &AccountId,
+        copy: &crate::outbox::drafts::Copy,
+    ) -> Result<()> {
+        if copies::hide_draft(tx, account, copy)? {
+            self.rethread_written(tx, account)?;
+        }
+        Ok(())
+    }
+
     fn rethread_written(&self, conn: &Connection, account_id: &AccountId) -> Result<()> {
         #[cfg(test)]
         if self.full_rethread.get() {
@@ -1796,28 +1861,35 @@ impl Store {
         Ok(out)
     }
 
-    /// Who each thread's latest message in `folder` is addressed to: its To,
-    /// then its Cc. The Drafts list names a synced draft by who it is to, as
-    /// it does a compose draft. A thread with no message in the folder is
-    /// left out.
-    pub fn folder_recipients(
+    /// The latest draft in each listed thread, using the editable MIME body.
+    /// The Drafts list reads these off the UI thread. Other folders use their
+    /// precomputed message snippets.
+    pub fn synced_draft_previews(
         &self,
         account_id: &AccountId,
         folder: &str,
         threads: &[ThreadId],
-    ) -> Result<std::collections::HashMap<ThreadId, Vec<Address>>> {
+    ) -> Result<HashMap<ThreadId, SyncedDraftPreview>> {
         let names: Vec<String> = folder_query_names(folder)
             .into_iter()
             .map(|name| name.to_ascii_lowercase())
             .collect();
+        let roles = self.folder_roles(account_id)?;
+        let mailbox = roles
+            .get(FolderRole::Drafts)
+            .map(|folder| crate::imap::escape_mailbox(&folder.raw));
         let mut stmt = self.conn.prepare_cached(
-            "SELECT folders, to_line, cc_line FROM messages
-             WHERE account_id = ?1 AND thread_id = ?2
-             ORDER BY date_unix DESC, rowid DESC",
+            "SELECT m.folders, m.to_line, m.cc_line, m.subject, m.body_text, m.message_id,
+                (SELECT 'imap:' || c.uidvalidity || ':' || c.uid || ':' || c.mailbox
+                 FROM message_copies c
+                 WHERE c.account_id = m.account_id AND c.message_id = m.message_id AND c.mailbox = ?3
+                 ORDER BY c.uidvalidity DESC, c.uid DESC LIMIT 1)
+             FROM messages m WHERE m.account_id = ?1 AND m.thread_id = ?2
+             ORDER BY m.date_unix DESC, m.rowid DESC",
         )?;
-        let mut out = std::collections::HashMap::new();
+        let mut out = HashMap::new();
         for thread in threads {
-            let mut rows = stmt.query(params![account_id.as_str(), thread.0])?;
+            let mut rows = stmt.query(params![account_id.as_str(), thread.0, mailbox])?;
             while let Some(row) = rows.next()? {
                 let folders: String = row.get(0)?;
                 let here = split_field(&folders)
@@ -1826,13 +1898,59 @@ impl Store {
                 if !here {
                     continue;
                 }
-                let mut people = decode_addresses(&row.get::<_, String>(1)?);
-                people.extend(decode_addresses(&row.get::<_, String>(2)?));
-                out.insert(thread.clone(), people);
+                let mut recipients = decode_addresses(&row.get::<_, String>(1)?);
+                recipients.extend(decode_addresses(&row.get::<_, String>(2)?));
+                let subject = crate::notes::display_safe(&row.get::<_, String>(3)?, false);
+                let id: String = row.get(5)?;
+                let fallback: Option<String> = row.get(4)?;
+                let body = self
+                    .editable_draft_body(account_id, &id, fallback.as_deref())?
+                    .unwrap_or_default();
+                out.insert(
+                    thread.clone(),
+                    SyncedDraftPreview {
+                        source: row.get::<_, Option<String>>(6)?.map(RemoteId),
+                        recipients,
+                        subject,
+                        body,
+                    },
+                );
                 break;
             }
         }
         Ok(out)
+    }
+
+    /// Read the same editable body for a synced draft's list and reader.
+    /// Leave unsupported formatting to the native HTML reader.
+    pub fn editable_draft_body(
+        &self,
+        account: &AccountId,
+        message_id: &str,
+        fallback: Option<&str>,
+    ) -> Result<Option<String>> {
+        let Some(parts) = bodies::read_body_text(&self.conn, account, message_id)? else {
+            return Ok(Some(fallback.unwrap_or_default().to_owned()));
+        };
+        if parts
+            .html
+            .as_deref()
+            .is_some_and(fell_render::html_has_uneditable_draft_formatting)
+        {
+            return Ok(None);
+        }
+        Ok(Some(
+            parts
+                .plain
+                .filter(|plain| !plain.trim().is_empty())
+                .or_else(|| {
+                    parts
+                        .html
+                        .as_deref()
+                        .map(crate::imap::rfc822::html_draft_body)
+                })
+                .unwrap_or_else(|| fallback.unwrap_or_default().to_owned()),
+        ))
     }
 
     /// One window of the list [`Store::folder_threads`] returns, whether the
@@ -2515,6 +2633,9 @@ fn delete_demo_account(conn: &Connection, id: &str) -> Result<()> {
         "account_folders",
         "sent_bcc",
         "server_outbox",
+        "server_draft_copies",
+        "server_draft_rescans",
+        "discarded_server_draft_copies",
         "write_back_accounts",
         "agent_grants",
         "agent_actions",
@@ -2622,19 +2743,24 @@ impl<'a> MergeRoles<'a> {
         }
     }
 
+    fn listed(&mut self, conn: &Connection, account: &AccountId) -> Result<&FolderRoles> {
+        if self.listed.is_none() {
+            self.listed = Some(Cow::Owned(
+                roles::listed(conn, account)?.unwrap_or_default(),
+            ));
+        }
+        Ok(self.listed.as_deref().expect("loaded roles"))
+    }
+
     fn resolve<'b>(
         &'b mut self,
         conn: &Connection,
         message: &Message,
         fallback: &'b mut Option<FolderRoles>,
     ) -> Result<&'b FolderRoles> {
-        if self.listed.is_none() {
-            self.listed = Some(Cow::Owned(
-                roles::listed(conn, &message.account_id)?.unwrap_or_default(),
-            ));
-        }
-        if let Some(found) = self.listed.as_deref().filter(|roles| !roles.is_empty()) {
-            return Ok(found);
+        let listed = self.listed(conn, &message.account_id)?;
+        if !listed.is_empty() {
+            return Ok(listed);
         }
         match fallback {
             Some(found) => Ok(found),
@@ -5232,13 +5358,14 @@ mod tests {
         other.folders = vec!["INBOX".into()];
         let elsewhere = store.upsert_message(&other).unwrap();
         let found = store
-            .folder_recipients(
+            .synced_draft_previews(
                 &AccountId("a1".into()),
                 "drafts",
                 &[thread.clone(), elsewhere.clone()],
             )
             .unwrap();
         let people: Vec<&str> = found[&thread]
+            .recipients
             .iter()
             .map(|person| person.email.as_str())
             .collect();

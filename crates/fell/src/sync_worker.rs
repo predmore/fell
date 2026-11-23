@@ -75,6 +75,8 @@ pub enum SyncEvent {
         dropped: Vec<DroppedWrite>,
         flag_recovery_delayed: bool,
         sent_append_delayed: bool,
+        draft_append_delayed: bool,
+        draft_append_recovered: bool,
     },
     /// Parts were stored for mail that had none (the backfill after a
     /// pass). An open thread may have HTML to show now.
@@ -129,6 +131,7 @@ enum Ask {
 /// Whether the fetch left a stored HTML part, or why it did not finish.
 pub type BodyReply = Result<bool, String>;
 
+#[derive(Clone)]
 pub struct SyncHandle {
     wake: Sender<Request>,
     /// `write_back` in the account file.
@@ -355,12 +358,16 @@ fn run(
             }
             if (!report.dropped.is_empty()
                 || report.flag_recovery_delayed
-                || report.sent_append_delayed)
+                || report.sent_append_delayed
+                || report.draft_append_delayed
+                || report.draft_append_recovered)
                 && events
                     .unbounded_send(SyncEvent::WriteBackNotice {
                         dropped: report.dropped,
                         flag_recovery_delayed: report.flag_recovery_delayed,
                         sent_append_delayed: report.sent_append_delayed,
+                        draft_append_delayed: report.draft_append_delayed,
+                        draft_append_recovered: report.draft_append_recovered,
                     })
                     .is_err()
             {

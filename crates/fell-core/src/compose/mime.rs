@@ -45,6 +45,28 @@ pub fn build_outgoing(
     files: &[ResolvedFile],
     reply: &ReplyParts,
 ) -> Outgoing {
+    build_message(account_id, fields, body, files, reply, false)
+}
+
+pub(super) fn build_server_draft(draft: &super::StoredCompose, files: &[ResolvedFile]) -> Outgoing {
+    build_message(
+        draft.account_id.clone(),
+        &draft.fields,
+        &draft.body,
+        files,
+        &draft.reply,
+        true,
+    )
+}
+
+fn build_message(
+    account_id: crate::AccountId,
+    fields: &DraftFields,
+    body: &str,
+    files: &[ResolvedFile],
+    reply: &ReplyParts,
+    draft: bool,
+) -> Outgoing {
     let mut plain = if body.ends_with('\n') || body.is_empty() {
         body.to_string()
     } else {
@@ -71,7 +93,15 @@ pub fn build_outgoing(
     }
     let digest = attachment_digest(files);
     let message_id = fresh_message_id();
-    let mime = render_mime(fields, &message_id, &plain, &html, files, &reply.references);
+    let mime = render_mime(
+        fields,
+        &message_id,
+        &plain,
+        &html,
+        files,
+        &reply.references,
+        draft,
+    );
     let in_reply_to = fields
         .in_reply_to
         .as_ref()
@@ -102,6 +132,7 @@ fn render_mime(
     html: &str,
     files: &[ResolvedFile],
     references: &[String],
+    draft: bool,
 ) -> Vec<u8> {
     let blobs = content_blobs(plain, html, files);
     let mixed = fresh_boundary("mix", &blobs);
@@ -114,6 +145,9 @@ fn render_mime(
     headers.push_str(&header_line("To", &encode_addresses(&fields.to)));
     if !fields.cc.is_empty() {
         headers.push_str(&header_line("Cc", &encode_addresses(&fields.cc)));
+    }
+    if draft && !fields.bcc.is_empty() {
+        headers.push_str(&header_line("Bcc", &encode_addresses(&fields.bcc)));
     }
     headers.push_str(&header_line(
         "Subject",

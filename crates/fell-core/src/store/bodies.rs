@@ -695,18 +695,26 @@ pub(super) fn move_into(
     Ok(None)
 }
 
+pub(super) fn read_body_text(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_id: &str,
+) -> Result<Option<MessageParts>> {
+    read_text(
+        conn,
+        "SELECT codec, html, plain, bulk_headers FROM message_bodies
+         WHERE account_id = ?1 AND message_id = ?2",
+        params![account_id.as_str(), message_id],
+    )
+}
+
 /// Stored parts for a canonical message id, or `None` when there is no row.
 pub(super) fn read(
     conn: &Connection,
     account_id: &AccountId,
     message_id: &str,
 ) -> Result<Option<MessageParts>> {
-    let mut parts = read_text(
-        conn,
-        "SELECT codec, html, plain, bulk_headers FROM message_bodies
-         WHERE account_id = ?1 AND message_id = ?2",
-        params![account_id.as_str(), message_id],
-    )?;
+    let mut parts = read_body_text(conn, account_id, message_id)?;
     if let Some(parts) = &mut parts {
         parts.mime_parts = list(conn, account_id, message_id)?.unwrap_or_default();
     }

@@ -26,7 +26,10 @@ pub use fixtures::{Fixture, fixture, fixtures};
 pub use history::{
     Fold, FoldedDocument, Section, fold_history, is_forward_subject, is_quoted_from_line,
 };
-pub use html::{document_from_body, html_to_document, looks_like_html, plain_to_document};
+pub use html::{
+    document_from_body, html_has_uneditable_draft_formatting, html_to_document, looks_like_html,
+    plain_to_document,
+};
 pub use markdown::markdown_to_document;
 pub use webview_html::{
     WebFrame, address_is_blocked, request_is_blocked, request_is_blocked_with, sanitize_html,

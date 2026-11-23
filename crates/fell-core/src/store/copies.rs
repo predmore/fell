@@ -547,6 +547,9 @@ pub(super) fn link(
     let Some(row) = canonical_id_on(conn, account_id, message_id)? else {
         return Ok(false);
     };
+    if crate::outbox::drafts::hides(conn, account_id, copy, message_id)? {
+        return Ok(false);
+    }
     let inserted = conn
         .prepare_cached(
             "INSERT OR IGNORE INTO message_copies
@@ -595,6 +598,38 @@ pub(super) fn link_arrival(
         }
     }
     Ok(true)
+}
+
+/// The imported copy is shown by its local compose row. Settle this UID
+/// immediately so both representations never occupy the list together.
+pub(super) fn hide_draft(
+    conn: &Connection,
+    account: &AccountId,
+    copy: &crate::outbox::drafts::Copy,
+) -> Result<bool> {
+    let mailbox = crate::imap::escape_mailbox(&copy.mailbox);
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT message_id, folder FROM message_copies
+         WHERE account_id = ?1 AND mailbox = ?2 AND uidvalidity = ?3 AND uid = ?4",
+            params![account.as_str(), mailbox, copy.validity, copy.uid],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((message, folder)) = row else {
+        return Ok(false);
+    };
+    let mut changed = drop_copy(conn, account, &mailbox, copy.validity, copy.uid, copy.uid)?;
+    if matches!(
+        settle_one(conn, account, &message, &folder, Settle::All, &mut changed)?,
+        Outcome::Done
+    ) {
+        conn.execute(
+            "DELETE FROM copy_orphans WHERE account_id = ?1 AND message_id = ?2 AND folder = ?3",
+            params![account.as_str(), message, folder],
+        )?;
+    }
+    Ok(changed)
 }
 
 pub(super) fn drop_copy(

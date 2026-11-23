@@ -38,6 +38,8 @@ pub struct ThreadRow {
     /// The compose draft this row stands for, in the drafts list. `None`
     /// for a thread.
     pub draft: Option<String>,
+    /// The exact server copy used to build a synced Drafts preview.
+    pub server_draft: Option<fell_core::RemoteId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -475,6 +477,7 @@ pub fn thread_rows(threads: &[FolderThread], me: &str) -> Vec<ThreadRow> {
             warn: false,
             unread: thread.unread,
             draft: None,
+            server_draft: None,
         })
         .collect()
 }
@@ -535,11 +538,12 @@ pub fn draft_rows(drafts: &[DraftSummary]) -> Vec<ThreadRow> {
                 } else {
                     one_line(&draft.subject)
                 },
-                snippet: markdown_snippet(&draft.body),
+                snippet: markdown_snippet(&draft.body, &draft.subject),
                 labels,
                 warn: draft.maybe_sent,
                 unread: false,
                 draft: Some(draft.id.clone()),
+                server_draft: None,
             }
         })
         .collect()
@@ -574,7 +578,7 @@ pub fn draft_conversation(draft: &DraftSummary, me: &str, now: i64) -> Vec<ConvM
         },
         remote_id: fell_core::RemoteId(String::new()),
         thread_id: fell_core::ThreadId::from_message_id(&message_id),
-        snippet: markdown_snippet(&draft.body),
+        snippet: markdown_snippet(&draft.body, &draft.subject),
         body_text: Some(draft.body.clone()),
         unread: false,
         folders: Vec::new(),
@@ -604,15 +608,10 @@ pub fn draft_conversation(draft: &DraftSummary, me: &str, now: i64) -> Vec<ConvM
             Vec::new()
         };
         message.expanded = true;
-        // The markdown the person wrote, styled as the compose window and
-        // the recipient see it, not as source.
-        if !draft.body.trim().is_empty() {
-            message.body = RenderedBody {
-                blocks: vec![BodyBlock::Markdown {
-                    doc: std::sync::Arc::new(fell_core::compose::markdown_to_doc(&draft.body)),
-                    agent: !draft.owner.trim().is_empty(),
-                }],
-            };
+        if let Some(body) =
+            draft_reader_body(&draft.body, &draft.subject, !draft.owner.trim().is_empty())
+        {
+            message.body = body;
         }
         message.context = draft_context(draft, me, now);
     }
@@ -661,31 +660,56 @@ pub fn draft_context(draft: &DraftSummary, me: &str, now: i64) -> Option<String>
     })
 }
 
-/// A compose draft's body on one line, as it reads: markdown markers,
-/// link destinations and image references left out.
-pub fn markdown_snippet(body: &str) -> String {
-    use fell_core::compose::{BlockBody, Inline};
-    fn inlines(out: &mut Vec<String>, items: &[Inline]) {
-        for item in items {
-            match item {
-                Inline::Text(text) | Inline::Code(text) => out.push(text.clone()),
-                Inline::Em(inner) | Inline::Strong(inner) => inlines(out, inner),
-                Inline::Link { text, .. } => out.push(text.clone()),
-                Inline::Image { .. } => {}
-            }
+pub(crate) fn draft_reader_body(body: &str, subject: &str, agent: bool) -> Option<RenderedBody> {
+    (!body.trim().is_empty()).then(|| RenderedBody {
+        blocks: vec![BodyBlock::Markdown {
+            doc: std::sync::Arc::new(draft_preview_document(body, subject)),
+            agent,
+        }],
+    })
+}
+
+fn draft_preview_document(body: &str, subject: &str) -> fell_core::compose::StyledDoc {
+    use fell_core::compose::BlockBody;
+    let mut doc = fell_core::compose::markdown_to_doc(body);
+    if let Some(first) = doc.blocks.first()
+        && let BlockBody::Heading { inlines, .. } = &first.body
+    {
+        let mut heading = Vec::new();
+        draft_inline_text(&mut heading, inlines);
+        if one_line(&heading.concat()) == one_line(subject) {
+            doc.blocks.remove(0);
         }
     }
+    doc
+}
+
+fn draft_inline_text(out: &mut Vec<String>, items: &[fell_core::compose::Inline]) {
+    use fell_core::compose::Inline;
+    for item in items {
+        match item {
+            Inline::Text(text) | Inline::Code(text) => out.push(text.clone()),
+            Inline::Em(inner) | Inline::Strong(inner) => draft_inline_text(out, inner),
+            Inline::Link { text, .. } => out.push(text.clone()),
+            Inline::Image { .. } => {}
+        }
+    }
+}
+
+/// A compose draft's rendered body on one line.
+pub fn markdown_snippet(body: &str, subject: &str) -> String {
+    use fell_core::compose::BlockBody;
     fn blocks(out: &mut Vec<String>, items: &[fell_core::compose::Block]) {
         for block in items {
             match &block.body {
                 BlockBody::Heading { inlines: items, .. }
                 | BlockBody::Paragraph { inlines: items } => {
-                    inlines(out, items);
+                    draft_inline_text(out, items);
                     out.push(" ".into());
                 }
                 BlockBody::List { items, .. } => {
                     for item in items {
-                        inlines(out, item);
+                        draft_inline_text(out, item);
                         out.push(" ".into());
                     }
                 }
@@ -698,7 +722,7 @@ pub fn markdown_snippet(body: &str) -> String {
             }
         }
     }
-    let doc = fell_core::compose::markdown_to_doc(body);
+    let doc = draft_preview_document(body, subject);
     let mut out = Vec::new();
     blocks(&mut out, &doc.blocks);
     one_line(&out.concat())
@@ -708,19 +732,29 @@ pub fn markdown_snippet(body: &str) -> String {
 /// drafts do, instead of their sender (always "me").
 pub fn address_draft_rows(
     rows: &mut [ThreadRow],
-    recipients: &std::collections::HashMap<fell_core::ThreadId, Vec<fell_core::Address>>,
+    drafts: &std::collections::HashMap<fell_core::ThreadId, fell_core::SyncedDraftPreview>,
     me: &str,
 ) {
     for row in rows.iter_mut() {
         // A draft is not mail waiting to be read.
         row.unread = false;
-        let Some(people) = recipients.get(&fell_core::ThreadId(row.id.clone())) else {
+        let Some(draft) = drafts.get(&fell_core::ThreadId(row.id.clone())) else {
             continue;
         };
-        let names: Vec<String> = people
+        row.server_draft.clone_from(&draft.source);
+        row.subject = if draft.subject.trim().is_empty() {
+            "(no subject)".into()
+        } else {
+            one_line(&draft.subject)
+        };
+        row.snippet = markdown_snippet(&draft.body, &draft.subject);
+        let names: Vec<String> = draft
+            .recipients
             .iter()
             .map(|person| match person.name.as_deref().map(str::trim) {
-                Some(name) if !name.is_empty() => one_line(name),
+                Some(name) if !name.is_empty() => {
+                    one_line(&fell_core::notes::display_safe(name, false))
+                }
                 _ if person.email.eq_ignore_ascii_case(me) => "me".into(),
                 _ => one_line(&person.email),
             })
@@ -1677,12 +1711,16 @@ mod tests {
     fn a_draft_snippet_is_the_text_without_markdown() {
         // #159: the row showed the raw markdown.
         assert_eq!(
-            markdown_snippet(STYLED),
+            markdown_snippet(STYLED, "Plans"),
             "Some bold text, a link and a list: one"
         );
         assert_eq!(
-            markdown_snippet("# Dates\n\n> quoted *note*\n"),
+            markdown_snippet("# Dates\n\n> quoted *note*\n", "Plans"),
             "Dates quoted note"
+        );
+        assert_eq!(
+            markdown_snippet("# Plans\n\n> quoted *note*\n", "Plans"),
+            "quoted note"
         );
         let row = &draft_rows(&[draft(STYLED)])[0];
         assert_eq!(row.snippet, "Some bold text, a link and a list: one");
@@ -1697,6 +1735,26 @@ mod tests {
         };
         assert_eq!(*doc.as_ref(), fell_core::compose::markdown_to_doc(STYLED));
         assert_eq!(shown[0].snippet, "Some bold text, a link and a list: one");
+        let headed = draft(&format!("# Plans\n\n{STYLED}"));
+        assert_eq!(
+            draft_conversation(&headed, "me@example.com", 2_000)[0].snippet,
+            shown[0].snippet
+        );
+        let headed = draft_conversation(&headed, "me@example.com", 2_000);
+        let [BodyBlock::Markdown { doc: headed, .. }] = headed[0].body.blocks.as_slice() else {
+            panic!("the heading-free preview should still render Markdown");
+        };
+        assert_eq!(
+            headed
+                .blocks
+                .iter()
+                .map(|block| &block.body)
+                .collect::<Vec<_>>(),
+            doc.blocks
+                .iter()
+                .map(|block| &block.body)
+                .collect::<Vec<_>>()
+        );
         // An empty draft keeps the plain empty body.
         let empty = draft_conversation(&draft(""), "me@example.com", 2_000);
         assert!(matches!(
@@ -1833,25 +1891,36 @@ mod tests {
             warn: false,
             unread: true,
             draft: None,
+            server_draft: None,
         }];
         let mut untouched = rows[0].clone();
         untouched.id = "t2".into();
         rows.push(untouched);
-        let mut recipients = std::collections::HashMap::new();
-        recipients.insert(
+        let mut previews = std::collections::HashMap::new();
+        previews.insert(
             ThreadId("t1".into()),
-            vec![
-                Address {
-                    name: Some("Ada Lovelace".into()),
-                    email: "ada@example.com".into(),
-                },
-                Address {
-                    name: None,
-                    email: "sam@example.com".into(),
-                },
-            ],
+            fell_core::SyncedDraftPreview {
+                source: None,
+                recipients: vec![
+                    Address {
+                        name: Some("Ada Lovelace".into()),
+                        email: "ada@example.com".into(),
+                    },
+                    Address {
+                        name: None,
+                        email: "sam@example.com".into(),
+                    },
+                ],
+                subject: "Plans".into(),
+                body: format!("# Plans\n\n{STYLED}"),
+            },
         );
-        address_draft_rows(&mut rows, &recipients, "me@example.com");
+        address_draft_rows(&mut rows, &previews, "me@example.com");
+        let local = &draft_rows(&[draft(STYLED)])[0];
+        assert_eq!(
+            (&rows[0].subject, &rows[0].snippet),
+            (&local.subject, &local.snippet)
+        );
         let names: Vec<&str> = rows[0]
             .spans
             .iter()

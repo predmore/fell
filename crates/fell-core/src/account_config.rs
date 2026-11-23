@@ -19,7 +19,7 @@
 //! # smtp_security = "starttls"  # "plain" only for a loopback address
 //! # sent_folder = "Sent Items"  # only for a server that does not mark its folders
 //! # save_sent = "auto"        # "append" or "server" overrides provider detection
-//! # write_back = true           # send moves and flag changes to the server (off by default)
+//! # write_back = true           # send local changes to the server (off by default)
 //! # notifications = "on"       # "on", "private", or "off"
 //! ```
 //!
@@ -34,8 +34,8 @@
 //! and selects `"append"` elsewhere. Set `"server"` to let your provider
 //! file the copy, or `"append"` to have Fell file it with IMAP.
 //!
-//! With `write_back = true`, Fell queues Sent appends, moves, and read and star
-//! changes for the sync thread (see [`crate::outbox`]). With write-back off,
+//! With `write_back = true`, Fell queues drafts, Sent appends, moves, and read and
+//! star changes for the sync thread (see [`crate::outbox`]). With write-back off,
 //! append mode saves the local Sent copy only.
 //!
 //! Sending uses only this file's username and password source, never anything in a
@@ -559,6 +559,46 @@ impl AccountConfig {
             &self.username,
             &password,
         ))
+    }
+
+    /// Import the same Drafts copy that the list would preview for this thread.
+    /// The remote UID stays attached to the resulting local compose draft.
+    pub fn import_server_draft(
+        &self,
+        store: &crate::Store,
+        thread: &crate::ThreadId,
+        draft_id: &str,
+    ) -> Result<String> {
+        let account = self.account();
+        let roles = store.folder_roles(&account.id)?;
+        let folder = roles
+            .get(FolderRole::Drafts)
+            .ok_or(crate::Error::DraftNoLongerInFolder)?;
+        let source = store
+            .synced_draft_previews(&account.id, &folder.name, std::slice::from_ref(thread))?
+            .remove(thread)
+            .and_then(|preview| preview.source)
+            .ok_or(crate::Error::DraftNoLongerInFolder)?;
+        self.import_server_draft_copy(store, &source, draft_id)
+    }
+
+    /// Import the exact UID from the displayed Drafts preview, if it is still
+    /// in the listed Drafts mailbox.
+    pub fn import_server_draft_copy(
+        &self,
+        store: &crate::Store,
+        source: &crate::RemoteId,
+        draft_id: &str,
+    ) -> Result<String> {
+        let account = self.account();
+        let copy = store
+            .server_draft_source(&account.id, source)?
+            .ok_or(crate::Error::DraftNoLongerInFolder)?;
+        let raw = crate::imap::part_fetch::fetch_draft(&self.imap_config()?, source)?
+            .ok_or(crate::Error::DraftUnavailable)?;
+        let draft = crate::imap::rfc822::parse_draft(&account, draft_id, &raw)?;
+        let message_id = crate::imap::rfc822::draft_message_id(&raw);
+        store.import_server_draft(&copy, &draft, message_id.as_deref())
     }
 
     fn imap_config(&self) -> Result<ImapConfig> {

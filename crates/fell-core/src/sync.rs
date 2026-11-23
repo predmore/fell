@@ -75,7 +75,7 @@ pub fn sync_with_arrivals(
     arrivals: Option<&mut dyn FnMut(Result<Vec<InboxArrival>>)>,
 ) -> Result<SyncReport> {
     store.upsert_account(account)?;
-    let cursor = store.sync_cursor(&account.id)?;
+    let cursor = store.sync_cursor_for_pass(&account.id)?;
     let mut observer = arrivals.and_then(|send| {
         let inbox = FolderRole::Inbox.default_name();
         let (_, checkpoint) = decode_cursor(cursor.as_ref())

@@ -46,6 +46,7 @@ use crate::folders::FolderRoles;
 use crate::store::Store;
 use crate::{Error, Result};
 
+pub(crate) mod drafts;
 pub(crate) mod flags;
 pub(crate) mod labels;
 
@@ -108,6 +109,8 @@ CREATE TABLE IF NOT EXISTS server_outbox (
     -- Extra copies bound from an early keyword edit replay with that edit.
     keyword_parent INTEGER,
     append_mime BLOB,
+    draft_id TEXT,
+    draft_digest BLOB,
     append_checks INTEGER NOT NULL DEFAULT 0
 );
 
@@ -146,6 +149,9 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("server_outbox", "flag_modseq", "BLOB"),
     ("server_outbox", "flag_base", "INTEGER"),
     ("server_outbox", "append_mime", "BLOB"),
+    ("server_outbox", "draft_id", "TEXT"),
+    ("server_outbox", "draft_digest", "BLOB"),
+    ("server_draft_copies", "message_id", "TEXT"),
     (
         "server_outbox",
         "append_checks",
@@ -169,6 +175,8 @@ pub enum OutboxKind {
     /// Trash, spam, and not spam).
     Move,
     AppendSent,
+    AppendDraft,
+    DeleteDraft,
     Seen,
     Flagged,
     Keyword,
@@ -180,6 +188,8 @@ impl OutboxKind {
         match self {
             Self::Move => "move",
             Self::AppendSent => "append_sent",
+            Self::AppendDraft => "append_draft",
+            Self::DeleteDraft => "delete_draft",
             Self::Seen => "seen",
             Self::Flagged => "flagged",
             Self::Keyword => "keyword",
@@ -191,6 +201,8 @@ impl OutboxKind {
         match raw {
             "move" => Ok(Self::Move),
             "append_sent" => Ok(Self::AppendSent),
+            "append_draft" => Ok(Self::AppendDraft),
+            "delete_draft" => Ok(Self::DeleteDraft),
             "seen" => Ok(Self::Seen),
             "flagged" => Ok(Self::Flagged),
             "keyword" => Ok(Self::Keyword),
@@ -199,9 +211,18 @@ impl OutboxKind {
         }
     }
 
+    pub(crate) fn is_append(self) -> bool {
+        matches!(self, Self::AppendSent | Self::AppendDraft)
+    }
+
     pub(crate) fn flag_name(self) -> Option<&'static str> {
         match self {
-            Self::Move | Self::AppendSent | Self::Keyword | Self::BridgeLabel => None,
+            Self::Move
+            | Self::AppendSent
+            | Self::AppendDraft
+            | Self::DeleteDraft
+            | Self::Keyword
+            | Self::BridgeLabel => None,
             Self::Seen => Some("\\Seen"),
             Self::Flagged => Some("\\Flagged"),
         }
@@ -293,6 +314,10 @@ pub struct ReplayReport {
     pub flag_recovery_delayed: bool,
     /// An APPEND failed and the Sent copy is still queued.
     pub sent_append_delayed: bool,
+    /// A draft's upload first failed and is still queued.
+    pub draft_append_delayed: bool,
+    /// A draft upload that had been delayed is now confirmed.
+    pub draft_append_recovered: bool,
     /// Replay applied a conflicting server value to the local store.
     pub flags_changed: bool,
     /// The connection failed part way; the rest waits for the next pass.
@@ -317,6 +342,8 @@ pub enum DropReason {
     Refused,
     /// The result of a Sent APPEND could not be verified.
     UnconfirmedAppend,
+    /// The previous Drafts copy could not be removed.
+    DraftCleanup,
     /// The folder, or the message in it, never turned up on the server.
     NotFound,
     /// The server has no MOVE. Fell does not copy and expunge instead, so
@@ -398,6 +425,7 @@ pub(crate) fn set_write_back_on(
 
 pub(crate) fn ensure_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(OUTBOX_SCHEMA)?;
+    drafts::ensure_schema(conn)?;
     for (table, column, definition) in ADDED_COLUMNS {
         let present: Option<i64> = conn
             .query_row(
@@ -412,6 +440,10 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<()> {
             ))?;
         }
     }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_outbox_draft
+         ON server_outbox(account_id, draft_id, id) WHERE draft_id IS NOT NULL;",
+    )?;
     // Earlier builds of write-back copied, flagged, and expunged on a server
     // without MOVE. A row they left half done is never finished: the
     // source copy stays (maybe flagged `\Deleted`), and it is reported once.
@@ -479,7 +511,8 @@ pub(crate) fn queue_append(
 }
 
 pub(crate) struct PendingAppend {
-    pub mime: Vec<u8>,
+    /// A draft whose recovery budget ran out has no payload to retransmit.
+    pub mime: Option<Vec<u8>>,
     /// The exact mailbox used if a command may already have reached it.
     pub sent_to: Option<String>,
     pub validity: u32,
@@ -523,7 +556,12 @@ pub(crate) fn mark_append_sent(
          SET sent = 1, target_mailbox = ?2, target_uidvalidity = ?3, target_uidnext = ?4,
              append_checks = 0
          WHERE id = ?1 AND state = 'pending' AND generation IN
-             (SELECT generation FROM write_back_accounts WHERE account_id = server_outbox.account_id AND enabled)",
+             (SELECT generation FROM write_back_accounts WHERE account_id = server_outbox.account_id AND enabled)
+           AND NOT EXISTS (SELECT 1 FROM compose_send s WHERE s.account_id = server_outbox.account_id
+                           AND s.draft_id = server_outbox.draft_id AND s.state = 'sent')
+           AND (draft_id IS NULL OR EXISTS (SELECT 1 FROM compose_drafts d
+                   WHERE d.account_id = server_outbox.account_id AND d.id = server_outbox.draft_id
+                     AND d.discarded_action_id IS NULL))",
         params![entry.id, mailbox, validity, next],
     )?;
     tx.commit()?;
@@ -532,13 +570,18 @@ pub(crate) fn mark_append_sent(
 
 pub(crate) fn complete_append(store: &Store, entry: &OutboxEntry) -> Result<bool> {
     let tx = crate::store::immediate_transaction(store.connection())?;
+    let changed = complete_append_in(&tx, entry)?;
+    tx.commit()?;
+    Ok(changed)
+}
+
+fn complete_append_in(tx: &Connection, entry: &OutboxEntry) -> Result<bool> {
     let changed = tx.execute(
         "UPDATE server_outbox
          SET state = 'done', append_mime = NULL, error = '', settled_unix = ?2
          WHERE id = ?1 AND state = 'pending'",
         params![entry.id, now_unix()],
     )?;
-    tx.commit()?;
     Ok(changed != 0)
 }
 
@@ -958,8 +1001,9 @@ pub(crate) fn unfinished(store: &Store, account_id: &AccountId) -> Result<Vec<Ou
     }
     tx.execute(
         "DELETE FROM server_outbox
-         WHERE account_id = ?1 AND state IN ('done', 'dropped') AND settled_unix < ?2",
-        params![account_id.as_str(), now_unix() - KEEP_SETTLED_SECS],
+         WHERE account_id = ?1 AND state IN ('done', 'dropped') AND settled_unix < ?2
+           AND NOT (kind = 'append_draft' AND state = 'dropped' AND append_checks > 0 AND generation = ?3)",
+        params![account_id.as_str(), now_unix() - KEEP_SETTLED_SECS, generation(&tx, account_id)?],
     )?;
     let generation = generation(&tx, account_id)?;
     labels::bind_keyword_copies(&tx, account_id, generation)?;
@@ -1175,9 +1219,7 @@ pub(crate) enum Outcome<'a> {
     /// or found in the target. A move whose new copy is not known is not
     /// done: it stays [`Outcome::Retry`] until it is dropped, so the source
     /// copy stays in `message_copies` until a new one replaces it.
-    Done {
-        placed: (u32, u32),
-    },
+    Done { placed: (u32, u32) },
     /// Try again at `retry_unix`. `counts` is false for a dropped connection,
     /// which says nothing about the row. `refused`: the server answered the
     /// MOVE with NO or BAD, so it did not move it, and the next try is a
@@ -1191,6 +1233,8 @@ pub(crate) enum Outcome<'a> {
     },
     Dropped {
         error: &'a str,
+        draft_cleanup: bool,
+        draft_lookup: Option<(u32, u32)>,
     },
 }
 
@@ -1297,14 +1341,33 @@ pub(crate) fn settle(
                 Settled::Recorded
             });
         }
-        Outcome::Dropped { error } => {
+        Outcome::Dropped {
+            error,
+            draft_cleanup,
+            draft_lookup,
+        } => {
+            let settled = match draft_lookup {
+                Some(lookup) => {
+                    drafts::recover_for_waiting_save(&tx, account_id, entry, lookup, error)?
+                }
+                None => None,
+            };
+            if settled == Some(Settled::Recovering) {
+                tx.commit()?;
+                return Ok(Settled::Recovering);
+            }
+            if draft_cleanup {
+                drafts::abandon_cleanup(store, &tx, account_id, entry)?;
+            }
             tx.execute(
-                "UPDATE server_outbox SET state = 'dropped', append_mime = NULL, error = ?2, settled_unix = ?3
+                "UPDATE server_outbox
+                 SET state = 'dropped', append_mime = NULL, error = ?2, settled_unix = ?3,
+                     append_checks = CASE WHEN ?4 THEN 0 ELSE append_checks END
                  WHERE id = ?1",
-                params![entry.id, error, now],
+                params![entry.id, error, now, draft_cleanup],
             )?;
             tx.commit()?;
-            return Ok(Settled::Recorded);
+            return Ok(settled.unwrap_or(Settled::Recorded));
         }
     };
     let (source_mailbox, uidvalidity, uid) =

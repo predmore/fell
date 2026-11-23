@@ -72,8 +72,8 @@ pub use smtp::SmtpConfig;
 pub use store::PendingFlags;
 pub use store::{
     CidRepairBatch, CidRepairProgress, FolderPage, FolderSpan, FolderThread, ListFilter, ListKey,
-    ListSource, PartKinds, PartStamp, Participant, SearchPage, Store, ThreadList, ThreadSummary,
-    folder_aliases,
+    ListSource, PartKinds, PartStamp, Participant, SearchPage, Store, SyncedDraftPreview,
+    ThreadList, ThreadSummary, folder_aliases,
 };
 pub use sync::{
     InboxArrival, ReplyToBackfill, ReplyToProgress, SyncReport, fetch_message_bodies,
@@ -90,6 +90,18 @@ pub enum Error {
     Search(String),
     #[error("{0}")]
     Action(String),
+    #[error("This draft has no text Fell can edit. The copy is still on the server.")]
+    DraftBodyUnavailable,
+    #[error("This draft has formatting Fell can't edit yet. The copy is still on the server.")]
+    DraftFormattingUnavailable,
+    #[error("This message is no longer in Drafts.")]
+    DraftNoLongerInFolder,
+    #[error("This draft is no longer available on the server.")]
+    DraftUnavailable,
+    #[error("This draft has too many attachments or its attachments are too large.")]
+    DraftAttachmentLimit,
+    #[error("This draft exceeds the 32 MiB message limit. The copy is still on the server.")]
+    DraftMessageLimit,
     #[error("{0} is not implemented yet")]
     NotImplemented(&'static str),
     #[error("send requires explicit UI confirmation")]

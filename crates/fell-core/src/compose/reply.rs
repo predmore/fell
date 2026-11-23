@@ -337,7 +337,15 @@ fn build_references_keeping(
 
 /// An address as a draft's To or Cc line holds it: `Name <email>`, with the
 /// name in quotes when it has a comma or another special character.
-fn format_address(address: &Address) -> String {
+/// Format the account identity for a compose editor.
+pub fn configured_from(display_name: &str, email: &str) -> String {
+    format_address(&Address {
+        name: Some(crate::notes::display_safe(display_name, false)),
+        email: email.to_string(),
+    })
+}
+
+pub(crate) fn format_address(address: &Address) -> String {
     let email = address.email.trim().to_string();
     let name: String = address
         .name

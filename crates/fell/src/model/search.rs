@@ -124,6 +124,7 @@ impl SearchReply {
                         warn: false,
                         unread: location.as_ref().is_some_and(|hit| hit.unread),
                         draft: None,
+                        server_draft: None,
                     });
                     hits.insert(
                         thread_id.0,

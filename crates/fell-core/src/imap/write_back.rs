@@ -34,7 +34,7 @@ use crate::account::AccountId;
 use crate::folders::{FolderRole, FolderRoles};
 use crate::outbox::{
     self, DropReason, DroppedWrite, OutboxEntry, OutboxKind, Outcome, ReplayReport, Reversed,
-    Settled,
+    Settled, drafts,
     flags::{self, FetchReason, Observation, Progress},
 };
 use crate::store::{Store, copies::CopyFlags};
@@ -86,7 +86,7 @@ pub(super) fn replay_with(
         held_moves: HashMap::new(),
         unconfirmed_stores: HashMap::new(),
         listing: None,
-        sent_mailbox: None,
+        append_roles: FolderRoles::default(),
         overrides: &config.folder_overrides,
         selected: None,
         bounds: HashMap::new(),
@@ -96,7 +96,10 @@ pub(super) fn replay_with(
     let result = match WriteSession::open(config) {
         Ok(mut session) => {
             let result = pass.run(&mut session);
-            if !matches!(&result, Err(Stop::Connection(_))) {
+            if !matches!(
+                &result,
+                Err(Stop::Connection(_) | Stop::AppendCheckDisconnected(_))
+            ) {
                 session.logout();
             }
             result
@@ -104,11 +107,11 @@ pub(super) fn replay_with(
         Err(err)
             if entries
                 .iter()
-                .any(|entry| entry.kind == OutboxKind::AppendSent && entry.retry_unix <= now) =>
+                .any(|entry| entry.kind.is_append() && entry.retry_unix <= now) =>
         {
             let note = err.to_string();
             for (index, entry) in entries.iter().enumerate() {
-                if entry.kind == OutboxKind::AppendSent && entry.retry_unix <= now {
+                if entry.kind.is_append() && entry.retry_unix <= now {
                     let guard = store.try_lock_mailbox_operation(".append-sent")?;
                     if (guard.is_none() && store.db_path().is_some())
                         || outbox::pending_append(store, entry)?.is_none()
@@ -131,11 +134,18 @@ pub(super) fn replay_with(
         Ok(()) => {}
         Err(Stop::Store(err)) => return Err(err),
         Err(
-            Stop::AppendRetry(message) | Stop::AppendRefused(message) | Stop::AppendCheck(message),
+            Stop::AppendRetry(message)
+            | Stop::AppendRefused(message)
+            | Stop::DraftCleanupRefused(message)
+            | Stop::AppendCheck(message),
         ) => {
             return Err(Error::Backend(message));
         }
-        Err(Stop::Connection(err) | Stop::AppendCheckDisconnected(err)) => {
+        Err(
+            Stop::Connection(err)
+            | Stop::AppendCheckDisconnected(err)
+            | Stop::DraftCleanupDisconnected(err),
+        ) => {
             report.interrupted = Some(err.to_string());
         }
         // Write-back was turned off by another process mid-pass.
@@ -150,6 +160,8 @@ enum Stop {
     Store(Error),
     AppendRetry(String),
     AppendRefused(String),
+    DraftCleanupRefused(String),
+    DraftCleanupDisconnected(Error),
     AppendCheck(String),
     AppendCheckDisconnected(Error),
     /// The row is no longer in this write-back generation: send nothing more.
@@ -169,6 +181,7 @@ fn append_check_error(error: WriteError) -> Stop {
 enum AppendRetry {
     Deferred,
     Refused,
+    CleanupRefused,
     Inconclusive { checks: u32 },
 }
 
@@ -197,7 +210,7 @@ struct Pass<'a> {
     unconfirmed_stores: HashMap<String, HashSet<(u32, u32)>>,
     /// Folder name → raw mailbox name, from LIST when first needed.
     listing: Option<HashMap<String, String>>,
-    sent_mailbox: Option<String>,
+    append_roles: FolderRoles,
     overrides: &'a [(FolderRole, String)],
     /// The mailbox selected now and its UIDVALIDITY.
     selected: Option<(String, u32)>,
@@ -239,10 +252,11 @@ impl Pass<'_> {
                         .insert(entry.message_id.clone(), MoveHold::EarlierMove);
                 }
                 OutboxKind::Move => self.replay_move(session, index, &mut visited)?,
-                OutboxKind::AppendSent if entry.retry_unix <= self.now => {
-                    self.replay_append(session, index)?;
+                OutboxKind::AppendSent | OutboxKind::AppendDraft | OutboxKind::DeleteDraft => {
+                    if entry.retry_unix <= self.now {
+                        self.replay_append(session, index)?;
+                    }
                 }
-                OutboxKind::AppendSent => {}
                 _ if matches!(held_move, Some(MoveHold::EarlierMove)) => {}
                 OutboxKind::Seen | OutboxKind::Flagged => self.replay_flag(session, index)?,
                 OutboxKind::Keyword | OutboxKind::BridgeLabel => {
@@ -265,13 +279,33 @@ impl Pass<'_> {
             return Ok(());
         }
         let entry = &self.entries[index];
-        let Some(pending) = outbox::pending_append(self.store, entry)? else {
-            return Ok(());
+        let draft = if entry.kind == OutboxKind::AppendSent {
+            None
+        } else {
+            let Some(draft) = drafts::pending(self.store, entry)? else {
+                return Ok(());
+            };
+            Some(draft)
         };
-        match self.append(session, entry, &pending) {
-            Ok(()) => {
-                if outbox::complete_append(self.store, entry)? {
+        let pending = if entry.kind.is_append() {
+            let Some(pending) = outbox::pending_append(self.store, entry)? else {
+                return Ok(());
+            };
+            Some(pending)
+        } else {
+            None
+        };
+        let checks = pending.as_ref().map_or(0, |pending| pending.checks);
+        let result = self.write_compose_copy(session, entry, pending.as_ref(), draft.as_ref());
+        match result {
+            Ok(changed) => {
+                if changed {
                     self.report.sent += 1;
+                    self.report.draft_append_recovered |= entry.kind == OutboxKind::AppendDraft
+                        && (!entry.error.is_empty()
+                            || draft
+                                .as_ref()
+                                .is_some_and(|draft| draft.supersedes_uncertain));
                     self.settled[index] = true;
                 }
                 Ok(())
@@ -286,24 +320,153 @@ impl Pass<'_> {
             Err(Stop::AppendRefused(message)) => {
                 self.retry_append(index, &message, AppendRetry::Refused)
             }
-            Err(Stop::AppendCheck(message)) => self.retry_append(
-                index,
-                &message,
-                AppendRetry::Inconclusive {
-                    checks: pending.checks,
-                },
-            ),
+            Err(Stop::DraftCleanupDisconnected(error)) => {
+                self.retry_append(index, &error.to_string(), AppendRetry::CleanupRefused)?;
+                Err(Stop::Connection(error))
+            }
+            Err(Stop::DraftCleanupRefused(message)) => {
+                self.retry_append(index, &message, AppendRetry::CleanupRefused)
+            }
+            Err(Stop::AppendCheck(message)) => {
+                self.retry_append(index, &message, AppendRetry::Inconclusive { checks })
+            }
             Err(Stop::AppendCheckDisconnected(err)) => {
                 self.retry_append(
                     index,
                     &err.to_string(),
-                    AppendRetry::Inconclusive {
-                        checks: pending.checks,
-                    },
+                    AppendRetry::Inconclusive { checks },
                 )?;
                 Err(Stop::Connection(err))
             }
             Err(stop) => Err(stop),
+        }
+    }
+
+    fn write_compose_copy(
+        &mut self,
+        session: &mut WriteSession,
+        entry: &OutboxEntry,
+        pending: Option<&outbox::PendingAppend>,
+        draft: Option<&drafts::Pending>,
+    ) -> Result<bool, Stop> {
+        let Some(draft) = draft else {
+            self.append(session, entry, pending.expect("Sent APPEND payload"), true)?;
+            return Ok(outbox::complete_append(self.store, entry)?);
+        };
+        if entry.kind == OutboxKind::DeleteDraft {
+            if let Some(copy) = &draft.current {
+                self.delete_draft_copy(session, entry, copy, draft.current_message_id.as_deref())?;
+            }
+        } else {
+            let placed = if let Some(placed) = &draft.placed {
+                Some(placed.clone())
+            } else {
+                let placed = self.append(
+                    session,
+                    entry,
+                    pending.expect("Drafts APPEND payload"),
+                    draft.can_append,
+                )?;
+                if let Some(copy) = &placed
+                    && !drafts::placed(self.store, entry, copy)?
+                {
+                    return Err(Stop::Stale);
+                }
+                placed
+            };
+            if let Some(copy) = &draft.current
+                && placed.as_ref().is_some_and(|new| new != copy)
+            {
+                self.delete_draft_copy(session, entry, copy, draft.current_message_id.as_deref())?;
+            }
+        }
+        let changed = drafts::finish(self.store, entry)?;
+        if changed {
+            crate::diagnostic!(DEBUG, "Server draft write completed");
+        }
+        Ok(changed)
+    }
+
+    fn delete_draft_copy(
+        &mut self,
+        session: &mut WriteSession,
+        entry: &OutboxEntry,
+        copy: &drafts::Copy,
+        message_id: Option<&str>,
+    ) -> Result<(), Stop> {
+        let write_error = |error| match error {
+            WriteError::Refused(message) => Stop::DraftCleanupRefused(message),
+            WriteError::Connection(error) => Stop::DraftCleanupDisconnected(error),
+        };
+        self.selected = None;
+        let validity = session.select(&copy.mailbox).map_err(write_error)?;
+        self.selected = Some((copy.mailbox.clone(), validity));
+        let uid = if validity == copy.validity {
+            copy.uid
+        } else {
+            let unconfirmed = || {
+                Stop::DraftCleanupRefused(
+                    "Drafts mailbox changed and the old copy could not be verified".into(),
+                )
+            };
+            let message_id = message_id.ok_or_else(unconfirmed)?;
+            let candidates = session
+                .search_message_id(message_id, APPEND_UID_LIMIT)
+                .map_err(|error| match error {
+                    WriteError::Refused(_) => unconfirmed(),
+                    WriteError::Connection(error) => Stop::DraftCleanupDisconnected(error),
+                })?;
+            if candidates.is_empty() {
+                if entry.kind == OutboxKind::DeleteDraft
+                    && !drafts::begin_delete(self.store, entry)?
+                {
+                    return Err(Stop::Stale);
+                }
+                return Ok(());
+            }
+            let (found, complete) = Self::check_append_headers(
+                session,
+                message_id,
+                &copy.mailbox,
+                validity,
+                &candidates,
+            )
+            .map_err(|stop| match stop {
+                Stop::AppendCheck(_) => unconfirmed(),
+                Stop::AppendCheckDisconnected(error) | Stop::Connection(error) => {
+                    Stop::DraftCleanupDisconnected(error)
+                }
+                stop => stop,
+            })?;
+            found.filter(|_| complete).ok_or_else(unconfirmed)?
+        };
+        let cleanup = |session: &mut WriteSession| {
+            if drafts::pending(self.store, entry)?.is_none() {
+                return Err(Stop::Stale);
+            }
+            if entry.kind == OutboxKind::DeleteDraft && !drafts::begin_delete(self.store, entry)? {
+                return Err(Stop::Stale);
+            }
+            session.mark_deleted(uid).map_err(write_error)?;
+            if session.has_uid_expunge() {
+                if drafts::pending(self.store, entry)?.is_none() {
+                    return Err(Stop::Stale);
+                }
+                session.expunge_uid(uid).map_err(write_error)?;
+            }
+            Ok(())
+        };
+        match cleanup(session) {
+            // A server may refuse STORE or EXPUNGE after someone already
+            // removed the UID. Only an explicit empty listing settles it.
+            Err(Stop::DraftCleanupRefused(_))
+                if session
+                    .search_uid_range(uid, uid, 1)
+                    .is_ok_and(|uids| uids.is_empty()) =>
+            {
+                Ok(())
+            }
+            result => result,
         }
     }
 
@@ -312,7 +475,15 @@ impl Pass<'_> {
         session: &mut WriteSession,
         entry: &OutboxEntry,
         pending: &outbox::PendingAppend,
-    ) -> Result<(), Stop> {
+        may_append: bool,
+    ) -> Result<Option<drafts::Copy>, Stop> {
+        let draft = entry.kind == OutboxKind::AppendDraft;
+        let mime = pending.mime.as_deref().filter(|_| may_append);
+        let role = if draft {
+            FolderRole::Drafts
+        } else {
+            FolderRole::Sent
+        };
         let (mailbox, bound) = if let Some(mailbox) = &pending.sent_to {
             // Refresh the selected UID state before checking for the copy.
             self.selected = None;
@@ -321,16 +492,25 @@ impl Pass<'_> {
                 .map_err(append_check_error)?;
             self.selected = Some((mailbox.clone(), validity));
             let next = next.unwrap_or_default();
-            if Self::check_append(session, entry, pending, mailbox, validity, next)? {
-                return Ok(());
+            if let Some(uid) = Self::check_append(session, entry, pending, mailbox, validity, next)?
+            {
+                return Ok(Some(drafts::Copy {
+                    mailbox: mailbox.clone(),
+                    validity,
+                    uid,
+                }));
             }
             (mailbox.clone(), (validity, next))
         } else {
             self.load_listing(session)?;
+            if mime.is_none() {
+                return Ok(None);
+            }
             let mailbox = self
-                .sent_mailbox
-                .clone()
-                .ok_or_else(|| Stop::AppendRetry("no Sent mailbox".into()))?;
+                .append_roles
+                .get(role)
+                .map(|folder| folder.raw.clone())
+                .ok_or_else(|| Stop::AppendRetry(format!("no {} mailbox", role.default_name())))?;
             let bound = if self
                 .selected
                 .as_ref()
@@ -354,6 +534,9 @@ impl Pass<'_> {
             };
             (mailbox, bound)
         };
+        let Some(mime) = mime else {
+            return Ok(None);
+        };
         // Never send without a bound that recovery can use if the reply is lost.
         if bound.1 == 0 {
             return Err(Stop::AppendRetry(
@@ -364,14 +547,49 @@ impl Pass<'_> {
         if !outbox::mark_append_sent(self.store, entry, &mailbox, bound)? {
             return Err(Stop::Stale);
         }
-        match session.append_seen(&quoted_mailbox, &pending.mime) {
-            Ok(()) => Ok(()),
+        match session.append(&quoted_mailbox, mime, draft) {
+            Ok(_) if !draft => Ok(None),
+            Ok(Some((validity, uid))) if validity != bound.0 || uid >= bound.1 => {
+                Ok(Some(drafts::Copy {
+                    mailbox,
+                    validity,
+                    uid,
+                }))
+            }
+            Ok(_) => {
+                // Without APPENDUID use the same bounded lookup as a lost
+                // reply. Do not send again from this acknowledged write.
+                let Some(marked) = outbox::pending_append(self.store, entry)? else {
+                    return Err(Stop::Stale);
+                };
+                self.selected = None;
+                let (validity, next) = session
+                    .select_with_next(&mailbox)
+                    .map_err(append_check_error)?;
+                self.selected = Some((mailbox.clone(), validity));
+                let uid = Self::check_append(
+                    session,
+                    entry,
+                    &marked,
+                    &mailbox,
+                    validity,
+                    next.unwrap_or_default(),
+                )?
+                .ok_or_else(|| {
+                    Stop::AppendCheck("Drafts APPENDUID could not be verified".into())
+                })?;
+                Ok(Some(drafts::Copy {
+                    mailbox,
+                    validity,
+                    uid,
+                }))
+            }
             Err(WriteError::Refused(message)) => Err(Stop::AppendRefused(message)),
             Err(WriteError::Connection(error)) => Err(Stop::Connection(error)),
         }
     }
 
-    /// True means the copy is present, false means it is safe to APPEND.
+    /// The matching UID, or None when it is safe to APPEND again.
     fn check_append(
         session: &mut WriteSession,
         entry: &OutboxEntry,
@@ -379,36 +597,41 @@ impl Pass<'_> {
         mailbox: &str,
         validity: u32,
         next: u32,
-    ) -> Result<bool, Stop> {
+    ) -> Result<Option<u32>, Stop> {
         let candidates = session
             .search_message_id(&entry.message_id, APPEND_UID_LIMIT)
             .map_err(append_check_error)?;
         if !candidates.is_empty() {
-            let (found, _) =
-                Self::check_append_headers(session, entry, mailbox, validity, &candidates)?;
-            return if found {
-                Ok(true)
+            let (found, _) = Self::check_append_headers(
+                session,
+                entry.message_id.as_str(),
+                mailbox,
+                validity,
+                &candidates,
+            )?;
+            return if found.is_some() {
+                Ok(found)
             } else {
                 Err(Stop::AppendCheck(
-                    "Sent Message-ID check found no exact match".into(),
+                    "APPEND Message-ID check found no exact match".into(),
                 ))
             };
         }
         if pending.validity != 0 && validity != pending.validity {
-            return Ok(false);
+            return Ok(None);
         }
         if pending.next == 0 || next < pending.next {
             return Err(Stop::AppendCheck(
-                "Sent UIDNEXT could not be verified".into(),
+                "APPEND UIDNEXT could not be verified".into(),
             ));
         }
         if next == pending.next {
             // A successful APPEND allocates a UID even if it is expunged later.
-            return Ok(false);
+            return Ok(None);
         }
         if next - pending.next > APPEND_UID_LIMIT as u32 {
             return Err(Stop::AppendCheck(
-                "Sent UID range is too large to verify".into(),
+                "APPEND UID range is too large to verify".into(),
             ));
         }
         // UIDNEXT may also advance for unrelated arrivals. List the existing
@@ -417,40 +640,47 @@ impl Pass<'_> {
         let uids = session
             .search_uid_range(pending.next, next - 1, APPEND_UID_LIMIT)
             .map_err(append_check_error)?;
-        let (found, complete) =
-            Self::check_append_headers(session, entry, mailbox, validity, &uids)?;
-        if found || complete {
+        let (found, complete) = Self::check_append_headers(
+            session,
+            entry.message_id.as_str(),
+            mailbox,
+            validity,
+            &uids,
+        )?;
+        if found.is_some() || complete {
             Ok(found)
         } else {
             Err(Stop::AppendCheck(
-                "Sent UID range had missing headers".into(),
+                "APPEND UID range had missing headers".into(),
             ))
         }
     }
 
     fn check_append_headers(
         session: &mut WriteSession,
-        entry: &OutboxEntry,
+        message_id: &str,
         mailbox: &str,
         validity: u32,
         uids: &[u32],
-    ) -> Result<(bool, bool), Stop> {
+    ) -> Result<(Option<u32>, bool), Stop> {
         let mut complete = true;
+        let mut found = None;
         for batch in uids.chunks(APPEND_HEADER_BATCH) {
             let headers = session
                 .uid_fetch_message_ids(batch)
                 .map_err(append_check_error)?;
             let returned: HashSet<_> = headers.iter().map(|(uid, _)| *uid).collect();
-            if headers.iter().any(|(uid, bytes)| {
-                batch.binary_search(uid).is_ok()
-                    && copy_message_id(mailbox, validity, *uid, bytes, false).as_str()
-                        == entry.message_id
-            }) {
-                return Ok((true, true));
+            for (uid, bytes) in headers {
+                if batch.binary_search(&uid).is_ok()
+                    && copy_message_id(mailbox, validity, uid, &bytes, false).as_str() == message_id
+                    && found.replace(uid).is_some_and(|prev| prev != uid)
+                {
+                    return Ok((None, false));
+                }
             }
             complete &= batch.iter().all(|uid| returned.contains(uid));
         }
-        Ok((false, complete))
+        Ok((found, complete))
     }
 
     fn retry_append(
@@ -460,13 +690,80 @@ impl Pass<'_> {
         retry: AppendRetry,
     ) -> Result<(), Stop> {
         let entry = &self.entries[index];
+        let message = if entry.kind == OutboxKind::AppendSent {
+            message
+        } else {
+            match retry {
+                AppendRetry::Deferred => {
+                    crate::diagnostic!(WARN, "Server draft upload was interrupted");
+                }
+                AppendRetry::Refused => {
+                    crate::diagnostic!(WARN, "The server refused the draft upload");
+                }
+                AppendRetry::CleanupRefused => {
+                    crate::diagnostic!(WARN, "Could not remove the previous server draft copy");
+                }
+                AppendRetry::Inconclusive { .. } => {
+                    crate::diagnostic!(WARN, "Could not verify the previous server draft upload");
+                }
+            }
+            "Drafts write could not be confirmed"
+        };
         let attempts = match retry {
-            AppendRetry::Deferred | AppendRetry::Refused => entry.attempts,
+            AppendRetry::Deferred | AppendRetry::Refused | AppendRetry::CleanupRefused => {
+                entry.attempts
+            }
             AppendRetry::Inconclusive { checks } => checks,
         };
         match retry {
             AppendRetry::Refused if attempts + 1 >= MAX_ATTEMPTS => {
                 return self.drop_row(index, DropReason::Refused, message);
+            }
+            AppendRetry::CleanupRefused if attempts + 1 >= MAX_ATTEMPTS => {
+                let settled = outbox::settle(
+                    self.store,
+                    self.account_id,
+                    entry,
+                    None,
+                    None,
+                    Outcome::Dropped {
+                        error: message,
+                        draft_cleanup: true,
+                        draft_lookup: None,
+                    },
+                )?;
+                match settled {
+                    Settled::Stale => return Err(Stop::Stale),
+                    Settled::Recorded => self.note_drop(index, DropReason::DraftCleanup),
+                    _ => {}
+                }
+                self.settled[index] = true;
+                return Ok(());
+            }
+            AppendRetry::Inconclusive { checks }
+                if attempts + 1 >= MAX_APPEND_CHECKS && entry.kind == OutboxKind::AppendDraft =>
+            {
+                match outbox::settle(
+                    self.store,
+                    self.account_id,
+                    entry,
+                    None,
+                    None,
+                    Outcome::Dropped {
+                        error: message,
+                        draft_cleanup: false,
+                        draft_lookup: Some((checks, MAX_APPEND_CHECKS)),
+                    },
+                )? {
+                    Settled::Stale => return Err(Stop::Stale),
+                    Settled::Recorded => {
+                        self.note_drop(index, DropReason::UnconfirmedAppend);
+                        self.settled[index] = true;
+                    }
+                    Settled::Retired => self.settled[index] = true,
+                    _ => {}
+                }
+                return Ok(());
             }
             AppendRetry::Inconclusive { .. } if attempts + 1 >= MAX_APPEND_CHECKS => {
                 return self.drop_row(index, DropReason::UnconfirmedAppend, message);
@@ -484,12 +781,21 @@ impl Pass<'_> {
             Outcome::Retry {
                 error: message,
                 retry_unix: self.now + wait,
-                counts: refused,
+                // Cleanup follows a confirmed APPEND. Keep its sent
+                // marker so queueing a later revision cannot cancel it.
+                counts: refused || matches!(retry, AppendRetry::CleanupRefused),
                 refused,
                 append_check: matches!(retry, AppendRetry::Inconclusive { .. }),
             },
         )? {
-            Settled::Recorded => self.report.sent_append_delayed |= entry.error.is_empty(),
+            Settled::Recorded => {
+                self.report.sent_append_delayed |=
+                    entry.kind == OutboxKind::AppendSent && entry.error.is_empty();
+                self.report.draft_append_delayed |= entry.kind == OutboxKind::AppendDraft
+                    && !matches!(retry, AppendRetry::CleanupRefused)
+                    && entry.error.is_empty()
+                    && entry.placed_uid.is_none();
+            }
             Settled::Stale => return Err(Stop::Stale),
             Settled::Retired | Settled::Recovering => {}
         }
@@ -982,9 +1288,7 @@ impl Pass<'_> {
     fn load_listing(&mut self, session: &mut WriteSession) -> Result<(), Stop> {
         if self.listing.is_none() {
             let listed = session.list().map_err(Stop::Connection)?;
-            self.sent_mailbox = FolderRoles::detect(&listed_mailboxes(&listed), self.overrides)
-                .get(FolderRole::Sent)
-                .map(|folder| folder.raw.clone());
+            self.append_roles = FolderRoles::detect(&listed_mailboxes(&listed), self.overrides);
             self.listing = Some(
                 listed
                     .into_iter()
@@ -1105,6 +1409,11 @@ impl Pass<'_> {
         if self.drop_quietly(index, message)? == Settled::Retired {
             return Ok(());
         }
+        self.note_drop(index, reason);
+        Ok(())
+    }
+
+    fn note_drop(&mut self, index: usize, reason: DropReason) {
         let entry = &self.entries[index];
         self.report.dropped.push(DroppedWrite {
             kind: entry.kind,
@@ -1112,7 +1421,6 @@ impl Pass<'_> {
             target_folder: entry.target_folder.clone(),
             reason,
         });
-        Ok(())
     }
 
     /// Drop the row without a notice: the user has nothing to learn from it.
@@ -1125,7 +1433,11 @@ impl Pass<'_> {
             entry,
             None,
             None,
-            Outcome::Dropped { error: message },
+            Outcome::Dropped {
+                error: message,
+                draft_cleanup: false,
+                draft_lookup: None,
+            },
         )?;
         if settled == Settled::Stale {
             return Err(Stop::Stale);

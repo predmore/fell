@@ -826,7 +826,8 @@ impl Store {
         }
         let mut restored_threads = Vec::new();
         if action.kind == ActionKind::DiscardDrafts {
-            let (restored, confirmed) = crate::compose::undo_discard(&tx, account_id, action.id)?;
+            let (restored, confirmed) =
+                crate::compose::undo_discard(self, &tx, account_id, action.id)?;
             action.summary = match (restored, confirmed) {
                 (1, 0) => "Draft restored".into(),
                 (n, 0) => format!("{n} drafts restored"),

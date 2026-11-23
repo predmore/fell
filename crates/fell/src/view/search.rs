@@ -671,8 +671,8 @@ impl Inbox {
                     .iter()
                     .map(|row| row.thread_id.clone())
                     .collect();
-                let recipients = store.folder_recipients(&account, &folder, &ids)?;
-                present::address_draft_rows(&mut rows, &recipients, &me);
+                let previews = store.synced_draft_previews(&account, &folder, &ids)?;
+                present::address_draft_rows(&mut rows, &previews, &me);
                 store.unsent_compose_drafts(&account)?
             } else {
                 Vec::new()
@@ -2285,6 +2285,7 @@ mod tests {
             warn: false,
             unread: false,
             draft: None,
+            server_draft: None,
         };
         // Deterministic glyph widths keep this row test independent of local fonts.
         let shape = |text: &str, kind, room: Option<f32>| {

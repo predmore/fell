@@ -142,17 +142,17 @@ impl DraftHome {
         }
     }
 
-    /// Start a new, empty draft from `email` on `account` and make it live
+    /// Start a new, empty draft from `from` on `account` and make it live
     /// in `hub`. Its mailbox row is written before its folder. Disk only;
     /// run it off the UI thread. Returns the draft's id.
     pub fn new_draft(
         &self,
         hub: &DraftHub,
         account: &AccountId,
-        email: &str,
+        from: &str,
     ) -> Result<String, String> {
         let fields = DraftFields {
-            from: email.to_string(),
+            from: from.to_string(),
             ..DraftFields::default()
         };
         self.new_reply(
@@ -213,6 +213,24 @@ impl DraftHome {
                 .map_err(|err| err.to_string())?;
         }
         self.open(hub, &id, account)?;
+        Ok(id)
+    }
+
+    pub fn open_server_draft(
+        &self,
+        hub: &DraftHub,
+        account: &AccountId,
+        source: &fell_core::RemoteId,
+    ) -> Result<String, fell_core::Error> {
+        let config = crate::mailbox::send_account_config(account)
+            .map_err(|_| fell_core::Error::Action("The account is unavailable".into()))?
+            .ok_or_else(|| {
+                fell_core::Error::Action("There is no server draft in the demo mailbox".into())
+            })?;
+        let store = fell_core::Store::open(&self.store)?;
+        let id = config.import_server_draft_copy(&store, source, &new_draft_id())?;
+        self.open(hub, &id, account)
+            .map_err(fell_core::Error::Action)?;
         Ok(id)
     }
 
@@ -408,6 +426,7 @@ fn reveal(
         if opened.is_none() {
             // No window shows it, so it is not open for editing.
             hub.with_session(id, |session| session.close_editor());
+            let _ = cx.update(|cx| crate::view::compose_draft_window_failed(id, cx));
         }
         *window.borrow_mut() = opened;
     }

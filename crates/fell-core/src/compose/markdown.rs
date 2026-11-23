@@ -72,6 +72,149 @@ struct SrcLine<'a> {
     end: usize,
 }
 
+/// Write the native HTML document in the editor's Markdown dialect.
+pub(crate) fn document_to_markdown(blocks: &[fell_render::Block]) -> String {
+    use fell_render::{Block, StyledDocument};
+    blocks
+        .iter()
+        .filter_map(|block| {
+            let text = match block {
+                Block::Heading { level, inlines } => {
+                    format!(
+                        "{} {}",
+                        "#".repeat((*level).into()),
+                        markdown_inlines(inlines)
+                    )
+                }
+                Block::Paragraph { inlines } => markdown_inlines(inlines),
+                Block::List { ordered, items } => items
+                    .iter()
+                    .enumerate()
+                    .map(|(index, item)| {
+                        let prefix = if *ordered {
+                            format!("{}. ", index + 1)
+                        } else {
+                            "- ".into()
+                        };
+                        let body = document_to_markdown(&item.blocks);
+                        format!(
+                            "{prefix}{}",
+                            body.split_whitespace().collect::<Vec<_>>().join(" ")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                Block::Quote { blocks } => document_to_markdown(blocks)
+                    .split('\n')
+                    .map(|line| format!("> {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                Block::Code { text, .. } => format!("```\n{}\n```", text.trim_end_matches('\n')),
+                Block::Image { source, alt } => markdown_image(source, alt),
+                Block::Small { blocks } | Block::ReplyHeader { blocks } => {
+                    document_to_markdown(blocks)
+                }
+                Block::Table { .. } => StyledDocument::blocks_text(std::slice::from_ref(block)),
+                Block::ThematicBreak => return None,
+            };
+            (!text.trim().is_empty()).then_some(text)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn markdown_inlines(inlines: &[fell_render::Inline]) -> String {
+    use fell_render::{Inline, StyledDocument};
+    let mut text = String::new();
+    for inline in inlines {
+        match inline {
+            Inline::Text(value) => text.push_str(&escape_markdown(value)),
+            Inline::Emphasis(children) => {
+                let value = markdown_inlines(children);
+                let marker = if value.contains('*') { "_" } else { "*" };
+                text.push_str(&format!("{marker}{value}{marker}"));
+            }
+            Inline::Strong(children) => {
+                let value = markdown_inlines(children);
+                let marker = if value.starts_with('*') || value.ends_with('*') {
+                    "__"
+                } else {
+                    "**"
+                };
+                text.push_str(&format!("{marker}{value}{marker}"));
+            }
+            Inline::Strike(children) => text.push_str(&markdown_inlines(children)),
+            Inline::Code(value) if !value.contains('`') => text.push_str(&format!("`{value}`")),
+            Inline::Code(value) => text.push_str(&escape_markdown(value)),
+            Inline::Link { href, children } => {
+                let label = StyledDocument::blocks_text(&[fell_render::Block::Paragraph {
+                    inlines: children.clone(),
+                }]);
+                text.push_str(&format!(
+                    "[{}]({})",
+                    label.replace("](", "] ("),
+                    markdown_url(href)
+                ));
+            }
+            Inline::Image { alt, source } => text.push_str(&markdown_image(source, alt)),
+            Inline::LineBreak => text.push(' '),
+        }
+    }
+    text
+}
+
+fn escape_markdown(text: &str) -> String {
+    let mut escaped = String::new();
+    for (index, ch) in text.char_indices() {
+        if matches!(ch, '\\' | '*' | '_' | '`' | '[' | ']')
+            || (index == 0 && matches!(ch, '#' | '>' | '-' | '+'))
+            || (ch == '.' && index > 0 && text[..index].bytes().all(|b| b.is_ascii_digit()))
+        {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+fn markdown_escape(ch: char) -> bool {
+    matches!(
+        ch,
+        '\\' | '*' | '_' | '`' | '[' | ']' | '#' | '>' | '-' | '+' | '.'
+    )
+}
+
+fn markdown_url(url: &str) -> String {
+    url.replace(' ', "%20")
+        .replace('(', "%28")
+        .replace(')', "%29")
+}
+
+fn markdown_image(source: &fell_render::ImageSource, alt: &str) -> String {
+    use fell_render::ImageSource;
+    let src = match source {
+        ImageSource::Cid(cid) => format!("cid:{cid}"),
+        ImageSource::Remote(url) => markdown_url(url),
+        ImageSource::Data { .. } => return escape_markdown(alt),
+    };
+    format!("![{}]({src})", alt.replace("](", "] ("))
+}
+
+/// The editor recognizes backslash escapes before looking for inline closers.
+fn unescaped_find(text: &str, marker: &str) -> Option<usize> {
+    let mut escaped = false;
+    for (at, ch) in text.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if text[at..].starts_with(marker) {
+            return Some(at);
+        }
+    }
+    None
+}
+
 pub fn markdown_to_doc(source: &str) -> StyledDoc {
     let lines = split_lines(source);
     let mut blocks = Vec::new();
@@ -485,7 +628,8 @@ fn take_quote(lines: &[SrcLine<'_>], start: usize) -> (Block, usize) {
         if !inner.is_empty() {
             inner.push('\n');
         }
-        let rest = lines[index].text.trim_start_matches('>').trim_start();
+        let rest = &lines[index].text[1..];
+        let rest = rest.strip_prefix(' ').unwrap_or(rest);
         inner.push_str(rest);
         index += 1;
     }
@@ -565,6 +709,16 @@ fn parse_inlines(text: &str) -> Vec<Inline> {
         }
     };
     while index < bytes.len() {
+        if bytes[index] == b'\\'
+            && let Some(ch) = text[index + 1..]
+                .chars()
+                .next()
+                .filter(|ch| markdown_escape(*ch))
+        {
+            buf.push(ch);
+            index += 1 + ch.len_utf8();
+            continue;
+        }
         if bytes[index] == b'`'
             && let Some(end) = text[index + 1..].find('`')
         {
@@ -576,7 +730,7 @@ fn parse_inlines(text: &str) -> Vec<Inline> {
         }
         if text[index..].starts_with("**") || text[index..].starts_with("__") {
             let marker = &text[index..index + 2];
-            if let Some(end) = text[index + 2..].find(marker) {
+            if let Some(end) = unescaped_find(&text[index + 2..], marker) {
                 flush(&mut buf, &mut out);
                 let close = index + 2 + end;
                 out.push(Inline::Strong(parse_inlines(&text[index + 2..close])));
@@ -585,7 +739,10 @@ fn parse_inlines(text: &str) -> Vec<Inline> {
             }
         }
         if (bytes[index] == b'*' || bytes[index] == b'_')
-            && let Some(end) = text[index + 1..].find(if bytes[index] == b'*' { '*' } else { '_' })
+            && let Some(end) = unescaped_find(
+                &text[index + 1..],
+                if bytes[index] == b'*' { "*" } else { "_" },
+            )
         {
             let close = index + 1 + end;
             if close > index + 1 {

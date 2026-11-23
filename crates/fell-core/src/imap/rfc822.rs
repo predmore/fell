@@ -106,6 +106,135 @@ pub(super) fn keywords(flags: &[String]) -> Vec<String> {
         .collect()
 }
 
+pub(crate) fn draft_message_id(raw: &[u8]) -> Option<String> {
+    let parsed = MessageParser::new().parse_headers(raw)?;
+    parsed
+        .message_id()
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+/// Read the draft's editable plain part and decoded files from the same MIME.
+pub(crate) fn parse_draft(
+    account: &crate::Account,
+    id: &str,
+    raw: &[u8],
+) -> crate::Result<crate::compose::StoredCompose> {
+    use crate::compose::{DraftFields, ReplyParts, ResolvedFile, StoredCompose};
+
+    let parsed = MessageParser::new()
+        .parse(raw)
+        .ok_or_else(|| crate::Error::Action("The message could not be read.".into()))?;
+    let mut html_parts = parsed
+        .html_body()
+        .filter(|part| matches!(part.kind(), PartKind::Html))
+        .peekable();
+    let html = if html_parts.peek().is_some() {
+        let html = joined(html_parts, |_| true).unwrap_or_default();
+        if fell_render::html_has_uneditable_draft_formatting(&html) {
+            return Err(crate::Error::DraftFormattingUnavailable);
+        }
+        Some(html)
+    } else {
+        None
+    };
+    let addresses = |list| {
+        address_list(list)
+            .into_iter()
+            .map(|mut address| {
+                address.name = address
+                    .name
+                    .map(|name| crate::notes::display_safe(&name, false));
+                crate::compose::format_address(&address)
+            })
+            .collect()
+    };
+    let fields = DraftFields {
+        from: crate::compose::configured_from(&account.display_name, &account.email),
+        to: addresses(parsed.to()),
+        cc: addresses(parsed.cc()),
+        bcc: addresses(parsed.bcc()),
+        subject: crate::notes::display_safe(parsed.subject().unwrap_or_default(), false),
+        in_reply_to: parsed
+            .in_reply_to()
+            .and_then(|ids| ids.first())
+            .map(str::to_string),
+        ..DraftFields::default()
+    };
+    let plain = joined(parsed.text_body(), |kind| matches!(kind, PartKind::Text));
+    let mut body = if let Some(plain) = plain.filter(|text| !text.trim().is_empty()) {
+        plain.replace("\r\n", "\n")
+    } else if let Some(html) = html {
+        let text = html_draft_body(&html);
+        if text.trim().is_empty() {
+            return Err(crate::Error::DraftBodyUnavailable);
+        }
+        text
+    } else {
+        String::new()
+    };
+    let references = parsed
+        .references()
+        .map(|ids| ids.iter().map(str::to_string).collect())
+        .unwrap_or_default();
+    let paths = crate::compose::inline_image_paths(&body);
+    let mut files = Vec::new();
+    let mut bytes = 0_u64;
+    for part in parsed.attachments() {
+        let index = files.len() + 1;
+        bytes += part.decoded_len() as u64;
+        if index > crate::compose::MAX_ATTACHMENT_FILES
+            || bytes > crate::compose::MAX_ATTACHMENT_BYTES
+        {
+            return Err(crate::Error::DraftAttachmentLimit);
+        }
+        let mime = mime_type(&part);
+        let name = crate::parts::sanitize_filename(part.attachment_name(), &mime);
+        let inline_src = part.content_id().and_then(|cid| {
+            paths.iter().find(|path| {
+                crate::compose::draft_content_id(path) == cid
+                    || path.strip_prefix("cid:") == Some(cid)
+            })
+        });
+        let path = if let Some(src) = inline_src {
+            let basename = name.replace(['(', ')'], "_");
+            let path = format!("files/{index:02}-{basename}");
+            body = body.replace(&format!("]({src})"), &format!("]({path})"));
+            path
+        } else {
+            format!("files/{index:02}-{name}")
+        };
+        files.push(ResolvedFile {
+            path,
+            display_name: name,
+            bytes: part.decoded().into_owned(),
+            inline: inline_src.is_some(),
+        });
+    }
+    Ok(StoredCompose {
+        id: id.to_string(),
+        account_id: account.id.clone(),
+        fields,
+        body,
+        files,
+        identities: vec![account.email.clone()],
+        owner: String::new(),
+        reply: ReplyParts {
+            references,
+            ..ReplyParts::default()
+        },
+    })
+}
+
+/// Use the same sanitized document as the native HTML reader.
+pub(crate) fn html_draft_body(html: &str) -> String {
+    let doc = fell_render::html_to_document(html);
+    if doc.plain_text().trim().is_empty() {
+        return String::new();
+    }
+    crate::compose::document_to_markdown(&doc.blocks)
+}
+
 /// Parse the exact outgoing MIME without inventing a server copy or UID.
 pub(crate) fn local_sent_message(account: &AccountId, folder: &str, mime: &[u8]) -> Message {
     let mut message = parse_message(

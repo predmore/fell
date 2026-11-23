@@ -817,10 +817,12 @@ fn part_request(upper: &str) -> Option<(String, Option<(usize, usize)>)> {
     let start = upper.find("BODY.PEEK[")? + "BODY.PEEK[".len();
     let end = start + upper[start..].find(']')?;
     let section = &upper[start..end];
-    if section.is_empty() || !section.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+    let after = &upper[end + 1..];
+    if (section.is_empty() && !after.starts_with('<'))
+        || !section.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+    {
         return None;
     }
-    let after = &upper[end + 1..];
     let window = after.strip_prefix('<').and_then(|tail| {
         let (offset, rest) = tail.split_once('.')?;
         let (len, _) = rest.split_once('>')?;
@@ -838,7 +840,12 @@ fn write_part(
     delay: Option<Duration>,
     ignore_window: bool,
 ) {
-    let Some(bytes) = section_body(&message.raw, section) else {
+    let bytes = if section.is_empty() {
+        Some(message.raw.clone())
+    } else {
+        section_body(&message.raw, section)
+    };
+    let Some(bytes) = bytes else {
         let _ = write.write_all(
             format!(
                 "* {seq} FETCH (UID {} BODY[{section}] NIL)\r\n",

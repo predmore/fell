@@ -163,6 +163,24 @@ pub(crate) fn parse_html(html: &str) -> Html {
     parse_document(scraper::HtmlTreeSink::new(Html::new_document()), opts).one(html)
 }
 
+/// Whether importing this HTML into the draft editor would silently lose
+/// formatting the editor cannot round-trip.
+pub fn html_has_uneditable_draft_formatting(html: &str) -> bool {
+    parse_html(html).tree.nodes().any(|node| {
+        let Some(element) = node.value().as_element() else {
+            return false;
+        };
+        matches!(element.name(), "s" | "del" | "strike" | "table")
+            || is_strike(element)
+            || (element.name() == "img"
+                && element.attr("src").is_some_and(|src| {
+                    src.trim()
+                        .get(..5)
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
+                }))
+    })
+}
+
 pub fn html_to_document(html: &str) -> StyledDocument {
     let blocks = split_blank_lines(native_blocks(html, 0));
     let mut blocks: Vec<Block> = quote_marked_lines(blocks)

@@ -52,7 +52,80 @@ fn sentence_case(text: &str) -> String {
     }
 }
 
+use super::SERVER_DRAFT_SAVE_FAILED;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClosedDraftSave {
+    account: crate::AccountId,
+    draft: String,
+    digest: [u8; 32],
+}
+
+impl ClosedDraftSave {
+    pub fn status(&self, store: &crate::Store) -> Option<super::DraftSaveStatus> {
+        store
+            .server_draft_save_status(&self.account, &self.draft, &self.digest)
+            .ok()
+            .flatten()
+    }
+}
+
+/// A notice whose result can be checked on the mailbox worker after close.
+pub struct DraftCloseNotice {
+    text: String,
+    alert: bool,
+    server_save: Option<ClosedDraftSave>,
+    pending_write: Option<(crate::AccountId, String, u64, super::SaveWaiter)>,
+}
+
+impl DraftCloseNotice {
+    pub fn after_local_write(mut self) -> Self {
+        if let Some((account, draft, revision, waiter)) = self.pending_write.take() {
+            match waiter.wait_for_receipt(revision) {
+                Some(super::SaveReceipt::Server(digest)) => {
+                    self.server_save = Some(ClosedDraftSave {
+                        account,
+                        draft,
+                        digest,
+                    });
+                }
+                Some(super::SaveReceipt::ServerFailed) => {
+                    self.text = SERVER_DRAFT_SAVE_FAILED.into();
+                    self.alert = true;
+                }
+                _ => {}
+            }
+        }
+        self
+    }
+
+    pub fn needs_local_write(&self) -> bool {
+        self.pending_write.is_some()
+    }
+
+    pub fn server_save(&self) -> Option<&ClosedDraftSave> {
+        self.server_save.as_ref()
+    }
+
+    pub fn resolve(self, store: &crate::Store) -> (String, bool) {
+        if let Some(warning) = self
+            .server_save
+            .as_ref()
+            .and_then(|save| save.status(store))
+            .and_then(super::DraftSaveStatus::warning)
+        {
+            return (warning.into(), true);
+        }
+        self.into_line()
+    }
+
+    pub fn into_line(self) -> (String, bool) {
+        (self.text, self.alert)
+    }
+}
+
 pub struct DraftHub {
+    server_draft_wake: Mutex<Option<super::server::Wake>>,
     sessions: Mutex<HashMap<String, DraftSession>>,
     listeners: Mutex<Vec<Listener>>,
     focused: Mutex<Option<String>>,
@@ -63,7 +136,7 @@ pub struct DraftHub {
     reveals: AtomicU64,
     /// One line per review window that closed, for the inbox to show.
     /// Closing notices for the inbox, each with whether it is a warning.
-    closed: Mutex<Vec<(String, bool)>>,
+    closed: Mutex<Vec<DraftCloseNotice>>,
     /// The draft whose review window closed last, for the inbox to reopen.
     last_closed: Mutex<Option<String>>,
     /// Drafts being read from disk to go live, so two opens of one draft
@@ -108,6 +181,7 @@ impl Default for DraftHub {
 impl DraftHub {
     pub fn new() -> Self {
         Self {
+            server_draft_wake: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
             listeners: Mutex::new(Vec::new()),
             focused: Mutex::new(None),
@@ -197,6 +271,7 @@ impl DraftHub {
             return false;
         };
         session.open_for_edit();
+        session.server_save.allow();
         *self.focused.lock().expect("focused") = Some(id.to_string());
         self.reveals.fetch_add(1, Ordering::SeqCst);
         drop(sessions);
@@ -297,10 +372,15 @@ impl DraftHub {
         }
         drop(opening);
         drop(sessions);
-        self.closed
-            .lock()
-            .expect("closed")
-            .push((format!("{}  ·  u", action.summary), false));
+        if let Some(wake) = self.server_draft_wake() {
+            wake();
+        }
+        self.closed.lock().expect("closed").push(DraftCloseNotice {
+            text: format!("{}  ·  u", action.summary),
+            alert: false,
+            server_save: None,
+            pending_write: None,
+        });
         self.emit();
         Ok(())
     }
@@ -345,16 +425,48 @@ impl DraftHub {
         self.emit();
     }
 
+    /// The GUI's sync worker wakes once an editor save reaches the outbox.
+    pub fn on_server_draft_queued(&self, wake: impl Fn() + Send + Sync + 'static) {
+        *self.server_draft_wake.lock().expect("server draft wake") = Some(Arc::new(wake));
+    }
+
+    fn server_draft_wake(&self) -> Option<super::server::Wake> {
+        self.server_draft_wake
+            .lock()
+            .expect("server draft wake")
+            .clone()
+    }
+
+    /// Called only by the compose window. Agent request_send can reveal a
+    /// window but does not grant permission to publish that draft.
+    pub fn poll_server_draft(&self, id: &str, now_ms: u64) {
+        if self.shown.lock().expect("shown").as_deref() != Some(id) {
+            return;
+        }
+        if let Some(wake) = self.server_draft_wake() {
+            self.with_session(id, |session| {
+                session.flush_server_if_due(Some(now_ms), &wake)
+            });
+        }
+    }
+
     /// Queue every save still waiting on the editor's debounce, then wait
     /// until each live draft's saves are on disk. The app calls this when it
     /// quits.
     pub fn settle_all(&self) {
+        let wake = self.server_draft_wake();
+        let shown = self.shown.lock().expect("shown").clone();
         let waiters: Vec<super::SaveWaiter> = self
             .sessions
             .lock()
             .expect("sessions")
             .values_mut()
             .filter_map(|session| {
+                if let Some(wake) = &wake
+                    && shown.as_deref() == Some(session.id())
+                {
+                    session.flush_server_if_due(None, wake);
+                }
                 let _ = session.flush_pending();
                 session.save_waiter()
             })
@@ -387,8 +499,18 @@ impl DraftHub {
         };
         // No window has it open for editing any more. Typing still waiting
         // on the save debounce is saved now.
+        let wake = was_shown.then(|| self.server_draft_wake()).flatten();
         let summary = self.with_session(id, |session| {
+            if let Some(wake) = &wake {
+                session.flush_server_if_due(None, wake);
+            }
             let _ = session.flush_pending();
+            let receipt = session.save_receipt();
+            let pending_write = (wake.is_some()
+                && matches!(receipt, None | Some(super::SaveReceipt::Pending)))
+            .then(|| session.save_waiter())
+            .flatten()
+            .map(|waiter| (session.revision(), waiter));
             session.close_editor();
             let snap = session.snapshot();
             (
@@ -396,11 +518,19 @@ impl DraftHub {
                 snap.unreviewed,
                 snap.send_requested_by.is_some(),
                 snap.subject.clone(),
+                receipt,
+                pending_write,
+                session.account_id().clone(),
             )
         });
-        if was_shown && let Some((locked, unreviewed, asked, subject)) = summary {
+        if was_shown
+            && let Some((locked, unreviewed, asked, subject, receipt, pending_write, account)) =
+                summary
+        {
             let sent = locked == Some(SendLock::Sent.reason());
+            let failed = locked.is_none() && receipt == Some(super::SaveReceipt::ServerFailed);
             let line = match locked {
+                None if failed => SERVER_DRAFT_SAVE_FAILED.into(),
                 // What happened, as docs/ux.md has it: "Sent" and the subject.
                 Some(_) if sent => format!("Sent{}", quoted_subject(&subject)),
                 // The key to what the warning asks: look in Sent.
@@ -419,8 +549,28 @@ impl DraftHub {
                 // The person's own draft: kept, and in the drafts list.
                 None => format!("draft saved{}  ·  gd drafts", quoted_subject(&subject)),
             };
-            let warn = locked == Some(SendLock::MaybeSent.reason());
-            self.push_closed(id, line, sent, warn);
+            let server_save = match receipt {
+                Some(super::SaveReceipt::Server(digest)) if locked.is_none() => {
+                    Some(ClosedDraftSave {
+                        account: account.clone(),
+                        draft: id.to_owned(),
+                        digest,
+                    })
+                }
+                _ => None,
+            };
+            self.push_notice(
+                id,
+                sent,
+                DraftCloseNotice {
+                    text: line,
+                    alert: failed || locked == Some(SendLock::MaybeSent.reason()),
+                    server_save,
+                    pending_write: pending_write
+                        .filter(|_| locked.is_none())
+                        .map(|(revision, waiter)| (account, id.to_owned(), revision, waiter)),
+                },
+            );
         }
     }
 
@@ -464,6 +614,19 @@ impl DraftHub {
     /// Queue `line` for the inbox. Mail that went out is not offered again
     /// by reopen; anything else is the draft reopen brings back.
     fn push_closed(&self, id: &str, line: String, sent: bool, warn: bool) {
+        self.push_notice(
+            id,
+            sent,
+            DraftCloseNotice {
+                text: line,
+                alert: warn,
+                server_save: None,
+                pending_write: None,
+            },
+        );
+    }
+
+    fn push_notice(&self, id: &str, sent: bool, mut notice: DraftCloseNotice) {
         {
             let mut last = self.last_closed.lock().expect("last closed");
             if !sent {
@@ -473,8 +636,8 @@ impl DraftHub {
             }
         }
         // Inbox notices start with a capital, as "Sent “Lunch”" does.
-        let line = sentence_case(&line);
-        self.closed.lock().expect("closed").push((line, warn));
+        notice.text = sentence_case(&notice.text);
+        self.closed.lock().expect("closed").push(notice);
         self.emit();
     }
 
@@ -497,6 +660,7 @@ impl DraftHub {
             return false;
         }
         session.request_send();
+        session.server_save.allow();
         *self.focused.lock().expect("focused") = Some(id);
         self.reveals.fetch_add(1, Ordering::SeqCst);
         drop(sessions);
@@ -515,6 +679,13 @@ impl DraftHub {
     /// The closing notices since the last take, each with whether it is a
     /// warning the inbox shows in its error colour.
     pub fn take_notices(&self) -> Vec<(String, bool)> {
+        self.take_close_notices()
+            .into_iter()
+            .map(DraftCloseNotice::into_line)
+            .collect()
+    }
+
+    pub fn take_close_notices(&self) -> Vec<DraftCloseNotice> {
         std::mem::take(&mut *self.closed.lock().expect("closed"))
     }
 
