@@ -3481,6 +3481,18 @@ fn absorb_duplicate(
 ) -> Result<ThreadId> {
     let extra_folders = split_field(&doomed.folders);
     let labels = keywords::merge(conn, &message.account_id, doomed, keeper, &message.labels)?;
+    copies::repoint(
+        conn,
+        &message.account_id,
+        &doomed.canonical_id,
+        &keeper.canonical_id,
+    )?;
+    intents::merge(
+        conn,
+        &message.account_id,
+        &doomed.canonical_id,
+        &keeper.canonical_id,
+    )?;
     let keeper = fold_doomed_local_state(keeper, doomed);
     let thread = write_kept(conn, message, &keeper, true, &extra_folders, Some(labels))?;
     // The stored parts of the doomed row fill what the keeper lacks; the
@@ -3533,12 +3545,6 @@ fn absorb_duplicate(
             message.account_id.as_str(),
             doomed.canonical_id,
         ],
-    )?;
-    copies::repoint(
-        conn,
-        &message.account_id,
-        &doomed.canonical_id,
-        &keeper.canonical_id,
     )?;
     Ok(thread)
 }

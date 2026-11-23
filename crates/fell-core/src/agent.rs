@@ -1427,7 +1427,16 @@ fn undo_messages(conn: &Connection, account_id: &AccountId, action: &RecordedAct
         ),
         params![action.id, account_id.as_str()],
     )?;
-    for (message_id, unread, starred) in flag_states {
+    for (snapshot_id, message_id, unread, starred) in flag_states {
+        if snapshot_id != message_id
+            && let Some(kind) = unread
+                .map(|_| crate::outbox::OutboxKind::Seen)
+                .or_else(|| starred.map(|_| crate::outbox::OutboxKind::Flagged))
+        {
+            // Older folds left writes on the snapshot ID. Repoint them so
+            // queuing the undo supersedes them and retains any STORE recovery.
+            crate::outbox::flags::repoint(conn, account_id, &snapshot_id, &message_id, Some(kind))?;
+        }
         crate::store::intents::record(conn, account_id, &message_id, unread, starred)?;
     }
     Ok(())
@@ -1467,9 +1476,9 @@ fn snooze_changed_error() -> Error {
 }
 
 /// Messages whose read state or star undo of `action_id` changes, as
-/// `(id, unread, starred)`; `None` where that flag stays as it is. A row
+/// `(snapshot_id, live_id, unread, starred)`; `None` where that flag stays as it is. A row
 /// logged before stars were recorded restores no star.
-type FlagRestore = (String, Option<bool>, Option<bool>);
+type FlagRestore = (String, String, Option<bool>, Option<bool>);
 
 enum FlagUndo {
     Unread,
@@ -1484,7 +1493,7 @@ fn flag_changes(
 ) -> Result<Vec<FlagRestore>> {
     let mut stmt = conn.prepare_cached(&format!(
         "{resolved}
-         SELECT s.live_id,
+         SELECT s.message_id, s.live_id,
                 CASE WHEN ?3 AND m.unread != s.unread THEN s.unread END,
                 CASE WHEN NOT ?3 AND m.starred != s.starred THEN s.starred END
          FROM resolved s
@@ -1500,8 +1509,9 @@ fn flag_changes(
         |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, Option<i64>>(1)?.map(|unread| unread != 0),
-                row.get::<_, Option<i64>>(2)?.map(|starred| starred != 0),
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(2)?.map(|unread| unread != 0),
+                row.get::<_, Option<i64>>(3)?.map(|starred| starred != 0),
             ))
         },
     )?;
@@ -2072,6 +2082,194 @@ mod tests {
                 _ => assert_eq!(after.snooze_until, None),
             }
             assert!(after.folders.iter().any(|folder| folder == "Sent"));
+        }
+    }
+
+    #[test]
+    fn activity_undo_reverses_a_folded_star_with_write_back() {
+        assert_folded_flag_undo(crate::outbox::OutboxKind::Flagged);
+    }
+
+    #[test]
+    fn activity_undo_reverses_a_folded_read_with_write_back() {
+        assert_folded_flag_undo(crate::outbox::OutboxKind::Seen);
+    }
+
+    fn assert_folded_flag_undo(kind: crate::outbox::OutboxKind) {
+        use crate::outbox::{OutboxKind, OutboxState, flags};
+
+        for legacy in [false, true] {
+            let store = Store::open_in_memory().unwrap();
+            let account = account("a1");
+            store.upsert_account(&account).unwrap();
+            store.set_write_back(&account.id, true).unwrap();
+            store
+                .set_agent_grant(&account.id, "fern", AgentGrant::enabled(false, true, false))
+                .unwrap();
+            let sent = Message {
+                remote_id: RemoteId("imap:1:10:INBOX".into()),
+                ..message(
+                    "a1",
+                    "sent@x",
+                    None,
+                    "Hello",
+                    "hello body",
+                    true,
+                    &["INBOX"],
+                    &[],
+                    10,
+                )
+            };
+            let echo = Message {
+                remote_id: RemoteId("imap:1:20:INBOX".into()),
+                ..message(
+                    "a1",
+                    "list@x",
+                    None,
+                    "[list] Hello",
+                    "hello body",
+                    true,
+                    &["INBOX"],
+                    &[],
+                    10,
+                )
+            };
+            let thread = store.upsert_message(&sent).unwrap();
+            let keeper_thread = store.upsert_message(&echo).unwrap();
+            let action = if kind == OutboxKind::Seen {
+                store
+                    .star_thread(&account.id, &keeper_thread, true, "user")
+                    .unwrap();
+                store.mark_thread_read(&account.id, &thread, "agent:fern")
+            } else {
+                store
+                    .mark_thread_read(&account.id, &keeper_thread, "user")
+                    .unwrap();
+                store.star_thread(&account.id, &thread, true, "agent:fern")
+            }
+            .unwrap()
+            .unwrap();
+            let initial = store
+                .outbox(&account.id)
+                .unwrap()
+                .into_iter()
+                .find(|row| row.kind == kind && row.message_id == "sent@x")
+                .unwrap();
+            assert_eq!(initial.flag_value, Some(true));
+            assert_eq!(initial.uid, Some(10));
+            store
+                .conn
+                .execute(
+                    "UPDATE messages SET list_id = 'list.example' WHERE message_id = 'list@x'",
+                    [],
+                )
+                .unwrap();
+            let arrived = Message {
+                remote_id: RemoteId("imap:1:30:Sent".into()),
+                folders: vec!["Sent".into()],
+                ..sent
+            };
+            store.upsert_message(&arrived).unwrap();
+            // Sync still sees the server's old flags on the newly folded row.
+            store.upsert_message(&echo).unwrap();
+            let intents = store.pending_flag_changes(&account.id).unwrap();
+            assert_eq!(intents.len(), 1);
+            assert_eq!(intents[0].message_id, "list@x");
+            assert_eq!(
+                (intents[0].unread, intents[0].starred),
+                (Some(false), Some(true))
+            );
+            let keeper = store
+                .message(&account.id, &MessageId::new("list@x"))
+                .unwrap()
+                .unwrap();
+            assert!(!keeper.unread && keeper.starred);
+            let folded = store
+                .outbox(&account.id)
+                .unwrap()
+                .into_iter()
+                .find(|row| row.id == initial.id)
+                .unwrap();
+            assert_eq!(folded.message_id, "list@x");
+            assert_eq!(folded.uid, initial.uid);
+            assert_eq!(folded.state, OutboxState::Pending);
+
+            if legacy {
+                // Simulate a row left keyed to the deleted ID by an older build,
+                // with the original STORE potentially already on the wire.
+                store
+                    .conn
+                    .execute(
+                        "UPDATE server_outbox SET message_id = 'sent@x', sent = 1 WHERE id = ?1",
+                        [initial.id],
+                    )
+                    .unwrap();
+            }
+            assert!(
+                store
+                    .undo_agent_activity(&account.id, action.id, None)
+                    .unwrap()
+                    .undone
+            );
+            let outbox = store.outbox(&account.id).unwrap();
+            assert!(
+                outbox
+                    .iter()
+                    .all(|row| row.state != OutboxState::Pending || row.message_id != "sent@x")
+            );
+            let replacements = outbox
+                .iter()
+                .filter(|row| row.kind == kind && row.flag_value == Some(false))
+                .map(|row| (row.message_id.as_str(), row.state, row.uid))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                replacements,
+                [
+                    ("list@x", OutboxState::Pending, Some(10)),
+                    ("list@x", OutboxState::Pending, Some(20)),
+                    ("list@x", OutboxState::Pending, Some(30)),
+                ]
+            );
+            let keeper = store
+                .message(&account.id, &MessageId::new("list@x"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(keeper.unread, kind == OutboxKind::Seen);
+            assert_eq!(keeper.starred, kind == OutboxKind::Seen);
+            if legacy {
+                let superseded: bool = store
+                    .conn
+                    .query_row(
+                        "SELECT flag_superseded FROM server_outbox WHERE id = ?1",
+                        [initial.id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert!(superseded);
+                // A response for the original ID still rebases the replacement.
+                assert!(matches!(
+                    flags::observe(
+                        &store,
+                        &account.id,
+                        &initial,
+                        flags::Observation::Stored(Some(12))
+                    )
+                    .unwrap(),
+                    flags::Progress::Retired
+                ));
+                assert!(
+                    store
+                        .outbox(&account.id)
+                        .unwrap()
+                        .iter()
+                        .any(|row| row.kind == kind
+                            && row.uid == Some(10)
+                            && row.flag_value == Some(false)
+                            && row.flag_modseq == Some(12))
+                );
+            } else {
+                assert!(outbox.iter().all(|row| row.id != initial.id));
+            }
         }
     }
 

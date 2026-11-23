@@ -14,6 +14,29 @@ use crate::store::{
 };
 use crate::{Error, Result};
 
+/// Keep pending writes attached to their live message. The stored UID and
+/// revision still identify the same server copy after a local fold.
+pub(crate) fn repoint(
+    conn: &Connection,
+    account: &AccountId,
+    from: &str,
+    to: &str,
+    kind: Option<OutboxKind>,
+) -> Result<()> {
+    conn.prepare_cached(
+        "UPDATE server_outbox SET message_id = ?3
+         WHERE account_id = ?1 AND message_id = ?2 AND state = 'pending'
+           AND kind IN ('seen', 'flagged') AND (?4 IS NULL OR kind = ?4)",
+    )?
+    .execute(params![
+        account.as_str(),
+        from,
+        to,
+        kind.map(OutboxKind::as_str)
+    ])?;
+    Ok(())
+}
+
 /// Record the new intent in the same transaction as the local edit. A sent
 /// row may have reached the server and is kept only to recover its revision.
 pub(crate) fn queue(
@@ -194,14 +217,20 @@ pub(crate) fn observe(
     if !current(&tx, account, entry)? {
         return Ok(Progress::Stale);
     }
-    let live: Option<bool> = tx
+    let live: Option<(String, bool)> = tx
         .query_row(
-            "SELECT NOT flag_superseded FROM server_outbox
+            "SELECT message_id, NOT flag_superseded FROM server_outbox
              WHERE account_id = ?1 AND id = ?2 AND state = 'pending'",
             params![account.as_str(), entry.id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
+    // A sync fold can retarget the row while STORE is on the wire.
+    let (message, active) = live
+        .as_ref()
+        .map_or((entry.message_id.as_str(), false), |(id, active)| {
+            (id.as_str(), *active)
+        });
     let (Some(mailbox), Some(validity), Some(uid), Some(value)) = (
         &entry.source_mailbox,
         entry.uidvalidity,
@@ -258,7 +287,6 @@ pub(crate) fn observe(
             (flags, None, confirmed, progress)
         }
     };
-    let active = live == Some(true);
     copies::observe_flags(
         &tx,
         account,
@@ -271,7 +299,15 @@ pub(crate) fn observe(
             before_store,
         },
     )?;
-    advance(&tx, account, entry, flags, before_store, confirms_previous)?;
+    advance(
+        &tx,
+        account,
+        entry,
+        message,
+        flags,
+        before_store,
+        confirms_previous,
+    )?;
 
     let result = match progress {
         Progress::Unconfirmed if live.is_some() => Progress::Unconfirmed,
@@ -290,14 +326,14 @@ pub(crate) fn observe(
         }
         Progress::Applied => {
             complete(&tx, entry.id)?;
-            acknowledge(&tx, account, entry, &remote_id, value)?;
+            acknowledge(&tx, account, message, entry.kind, &remote_id, value)?;
             Progress::Applied
         }
         Progress::Conflict { .. } => {
             let server = flag_value(flags, entry.kind)
                 .ok_or_else(|| Error::Action("flag conflict needs a server value".into()))?;
             Progress::Conflict {
-                changed: settle_conflict(&tx, account, entry, server)?,
+                changed: settle_conflict(&tx, account, message, entry.kind, server)?,
             }
         }
         other => other,
@@ -331,12 +367,13 @@ fn complete(conn: &Connection, id: i64) -> Result<()> {
 fn acknowledge(
     conn: &Connection,
     account: &AccountId,
-    entry: &OutboxEntry,
+    message: &str,
+    kind: OutboxKind,
     remote_id: &str,
     value: bool,
 ) -> Result<()> {
-    if entry.kind == OutboxKind::Seen {
-        return intents::acknowledge_unread(conn, account, &entry.message_id, remote_id, !value);
+    if kind == OutboxKind::Seen {
+        return intents::acknowledge_unread(conn, account, message, remote_id, !value);
     }
     let pending: bool = conn.query_row(
         "SELECT EXISTS(
@@ -344,11 +381,11 @@ fn acknowledge(
              WHERE account_id = ?1 AND message_id = ?2
                AND kind = 'flagged' AND state = 'pending' AND flag_superseded = 0
          )",
-        params![account.as_str(), entry.message_id],
+        params![account.as_str(), message],
         |row| row.get(0),
     )?;
     if !pending {
-        intents::clear_flag(conn, account, &entry.message_id, entry.kind)?;
+        intents::clear_flag(conn, account, message, kind)?;
     }
     Ok(())
 }
@@ -356,11 +393,10 @@ fn acknowledge(
 fn settle_conflict(
     conn: &Connection,
     account: &AccountId,
-    entry: &OutboxEntry,
+    message: &str,
+    kind: OutboxKind,
     server: bool,
 ) -> Result<bool> {
-    let message = &entry.message_id;
-    let kind = entry.kind;
     conn.execute(
         "UPDATE server_outbox
          SET state = 'dropped', error = 'server flag won a conflict', settled_unix = ?4
@@ -396,6 +432,7 @@ fn advance(
     conn: &Connection,
     account: &AccountId,
     entry: &OutboxEntry,
+    message: &str,
     flags: CopyFlags,
     before_store: Option<u64>,
     confirms_previous: bool,
@@ -420,7 +457,7 @@ fn advance(
     for kind in [OutboxKind::Seen, OutboxKind::Flagged] {
         update.execute(params![
             account.as_str(),
-            entry.message_id,
+            message,
             entry.source_mailbox,
             entry.uidvalidity,
             entry.uid,

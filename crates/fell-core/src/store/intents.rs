@@ -78,6 +78,45 @@ pub(crate) fn record(
     outbox::flags::queue(conn, account_id, message_id, unread, starred)
 }
 
+/// Merge intents before the duplicate is deleted. Keep the survivor's
+/// value for a flag edited on both rows and carry over independent edits.
+pub(super) fn merge(conn: &Connection, account: &AccountId, from: &str, to: &str) -> Result<()> {
+    let scope = params![account.as_str(), from, to];
+    let (unread, starred): (Option<bool>, Option<bool>) = conn
+        .prepare_cached(
+            "SELECT CASE WHEN k.unread <> d.unread THEN k.unread END,
+                    CASE WHEN k.starred <> d.starred THEN k.starred END
+             FROM local_flag_intents d
+             JOIN local_flag_intents k ON k.account_id = d.account_id AND k.message_id = ?3
+             WHERE d.account_id = ?1 AND d.message_id = ?2",
+        )?
+        .query_row(scope, |row| Ok((row.get(0)?, row.get(1)?)))
+        .optional()?
+        .unwrap_or_default();
+    let merged = conn
+        .prepare_cached(
+            "INSERT INTO local_flag_intents (account_id, message_id, unread, starred)
+         SELECT account_id, ?3, unread, starred FROM local_flag_intents
+         WHERE account_id = ?1 AND message_id = ?2
+         ON CONFLICT(account_id, message_id) DO UPDATE SET
+             unread = COALESCE(local_flag_intents.unread, excluded.unread),
+             starred = COALESCE(local_flag_intents.starred, excluded.starred)",
+        )?
+        .execute(scope)?;
+    if merged != 0 && unread.is_none() {
+        conn.prepare_cached(
+            "INSERT OR IGNORE INTO local_flag_intent_copies (account_id, message_id, remote_id)
+             SELECT account_id, ?3, remote_id FROM local_flag_intent_copies
+             WHERE account_id = ?1 AND message_id = ?2",
+        )?
+        .execute(scope)?;
+    }
+    outbox::flags::repoint(conn, account, from, to, None)?;
+    // Conflicting values cannot both play on the merged set of copies.
+    // Reuse the normal queue to retain recovery for any STORE already sent.
+    record(conn, account, to, unread, starred)
+}
+
 /// The unread value the server copy `remote_id` may write to `message_id`:
 /// the server's, unless Fell changed it and some copy has not caught up.
 ///
