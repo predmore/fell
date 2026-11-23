@@ -43,9 +43,7 @@ use crate::draft_host::DraftHome;
 use crate::frame_log::{FrameLog, SharedFrameLog};
 use crate::inbox_motion::{Disclosures, InboxMotion, PaneEntry, StatusMotion};
 use crate::keymap::{self, Action, KeyId};
-use crate::mail_body::{
-    self, BodyAsks, BodyCache, BodyJob, BodyLoad, BodyLoads, HtmlBody, PreparedBody,
-};
+use crate::mail_body::{self, BodyCache, BodyJob, BodyLoad, BodyLoads, HtmlBody, PreparedBody};
 use crate::mailbox;
 use crate::model::{
     Banner, DRAFT_NOT_THREAD, DownloadStatus, Fetch, FlagEdit, FolderIntent, LabelEdit, Overlay,
@@ -54,6 +52,7 @@ use crate::model::{
 use crate::motion::{self, Glide, LayerSwap, ListShift, Motion, RowMotion, SwapFrame, Transition};
 use crate::onboarding::Onboarding;
 use crate::present::{self, ConvMessage, Pane, Rich, ThreadRow};
+use crate::reader_body_worker;
 use crate::render::READING_MEASURE_PX;
 use crate::reply_check::{ReplyCheck, ReplyChecks};
 use crate::row_widths::{self, RowFrame, RowWidths};
@@ -664,6 +663,8 @@ struct Inbox {
     attachment_busy: bool,
     attachment_retry: Option<AttachmentRequest>,
     attachment_download: Option<(String, String, Download)>,
+    attachment_marks: HashMap<(String, String), AttachmentMark>,
+    cached_files: HashSet<(String, String)>,
     reveal_attachment: bool,
     forwarding_attachments: bool,
     note_view: agent_notes::NoteView,
@@ -776,7 +777,8 @@ struct Inbox {
     /// Body revisions to load for the current conversation and work in flight.
     body_loads: BodyLoads,
     /// Messages whose parts were asked of sync, and what came back.
-    bodies_asked: BodyAsks,
+    reader_fetcher: Option<reader_body_worker::Handle>,
+    reader_bodies: ReaderBodies,
     /// The reader's message to hold at the top of the conversation until
     /// they scroll it. See [`Inbox::hold_landing`].
     landing: ReaderLanding,
@@ -896,6 +898,8 @@ impl Inbox {
             attachment_busy: false,
             attachment_retry: None,
             attachment_download: None,
+            attachment_marks: HashMap::new(),
+            cached_files: HashSet::new(),
             reveal_attachment: false,
             forwarding_attachments: false,
             note_view: agent_notes::NoteView::default(),
@@ -972,7 +976,8 @@ impl Inbox {
             warmed_folder: None,
             bodies: BodyCache::default(),
             body_loads: BodyLoads::default(),
-            bodies_asked: BodyAsks::default(),
+            reader_fetcher: None,
+            reader_bodies: ReaderBodies::default(),
             landing: ReaderLanding::default(),
         };
         let sync_with = config.zip(startup.path.ok());
@@ -1072,6 +1077,7 @@ impl Inbox {
         // and migrating the file, so the two never race for the first lock.
         if !store_failed && let Some((config, path)) = sync_with {
             let write_back = config.write_back;
+            self.reader_fetcher = Some(reader_body_worker::start(config.clone(), path.clone()));
             let (handle, events) = sync_worker::start(config, path, self.notifications.clone());
             if write_back && let Some(drafts) = cx.try_global::<crate::draft_host::AgentDrafts>() {
                 let sync = handle.clone();
@@ -1329,9 +1335,9 @@ impl Inbox {
                                 inbox
                                     .refresh_reply_checks(cx.global::<ReplyChecks>().pending(), cx);
                             }
-                            // Sync is answering again: asks that failed
-                            // while it was not can go now.
-                            inbox.bodies_asked.retry_failed();
+                            inbox.reader_bodies.failed.retain(|_, failure| {
+                                !matches!(failure, reader_body_worker::Failure::Offline)
+                            });
                         }
                         let open_pending = inbox.first_preview.sync_changed(&kind);
                         inbox.session.apply_sync_status(kind);
@@ -2317,6 +2323,9 @@ impl Inbox {
             }
             return;
         }
+        if self.open_thread.as_deref() != Some(id.as_str()) {
+            self.reader_bodies.clear();
+        }
         if let Some(draft) = self.session.cursor_draft() {
             self.first_preview.take();
             // A draft is shown from the drafts list, not read as a thread.
@@ -2386,6 +2395,7 @@ impl Inbox {
                 return Ok(None);
             }
             let reads = mail_body::read_bodies(store, &account, &mut view, &cached);
+            let cached_files = cached_attachment_keys(store, &account, &view);
             let matches = query.as_ref().map(|(accepted, query)| {
                 (
                     *accepted,
@@ -2407,6 +2417,7 @@ impl Inbox {
                 view,
                 reads,
                 matches,
+                cached_files,
                 notes,
                 latest_note,
                 note_generation,
@@ -2466,10 +2477,12 @@ impl Inbox {
                 mut view,
                 reads,
                 matches,
+                cached_files,
                 notes,
                 latest_note,
                 note_generation,
             })) => {
+                inbox.cached_files = cached_files;
                 if let Some(notes) = notes {
                     inbox.update_agent_notes(note_generation, &id, notes);
                 }
@@ -2559,6 +2572,7 @@ impl Inbox {
                 && old.body_state == fell_core::BodyState::Stored
                 && message.body_state == fell_core::BodyState::Stored
                 && old.rich != Rich::Pending
+                && old.reader_parts == fell_core::ReaderParts::Ready
             {
                 message.rich = old.rich.clone();
             }
@@ -2629,27 +2643,15 @@ impl Inbox {
         }
     }
 
-    /// Read and prepare the body of every open message that still needs it,
-    /// and ask sync for parts that were never stored. Runs before each frame
-    /// is built, so any way of opening a message (a key, a click, a reread
-    /// that keeps it open) starts its body.
-    fn want_bodies(&mut self, cx: &mut Context<Self>) {
-        let now = Instant::now();
+    /// Prepare local HTML and ask the foreground worker for any missing
+    /// parts. Both are driven by the expanded messages in the visible pane.
+    fn want_bodies(&mut self, visible: bool, cx: &mut Context<Self>) {
+        self.want_reader_parts(visible, cx);
         let mut read = Vec::new();
-        let mut fetch = Vec::new();
         for message in self.session.messages.iter().filter(|m| m.expanded) {
             if let Some(load) = self.body_loads.begin(&message.id) {
                 read.push((message.id.clone(), load, message.mail_headers.clone()));
-            } else if message.rich == Rich::Missing
-                && message.body_state == fell_core::BodyState::Stored
-                && self.sync.is_some()
-                && self.bodies_asked.should_ask(&message.id, now)
-            {
-                fetch.push(message.id.clone());
             }
-        }
-        for id in fetch {
-            self.fetch_body(id, cx);
         }
         if read.is_empty() {
             return;
@@ -2691,60 +2693,126 @@ impl Inbox {
         .detach();
     }
 
-    /// Ask the sync thread for one message's parts. Until they come the
-    /// stored text shows. A real answer is kept for the session; an error
-    /// (sync not started, no connection) is asked again after a while.
-    /// Parts that come are stored, so the open thread is read again and
-    /// their HTML fades in over the text.
-    fn fetch_body(&mut self, id: String, cx: &mut Context<Self>) {
-        let Some(sync) = &self.sync else {
+    fn want_reader_parts(&mut self, visible: bool, cx: &mut Context<Self>) {
+        let Some(fetcher) = self.reader_fetcher.as_ref() else {
             return;
         };
-        self.bodies_asked.asking(&id);
-        let answer = sync.fetch_body(MessageId(id.clone()));
+        if !visible || self.open_thread != self.session.cursor_id {
+            self.reader_bodies.active = None;
+            return;
+        }
+        let expanded = || {
+            self.session
+                .messages
+                .iter()
+                .filter(|message| message.expanded)
+        };
+        if self.reader_bodies.active.as_ref().is_some_and(|active| {
+            active
+                .ids
+                .iter()
+                .any(|id| !expanded().any(|message| message.id == id.as_str()))
+        }) {
+            self.reader_bodies.active = None;
+        }
+        if self.reader_bodies.active.is_some() {
+            return;
+        }
+        let ids: Vec<_> = expanded()
+            .filter(|message| {
+                message.needs_reader_parts()
+                    && !self.reader_bodies.failed.contains_key(&message.id)
+                    && !self.reader_bodies.completed.contains(&message.id)
+            })
+            .map(|message| MessageId(message.id.clone()))
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+
+        self.reader_bodies.generation = self.reader_bodies.generation.wrapping_add(1);
+        let generation = self.reader_bodies.generation;
+        self.reader_bodies
+            .reserved
+            .extend(ids.iter().map(|id| id.0.clone()));
+        let (job, mut events) = fetcher.fetch(ids.clone());
+        self.reader_bodies.active = Some(ReaderRequest {
+            ids,
+            generation,
+            started: Instant::now(),
+            _job: job,
+        });
         cx.spawn(async move |this, cx| {
-            let reply = answer.await;
+            cx.background_executor()
+                .timer(reader_body_worker::SHOW_AFTER)
+                .await;
             let _ = this.update(cx, |inbox, cx| {
-                match reply {
-                    Ok(Ok(has_html)) => {
-                        inbox.bodies_asked.answered(&id);
-                        if has_html {
-                            if inbox.session.search.is_some() {
-                                inbox.refresh_search_snippet(MessageId(id.clone()), cx);
-                                inbox.reread_open_thread(cx);
-                            }
-                            inbox.request_threads(
-                                ReadIntent {
-                                    refresh_open: true,
-                                    ..ReadIntent::default()
-                                },
-                                cx,
-                            );
-                        } else {
-                            for message in &mut inbox.session.messages {
-                                if message.id == id && message.rich == Rich::Missing {
-                                    message.rich = Rich::Plain;
-                                }
-                            }
-                        }
-                    }
-                    _ => {
-                        inbox.bodies_asked.failed(&id, Instant::now());
-                        // Ask again once the wait is over, even if nothing
-                        // else redraws the window by then.
-                        cx.spawn(async move |this, cx| {
-                            cx.background_executor()
-                                .timer(mail_body::ASK_AGAIN_AFTER)
-                                .await;
-                            let _ = this.update(cx, |_, cx| cx.notify());
-                        })
-                        .detach();
-                    }
+                if inbox.reader_bodies.is_active(generation) {
+                    cx.notify();
                 }
-                cx.notify();
             });
         })
         .detach();
+        cx.spawn(async move |this, cx| {
+            while let Some(event) = events.next().await {
+                let finished = matches!(event, reader_body_worker::Event::Finished(_));
+                let live = this.update(cx, |inbox, cx| {
+                    if !inbox.reader_bodies.is_active(generation) {
+                        return false;
+                    }
+                    match event {
+                        reader_body_worker::Event::Stored => inbox.reread_open_thread(cx),
+                        reader_body_worker::Event::Finished(result) => {
+                            inbox.finish_reader_parts(result, cx);
+                        }
+                    }
+                    true
+                });
+                if finished || !matches!(live, Ok(true)) {
+                    return;
+                }
+            }
+            let _ = this.update(cx, |inbox, cx| {
+                if inbox.reader_bodies.is_active(generation) {
+                    inbox.finish_reader_parts(Err(reader_body_worker::Failure::Failed), cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn finish_reader_parts(
+        &mut self,
+        result: Result<Vec<MessageId>, reader_body_worker::Failure>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active) = self.reader_bodies.active.take() else {
+            return;
+        };
+        for id in active.ids {
+            match &result {
+                Ok(failed) if !failed.contains(&id) => {
+                    self.reader_bodies.completed.insert(id.0);
+                }
+                outcome => {
+                    let failure = outcome
+                        .as_ref()
+                        .err()
+                        .copied()
+                        .unwrap_or(reader_body_worker::Failure::Failed);
+                    self.reader_bodies.failed.insert(id.0, failure);
+                }
+            }
+        }
+        self.reread_open_thread(cx);
+        if self.session.search.is_some() {
+            if let Some(message) = self.session.messages.get(self.session.message_cursor) {
+                self.refresh_search_snippet(MessageId(message.id.clone()), cx);
+            }
+        } else {
+            self.request_threads(ReadIntent::default(), cx);
+        }
+        cx.notify();
     }
 
     /// Read the open thread again, for parts that were written since.
@@ -3929,6 +3997,7 @@ impl Inbox {
     fn clear_open_message(&mut self) {
         self.conversation_revision = self.conversation_revision.wrapping_add(1);
         self.body_loads.clear();
+        self.reader_bodies.clear();
         self.invalidate_conversation_layout();
         self.session.messages.clear();
         self.open_thread = None;
@@ -4209,6 +4278,7 @@ impl Inbox {
             self.start_reply(kind, None, cx);
         }
         if step.sync_now {
+            self.reader_bodies.failed.clear();
             match &self.sync {
                 Some(handle) => {
                     handle.sync_now();
@@ -4454,6 +4524,7 @@ impl Inbox {
             now,
             height,
             downloading,
+            &self.reader_bodies.reserved,
         );
         if let Some(generation) = generation {
             self.finish_body_refresh_at(generation, true, now);
@@ -4853,15 +4924,7 @@ impl Render for Inbox {
             .take()
             .or_else(|| self.apply_body_refresh(now));
         let reveal_attachment = std::mem::take(&mut self.reveal_attachment);
-        let spin_attachment = self.motion.motion.enabled()
-            && panes.1
-            && self.attachment_download.as_ref().is_some_and(|(id, _, _)| {
-                self.session
-                    .messages
-                    .iter()
-                    .any(|message| message.expanded && &message.id == id)
-            });
-        self.want_bodies(cx);
+        self.want_bodies(panes.1, cx);
         self.motion.narrow_status = width < present::NARROW_WIDTH;
         let composing = compose_open(cx);
         let viewport = (window.viewport_size(), window.scale_factor());
@@ -5105,6 +5168,7 @@ impl Render for Inbox {
         let conv = ConvFrame {
             syncing: self.pending_bodies.downloading(&self.session.sync),
             missing_fade: self.pending_bodies.fade(now),
+            part_status: self.reader_bodies.labels(&self.session, real),
             agent_note,
             pin,
             note_details_only,
@@ -5113,6 +5177,8 @@ impl Render for Inbox {
             return_glide: returning.map(|(_, glide)| glide),
             card_alphas: self.motion.card_alphas(now),
             alphas: self.motion.body_alphas(now),
+            attachment_alphas: self.motion.attachment_alphas(now),
+            replacing_text: self.motion.replacing_body_text(),
             heights: self.motion.body_heights(now),
             outgoing_placeholders: self.motion.body_placeholders(),
             preview_padding,
@@ -5120,8 +5186,9 @@ impl Render for Inbox {
             anchor: returning.map(|(anchor, _)| anchor).or(anchor),
             frames: self.frames.clone(),
             attachment_download: self.attachment_download.clone(),
+            attachment_marks: self.attachment_marks.clone(),
+            cached_files: self.cached_files.clone(),
             reveal_attachment,
-            spin_attachment,
             preview_current,
             quiet_preview: self.quiet_search_preview(),
             match_line: self.search_match_frame(now, preview_current),
@@ -5168,7 +5235,6 @@ impl Render for Inbox {
             | conv.missing_fade.is_some()
             | conv.match_line.animating
             | self.row_widths.running(now)
-            | spin_attachment
             | agents_animating
             | activity_animating
             | self.search_view.animating(now)
@@ -5429,6 +5495,12 @@ struct ListContent {
     cached_results: Option<(u64, gpui::AnyView)>,
 }
 
+#[derive(Clone, Copy)]
+enum AttachmentMark {
+    Ready,
+    Failed,
+}
+
 /// What the conversation's bodies show this frame beyond the session.
 #[derive(Default)]
 struct ConvFrame {
@@ -5440,8 +5512,11 @@ struct ConvFrame {
     return_glide: Option<LandingGlide>,
     syncing: bool,
     missing_fade: Option<f32>,
+    part_status: HashMap<String, ReaderLabel>,
     /// Bodies fading in, by message id: their opacity.
     alphas: HashMap<String, f32>,
+    attachment_alphas: HashMap<String, f32>,
+    replacing_text: HashSet<String>,
     card_alphas: HashMap<String, f32>,
     heights: HashMap<String, (f32, f32)>,
     outgoing_placeholders: HashMap<String, bool>,
@@ -5451,8 +5526,9 @@ struct ConvFrame {
     anchor: Option<ScrollAnchor>,
     frames: Option<SharedFrameLog>,
     attachment_download: Option<(String, String, Download)>,
+    attachment_marks: HashMap<(String, String), AttachmentMark>,
+    cached_files: HashSet<(String, String)>,
     reveal_attachment: bool,
-    spin_attachment: bool,
     preview_current: bool,
     quiet_preview: bool,
     match_line: search::MatchLineFrame,
@@ -5467,6 +5543,10 @@ impl ConvFrame {
             .get(id)
             .copied()
             .unwrap_or(1.0)
+    }
+
+    fn attachment_alpha(&self, id: &str) -> f32 {
+        self.attachment_alphas.get(id).copied().unwrap_or(1.0)
     }
 
     fn disclosures(&self) -> &Disclosures {
@@ -7914,6 +7994,139 @@ struct ConversationRead {
     view: Vec<ConvMessage>,
     reads: mail_body::BodyReads,
     matches: Option<(u64, Vec<fell_core::SearchMatch>)>,
+    cached_files: HashSet<(String, String)>,
+}
+
+struct ReaderRequest {
+    ids: Vec<MessageId>,
+    generation: u64,
+    started: Instant,
+    _job: reader_body_worker::Job,
+}
+
+#[derive(Default)]
+struct ReaderBodies {
+    active: Option<ReaderRequest>,
+    generation: u64,
+    failed: HashMap<String, reader_body_worker::Failure>,
+    completed: HashSet<String>,
+    reserved: HashSet<String>,
+    announced: HashSet<String>,
+}
+
+#[derive(Clone, Copy)]
+enum ReaderLabel {
+    Hidden,
+    Checking,
+    Formatted,
+    Loading,
+    Failed {
+        offline: bool,
+        html: bool,
+        unknown: bool,
+    },
+}
+
+impl ReaderBodies {
+    fn clear(&mut self) {
+        let generation = self.generation;
+        *self = Self {
+            generation,
+            ..Self::default()
+        };
+    }
+
+    fn is_active(&self, generation: u64) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|active| active.generation == generation)
+    }
+
+    fn labels(&mut self, session: &Session, now: Instant) -> HashMap<String, ReaderLabel> {
+        use fell_core::ReaderParts::*;
+        if let Some(active) = &self.active
+            && now.saturating_duration_since(active.started) >= reader_body_worker::SHOW_AFTER
+        {
+            self.announced
+                .extend(active.ids.iter().map(|id| id.0.clone()));
+        }
+        session
+            .messages
+            .iter()
+            .filter(|message| message.expanded && self.reserved.contains(&message.id))
+            .map(|message| {
+                let parts = message.reader_parts;
+                let html = matches!(parts, Listed { html: true });
+                let label = if message.needs_reader_parts()
+                    && let Some(failure) = self.failed.get(&message.id)
+                {
+                    ReaderLabel::Failed {
+                        offline: matches!(failure, reader_body_worker::Failure::Offline),
+                        html,
+                        unknown: parts == Unknown,
+                    }
+                } else if !self.announced.contains(&message.id) {
+                    ReaderLabel::Hidden
+                } else {
+                    match parts {
+                        Unknown => ReaderLabel::Checking,
+                        Listed { .. } if !message.needs_reader_parts() => ReaderLabel::Hidden,
+                        Listed { html: true } => ReaderLabel::Formatted,
+                        Listed { html: false } => ReaderLabel::Loading,
+                        Ready if message.rich == Rich::Pending => ReaderLabel::Formatted,
+                        Ready => ReaderLabel::Hidden,
+                    }
+                };
+                (message.id.clone(), label)
+            })
+            .collect()
+    }
+}
+
+fn reader_label(
+    theme: &Theme,
+    columns: ReaderColumns,
+    session: &Session,
+    label: ReaderLabel,
+) -> gpui::AnyElement {
+    let (line, color) = match label {
+        ReaderLabel::Hidden => (String::new(), theme.dimmed),
+        ReaderLabel::Checking => ("Checking message parts…".into(), theme.dimmed),
+        ReaderLabel::Formatted => ("Loading formatted version…".into(), theme.dimmed),
+        ReaderLabel::Loading => ("Loading message…".into(), theme.dimmed),
+        ReaderLabel::Failed {
+            offline,
+            html,
+            unknown,
+        } => {
+            let retry = keymap::binding_text(&session.keymap, Action::SyncNow);
+            let missing = if unknown {
+                "Parts"
+            } else if html {
+                "Formatted version"
+            } else {
+                "Body"
+            };
+            let reason = if offline {
+                "unavailable offline"
+            } else {
+                "couldn’t load"
+            };
+            (format!("{missing} {reason} · {retry} retry"), theme.error)
+        }
+    };
+    columns.flow(
+        |columns| columns.prose,
+        |_, _| {
+            div()
+                .h(px(theme.ui_px * 1.45))
+                .text_size(px(theme.ui_px - 1.0))
+                .text_color(rgb(color))
+                .truncate()
+                .child(line.clone())
+                .into_any_element()
+        },
+    )
 }
 
 #[derive(Default)]
@@ -7964,6 +8177,7 @@ impl BodyRefresh {
         now: Instant,
         height: impl Fn(usize) -> Option<f32>,
         downloading: bool,
+        fetched: &HashSet<String>,
     ) {
         let mut rich = self.rich;
         if let Some((mut messages, _)) = self.messages {
@@ -7983,7 +8197,21 @@ impl BodyRefresh {
                     == fell_core::BodyState::Pending
                     && messages[index].body_state != fell_core::BodyState::Pending)
                     .then_some(downloading);
-                motion.body_arrived(&messages[index].id, old_height, placeholder, now);
+                let id = &messages[index].id;
+                motion.body_arrived(id, old_height, placeholder, now);
+                if session.messages[index].attachments.is_empty()
+                    && !messages[index].attachments.is_empty()
+                {
+                    motion.attachments_arrived(id);
+                }
+                if matches!(messages[index].rich, Rich::Html(_) | Rich::PlainPart(_))
+                    && matches!(
+                        session.messages[index].reader_parts,
+                        fell_core::ReaderParts::Listed { html: true }
+                    )
+                {
+                    motion.body_text_replaced(id);
+                }
             }
             session.refresh_same_messages(messages);
         } else {
@@ -7993,12 +8221,42 @@ impl BodyRefresh {
                 {
                     if message.expanded {
                         motion.body_arrived(&message.id, height(index), None, now);
+                        if fetched.contains(&message.id)
+                            && message.rich == Rich::Pending
+                            && matches!(ready, Rich::Html(_) | Rich::PlainPart(_))
+                        {
+                            motion.body_text_replaced(&message.id);
+                        }
                     }
                     message.rich = ready;
                 }
             }
         }
     }
+}
+
+fn cached_attachment_keys(
+    store: &fell_core::Store,
+    account: &AccountId,
+    messages: &[ConvMessage],
+) -> HashSet<(String, String)> {
+    messages
+        .iter()
+        .filter(|message| !message.attachments.is_empty())
+        .flat_map(|message| {
+            message.attachments.iter().filter_map(|part| {
+                let request = fell_core::PartRequest {
+                    account_id: account.clone(),
+                    message_id: MessageId(message.id.clone()),
+                    part: part.clone(),
+                    copies: Vec::new(),
+                    decoded_size_known: message.reader_parts == fell_core::ReaderParts::Ready,
+                };
+                fell_core::PartCache::is_cached(store, &request)
+                    .then(|| (message.id.clone(), part.section.clone()))
+            })
+        })
+        .collect()
 }
 
 /// One thread's messages as the conversation shows them, with whether
@@ -8020,6 +8278,7 @@ pub fn read_conversation(
     let mut view = present::conversation(&messages, me, roles, names, viewing);
     for ((message, state), stored) in view.iter_mut().zip(states).zip(&messages) {
         message.body_state = state;
+        message.reader_parts = store.reader_parts(account, &message.id)?;
         if state == fell_core::BodyState::Stored
             && roles.is(FolderRole::Drafts, viewing)
             && stored
@@ -8036,7 +8295,9 @@ pub fn read_conversation(
             message.body = preview;
             message.snippet = present::markdown_snippet(&body, &stored.headers.subject);
         }
-        if stored.has_attachment {
+        if stored.has_attachment
+            || matches!(message.reader_parts, fell_core::ReaderParts::Listed { .. })
+        {
             let parts = store.message_attachments(account, &stored.headers.message_id)?;
             message.attachments = attachments::visible_parts(parts.unwrap_or_default());
         }
@@ -8793,6 +9054,12 @@ fn expanded_message(
                     })),
             ),
         )
+        .children(
+            frame
+                .part_status
+                .get(&message.id)
+                .map(|label| reader_label(theme, columns, session, *label)),
+        )
         // `q` opens every collapsed block in the message at once, so only
         // the first fold of the reader's message names the key.
         .child(message_body(
@@ -8821,26 +9088,31 @@ fn expanded_message(
             cx,
         ))
         .when(!message.attachments.is_empty(), |card| {
-            card.child(div().id("attachment-layout").child(columns.flow(
-                |columns| columns.header,
-                |width, active| {
-                    div()
-                        .id(("attachment-measure", width as usize))
-                        .child(attachment_chips::row(
-                            theme,
-                            session,
-                            message,
-                            index,
-                            width,
-                            Live(live.0 && active),
-                            frame,
-                            chip_probe.filter(|_| active),
-                            window,
-                            cx,
-                        ))
-                        .into_any_element()
-                },
-            )))
+            card.child(
+                div()
+                    .id("attachment-layout")
+                    .opacity(frame.attachment_alpha(&message.id))
+                    .child(columns.flow(
+                        |columns| columns.header,
+                        |width, active| {
+                            div()
+                                .id(("attachment-measure", width as usize))
+                                .child(attachment_chips::row(
+                                    theme,
+                                    session,
+                                    message,
+                                    index,
+                                    width,
+                                    Live(live.0 && active),
+                                    frame,
+                                    chip_probe.filter(|_| active),
+                                    window,
+                                    cx,
+                                ))
+                                .into_any_element()
+                        },
+                    )),
+            )
         })
         .into_any_element()
 }
@@ -8877,7 +9149,14 @@ fn message_body(
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
     let (alpha, outgoing) = frame.body_labels(message);
+    let status = frame.part_status.get(&message.id);
+    let hide = message.reader_parts == fell_core::ReaderParts::Unknown
+        && matches!(status, Some(ReaderLabel::Hidden | ReaderLabel::Checking));
     let body = match present::missing_body_line(message.body_state, frame.syncing) {
+        _ if hide => stored_message_body(theme, message, folds, frame, 0.0, cx),
+        Some(_) if message.body_state == fell_core::BodyState::Pending && status.is_some() => {
+            missing_message_body(theme, folds.columns, "", 0.0)
+        }
         Some(line) => missing_message_body(theme, folds.columns, &line, alpha),
         None => {
             let style = conversation_line_style(window, theme, px(theme.ui_px));
@@ -8885,18 +9164,29 @@ fn message_body(
             stored_message_body(theme, message, folds, frame, alpha, &markers, cx)
         }
     };
-    let Some(line) = outgoing else {
+    let old = if let Some(line) = outgoing {
+        missing_message_body(theme, folds.columns, &line, 1.0 - alpha)
+    } else if frame.replacing_text.contains(&message.id) && alpha < 1.0 {
+        let mut previous = message.clone();
+        previous.rich = Rich::Plain;
+        stored_message_body(
+            theme,
+            &previous,
+            FoldView {
+                live: false,
+                ..folds
+            },
+            frame,
+            1.0 - alpha,
+            cx,
+        )
+    } else {
         return body;
     };
     div()
         .relative()
         .child(body)
-        .child(div().absolute().inset_0().child(missing_message_body(
-            theme,
-            folds.columns,
-            &line,
-            1.0 - alpha,
-        )))
+        .child(div().absolute().inset_0().child(old))
         .into_any_element()
 }
 
@@ -11530,6 +11820,7 @@ mod tests {
             let id = inbox.open_thread.clone().unwrap();
             inbox.read_in_flight = true;
             let reply = super::ConversationRead {
+                cached_files: Default::default(),
                 notes: None,
                 latest_note: None,
                 note_generation: 0,
@@ -11547,6 +11838,7 @@ mod tests {
             );
             let id = inbox.open_thread.clone().unwrap();
             let reply = super::ConversationRead {
+                cached_files: Default::default(),
                 notes: None,
                 latest_note: None,
                 note_generation: 0,
@@ -11639,6 +11931,7 @@ mod tests {
                 row.id,
                 before + 1,
                 Ok(Some(super::ConversationRead {
+                    cached_files: Default::default(),
                     notes: None,
                     latest_note: None,
                     note_generation: 0,
@@ -11772,6 +12065,7 @@ mod tests {
                     row.id.clone(),
                     read,
                     Ok(Some(super::ConversationRead {
+                        cached_files: Default::default(),
                         notes: None,
                         latest_note: None,
                         note_generation: 0,
@@ -11855,6 +12149,7 @@ mod tests {
             now,
             |_| Some(100.),
             pending.downloading(&SyncKind::LocalOffline),
+            &Default::default(),
         );
         pending.applied(
             8,

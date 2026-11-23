@@ -70,6 +70,19 @@ pub struct ConvMessage {
     /// Whether sync has downloaded the body. A first sync lists rows from
     /// their headers, then fills bodies in.
     pub body_state: fell_core::BodyState,
+    pub reader_parts: fell_core::ReaderParts,
+}
+
+impl ConvMessage {
+    pub fn needs_reader_parts(&self) -> bool {
+        match self.reader_parts {
+            fell_core::ReaderParts::Unknown => true,
+            fell_core::ReaderParts::Listed { .. } => {
+                self.body_state != fell_core::BodyState::TooLarge
+            }
+            fell_core::ReaderParts::Ready => false,
+        }
+    }
 }
 
 /// What the conversation says in place of a body it does not have.
@@ -117,7 +130,11 @@ pub fn bodies_filled(shown: &[ConvMessage], read: &[ConvMessage]) -> Option<Vec<
             .filter(|(_, (old, new))| {
                 let replaced_html =
                     matches!(new.rich, Rich::Html(_) | Rich::PlainPart(_)) && old.rich != new.rich;
-                old.body != new.body || old.body_state != new.body_state || replaced_html
+                old.body != new.body
+                    || old.body_state != new.body_state
+                    || old.reader_parts != new.reader_parts
+                    || old.attachments != new.attachments
+                    || replaced_html
             })
             .map(|(index, _)| index)
             .collect(),
@@ -167,7 +184,7 @@ pub enum Rich {
     /// The stored plain part, used when the HTML has no native output.
     PlainPart(std::sync::Arc<RenderedBody>),
     /// No parts are stored at all yet (mail synced before they were kept).
-    /// Paints the stored text; opening the message asks sync for the parts.
+    /// The reader can use stored text once it knows which parts exist.
     Missing,
     /// An HTML part is stored and is being read and prepared off the UI
     /// thread. The body's space is reserved until it is ready.
@@ -876,6 +893,7 @@ pub fn conversation(
                 recipients: recipient_line(message, me),
                 context: None,
                 body_state: fell_core::BodyState::Stored,
+                reader_parts: Default::default(),
             }
         })
         .collect()
@@ -1480,6 +1498,7 @@ mod tests {
             recipients: None,
             context: None,
             body_state: state,
+            reader_parts: Default::default(),
         }
     }
 

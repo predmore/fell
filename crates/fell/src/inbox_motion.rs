@@ -99,6 +99,8 @@ struct BodyArrival {
     height: Option<(f32, Transition)>,
     /// Whether the outgoing pending label said the body was downloading.
     placeholder: Option<bool>,
+    attachments: bool,
+    text: bool,
 }
 
 /// What an overlay or which-key showed, kept from the frame before it
@@ -1192,9 +1194,39 @@ impl InboxMotion {
                     fade,
                     height,
                     placeholder,
+                    attachments: false,
+                    text: false,
                 },
             );
         }
+    }
+
+    pub fn attachments_arrived(&mut self, id: &str) {
+        if let Some(body) = self.bodies.get_mut(id) {
+            body.attachments = true;
+        }
+    }
+
+    pub fn body_text_replaced(&mut self, id: &str) {
+        if let Some(body) = self.bodies.get_mut(id) {
+            body.text = true;
+        }
+    }
+
+    pub fn attachment_alphas(&self, now: Instant) -> HashMap<String, f32> {
+        self.bodies
+            .iter()
+            .filter(|(_, body)| body.attachments)
+            .map(|(id, body)| (id.clone(), body.fade.progress(now)))
+            .collect()
+    }
+
+    pub fn replacing_body_text(&self) -> HashSet<String> {
+        self.bodies
+            .iter()
+            .filter(|(_, body)| body.text)
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     /// Fade in the whole card when a newly sent reply joins the open thread.
@@ -1275,7 +1307,7 @@ impl InboxMotion {
                 } else {
                     body.fade.progress(now)
                 };
-                let alpha = if body.placeholder.is_some() {
+                let alpha = if body.placeholder.is_some() || body.text {
                     shown
                 } else {
                     motion::lerp(motion::ARRIVE_FROM, 1.0, shown)

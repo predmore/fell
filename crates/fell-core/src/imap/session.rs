@@ -148,12 +148,20 @@ enum Io {
 
 impl Session {
     pub(super) fn open(config: &ImapConfig) -> Result<Self, Error> {
+        Self::open_with(config, |_| Ok(()))
+    }
+
+    pub(super) fn open_with(
+        config: &ImapConfig,
+        connected: impl FnOnce(&TcpStream) -> Result<(), Error>,
+    ) -> Result<Self, Error> {
         if config.accept_invalid_certs && !is_loopback_host(&config.host) {
             return Err(imap_err(
                 "accept_invalid_certs is only allowed for a loopback host",
             ));
         }
         let stream = connect_tcp(config)?;
+        connected(&stream)?;
         let mut session = match config.security {
             ImapSecurity::Tls => Session {
                 io: Some(Io::Tls(Box::new(wrap_tls(stream, Vec::new(), config)?))),
@@ -303,6 +311,49 @@ impl Session {
             exists,
             highest_modseq,
         }))
+    }
+
+    pub(super) fn tcp(&self) -> Result<&TcpStream, Error> {
+        match self.io.as_ref() {
+            Some(Io::Plain(tcp)) => Ok(tcp),
+            Some(Io::Tls(stream)) => Ok(&stream.sock.inner),
+            None => Err(imap_err("connection closed")),
+        }
+    }
+
+    pub(super) fn uid_structures(
+        &mut self,
+        set: &str,
+    ) -> Result<Vec<(u32, super::BodyStructure)>, Error> {
+        let reply = self.command(
+            "UID FETCH BODYSTRUCTURE",
+            &format!("UID FETCH {set} (UID BODYSTRUCTURE)"),
+        )?;
+        let mut found = Vec::new();
+        for line in reply.untagged {
+            let upper = line.text.to_ascii_uppercase();
+            let Some(value) = fetch_item(&line.text, &upper, "BODYSTRUCTURE", '(') else {
+                continue;
+            };
+            let Some(uid) = fetch_number(&line.text, &upper, "UID") else {
+                return Err(imap_err("BODYSTRUCTURE reply has no UID"));
+            };
+            let before = line.text.len() - value.len() - 1;
+            let literals = line
+                .literals
+                .iter()
+                .skip(literals_before(&line.text[..before]));
+            let structure = super::structure::parse(
+                &line.text[before..],
+                literals.map(|literal| match literal {
+                    LiteralBytes::Kept(bytes) => Some(bytes.as_slice()),
+                    LiteralBytes::Discarded => None,
+                }),
+            )
+            .ok_or_else(|| imap_err("invalid BODYSTRUCTURE reply"))?;
+            found.push((uid, structure));
+        }
+        Ok(found)
     }
 
     /// Flags only. Used to learn unread state before the first modseq is stored.
@@ -1810,7 +1861,33 @@ fn fetch_internal_date(text: &str, upper: &str) -> Option<i64> {
     super::rfc822::valid_date(&date)
 }
 
+fn fetch_number<T: std::str::FromStr>(text: &str, upper: &str, key: &str) -> Option<T> {
+    let value = fetch_value(text, upper, key)?;
+    value.split([' ', ')']).next()?.parse().ok()
+}
+
+fn literals_before(text: &str) -> usize {
+    let mut quoted = false;
+    let mut count = 0;
+    let mut bytes = text.bytes();
+    while let Some(byte) = bytes.next() {
+        match byte {
+            b'\\' if quoted => {
+                bytes.next();
+            }
+            b'"' => quoted = !quoted,
+            b'{' if !quoted => count += 1,
+            _ => {}
+        }
+    }
+    count
+}
+
 fn fetch_item<'a>(text: &'a str, upper: &str, key: &str, delimiter: char) -> Option<&'a str> {
+    fetch_value(text, upper, key)?.strip_prefix(delimiter)
+}
+
+fn fetch_value<'a>(text: &'a str, upper: &str, key: &str) -> Option<&'a str> {
     // A quoted body or a nested list can contain the key too. Literal bytes
     // are already out of band.
     let start = upper.find("FETCH")? + "FETCH".len();
@@ -1834,12 +1911,13 @@ fn fetch_item<'a>(text: &'a str, upper: &str, key: &str, delimiter: char) -> Opt
                 if depth == 1
                     && first == key.as_bytes()[0]
                     && matches!(items.as_bytes()[index - 1], b'(' | b' ')
-                    && items[index..].starts_with(key) =>
+                    && items[index..].starts_with(key)
+                    && matches!(
+                        items.as_bytes().get(index + key.len()),
+                        Some(b' ' | b'(' | b'"')
+                    ) =>
             {
-                let rest = text[start + index + key.len()..].trim_start();
-                if let Some(value) = rest.strip_prefix(delimiter) {
-                    return Some(value);
-                }
+                return Some(text[start + index + key.len()..].trim_start());
             }
             _ => {}
         }

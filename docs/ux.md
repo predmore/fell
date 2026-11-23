@@ -50,6 +50,7 @@ Decided with Jon on 2026-11-16. This is the bar the UX judges score against (eve
 - Native styled text by default; a key toggles to the web view for complex HTML; remote images blocked with a one-line, per-sender allow prompt.
 - `j`/`k` move between messages when the conversation has focus; `Ctrl-d`/`Ctrl-u` page (Space is the leader).
 - Attachments wrap beneath each expanded message. `a` focuses its files, `h`/`l` move between them, and `Esc` returns to the message. `Enter` or `o` opens the focused file in the desktop's default app. `S` saves it to Downloads, and `Space a s` saves all files on the current message. `Space a R` retries a failed attachment action.
+- When an open message needs parts from the server, the reader waits 100 ms before showing a loading line. It checks the part list first, then shows available text with “Loading formatted version…” while HTML arrives. A failed or offline read names what is missing and shows the sync retry key. The line has reserved space and disappears when the body is ready. File chips appear as soon as their metadata is known and show whether the file is listed, downloading, ready or failed.
 
 - Agent notes sit above the messages. Open the conversation to see a note's suggestion keys, use `Space a n` to expand or collapse it, and `Space a x` to dismiss it. `Space a t` opens Threads with suggestions. An outlined marker in the list shows a note you haven't seen.
 

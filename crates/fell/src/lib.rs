@@ -21,6 +21,7 @@ mod notifications;
 mod onboarding;
 mod png;
 mod present;
+mod reader_body_worker;
 mod recipient_menu;
 mod reply_check;
 mod row_widths;

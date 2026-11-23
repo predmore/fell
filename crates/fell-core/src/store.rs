@@ -439,6 +439,7 @@ pub struct ThreadSummary {
     pub unread: bool,
 }
 
+pub use bodies::ReaderParts;
 pub use bodies::cid_upgrade::{CidRepairBatch, CidRepairProgress};
 
 impl Store {
@@ -1297,7 +1298,7 @@ impl Store {
         let Some(list) = bodies::list(&self.conn, account_id, &canonical)? else {
             return Ok(Vec::new());
         };
-        let copies = bodies::copies_of(&self.conn, account_id, &canonical)?;
+        let (copies, decoded_size_known) = bodies::part_copies(&self.conn, account_id, &canonical)?;
         if copies.is_empty() {
             return Ok(Vec::new());
         }
@@ -1308,6 +1309,7 @@ impl Store {
                 message_id: MessageId(canonical.clone()),
                 part,
                 copies: copies.clone(),
+                decoded_size_known,
             })
             .collect())
     }
@@ -1338,6 +1340,29 @@ impl Store {
         bodies::repair_html_snippets(&self.conn)
     }
 
+    /// Whether the conversation needs to check or download a message's parts.
+    /// `message_id` is canonical, as returned by [`Self::thread_messages`].
+    pub fn reader_parts(&self, account: &AccountId, message_id: &str) -> Result<ReaderParts> {
+        bodies::reader_parts(&self.conn, account, message_id)
+    }
+
+    pub(crate) fn store_structures(
+        &self,
+        account: &AccountId,
+        fetched: &[(MessageId, RemoteId, crate::imap::BodyStructure)],
+    ) -> Result<()> {
+        let tx = immediate_transaction(&self.conn)?;
+        for (id, copy, structure) in fetched {
+            if let Some(id) = canonical_id_on(&tx, account, id)?
+                && bodies::write_structure(&tx, account, &id, copy, structure)?
+            {
+                set_attachments_from_list(&tx, account, &id, &structure.parts)?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// The server copies to fetch for one message with no stored body part
     /// or no part list, including one an earlier backfill could not fetch.
     /// `None` when it has both already, or no copy to fetch.
@@ -1349,9 +1374,16 @@ impl Store {
         let Some(canonical) = self.canonical_id(account_id, message_id)? else {
             return Ok(None);
         };
-        if bodies::read(&self.conn, account_id, &canonical)?
-            .is_some_and(|parts| parts.html.is_some() || parts.plain.is_some())
-            && bodies::parts_listed(&self.conn, account_id, &canonical)?
+        if self
+            .conn
+            .prepare_cached(
+                "SELECT EXISTS (SELECT 1 FROM message_bodies
+                            WHERE account_id = ?1 AND message_id = ?2 AND parts_listed = 1
+                              AND (html IS NOT NULL OR plain IS NOT NULL))",
+            )?
+            .query_row(params![account_id.as_str(), canonical], |row| {
+                row.get::<_, bool>(0)
+            })?
         {
             return Ok(None);
         }
@@ -1470,6 +1502,18 @@ impl Store {
         account_id: &AccountId,
         fetched: &[(MessageId, Option<crate::MessageParts>)],
     ) -> Result<usize> {
+        self.store_fetched_parts_with(account_id, fetched, false)
+    }
+
+    pub(crate) fn store_fetched_parts_with(
+        &self,
+        account_id: &AccountId,
+        fetched: &[(MessageId, Option<crate::MessageParts>)],
+        foreground: bool,
+    ) -> Result<usize> {
+        if fetched.is_empty() {
+            return Ok(0);
+        }
         // Deflate and render before the write lock: archive and mark-read wait on it.
         let compressed: Vec<_> = fetched
             .iter()
@@ -1479,7 +1523,9 @@ impl Store {
                     .map(bodies::StoredParts::new)
                     .unwrap_or_default();
                 let full_snippet = parts.as_ref().and_then(crate::imap::html_only_snippet_text);
-                (message_id, stored, full_snippet)
+                let plain = parts.as_ref().and_then(|parts| parts.plain.as_deref());
+                let snippet = plain.map(crate::imap::plain_snippet);
+                (message_id, stored, full_snippet, plain, snippet)
             })
             .collect();
         // A CID-only answer can require inspecting the kept HTML again.
@@ -1490,7 +1536,7 @@ impl Store {
         )?;
         let repairs = compressed
             .iter()
-            .map(|(id, parts, _)| {
+            .map(|(id, parts, ..)| {
                 let Some(canonical) = canonical_id_on(&read, account_id, id)? else {
                     return Ok(None);
                 };
@@ -1503,11 +1549,16 @@ impl Store {
             })
             .collect::<Result<Vec<_>>>()?;
         read.commit()?;
-        let tx = self
-            .lock_wait
-            .behind_waiting_writes(|| immediate_transaction(&self.conn))?;
+        let tx = if foreground {
+            immediate_transaction(&self.conn)?
+        } else {
+            self.lock_wait
+                .behind_waiting_writes(|| immediate_transaction(&self.conn))?
+        };
         let mut filled = 0;
-        for ((message_id, parts, full_snippet), repair) in compressed.iter().zip(repairs) {
+        for ((message_id, parts, full_snippet, plain, snippet), repair) in
+            compressed.iter().zip(repairs)
+        {
             let Some(canonical) = canonical_id_on(&tx, account_id, message_id)? else {
                 continue;
             };
@@ -1518,6 +1569,19 @@ impl Store {
                 filled += 1;
             }
             let listed = bodies::write(&tx, account_id, &canonical, parts, bodies::Write::FillGap)?;
+            if let (Some(plain), Some(snippet)) = (plain, snippet) {
+                tx.prepare_cached(
+                    "UPDATE messages SET body_text = ?3, snippet = ?4
+                     WHERE account_id = ?1 AND message_id = ?2
+                       AND body_text IS NULL AND snippet = ''",
+                )?
+                .execute(params![
+                    account_id.as_str(),
+                    canonical,
+                    plain,
+                    snippet
+                ])?;
+            }
             if let Some(full_snippet) = full_snippet {
                 bodies::fill_fetched_html_snippet(
                     &tx,
@@ -1526,6 +1590,20 @@ impl Store {
                     parts,
                     full_snippet,
                 )?;
+                if foreground {
+                    // Header-first sync can now skip this copy. Make the
+                    // newly stored HTML searchable even if sync never does
+                    // a second download of the same source.
+                    tx.prepare_cached(
+                        "UPDATE messages SET body_text = ?3 WHERE account_id = ?1
+                         AND message_id = ?2 AND body_text IS NULL",
+                    )?
+                    .execute(params![
+                        account_id.as_str(),
+                        canonical,
+                        full_snippet
+                    ])?;
+                }
             }
             if listed && let Some(list) = parts.mime_parts() {
                 // The first list replaces flags an older classifier set.

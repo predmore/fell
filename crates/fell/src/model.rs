@@ -3328,11 +3328,13 @@ mod tests {
         );
         let older = ConvMessage {
             body_state: BodyState::Pending,
+            reader_parts: Default::default(),
             ..empty_message(false)
         };
         let newest = ConvMessage {
             id: "newest".into(),
             body_state: BodyState::Stored,
+            reader_parts: Default::default(),
             ..empty_message(true)
         };
         session.set_messages(vec![older, newest]);
@@ -6079,6 +6081,7 @@ mod tests {
             recipients: None,
             context: None,
             body_state: fell_core::BodyState::Stored,
+            reader_parts: Default::default(),
         }
     }
 }

@@ -1,7 +1,7 @@
 //! Run attachment operations off the window thread and show their results.
 
 use std::process::Child;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use fell_core::compose::{MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_FILES, ResolvedFile};
 use fell_core::parts::{CachedPart, PartEvent, PartRequest};
@@ -85,6 +85,18 @@ impl Inbox {
     }
 
     fn attachment_failed(&mut self, line: String, detail: String, retry: Request) {
+        match &retry {
+            Request::Open(target) => {
+                self.attachment_marks
+                    .insert(part_key(target), super::AttachmentMark::Failed);
+            }
+            Request::Save(targets) => {
+                for target in targets {
+                    self.attachment_marks
+                        .insert(part_key(target), super::AttachmentMark::Failed);
+                }
+            }
+        }
         let key = keymap::binding_text(&self.session.keymap, Action::RetryAttachment);
         self.attachment_retry = Some(retry);
         self.session.attachment_error = Some(format!("{line}\n{}", display_safe(&detail)));
@@ -116,6 +128,10 @@ impl Inbox {
         })
         .detach();
     }
+}
+
+fn part_key(target: &Target) -> (String, String) {
+    (target.message.clone(), target.part.section.clone())
 }
 
 enum Outcome {
@@ -251,7 +267,13 @@ impl AttachmentSource {
             .call(move |store| {
                 let request = store.part_request(&account, &id, &expected.section)?;
                 if request.is_some() {
-                    return Ok(request.filter(|request| request.part == expected));
+                    return Ok(request.filter(|request| {
+                        let mut actual = request.part.clone();
+                        if expected.size == expected.encoded_size {
+                            actual.size = expected.size;
+                        }
+                        actual == expected
+                    }));
                 }
                 // A local copy without server coordinates can still use bytes
                 // previously cached for this canonical message.
@@ -264,6 +286,7 @@ impl AttachmentSource {
                             message_id: id,
                             part: expected,
                             copies: Vec::new(),
+                            decoded_size_known: true,
                         }),
                 )
             })
@@ -281,11 +304,7 @@ impl AttachmentSource {
         while let Some(event) = events.next().await {
             match event {
                 PartEvent::Downloading { total } => {
-                    download = Some(Download {
-                        fetched: 0,
-                        total,
-                        started: Instant::now(),
-                    });
+                    download = Some(Download { fetched: 0, total });
                 }
                 PartEvent::Progress { fetched, total } => {
                     if let Some(progress) = &mut download {
@@ -298,9 +317,16 @@ impl AttachmentSource {
                     }
                 }
                 PartEvent::Done(result) => {
-                    if download.is_some() {
-                        Self::show_download(this, cx, target, None)?;
-                    }
+                    Self::show_download(this, cx, target, None)?;
+                    let mark = if result.is_ok() {
+                        super::AttachmentMark::Ready
+                    } else {
+                        super::AttachmentMark::Failed
+                    };
+                    let _ = this.update(cx, |inbox, cx| {
+                        inbox.attachment_marks.insert(part_key(target), mark);
+                        cx.notify();
+                    });
                     return result.map_err(|err| err.to_string());
                 }
             }

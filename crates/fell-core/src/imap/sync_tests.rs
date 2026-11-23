@@ -4680,6 +4680,165 @@ fn inbox_state(messages: Vec<(u32, Vec<u8>)>) -> TestState {
     state
 }
 
+#[test]
+fn reader_stores_metadata_and_bodies_before_the_sync_pass_finishes() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let sample = |uid: u32| {
+        format!(
+            concat!(
+                "From: Demo <sender@example.test>\r\n",
+                "Message-ID: <reader-{}@example.test>\r\n",
+                "Subject: Route notes\r\n",
+                "Content-Type: multipart/mixed; boundary=route\r\n\r\n",
+                "--route\r\nContent-Type: text/html\r\n\r\n<p>Route ready.</p>\r\n",
+                "--route\r\nContent-Type: text/plain\r\n",
+                "Content-Disposition: attachment; filename=route.txt\r\n\r\n",
+                "notes\r\n--route--\r\n"
+            ),
+            uid
+        )
+        .into_bytes()
+    };
+    let structure = concat!(
+        r#"(("TEXT" "HTML" NIL NIL NIL "7BIT" 19 1 NIL NIL)"#,
+        r#"("TEXT" "PLAIN" NIL NIL NIL "7BIT" 5 1 NIL ("ATTACHMENT" ("FILENAME" "route.txt"))) "MIXED")"#,
+    );
+    let server = TestServer::spawn_parallel(
+        inbox_state((1..=5).map(|uid| (uid, sample(uid))).collect()),
+        (1..=5).map(|uid| (uid, structure.into())).collect(),
+    );
+    let config = crate::AccountConfig::parse(&format!(
+        concat!(
+            "id = \"reader\"\nemail = \"sender@example.test\"\nbackend = \"imap\"\n",
+            "host = \"127.0.0.1\"\nport = {}\nsecurity = \"plain\"\n",
+            "username = \"caleb\"\npassword = \"secret\"\n"
+        ),
+        server.addr.port()
+    ))
+    .unwrap();
+    let account = config.account();
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("mail.db");
+    let store = crate::ReaderBodyFetcher::open_store(&path).unwrap();
+    store.upsert_account(&account).unwrap();
+    let ids = |uid| crate::MessageId::new(format!("reader-{uid}@example.test"));
+    let messages = (1..=4)
+        .map(|uid| {
+            let mut message =
+                crate::imap::to_message(&account.id, "INBOX", "INBOX", 20, uid, &[], &sample(uid));
+            message.parts = None;
+            message.has_attachment = false;
+            message.attachment_names.clear();
+            message
+        })
+        .collect();
+    store
+        .apply_delta(
+            &account.id,
+            &crate::backend::MailboxDelta {
+                messages,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let backend = config.backend().unwrap();
+    let sync_account = account.clone();
+    let (running, pass_started) = mpsc::channel();
+    let (release, finish_pass) = mpsc::channel();
+    let pass = std::thread::spawn(move || {
+        let store = crate::ReaderBodyFetcher::open_store(&path).unwrap();
+        let mut running = Some(running);
+        sync_with_progress(&sync_account, backend.as_ref(), &store, &mut |_| {
+            if let Some(running) = running.take() {
+                running.send(()).unwrap();
+                finish_pass.recv_timeout(Duration::from_secs(20)).unwrap();
+            }
+        })
+        .unwrap()
+    });
+    pass_started.recv_timeout(Duration::from_secs(10)).unwrap();
+    let commands_before = commands(&server).len();
+    let mut reader = crate::ReaderBodyFetcher::default();
+    let cancel = crate::CancelBodyFetch::default();
+    let mut last = Instant::now();
+    let mut commit = 0;
+    let unresolved = reader
+        .fetch(&config, &store, &[ids(1), ids(2)], &cancel, || {
+            if commit == 0 {
+                assert_eq!(
+                    store.reader_parts(&account.id, ids(1).as_str()).unwrap(),
+                    crate::ReaderParts::Listed { html: true }
+                );
+                assert_eq!(
+                    store
+                        .message_attachments(&account.id, &ids(1))
+                        .unwrap()
+                        .unwrap()[0]
+                        .filename
+                        .as_deref(),
+                    Some("route.txt")
+                );
+                assert!(
+                    store
+                        .message_body(&account.id, &ids(1))
+                        .unwrap()
+                        .unwrap()
+                        .html
+                        .is_none()
+                );
+            }
+            eprintln!(
+                "reader commit {} at {:.2?} while sync is held",
+                commit + 1,
+                last.elapsed()
+            );
+            commit += 1;
+        })
+        .unwrap();
+    assert!(unresolved.is_empty());
+    assert_eq!(commit, 2);
+    assert_eq!(
+        store.reader_parts(&account.id, ids(2).as_str()).unwrap(),
+        crate::ReaderParts::Ready
+    );
+    last = Instant::now();
+    assert!(
+        reader
+            .fetch(&config, &store, &[ids(3)], &cancel, || {})
+            .unwrap()
+            .is_empty()
+    );
+    eprintln!(
+        "warm reader stored parts at {:.2?} while sync is held",
+        last.elapsed()
+    );
+    let foreground = commands(&server).split_off(commands_before);
+    let count = |needle: &str| {
+        foreground
+            .iter()
+            .filter(|line| line.contains(needle))
+            .count()
+    };
+    assert_eq!(count("LOGIN"), 1, "{foreground:?}");
+    assert_eq!(count(" EXAMINE "), 1, "{foreground:?}");
+    assert_eq!(count("UID FETCH 1,2 "), 2, "{foreground:?}");
+    assert_eq!(count("UID FETCH 3 "), 2, "{foreground:?}");
+    let cancelled = crate::CancelBodyFetch::default();
+    cancelled.cancel();
+    assert!(
+        reader
+            .fetch(&config, &store, &[ids(4)], &cancelled, || panic!(
+                "cancelled write"
+            ))
+            .is_err()
+    );
+    assert_eq!(commands(&server).len(), commands_before + foreground.len());
+    release.send(()).unwrap();
+    pass.join().unwrap();
+}
+
 fn temp_cache(tag: &str) -> (std::path::PathBuf, crate::parts::PartCache) {
     let root = std::env::temp_dir().join(format!(
         "fell-part-fetch-{tag}-{}-{:?}",

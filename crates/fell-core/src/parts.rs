@@ -50,6 +50,9 @@ pub struct PartRequest {
     pub message_id: MessageId,
     pub part: MimePart,
     pub copies: Vec<RemoteId>,
+    /// BODYSTRUCTURE lists the on-the-wire size. Only the verified copy can
+    /// supply these bytes until the decoded size is known.
+    pub decoded_size_known: bool,
 }
 
 /// A part's decoded bytes on disk.
@@ -107,6 +110,33 @@ impl PartCache {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Check an existing cache entry without creating files or marking it used.
+    /// The reader calls this on its store lane.
+    pub fn is_cached(store: &Store, request: &PartRequest) -> bool {
+        if !request.decoded_size_known {
+            return false;
+        }
+        let Some(root) = Self::default_root() else {
+            return false;
+        };
+        let cache = Self {
+            root,
+            cap: DEFAULT_CACHE_BYTES,
+        };
+        let dir = cache.request_dir(request);
+        let file = dir.join(sanitize_filename(
+            request.part.filename.as_deref(),
+            &request.part.mime_type,
+        ));
+        fs::symlink_metadata(&dir).is_ok_and(|meta| meta.is_dir() && meta.uid() == user_id())
+            && fs::symlink_metadata(file).is_ok_and(|meta| {
+                meta.is_file() && meta.uid() == user_id() && meta.len() == request.part.size
+            })
+            && store
+                .cached_part_state(request)
+                .is_ok_and(|state| state.is_some_and(|(_, pending)| !pending))
     }
 
     fn entry_dir(&self, account: &str, message: &str, section: &str) -> PathBuf {
@@ -427,7 +457,9 @@ fn fetch_cached_part(
         if store.cached_part_state(request)? != Some((stamp, false)) {
             return Err(part_removed());
         }
-        if let Some(hit) = cache.lookup_locked(request) {
+        if request.decoded_size_known
+            && let Some(hit) = cache.lookup_locked(request)
+        {
             return Ok(hit);
         }
         stamp
@@ -454,12 +486,16 @@ fn download_part(
         else {
             continue;
         };
+        if !request.decoded_size_known && raw.len() as u64 != request.part.encoded_size {
+            differed = true;
+            continue;
+        }
         let bytes = decode_part(request.part.encoding, &raw);
         drop(raw);
         // A copy merged from another delivery (a list echo with a footer)
         // may number its parts differently. Its part of another size is
         // some other part: never hand that over as this one.
-        if bytes.len() as u64 != request.part.size {
+        if request.decoded_size_known && bytes.len() as u64 != request.part.size {
             differed = true;
             continue;
         }
@@ -674,6 +710,7 @@ mod tests {
 
     pub(crate) fn request(message_id: &str, section: &str, name: Option<&str>) -> PartRequest {
         PartRequest {
+            decoded_size_known: true,
             account_id: AccountId("a1".into()),
             message_id: MessageId::new(message_id),
             part: MimePart {

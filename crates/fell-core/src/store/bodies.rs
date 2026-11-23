@@ -44,8 +44,11 @@ CREATE TABLE IF NOT EXISTS message_bodies (
     plain BLOB,
     -- Bulk-mail headers: name US value, records joined by RS.
     bulk_headers TEXT NOT NULL DEFAULT '',
-    -- 1 once message_parts holds this message's part list (maybe none).
+    -- 0 unknown, 1 parsed from the message, 2/3 from BODYSTRUCTURE
+    -- (without/with HTML). A known list may be empty.
     parts_listed INTEGER NOT NULL DEFAULT 0,
+    -- Only this copy can serve sections from its provisional structure.
+    structure_copy TEXT,
     -- 1 when sync kept no body: the message is larger than it downloads.
     withheld INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (account_id, message_id)
@@ -133,6 +136,9 @@ pub(super) fn ensure_bodies(conn: &Connection) -> Result<()> {
         tx.execute_batch(
             "ALTER TABLE message_bodies ADD COLUMN parts_listed INTEGER NOT NULL DEFAULT 0",
         )?;
+    }
+    if !has_column(&tx, "message_bodies", "structure_copy")? {
+        tx.execute_batch("ALTER TABLE message_bodies ADD COLUMN structure_copy TEXT")?;
     }
     if !has_column(&tx, "message_bodies", "withheld")? {
         tx.execute_batch(
@@ -434,19 +440,97 @@ fn part_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MimePart> {
     })
 }
 
-/// Whether `message_id` has its part list recorded.
+/// What the reader knows before it downloads the full message.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReaderParts {
+    #[default]
+    Ready,
+    Unknown,
+    Listed {
+        html: bool,
+    },
+}
+
+pub(super) fn reader_parts(
+    conn: &Connection,
+    account: &AccountId,
+    id: &str,
+) -> Result<ReaderParts> {
+    let row = conn
+        .prepare_cached(
+            "SELECT COALESCE(b.parts_listed, 0), b.html IS NOT NULL,
+                EXISTS (SELECT 1 FROM message_copies c
+                        WHERE c.account_id = m.account_id AND c.message_id = m.message_id)
+         FROM messages m LEFT JOIN message_bodies b USING (account_id, message_id)
+         WHERE m.account_id = ?1 AND m.message_id = ?2",
+        )?
+        .query_row(params![account.as_str(), id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, bool>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
+        })
+        .optional()?;
+    Ok(match row {
+        Some((0, _, true)) => ReaderParts::Unknown,
+        Some((2 | 3, _, false)) => ReaderParts::Ready,
+        Some((code @ (2 | 3), html, true)) => ReaderParts::Listed {
+            html: code == 3 && !html,
+        },
+        _ => ReaderParts::Ready,
+    })
+}
+
+fn list_code(conn: &Connection, account_id: &AccountId, message_id: &str) -> Result<i64> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT parts_listed FROM message_bodies WHERE account_id = ?1 AND message_id = ?2",
+        )?
+        .query_row(params![account_id.as_str(), message_id], |row| row.get(0))
+        .optional()?
+        .unwrap_or(0))
+}
+
+/// Whether the part list was parsed from the full source.
 pub(crate) fn parts_listed(
     conn: &Connection,
     account_id: &AccountId,
     message_id: &str,
 ) -> Result<bool> {
-    let listed: Option<i64> = conn
-        .prepare_cached(
-            "SELECT parts_listed FROM message_bodies WHERE account_id = ?1 AND message_id = ?2",
-        )?
-        .query_row(params![account_id.as_str(), message_id], |row| row.get(0))
-        .optional()?;
-    Ok(listed == Some(1))
+    Ok(list_code(conn, account_id, message_id)? == 1)
+}
+
+/// Write provisional metadata only while the original server copy is still
+/// recorded. A full source stored by sync always wins.
+pub(super) fn write_structure(
+    conn: &Connection,
+    account: &AccountId,
+    id: &str,
+    copy: &RemoteId,
+    structure: &crate::imap::BodyStructure,
+) -> Result<bool> {
+    if list_code(conn, account, id)? != 0 || !copies_of(conn, account, id)?.contains(copy) {
+        return Ok(false);
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO message_bodies (account_id, message_id, codec)
+         VALUES (?1, ?2, ?3)",
+        params![account.as_str(), id, CODEC_DEFLATE],
+    )?;
+    replace_list(
+        conn,
+        account,
+        id,
+        &structure.parts,
+        if structure.html { 3 } else { 2 },
+    )?;
+    conn.execute(
+        "UPDATE message_bodies SET structure_copy = ?3
+         WHERE account_id = ?1 AND message_id = ?2",
+        params![account.as_str(), id, copy.0],
+    )?;
+    Ok(true)
 }
 
 /// Replace the part list of a message whose `message_bodies` row exists.
@@ -455,6 +539,7 @@ fn replace_list(
     account_id: &AccountId,
     message_id: &str,
     list: &[MimePart],
+    code: i64,
 ) -> Result<()> {
     conn.execute(
         "DELETE FROM message_parts WHERE account_id = ?1 AND message_id = ?2",
@@ -474,10 +559,33 @@ fn replace_list(
         )?;
     }
     conn.execute(
-        "UPDATE message_bodies SET parts_listed = 1 WHERE account_id = ?1 AND message_id = ?2",
-        params![account_id.as_str(), message_id],
+        "UPDATE message_bodies SET parts_listed = ?3, structure_copy = NULL
+         WHERE account_id = ?1 AND message_id = ?2",
+        params![account_id.as_str(), message_id, code],
     )?;
     Ok(())
+}
+
+/// Copies safe to use for the listed sections. A BODYSTRUCTURE list belongs
+/// to the copy that supplied it, and can report only the encoded byte size.
+pub(super) fn part_copies(
+    conn: &Connection,
+    account: &AccountId,
+    id: &str,
+) -> Result<(Vec<RemoteId>, bool)> {
+    let (code, source): (i64, Option<String>) = conn
+        .prepare_cached(
+            "SELECT parts_listed, structure_copy FROM message_bodies
+         WHERE account_id = ?1 AND message_id = ?2",
+        )?
+        .query_row(params![account.as_str(), id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+    let mut copies = copies_of(conn, account, id)?;
+    if code != 1 {
+        copies.retain(|copy| Some(&copy.0) == source.as_ref());
+    }
+    Ok((copies, code == 1))
 }
 
 /// The recorded part list of a canonical message id, in document order.
@@ -487,7 +595,7 @@ pub(super) fn list(
     account_id: &AccountId,
     message_id: &str,
 ) -> Result<Option<Vec<MimePart>>> {
-    if !parts_listed(conn, account_id, message_id)? {
+    if list_code(conn, account_id, message_id)? == 0 {
         return Ok(None);
     }
     let mut stmt = conn.prepare_cached(&format!(
@@ -550,7 +658,7 @@ pub(super) fn write(
         && ((mode == Write::Replace && parts.has_body())
             || !parts_listed(conn, account_id, message_id)?)
     {
-        replace_list(conn, account_id, message_id, list)?;
+        replace_list(conn, account_id, message_id, list, 1)?;
         replaced = true;
     }
     conn.execute(
@@ -610,7 +718,7 @@ pub(super) fn state(
     let row = conn
         .prepare_cached(
             "SELECT m.body_text IS NULL AND m.snippet = '',
-                    b.message_id IS NOT NULL,
+                    IFNULL(b.parts_listed NOT IN (2, 3) OR b.html IS NOT NULL OR b.plain IS NOT NULL, 0),
                     IFNULL(b.withheld, 0),
                     EXISTS (
                         SELECT 1 FROM message_copies c
@@ -673,7 +781,9 @@ pub(super) fn move_into(
         )?;
     }
     // The part list goes with it when the kept row has none.
-    if !parts_listed(conn, account_id, to)?
+    let source_list = list_code(conn, account_id, from)?;
+    let kept_list = list_code(conn, account_id, to)?;
+    if (kept_list == 0 || (kept_list != 1 && source_list == 1))
         && let Some(list) = list(conn, account_id, from)?
     {
         conn.execute(
@@ -681,7 +791,7 @@ pub(super) fn move_into(
              VALUES (?1, ?2, ?3)",
             params![account_id.as_str(), to, CODEC_DEFLATE],
         )?;
-        replace_list(conn, account_id, to, &list)?;
+        replace_list(conn, account_id, to, &list, source_list)?;
         cid_upgrade::inherited_list(conn, account_id, from, to)?;
         conn.execute(
             "INSERT INTO body_backfill (account_id, message_id, refresh_cid_roles)

@@ -6,8 +6,11 @@ use gpui::{
     PathBuilder, Styled, Window, div, point, prelude::*, px, rgb,
 };
 
-use super::{ConvFrame, Inbox, LayoutProbe, LayoutSlot, Live, conversation_line_style};
+use super::{
+    AttachmentMark, ConvFrame, Inbox, LayoutProbe, LayoutSlot, Live, conversation_line_style,
+};
 use crate::attachments::{self, Request, Target};
+use crate::keymap::{self, Action};
 use crate::model::Session;
 use crate::present::ConvMessage;
 
@@ -29,11 +32,19 @@ pub(super) fn row(
     let selected = session
         .focused_attachment()
         .filter(|target| target.message == message.id);
-    let max_width = width.min(300.0);
+    let max_width = width.min(338.0);
     let font_size = (theme.ui_px - 1.0).max(12.0);
     let style = conversation_line_style(window, theme, px(font_size - 1.0));
     let measure =
         |text: &str| super::line_px_with_style(window, &style, text, FontWeight::NORMAL).ceil();
+    let retry = format!(
+        "Failed · {}",
+        keymap::binding_text(&session.keymap, Action::RetryAttachment)
+    );
+    let status_width = ["Listed", "Ready", "Downloading", "↓ 100%", &retry]
+        .into_iter()
+        .map(measure)
+        .fold(0.0, f32::max);
     div()
         .mt(px(16.))
         .flex()
@@ -70,18 +81,30 @@ pub(super) fn row(
                                 (*id == message.id && *section == part.section).then_some(*progress)
                             });
                     let size = attachments::size_label(part.size);
-                    let meta_width = measure(&size).max(measure("100%"));
-                    let icon = match download {
-                        Some(progress) => {
-                            let tick = if frame.spin_attachment {
-                                progress.started.elapsed().as_millis() / 80
-                            } else {
-                                0
-                            };
-                            spinner(meta, tick as usize)
+                    let status = if let Some(progress) = download {
+                        if progress.total == 0 {
+                            "Downloading".to_owned()
+                        } else {
+                            format!("↓ {}", progress.label())
                         }
-                        None => file_icon(part, meta),
+                    } else {
+                        match frame
+                            .attachment_marks
+                            .get(&(message.id.clone(), part.section.clone()))
+                        {
+                            Some(AttachmentMark::Ready) => "Ready".into(),
+                            Some(AttachmentMark::Failed) => retry.clone(),
+                            None if frame
+                                .cached_files
+                                .contains(&(message.id.clone(), part.section.clone())) =>
+                            {
+                                "Ready".into()
+                            }
+                            None => "Listed".into(),
+                        }
                     };
+                    let failed = download.is_none() && status == retry;
+                    let icon = file_icon(part, meta);
                     let chip = div()
                         .id(gpui::ElementId::named_usize("attachment", part_index))
                         .flex()
@@ -149,12 +172,26 @@ pub(super) fn row(
                         .child(
                             div()
                                 .flex_shrink_0()
-                                .w(px(meta_width))
+                                .w(px(measure("999 MB").max(measure(&size))))
                                 .text_right()
                                 .text_color(rgb(meta))
                                 .text_size(px(font_size - 1.0))
                                 .whitespace_nowrap()
-                                .child(download.map_or(size, |progress| progress.label())),
+                                .child(size),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .w(px(status_width))
+                                .text_right()
+                                .text_color(rgb(if failed && !focused {
+                                    theme.error
+                                } else {
+                                    meta
+                                }))
+                                .text_size(px(font_size - 1.0))
+                                .whitespace_nowrap()
+                                .child(status),
                         )
                         .into_any_element();
                     match probe.filter(|_| focused) {
@@ -249,28 +286,6 @@ fn file_icon(part: &MimePart, color: u32) -> AnyElement {
             }
             if let Ok(path) = path.build() {
                 window.paint_path(path, rgb(color));
-            }
-        },
-    )
-    .size(px(14.))
-    .flex_shrink_0()
-    .into_any_element()
-}
-
-fn spinner(color: u32, tick: usize) -> AnyElement {
-    gpui::canvas(
-        |_, _, _| (),
-        move |bounds, (), window, _| {
-            let origin = bounds.origin + point(px(7.), px(7.));
-            for i in 0..8 {
-                let a = i as f32 * std::f32::consts::TAU / 8.0;
-                let mut path = PathBuilder::stroke(px(1.3));
-                path.move_to(origin + point(px(a.cos() * 3.4), px(a.sin() * 3.4)));
-                path.line_to(origin + point(px(a.cos() * 5.7), px(a.sin() * 5.7)));
-                if let Ok(path) = path.build() {
-                    let opacity = 0.20 + 0.80 * ((8 + i - tick % 8) % 8) as f32 / 7.0;
-                    window.paint_path(path, gpui::Hsla::from(rgb(color)).alpha(opacity));
-                }
             }
         },
     )

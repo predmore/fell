@@ -677,7 +677,7 @@ fn walk_children(
     }
 }
 
-fn section(prefix: &str, number: usize) -> String {
+pub(super) fn section(prefix: &str, number: usize) -> String {
     if prefix.is_empty() {
         number.to_string()
     } else {
@@ -776,7 +776,7 @@ fn mime_type(part: &mail_parser::MessagePart<'_>) -> String {
 }
 
 /// One line, no control or bidi-override characters, at most 255 bytes.
-fn clean_name(raw: &str) -> Option<String> {
+pub(super) fn clean_name(raw: &str) -> Option<String> {
     let cleaned: String = raw
         .chars()
         .map(|ch| if ch.is_control() { ' ' } else { ch })
@@ -994,7 +994,7 @@ fn collapse_snippet(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn snippet(text: &str) -> String {
+pub(crate) fn snippet(text: &str) -> String {
     cap_snippet(&collapse_snippet(text)).to_owned()
 }
 

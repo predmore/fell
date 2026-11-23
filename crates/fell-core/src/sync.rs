@@ -304,7 +304,7 @@ pub fn fetch_missing_bodies(
 
 /// Fetch and store the parts of one message that has no stored body part.
 ///
-/// For the conversation view: call it on the sync thread, never the UI
+/// For stored mail: call it on a background thread, never the UI
 /// thread, when [`Store::message_body`] has no `html` or `plain`. Returns what
 /// [`Store::message_body`] returns afterwards.
 pub fn fetch_message_body(
@@ -357,6 +357,146 @@ pub fn fetch_message_bodies(
         .collect()
 }
 
+/// A read-only connection owned by the foreground body worker. It keeps
+/// both the login and the examined mailbox across requests.
+#[derive(Default)]
+pub struct ReaderBodyFetcher {
+    connection: crate::imap::BodyConnection,
+}
+
+impl ReaderBodyFetcher {
+    /// Open a connection without starting another embeddings indexer.
+    pub fn open_store(path: &std::path::Path) -> Result<Store> {
+        Store::open_for_part_fetch(path)
+    }
+
+    /// Check structure first, then fetch any missing bodies. `stored` runs
+    /// after each commit so the reader can show the new information while
+    /// the next command is still on the wire. Returns unresolved ids.
+    pub fn fetch(
+        &mut self,
+        config: &crate::AccountConfig,
+        store: &Store,
+        ids: &[MessageId],
+        cancel: &crate::CancelBodyFetch,
+        mut stored: impl FnMut(),
+    ) -> Result<Vec<MessageId>> {
+        use crate::{BodyState, ReaderParts};
+
+        let account = AccountId(config.id.clone());
+        let mut unknown = Vec::new();
+        let mut wanted = Vec::new();
+        for id in ids {
+            match store.reader_parts(&account, id.as_str())? {
+                ReaderParts::Unknown => unknown.extend(store.body_request(&account, id)?),
+                ReaderParts::Listed { .. } => wanted.extend(store.body_request(&account, id)?),
+                ReaderParts::Ready => {}
+            }
+        }
+
+        let mut failed = Vec::new();
+        if !unknown.is_empty() {
+            let (structures, missing) = self.structures(config, cancel, unknown)?;
+            if cancel.is_cancelled() {
+                return Err(crate::imap::body_fetch_cancelled());
+            }
+            if !structures.is_empty() {
+                store.store_structures(&account, &structures)?;
+                stored();
+            }
+            for (id, _, _) in structures {
+                if store.reader_parts(&account, id.as_str())? != ReaderParts::Ready {
+                    wanted.extend(store.body_request(&account, &id)?);
+                }
+            }
+            for request in missing {
+                // Sync may have filled the gap while the server answered.
+                if store.reader_parts(&account, request.message_id.as_str())?
+                    == ReaderParts::Unknown
+                {
+                    failed.push(request.message_id);
+                }
+            }
+        }
+
+        let states = store.body_states(
+            &account,
+            &wanted
+                .iter()
+                .map(|request| request.message_id.clone())
+                .collect::<Vec<_>>(),
+        )?;
+        let mut wanted: Vec<_> = wanted
+            .into_iter()
+            .zip(states)
+            .filter_map(|(request, state)| (state != BodyState::TooLarge).then_some(request))
+            .collect();
+        while !wanted.is_empty() {
+            let mut fetched = collect_bodies(&wanted, |copies| {
+                self.connection
+                    .bodies(|| config.imap_config(), cancel, copies)
+            })?;
+            if cancel.is_cancelled() {
+                return Err(crate::imap::body_fetch_cancelled());
+            }
+            if fetched.is_empty() {
+                failed.extend(wanted.into_iter().map(|request| request.message_id));
+                break;
+            }
+            wanted.retain(|request| !fetched.iter().any(|(id, _)| *id == request.message_id));
+            fetched.retain(|(id, parts)| {
+                if parts.is_none() {
+                    failed.push(id.clone());
+                }
+                parts.is_some()
+            });
+            if !fetched.is_empty() {
+                store.store_fetched_parts_with(&account, &fetched, true)?;
+                stored();
+            }
+        }
+        Ok(failed)
+    }
+
+    fn structures(
+        &mut self,
+        config: &crate::AccountConfig,
+        cancel: &crate::CancelBodyFetch,
+        mut waiting: Vec<BodyRequest>,
+    ) -> Result<(Vec<StoredStructure>, Vec<BodyRequest>)> {
+        let mut found = Vec::new();
+        let mut missing = Vec::new();
+        let mut round = 0;
+        while !waiting.is_empty() {
+            let copies: Vec<_> = waiting
+                .iter()
+                .map(|request| request.copies[round].clone())
+                .collect();
+            let mut answers: HashMap<_, _> = self
+                .connection
+                .structures(|| config.imap_config(), cancel, &copies)?
+                .into_iter()
+                .collect();
+            let mut next = Vec::new();
+            for request in waiting {
+                let copy = &request.copies[round];
+                if let Some(structure) = answers.remove(copy) {
+                    found.push((request.message_id, copy.clone(), structure));
+                } else if request.copies.len() > round + 1 {
+                    next.push(request);
+                } else {
+                    missing.push(request);
+                }
+            }
+            waiting = next;
+            round += 1;
+        }
+        Ok((found, missing))
+    }
+}
+
+type StoredStructure = (MessageId, RemoteId, crate::imap::BodyStructure);
+
 /// Fetch `wanted` and record what the server answered. Returns how many
 /// were recorded.
 ///
@@ -370,6 +510,15 @@ fn fetch_bodies(
     store: &Store,
     wanted: &[BodyRequest],
 ) -> Result<usize> {
+    let results = collect_bodies(wanted, |copies| backend.fetch_bodies(copies))?;
+    store.store_fetched_parts(account_id, &results)?;
+    Ok(results.len())
+}
+
+fn collect_bodies(
+    wanted: &[BodyRequest],
+    mut fetch: impl FnMut(&[RemoteId]) -> Result<Vec<crate::backend::FetchedBody>>,
+) -> Result<Vec<(MessageId, Option<MessageParts>)>> {
     let mut results: Vec<(MessageId, Option<MessageParts>)> = Vec::new();
     // Copy `round` of each message still waiting. Most are found in round 0.
     let mut waiting: Vec<&BodyRequest> = wanted.iter().collect();
@@ -382,8 +531,7 @@ fn fetch_bodies(
         if asks.is_empty() {
             break;
         }
-        let mut answers: std::collections::HashMap<RemoteId, Option<Vec<u8>>> = backend
-            .fetch_bodies(&asks)?
+        let mut answers: HashMap<RemoteId, Option<Vec<u8>>> = fetch(&asks)?
             .into_iter()
             .map(|answer| (answer.remote_id, answer.raw))
             .collect();
@@ -410,8 +558,7 @@ fn fetch_bodies(
         waiting = next;
         round += 1;
     }
-    store.store_fetched_parts(account_id, &results)?;
-    Ok(results.len())
+    Ok(results)
 }
 
 #[cfg(test)]
