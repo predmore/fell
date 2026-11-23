@@ -3,7 +3,7 @@
 //! a crash between APPEND and cleanup leaves at most two copies.
 use rusqlite::{Connection, OptionalExtension, params};
 
-use super::{OutboxEntry, enabled, generation, now_unix};
+use super::{OutboxEntry, Settled, enabled, generation, now_unix};
 use crate::{AccountId, FolderRole, MessageId, Result, Store};
 
 pub(super) fn ensure_schema(conn: &Connection) -> Result<()> {
@@ -58,12 +58,18 @@ pub(crate) fn save_status(
     let conn = store.connection();
     let (state, confirmed): (Option<String>, bool) = conn
         .prepare_cached(
-            "SELECT (SELECT CASE WHEN state = 'pending' AND placed_uid IS NOT NULL THEN 'placed'
-                                 WHEN state = 'pending' AND error != '' THEN 'retrying'
-                                  ELSE state END
-                    FROM server_outbox WHERE account_id = ?1 AND draft_id = ?2
-                    AND kind = 'append_draft' AND draft_digest = ?3 AND generation = ?4
-                    ORDER BY id DESC LIMIT 1),
+            "SELECT (SELECT CASE WHEN o.state = 'pending' AND o.placed_uid IS NOT NULL THEN 'placed'
+                                 WHEN o.state = 'pending' AND (o.error != '' OR
+                                    (SELECT (p.state = 'pending' AND p.sent AND p.placed_uid IS NULL)
+                                            OR (p.state = 'dropped' AND p.append_checks > 0)
+                                     FROM server_outbox p
+                                     WHERE p.account_id = o.account_id AND p.draft_id = o.draft_id
+                                       AND p.generation = o.generation AND p.kind = 'append_draft'
+                                       AND p.id < o.id ORDER BY p.id DESC LIMIT 1))
+                                 THEN 'retrying' ELSE o.state END
+                    FROM server_outbox o WHERE o.account_id = ?1 AND o.draft_id = ?2
+                    AND o.kind = 'append_draft' AND o.draft_digest = ?3 AND o.generation = ?4
+                    ORDER BY o.id DESC LIMIT 1),
                 EXISTS (SELECT 1 FROM server_draft_copies
                     WHERE account_id = ?1 AND draft_id = ?2 AND digest = ?3)",
         )?
@@ -115,7 +121,6 @@ pub(crate) fn queue(
     if !active {
         return Ok(false);
     }
-    let rearmed = rearm_recovery(&tx, account, draft)?;
     let latest: Option<Vec<u8>> = tx.query_row(
         "WITH cleanup AS (
              SELECT max(id) AS last_delete FROM server_outbox
@@ -131,7 +136,7 @@ pub(crate) fn queue(
         params![account.as_str(), draft],
         |row| row.get(0),
     )?;
-    if !rearmed && latest.as_deref() == Some(digest) {
+    if latest.as_deref() == Some(digest) {
         return Ok(false);
     }
     // Give the replacement its own row ID. A replay that already read the
@@ -168,57 +173,35 @@ fn insert_append(
     Ok(())
 }
 
-/// Give an unconfirmed APPEND a fresh bounded lookup on the next save or
-/// send. Its MIME was cleared when recovery stopped. Only the newer row is
-/// allowed to APPEND if the recovered UID range proves the earlier copy absent.
-fn rearm_recovery(conn: &Connection, account: &AccountId, draft: &str) -> Result<bool> {
-    Ok(conn.execute(
-        "UPDATE server_outbox SET state = 'pending', append_checks = 0,
-             retry_unix = 0, error = '', settled_unix = NULL
-         WHERE account_id = ?1 AND draft_id = ?2 AND generation = ?3
-           AND kind = 'append_draft' AND state = 'dropped' AND append_checks > 0",
-        params![account.as_str(), draft, generation(conn, account)?],
-    )? != 0)
-}
-
 /// If a newer revision is already queued, give the older transfer one last
-/// lookup with no payload. A second inconclusive result settles the waiting
-/// revision as failed too, since sending it could leave a duplicate.
+/// lookup with no payload. If that cannot confirm the old transfer, retire
+/// its row quietly and let the newer revision upload.
 pub(super) fn recover_for_waiting_save(
     conn: &Connection,
     account: &AccountId,
     entry: &OutboxEntry,
     (checks, limit): (u32, u32),
     error: &str,
-    now: i64,
-) -> Result<bool> {
-    let newer = "account_id = ?2 AND generation = ?3
-                 AND draft_id = (SELECT draft_id FROM server_outbox WHERE id = ?1)
-                 AND id > ?1 AND kind = 'append_draft' AND state = 'pending' AND NOT sent";
-    if checks < limit {
-        let waiting: bool = conn.query_row(
-            &format!("SELECT EXISTS (SELECT 1 FROM server_outbox WHERE {newer})"),
-            params![entry.id, account.as_str(), entry.generation],
-            |row| row.get(0),
-        )?;
-        if waiting {
-            conn.execute(
-                "UPDATE server_outbox SET append_checks = ?2, retry_unix = 0,
-                     append_mime = NULL, error = ?3 WHERE id = ?1",
-                params![entry.id, limit, error],
-            )?;
-            return Ok(true);
-        }
-    } else {
-        conn.execute(
-            &format!(
-                "UPDATE server_outbox SET state = 'dropped', append_mime = NULL,
-                          error = ?4, settled_unix = ?5 WHERE {newer}"
-            ),
-            params![entry.id, account.as_str(), entry.generation, error, now],
-        )?;
+) -> Result<Option<Settled>> {
+    let waiting: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM server_outbox WHERE account_id = ?2 AND generation = ?3
+             AND draft_id = (SELECT draft_id FROM server_outbox WHERE id = ?1)
+             AND id > ?1 AND kind = 'append_draft' AND state = 'pending' AND NOT sent)",
+        params![entry.id, account.as_str(), entry.generation],
+        |row| row.get(0),
+    )?;
+    if !waiting {
+        return Ok(None);
     }
-    Ok(false)
+    if checks >= limit {
+        return Ok(Some(Settled::Retired));
+    }
+    conn.execute(
+        "UPDATE server_outbox SET append_checks = ?2, retry_unix = 0,
+             append_mime = NULL, error = ?3 WHERE id = ?1",
+        params![entry.id, limit, error],
+    )?;
+    Ok(Some(Settled::Recovering))
 }
 
 pub(crate) fn cancel_unsent(conn: &Connection, account: &AccountId, draft: &str) -> Result<()> {
@@ -375,7 +358,6 @@ fn queue_delete_for(
         return Ok(());
     }
     cancel_unsent(conn, account, draft)?;
-    rearm_recovery(conn, account, draft)?;
     conn.execute(
         "INSERT INTO server_outbox (account_id, kind, state, message_id, source_folder,
              target_folder, generation, created_unix, draft_id, action_id)
@@ -402,6 +384,7 @@ pub(crate) struct Pending {
     pub current_message_id: Option<String>,
     pub placed: Option<Copy>,
     pub can_append: bool,
+    pub supersedes_uncertain: bool,
 }
 
 pub(crate) fn pending(store: &Store, entry: &OutboxEntry) -> Result<Option<Pending>> {
@@ -415,21 +398,31 @@ pub(crate) fn pending(store: &Store, entry: &OutboxEntry) -> Result<Option<Pendi
                     WHERE p.account_id = o.account_id AND p.draft_id = o.draft_id
                       AND p.kind = 'append_draft' AND p.target_mailbox = c.mailbox
                       AND p.placed_uidvalidity = c.uidvalidity AND p.placed_uid = c.uid
-                    ORDER BY p.id DESC LIMIT 1))
+                    ORDER BY p.id DESC LIMIT 1)),
+                coalesce((SELECT p.state = 'dropped' AND p.append_checks > 0
+                    FROM server_outbox p
+                    WHERE p.account_id = o.account_id AND p.draft_id = o.draft_id
+                      AND p.generation = o.generation AND p.kind = 'append_draft'
+                      AND p.id < o.id ORDER BY p.id DESC LIMIT 1), 0)
          FROM server_outbox o JOIN write_back_accounts a USING (account_id)
          LEFT JOIN server_draft_copies c ON c.account_id = o.account_id AND c.draft_id = o.draft_id
          WHERE o.id = ?1 AND a.enabled AND o.generation = a.generation AND o.state = 'pending'
            AND NOT EXISTS (SELECT 1 FROM server_outbox t WHERE t.account_id = o.account_id
                AND t.draft_id = o.draft_id AND t.generation = o.generation AND t.id < o.id
-               AND (t.state = 'pending' OR
-                    (o.kind = 'append_draft' AND t.state = 'dropped' AND t.append_checks > 0)))",
+               AND t.state = 'pending')",
         [entry.id],
         |row| {
             let copy = |offset| -> rusqlite::Result<Option<Copy>> {
                 let Some(uid) = row.get(offset + 2)? else { return Ok(None) };
                 Ok(Some(Copy { mailbox: row.get(offset)?, validity: row.get(offset + 1)?, uid }))
             };
-            Ok(Pending { current: copy(0)?, current_message_id: row.get(7)?, placed: copy(3)?, can_append: row.get(6)? })
+            Ok(Pending {
+                current: copy(0)?,
+                current_message_id: row.get(7)?,
+                placed: copy(3)?,
+                can_append: row.get(6)?,
+                supersedes_uncertain: row.get(8)?,
+            })
         },
     ).optional()?)
 }

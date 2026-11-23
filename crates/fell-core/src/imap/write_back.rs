@@ -301,8 +301,11 @@ impl Pass<'_> {
             Ok(changed) => {
                 if changed {
                     self.report.sent += 1;
-                    self.report.draft_append_recovered |=
-                        entry.kind == OutboxKind::AppendDraft && !entry.error.is_empty();
+                    self.report.draft_append_recovered |= entry.kind == OutboxKind::AppendDraft
+                        && (!entry.error.is_empty()
+                            || draft
+                                .as_ref()
+                                .is_some_and(|draft| draft.supersedes_uncertain));
                     self.settled[index] = true;
                 }
                 Ok(())
@@ -757,6 +760,7 @@ impl Pass<'_> {
                         self.note_drop(index, DropReason::UnconfirmedAppend);
                         self.settled[index] = true;
                     }
+                    Settled::Retired => self.settled[index] = true,
                     _ => {}
                 }
                 return Ok(());

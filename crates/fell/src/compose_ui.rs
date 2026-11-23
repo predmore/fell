@@ -2084,7 +2084,10 @@ impl Render for ComposeView {
                 });
                 return Some((status, opacity));
             }
-            if status.warning().is_some() || !motion.enabled() {
+            if status.warning().is_some() {
+                return Some((DraftSaveStatus::ServerRetrying, 1.));
+            }
+            if !motion.enabled() {
                 return None;
             }
             let exit = save_exit.get_or_insert_with(|| Transition::new(now, motion::FADE));

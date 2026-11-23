@@ -1346,9 +1346,13 @@ pub(crate) fn settle(
             draft_cleanup,
             draft_lookup,
         } => {
-            if let Some(lookup) = draft_lookup
-                && drafts::recover_for_waiting_save(&tx, account_id, entry, lookup, error, now)?
-            {
+            let settled = match draft_lookup {
+                Some(lookup) => {
+                    drafts::recover_for_waiting_save(&tx, account_id, entry, lookup, error)?
+                }
+                None => None,
+            };
+            if settled == Some(Settled::Recovering) {
                 tx.commit()?;
                 return Ok(Settled::Recovering);
             }
@@ -1363,7 +1367,7 @@ pub(crate) fn settle(
                 params![entry.id, error, now, draft_cleanup],
             )?;
             tx.commit()?;
-            return Ok(Settled::Recorded);
+            return Ok(settled.unwrap_or(Settled::Recorded));
         }
     };
     let (source_mailbox, uidvalidity, uid) =

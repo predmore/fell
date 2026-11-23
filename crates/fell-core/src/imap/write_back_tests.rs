@@ -3634,38 +3634,64 @@ fn server_draft_write_back_off_and_cleanup_without_uidplus() {
 }
 
 #[test]
-fn server_draft_new_save_checks_an_unconfirmed_copy_before_replacing_it() {
+fn server_draft_edit_uploads_after_lookup_exhaustion_even_when_search_is_refused() {
+    use crate::compose::{DraftSaveStatus, SaveReceipt};
     let dir = tempfile::tempdir().unwrap();
     let fx = draft_fixture(Store::open(dir.path().join("mail.db")).unwrap());
     let hub = draft_hub(&dir.path().join("drafts"), &fx);
-    let queue = |body: &str| {
-        hub.show("draft-test");
-        hub.note_shown("draft-test");
-        set_draft_body(&hub, body.into());
-        hub.note_hidden("draft-test");
-        wait_for_draft(&hub);
+    let status = || {
+        let Some(SaveReceipt::Server(digest)) = hub
+            .with_session("draft-test", |session| session.save_receipt())
+            .flatten()
+        else {
+            panic!("missing save receipt");
+        };
+        fx.store
+            .server_draft_save_status(&fx.account.id, "draft-test", &digest)
+            .unwrap()
     };
-    queue("Original");
+    queue_draft_body(&hub, "Original");
     assert_eq!(fx.replay().sent, 1);
-    queue("Unconfirmed");
+    queue_draft_body(&hub, "Unconfirmed");
     {
         let mut writes = fx.server.writes.lock().unwrap();
         writes.lose_reply_to = Some("APPEND");
         writes.refuse_search = true;
     }
     assert!(fx.replay().interrupted.is_some());
-    queue("Already queued before recovery stopped");
     for _ in 0..super::write_back::MAX_APPEND_CHECKS {
         fx.make_due();
         assert_eq!(fx.replay().sent, 0);
     }
+    assert_eq!(status(), Some(DraftSaveStatus::ServerFailed));
     assert_eq!(draft_appends(&fx), 2);
     assert_eq!(fx.on_server(SERVER_DRAFTS).len(), 2);
-    fx.server.writes.lock().unwrap().refuse_search = false;
-    queue("Next authorized save");
-    assert_eq!(fx.replay().sent, 2);
+    assert!(hub.show("draft-test"));
+    hub.note_shown("draft-test");
+    set_draft_body(&hub, "Edit after the lookup failed".into());
+    hub.poll_server_draft("draft-test", 0);
+    hub.poll_server_draft("draft-test", 6_000);
+    wait_for_draft(&hub);
+    assert_eq!(status(), Some(DraftSaveStatus::ServerRetrying));
+    let report = fx.replay();
+    assert_eq!(report.sent, 1);
+    assert!(report.draft_append_recovered);
+    assert_eq!(status(), Some(DraftSaveStatus::Server));
     assert_eq!(draft_appends(&fx), 3);
-    assert_eq!(fx.on_server(SERVER_DRAFTS), [(3, "Weekly notes".into())]);
+    assert_eq!(
+        fx.on_server(SERVER_DRAFTS),
+        [(2, "Weekly notes".into()), (3, "Weekly notes".into())]
+    );
+    let state = fx.server.state.lock().unwrap();
+    let latest = state.mailboxes[1]
+        .messages
+        .iter()
+        .find(|message| message.uid == 3)
+        .unwrap();
+    assert!(String::from_utf8_lossy(&latest.raw).contains("Edit after the lookup failed"));
+    drop(state);
+    fx.sync();
+    assert!(fx.subjects(SERVER_DRAFTS).is_empty());
 }
 
 #[test]
@@ -4420,6 +4446,7 @@ fn server_draft_confirmed_upload_stays_saved_when_previous_copy_cleanup_fails() 
 
 #[test]
 fn server_draft_waiting_revision_gets_one_final_lookup_without_another_edit() {
+    use crate::compose::{DraftSaveStatus, SaveReceipt};
     for recover in [true, false] {
         let dir = tempfile::tempdir().unwrap();
         let fx = draft_fixture(Store::open(dir.path().join("mail.db")).unwrap());
@@ -4432,12 +4459,25 @@ fn server_draft_waiting_revision_gets_one_final_lookup_without_another_edit() {
         }
         assert!(fx.replay().interrupted.is_some());
         queue_draft_body(&hub, "Waiting");
+        let Some(SaveReceipt::Server(digest)) = hub
+            .with_session("draft-test", |session| session.save_receipt())
+            .flatten()
+        else {
+            panic!("missing save receipt");
+        };
+        let status = || {
+            fx.store
+                .server_draft_save_status(&fx.account.id, "draft-test", &digest)
+                .unwrap()
+        };
+        assert_eq!(status(), Some(DraftSaveStatus::ServerRetrying));
         for _ in 0..super::write_back::MAX_APPEND_CHECKS {
             fx.make_due();
             let report = fx.replay();
             assert!(report.dropped.is_empty());
             assert_eq!(report.sent, 0);
         }
+        assert_eq!(status(), Some(DraftSaveStatus::ServerRetrying));
         fx.server.writes.lock().unwrap().refuse_search = !recover;
         let report = fx.replay();
         if recover {
@@ -4445,11 +4485,27 @@ fn server_draft_waiting_revision_gets_one_final_lookup_without_another_edit() {
             assert_eq!(draft_appends(&fx), 2);
             assert_eq!(fx.on_server(SERVER_DRAFTS), [(2, "Weekly notes".into())]);
         } else {
-            assert_eq!(report.dropped.len(), 1);
-            assert_eq!(draft_appends(&fx), 1);
-            assert_eq!(fx.replay().waiting, 0);
-            assert_eq!(fx.on_server(SERVER_DRAFTS), [(1, "Weekly notes".into())]);
+            assert_eq!(report.sent, 1);
+            assert_eq!(
+                fx.on_server(SERVER_DRAFTS),
+                [(1, "Weekly notes".into()), (2, "Weekly notes".into())]
+            );
         }
+        assert!(report.dropped.is_empty());
+        assert_eq!(report.waiting, 0);
+        assert!(report.draft_append_recovered);
+        assert_eq!(draft_appends(&fx), 2);
+        assert_eq!(status(), Some(DraftSaveStatus::Server));
+        let state = fx.server.state.lock().unwrap();
+        let latest = state.mailboxes[1]
+            .messages
+            .iter()
+            .find(|message| message.uid == 2)
+            .unwrap();
+        assert!(String::from_utf8_lossy(&latest.raw).contains("Waiting"));
+        drop(state);
+        fx.sync();
+        assert!(fx.subjects(SERVER_DRAFTS).is_empty());
     }
 }
 
