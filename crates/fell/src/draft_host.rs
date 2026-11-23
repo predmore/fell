@@ -220,7 +220,7 @@ impl DraftHome {
         &self,
         hub: &DraftHub,
         account: &AccountId,
-        thread: &fell_core::ThreadId,
+        source: &fell_core::RemoteId,
     ) -> Result<String, fell_core::Error> {
         let config = crate::mailbox::send_account_config(account)
             .map_err(|_| fell_core::Error::Action("The account is unavailable".into()))?
@@ -228,7 +228,7 @@ impl DraftHome {
                 fell_core::Error::Action("There is no server draft in the demo mailbox".into())
             })?;
         let store = fell_core::Store::open(&self.store)?;
-        let id = config.import_server_draft(&store, thread, &new_draft_id())?;
+        let id = config.import_server_draft_copy(&store, source, &new_draft_id())?;
         self.open(hub, &id, account)
             .map_err(fell_core::Error::Action)?;
         Ok(id)

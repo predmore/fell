@@ -38,6 +38,8 @@ pub struct ThreadRow {
     /// The compose draft this row stands for, in the drafts list. `None`
     /// for a thread.
     pub draft: Option<String>,
+    /// The exact server copy used to build a synced Drafts preview.
+    pub server_draft: Option<fell_core::RemoteId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -475,6 +477,7 @@ pub fn thread_rows(threads: &[FolderThread], me: &str) -> Vec<ThreadRow> {
             warn: false,
             unread: thread.unread,
             draft: None,
+            server_draft: None,
         })
         .collect()
 }
@@ -540,6 +543,7 @@ pub fn draft_rows(drafts: &[DraftSummary]) -> Vec<ThreadRow> {
                 warn: draft.maybe_sent,
                 unread: false,
                 draft: Some(draft.id.clone()),
+                server_draft: None,
             }
         })
         .collect()
@@ -737,6 +741,7 @@ pub fn address_draft_rows(
         let Some(draft) = drafts.get(&fell_core::ThreadId(row.id.clone())) else {
             continue;
         };
+        row.server_draft.clone_from(&draft.source);
         row.subject = if draft.subject.trim().is_empty() {
             "(no subject)".into()
         } else {
@@ -1886,6 +1891,7 @@ mod tests {
             warn: false,
             unread: true,
             draft: None,
+            server_draft: None,
         }];
         let mut untouched = rows[0].clone();
         untouched.id = "t2".into();
@@ -1894,6 +1900,7 @@ mod tests {
         previews.insert(
             ThreadId("t1".into()),
             fell_core::SyncedDraftPreview {
+                source: None,
                 recipients: vec![
                     Address {
                         name: Some("Ada Lovelace".into()),

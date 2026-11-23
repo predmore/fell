@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use fell_core::compose::{
-    BlockBody, DraftHub, DraftSaveStatus, HunkKind, SERVER_DRAFT_SAVE_FAILED, SaveReceipt,
-    SendLock, Snapshot, StyleKind, StyleSpan, StyledDoc, html_to_doc, line_styles, markdown_to_doc,
+    BlockBody, DraftHub, DraftSaveStatus, HunkKind, SaveReceipt, SendLock, Snapshot, StyleKind,
+    StyleSpan, StyledDoc, html_to_doc, line_styles, markdown_to_doc,
 };
 use fell_core::{AccountId, MailBackend};
 use gpui::{
@@ -308,7 +308,7 @@ pub struct ComposeView {
     flush_gen: u64,
     draft_save: Option<(u64, DraftSaveStatus, Option<Transition>)>,
     draft_save_exit: Option<Transition>,
-    announced_paint: Option<SharedString>,
+    announced_shown: Option<SharedString>,
     motion: Motion,
     /// `:q` asked to close this window. The next frame removes it.
     closing: bool,
@@ -392,8 +392,13 @@ impl ComposeView {
         })
         .detach();
         // A closed window no longer counts as showing its draft.
-        cx.on_release(|this: &mut Self, _| this.hub.note_hidden(this.draft_id.as_ref()))
-            .detach();
+        cx.on_release(|this: &mut Self, cx| {
+            this.hub.note_hidden(this.draft_id.as_ref());
+            if !this.closing {
+                crate::view::compose_draft_closing(this.draft_id.as_ref(), cx);
+            }
+        })
+        .detach();
         let mut view = Self {
             hub,
             draft_id: draft_id.into(),
@@ -426,7 +431,7 @@ impl ComposeView {
             flush_gen: 0,
             draft_save: None,
             draft_save_exit: None,
-            announced_paint: None,
+            announced_shown: None,
             motion: Motion::from_env(),
             closing: false,
             discarding: false,
@@ -512,7 +517,7 @@ impl ComposeView {
                                 ))
                             })??;
                         if this.draft_save.is_some_and(|(saved, status, _)| {
-                            saved == revision && status != DraftSaveStatus::ServerFailed
+                            saved == revision && status.warning().is_none()
                         }) {
                             return None;
                         }
@@ -1517,7 +1522,12 @@ impl ComposeView {
                 self.closing = true;
                 // From now on a request_send must wait for a new window.
                 self.hub.note_hidden(self.draft_id.as_ref());
+                crate::view::compose_draft_closing(self.draft_id.as_ref(), cx);
                 cx.notify();
+            }
+            "diagnostic log" => {
+                self.status = "".into();
+                crate::view::open_compose_diagnostic_log(cx);
             }
             _ => {}
         }
@@ -1595,7 +1605,11 @@ impl ComposeView {
                 self.status = "agent: k keep · x reject".into();
                 return;
             }
-            "d" | "s" | "p" | "r" | "q" | "t" | "k" | "x" => {}
+            "?" => {
+                self.status = "help: l diagnostic log".into();
+                return;
+            }
+            "d" | "s" | "p" | "r" | "q" | "t" | "k" | "x" | "l" => {}
             "escape" => {
                 self.leader = false;
                 self.which_visible = false;
@@ -1624,6 +1638,8 @@ impl ComposeView {
                 "x" => "reject",
                 _ => "",
             }
+        } else if status.starts_with("help:") && key == "l" {
+            "diagnostic log"
         } else {
             ""
         };
@@ -2028,8 +2044,12 @@ impl Render for ComposeView {
             (Some(SendLock::MaybeSent), false) => "unlock · q close",
             (Some(_), _) => "q close",
             (None, true) if attempt.is_some() => "details · dismiss · send · q close",
-            (None, true) => "details · send · preview · raw · quote · theme · keep · reject · undo",
-            (None, false) => "send · preview · raw · quote · theme · keep · reject · undo",
+            (None, true) => {
+                "details · send · preview · raw · quote · theme · keep · reject · undo · diagnostic log"
+            }
+            (None, false) => {
+                "send · preview · raw · quote · theme · keep · reject · undo · diagnostic log"
+            }
         };
         let mode = match self.editor.mode {
             // A locked draft has no editing mode.
@@ -2064,7 +2084,7 @@ impl Render for ComposeView {
                 });
                 return Some((status, opacity));
             }
-            if status == DraftSaveStatus::ServerFailed || !motion.enabled() {
+            if status.warning().is_some() || !motion.enabled() {
                 return None;
             }
             let exit = save_exit.get_or_insert_with(|| Transition::new(now, motion::FADE));
@@ -2074,12 +2094,10 @@ impl Render for ComposeView {
             }
             None
         });
-        if !self.closing && self.announced_paint.as_ref() != Some(&self.draft_id) {
+        if !self.closing && self.announced_shown.as_ref() != Some(&self.draft_id) {
             let draft = self.draft_id.clone();
-            self.announced_paint = Some(draft.clone());
-            window.on_next_frame(move |window, _| {
-                window.on_next_frame(move |_, cx| crate::view::compose_draft_painted(&draft, cx));
-            });
+            self.announced_shown = Some(draft.clone());
+            window.on_next_frame(move |_, cx| crate::view::compose_draft_shown(&draft, cx));
         }
         let mono = self
             .look
@@ -2170,6 +2188,9 @@ impl Render for ComposeView {
                     &|text, size| {
                         text_px(window, text, size, mono.as_deref().unwrap_or(&ui_family))
                     },
+                    (&ui_family, &|text, size| {
+                        text_px(window, text, size, &ui_family)
+                    }),
                 )
                 .flex_shrink_0()
                 .when_some(mono, |bar, family| bar.font_family(family))
@@ -4834,7 +4855,11 @@ fn render_doc(doc: &StyledDoc, folder: &Path, paint: Paint, colors: Palette) -> 
     for block in &doc.blocks {
         let mut painted = render_block(block, folder, paint, colors);
         if previous.is_some() && !joins_previous(previous, Some(&block.body)) {
-            painted = painted.mt_2();
+            painted = if matches!(block.body, BlockBody::Heading { .. }) {
+                painted.mt_4()
+            } else {
+                painted.mt_2()
+            };
         }
         previous = Some(&block.body);
         column = column.child(painted);
@@ -5560,13 +5585,16 @@ struct ComposeStatus<'a> {
 /// the right, `key action` pairs separated by ` · `, in the mono face.
 /// `measure` gives a text's width at a size, in the bar's face, so a long
 /// message is cut at a word with `…` and keeps 16px clear of the right.
+type StatusMeasure<'a> = &'a dyn Fn(&str, f32) -> f32;
+
 fn status_bar(
     status: ComposeStatus<'_>,
     snap: &Snapshot,
     send_tried: bool,
     colors: Palette,
     width: f32,
-    measure: &dyn Fn(&str, f32) -> f32,
+    measure: StatusMeasure<'_>,
+    (warning_font, measure_warning): (&str, StatusMeasure<'_>),
 ) -> gpui::Div {
     let wide = width > 640.;
     let size = if wide { 14. } else { 13. };
@@ -5596,8 +5624,7 @@ fn status_bar(
         1 => Some("1 first-time recipient".to_string()),
         count => Some(format!("{count} first-time recipients")),
     };
-    let right = if saved.is_some_and(|(status, _)| status == DraftSaveStatus::ServerFailed) && !wide
-    {
+    let right = if saved.is_some_and(|(status, _)| status.warning().is_some()) && !wide {
         Vec::new()
     } else {
         status_right(snap, note, send_tried, wide)
@@ -5621,13 +5648,13 @@ fn status_bar(
     let (message, color, opacity) = match saved {
         Some((DraftSaveStatus::Local, alpha)) => ("saved", colors.dim, alpha),
         Some((DraftSaveStatus::Server, alpha)) => ("saved to Drafts", colors.dim, alpha),
-        Some((DraftSaveStatus::ServerFailed, alpha)) => {
-            (SERVER_DRAFT_SAVE_FAILED, colors.error, alpha)
-        }
+        Some((status, alpha)) => (status.warning().unwrap_or_default(), colors.error, alpha),
         None if idle => ("", colors.fg, 1.),
         None => (note, colors.fg, 1.),
     };
-    let message = fit_words(message, room, &|text| measure(text, size));
+    let warning = saved.is_some_and(|(status, _)| status.warning().is_some());
+    let message_measure = if warning { measure_warning } else { measure };
+    let message = fit_words(message, room, &|text| message_measure(text, size));
     let dot = || div().text_color(rgb(colors.dim)).child("·");
     let mut left = div()
         .flex()
@@ -5653,6 +5680,9 @@ fn status_bar(
                 .whitespace_nowrap()
                 .overflow_hidden()
                 .text_color(rgb(color))
+                .when(warning, |message| {
+                    message.font_family(warning_font.to_owned())
+                })
                 .opacity(opacity)
                 .child(message),
         );
@@ -5861,6 +5891,8 @@ fn which_key(colors: Palette) -> gpui::Div {
         )
         .child("space a  agent edit")
         .child(div().text_color(rgb(colors.dim)).child("k keep   x reject"))
+        .child("space ?  help")
+        .child(div().text_color(rgb(colors.dim)).child("l diagnostic log"))
 }
 
 const DISCARD_DRAFT_LABEL: &str = "Discard draft";
@@ -6331,6 +6363,7 @@ fn palette_action(query: &str) -> Option<&'static str> {
         "complete recipient" | "complete" => return Some("complete recipient"),
         "details" => return Some("details"),
         "dismiss" => return Some("dismiss"),
+        "diagnostic log" | "open diagnostic log" => return Some("diagnostic log"),
         _ => {}
     }
     let mut found = None;

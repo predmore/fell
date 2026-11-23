@@ -561,7 +561,7 @@ impl AccountConfig {
         ))
     }
 
-    /// Import the newest copy from this thread in the listed Drafts mailbox.
+    /// Import the same Drafts copy that the list would preview for this thread.
     /// The remote UID stays attached to the resulting local compose draft.
     pub fn import_server_draft(
         &self,
@@ -570,16 +570,31 @@ impl AccountConfig {
         draft_id: &str,
     ) -> Result<String> {
         let account = self.account();
-        let copy = store
-            .server_draft_source(&account.id, thread)?
+        let roles = store.folder_roles(&account.id)?;
+        let folder = roles
+            .get(FolderRole::Drafts)
             .ok_or(crate::Error::DraftNoLongerInFolder)?;
-        let remote = crate::RemoteId(format!(
-            "imap:{}:{}:{}",
-            copy.validity,
-            copy.uid,
-            crate::imap::escape_mailbox(&copy.mailbox)
-        ));
-        let raw = crate::imap::part_fetch::fetch_draft(&self.imap_config()?, &remote)?
+        let source = store
+            .synced_draft_previews(&account.id, &folder.name, std::slice::from_ref(thread))?
+            .remove(thread)
+            .and_then(|preview| preview.source)
+            .ok_or(crate::Error::DraftNoLongerInFolder)?;
+        self.import_server_draft_copy(store, &source, draft_id)
+    }
+
+    /// Import the exact UID from the displayed Drafts preview, if it is still
+    /// in the listed Drafts mailbox.
+    pub fn import_server_draft_copy(
+        &self,
+        store: &crate::Store,
+        source: &crate::RemoteId,
+        draft_id: &str,
+    ) -> Result<String> {
+        let account = self.account();
+        let copy = store
+            .server_draft_source(&account.id, source)?
+            .ok_or(crate::Error::DraftNoLongerInFolder)?;
+        let raw = crate::imap::part_fetch::fetch_draft(&self.imap_config()?, source)?
             .ok_or(crate::Error::DraftUnavailable)?;
         let draft = crate::imap::rfc822::parse_draft(&account, draft_id, &raw)?;
         let message_id = crate::imap::rfc822::draft_message_id(&raw);

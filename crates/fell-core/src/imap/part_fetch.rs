@@ -132,10 +132,13 @@ fn fetch_windows(
         return Err(too_large());
     }
     let window = window();
+    let draft_limit = section.is_empty().then_some(crate::MAX_MESSAGE_BYTES);
     let mut out: Vec<u8> = Vec::new();
     loop {
         let offset = out.len();
-        let Some(reply) = session.uid_fetch_part(uid, section, offset, window)? else {
+        let budget = draft_limit.map(|limit| limit - offset);
+        let requested = budget.map_or(window, |left| window.min(left + 1));
+        let Some(reply) = session.uid_fetch_part(uid, section, offset, requested, budget)? else {
             if out.is_empty() {
                 return Ok(None);
             }
@@ -145,7 +148,7 @@ fn fetch_windows(
         };
         let done = match reply.origin {
             Some(origin) if origin == offset => {
-                let short = reply.bytes.len() < window;
+                let short = reply.bytes.len() < requested;
                 out.extend_from_slice(&reply.bytes);
                 short
             }

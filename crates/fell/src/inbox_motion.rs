@@ -966,7 +966,7 @@ impl InboxMotion {
                 // Narrow layouts share one cell. Finish the old text before
                 // the next can rise into it, and keep sync out of the handoff.
                 self.toast_out = start(STATUS_SWAP_OUT).map(|fade| (old, fade));
-                self.toast_in = self.motion.start(motion::QUICK, now + STATUS_SWAP_OUT);
+                self.toast_in = self.motion.start(motion::FADE, now + STATUS_SWAP_OUT);
             }
             (Some(_), Some(_)) => {
                 // Repeating the same notice keeps it visible.
@@ -1776,7 +1776,7 @@ mod tests {
             session.show_toast("Undone", false);
             motion.observe(&session, (true, true), swap);
 
-            for ms in [0, 17, 33, 59, 60, 61, 77, 139, 140, 300] {
+            for ms in [0, 17, 33, 59, 60, 61, 77, 179, 180, 300] {
                 let status = motion.status(&session, later(swap, ms));
                 let (incoming, opacity) = status.notice.unwrap();
                 assert_eq!(incoming.text, "Undone");
@@ -1786,10 +1786,10 @@ mod tests {
                 });
                 assert_eq!(leaving > 0.0, ms < 60, "{ms} ms");
                 assert_eq!(opacity > 0.0, ms > 60, "{ms} ms");
-                assert_eq!(opacity == 1.0, ms >= 140, "{ms} ms");
+                assert_eq!(opacity == 1.0, ms >= 180, "{ms} ms");
                 assert_eq!(status.sync, 0.0, "{ms} ms");
                 assert_eq!(status.notice_dy == motion::NOTICE_RISE_PX, ms <= 60);
-                assert_eq!(status.notice_dy == 0.0, ms >= 140);
+                assert_eq!(status.notice_dy == 0.0, ms >= 180);
             }
         }
     }
@@ -1816,7 +1816,7 @@ mod tests {
         assert_eq!(arriving.leaving.unwrap().1, 0.0);
         assert!((0.0..1.0).contains(&arriving.notice.unwrap().1));
         assert_eq!(
-            notice_opacity(&motion, &session, later(swap, 140)),
+            notice_opacity(&motion, &session, later(swap, 180)),
             Some(1.0)
         );
     }
@@ -1841,7 +1841,7 @@ mod tests {
         assert!(!notice.alert);
         assert!((0.0..1.0).contains(&opacity));
         assert_eq!(
-            notice_opacity(&motion, &session, later(swapped, 140)),
+            notice_opacity(&motion, &session, later(swapped, 180)),
             Some(1.0)
         );
     }
@@ -1914,7 +1914,7 @@ mod tests {
         assert_eq!(incoming.leaving.unwrap().1, 0.0);
         assert!((0.0..1.0).contains(&incoming.notice.unwrap().1));
         assert_eq!(
-            notice_opacity(&motion, &session, later(shown, 140)),
+            notice_opacity(&motion, &session, later(shown, 180)),
             Some(1.0)
         );
     }

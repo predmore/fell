@@ -200,25 +200,23 @@ pub(crate) fn compose_draft_shown(id: &str, cx: &mut App) {
     if let Some(inbox) = cx.try_global::<InboxWindow>().copied() {
         inbox.update(cx, |inbox, cx| {
             if inbox
-                .closed_draft_save
+                .opening_draft
                 .as_ref()
-                .is_some_and(|save| save.draft() == id)
+                .and_then(|open| open.ready.as_deref())
+                == Some(id)
             {
-                inbox.closed_draft_save = None;
-            }
-            if let Some(open) = &mut inbox.opening_draft
-                && open.ready.as_deref() == Some(id)
-            {
-                open.shown = true;
-                cx.notify();
+                inbox.finish_server_draft_open(Some(id), cx);
             }
         });
     }
 }
 
-pub(crate) fn compose_draft_painted(id: &str, cx: &mut App) {
+pub(crate) fn compose_draft_closing(id: &str, cx: &mut App) {
     if let Some(inbox) = cx.try_global::<InboxWindow>().copied() {
         inbox.update(cx, |inbox, cx| {
+            if !inbox.session.in_drafts() {
+                return;
+            }
             if inbox
                 .opening_draft
                 .as_ref()
@@ -227,6 +225,15 @@ pub(crate) fn compose_draft_painted(id: &str, cx: &mut App) {
             {
                 inbox.finish_server_draft_open(Some(id), cx);
             }
+            inbox.refresh_closing_draft(id, cx);
+        });
+    }
+}
+
+pub(crate) fn open_compose_diagnostic_log(cx: &mut App) {
+    if let Some(inbox) = cx.try_global::<InboxWindow>().copied() {
+        inbox.update(cx, |inbox, cx| {
+            inbox.open_diagnostic(fell_core::diagnostics::DiagnosticFile::Log, cx);
         });
     }
 }
@@ -334,7 +341,6 @@ struct OpeningServerDraft {
     thread: ThreadId,
     started: Instant,
     ready: Option<String>,
-    shown: bool,
 }
 
 const DRAFT_OPEN_FEEDBACK: Duration = Duration::from_millis(300);
@@ -584,6 +590,7 @@ fn not_sent_detail(session: &Session, write: &DroppedWrite, count: usize) -> Str
         DropReason::NoMove => "This server can't move mail; archive stays in Fell".to_string(),
         DropReason::Abandoned => format!("{messages} left half moved in {folder} on the server"),
         DropReason::UnconfirmedAppend => "Sent · server copy unconfirmed".to_string(),
+        DropReason::DraftCleanup => "An older draft copy remains on the server".to_string(),
     }
 }
 
@@ -748,7 +755,6 @@ struct Inbox {
     /// Where `c` keeps a new draft. `None` when the mailbox did not open.
     draft_home: Option<DraftHome>,
     opening_draft: Option<OpeningServerDraft>,
-    closed_draft_save: Option<fell_core::compose::ClosedDraftSave>,
     /// The compose drafts at the top of the Drafts list, as last read.
     drafts: Vec<DraftSummary>,
     /// Transitions running in this window. See [`crate::motion`].
@@ -953,7 +959,6 @@ impl Inbox {
             conv_gen: Arc::new(AtomicU64::new(0)),
             draft_home,
             opening_draft: None,
-            closed_draft_save: None,
             drafts: Vec::new(),
             motion: InboxMotion::new(motion),
             frame_now: Instant::now(),
@@ -1212,15 +1217,18 @@ impl Inbox {
                                 mut dropped,
                                 flag_recovery_delayed,
                                 sent_append_delayed,
+                                draft_append_delayed,
+                                draft_append_recovered,
                             } => {
                                 let sent_failed = dropped
                                     .iter()
                                     .any(|write| write.kind == OutboxKind::AppendSent);
+                                let cleanup_failed = dropped
+                                    .iter()
+                                    .any(|write| write.reason == DropReason::DraftCleanup);
                                 let draft_failed = dropped.iter().any(|write| {
-                                    matches!(
-                                        write.kind,
-                                        OutboxKind::AppendDraft | OutboxKind::DeleteDraft
-                                    )
+                                    write.kind == OutboxKind::AppendDraft
+                                        && write.reason != DropReason::DraftCleanup
                                 });
                                 dropped.retain(|write| {
                                     !matches!(
@@ -1238,6 +1246,9 @@ impl Inbox {
                                 if sent_failed {
                                     lines.push("Sent · server copy unconfirmed".to_string());
                                 }
+                                if cleanup_failed {
+                                    lines.push("An older draft copy may still be in Drafts".into());
+                                }
                                 if !dropped.is_empty() || flag_recovery_delayed {
                                     lines.push(write_back_notice(
                                         &inbox.session,
@@ -1245,8 +1256,17 @@ impl Inbox {
                                         flag_recovery_delayed,
                                     ));
                                 }
-                                if draft_failed {
-                                    inbox.show_draft_write_failure(lines, cx);
+                                let draft_status = if draft_failed {
+                                    Some(fell_core::compose::DraftSaveStatus::ServerFailed)
+                                } else if draft_append_delayed {
+                                    Some(fell_core::compose::DraftSaveStatus::ServerRetrying)
+                                } else if draft_append_recovered {
+                                    Some(fell_core::compose::DraftSaveStatus::Server)
+                                } else {
+                                    None
+                                };
+                                if let Some(status) = draft_status {
+                                    inbox.apply_draft_write_notice(status, lines, cx);
                                     return;
                                 }
                                 if !lines.is_empty() {
@@ -2305,10 +2325,17 @@ impl Inbox {
                 })
                 .unwrap_or_default();
             let same = self.open_thread.as_deref() == Some(id.as_str());
-            self.invalidate_conversation_layout();
             if same {
-                self.session.refresh_messages(shown, true);
+                if present::same_messages(&self.session.messages, &shown) {
+                    if self.session.messages != shown {
+                        let generation = self.conv_gen.fetch_add(1, Ordering::SeqCst) + 1;
+                        self.queue_conversation_refresh(shown, generation);
+                    }
+                } else {
+                    self.session.refresh_messages(shown, true);
+                }
             } else {
+                self.invalidate_conversation_layout();
                 // Fades in as a synced draft's messages do, so `j` between
                 // the two kinds never pops.
                 self.reveal = Reveal::Waiting;
@@ -2765,35 +2792,26 @@ impl Inbox {
         .detach();
     }
 
-    fn show_draft_write_failure(&mut self, mut lines: Vec<String>, cx: &mut Context<Self>) {
-        use fell_core::compose::{FAILED_DRAFT_CLOSE, SERVER_DRAFT_SAVE_FAILED};
-        let Some(save) = self.closed_draft_save.clone() else {
-            lines.insert(0, SERVER_DRAFT_SAVE_FAILED.into());
+    fn apply_draft_write_notice(
+        &mut self,
+        status: fell_core::compose::DraftSaveStatus,
+        mut lines: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(warning) = status.warning() {
+            lines.insert(0, warning.into());
+        }
+        if !lines.is_empty() {
             self.session.show_toast(lines.join(" · "), true);
             cx.notify();
-            return;
-        };
-        let probe = save.clone();
-        let checked = self.store.call(move |store| probe.failed(store));
-        let generation = self.session.toast_generation();
-        cx.spawn(async move |this, cx| {
-            let failed = checked.await.unwrap_or(false);
-            let _ = this.update(cx, |inbox, cx| {
-                if inbox.session.toast_generation() != generation {
-                    return;
-                }
-                let note = if failed && inbox.closed_draft_save.as_ref() == Some(&save) {
-                    inbox.closed_draft_save = None;
-                    FAILED_DRAFT_CLOSE
-                } else {
-                    SERVER_DRAFT_SAVE_FAILED
-                };
-                lines.insert(0, note.into());
-                inbox.session.show_toast(lines.join(" · "), true);
-                cx.notify();
-            });
-        })
-        .detach();
+        } else if self
+            .session
+            .status_notice()
+            .is_some_and(|notice| notice.text == fell_core::compose::SERVER_DRAFT_SAVE_RETRYING)
+        {
+            self.session.show_toast("Draft saved", false);
+            cx.notify();
+        }
     }
 
     /// Say so in the status bar when a review window an agent opened closes,
@@ -2811,7 +2829,6 @@ impl Inbox {
         cx.spawn(async move |this, cx| {
             while events.next().await.is_some() {
                 while events.try_recv().is_ok() {}
-                let mut server_save = None;
                 let closed = if let Some(notice) = hub.take_close_notices().pop() {
                     let notice = if notice.needs_local_write() {
                         cx.background_executor()
@@ -2820,8 +2837,7 @@ impl Inbox {
                     } else {
                         notice
                     };
-                    server_save = notice.server_save().cloned();
-                    if server_save.is_some() {
+                    if notice.server_save().is_some() {
                         store.call(move |store| notice.resolve(store)).await.ok()
                     } else {
                         Some(notice.into_line())
@@ -2837,8 +2853,6 @@ impl Inbox {
                             inbox.request_threads(ReadIntent::default(), cx);
                         }
                         if let Some((mut line, warn)) = closed {
-                            inbox.closed_draft_save = server_save
-                                .filter(|_| line != fell_core::compose::FAILED_DRAFT_CLOSE);
                             if inbox.session.in_drafts()
                                 && let Some(trimmed) = line.strip_suffix("  ·  gd drafts")
                             {
@@ -3554,7 +3568,7 @@ impl Inbox {
     fn open_draft(
         &mut self,
         id: Option<String>,
-        remote: Option<fell_core::ThreadId>,
+        remote: Option<(ThreadId, fell_core::RemoteId)>,
         cx: &mut Context<Self>,
     ) {
         let Some(hub) = cx
@@ -3579,7 +3593,7 @@ impl Inbox {
             return;
         };
         let remote_open = remote.is_some();
-        if let Some(thread) = &remote {
+        if let Some((thread, _)) = &remote {
             if self.opening_draft.is_some() {
                 return;
             }
@@ -3588,7 +3602,6 @@ impl Inbox {
                 thread: thread.clone(),
                 started,
                 ready: None,
-                shown: false,
             });
             cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(DRAFT_OPEN_FEEDBACK).await;
@@ -3620,7 +3633,7 @@ impl Inbox {
                         .open(&hub, &id, &account)
                         .map(|()| id)
                         .map_err(fell_core::Error::Action),
-                    (None, Some(thread)) => home.open_server_draft(&hub, &account, &thread),
+                    (None, Some((_, source))) => home.open_server_draft(&hub, &account, &source),
                     (None, None) => home
                         .new_draft(&hub, &account, &from)
                         .map_err(fell_core::Error::Action),
@@ -3650,14 +3663,12 @@ impl Inbox {
                             "Could not open compose draft",
                             error = &err as &dyn std::error::Error
                         );
-                        let text = match err {
-                            fell_core::Error::DraftBodyUnavailable
-                            | fell_core::Error::DraftNoLongerInFolder
-                            | fell_core::Error::DraftUnavailable
-                            | fell_core::Error::DraftAttachmentLimit => err.to_string(),
-                            _ if creating => format!("Couldn't start a draft. {err}"),
-                            _ if !remote_open => format!("Couldn't open the draft. {err}"),
-                            _ => "Couldn't open the server draft. Try opening it again.".into(),
+                        let text = if remote_open {
+                            fell_core::compose::server_draft_open_notice(&err)
+                        } else if creating {
+                            format!("Couldn't start a draft. {err}")
+                        } else {
+                            format!("Couldn't open the draft. {err}")
                         };
                         inbox.session.show_toast(text, true);
                     }
@@ -3686,6 +3697,33 @@ impl Inbox {
                 cx,
             );
         }
+        cx.notify();
+    }
+
+    fn refresh_closing_draft(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.session.cursor_draft() == Some(id)
+            && let Some(index) = self.drafts.iter().position(|draft| draft.id == id)
+            && let Some(draft) = self.live_drafts(vec![self.drafts[index].clone()], cx).pop()
+        {
+            if let Some(row) = self
+                .session
+                .threads
+                .iter_mut()
+                .find(|row| row.draft.as_deref() == Some(id))
+                && let Some(updated) = present::draft_rows(std::slice::from_ref(&draft)).pop()
+            {
+                *row = updated;
+            }
+            self.drafts[index] = draft;
+            self.read_selected_messages(true, cx);
+        }
+        self.request_threads(
+            ReadIntent {
+                refresh_open: true,
+                ..ReadIntent::default()
+            },
+            cx,
+        );
         cx.notify();
     }
 
@@ -4143,14 +4181,20 @@ impl Inbox {
         if step.compose {
             self.open_draft(None, None, cx);
         }
-        if step.open_draft {
-            let id = self.session.cursor_draft().map(str::to_string);
-            let server = if id.is_none() {
-                self.session.cursor_id.clone().map(fell_core::ThreadId)
+        if step.open_draft
+            && let Some(row) = self.session.cursor_thread()
+        {
+            let id = row.draft.clone();
+            let server = row
+                .server_draft
+                .clone()
+                .map(|source| (ThreadId(row.id.clone()), source));
+            if id.is_some() || server.is_some() {
+                self.open_draft(id, server, cx);
             } else {
-                None
-            };
-            self.open_draft(id, server, cx);
+                self.session
+                    .show_toast(fell_core::Error::DraftNoLongerInFolder.to_string(), true);
+            }
         }
         if let Some(kind) = step.reply {
             self.start_reply(kind, None, cx);
@@ -5082,13 +5126,14 @@ impl Render for Inbox {
             });
             selected.and_then(|target| checks.for_message(&target.id))
         });
-        let status = if self.opening_draft.as_ref().is_some_and(|open| {
-            !open.shown && real.saturating_duration_since(open.started) >= DRAFT_OPEN_FEEDBACK
-        }) {
-            StatusLabel::opening_draft(&self.theme)
-        } else {
-            StatusLabel::new(&self.theme, &self.session, reply_check, width)
-        };
+        let status =
+            if self.opening_draft.as_ref().is_some_and(|open| {
+                real.saturating_duration_since(open.started) >= DRAFT_OPEN_FEEDBACK
+            }) {
+                StatusLabel::opening_draft(&self.theme)
+            } else {
+                StatusLabel::new(&self.theme, &self.session, reply_check, width)
+            };
         let status_labels = self.status_labels.update(status, self.motion.motion, now);
         let animating = self.motion.tick(now)
             | waiting_for_resize
@@ -7938,17 +7983,15 @@ pub fn read_conversation(
                 .folders
                 .iter()
                 .any(|folder| roles.is(FolderRole::Drafts, folder))
-        {
-            let body = store.editable_draft_body(
+            && let Some(body) = store.editable_draft_body(
                 account,
                 stored.headers.message_id.as_str(),
                 stored.body_text.as_deref(),
-            )?;
-            if let Some(preview) = present::draft_reader_body(&body, &stored.headers.subject, false)
-            {
-                message.body = preview;
-                message.snippet = present::markdown_snippet(&body, &stored.headers.subject);
-            }
+            )?
+            && let Some(preview) = present::draft_reader_body(&body, &stored.headers.subject, false)
+        {
+            message.body = preview;
+            message.snippet = present::markdown_snippet(&body, &stored.headers.subject);
         }
         if stored.has_attachment {
             let parts = store.message_attachments(account, &stored.headers.message_id)?;
@@ -9575,7 +9618,10 @@ impl StatusLabels {
             self.outgoing = None;
         }
         if let Some(old) = old {
-            if old.phase != next.phase {
+            if old.phase == StatusPhase::OpeningDraft && old.phase != next.phase {
+                self.outgoing = None;
+                self.count_fade = motion::NumberFade::default();
+            } else if old.phase != next.phase {
                 self.outgoing = motion.start(motion::FADE, now).map(|fade| (old, fade));
                 self.count_fade = motion::NumberFade::default();
             } else if let (Some(old_download), Some(next_download)) =
@@ -9709,7 +9755,8 @@ fn status_bar(
                     theme,
                 ));
             (label, width)
-        } else if !narrow
+        } else if !noticed
+            && !narrow
             && labels.current.steady_sync
             && labels
                 .outgoing
@@ -9750,7 +9797,17 @@ fn status_bar(
             bar_px(window, &format!(" · {key}{suffix}"), size, ui)
         });
         let room = (width - used - tail_width).max(0.0);
-        let measure = |text: &str| bar_px(window, text, size, ui);
+        let notice_size = if narrow && toast.alert && toast.label.is_none() && hint.is_none() {
+            let natural = bar_px(window, &toast.text, size, ui);
+            if natural > room {
+                (size * (room - 2.).max(0.) / natural).max(11.)
+            } else {
+                size
+            }
+        } else {
+            size
+        };
+        let measure = |text: &str| bar_px(window, text, notice_size, ui);
         let text = toast.label.as_ref().map_or_else(
             || present::fit_notice(&toast.text, room, measure),
             |label| label.fit(room, measure),
@@ -9759,6 +9816,7 @@ fn status_bar(
             .overflow_hidden()
             .whitespace_nowrap()
             .text_ellipsis()
+            .text_size(px(notice_size))
             .text_color(rgb(if toast.alert {
                 theme.error
             } else {
@@ -10924,6 +10982,7 @@ mod tests {
             warn: false,
             unread: true,
             draft: None,
+            server_draft: None,
         }
     }
 

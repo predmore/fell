@@ -52,7 +52,7 @@ fn sentence_case(text: &str) -> String {
     }
 }
 
-pub const FAILED_DRAFT_CLOSE: &str = "Kept in Fell · not on the server";
+use super::SERVER_DRAFT_SAVE_FAILED;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClosedDraftSave {
@@ -62,15 +62,11 @@ pub struct ClosedDraftSave {
 }
 
 impl ClosedDraftSave {
-    pub fn draft(&self) -> &str {
-        &self.draft
-    }
-
-    pub fn failed(&self, store: &crate::Store) -> bool {
-        matches!(
-            store.server_draft_save_status(&self.account, &self.draft, &self.digest),
-            Ok(Some(super::DraftSaveStatus::ServerFailed))
-        )
+    pub fn status(&self, store: &crate::Store) -> Option<super::DraftSaveStatus> {
+        store
+            .server_draft_save_status(&self.account, &self.draft, &self.digest)
+            .ok()
+            .flatten()
     }
 }
 
@@ -94,7 +90,7 @@ impl DraftCloseNotice {
                     });
                 }
                 Some(super::SaveReceipt::ServerFailed) => {
-                    self.text = FAILED_DRAFT_CLOSE.into();
+                    self.text = SERVER_DRAFT_SAVE_FAILED.into();
                     self.alert = true;
                 }
                 _ => {}
@@ -112,12 +108,13 @@ impl DraftCloseNotice {
     }
 
     pub fn resolve(self, store: &crate::Store) -> (String, bool) {
-        if self
+        if let Some(warning) = self
             .server_save
             .as_ref()
-            .is_some_and(|save| save.failed(store))
+            .and_then(|save| save.status(store))
+            .and_then(super::DraftSaveStatus::warning)
         {
-            return (FAILED_DRAFT_CLOSE.into(), true);
+            return (warning.into(), true);
         }
         self.into_line()
     }
@@ -533,7 +530,7 @@ impl DraftHub {
             let sent = locked == Some(SendLock::Sent.reason());
             let failed = locked.is_none() && receipt == Some(super::SaveReceipt::ServerFailed);
             let line = match locked {
-                None if failed => FAILED_DRAFT_CLOSE.into(),
+                None if failed => SERVER_DRAFT_SAVE_FAILED.into(),
                 // What happened, as docs/ux.md has it: "Sent" and the subject.
                 Some(_) if sent => format!("Sent{}", quoted_subject(&subject)),
                 // The key to what the warning asks: look in Sent.

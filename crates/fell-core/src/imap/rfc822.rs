@@ -124,7 +124,20 @@ pub(crate) fn parse_draft(
 
     let parsed = MessageParser::new()
         .parse(raw)
-        .ok_or_else(|| crate::Error::Action("Couldn't read the server draft".into()))?;
+        .ok_or_else(|| crate::Error::Action("The message could not be read.".into()))?;
+    let mut html_parts = parsed
+        .html_body()
+        .filter(|part| matches!(part.kind(), PartKind::Html))
+        .peekable();
+    let html = if html_parts.peek().is_some() {
+        let html = joined(html_parts, |_| true).unwrap_or_default();
+        if fell_render::html_has_uneditable_draft_formatting(&html) {
+            return Err(crate::Error::DraftFormattingUnavailable);
+        }
+        Some(html)
+    } else {
+        None
+    };
     let addresses = |list| {
         address_list(list)
             .into_iter()
@@ -151,21 +164,14 @@ pub(crate) fn parse_draft(
     let plain = joined(parsed.text_body(), |kind| matches!(kind, PartKind::Text));
     let mut body = if let Some(plain) = plain.filter(|text| !text.trim().is_empty()) {
         plain.replace("\r\n", "\n")
-    } else {
-        let mut html_parts = parsed
-            .html_body()
-            .filter(|part| matches!(part.kind(), PartKind::Html))
-            .peekable();
-        if html_parts.peek().is_some() {
-            let html = joined(html_parts, |_| true).unwrap_or_default();
-            let text = html_draft_body(&html);
-            if text.trim().is_empty() {
-                return Err(crate::Error::DraftBodyUnavailable);
-            }
-            text
-        } else {
-            String::new()
+    } else if let Some(html) = html {
+        let text = html_draft_body(&html);
+        if text.trim().is_empty() {
+            return Err(crate::Error::DraftBodyUnavailable);
         }
+        text
+    } else {
+        String::new()
     };
     let references = parsed
         .references()

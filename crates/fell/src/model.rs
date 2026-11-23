@@ -3413,6 +3413,7 @@ mod tests {
             warn: false,
             unread: false,
             draft: None,
+            server_draft: None,
         }
     }
 
@@ -5434,6 +5435,7 @@ mod tests {
             .into_iter()
             .map(|(id, date)| ThreadRow {
                 draft: Some(id.into()),
+                server_draft: None,
                 ..dated(id, date)
             })
             .collect();

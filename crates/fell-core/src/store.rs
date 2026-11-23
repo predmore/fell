@@ -403,6 +403,7 @@ type SyncCommitHook = Box<dyn FnMut() -> Result<()> + Send>;
 
 /// The latest synced draft in a list thread.
 pub struct SyncedDraftPreview {
+    pub source: Option<RemoteId>,
     pub recipients: Vec<Address>,
     pub subject: String,
     pub body: String,
@@ -1873,14 +1874,22 @@ impl Store {
             .into_iter()
             .map(|name| name.to_ascii_lowercase())
             .collect();
+        let roles = self.folder_roles(account_id)?;
+        let mailbox = roles
+            .get(FolderRole::Drafts)
+            .map(|folder| crate::imap::escape_mailbox(&folder.raw));
         let mut stmt = self.conn.prepare_cached(
-            "SELECT folders, to_line, cc_line, subject, body_text, message_id FROM messages
-             WHERE account_id = ?1 AND thread_id = ?2
-             ORDER BY date_unix DESC, rowid DESC",
+            "SELECT m.folders, m.to_line, m.cc_line, m.subject, m.body_text, m.message_id,
+                (SELECT 'imap:' || c.uidvalidity || ':' || c.uid || ':' || c.mailbox
+                 FROM message_copies c
+                 WHERE c.account_id = m.account_id AND c.message_id = m.message_id AND c.mailbox = ?3
+                 ORDER BY c.uidvalidity DESC, c.uid DESC LIMIT 1)
+             FROM messages m WHERE m.account_id = ?1 AND m.thread_id = ?2
+             ORDER BY m.date_unix DESC, m.rowid DESC",
         )?;
         let mut out = HashMap::new();
         for thread in threads {
-            let mut rows = stmt.query(params![account_id.as_str(), thread.0])?;
+            let mut rows = stmt.query(params![account_id.as_str(), thread.0, mailbox])?;
             while let Some(row) = rows.next()? {
                 let folders: String = row.get(0)?;
                 let here = split_field(&folders)
@@ -1894,10 +1903,13 @@ impl Store {
                 let subject = crate::notes::display_safe(&row.get::<_, String>(3)?, false);
                 let id: String = row.get(5)?;
                 let fallback: Option<String> = row.get(4)?;
-                let body = self.editable_draft_body(account_id, &id, fallback.as_deref())?;
+                let body = self
+                    .editable_draft_body(account_id, &id, fallback.as_deref())?
+                    .unwrap_or_default();
                 out.insert(
                     thread.clone(),
                     SyncedDraftPreview {
+                        source: row.get::<_, Option<String>>(6)?.map(RemoteId),
                         recipients,
                         subject,
                         body,
@@ -1910,25 +1922,35 @@ impl Store {
     }
 
     /// Read the same editable body for a synced draft's list and reader.
+    /// Leave unsupported formatting to the native HTML reader.
     pub fn editable_draft_body(
         &self,
         account: &AccountId,
         message_id: &str,
         fallback: Option<&str>,
-    ) -> Result<String> {
+    ) -> Result<Option<String>> {
         let Some(parts) = bodies::read_body_text(&self.conn, account, message_id)? else {
-            return Ok(fallback.unwrap_or_default().to_owned());
+            return Ok(Some(fallback.unwrap_or_default().to_owned()));
         };
-        Ok(parts
-            .plain
-            .filter(|plain| !plain.trim().is_empty())
-            .or_else(|| {
-                parts
-                    .html
-                    .as_deref()
-                    .map(crate::imap::rfc822::html_draft_body)
-            })
-            .unwrap_or_else(|| fallback.unwrap_or_default().to_owned()))
+        if parts
+            .html
+            .as_deref()
+            .is_some_and(fell_render::html_has_uneditable_draft_formatting)
+        {
+            return Ok(None);
+        }
+        Ok(Some(
+            parts
+                .plain
+                .filter(|plain| !plain.trim().is_empty())
+                .or_else(|| {
+                    parts
+                        .html
+                        .as_deref()
+                        .map(crate::imap::rfc822::html_draft_body)
+                })
+                .unwrap_or_else(|| fallback.unwrap_or_default().to_owned()),
+        ))
     }
 
     /// One window of the list [`Store::folder_threads`] returns, whether the

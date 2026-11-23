@@ -22,9 +22,9 @@ pub use frontmatter::{
     mailbox_parts, parse_address_line,
 };
 pub use hub::{
-    ClosedDraftSave, DraftCloseNotice, DraftHub, FAILED_DRAFT_CLOSE, HubEvent,
-    LOCAL_SENT_COPY_FAILED, MAYBE_SENT_NOTICE, editor_is_running, file_fallback_edit,
-    file_fallback_get, file_fallback_replace_body, request_send_without_editor, rpc_call,
+    ClosedDraftSave, DraftCloseNotice, DraftHub, HubEvent, LOCAL_SENT_COPY_FAILED,
+    MAYBE_SENT_NOTICE, editor_is_running, file_fallback_edit, file_fallback_get,
+    file_fallback_replace_body, request_send_without_editor, rpc_call,
 };
 pub(crate) use markdown::content_id as draft_content_id;
 pub(crate) use markdown::document_to_markdown;
@@ -48,7 +48,10 @@ pub use reply::{
     start_reply_in_zone,
 };
 pub(crate) use server::server_draft_payload;
-pub use server::{DraftSaveStatus, SERVER_DRAFT_SAVE_FAILED, SaveReceipt};
+pub use server::{
+    DraftSaveStatus, SERVER_DRAFT_SAVE_FAILED, SERVER_DRAFT_SAVE_RETRYING, SaveReceipt,
+    server_draft_open_notice,
+};
 pub use session::{
     AddressView, AttachmentView, DraftSession, HunkView, ReplyContext, SendLock, SentCopy, Snapshot,
 };

@@ -350,31 +350,38 @@ impl Store {
     pub(crate) fn server_draft_source(
         &self,
         account: &AccountId,
-        thread: &crate::ThreadId,
+        source: &crate::RemoteId,
     ) -> Result<Option<crate::outbox::drafts::Copy>> {
         let roles = self.folder_roles(account)?;
-        let Some(folder) = roles.get(crate::FolderRole::Drafts) else {
+        let Some((folder, remote)) = roles
+            .get(crate::FolderRole::Drafts)
+            .zip(crate::imap::parse_remote_id(&source.0))
+            .filter(|(folder, remote)| crate::imap::escape_mailbox(&folder.raw) == remote.mailbox)
+        else {
             return Ok(None);
         };
-        let found: Option<(u32, u32)> = self
+        let withheld: Option<bool> = self
             .conn
             .query_row(
-                "SELECT c.uidvalidity, c.uid FROM message_copies c
-             JOIN messages m ON m.account_id = c.account_id AND m.message_id = c.message_id
-             WHERE c.account_id = ?1 AND c.mailbox = ?2 AND m.thread_id = ?3
-             ORDER BY m.date_unix DESC, c.uid DESC LIMIT 1",
+                "SELECT COALESCE(b.withheld, 0) FROM message_copies c
+             LEFT JOIN message_bodies b USING (account_id, message_id)
+             WHERE c.account_id = ?1 AND c.mailbox = ?2 AND c.uidvalidity = ?3 AND c.uid = ?4",
                 params![
                     account.as_str(),
-                    crate::imap::escape_mailbox(&folder.raw),
-                    thread.as_str()
+                    remote.mailbox,
+                    remote.uidvalidity,
+                    remote.uid
                 ],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| row.get(0),
             )
             .optional()?;
-        Ok(found.map(|(validity, uid)| crate::outbox::drafts::Copy {
+        if withheld == Some(true) {
+            return Err(crate::Error::DraftMessageLimit);
+        }
+        Ok(withheld.map(|_| crate::outbox::drafts::Copy {
             mailbox: folder.raw.clone(),
-            validity,
-            uid,
+            validity: remote.uidvalidity,
+            uid: remote.uid,
         }))
     }
 

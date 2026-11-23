@@ -7,7 +7,9 @@ use crate::{Result, Store, diagnostic, outbox};
 
 pub(super) type Wake = Arc<dyn Fn() + Send + Sync>;
 
-pub const SERVER_DRAFT_SAVE_FAILED: &str = "Draft not saved to the server · kept in Fell";
+pub const SERVER_DRAFT_SAVE_FAILED: &str =
+    "Not saved to the server · kept in Fell · edit to retry · Space ? l for details";
+pub const SERVER_DRAFT_SAVE_RETRYING: &str = "Not saved to the server · kept in Fell · retrying";
 
 /// What the writer saved for one exact editor revision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,7 +24,40 @@ pub enum SaveReceipt {
 pub enum DraftSaveStatus {
     Local,
     Server,
+    ServerRetrying,
     ServerFailed,
+}
+
+impl DraftSaveStatus {
+    pub fn warning(self) -> Option<&'static str> {
+        match self {
+            Self::ServerRetrying => Some(SERVER_DRAFT_SAVE_RETRYING),
+            Self::ServerFailed => Some(SERVER_DRAFT_SAVE_FAILED),
+            _ => None,
+        }
+    }
+}
+
+pub fn server_draft_open_notice(error: &crate::Error) -> String {
+    use crate::{Error, SyncFailureKind, classify_sync_error};
+    let detail = match error {
+        Error::DraftBodyUnavailable
+        | Error::DraftFormattingUnavailable
+        | Error::DraftNoLongerInFolder
+        | Error::DraftUnavailable
+        | Error::DraftAttachmentLimit
+        | Error::DraftMessageLimit => return error.to_string(),
+        _ => match classify_sync_error(error) {
+            SyncFailureKind::Unreachable => "Fell couldn't reach the mail server.".into(),
+            SyncFailureKind::LoginRejected => "The mail server rejected the account login.".into(),
+            SyncFailureKind::Password => "Fell couldn't read the account password.".into(),
+            SyncFailureKind::Tls => {
+                "Fell couldn't establish a secure connection to the mail server.".into()
+            }
+            SyncFailureKind::Other => crate::notes::display_safe(&error.to_string(), false),
+        },
+    };
+    format!("Couldn't open the server draft. {detail}")
 }
 
 impl Store {
@@ -49,6 +84,13 @@ pub(super) struct Debounce {
 impl Debounce {
     pub fn allow(&mut self) {
         self.allowed = true;
+    }
+
+    pub fn close(&mut self) {
+        // Reopening reauthorizes future edits. A revision already queued
+        // keeps its receipt and does not get another automatic attempt.
+        self.allowed = false;
+        self.observed = None;
     }
 
     pub fn due(&mut self, revision: u64, now_ms: Option<u64>) -> bool {

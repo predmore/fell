@@ -2285,6 +2285,7 @@ mod tests {
             warn: false,
             unread: false,
             draft: None,
+            server_draft: None,
         };
         // Deterministic glyph widths keep this row test independent of local fonts.
         let shape = |text: &str, kind, room: Option<f32>| {

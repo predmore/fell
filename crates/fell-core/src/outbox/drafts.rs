@@ -58,7 +58,10 @@ pub(crate) fn save_status(
     let conn = store.connection();
     let (state, confirmed): (Option<String>, bool) = conn
         .prepare_cached(
-            "SELECT (SELECT state FROM server_outbox WHERE account_id = ?1 AND draft_id = ?2
+            "SELECT (SELECT CASE WHEN state = 'pending' AND placed_uid IS NOT NULL THEN 'placed'
+                                 WHEN state = 'pending' AND error != '' THEN 'retrying'
+                                  ELSE state END
+                    FROM server_outbox WHERE account_id = ?1 AND draft_id = ?2
                     AND kind = 'append_draft' AND draft_digest = ?3 AND generation = ?4
                     ORDER BY id DESC LIMIT 1),
                 EXISTS (SELECT 1 FROM server_draft_copies
@@ -69,9 +72,10 @@ pub(crate) fn save_status(
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
     Ok(match state.as_deref() {
-        Some("dropped") => Some(DraftSaveStatus::ServerFailed),
-        Some("pending") => None,
         _ if confirmed => Some(DraftSaveStatus::Server),
+        Some("placed") => Some(DraftSaveStatus::Server),
+        Some("dropped") => Some(DraftSaveStatus::ServerFailed),
+        Some("retrying") => Some(DraftSaveStatus::ServerRetrying),
         _ => None,
     })
 }
@@ -175,6 +179,46 @@ fn rearm_recovery(conn: &Connection, account: &AccountId, draft: &str) -> Result
            AND kind = 'append_draft' AND state = 'dropped' AND append_checks > 0",
         params![account.as_str(), draft, generation(conn, account)?],
     )? != 0)
+}
+
+/// If a newer revision is already queued, give the older transfer one last
+/// lookup with no payload. A second inconclusive result settles the waiting
+/// revision as failed too, since sending it could leave a duplicate.
+pub(super) fn recover_for_waiting_save(
+    conn: &Connection,
+    account: &AccountId,
+    entry: &OutboxEntry,
+    (checks, limit): (u32, u32),
+    error: &str,
+    now: i64,
+) -> Result<bool> {
+    let newer = "account_id = ?2 AND generation = ?3
+                 AND draft_id = (SELECT draft_id FROM server_outbox WHERE id = ?1)
+                 AND id > ?1 AND kind = 'append_draft' AND state = 'pending' AND NOT sent";
+    if checks < limit {
+        let waiting: bool = conn.query_row(
+            &format!("SELECT EXISTS (SELECT 1 FROM server_outbox WHERE {newer})"),
+            params![entry.id, account.as_str(), entry.generation],
+            |row| row.get(0),
+        )?;
+        if waiting {
+            conn.execute(
+                "UPDATE server_outbox SET append_checks = ?2, retry_unix = 0,
+                     append_mime = NULL, error = ?3 WHERE id = ?1",
+                params![entry.id, limit, error],
+            )?;
+            return Ok(true);
+        }
+    } else {
+        conn.execute(
+            &format!(
+                "UPDATE server_outbox SET state = 'dropped', append_mime = NULL,
+                          error = ?4, settled_unix = ?5 WHERE {newer}"
+            ),
+            params![entry.id, account.as_str(), entry.generation, error, now],
+        )?;
+    }
+    Ok(false)
 }
 
 pub(crate) fn cancel_unsent(conn: &Connection, account: &AccountId, draft: &str) -> Result<()> {

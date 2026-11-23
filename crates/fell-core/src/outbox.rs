@@ -314,6 +314,10 @@ pub struct ReplayReport {
     pub flag_recovery_delayed: bool,
     /// An APPEND failed and the Sent copy is still queued.
     pub sent_append_delayed: bool,
+    /// A draft's upload first failed and is still queued.
+    pub draft_append_delayed: bool,
+    /// A draft upload that had been delayed is now confirmed.
+    pub draft_append_recovered: bool,
     /// Replay applied a conflicting server value to the local store.
     pub flags_changed: bool,
     /// The connection failed part way; the rest waits for the next pass.
@@ -338,6 +342,8 @@ pub enum DropReason {
     Refused,
     /// The result of a Sent APPEND could not be verified.
     UnconfirmedAppend,
+    /// The previous Drafts copy could not be removed.
+    DraftCleanup,
     /// The folder, or the message in it, never turned up on the server.
     NotFound,
     /// The server has no MOVE. Fell does not copy and expunge instead, so
@@ -1213,9 +1219,7 @@ pub(crate) enum Outcome<'a> {
     /// or found in the target. A move whose new copy is not known is not
     /// done: it stays [`Outcome::Retry`] until it is dropped, so the source
     /// copy stays in `message_copies` until a new one replaces it.
-    Done {
-        placed: (u32, u32),
-    },
+    Done { placed: (u32, u32) },
     /// Try again at `retry_unix`. `counts` is false for a dropped connection,
     /// which says nothing about the row. `refused`: the server answered the
     /// MOVE with NO or BAD, so it did not move it, and the next try is a
@@ -1230,6 +1234,7 @@ pub(crate) enum Outcome<'a> {
     Dropped {
         error: &'a str,
         draft_cleanup: bool,
+        draft_lookup: Option<(u32, u32)>,
     },
 }
 
@@ -1339,7 +1344,14 @@ pub(crate) fn settle(
         Outcome::Dropped {
             error,
             draft_cleanup,
+            draft_lookup,
         } => {
+            if let Some(lookup) = draft_lookup
+                && drafts::recover_for_waiting_save(&tx, account_id, entry, lookup, error, now)?
+            {
+                tx.commit()?;
+                return Ok(Settled::Recovering);
+            }
             if draft_cleanup {
                 drafts::abandon_cleanup(store, &tx, account_id, entry)?;
             }

@@ -704,7 +704,7 @@ impl DraftSession {
     /// The window showing this draft closed. Agents may delete it again.
     pub fn close_editor(&mut self) {
         self.open = false;
-        self.server_save = Default::default();
+        self.server_save.close();
         self.focused = false;
     }
 

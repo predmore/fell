@@ -301,6 +301,8 @@ impl Pass<'_> {
             Ok(changed) => {
                 if changed {
                     self.report.sent += 1;
+                    self.report.draft_append_recovered |=
+                        entry.kind == OutboxKind::AppendDraft && !entry.error.is_empty();
                     self.settled[index] = true;
                 }
                 Ok(())
@@ -391,7 +393,7 @@ impl Pass<'_> {
     ) -> Result<(), Stop> {
         let write_error = |error| match error {
             WriteError::Refused(message) => Stop::DraftCleanupRefused(message),
-            WriteError::Connection(error) => Stop::Connection(error),
+            WriteError::Connection(error) => Stop::DraftCleanupDisconnected(error),
         };
         self.selected = None;
         let validity = session.select(&copy.mailbox).map_err(write_error)?;
@@ -412,6 +414,11 @@ impl Pass<'_> {
                     WriteError::Connection(error) => Stop::DraftCleanupDisconnected(error),
                 })?;
             if candidates.is_empty() {
+                if entry.kind == OutboxKind::DeleteDraft
+                    && !drafts::begin_delete(self.store, entry)?
+                {
+                    return Err(Stop::Stale);
+                }
                 return Ok(());
             }
             let (found, complete) = Self::check_append_headers(
@@ -683,7 +690,20 @@ impl Pass<'_> {
         let message = if entry.kind == OutboxKind::AppendSent {
             message
         } else {
-            crate::diagnostic!(DEBUG, "Server draft write needs retry");
+            match retry {
+                AppendRetry::Deferred => {
+                    crate::diagnostic!(WARN, "Server draft upload was interrupted");
+                }
+                AppendRetry::Refused => {
+                    crate::diagnostic!(WARN, "The server refused the draft upload");
+                }
+                AppendRetry::CleanupRefused => {
+                    crate::diagnostic!(WARN, "Could not remove the previous server draft copy");
+                }
+                AppendRetry::Inconclusive { .. } => {
+                    crate::diagnostic!(WARN, "Could not verify the previous server draft upload");
+                }
+            }
             "Drafts write could not be confirmed"
         };
         let attempts = match retry {
@@ -706,14 +726,39 @@ impl Pass<'_> {
                     Outcome::Dropped {
                         error: message,
                         draft_cleanup: true,
+                        draft_lookup: None,
                     },
                 )?;
                 match settled {
                     Settled::Stale => return Err(Stop::Stale),
-                    Settled::Recorded => self.note_drop(index, DropReason::UnconfirmedAppend),
+                    Settled::Recorded => self.note_drop(index, DropReason::DraftCleanup),
                     _ => {}
                 }
                 self.settled[index] = true;
+                return Ok(());
+            }
+            AppendRetry::Inconclusive { checks }
+                if attempts + 1 >= MAX_APPEND_CHECKS && entry.kind == OutboxKind::AppendDraft =>
+            {
+                match outbox::settle(
+                    self.store,
+                    self.account_id,
+                    entry,
+                    None,
+                    None,
+                    Outcome::Dropped {
+                        error: message,
+                        draft_cleanup: false,
+                        draft_lookup: Some((checks, MAX_APPEND_CHECKS)),
+                    },
+                )? {
+                    Settled::Stale => return Err(Stop::Stale),
+                    Settled::Recorded => {
+                        self.note_drop(index, DropReason::UnconfirmedAppend);
+                        self.settled[index] = true;
+                    }
+                    _ => {}
+                }
                 return Ok(());
             }
             AppendRetry::Inconclusive { .. } if attempts + 1 >= MAX_APPEND_CHECKS => {
@@ -742,6 +787,10 @@ impl Pass<'_> {
             Settled::Recorded => {
                 self.report.sent_append_delayed |=
                     entry.kind == OutboxKind::AppendSent && entry.error.is_empty();
+                self.report.draft_append_delayed |= entry.kind == OutboxKind::AppendDraft
+                    && !matches!(retry, AppendRetry::CleanupRefused)
+                    && entry.error.is_empty()
+                    && entry.placed_uid.is_none();
             }
             Settled::Stale => return Err(Stop::Stale),
             Settled::Retired | Settled::Recovering => {}
@@ -1383,6 +1432,7 @@ impl Pass<'_> {
             Outcome::Dropped {
                 error: message,
                 draft_cleanup: false,
+                draft_lookup: None,
             },
         )?;
         if settled == Settled::Stale {

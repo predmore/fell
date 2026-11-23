@@ -3872,7 +3872,7 @@ fn server_draft_read_only_cleanup_exhausts_its_budget_and_releases_later_saves()
     fx.make_due();
     let report = fx.replay();
     assert_eq!(report.dropped.len(), 1);
-    assert_eq!(report.dropped[0].reason, DropReason::UnconfirmedAppend);
+    assert_eq!(report.dropped[0].reason, DropReason::DraftCleanup);
     assert_eq!(draft_appends(&fx), 3);
 
     fx.server.writes.lock().unwrap().read_only_mailbox = None;
@@ -4041,7 +4041,10 @@ fn server_draft_close_uses_the_durable_failure_and_leaves_unchanged_edits_local(
     hub.note_hidden("draft-test");
     wait_for_draft(&hub);
     let notice = hub.take_close_notices().pop().unwrap().resolve(&fx.store);
-    assert_eq!(notice, ("Kept in Fell · not on the server".into(), true));
+    assert_eq!(
+        notice,
+        (crate::compose::SERVER_DRAFT_SAVE_FAILED.into(), true)
+    );
     assert!(
         fx.store
             .outbox(&fx.account.id)
@@ -4101,7 +4104,7 @@ fn server_draft_refused_or_incomplete_search_after_uidvalidity_reset_uses_the_bu
         fx.make_due();
         let report = fx.replay();
         assert_eq!(report.dropped.len(), 1);
-        assert_eq!(report.dropped[0].reason, DropReason::UnconfirmedAppend);
+        assert_eq!(report.dropped[0].reason, DropReason::DraftCleanup);
         assert_eq!(report.sent, 1);
         assert_eq!(
             fx.on_server(SERVER_DRAFTS),
@@ -4162,18 +4165,32 @@ fn server_draft_close_before_debounce_tracks_failure_of_the_queued_revision() {
     hub.note_hidden("draft-test");
     let notice = hub.take_close_notices().pop().unwrap().after_local_write();
     let receipt = notice.server_save().unwrap();
-    assert!(!receipt.failed(&fx.store));
+    assert_eq!(receipt.status(&fx.store), None);
 
     fx.server.writes.lock().unwrap().refuse_append = true;
-    for _ in 0..super::write_back::MAX_ATTEMPTS {
+    assert!(fx.replay().draft_append_delayed);
+    assert_eq!(
+        receipt.status(&fx.store),
+        Some(crate::compose::DraftSaveStatus::ServerRetrying)
+    );
+    for _ in 1..super::write_back::MAX_ATTEMPTS {
         fx.make_due();
         fx.replay();
     }
-    assert!(receipt.failed(&fx.store));
+    assert_eq!(
+        receipt.status(&fx.store),
+        Some(crate::compose::DraftSaveStatus::ServerFailed)
+    );
     assert_eq!(
         notice.resolve(&fx.store),
-        ("Kept in Fell · not on the server".into(), true)
+        (crate::compose::SERVER_DRAFT_SAVE_FAILED.into(), true)
     );
+    assert!(hub.show("draft-test"));
+    hub.note_shown("draft-test");
+    hub.note_hidden("draft-test");
+    wait_for_draft(&hub);
+    assert_eq!(fx.replay().waiting, 0);
+    assert_eq!(draft_appends(&fx), super::write_back::MAX_ATTEMPTS as usize);
 }
 
 #[test]
@@ -4209,4 +4226,263 @@ fn server_draft_import_reports_missing_source_and_attachment_limit() {
         matches!(result, Err(crate::Error::DraftNoLongerInFolder)),
         "{result:?}"
     );
+}
+
+#[test]
+fn server_draft_refuses_uneditable_formatting_without_linking_the_copy() {
+    let fx = draft_fixture(Store::open_in_memory().unwrap());
+    for (index, html) in [
+        "<p>Do <del>not</del> ship.</p>",
+        "<p>Do <strike>not</strike> ship.</p>",
+        "<p>Do <s>not</s> ship.</p>",
+        "<table><tr><td>West</td><td>East</td></tr></table>",
+        "<p>Map:</p><img src='data:image/png;base64,AA=='>",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let subject = format!("Formatting {index}");
+        let mime = format!(
+            "From: Reader <c@x>\r\nSubject: {subject}\r\nMessage-ID: <format-{index}@x>\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=parts\r\n\r\n--parts\r\nContent-Type: text/plain\r\n\r\nPlain alternative.\r\n--parts\r\nContent-Type: text/html\r\n\r\n{html}\r\n--parts--\r\n"
+        );
+        let uid = index as u32 + 1;
+        fx.deliver(SERVER_DRAFTS, uid, mime.into_bytes());
+        fx.sync();
+        let thread = fx.thread(SERVER_DRAFTS, &subject);
+        let error = fx
+            .account_config()
+            .import_server_draft(&fx.store, &thread, "format-draft")
+            .unwrap_err();
+        assert!(
+            matches!(error, crate::Error::DraftFormattingUnavailable),
+            "{error}"
+        );
+        assert!(fx.copy_recorded(SERVER_DRAFTS, uid));
+    }
+    assert!(fx.store.load_compose("format-draft").unwrap().is_none());
+    assert_eq!(draft_appends(&fx), 0);
+    assert_eq!(fx.on_server(SERVER_DRAFTS).len(), 5);
+}
+
+#[test]
+fn server_draft_import_uses_the_preview_uid_even_when_a_thread_has_other_copies() {
+    let fx = draft_fixture(Store::open_in_memory().unwrap());
+    let root = raw_message("root@x", None, "Survey", "Reader <c@x>", "Wrong draft.", "");
+    let newest_row = raw_message(
+        "reply@x",
+        Some("root@x"),
+        "Re: Survey",
+        "Reader <c@x>",
+        "Previewed draft.",
+        "",
+    );
+    fx.deliver(SERVER_DRAFTS, 2, root);
+    fx.deliver(SERVER_DRAFTS, 1, newest_row);
+    fx.sync();
+    let rows = fx
+        .store
+        .threads_in_folder(&fx.account.id, SERVER_DRAFTS)
+        .unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let thread = rows[0].thread_id.clone();
+    let preview = fx
+        .store
+        .synced_draft_previews(&fx.account.id, SERVER_DRAFTS, std::slice::from_ref(&thread))
+        .unwrap()
+        .remove(&thread)
+        .unwrap();
+    assert_eq!(preview.body, "Previewed draft.");
+    let source = preview.source.unwrap();
+    assert_eq!(source, crate::RemoteId("imap:64:1:Work in progress".into()));
+
+    fx.deliver(
+        SERVER_DRAFTS,
+        3,
+        raw_message(
+            "later@x",
+            Some("root@x"),
+            "Re: Survey",
+            "Reader <c@x>",
+            "Later draft.",
+            "",
+        ),
+    );
+    fx.sync();
+    let id = fx
+        .account_config()
+        .import_server_draft_copy(&fx.store, &source, "selected-draft")
+        .unwrap();
+    let stored = fx.store.load_compose(&id).unwrap().unwrap();
+    assert_eq!(stored.body, "Previewed draft.");
+    assert!(!fx.copy_recorded(SERVER_DRAFTS, 1));
+    assert!(fx.copy_recorded(SERVER_DRAFTS, 2));
+    assert!(fx.copy_recorded(SERVER_DRAFTS, 3));
+}
+
+#[test]
+fn server_draft_fetch_limits_partial_and_unsolicited_whole_messages() {
+    for ignore_windows in [false, true] {
+        let fx = draft_fixture(Store::open_in_memory().unwrap());
+        let mime = raw_message(
+            "large@x",
+            None,
+            "Large draft",
+            "Reader <c@x>",
+            "Content.",
+            "",
+        );
+        fx.deliver(SERVER_DRAFTS, 1, mime);
+        fx.sync();
+        let thread = fx.thread(SERVER_DRAFTS, "Large draft");
+        {
+            let mut state = fx.server.state.lock().unwrap();
+            state.part_ignores_window = ignore_windows;
+            state.mailboxes[1].messages[0]
+                .raw
+                .resize(crate::MAX_MESSAGE_BYTES + 1, b'x');
+        }
+        let err = fx
+            .account_config()
+            .import_server_draft(&fx.store, &thread, "large-draft")
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::DraftMessageLimit), "{err}");
+        let windows: Vec<_> = fx
+            .commands()
+            .into_iter()
+            .filter(|cmd| cmd.contains("BODY.PEEK[]<"))
+            .collect();
+        if ignore_windows {
+            assert_eq!(windows.len(), 1, "{windows:?}");
+        } else {
+            assert!(
+                windows
+                    .last()
+                    .unwrap()
+                    .contains(&format!("<{}.1>", crate::MAX_MESSAGE_BYTES)),
+                "{windows:?}"
+            );
+        }
+        assert!(fx.copy_recorded(SERVER_DRAFTS, 1));
+        assert!(fx.store.load_compose("large-draft").unwrap().is_none());
+    }
+}
+
+#[test]
+fn server_draft_undo_replaces_copy_after_empty_search_settles_discard() {
+    let dir = tempfile::tempdir().unwrap();
+    let fx = draft_fixture(Store::open(dir.path().join("mail.db")).unwrap());
+    let hub = draft_hub(&dir.path().join("drafts"), &fx);
+    queue_draft_body(&hub, "Restore this.");
+    assert_eq!(fx.replay().sent, 1);
+    fx.store
+        .discard_compose_drafts(&fx.account.id, &["draft-test".into()])
+        .unwrap();
+    {
+        let mut state = fx.server.state.lock().unwrap();
+        state.mailboxes[1].uidvalidity += 1;
+        state.mailboxes[1].messages.clear();
+    }
+    assert_eq!(fx.replay().sent, 1);
+    fx.store.undo(&fx.account.id).unwrap();
+    assert_eq!(fx.replay().sent, 1);
+    assert_eq!(fx.on_server(SERVER_DRAFTS), [(2, "Weekly notes".into())]);
+}
+
+#[test]
+fn server_draft_confirmed_upload_stays_saved_when_previous_copy_cleanup_fails() {
+    use crate::compose::{DraftSaveStatus, SaveReceipt};
+    let dir = tempfile::tempdir().unwrap();
+    let fx = draft_fixture(Store::open(dir.path().join("mail.db")).unwrap());
+    let hub = draft_hub(&dir.path().join("drafts"), &fx);
+    queue_draft_body(&hub, "Original");
+    assert_eq!(fx.replay().sent, 1);
+    queue_draft_body(&hub, "Replacement");
+    let Some(SaveReceipt::Server(digest)) = hub
+        .with_session("draft-test", |draft| draft.save_receipt())
+        .flatten()
+    else {
+        panic!("missing receipt");
+    };
+    fx.server.writes.lock().unwrap().read_only_mailbox = Some(SERVER_DRAFTS.into());
+    for _ in 0..super::write_back::MAX_ATTEMPTS {
+        fx.make_due();
+        let report = fx.replay();
+        assert!(!report.draft_append_delayed);
+        assert_eq!(
+            fx.store
+                .server_draft_save_status(&fx.account.id, "draft-test", &digest)
+                .unwrap(),
+            Some(DraftSaveStatus::Server)
+        );
+    }
+    assert_eq!(fx.on_server(SERVER_DRAFTS).len(), 2);
+}
+
+#[test]
+fn server_draft_waiting_revision_gets_one_final_lookup_without_another_edit() {
+    for recover in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let fx = draft_fixture(Store::open(dir.path().join("mail.db")).unwrap());
+        let hub = draft_hub(&dir.path().join("drafts"), &fx);
+        queue_draft_body(&hub, "Unconfirmed");
+        {
+            let mut writes = fx.server.writes.lock().unwrap();
+            writes.lose_reply_to = Some("APPEND");
+            writes.refuse_search = true;
+        }
+        assert!(fx.replay().interrupted.is_some());
+        queue_draft_body(&hub, "Waiting");
+        for _ in 0..super::write_back::MAX_APPEND_CHECKS {
+            fx.make_due();
+            let report = fx.replay();
+            assert!(report.dropped.is_empty());
+            assert_eq!(report.sent, 0);
+        }
+        fx.server.writes.lock().unwrap().refuse_search = !recover;
+        let report = fx.replay();
+        if recover {
+            assert_eq!(report.sent, 2);
+            assert_eq!(draft_appends(&fx), 2);
+            assert_eq!(fx.on_server(SERVER_DRAFTS), [(2, "Weekly notes".into())]);
+        } else {
+            assert_eq!(report.dropped.len(), 1);
+            assert_eq!(draft_appends(&fx), 1);
+            assert_eq!(fx.replay().waiting, 0);
+            assert_eq!(fx.on_server(SERVER_DRAFTS), [(1, "Weekly notes".into())]);
+        }
+    }
+}
+
+#[test]
+fn server_draft_open_reports_the_loopback_login_failure() {
+    let fx = draft_fixture(Store::open_in_memory().unwrap());
+    let mime = raw_message(
+        "login@x",
+        None,
+        "Login draft",
+        "Reader <c@x>",
+        "Content.",
+        "",
+    );
+    fx.deliver(SERVER_DRAFTS, 1, mime);
+    fx.sync();
+    let mut config = fx.account_config();
+    config.password = crate::PasswordSource::Inline("wrong fixture password".into());
+    let err = config
+        .import_server_draft(
+            &fx.store,
+            &fx.thread(SERVER_DRAFTS, "Login draft"),
+            "login-draft",
+        )
+        .unwrap_err();
+    let notice = crate::compose::server_draft_open_notice(&err);
+    assert!(
+        notice.starts_with("Couldn't open the server draft. "),
+        "{notice}"
+    );
+    assert!(
+        notice.contains("The mail server rejected the account login."),
+        "{notice}"
+    );
+    assert!(fx.copy_recorded(SERVER_DRAFTS, 1));
 }
