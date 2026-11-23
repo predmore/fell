@@ -90,6 +90,8 @@ pub enum Error {
     Search(String),
     #[error("{0}")]
     Action(String),
+    #[error("This draft has no text Fell can edit. The copy is still on the server.")]
+    DraftBodyUnavailable,
     #[error("{0} is not implemented yet")]
     NotImplemented(&'static str),
     #[error("send requires explicit UI confirmation")]

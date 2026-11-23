@@ -604,15 +604,10 @@ pub fn draft_conversation(draft: &DraftSummary, me: &str, now: i64) -> Vec<ConvM
             Vec::new()
         };
         message.expanded = true;
-        // The markdown the person wrote, styled as the compose window and
-        // the recipient see it, not as source.
-        if !draft.body.trim().is_empty() {
-            message.body = RenderedBody {
-                blocks: vec![BodyBlock::Markdown {
-                    doc: std::sync::Arc::new(fell_core::compose::markdown_to_doc(&draft.body)),
-                    agent: !draft.owner.trim().is_empty(),
-                }],
-            };
+        if let Some(body) =
+            draft_reader_body(&draft.body, &draft.subject, !draft.owner.trim().is_empty())
+        {
+            message.body = body;
         }
         message.context = draft_context(draft, me, now);
     }
@@ -661,31 +656,56 @@ pub fn draft_context(draft: &DraftSummary, me: &str, now: i64) -> Option<String>
     })
 }
 
-/// A compose draft's body on one line, as it reads: markdown markers,
-/// link destinations and image references left out.
-pub fn markdown_snippet(body: &str, subject: &str) -> String {
-    use fell_core::compose::{BlockBody, Inline};
-    fn inlines(out: &mut Vec<String>, items: &[Inline]) {
-        for item in items {
-            match item {
-                Inline::Text(text) | Inline::Code(text) => out.push(text.clone()),
-                Inline::Em(inner) | Inline::Strong(inner) => inlines(out, inner),
-                Inline::Link { text, .. } => out.push(text.clone()),
-                Inline::Image { .. } => {}
-            }
+pub(crate) fn draft_reader_body(body: &str, subject: &str, agent: bool) -> Option<RenderedBody> {
+    (!body.trim().is_empty()).then(|| RenderedBody {
+        blocks: vec![BodyBlock::Markdown {
+            doc: std::sync::Arc::new(draft_preview_document(body, subject)),
+            agent,
+        }],
+    })
+}
+
+fn draft_preview_document(body: &str, subject: &str) -> fell_core::compose::StyledDoc {
+    use fell_core::compose::BlockBody;
+    let mut doc = fell_core::compose::markdown_to_doc(body);
+    if let Some(first) = doc.blocks.first()
+        && let BlockBody::Heading { inlines, .. } = &first.body
+    {
+        let mut heading = Vec::new();
+        draft_inline_text(&mut heading, inlines);
+        if one_line(&heading.concat()) == one_line(subject) {
+            doc.blocks.remove(0);
         }
     }
+    doc
+}
+
+fn draft_inline_text(out: &mut Vec<String>, items: &[fell_core::compose::Inline]) {
+    use fell_core::compose::Inline;
+    for item in items {
+        match item {
+            Inline::Text(text) | Inline::Code(text) => out.push(text.clone()),
+            Inline::Em(inner) | Inline::Strong(inner) => draft_inline_text(out, inner),
+            Inline::Link { text, .. } => out.push(text.clone()),
+            Inline::Image { .. } => {}
+        }
+    }
+}
+
+/// A compose draft's rendered body on one line.
+pub fn markdown_snippet(body: &str, subject: &str) -> String {
+    use fell_core::compose::BlockBody;
     fn blocks(out: &mut Vec<String>, items: &[fell_core::compose::Block]) {
         for block in items {
             match &block.body {
                 BlockBody::Heading { inlines: items, .. }
                 | BlockBody::Paragraph { inlines: items } => {
-                    inlines(out, items);
+                    draft_inline_text(out, items);
                     out.push(" ".into());
                 }
                 BlockBody::List { items, .. } => {
                     for item in items {
-                        inlines(out, item);
+                        draft_inline_text(out, item);
                         out.push(" ".into());
                     }
                 }
@@ -698,21 +718,9 @@ pub fn markdown_snippet(body: &str, subject: &str) -> String {
             }
         }
     }
-    let doc = fell_core::compose::markdown_to_doc(body);
+    let doc = draft_preview_document(body, subject);
     let mut out = Vec::new();
-    let mut preview = doc.blocks.as_slice();
-    if let Some((first, rest)) = preview.split_first()
-        && let BlockBody::Heading {
-            inlines: heading, ..
-        } = &first.body
-    {
-        inlines(&mut out, heading);
-        if one_line(&out.concat()) == one_line(subject) {
-            preview = rest;
-        }
-        out.clear();
-    }
-    blocks(&mut out, preview);
+    blocks(&mut out, &doc.blocks);
     one_line(&out.concat())
 }
 
@@ -1722,6 +1730,26 @@ mod tests {
         };
         assert_eq!(*doc.as_ref(), fell_core::compose::markdown_to_doc(STYLED));
         assert_eq!(shown[0].snippet, "Some bold text, a link and a list: one");
+        let headed = draft(&format!("# Plans\n\n{STYLED}"));
+        assert_eq!(
+            draft_conversation(&headed, "me@example.com", 2_000)[0].snippet,
+            shown[0].snippet
+        );
+        let headed = draft_conversation(&headed, "me@example.com", 2_000);
+        let [BodyBlock::Markdown { doc: headed, .. }] = headed[0].body.blocks.as_slice() else {
+            panic!("the heading-free preview should still render Markdown");
+        };
+        assert_eq!(
+            headed
+                .blocks
+                .iter()
+                .map(|block| &block.body)
+                .collect::<Vec<_>>(),
+            doc.blocks
+                .iter()
+                .map(|block| &block.body)
+                .collect::<Vec<_>>()
+        );
         // An empty draft keeps the plain empty body.
         let empty = draft_conversation(&draft(""), "me@example.com", 2_000);
         assert!(matches!(

@@ -341,7 +341,7 @@ impl Pass<'_> {
         };
         if entry.kind == OutboxKind::DeleteDraft {
             if let Some(copy) = &draft.current {
-                self.delete_draft_copy(session, entry, copy)?;
+                self.delete_draft_copy(session, entry, copy, draft.current_message_id.as_deref())?;
             }
         } else {
             let placed = if let Some(placed) = &draft.placed {
@@ -363,7 +363,7 @@ impl Pass<'_> {
             if let Some(copy) = &draft.current
                 && placed.as_ref().is_some_and(|new| new != copy)
             {
-                self.delete_draft_copy(session, entry, copy)?;
+                self.delete_draft_copy(session, entry, copy, draft.current_message_id.as_deref())?;
             }
         }
         let changed = drafts::finish(self.store, entry)?;
@@ -378,6 +378,7 @@ impl Pass<'_> {
         session: &mut WriteSession,
         entry: &OutboxEntry,
         copy: &drafts::Copy,
+        message_id: Option<&str>,
     ) -> Result<(), Stop> {
         let write_error = |error| match error {
             WriteError::Refused(message) => Stop::DraftCleanupRefused(message),
@@ -386,19 +387,49 @@ impl Pass<'_> {
         self.selected = None;
         let validity = session.select(&copy.mailbox).map_err(write_error)?;
         self.selected = Some((copy.mailbox.clone(), validity));
-        if validity != copy.validity {
-            return Ok(());
-        }
+        let uid = if validity == copy.validity {
+            copy.uid
+        } else {
+            let pending = || {
+                Stop::AppendRetry(
+                    "Drafts mailbox changed and the old copy could not be verified".into(),
+                )
+            };
+            let message_id = message_id.ok_or_else(pending)?;
+            let search_error = |error| match error {
+                WriteError::Refused(_) => pending(),
+                WriteError::Connection(error) => Stop::Connection(error),
+            };
+            let candidates = session
+                .search_message_id(message_id, APPEND_UID_LIMIT)
+                .map_err(search_error)?;
+            let (found, complete) = Self::check_append_headers(
+                session,
+                message_id,
+                &copy.mailbox,
+                validity,
+                &candidates,
+            )
+            .map_err(|stop| match stop {
+                Stop::AppendCheck(_) => pending(),
+                Stop::AppendCheckDisconnected(error) => Stop::Connection(error),
+                stop => stop,
+            })?;
+            found.filter(|_| complete).ok_or_else(pending)?
+        };
         let cleanup = |session: &mut WriteSession| {
             if drafts::pending(self.store, entry)?.is_none() {
                 return Err(Stop::Stale);
             }
-            session.mark_deleted(copy.uid).map_err(write_error)?;
+            if entry.kind == OutboxKind::DeleteDraft && !drafts::begin_delete(self.store, entry)? {
+                return Err(Stop::Stale);
+            }
+            session.mark_deleted(uid).map_err(write_error)?;
             if session.has_uid_expunge() {
                 if drafts::pending(self.store, entry)?.is_none() {
                     return Err(Stop::Stale);
                 }
-                session.expunge_uid(copy.uid).map_err(write_error)?;
+                session.expunge_uid(uid).map_err(write_error)?;
             }
             Ok(())
         };
@@ -407,7 +438,7 @@ impl Pass<'_> {
             // removed the UID. Only an explicit empty listing settles it.
             Err(Stop::DraftCleanupRefused(_))
                 if session
-                    .search_uid_range(copy.uid, copy.uid, 1)
+                    .search_uid_range(uid, uid, 1)
                     .is_ok_and(|uids| uids.is_empty()) =>
             {
                 Ok(())
@@ -548,8 +579,13 @@ impl Pass<'_> {
             .search_message_id(&entry.message_id, APPEND_UID_LIMIT)
             .map_err(append_check_error)?;
         if !candidates.is_empty() {
-            let (found, _) =
-                Self::check_append_headers(session, entry, mailbox, validity, &candidates)?;
+            let (found, _) = Self::check_append_headers(
+                session,
+                entry.message_id.as_str(),
+                mailbox,
+                validity,
+                &candidates,
+            )?;
             return if found.is_some() {
                 Ok(found)
             } else {
@@ -581,8 +617,13 @@ impl Pass<'_> {
         let uids = session
             .search_uid_range(pending.next, next - 1, APPEND_UID_LIMIT)
             .map_err(append_check_error)?;
-        let (found, complete) =
-            Self::check_append_headers(session, entry, mailbox, validity, &uids)?;
+        let (found, complete) = Self::check_append_headers(
+            session,
+            entry.message_id.as_str(),
+            mailbox,
+            validity,
+            &uids,
+        )?;
         if found.is_some() || complete {
             Ok(found)
         } else {
@@ -594,27 +635,29 @@ impl Pass<'_> {
 
     fn check_append_headers(
         session: &mut WriteSession,
-        entry: &OutboxEntry,
+        message_id: &str,
         mailbox: &str,
         validity: u32,
         uids: &[u32],
     ) -> Result<(Option<u32>, bool), Stop> {
         let mut complete = true;
+        let mut found = None;
         for batch in uids.chunks(APPEND_HEADER_BATCH) {
             let headers = session
                 .uid_fetch_message_ids(batch)
                 .map_err(append_check_error)?;
             let returned: HashSet<_> = headers.iter().map(|(uid, _)| *uid).collect();
-            if let Some((uid, _)) = headers.iter().find(|(uid, bytes)| {
-                batch.binary_search(uid).is_ok()
-                    && copy_message_id(mailbox, validity, *uid, bytes, false).as_str()
-                        == entry.message_id
-            }) {
-                return Ok((Some(*uid), true));
+            for (uid, bytes) in headers {
+                if batch.binary_search(&uid).is_ok()
+                    && copy_message_id(mailbox, validity, uid, &bytes, false).as_str() == message_id
+                    && found.replace(uid).is_some_and(|prev| prev != uid)
+                {
+                    return Ok((None, false));
+                }
             }
             complete &= batch.iter().all(|uid| returned.contains(uid));
         }
-        Ok((None, complete))
+        Ok((found, complete))
     }
 
     fn retry_append(

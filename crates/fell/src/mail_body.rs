@@ -299,6 +299,12 @@ pub fn read_bodies(
     let last = messages.len().saturating_sub(1);
     let mut budget = STORE_PREPARE_BYTES;
     for (index, message) in messages.iter_mut().enumerate() {
+        if matches!(
+            message.body.blocks.as_slice(),
+            [crate::text_render::BodyBlock::Markdown { .. }]
+        ) {
+            continue;
+        }
         match kinds.get(&message.id) {
             Some(kinds) if kinds.html => {
                 message.rich = Rich::Pending;

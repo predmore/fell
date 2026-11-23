@@ -196,6 +196,19 @@ fn compose_open(cx: &App) -> bool {
         .any(|handle| handle.downcast::<ComposeView>().is_some())
 }
 
+pub(crate) fn compose_draft_shown(id: &str, cx: &mut App) {
+    if let Some(inbox) = cx.try_global::<InboxWindow>().copied() {
+        inbox.update(cx, |inbox, cx| {
+            if let Some(open) = &mut inbox.opening_draft
+                && open.ready.as_deref() == Some(id)
+            {
+                open.shown = true;
+                cx.notify();
+            }
+        });
+    }
+}
+
 pub(crate) fn compose_draft_painted(id: &str, cx: &mut App) {
     if let Some(inbox) = cx.try_global::<InboxWindow>().copied() {
         inbox.update(cx, |inbox, cx| {
@@ -314,6 +327,7 @@ struct OpeningServerDraft {
     thread: ThreadId,
     started: Instant,
     ready: Option<String>,
+    shown: bool,
 }
 
 const DRAFT_OPEN_FEEDBACK: Duration = Duration::from_millis(300);
@@ -2754,10 +2768,17 @@ impl Inbox {
         };
         let (tx, mut events) = futures::channel::mpsc::unbounded::<()>();
         hub.subscribe_with(move || tx.unbounded_send(()).is_ok());
+        let store = self.store.clone();
         cx.spawn(async move |this, cx| {
             while events.next().await.is_some() {
                 while events.try_recv().is_ok() {}
-                let closed = hub.take_notices();
+                let closed = match hub.take_close_notices().pop() {
+                    Some(notice) if notice.needs_mailbox() => {
+                        store.call(move |store| notice.resolve(store)).await.ok()
+                    }
+                    Some(notice) => Some(notice.into_line()),
+                    None => None,
+                };
                 let alive = this
                     .update(cx, |inbox, cx| {
                         // A draft changed, was sent, or is new: the drafts
@@ -2765,7 +2786,12 @@ impl Inbox {
                         if inbox.session.in_drafts() {
                             inbox.request_threads(ReadIntent::default(), cx);
                         }
-                        if let Some((line, warn)) = closed.last().cloned() {
+                        if let Some((mut line, warn)) = closed {
+                            if inbox.session.in_drafts()
+                                && let Some(trimmed) = line.strip_suffix("  ·  gd drafts")
+                            {
+                                line = trimmed.to_owned();
+                            }
                             inbox.session.show_toast(line, warn);
                             cx.notify();
                         }
@@ -3159,6 +3185,7 @@ impl Inbox {
                             inbox.note_generation = inbox.note_generation.wrapping_add(1);
                         }
                         if action.kind == fell_core::ActionKind::DiscardDrafts {
+                            inbox.send_to_server();
                             inbox.session.show_toast(action.summary, false);
                             return Some(ReadIntent {
                                 changed: true,
@@ -3509,6 +3536,7 @@ impl Inbox {
                 thread: thread.clone(),
                 started,
                 ready: None,
+                shown: false,
             });
             cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(DRAFT_OPEN_FEEDBACK).await;
@@ -3536,9 +3564,14 @@ impl Inbox {
             let hub = hub.clone();
             async move {
                 match (id, remote) {
-                    (Some(id), _) => home.open(&hub, &id, &account).map(|()| id),
+                    (Some(id), _) => home
+                        .open(&hub, &id, &account)
+                        .map(|()| id)
+                        .map_err(fell_core::Error::Action),
                     (None, Some(thread)) => home.open_server_draft(&hub, &account, &thread),
-                    (None, None) => home.new_draft(&hub, &account, &from),
+                    (None, None) => home
+                        .new_draft(&hub, &account, &from)
+                        .map_err(fell_core::Error::Action),
                 }
             }
         });
@@ -3560,16 +3593,15 @@ impl Inbox {
                         if remote_open {
                             inbox.finish_server_draft_open(None, cx);
                         }
-                        let error = std::io::Error::other(err);
                         fell_core::diagnostic!(
                             WARN,
                             "Could not open compose draft",
-                            error = &error as &dyn std::error::Error
+                            error = &err as &dyn std::error::Error
                         );
-                        let text = if creating {
-                            "Couldn't start a draft."
-                        } else {
-                            "Couldn't open the draft."
+                        let text = match err {
+                            fell_core::Error::DraftBodyUnavailable => err.to_string(),
+                            _ if creating => "Couldn't start a draft.".into(),
+                            _ => "Couldn't open the draft.".into(),
                         };
                         inbox.session.show_toast(text, true);
                     }
@@ -4994,14 +5026,13 @@ impl Render for Inbox {
             });
             selected.and_then(|target| checks.for_message(&target.id))
         });
-        let status =
-            if self.opening_draft.as_ref().is_some_and(|open| {
-                real.saturating_duration_since(open.started) >= DRAFT_OPEN_FEEDBACK
-            }) {
-                StatusLabel::opening_draft(&self.theme)
-            } else {
-                StatusLabel::new(&self.theme, &self.session, reply_check, width)
-            };
+        let status = if self.opening_draft.as_ref().is_some_and(|open| {
+            !open.shown && real.saturating_duration_since(open.started) >= DRAFT_OPEN_FEEDBACK
+        }) {
+            StatusLabel::opening_draft(&self.theme)
+        } else {
+            StatusLabel::new(&self.theme, &self.session, reply_check, width)
+        };
         let status_labels = self.status_labels.update(status, self.motion.motion, now);
         let animating = self.motion.tick(now)
             | waiting_for_resize
@@ -7845,6 +7876,24 @@ pub fn read_conversation(
     let mut view = present::conversation(&messages, me, roles, names, viewing);
     for ((message, state), stored) in view.iter_mut().zip(states).zip(&messages) {
         message.body_state = state;
+        if state == fell_core::BodyState::Stored
+            && roles.is(FolderRole::Drafts, viewing)
+            && stored
+                .folders
+                .iter()
+                .any(|folder| roles.is(FolderRole::Drafts, folder))
+        {
+            let body = store.editable_draft_body(
+                account,
+                stored.headers.message_id.as_str(),
+                stored.body_text.as_deref(),
+            )?;
+            if let Some(preview) = present::draft_reader_body(&body, &stored.headers.subject, false)
+            {
+                message.body = preview;
+                message.snippet = present::markdown_snippet(&body, &stored.headers.subject);
+            }
+        }
         if stored.has_attachment {
             let parts = store.message_attachments(account, &stored.headers.message_id)?;
             message.attachments = attachments::visible_parts(parts.unwrap_or_default());

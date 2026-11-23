@@ -52,13 +52,10 @@ impl Debounce {
     }
 
     pub fn due(&mut self, revision: u64, now_ms: Option<u64>) -> bool {
-        if !self.allowed {
+        if !self.allowed || self.queued == Some(revision) {
             return false;
         }
         if let Some(now_ms) = now_ms {
-            if self.queued == Some(revision) {
-                return false;
-            }
             let (previous, since) = *self.observed.get_or_insert((revision, now_ms));
             if previous != revision {
                 self.observed = Some((revision, now_ms));
@@ -146,8 +143,7 @@ fn queue_if_enabled(
         diagnostic!(DEBUG, "Server draft has an unresolved attachment");
         return Ok(SaveReceipt::ServerFailed);
     }
-    let digest = digest(draft, &closure.files);
-    let outgoing = mime::build_server_draft(draft, &closure.files);
+    let (digest, outgoing) = server_draft_payload(draft, &closure.files);
     if outbox::drafts::queue(
         store,
         &draft.account_id,
@@ -159,4 +155,11 @@ fn queue_if_enabled(
         wake();
     }
     Ok(SaveReceipt::Server(digest))
+}
+
+pub(crate) fn server_draft_payload(
+    draft: &StoredCompose,
+    files: &[ResolvedFile],
+) -> ([u8; 32], super::Outgoing) {
+    (digest(draft, files), mime::build_server_draft(draft, files))
 }

@@ -109,7 +109,7 @@ pub(crate) fn mark_discarded(
         params![account.as_str(), id, action_id, SEND_SENT],
     )?;
     if changed == 1 {
-        crate::outbox::drafts::discard(conn, account, id)?;
+        crate::outbox::drafts::discard(conn, account, id, action_id)?;
     }
     Ok(changed == 1)
 }
@@ -117,6 +117,7 @@ pub(crate) fn mark_discarded(
 /// Decide what is visible in Drafts under the same write lock that restores
 /// the batch. A Sent match arriving during the discard keeps its send lock.
 pub(crate) fn undo_discard(
+    store: &Store,
     conn: &rusqlite::Connection,
     account: &AccountId,
     action_id: i64,
@@ -130,11 +131,26 @@ pub(crate) fn undo_discard(
         params![account.as_str(), action_id, SEND_SENT],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
+    let drafts = {
+        let mut stmt = conn.prepare(
+            "SELECT d.id FROM compose_drafts d
+             WHERE d.account_id = ?1 AND d.discarded_action_id = ?2
+             AND NOT EXISTS (SELECT 1 FROM compose_send s
+                WHERE s.account_id = d.account_id AND s.draft_id = d.id AND s.state = ?3)",
+        )?;
+        stmt.query_map(params![account.as_str(), action_id, SEND_SENT], |r| {
+            r.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
     conn.execute(
         "UPDATE compose_drafts SET discarded_action_id = NULL
          WHERE account_id = ?1 AND discarded_action_id = ?2",
         params![account.as_str(), action_id],
     )?;
+    for id in drafts {
+        crate::outbox::drafts::undo_discard(store, conn, account, action_id, &id)?;
+    }
     Ok((restored, confirmed))
 }
 
@@ -366,6 +382,7 @@ impl Store {
         &self,
         copy: &crate::outbox::drafts::Copy,
         draft: &StoredCompose,
+        message_id: Option<&str>,
     ) -> Result<String> {
         workspace::validate_id(&draft.id).map_err(crate::Error::Invalid)?;
         let tx = crate::store::begin_immediate(&self.conn)?;
@@ -380,6 +397,7 @@ impl Store {
             &draft.id,
             copy,
             &super::server::digest(draft, &draft.files),
+            message_id,
         )?;
         self.hide_server_draft_copy(&tx, account, copy)?;
         tx.commit()?;

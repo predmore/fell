@@ -3,7 +3,7 @@
 
 use crate::FlagChange;
 use crate::account::{Account, AccountId, BackendKind};
-use crate::backend::ImapBackend;
+use crate::backend::{ImapBackend, MailBackend};
 use crate::outbox::{DropReason, OutboxKind, OutboxState};
 use crate::store::Store;
 use crate::sync::sync_once;
@@ -3685,7 +3685,7 @@ fn server_draft_import_keeps_html_only_text_and_filters_header_controls() {
         .import_server_draft(&fx.store, &thread, "imported-draft")
         .unwrap();
     let stored = fx.store.load_compose(&id).unwrap().unwrap();
-    assert_eq!(stored.body, "# Field notes\n\nTwo routes & a map.");
+    assert_eq!(stored.body, "# Field notes\n\nTwo **routes** & a map.");
     assert_eq!(stored.fields.subject, "Field notes");
     assert_eq!(stored.fields.to, ["Avery <avery@example.test>"]);
     assert_eq!(stored.fields.from, "c@x");
@@ -3706,10 +3706,7 @@ fn server_draft_with_uneditable_html_stays_on_the_server_and_in_drafts() {
         .account_config()
         .import_server_draft(&fx.store, &thread, "imported-draft")
         .unwrap_err();
-    assert!(
-        err.to_string().contains("HTML has no editable text"),
-        "{err}"
-    );
+    assert!(matches!(err, crate::Error::DraftBodyUnavailable), "{err}");
     assert!(fx.store.load_compose("imported-draft").unwrap().is_none());
     assert_eq!(fx.subjects(SERVER_DRAFTS), ["Image-only draft"]);
     assert_eq!(
@@ -3727,7 +3724,7 @@ fn queue_draft_body(hub: &crate::compose::DraftHub, body: &str) {
 }
 
 #[test]
-fn server_draft_discard_and_undo_queue_delete_then_a_new_copy() {
+fn server_draft_undo_cancels_a_pending_delete_without_reopening() {
     let dir = tempfile::tempdir().unwrap();
     let fx = draft_fixture(Store::open(dir.path().join("mail.db")).unwrap());
     let hub = draft_hub(&dir.path().join("drafts"), &fx);
@@ -3762,10 +3759,29 @@ fn server_draft_discard_and_undo_queue_delete_then_a_new_copy() {
             .len(),
         1
     );
-    // Even an unchanged save needs an APPEND after the already queued delete.
+    assert_eq!(fx.replay().sent, 0);
+    assert_eq!(fx.on_server(SERVER_DRAFTS), [(1, "Weekly notes".into())]);
+    assert!(!fx.commands().iter().any(|cmd| cmd.contains("UID EXPUNGE")));
+}
+
+#[test]
+fn server_draft_undo_after_expunge_replaces_the_saved_copy_without_reopening() {
+    let dir = tempfile::tempdir().unwrap();
+    let fx = draft_fixture(Store::open(dir.path().join("mail.db")).unwrap());
+    let hub = draft_hub(&dir.path().join("drafts"), &fx);
     queue_draft_body(&hub, "Original");
-    assert_eq!(fx.replay().sent, 2);
+    assert_eq!(fx.replay().sent, 1);
+    fx.store
+        .discard_compose_drafts(&fx.account.id, &["draft-test".into()])
+        .unwrap();
+    assert_eq!(fx.replay().sent, 1);
+    assert!(fx.on_server(SERVER_DRAFTS).is_empty());
+
+    fx.store.undo(&fx.account.id).unwrap();
+    assert_eq!(fx.replay().sent, 1);
     assert_eq!(fx.on_server(SERVER_DRAFTS), [(2, "Weekly notes".into())]);
+    let state = fx.server.state.lock().unwrap();
+    assert!(String::from_utf8_lossy(&state.mailboxes[1].messages[0].raw).contains("Original"));
 }
 
 #[test]
@@ -3784,8 +3800,8 @@ fn server_draft_undo_saves_even_while_an_older_append_is_in_recovery() {
     queue_draft_body(&hub, "Original");
 
     fx.make_due();
-    assert_eq!(fx.replay().sent, 3);
-    assert_eq!(fx.on_server(SERVER_DRAFTS), [(2, "Weekly notes".into())]);
+    assert_eq!(fx.replay().sent, 1);
+    assert_eq!(fx.on_server(SERVER_DRAFTS), [(1, "Weekly notes".into())]);
 }
 
 #[test]
@@ -3814,13 +3830,24 @@ fn server_draft_discard_with_write_back_off_reveals_the_original_on_sync() {
     assert_eq!(fx.on_server(SERVER_DRAFTS), [(1, "Weekly notes".into())]);
 
     fx.store.undo(&fx.account.id).unwrap();
+    assert!(fx.subjects(SERVER_DRAFTS).is_empty());
     fx.store.set_write_back(&fx.account.id, true).unwrap();
     queue_draft_body(&hub, "Original");
-    assert_eq!(fx.replay().sent, 1);
-    assert_eq!(
-        fx.on_server(SERVER_DRAFTS),
-        [(1, "Weekly notes".into()), (2, "Weekly notes".into())]
+    assert_eq!(fx.replay().sent, 0);
+    assert_eq!(fx.on_server(SERVER_DRAFTS), [(1, "Weekly notes".into())]);
+
+    fx.store.set_write_back(&fx.account.id, false).unwrap();
+    fx.store
+        .discard_compose_drafts(&fx.account.id, &["draft-test".into()])
+        .unwrap();
+    fx.store.undo(&fx.account.id).unwrap();
+    assert!(
+        crate::outbox::drafts::rescan_mailboxes(fx.store.connection(), &fx.account.id)
+            .unwrap()
+            .is_empty()
     );
+    fx.sync();
+    assert!(fx.subjects(SERVER_DRAFTS).is_empty());
 }
 
 #[test]
@@ -3879,4 +3906,152 @@ fn server_draft_cleanup_of_an_already_expunged_uid_does_not_stall() {
     assert_eq!(report.sent, 2);
     assert!(report.dropped.is_empty());
     assert_eq!(fx.on_server(SERVER_DRAFTS), [(3, "Weekly notes".into())]);
+}
+
+#[test]
+fn server_draft_rescan_keeps_the_floor_after_an_interrupted_mailbox_walk() {
+    let _windows = super::set_windows(super::Windows {
+        first: 2,
+        window: 2,
+        inbox_head: 2,
+        sent_head: 2,
+        other_head: 2,
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let fx = draft_fixture(Store::open(dir.path().join("mail.db")).unwrap());
+    let hub = draft_hub(&dir.path().join("drafts"), &fx);
+    queue_draft_body(&hub, "Original");
+    assert_eq!(fx.replay().sent, 1);
+    fx.sync();
+    for uid in 2..=8 {
+        let mime = format!("Subject: Other draft {uid}\r\nMessage-ID: <draft-{uid}@x>\r\n\r\nBody");
+        fx.deliver(SERVER_DRAFTS, uid, mime.into_bytes());
+    }
+    fx.store.set_write_back(&fx.account.id, false).unwrap();
+    fx.store
+        .discard_compose_drafts(&fx.account.id, &["draft-test".into()])
+        .unwrap();
+
+    let store = &fx.store;
+    let account = &fx.account.id;
+    let checkpoint = |cursor: Option<&crate::SyncCursor>| {
+        super::decode_cursor(cursor)
+            .into_iter()
+            .find(|(name, _)| name == SERVER_DRAFTS)
+            .map(|(_, state)| state)
+    };
+    let cursor = store.sync_cursor_for_pass(account).unwrap();
+    assert!(checkpoint(cursor.as_ref()).is_none());
+    let known =
+        |mailbox: &str, validity, range| store.stored_uids(account, mailbox, validity, range);
+    let stopped = fx
+        .backend
+        .sync_changes(cursor.as_ref(), &known, &mut |delta| {
+            store.apply_delta(account, &delta)?;
+            if checkpoint(delta.cursor.as_ref()).is_some_and(|state| state.floor.is_some()) {
+                return Err(crate::Error::Action(
+                    "test stopped after the first window".into(),
+                ));
+            }
+            Ok(())
+        });
+    assert!(stopped.is_err());
+    let saved = checkpoint(store.sync_cursor(account).unwrap().as_ref()).unwrap();
+    assert!(saved.floor.is_some());
+    let resumed = checkpoint(store.sync_cursor_for_pass(account).unwrap().as_ref()).unwrap();
+    assert_eq!(resumed, saved);
+    fx.sync();
+    assert!(
+        checkpoint(store.sync_cursor(account).unwrap().as_ref())
+            .unwrap()
+            .floor
+            .is_none()
+    );
+    assert!(fx.subjects(SERVER_DRAFTS).contains(&"Weekly notes".into()));
+}
+
+#[test]
+fn server_draft_cleanup_after_uidvalidity_reset_requires_an_exact_message_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let fx = draft_fixture(Store::open(dir.path().join("mail.db")).unwrap());
+    let hub = draft_hub(&dir.path().join("drafts"), &fx);
+    queue_draft_body(&hub, "Original");
+    assert_eq!(fx.replay().sent, 1);
+    let original = {
+        let mut state = fx.server.state.lock().unwrap();
+        let folder = &mut state.mailboxes[1];
+        folder.uidvalidity += 1;
+        folder.messages.pop().unwrap().raw
+    };
+    let unrelated = b"Subject: Unrelated\r\nMessage-ID: <other@x>\r\n\r\nKeep";
+    fx.deliver(SERVER_DRAFTS, 1, unrelated.to_vec());
+    fx.store
+        .discard_compose_drafts(&fx.account.id, &["draft-test".into()])
+        .unwrap();
+    assert_eq!(fx.replay().sent, 0);
+    assert_eq!(fx.on_server(SERVER_DRAFTS), [(1, "Unrelated".into())]);
+    assert!(!fx.commands().iter().any(|cmd| cmd.contains("UID STORE 1")));
+
+    fx.deliver(SERVER_DRAFTS, 9, original);
+    fx.make_due();
+    assert_eq!(fx.replay().sent, 1);
+    assert_eq!(fx.on_server(SERVER_DRAFTS), [(1, "Unrelated".into())]);
+    assert!(
+        fx.commands()
+            .iter()
+            .any(|cmd| cmd.contains("UID EXPUNGE 9"))
+    );
+}
+
+#[test]
+fn server_draft_with_whitespace_plain_part_uses_rich_html() {
+    let fx = draft_fixture(Store::open_in_memory().unwrap());
+    let html = "<h1>Route review</h1><p>A <strong>bold</strong> decision with <em>care</em>.</p><p>Open the <a href=\"https://example.test/map\">map</a>.</p><ul><li>Walk north</li><li>Turn west</li></ul><blockquote><p>Bring notes.</p><p>Stay together.</p></blockquote>";
+    let mime = format!(
+        "From: Reader <c@x>\r\nSubject: Route review\r\nMessage-ID: <rich-draft@x>\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=alt\r\n\r\n--alt\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n   \r\n--alt\r\nContent-Type: text/html; charset=utf-8\r\n\r\n{html}\r\n--alt--\r\n"
+    );
+    fx.deliver(SERVER_DRAFTS, 1, mime.into_bytes());
+    fx.sync();
+    let thread = fx.thread(SERVER_DRAFTS, "Route review");
+    let draft = fx
+        .account_config()
+        .import_server_draft(&fx.store, &thread, "rich-draft")
+        .unwrap();
+    let body = fx.store.load_compose(&draft).unwrap().unwrap().body;
+    let expected = "# Route review\n\nA **bold** decision with *care*.\n\nOpen the [map](https://example.test/map).\n\n- Walk north\n- Turn west\n\n> Bring notes.\n> \n> Stay together.";
+    assert_eq!(body, expected);
+    let editor = crate::compose::markdown_to_doc(&body);
+    assert_eq!(
+        fell_render::html_to_document(&crate::compose::doc_to_html(&editor)),
+        fell_render::html_to_document(html),
+    );
+}
+
+#[test]
+fn server_draft_close_uses_the_durable_failure_and_leaves_unchanged_edits_local() {
+    let dir = tempfile::tempdir().unwrap();
+    let fx = draft_fixture(Store::open(dir.path().join("mail.db")).unwrap());
+    let hub = draft_hub(&dir.path().join("drafts"), &fx);
+    assert!(hub.show("draft-test"));
+    hub.note_shown("draft-test");
+    set_draft_body(&hub, "Keep this edit".into());
+    hub.poll_server_draft("draft-test", 0);
+    hub.poll_server_draft("draft-test", 6_000);
+    wait_for_draft(&hub);
+    fx.server.writes.lock().unwrap().refuse_append = true;
+    for _ in 0..super::write_back::MAX_ATTEMPTS {
+        fx.make_due();
+        fx.replay();
+    }
+    hub.note_hidden("draft-test");
+    wait_for_draft(&hub);
+    let notice = hub.take_close_notices().pop().unwrap().resolve(&fx.store);
+    assert_eq!(notice, ("Kept in Fell · not on the server".into(), true));
+    assert!(
+        fx.store
+            .outbox(&fx.account.id)
+            .unwrap()
+            .iter()
+            .all(|entry| entry.state != OutboxState::Pending)
+    );
 }

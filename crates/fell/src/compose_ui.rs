@@ -307,6 +307,7 @@ pub struct ComposeView {
     flush_pending: bool,
     flush_gen: u64,
     draft_save: Option<(u64, DraftSaveStatus, Option<Transition>)>,
+    draft_save_exit: Option<Transition>,
     announced_paint: Option<SharedString>,
     motion: Motion,
     /// `:q` asked to close this window. The next frame removes it.
@@ -424,6 +425,7 @@ impl ComposeView {
             flush_pending: false,
             flush_gen: 0,
             draft_save: None,
+            draft_save_exit: None,
             announced_paint: None,
             motion: Motion::from_env(),
             closing: false,
@@ -555,6 +557,7 @@ impl ComposeView {
                         {
                             let fade = this.motion.start(motion::FADE, Instant::now());
                             this.draft_save = Some((revision, status, fade));
+                            this.draft_save_exit = None;
                             cx.notify();
                         }
                     });
@@ -564,6 +567,7 @@ impl ComposeView {
         .detach();
         cx.observe_window_activation(window, |this, window, cx| {
             if window.is_window_active() && !this.closing {
+                crate::view::compose_draft_shown(&this.draft_id, cx);
                 this.refresh_send_availability(cx);
             }
         })
@@ -899,6 +903,7 @@ impl ComposeView {
         self.folder = folder;
         self.draft_id = id.into();
         self.draft_save = None;
+        self.draft_save_exit = None;
         self.discarding = false;
         self.editor = Editor::from_body(&snap.body);
         self.applied_revision = snap.revision;
@@ -2041,21 +2046,34 @@ impl Render for ComposeView {
         } else {
             self.status.clone()
         };
-        let draft_save = self
-            .draft_save
-            .filter(|(revision, _, _)| {
-                lock.is_none() && *revision == snap.revision && self.header_matches(&snap)
-            })
-            .map(|(_, status, fade)| {
-                let now = Instant::now();
+        let header_matches = self.header_matches(&snap);
+        let save_exit = &mut self.draft_save_exit;
+        let motion = self.motion;
+        let draft_save = self.draft_save.and_then(|(revision, status, fade)| {
+            if lock.is_some() {
+                return None;
+            }
+            let now = Instant::now();
+            if revision == snap.revision && header_matches {
+                *save_exit = None;
                 let opacity = fade.map_or(1., |fade| {
                     if fade.running(now) {
                         window.request_animation_frame();
                     }
                     fade.progress(now)
                 });
-                (status, opacity)
-            });
+                return Some((status, opacity));
+            }
+            if status == DraftSaveStatus::ServerFailed || !motion.enabled() {
+                return None;
+            }
+            let exit = save_exit.get_or_insert_with(|| Transition::new(now, motion::FADE));
+            if exit.running(now) {
+                window.request_animation_frame();
+                return Some((status, exit.remaining(now)));
+            }
+            None
+        });
         if !self.closing && self.announced_paint.as_ref() != Some(&self.draft_id) {
             let draft = self.draft_id.clone();
             self.announced_paint = Some(draft.clone());

@@ -24,8 +24,18 @@ pub(super) fn ensure_schema(conn: &Connection) -> Result<()> {
              mailbox TEXT NOT NULL,
              UNIQUE (account_id, mailbox)
          );
-         CREATE INDEX IF NOT EXISTS idx_outbox_draft
-             ON server_outbox(account_id, draft_id, id) WHERE draft_id IS NOT NULL;",
+         CREATE TABLE IF NOT EXISTS discarded_server_draft_copies (
+             account_id TEXT NOT NULL,
+             action_id INTEGER NOT NULL,
+             draft_id TEXT NOT NULL,
+             mailbox TEXT NOT NULL,
+             uidvalidity INTEGER NOT NULL,
+             uid INTEGER NOT NULL,
+             digest BLOB NOT NULL,
+             message_id TEXT,
+             needs_rescan INTEGER NOT NULL DEFAULT 1,
+             PRIMARY KEY (account_id, action_id, draft_id)
+         ) WITHOUT ROWID;",
     )?;
     Ok(())
 }
@@ -123,7 +133,20 @@ pub(crate) fn queue(
     // Give the replacement its own row ID. A replay that already read the
     // superseded payload can no longer mark that row sent.
     cancel_unsent(&tx, account, draft)?;
-    tx.execute(
+    insert_append(&tx, account, draft, digest, message, mime)?;
+    tx.commit()?;
+    Ok(true)
+}
+
+fn insert_append(
+    conn: &Connection,
+    account: &AccountId,
+    draft: &str,
+    digest: &[u8],
+    message: MessageId,
+    mime: &[u8],
+) -> Result<()> {
+    conn.execute(
         "INSERT INTO server_outbox (account_id, kind, state, message_id, source_folder,
              target_folder, generation, created_unix, append_mime, draft_id, draft_digest)
          VALUES (?1, 'append_draft', 'pending', ?2, '', ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -131,15 +154,14 @@ pub(crate) fn queue(
             account.as_str(),
             message.as_str(),
             FolderRole::Drafts.default_name(),
-            generation(&tx, account)?,
+            generation(conn, account)?,
             now_unix(),
             mime,
             draft,
             digest
         ],
     )?;
-    tx.commit()?;
-    Ok(true)
+    Ok(())
 }
 
 /// Give an unconfirmed APPEND a fresh bounded lookup on the next save or
@@ -164,23 +186,26 @@ pub(crate) fn cancel_unsent(conn: &Connection, account: &AccountId, draft: &str)
     Ok(())
 }
 
-pub(crate) fn discard(conn: &Connection, account: &AccountId, draft: &str) -> Result<()> {
+pub(crate) fn discard(
+    conn: &Connection,
+    account: &AccountId,
+    draft: &str,
+    action: i64,
+) -> Result<()> {
     if enabled(conn, account)? {
-        queue_delete(conn, account, draft)
-    } else {
-        release_copy(conn, account, draft)
+        return queue_delete_for(conn, account, draft, Some(action));
     }
+    conn.execute(
+        "INSERT INTO discarded_server_draft_copies
+            (account_id, action_id, draft_id, mailbox, uidvalidity, uid, digest, message_id)
+         SELECT account_id, ?3, draft_id, mailbox, uidvalidity, uid, digest, message_id
+         FROM server_draft_copies WHERE account_id = ?1 AND draft_id = ?2",
+        params![account.as_str(), draft, action],
+    )?;
+    unlink_copy(conn, account, draft)
 }
 
-/// The next sync must revisit the mailbox: its cursor can already be
-/// past the UID whose synced representation was removed on import.
-fn release_copy(conn: &Connection, account: &AccountId, draft: &str) -> Result<()> {
-    conn.execute(
-        "INSERT OR REPLACE INTO server_draft_rescans (account_id, mailbox)
-         SELECT account_id, mailbox FROM server_draft_copies
-         WHERE account_id = ?1 AND draft_id = ?2",
-        params![account.as_str(), draft],
-    )?;
+fn unlink_copy(conn: &Connection, account: &AccountId, draft: &str) -> Result<()> {
     conn.execute(
         "DELETE FROM server_draft_copies WHERE account_id = ?1 AND draft_id = ?2",
         params![account.as_str(), draft],
@@ -188,26 +213,120 @@ fn release_copy(conn: &Connection, account: &AccountId, draft: &str) -> Result<(
     Ok(())
 }
 
-pub(crate) fn rescans(store: &Store, account: &AccountId) -> Result<Vec<(i64, String)>> {
-    let mut stmt = store
-        .connection()
-        .prepare_cached("SELECT id, mailbox FROM server_draft_rescans WHERE account_id = ?1")?;
-    Ok(stmt
-        .query_map([account.as_str()], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?)
-}
+/// Undo keeps an untouched UID. Once deletion could have reached the server,
+/// enqueue the exact restored local payload while the outbox row is retired.
+pub(crate) fn undo_discard(
+    store: &Store,
+    conn: &Connection,
+    account: &AccountId,
+    action: i64,
+    draft: &str,
+) -> Result<()> {
+    let copied = conn.execute(
+        "INSERT OR IGNORE INTO server_draft_copies
+            (account_id, draft_id, mailbox, uidvalidity, uid, digest, message_id)
+         SELECT account_id, draft_id, mailbox, uidvalidity, uid, digest, message_id
+         FROM discarded_server_draft_copies
+         WHERE account_id = ?1 AND action_id = ?2 AND draft_id = ?3",
+        params![account.as_str(), action, draft],
+    )?;
+    if copied != 0 {
+        let copy = conn.query_row(
+            "SELECT mailbox, uidvalidity, uid FROM server_draft_copies
+             WHERE account_id = ?1 AND draft_id = ?2",
+            params![account.as_str(), draft],
+            |r| {
+                Ok(Copy {
+                    mailbox: r.get(0)?,
+                    validity: r.get(1)?,
+                    uid: r.get(2)?,
+                })
+            },
+        )?;
+        store.hide_server_draft_copy(conn, account, &copy)?;
+    }
+    conn.execute(
+        "DELETE FROM discarded_server_draft_copies
+         WHERE account_id = ?1 AND action_id = ?2 AND draft_id = ?3",
+        params![account.as_str(), action, draft],
+    )?;
 
-pub(crate) fn finish_rescans(store: &Store, ids: impl Iterator<Item = i64>) -> Result<()> {
-    for id in ids {
-        // If a discard raced this sync, REPLACE assigned it a different ID.
-        store
-            .connection()
-            .execute("DELETE FROM server_draft_rescans WHERE id = ?1", [id])?;
+    let dispatched: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM server_outbox WHERE account_id = ?1 AND draft_id = ?3
+             AND action_id = ?2 AND kind = 'delete_draft'
+             AND state IN ('done', 'pending') AND sent)",
+        params![account.as_str(), action, draft],
+        |r| r.get(0),
+    )?;
+    conn.execute(
+        "DELETE FROM server_outbox WHERE account_id = ?1 AND draft_id = ?3 AND kind = 'delete_draft'
+            AND state = 'pending' AND (action_id = ?2 OR action_id IS NULL)",
+        params![account.as_str(), action, draft],
+    )?;
+    if dispatched
+        && enabled(conn, account)?
+        && let Some(mut restored) = store.load_compose(draft)?
+    {
+        let inline = crate::compose::inline_image_paths(&restored.body);
+        for file in &mut restored.files {
+            file.inline = inline.contains(&file.path);
+        }
+        let (digest, outgoing) = crate::compose::server_draft_payload(&restored, &restored.files);
+        insert_append(
+            conn,
+            account,
+            draft,
+            &digest,
+            outgoing.message_id,
+            &outgoing.mime,
+        )?;
     }
     Ok(())
 }
 
+fn release_copy(conn: &Connection, account: &AccountId, draft: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO server_draft_rescans (account_id, mailbox)
+         SELECT account_id, mailbox FROM server_draft_copies
+         WHERE account_id = ?1 AND draft_id = ?2",
+        params![account.as_str(), draft],
+    )?;
+    unlink_copy(conn, account, draft)
+}
+
+pub(crate) fn rescan_mailboxes(conn: &Connection, account: &AccountId) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT mailbox FROM server_draft_rescans WHERE account_id = ?1
+         UNION SELECT mailbox FROM discarded_server_draft_copies
+            WHERE account_id = ?1 AND needs_rescan",
+    )?;
+    Ok(stmt
+        .query_map([account.as_str()], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+pub(crate) fn consume_rescans(conn: &Connection, account: &AccountId) -> Result<()> {
+    conn.execute(
+        "DELETE FROM server_draft_rescans WHERE account_id = ?1",
+        [account.as_str()],
+    )?;
+    conn.execute(
+        "UPDATE discarded_server_draft_copies SET needs_rescan = 0 WHERE account_id = ?1 AND needs_rescan",
+        [account.as_str()],
+    )?;
+    Ok(())
+}
+
 pub(crate) fn queue_delete(conn: &Connection, account: &AccountId, draft: &str) -> Result<()> {
+    queue_delete_for(conn, account, draft, None)
+}
+
+fn queue_delete_for(
+    conn: &Connection,
+    account: &AccountId,
+    draft: &str,
+    action: Option<i64>,
+) -> Result<()> {
     if !enabled(conn, account)? {
         return Ok(());
     }
@@ -215,8 +334,8 @@ pub(crate) fn queue_delete(conn: &Connection, account: &AccountId, draft: &str) 
     rearm_recovery(conn, account, draft)?;
     conn.execute(
         "INSERT INTO server_outbox (account_id, kind, state, message_id, source_folder,
-             target_folder, generation, created_unix, draft_id)
-         SELECT ?1, 'delete_draft', 'pending', '', ?3, '', ?4, ?5, ?2
+             target_folder, generation, created_unix, draft_id, action_id)
+         SELECT ?1, 'delete_draft', 'pending', '', ?3, '', ?4, ?5, ?2, ?6
          WHERE NOT EXISTS (SELECT 1 FROM server_outbox WHERE account_id = ?1
                      AND draft_id = ?2 AND kind = 'delete_draft' AND state = 'pending')
            AND (EXISTS (SELECT 1 FROM server_draft_copies WHERE account_id = ?1 AND draft_id = ?2)
@@ -227,7 +346,8 @@ pub(crate) fn queue_delete(conn: &Connection, account: &AccountId, draft: &str) 
             draft,
             FolderRole::Drafts.default_name(),
             generation(conn, account)?,
-            now_unix()
+            now_unix(),
+            action,
         ],
     )?;
     Ok(())
@@ -235,6 +355,7 @@ pub(crate) fn queue_delete(conn: &Connection, account: &AccountId, draft: &str) 
 
 pub(crate) struct Pending {
     pub current: Option<Copy>,
+    pub current_message_id: Option<String>,
     pub placed: Option<Copy>,
     pub can_append: bool,
 }
@@ -245,7 +366,12 @@ pub(crate) fn pending(store: &Store, entry: &OutboxEntry) -> Result<Option<Pendi
                 EXISTS (SELECT 1 FROM compose_drafts d WHERE d.account_id = o.account_id
                         AND d.id = o.draft_id AND d.discarded_action_id IS NULL)
                 AND NOT EXISTS (SELECT 1 FROM compose_send s WHERE s.account_id = o.account_id
-                        AND s.draft_id = o.draft_id AND s.state = 'sent')
+                        AND s.draft_id = o.draft_id AND s.state = 'sent'),
+                coalesce(c.message_id, (SELECT p.message_id FROM server_outbox p
+                    WHERE p.account_id = o.account_id AND p.draft_id = o.draft_id
+                      AND p.kind = 'append_draft' AND p.target_mailbox = c.mailbox
+                      AND p.placed_uidvalidity = c.uidvalidity AND p.placed_uid = c.uid
+                    ORDER BY p.id DESC LIMIT 1))
          FROM server_outbox o JOIN write_back_accounts a USING (account_id)
          LEFT JOIN server_draft_copies c ON c.account_id = o.account_id AND c.draft_id = o.draft_id
          WHERE o.id = ?1 AND a.enabled AND o.generation = a.generation AND o.state = 'pending'
@@ -259,9 +385,19 @@ pub(crate) fn pending(store: &Store, entry: &OutboxEntry) -> Result<Option<Pendi
                 let Some(uid) = row.get(offset + 2)? else { return Ok(None) };
                 Ok(Some(Copy { mailbox: row.get(offset)?, validity: row.get(offset + 1)?, uid }))
             };
-            Ok(Pending { current: copy(0)?, placed: copy(3)?, can_append: row.get(6)? })
+            Ok(Pending { current: copy(0)?, current_message_id: row.get(7)?, placed: copy(3)?, can_append: row.get(6)? })
         },
     ).optional()?)
+}
+
+/// Record that a discard might reach the server before sending UID STORE.
+pub(crate) fn begin_delete(store: &Store, entry: &OutboxEntry) -> Result<bool> {
+    Ok(store.connection().execute(
+        "UPDATE server_outbox SET sent = 1
+         WHERE id = ?1 AND state = 'pending' AND generation IN
+             (SELECT generation FROM write_back_accounts WHERE account_id = server_outbox.account_id AND enabled)",
+        [entry.id],
+    )? != 0)
 }
 
 /// Commit APPENDUID (or the recovered UID) before issuing either delete command.
@@ -331,11 +467,12 @@ fn promote_placed(store: &Store, tx: &Connection, entry: &OutboxEntry) -> Result
     if let Some((account, copy)) = placed {
         store.hide_server_draft_copy(tx, &account, &copy)?;
         tx.execute(
-            "INSERT INTO server_draft_copies (account_id, draft_id, mailbox, uidvalidity, uid, digest)
-             SELECT account_id, draft_id, target_mailbox, placed_uidvalidity, placed_uid, draft_digest
+            "INSERT INTO server_draft_copies (account_id, draft_id, mailbox, uidvalidity, uid, digest, message_id)
+             SELECT account_id, draft_id, target_mailbox, placed_uidvalidity, placed_uid, draft_digest, message_id
              FROM server_outbox WHERE id = ?1
              ON CONFLICT(account_id, draft_id) DO UPDATE SET mailbox = excluded.mailbox,
-                 uidvalidity = excluded.uidvalidity, uid = excluded.uid, digest = excluded.digest",
+                 uidvalidity = excluded.uidvalidity, uid = excluded.uid, digest = excluded.digest,
+                 message_id = excluded.message_id",
             [entry.id],
         )?;
     }
@@ -365,17 +502,19 @@ pub(crate) fn import(
     draft: &str,
     copy: &Copy,
     digest: &[u8],
+    message_id: Option<&str>,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO server_draft_copies (account_id, draft_id, mailbox, uidvalidity, uid, digest)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO server_draft_copies (account_id, draft_id, mailbox, uidvalidity, uid, digest, message_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             account.as_str(),
             draft,
             copy.mailbox,
             copy.validity,
             copy.uid,
-            digest
+            digest,
+            message_id,
         ],
     )?;
     Ok(())

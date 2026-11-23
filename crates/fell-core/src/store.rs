@@ -750,6 +750,31 @@ impl Store {
         sync_cursor_on(&self.conn, account_id)
     }
 
+    /// Consume a request to revisit Drafts with the cursor change it needs.
+    /// Each later delta can advance this cursor, even when the walk is cut short.
+    pub(crate) fn sync_cursor_for_pass(
+        &self,
+        account: &AccountId,
+    ) -> Result<Option<crate::SyncCursor>> {
+        use crate::outbox::drafts;
+        if drafts::rescan_mailboxes(&self.conn, account)?.is_empty() {
+            return self.sync_cursor(account);
+        }
+        let tx = immediate_transaction(&self.conn)?;
+        let cursor = sync_cursor_on(&tx, account)?;
+        let mailboxes = drafts::rescan_mailboxes(&tx, account)?;
+        if mailboxes.is_empty() {
+            return Ok(cursor);
+        }
+        let mut checkpoints = crate::imap::decode_cursor(cursor.as_ref());
+        checkpoints.retain(|(mailbox, _)| !mailboxes.contains(mailbox));
+        let cursor = crate::imap::encode_cursor(account.as_str(), &checkpoints);
+        set_sync_cursor_on(&tx, account, &cursor)?;
+        drafts::consume_rescans(&tx, account)?;
+        tx.commit()?;
+        Ok(Some(cursor))
+    }
+
     /// Read and star changes made in Fell that sync has not seen the server
     /// agree with yet. Sync keeps these values over the server's.
     pub fn pending_flag_changes(&self, account_id: &AccountId) -> Result<Vec<PendingFlags>> {
@@ -1868,17 +1893,8 @@ impl Store {
                 recipients.extend(decode_addresses(&row.get::<_, String>(2)?));
                 let subject = crate::notes::display_safe(&row.get::<_, String>(3)?, false);
                 let id: String = row.get(5)?;
-                let body = bodies::read_body_text(&self.conn, account_id, &id)?
-                    .and_then(|parts| {
-                        parts.plain.or_else(|| {
-                            parts
-                                .html
-                                .as_deref()
-                                .map(crate::imap::rfc822::html_draft_body)
-                        })
-                    })
-                    .or(row.get::<_, Option<String>>(4)?)
-                    .unwrap_or_default();
+                let fallback: Option<String> = row.get(4)?;
+                let body = self.editable_draft_body(account_id, &id, fallback.as_deref())?;
                 out.insert(
                     thread.clone(),
                     SyncedDraftPreview {
@@ -1891,6 +1907,28 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    /// Read the same editable body for a synced draft's list and reader.
+    pub fn editable_draft_body(
+        &self,
+        account: &AccountId,
+        message_id: &str,
+        fallback: Option<&str>,
+    ) -> Result<String> {
+        let Some(parts) = bodies::read_body_text(&self.conn, account, message_id)? else {
+            return Ok(fallback.unwrap_or_default().to_owned());
+        };
+        Ok(parts
+            .plain
+            .filter(|plain| !plain.trim().is_empty())
+            .or_else(|| {
+                parts
+                    .html
+                    .as_deref()
+                    .map(crate::imap::rfc822::html_draft_body)
+            })
+            .unwrap_or_else(|| fallback.unwrap_or_default().to_owned()))
     }
 
     /// One window of the list [`Store::folder_threads`] returns, whether the
@@ -2575,6 +2613,7 @@ fn delete_demo_account(conn: &Connection, id: &str) -> Result<()> {
         "server_outbox",
         "server_draft_copies",
         "server_draft_rescans",
+        "discarded_server_draft_copies",
         "write_back_accounts",
         "agent_grants",
         "agent_actions",

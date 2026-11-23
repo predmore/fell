@@ -151,6 +151,7 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("server_outbox", "append_mime", "BLOB"),
     ("server_outbox", "draft_id", "TEXT"),
     ("server_outbox", "draft_digest", "BLOB"),
+    ("server_draft_copies", "message_id", "TEXT"),
     (
         "server_outbox",
         "append_checks",
@@ -418,6 +419,7 @@ pub(crate) fn set_write_back_on(
 
 pub(crate) fn ensure_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(OUTBOX_SCHEMA)?;
+    drafts::ensure_schema(conn)?;
     for (table, column, definition) in ADDED_COLUMNS {
         let present: Option<i64> = conn
             .query_row(
@@ -432,7 +434,10 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<()> {
             ))?;
         }
     }
-    drafts::ensure_schema(conn)?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_outbox_draft
+         ON server_outbox(account_id, draft_id, id) WHERE draft_id IS NOT NULL;",
+    )?;
     // Earlier builds of write-back copied, flagged, and expunged on a server
     // without MOVE. A row they left half done is never finished: the
     // source copy stays (maybe flagged `\Deleted`), and it is reported once.
