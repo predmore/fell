@@ -38,6 +38,34 @@ pub(crate) struct Copy {
     pub uid: u32,
 }
 
+pub(crate) fn save_status(
+    store: &Store,
+    account: &AccountId,
+    draft: &str,
+    digest: &[u8; 32],
+) -> Result<Option<crate::compose::DraftSaveStatus>> {
+    use crate::compose::DraftSaveStatus;
+    let conn = store.connection();
+    let (state, confirmed): (Option<String>, bool) = conn
+        .prepare_cached(
+            "SELECT (SELECT state FROM server_outbox WHERE account_id = ?1 AND draft_id = ?2
+                    AND kind = 'append_draft' AND draft_digest = ?3 AND generation = ?4
+                    ORDER BY id DESC LIMIT 1),
+                EXISTS (SELECT 1 FROM server_draft_copies
+                    WHERE account_id = ?1 AND draft_id = ?2 AND digest = ?3)",
+        )?
+        .query_row(
+            params![account.as_str(), draft, digest, generation(conn, account)?],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+    Ok(match state.as_deref() {
+        Some("dropped") => Some(DraftSaveStatus::ServerFailed),
+        Some("pending") => None,
+        _ if confirmed => Some(DraftSaveStatus::Server),
+        _ => None,
+    })
+}
+
 pub(crate) fn has_copy(store: &Store, account: &AccountId, draft: &str) -> Result<bool> {
     Ok(store.connection().query_row(
         "SELECT EXISTS (SELECT 1 FROM server_draft_copies WHERE account_id = ?1 AND draft_id = ?2

@@ -1045,6 +1045,7 @@ impl DraftSession {
         self.outbound_since = None;
         let text = self.serialize();
         let job = SaveJob {
+            revision: self.revision,
             folder: self.folder.clone(),
             text: text.clone(),
             mailbox: Some(self.mailbox_save(&text)),
@@ -1063,7 +1064,7 @@ impl DraftSession {
             return Ok(());
         }
         match job.run(&mut self.save_cache) {
-            Ok(()) => Ok(()),
+            Ok(_) => Ok(()),
             Err(SaveError::File(err)) => Err(err),
             Err(SaveError::Mailbox(err)) => {
                 note_mailbox_error(&mut self.notices, &err);
@@ -1078,6 +1079,10 @@ impl DraftSession {
         if self.writer.is_none() {
             self.writer = Some(DraftWriter::spawn());
         }
+    }
+
+    pub fn save_receipt(&self) -> Option<super::SaveReceipt> {
+        self.writer.as_ref()?.receipt(self.revision)
     }
 
     /// Waits for every save queued so far. Call it after releasing the

@@ -72,8 +72,8 @@ pub use smtp::SmtpConfig;
 pub use store::PendingFlags;
 pub use store::{
     CidRepairBatch, CidRepairProgress, FolderPage, FolderSpan, FolderThread, ListFilter, ListKey,
-    ListSource, PartKinds, PartStamp, Participant, SearchPage, Store, ThreadList, ThreadSummary,
-    folder_aliases,
+    ListSource, PartKinds, PartStamp, Participant, SearchPage, Store, SyncedDraftPreview,
+    ThreadList, ThreadSummary, folder_aliases,
 };
 pub use sync::{
     InboxArrival, ReplyToBackfill, ReplyToProgress, SyncReport, fetch_message_bodies,

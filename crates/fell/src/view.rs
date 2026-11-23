@@ -196,6 +196,37 @@ fn compose_open(cx: &App) -> bool {
         .any(|handle| handle.downcast::<ComposeView>().is_some())
 }
 
+pub(crate) fn compose_draft_painted(id: &str, cx: &mut App) {
+    if let Some(inbox) = cx.try_global::<InboxWindow>().copied() {
+        inbox.update(cx, |inbox, cx| {
+            if inbox
+                .opening_draft
+                .as_ref()
+                .and_then(|open| open.ready.as_deref())
+                == Some(id)
+            {
+                inbox.finish_server_draft_open(Some(id), cx);
+            }
+        });
+    }
+}
+
+pub(crate) fn compose_draft_window_failed(id: &str, cx: &mut App) {
+    if let Some(inbox) = cx.try_global::<InboxWindow>().copied() {
+        inbox.update(cx, |inbox, cx| {
+            if inbox
+                .opening_draft
+                .as_ref()
+                .and_then(|open| open.ready.as_deref())
+                == Some(id)
+            {
+                inbox.finish_server_draft_open(None, cx);
+                inbox.session.show_toast("Couldn't open the draft.", true);
+            }
+        });
+    }
+}
+
 pub(crate) fn wake_sent_copy_sync(cx: &mut App) {
     if let Some(inbox) = cx.try_global::<InboxWindow>().copied() {
         inbox.update(cx, |inbox, _| {
@@ -278,6 +309,14 @@ impl ReadIntent {
         !self.switch && !self.changed && self.select.is_none()
     }
 }
+
+struct OpeningServerDraft {
+    thread: ThreadId,
+    started: Instant,
+    ready: Option<String>,
+}
+
+const DRAFT_OPEN_FEEDBACK: Duration = Duration::from_millis(300);
 
 /// One folder read: a window of rows, its edges, the unread count, and the
 /// folder names for the picker.
@@ -687,6 +726,7 @@ struct Inbox {
     conv_gen: Arc<AtomicU64>,
     /// Where `c` keeps a new draft. `None` when the mailbox did not open.
     draft_home: Option<DraftHome>,
+    opening_draft: Option<OpeningServerDraft>,
     /// The compose drafts at the top of the Drafts list, as last read.
     drafts: Vec<DraftSummary>,
     /// Transitions running in this window. See [`crate::motion`].
@@ -890,6 +930,7 @@ impl Inbox {
             row_widths: RowWidths::new(motion),
             conv_gen: Arc::new(AtomicU64::new(0)),
             draft_home,
+            opening_draft: None,
             drafts: Vec::new(),
             motion: InboxMotion::new(motion),
             frame_now: Instant::now(),
@@ -1168,7 +1209,9 @@ impl Inbox {
                                 });
                                 let mut lines = Vec::new();
                                 if draft_failed {
-                                    lines.push("Drafts · server copy unconfirmed".to_string());
+                                    lines.push(
+                                        fell_core::compose::SERVER_DRAFT_SAVE_FAILED.to_string(),
+                                    );
                                 }
                                 let local_save_failed =
                                     inbox.session.status_notice().is_some_and(|notice| {
@@ -1278,6 +1321,10 @@ impl Inbox {
     /// flight, further requests merge into a single follow-up, so a burst of
     /// sync batches is one read and never a queue.
     fn request_threads(&mut self, mut intent: ReadIntent, cx: &mut Context<Self>) {
+        if self.opening_draft.is_some() && self.session.in_drafts() && !intent.switch {
+            self.defer_folder_read(intent);
+            return;
+        }
         if self.session.search.is_some() {
             self.search_view.defer_folder_read(intent);
             return;
@@ -1287,10 +1334,7 @@ impl Inbox {
         // when it lands. This read sees everything the refresh would have.
         let supersede = self.read_in_flight && self.refresh_in_flight && !intent.is_refresh();
         if self.undos_in_flight > 0 || (self.read_in_flight && !supersede) {
-            self.read_wanted = Some(match self.read_wanted.take() {
-                Some(earlier) => earlier.merge(intent),
-                None => intent,
-            });
+            self.defer_folder_read(intent);
             return;
         }
         if let Some(earlier) = self.read_wanted.take() {
@@ -1366,12 +1410,12 @@ impl Inbox {
                     .iter()
                     .map(|thread| thread.thread_id.clone())
                     .collect();
-                let recipients = store
-                    .folder_recipients(&account, &reading, &ids)
+                let previews = store
+                    .synced_draft_previews(&account, &reading, &ids)
                     .unwrap_or_default();
                 // The header shows no count in Drafts; the folder's own
                 // count stays, so leaving Drafts never reads "0 unread".
-                present::address_draft_rows(&mut rows, &recipients, &me);
+                present::address_draft_rows(&mut rows, &previews, &me);
                 store
                     .unsent_compose_drafts(&account)
                     .map_err(|err| err.to_string())?
@@ -1413,6 +1457,13 @@ impl Inbox {
         .detach();
     }
 
+    fn defer_folder_read(&mut self, intent: ReadIntent) {
+        self.read_wanted = Some(match self.read_wanted.take() {
+            Some(earlier) => earlier.merge(intent),
+            None => intent,
+        });
+    }
+
     fn read_landed(
         &mut self,
         scope: (String, Option<String>),
@@ -1422,6 +1473,15 @@ impl Inbox {
     ) {
         self.read_in_flight = false;
         self.refresh_in_flight = false;
+        if self.opening_draft.is_some()
+            && self.session.in_drafts()
+            && scope.0 == self.list_folder
+            && scope.1 == self.list_label
+            && !intent.switch
+        {
+            self.defer_folder_read(intent);
+            return;
+        }
         let wanted = self.read_wanted.take();
         if self.session.search.is_some() {
             let intent = match wanted {
@@ -2188,7 +2248,12 @@ impl Inbox {
             self.settle_pending_bodies();
             return;
         };
-        if !force && self.open_thread.as_deref() == Some(id.as_str()) {
+        if self
+            .opening_draft
+            .as_ref()
+            .is_some_and(|open| open.thread.as_str() == id)
+            || (!force && self.open_thread.as_deref() == Some(id.as_str()))
+        {
             return;
         }
         if !self.session.search_results_current() {
@@ -2312,6 +2377,10 @@ impl Inbox {
     ) {
         if self.conv_gen.load(Ordering::SeqCst) != generation
             || self.session.cursor_id.as_deref() != Some(id.as_str())
+            || self
+                .opening_draft
+                .as_ref()
+                .is_some_and(|open| open.thread.as_str() == id)
         {
             return;
         }
@@ -3430,8 +3499,36 @@ impl Inbox {
             );
             return;
         };
+        let remote_open = remote.is_some();
+        if let Some(thread) = &remote {
+            if self.opening_draft.is_some() {
+                return;
+            }
+            let started = Instant::now();
+            self.opening_draft = Some(OpeningServerDraft {
+                thread: thread.clone(),
+                started,
+                ready: None,
+            });
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(DRAFT_OPEN_FEEDBACK).await;
+                let _ = this.update(cx, |inbox, cx| {
+                    if inbox
+                        .opening_draft
+                        .as_ref()
+                        .is_some_and(|open| open.started == started)
+                    {
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
         let account = self.account_id.clone();
-        let email = self.session.account_email.clone();
+        let from = fell_core::compose::configured_from(
+            &self.session.account_name,
+            &self.session.account_email,
+        );
         let creating = id.is_none() && remote.is_none();
         // The draft goes live in the hub off this thread; only showing it
         // happens here.
@@ -3441,7 +3538,7 @@ impl Inbox {
                 match (id, remote) {
                     (Some(id), _) => home.open(&hub, &id, &account).map(|()| id),
                     (None, Some(thread)) => home.open_server_draft(&hub, &account, &thread),
-                    (None, None) => home.new_draft(&hub, &account, &email),
+                    (None, None) => home.new_draft(&hub, &account, &from),
                 }
             }
         });
@@ -3450,26 +3547,58 @@ impl Inbox {
             let _ = this.update(cx, |inbox, cx| {
                 match result {
                     Ok(id) => {
-                        // `false` while another open of it is still reading
-                        // it; that one shows it when it lands.
+                        if remote_open && let Some(open) = &mut inbox.opening_draft {
+                            open.ready = Some(id.clone());
+                        }
                         inbox.watch_held_draft(&hub, &id, cx);
-                        crate::draft_host::show_draft(&hub, &id);
+                        if !crate::draft_host::show_draft(&hub, &id) && remote_open {
+                            inbox.finish_server_draft_open(None, cx);
+                            inbox.session.show_toast("Couldn't open the draft.", true);
+                        }
                     }
                     Err(err) => {
-                        let what = if creating {
-                            "start a draft"
+                        if remote_open {
+                            inbox.finish_server_draft_open(None, cx);
+                        }
+                        let error = std::io::Error::other(err);
+                        fell_core::diagnostic!(
+                            WARN,
+                            "Could not open compose draft",
+                            error = &error as &dyn std::error::Error
+                        );
+                        let text = if creating {
+                            "Couldn't start a draft."
                         } else {
-                            "open the draft"
+                            "Couldn't open the draft."
                         };
-                        inbox
-                            .session
-                            .show_toast(format!("Couldn't {what}: {err}"), true);
+                        inbox.session.show_toast(text, true);
                     }
                 }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    fn finish_server_draft_open(&mut self, local_id: Option<&str>, cx: &mut Context<Self>) {
+        let Some(open) = self.opening_draft.take() else {
+            return;
+        };
+        if self.session.in_drafts() {
+            if let Some(id) = local_id
+                && self.session.cursor_id.as_deref() == Some(open.thread.as_str())
+            {
+                self.session.cursor_id = Some(present::draft_row_id(id));
+            }
+            self.request_threads(
+                ReadIntent {
+                    refresh_open: true,
+                    ..ReadIntent::default()
+                },
+                cx,
+            );
+        }
+        cx.notify();
     }
 
     /// `r`, `R`, `f`: start a reply, reply all, or forward of the message
@@ -4865,7 +4994,14 @@ impl Render for Inbox {
             });
             selected.and_then(|target| checks.for_message(&target.id))
         });
-        let status = StatusLabel::new(&self.theme, &self.session, reply_check, width);
+        let status =
+            if self.opening_draft.as_ref().is_some_and(|open| {
+                real.saturating_duration_since(open.started) >= DRAFT_OPEN_FEEDBACK
+            }) {
+                StatusLabel::opening_draft(&self.theme)
+            } else {
+                StatusLabel::new(&self.theme, &self.session, reply_check, width)
+            };
         let status_labels = self.status_labels.update(status, self.motion.motion, now);
         let animating = self.motion.tick(now)
             | waiting_for_resize
@@ -9159,6 +9295,7 @@ fn recipient_lines(
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StatusPhase {
+    OpeningDraft,
     Sync(std::mem::Discriminant<SyncKind>),
     Download,
     Reply(ReplyCheck),
@@ -9174,6 +9311,16 @@ struct StatusLabel {
 }
 
 impl StatusLabel {
+    fn opening_draft(theme: &Theme) -> Self {
+        Self {
+            phase: StatusPhase::OpeningDraft,
+            text: "Opening…".into(),
+            download: None,
+            color: theme.dimmed,
+            steady_sync: false,
+        }
+    }
+
     fn new(theme: &Theme, session: &Session, reply_check: Option<ReplyCheck>, width: f32) -> Self {
         let download = reply_check
             .is_none()

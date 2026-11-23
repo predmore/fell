@@ -7,6 +7,36 @@ use crate::{Result, Store, diagnostic, outbox};
 
 pub(super) type Wake = Arc<dyn Fn() + Send + Sync>;
 
+pub const SERVER_DRAFT_SAVE_FAILED: &str = "Draft not saved to the server · kept in Fell";
+
+/// What the writer saved for one exact editor revision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaveReceipt {
+    Local,
+    Pending,
+    Server([u8; 32]),
+    ServerFailed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DraftSaveStatus {
+    Local,
+    Server,
+    ServerFailed,
+}
+
+impl Store {
+    /// The write-back worker owns the transition from pending to confirmed.
+    pub fn server_draft_save_status(
+        &self,
+        account: &crate::AccountId,
+        draft: &str,
+        digest: &[u8; 32],
+    ) -> Result<Option<DraftSaveStatus>> {
+        outbox::drafts::save_status(self, account, draft, digest)
+    }
+}
+
 const DEBOUNCE_MS: u64 = 5_000;
 
 #[derive(Default)]
@@ -69,11 +99,22 @@ pub(super) fn digest(draft: &StoredCompose, files: &[ResolvedFile]) -> [u8; 32] 
     super::digest::sha256(&content)
 }
 
-pub(super) fn queue(store: &Store, folder: &std::path::Path, draft: &StoredCompose, wake: &Wake) {
-    match queue_if_enabled(store, folder, draft) {
-        Ok(true) => wake(),
-        Ok(false) => {}
-        Err(_) => diagnostic!(WARN, "Could not queue server draft"),
+pub(super) fn queue(
+    store: &Store,
+    folder: &std::path::Path,
+    draft: &StoredCompose,
+    wake: &Wake,
+) -> SaveReceipt {
+    match queue_if_enabled(store, folder, draft, wake) {
+        Ok(receipt) => receipt,
+        Err(err) => {
+            diagnostic!(
+                WARN,
+                "Could not queue server draft",
+                error = &err as &dyn std::error::Error
+            );
+            SaveReceipt::ServerFailed
+        }
     }
 }
 
@@ -81,7 +122,11 @@ fn queue_if_enabled(
     store: &Store,
     folder: &std::path::Path,
     draft: &StoredCompose,
-) -> Result<bool> {
+    wake: &Wake,
+) -> Result<SaveReceipt> {
+    if !store.write_back(&draft.account_id)? {
+        return Ok(SaveReceipt::Local);
+    }
     let fields = &draft.fields;
     if fields.subject.is_empty()
         && draft.body.trim().is_empty()
@@ -93,25 +138,25 @@ fn queue_if_enabled(
     {
         // Closing a fresh, untouched compose window does not create server mail.
         if !outbox::drafts::has_copy(store, &draft.account_id, &draft.id)? {
-            return Ok(false);
+            return Ok(SaveReceipt::Pending);
         }
-    }
-    if !store.write_back(&draft.account_id)? {
-        return Ok(false);
     }
     let closure = workspace::resolve_closure(folder, fields, &draft.body);
     if closure.issues.iter().any(|issue| issue.blocks_send) {
         diagnostic!(DEBUG, "Server draft has an unresolved attachment");
-        return Ok(false);
+        return Ok(SaveReceipt::ServerFailed);
     }
     let digest = digest(draft, &closure.files);
     let outgoing = mime::build_server_draft(draft, &closure.files);
-    outbox::drafts::queue(
+    if outbox::drafts::queue(
         store,
         &draft.account_id,
         &draft.id,
         &digest,
         outgoing.message_id,
         &outgoing.mime,
-    )
+    )? {
+        wake();
+    }
+    Ok(SaveReceipt::Server(digest))
 }

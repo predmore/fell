@@ -3445,7 +3445,21 @@ fn server_draft_debounce_close_and_sync_deduplicate() {
     }
     hub.poll_server_draft("draft-test", 17_000);
     wait_for_draft(&hub);
+    let receipt = || {
+        hub.with_session("draft-test", |session| session.save_receipt())
+            .flatten()
+    };
+    let Some(crate::compose::SaveReceipt::Server(digest)) = receipt() else {
+        panic!("save receipt must identify the pending draft content");
+    };
+    let status = || {
+        fx.store
+            .server_draft_save_status(&fx.account.id, "draft-test", &digest)
+            .unwrap()
+    };
+    assert_eq!(status(), None);
     assert_eq!(fx.replay().sent, 1);
+    assert_eq!(status(), Some(crate::compose::DraftSaveStatus::Server));
     assert_eq!(fx.on_server(SERVER_DRAFTS), [(1, "Weekly notes".into())]);
     assert_eq!(fx.flags(SERVER_DRAFTS, 1), ["\\Draft", "\\Seen"]);
     fx.sync();
@@ -3459,6 +3473,11 @@ fn server_draft_debounce_close_and_sync_deduplicate() {
     );
 
     set_draft_body(&hub, "Edited again before close".into());
+    assert_eq!(
+        receipt(),
+        None,
+        "an edit immediately invalidates the saved receipt"
+    );
     hub.note_hidden("draft-test");
     wait_for_draft(&hub);
     assert_eq!(fx.replay().sent, 1);
@@ -3588,6 +3607,11 @@ fn server_draft_write_back_off_and_cleanup_without_uidplus() {
     fx.server.writes.lock().unwrap().uidplus = false;
     fx.store.set_write_back(&fx.account.id, false).unwrap();
     queue("Local only");
+    assert_eq!(
+        hub.with_session("draft-test", |session| session.save_receipt())
+            .flatten(),
+        Some(crate::compose::SaveReceipt::Local),
+    );
     assert_eq!(fx.replay().sent, 0);
     assert_eq!(draft_appends(&fx), 0);
     fx.store.set_write_back(&fx.account.id, true).unwrap();
@@ -3661,7 +3685,7 @@ fn server_draft_import_keeps_html_only_text_and_filters_header_controls() {
         .import_server_draft(&fx.store, &thread, "imported-draft")
         .unwrap();
     let stored = fx.store.load_compose(&id).unwrap().unwrap();
-    assert_eq!(stored.body, "Field notes\nTwo routes & a map.");
+    assert_eq!(stored.body, "# Field notes\n\nTwo routes & a map.");
     assert_eq!(stored.fields.subject, "Field notes");
     assert_eq!(stored.fields.to, ["Avery <avery@example.test>"]);
     assert_eq!(stored.fields.from, "c@x");

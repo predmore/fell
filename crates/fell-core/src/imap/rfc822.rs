@@ -129,7 +129,7 @@ pub(crate) fn parse_draft(
             .collect()
     };
     let fields = DraftFields {
-        from: account.compose_from(),
+        from: crate::compose::configured_from(&account.display_name, &account.email),
         to: addresses(parsed.to()),
         cc: addresses(parsed.cc()),
         bcc: addresses(parsed.bcc()),
@@ -148,7 +148,7 @@ pub(crate) fn parse_draft(
         {
             let html = joined(parsed.html_body(), |kind| matches!(kind, PartKind::Html))
                 .unwrap_or_default();
-            let text = fell_render::html_to_document(&html).plain_text();
+            let text = html_draft_body(&html);
             if text.trim().is_empty() {
                 return Err(crate::Error::Action(
                     "Server draft HTML has no editable text".into(),
@@ -211,6 +211,26 @@ pub(crate) fn parse_draft(
             ..ReplyParts::default()
         },
     })
+}
+
+/// Use the native HTML-to-text path for drafts, keeping a leading heading
+/// recognizable to both the editor and the Drafts list.
+pub(crate) fn html_draft_body(html: &str) -> String {
+    use fell_render::{Block, StyledDocument};
+    let doc = fell_render::html_to_document(html);
+    let Some((heading @ Block::Heading { level, .. }, rest)) = doc.blocks.split_first() else {
+        return doc.plain_text();
+    };
+    let heading = StyledDocument::blocks_text(std::slice::from_ref(heading));
+    let rest = StyledDocument::blocks_text(rest);
+    if heading.is_empty() {
+        rest
+    } else {
+        let markers = "#".repeat((*level).into());
+        format!("{markers} {heading}\n\n{rest}")
+            .trim_end()
+            .to_owned()
+    }
 }
 
 /// Parse the exact outgoing MIME without inventing a server copy or UID.

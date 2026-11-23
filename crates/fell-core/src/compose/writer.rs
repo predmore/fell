@@ -15,10 +15,12 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use super::persist::{self, StoredCompose, StoredReview};
+use super::server::SaveReceipt;
 use super::workspace::{self, FileStamp};
 
 /// Everything one save writes. Built under the session lock, run without it.
 pub(crate) struct SaveJob {
+    pub revision: u64,
     pub folder: PathBuf,
     pub text: String,
     pub mailbox: Option<MailboxSave>,
@@ -51,7 +53,7 @@ pub(crate) enum SaveError {
 
 impl SaveJob {
     /// Write the draft file, then the mailbox row.
-    pub(crate) fn run(self, cache: &mut SaveCache) -> Result<(), SaveError> {
+    pub(crate) fn run(self, cache: &mut SaveCache) -> Result<SaveReceipt, SaveError> {
         // Noted first, so this text reads as Fell's own on the next open
         // even if the mailbox row below never lands. Without the note that
         // open goes back to the row, as before.
@@ -61,10 +63,10 @@ impl SaveJob {
         // reads it now; the mailbox holds them.
         let _ = std::fs::remove_file(workspace::control_dir(&self.folder).join("hunks.json"));
         if let Some(mailbox) = self.mailbox {
-            persist_mailbox_with_server(&self.folder, mailbox, cache, self.server.as_ref())
-                .map_err(SaveError::Mailbox)?;
+            return persist_mailbox_with_server(&self.folder, mailbox, cache, self.server.as_ref())
+                .map_err(SaveError::Mailbox);
         }
-        Ok(())
+        Ok(SaveReceipt::Local)
     }
 }
 
@@ -76,7 +78,7 @@ pub(crate) fn persist_mailbox(
     mailbox: MailboxSave,
     cache: &mut SaveCache,
 ) -> Result<(), String> {
-    persist_mailbox_with_server(folder, mailbox, cache, None)
+    persist_mailbox_with_server(folder, mailbox, cache, None).map(|_| ())
 }
 
 fn persist_mailbox_with_server(
@@ -84,12 +86,12 @@ fn persist_mailbox_with_server(
     mailbox: MailboxSave,
     cache: &mut SaveCache,
     server: Option<&super::server::Wake>,
-) -> Result<(), String> {
+) -> Result<SaveReceipt, String> {
     let path = mailbox
         .store_path
         .or_else(|| persist::remembered_store_path(&mailbox.draft.id));
     let Some(path) = path.filter(|path| path.is_file()) else {
-        return Ok(());
+        return Ok(SaveReceipt::Local);
     };
     let store = crate::Store::open(&path).map_err(|err| err.to_string())?;
     let draft = mailbox.draft;
@@ -107,9 +109,18 @@ fn persist_mailbox_with_server(
         cache.attachment_stamp = stamp;
     }
     if let Some(wake) = server {
-        super::server::queue(&store, folder, &draft, wake);
+        return Ok(super::server::queue(&store, folder, &draft, wake));
     }
-    Ok(())
+    Ok(
+        if store
+            .write_back(&draft.account_id)
+            .map_err(|err| err.to_string())?
+        {
+            SaveReceipt::Pending
+        } else {
+            SaveReceipt::Local
+        },
+    )
 }
 
 struct Progress {
@@ -122,6 +133,7 @@ struct Progress {
     written: u64,
     /// The newest save whose draft and attachments reached the mailbox.
     mailbox_written: u64,
+    receipt: Option<(u64, SaveReceipt)>,
     /// The newest failed write, until the session reports it.
     error: Option<String>,
     /// The newest save whose mailbox row was not written, until the session
@@ -151,6 +163,7 @@ impl DraftWriter {
                 completed: 0,
                 written: 0,
                 mailbox_written: 0,
+                receipt: None,
                 error: None,
                 mailbox_error: None,
             }),
@@ -189,6 +202,16 @@ impl DraftWriter {
     /// The newest save whose `draft.md` is on disk.
     pub(crate) fn written(&self) -> u64 {
         self.shared.progress.lock().expect("draft writer").written
+    }
+
+    pub(crate) fn receipt(&self, revision: u64) -> Option<SaveReceipt> {
+        self.shared
+            .progress
+            .lock()
+            .expect("draft writer")
+            .receipt
+            .filter(|(saved, _)| *saved == revision)
+            .map(|(_, receipt)| receipt)
     }
 
     pub(crate) fn take_error(&self) -> Option<String> {
@@ -277,11 +300,17 @@ fn write_loop(rx: Receiver<(u64, SaveJob)>, shared: Arc<Shared>) {
             next = newer;
         }
         let (number, job) = next;
+        let revision = job.revision;
         let result = job.run(&mut cache);
         let mut progress = shared.progress.lock().expect("draft writer");
         progress.completed = progress.completed.max(number);
         match result {
-            Ok(()) => {
+            Ok(receipt) => {
+                if receipt != SaveReceipt::Pending
+                    || progress.receipt.is_none_or(|(saved, _)| saved != revision)
+                {
+                    progress.receipt = Some((revision, receipt));
+                }
                 progress.written = progress.written.max(number);
                 progress.mailbox_written = progress.mailbox_written.max(number);
             }

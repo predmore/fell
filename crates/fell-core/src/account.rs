@@ -45,13 +45,3 @@ pub struct Account {
     pub email: String,
     pub backend_kind: BackendKind,
 }
-
-impl Account {
-    /// The configured sender used in compose, with a display-safe name.
-    pub fn compose_from(&self) -> String {
-        crate::compose::format_address(&crate::Address {
-            name: Some(crate::notes::display_safe(&self.display_name, false)),
-            email: self.email.clone(),
-        })
-    }
-}

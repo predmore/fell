@@ -142,17 +142,17 @@ impl DraftHome {
         }
     }
 
-    /// Start a new, empty draft from `email` on `account` and make it live
+    /// Start a new, empty draft from `from` on `account` and make it live
     /// in `hub`. Its mailbox row is written before its folder. Disk only;
     /// run it off the UI thread. Returns the draft's id.
     pub fn new_draft(
         &self,
         hub: &DraftHub,
         account: &AccountId,
-        email: &str,
+        from: &str,
     ) -> Result<String, String> {
         let fields = DraftFields {
-            from: email.to_string(),
+            from: from.to_string(),
             ..DraftFields::default()
         };
         self.new_reply(
@@ -229,7 +229,11 @@ impl DraftHome {
         let id = config
             .import_server_draft(&store, thread, &new_draft_id())
             .map_err(|err| {
-                fell_core::diagnostic!(WARN, "Could not import server draft");
+                fell_core::diagnostic!(
+                    WARN,
+                    "Could not import server draft",
+                    error = &err as &dyn std::error::Error
+                );
                 err.to_string()
             })?;
         self.open(hub, &id, account)?;
@@ -428,6 +432,7 @@ fn reveal(
         if opened.is_none() {
             // No window shows it, so it is not open for editing.
             hub.with_session(id, |session| session.close_editor());
+            let _ = cx.update(|cx| crate::view::compose_draft_window_failed(id, cx));
         }
         *window.borrow_mut() = opened;
     }

@@ -43,9 +43,10 @@ pub(crate) use persist::{
 pub(crate) use reply::format_address;
 pub use reply::{
     ForwardSummary, MAX_REFERENCES, ReplyKind, ReplyParts, ReplyStart, build_references,
-    forward_subject, own_addresses, reply_recipients, reply_subject, start_reply,
+    configured_from, forward_subject, own_addresses, reply_recipients, reply_subject, start_reply,
     start_reply_in_zone,
 };
+pub use server::{DraftSaveStatus, SERVER_DRAFT_SAVE_FAILED, SaveReceipt};
 pub use session::{
     AddressView, AttachmentView, DraftSession, HunkView, ReplyContext, SendLock, SentCopy, Snapshot,
 };

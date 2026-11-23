@@ -401,6 +401,13 @@ pub struct Store {
 #[cfg(test)]
 type SyncCommitHook = Box<dyn FnMut() -> Result<()> + Send>;
 
+/// The latest synced draft in a list thread.
+pub struct SyncedDraftPreview {
+    pub recipients: Vec<Address>,
+    pub subject: String,
+    pub body: String,
+}
+
 /// One page of FTS hits. `next_cursor` is passed back to [`Store::search_page`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchPage {
@@ -1828,26 +1835,25 @@ impl Store {
         Ok(out)
     }
 
-    /// Who each thread's latest message in `folder` is addressed to: its To,
-    /// then its Cc. The Drafts list names a synced draft by who it is to, as
-    /// it does a compose draft. A thread with no message in the folder is
-    /// left out.
-    pub fn folder_recipients(
+    /// The latest draft in each listed thread, using the editable MIME body.
+    /// The Drafts list reads these off the UI thread. Other folders use their
+    /// precomputed message snippets.
+    pub fn synced_draft_previews(
         &self,
         account_id: &AccountId,
         folder: &str,
         threads: &[ThreadId],
-    ) -> Result<std::collections::HashMap<ThreadId, Vec<Address>>> {
+    ) -> Result<HashMap<ThreadId, SyncedDraftPreview>> {
         let names: Vec<String> = folder_query_names(folder)
             .into_iter()
             .map(|name| name.to_ascii_lowercase())
             .collect();
         let mut stmt = self.conn.prepare_cached(
-            "SELECT folders, to_line, cc_line FROM messages
+            "SELECT folders, to_line, cc_line, subject, body_text, message_id FROM messages
              WHERE account_id = ?1 AND thread_id = ?2
              ORDER BY date_unix DESC, rowid DESC",
         )?;
-        let mut out = std::collections::HashMap::new();
+        let mut out = HashMap::new();
         for thread in threads {
             let mut rows = stmt.query(params![account_id.as_str(), thread.0])?;
             while let Some(row) = rows.next()? {
@@ -1858,9 +1864,29 @@ impl Store {
                 if !here {
                     continue;
                 }
-                let mut people = decode_addresses(&row.get::<_, String>(1)?);
-                people.extend(decode_addresses(&row.get::<_, String>(2)?));
-                out.insert(thread.clone(), people);
+                let mut recipients = decode_addresses(&row.get::<_, String>(1)?);
+                recipients.extend(decode_addresses(&row.get::<_, String>(2)?));
+                let subject = crate::notes::display_safe(&row.get::<_, String>(3)?, false);
+                let id: String = row.get(5)?;
+                let body = bodies::read_body_text(&self.conn, account_id, &id)?
+                    .and_then(|parts| {
+                        parts.plain.or_else(|| {
+                            parts
+                                .html
+                                .as_deref()
+                                .map(crate::imap::rfc822::html_draft_body)
+                        })
+                    })
+                    .or(row.get::<_, Option<String>>(4)?)
+                    .unwrap_or_default();
+                out.insert(
+                    thread.clone(),
+                    SyncedDraftPreview {
+                        recipients,
+                        subject,
+                        body,
+                    },
+                );
                 break;
             }
         }
@@ -5271,13 +5297,14 @@ mod tests {
         other.folders = vec!["INBOX".into()];
         let elsewhere = store.upsert_message(&other).unwrap();
         let found = store
-            .folder_recipients(
+            .synced_draft_previews(
                 &AccountId("a1".into()),
                 "drafts",
                 &[thread.clone(), elsewhere.clone()],
             )
             .unwrap();
         let people: Vec<&str> = found[&thread]
+            .recipients
             .iter()
             .map(|person| person.email.as_str())
             .collect();
