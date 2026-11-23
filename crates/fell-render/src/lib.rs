@@ -14,6 +14,7 @@ mod fixtures;
 mod history;
 mod html;
 mod markdown;
+mod typed_list;
 mod webview_html;
 
 pub use choose::{MailHeaders, PreparedMail, RenderMode, choose_view, layout_is_complex, prepare};
@@ -31,6 +32,7 @@ pub use html::{
     plain_to_document,
 };
 pub use markdown::markdown_to_document;
+pub use typed_list::plain_list_runs;
 pub use webview_html::{
     WebFrame, address_is_blocked, request_is_blocked, request_is_blocked_with, sanitize_html,
     strip_remote_css_urls, targets_private_network, wrap_for_webview,

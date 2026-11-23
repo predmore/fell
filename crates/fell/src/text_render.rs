@@ -3,7 +3,9 @@
 //! The conversation view paints [`RenderedBody`] for stored plain text and
 //! for the plain alternative when native HTML has no visible content.
 
-use fell_render::is_forward_subject;
+use std::sync::Arc;
+
+use fell_render::{Block, is_forward_subject, plain_list_runs};
 use gpui::SharedString;
 
 /// A message body the conversation view can paint.
@@ -18,6 +20,7 @@ pub struct RenderedBody {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BodyBlock {
     Text(SharedString),
+    List(Arc<[Block]>),
     /// Quoted history. Collapsed until the reader expands it.
     Quote(SharedString),
     /// A signature block. Collapsed until the reader expands it.
@@ -49,7 +52,10 @@ pub fn render_stored_body(body_text: Option<&str>, snippet: &str, subject: &str)
     } else {
         split_blocks(head)
     };
-    blocks.extend(history);
+    match history {
+        Some(BodyBlock::Text(forward)) => push_text(&forward, &mut blocks),
+        other => blocks.extend(other),
+    }
     RenderedBody { blocks }
 }
 
@@ -60,7 +66,7 @@ pub fn render_stored_body(body_text: Option<&str>, snippet: &str, subject: &str)
 /// lines stay. A forward stays open. Nothing is split off
 /// when no reply text would be left above it, or no quoted text under it.
 fn split_outlook_history<'a>(raw: &'a str, subject: &str) -> (&'a str, Option<BodyBlock>) {
-    let open_forward = || ("", Some(BodyBlock::Text(shared(raw.trim()))));
+    let open_forward = || ("", Some(BodyBlock::Text(shared(raw))));
     if is_forward_subject(subject) {
         return open_forward();
     }
@@ -123,9 +129,7 @@ fn split_blocks(raw: &str) -> Vec<BodyBlock> {
     let flush_text = |text: &mut Vec<&str>, blocks: &mut Vec<BodyBlock>| {
         let joined = text.join("\n");
         text.clear();
-        if !joined.trim().is_empty() {
-            blocks.push(BodyBlock::Text(shared(joined.trim())));
-        }
+        push_text(&joined, blocks);
     };
     let flush_quote = |quote: &mut Vec<&str>, blocks: &mut Vec<BodyBlock>| {
         if quote.is_empty() {
@@ -191,6 +195,22 @@ fn split_blocks(raw: &str) -> Vec<BodyBlock> {
         blocks.push(BodyBlock::Text(shared(raw.trim())));
     }
     blocks
+}
+
+fn push_text(text: &str, blocks: &mut Vec<BodyBlock>) {
+    let push_prose = |text: &str, blocks: &mut Vec<BodyBlock>| {
+        let text = text.trim();
+        if !text.is_empty() {
+            blocks.push(BodyBlock::Text(shared(text)));
+        }
+    };
+    let mut at = 0;
+    for (range, list) in plain_list_runs(text) {
+        push_prose(&text[at..range.start], blocks);
+        blocks.push(BodyBlock::List(list.into()));
+        at = range.end;
+    }
+    push_prose(&text[at..], blocks);
 }
 
 fn is_quote(line: &str) -> bool {

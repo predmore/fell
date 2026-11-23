@@ -1,0 +1,9 @@
+Review the release checklist before publishing the guide.
+
+-          Open the release checklist.
+o   Verify the preview link.
+    https://example.test/nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn
+o   Ask for a second look.
+- Publish the guide.
+
+Thanks for taking a look.

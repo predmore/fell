@@ -8962,7 +8962,6 @@ fn stored_message_body(
             let palette = mail_body::palette(theme);
             let quiet = mail_body::history_palette(theme);
             let mut runs: Vec<(usize, Option<fell_render::Fold>, Vec<&str>)> = Vec::new();
-            let mut drafts = HashMap::new();
             let body = match &message.rich {
                 Rich::PlainPart(plain) => plain,
                 _ => &message.body,
@@ -8970,8 +8969,7 @@ fn stored_message_body(
             for (at, block) in body.blocks.iter().enumerate() {
                 let (kind, text) = match block {
                     BodyBlock::Text(text) => (None, text.as_str()),
-                    BodyBlock::Markdown { doc, agent } => {
-                        drafts.insert(at, (doc, *agent));
+                    BodyBlock::List(_) | BodyBlock::Markdown { .. } => {
                         runs.push((at, None, Vec::new()));
                         continue;
                     }
@@ -8995,6 +8993,20 @@ fn stored_message_body(
             runs.into_iter()
                 .enumerate()
                 .map(|(run, (at, kind, texts))| match kind {
+                    None if let BodyBlock::List(blocks) = &body.blocks[at] => div()
+                        .pb(px(8.))
+                        .child(
+                            crate::render::blocks_column_spaced(
+                                blocks,
+                                &palette,
+                                false,
+                                &crate::render::ImageGallery::default(),
+                                folds.columns.blocks(folds.fill),
+                                crate::render::BLOCK_GAP,
+                            )
+                            .line_height(px(theme.ui_px * 1.45)),
+                        )
+                        .into_any_element(),
                     None => {
                         let text = texts.concat();
                         folds.columns.flow(
@@ -9003,11 +9015,11 @@ fn stored_message_body(
                                 div()
                                     .pb(px(8.))
                                     .line_height(px(theme.ui_px * 1.45))
-                                    .map(|block| match drafts.get(&at) {
-                                        Some((doc, agent)) => block.child(
+                                    .map(|block| match &body.blocks[at] {
+                                        BodyBlock::Markdown { doc, agent } => block.child(
                                             crate::compose_ui::render_draft_doc(doc, *agent, theme),
                                         ),
-                                        None => block.child(crate::render::plain_text(
+                                        _ => block.child(crate::render::plain_text(
                                             text.clone(),
                                             palette,
                                         )),

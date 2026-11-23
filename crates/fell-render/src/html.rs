@@ -4,6 +4,7 @@ use scraper::Html;
 use scraper::node::Node;
 
 use crate::document::{Align, Block, ImageSource, Inline, ListItem, StyledDocument};
+use crate::typed_list::{self, ListRun};
 
 /// How deep the native walk and the web serializer will recurse.
 ///
@@ -216,6 +217,17 @@ pub fn document_from_body(body: &str) -> StyledDocument {
 
 pub fn plain_to_document(body: &str) -> StyledDocument {
     let mut blocks = Vec::new();
+    let mut at = 0;
+    for (range, list) in typed_list::plain_list_runs(body) {
+        plain_paragraphs(&body[at..range.start], &mut blocks);
+        blocks.extend(list);
+        at = range.end;
+    }
+    plain_paragraphs(&body[at..], &mut blocks);
+    StyledDocument { blocks }
+}
+
+fn plain_paragraphs(body: &str, blocks: &mut Vec<Block>) {
     for para in body.split("\n\n") {
         let text = para.trim();
         if text.is_empty() {
@@ -230,7 +242,6 @@ pub fn plain_to_document(body: &str) -> StyledDocument {
         }
         blocks.push(Block::Paragraph { inlines });
     }
-    StyledDocument { blocks }
 }
 
 fn native_blocks(html: &str, depth: u32) -> Vec<Block> {
@@ -519,18 +530,18 @@ fn children_of(node: ego_tree::NodeRef<'_, Node>, depth: u32) -> Vec<Block> {
             push_inline(child, depth + 1, &mut run);
             continue;
         }
-        lines.end_run(&mut run);
-        match line_kind(child, depth + 1) {
-            LineKind::Line(inlines) => lines.line(inlines),
-            LineKind::Spacer => lines.gap(),
-            LineKind::Nothing => {}
-            LineKind::Block => {
-                lines.gap();
-                lines.blocks.extend(node_blocks(child, depth + 1));
-            }
+        lines.end_run(&mut run, depth + 1);
+        if matches!(child.value(), Node::Comment(_)) && !lines.list.is_empty() {
+            continue;
         }
+        if lines.list_paragraph(child, depth + 1) {
+            continue;
+        }
+        lines.flush_list(depth + 1);
+        lines.child(child, depth + 1);
     }
-    lines.end_run(&mut run);
+    lines.end_run(&mut run, depth + 1);
+    lines.flush_list(depth + 1);
     lines.gap();
     let mut blocks = merge_image_runs(lines.blocks);
     blocks.retain(|block| !block_is_empty(block));
@@ -539,12 +550,89 @@ fn children_of(node: ego_tree::NodeRef<'_, Node>, depth: u32) -> Vec<Block> {
 
 /// A paragraph built a line at a time.
 #[derive(Default)]
-struct Lines {
+struct Lines<'a> {
     blocks: Vec<Block>,
     paragraph: Vec<Inline>,
+    list: ListRun<ego_tree::NodeRef<'a, Node>>,
 }
 
-impl Lines {
+impl<'a> Lines<'a> {
+    fn child(&mut self, child: ego_tree::NodeRef<'a, Node>, depth: u32) {
+        match line_kind(child, depth) {
+            LineKind::Line(inlines) => self.line(inlines),
+            LineKind::Spacer => self.gap(),
+            LineKind::Nothing => {}
+            LineKind::Block => {
+                self.gap();
+                self.blocks.extend(node_blocks(child, depth));
+            }
+        }
+    }
+
+    fn list_paragraph(&mut self, node: ego_tree::NodeRef<'a, Node>, depth: u32) -> bool {
+        let Some(element) = node.value().as_element() else {
+            return false;
+        };
+        if element.name() != "p" || depth >= MAX_HTML_DEPTH {
+            return false;
+        }
+        let style = style_declarations(element);
+        let level = declared_value(&style, "mso-list").and_then(|value| {
+            value
+                .split_ascii_whitespace()
+                .find_map(|part| part.strip_prefix("level")?.parse::<u32>().ok())
+                .filter(|level| (1..=9).contains(level))
+        });
+        let margin = list_margin(&style);
+        // Use the same units for Outlook levels and the usual Word margins
+        // so a regular indented paragraph can continue an Outlook item.
+        let indent = level.map_or(margin, |level| level * 48 * 16);
+        let text = visible(&raw_text(node));
+        let marker = typed_list::marker(&text);
+        if level.is_some()
+            && let Some((ordered, mut inlines)) = outlook_list_marker(node, depth, marker.as_ref())
+            && strip_list_marker(&mut inlines, "")
+        {
+            let blocks = styled_blocks(node, element, paragraph(inlines));
+            self.list.item(indent, ordered, true, blocks, node);
+            return true;
+        }
+        if let Some(marker) = marker
+            .as_ref()
+            .filter(|marker| marker.has_padding() || level.is_some())
+        {
+            let mut inlines = collect_inlines(node, depth);
+            if strip_list_marker(&mut inlines, marker.token) {
+                let blocks = styled_blocks(node, element, paragraph(inlines));
+                self.list
+                    .item(indent, marker.ordered, indent > 0, blocks, node);
+                return true;
+            }
+        }
+        if marker.is_none() && self.list.accepts_continuation(indent) {
+            let blocks = node_blocks(node, depth);
+            if blocks.iter().any(|block| !block_is_empty(block)) {
+                self.list.continuation(blocks, node);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn flush_list(&mut self, depth: u32) {
+        match self.list.finish() {
+            Ok(blocks) => {
+                self.gap();
+                self.blocks.extend(blocks);
+            }
+            Err(original) => {
+                for child in original {
+                    self.child(child, depth);
+                }
+            }
+        }
+    }
+
     fn line(&mut self, inlines: Vec<Inline>) {
         if inlines.is_empty() {
             return;
@@ -573,7 +661,7 @@ impl Lines {
 
     /// Text and inline elements between blocks are a line. A run that is
     /// only `<br>`s is a blank line: a paragraph gap.
-    fn end_run(&mut self, run: &mut Vec<Inline>) {
+    fn end_run(&mut self, run: &mut Vec<Inline>, depth: u32) {
         let mut inlines = std::mem::take(run);
         let breaks = inlines
             .iter()
@@ -581,12 +669,143 @@ impl Lines {
         finish_inlines(&mut inlines);
         if inlines.is_empty() {
             if breaks {
+                self.flush_list(depth);
                 self.gap();
             }
             return;
         }
+        self.flush_list(depth);
         self.line(inlines);
     }
+}
+
+/// Resolve the left margin from either declaration, using CSS source order
+/// and priority. Store it in sixteenths of a CSS pixel for comparisons.
+fn list_margin(style: &[Declaration]) -> u32 {
+    let value = style
+        .iter()
+        .filter_map(|declaration| {
+            let value = match declaration.name.as_str() {
+                "margin-left" => declaration.value.as_str(),
+                "margin" => match declaration
+                    .value
+                    .split_ascii_whitespace()
+                    .collect::<Vec<_>>()[..]
+                {
+                    [all] => all,
+                    [_, sides] | [_, sides, _] => sides,
+                    [_, _, _, left] => left,
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            Some((declaration.important, value))
+        })
+        .max_by_key(|(important, _)| *important);
+    let Some((_, value)) = value else { return 0 };
+    for (unit, px) in [
+        ("px", 1.0),
+        ("pt", 4.0 / 3.0),
+        ("in", 96.0),
+        ("cm", 96.0 / 2.54),
+        ("mm", 96.0 / 25.4),
+    ] {
+        if let Some(number) = value.strip_suffix(unit)
+            && let Ok(number) = number.parse::<f32>()
+            && number.is_finite()
+        {
+            return (number * px * 16.0).round() as u32;
+        }
+    }
+    0
+}
+
+/// Outlook marks its dedicated glyph span with `mso-list:Ignore`. It can
+/// be visible in the DOM or hidden inside a conditional comment. Read the
+/// glyph separately before a Symbol or Courier span is styled as content.
+fn outlook_list_marker(
+    node: ego_tree::NodeRef<'_, Node>,
+    depth: u32,
+    visible_marker: Option<&typed_list::Marker<'_>>,
+) -> Option<(bool, Vec<Inline>)> {
+    let mut children = node.children();
+    let ordered = loop {
+        let child = children.next()?;
+        let text = match child.value() {
+            Node::Text(text) if is_blank_text(text) => continue,
+            Node::Comment(comment) => {
+                let Some(html) = comment
+                    .strip_prefix("[if !supportLists]>")
+                    .and_then(|html| html.strip_suffix("<![endif]"))
+                else {
+                    continue;
+                };
+                let dom = Html::parse_fragment(html);
+                raw_text(dom.tree.root())
+            }
+            Node::Element(element)
+                if style_value(element, "mso-list").as_deref() == Some("ignore") =>
+            {
+                raw_text(child)
+            }
+            _ => return None,
+        };
+        let ordered = typed_list::marker(&text)
+            .filter(|marker| marker.content.is_empty())
+            .map(|marker| marker.ordered)
+            .or_else(|| {
+                visible_marker
+                    .filter(|marker| marker.token == text.trim())
+                    .map(|marker| marker.ordered)
+            })?;
+        break ordered;
+    };
+    let mut inlines = Vec::new();
+    for child in children {
+        push_inline(child, depth + 1, &mut inlines);
+    }
+    Some((ordered, inlines))
+}
+
+/// Check the displayed prefix before cutting it. Normalization can shrink
+/// the original padding, and the marker and gap can cross style spans.
+fn strip_list_marker(inlines: &mut Vec<Inline>, token: &str) -> bool {
+    fn text_prefix<'a>(inlines: &'a mut [Inline], parts: &mut Vec<&'a mut String>) -> bool {
+        inlines.iter_mut().all(|inline| match inline {
+            Inline::Text(text) => {
+                parts.push(text);
+                true
+            }
+            Inline::Emphasis(children) | Inline::Strong(children) | Inline::Strike(children) => {
+                text_prefix(children, parts)
+            }
+            Inline::Code(_) | Inline::Image { .. } | Inline::Link { .. } | Inline::LineBreak => {
+                false
+            }
+        })
+    }
+    let mut parts = Vec::new();
+    let all_text = text_prefix(inlines, &mut parts);
+    let prefix: String = parts.iter().map(|text| text.as_str()).collect();
+    let lead = prefix.trim_start();
+    let Some(rest) = lead.strip_prefix(token) else {
+        return false;
+    };
+    let content = rest.trim_start();
+    if (!token.is_empty() && rest.len() == content.len()) || (all_text && content.is_empty()) {
+        return false;
+    }
+    let mut remove = prefix.len() - content.len();
+    for part in parts {
+        let take = remove.min(part.len());
+        part.drain(..take);
+        remove -= take;
+        if remove == 0 {
+            break;
+        }
+    }
+    finish_inlines(inlines);
+    !inlines.is_empty()
 }
 
 enum LineKind {

@@ -28,6 +28,7 @@ struct CachedImage {
     height: f32,
 }
 
+#[derive(Default)]
 pub struct ImageGallery {
     decoded: HashMap<usize, CachedImage>,
     held: Vec<Arc<RenderImage>>,
@@ -35,10 +36,7 @@ pub struct ImageGallery {
 
 impl ImageGallery {
     pub fn from_document(document: &StyledDocument) -> Self {
-        let mut gallery = Self {
-            decoded: HashMap::new(),
-            held: Vec::new(),
-        };
+        let mut gallery = Self::default();
         let mut used = 0u64;
         let mut visit = |source: &ImageSource| {
             let ImageSource::Data { bytes, .. } = source else {
