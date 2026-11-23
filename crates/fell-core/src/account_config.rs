@@ -572,7 +572,7 @@ impl AccountConfig {
         let account = self.account();
         let copy = store
             .server_draft_source(&account.id, thread)?
-            .ok_or_else(|| crate::Error::Action("Server draft is no longer in Drafts".into()))?;
+            .ok_or(crate::Error::DraftNoLongerInFolder)?;
         let remote = crate::RemoteId(format!(
             "imap:{}:{}:{}",
             copy.validity,
@@ -580,7 +580,7 @@ impl AccountConfig {
             crate::imap::escape_mailbox(&copy.mailbox)
         ));
         let raw = crate::imap::part_fetch::fetch_draft(&self.imap_config()?, &remote)?
-            .ok_or_else(|| crate::Error::Action("Server draft is no longer available".into()))?;
+            .ok_or(crate::Error::DraftUnavailable)?;
         let draft = crate::imap::rfc822::parse_draft(&account, draft_id, &raw)?;
         let message_id = crate::imap::rfc822::draft_message_id(&raw);
         store.import_server_draft(&copy, &draft, message_id.as_deref())

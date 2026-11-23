@@ -199,6 +199,13 @@ fn compose_open(cx: &App) -> bool {
 pub(crate) fn compose_draft_shown(id: &str, cx: &mut App) {
     if let Some(inbox) = cx.try_global::<InboxWindow>().copied() {
         inbox.update(cx, |inbox, cx| {
+            if inbox
+                .closed_draft_save
+                .as_ref()
+                .is_some_and(|save| save.draft() == id)
+            {
+                inbox.closed_draft_save = None;
+            }
             if let Some(open) = &mut inbox.opening_draft
                 && open.ready.as_deref() == Some(id)
             {
@@ -741,6 +748,7 @@ struct Inbox {
     /// Where `c` keeps a new draft. `None` when the mailbox did not open.
     draft_home: Option<DraftHome>,
     opening_draft: Option<OpeningServerDraft>,
+    closed_draft_save: Option<fell_core::compose::ClosedDraftSave>,
     /// The compose drafts at the top of the Drafts list, as last read.
     drafts: Vec<DraftSummary>,
     /// Transitions running in this window. See [`crate::motion`].
@@ -945,6 +953,7 @@ impl Inbox {
             conv_gen: Arc::new(AtomicU64::new(0)),
             draft_home,
             opening_draft: None,
+            closed_draft_save: None,
             drafts: Vec::new(),
             motion: InboxMotion::new(motion),
             frame_now: Instant::now(),
@@ -1222,11 +1231,6 @@ impl Inbox {
                                     )
                                 });
                                 let mut lines = Vec::new();
-                                if draft_failed {
-                                    lines.push(
-                                        fell_core::compose::SERVER_DRAFT_SAVE_FAILED.to_string(),
-                                    );
-                                }
                                 let local_save_failed =
                                     inbox.session.status_notice().is_some_and(|notice| {
                                         notice.text == fell_core::compose::LOCAL_SENT_COPY_FAILED
@@ -1240,6 +1244,10 @@ impl Inbox {
                                         &dropped,
                                         flag_recovery_delayed,
                                     ));
+                                }
+                                if draft_failed {
+                                    inbox.show_draft_write_failure(lines, cx);
+                                    return;
                                 }
                                 if !lines.is_empty() {
                                     inbox.session.show_toast(lines.join(" · "), true);
@@ -2757,6 +2765,37 @@ impl Inbox {
         .detach();
     }
 
+    fn show_draft_write_failure(&mut self, mut lines: Vec<String>, cx: &mut Context<Self>) {
+        use fell_core::compose::{FAILED_DRAFT_CLOSE, SERVER_DRAFT_SAVE_FAILED};
+        let Some(save) = self.closed_draft_save.clone() else {
+            lines.insert(0, SERVER_DRAFT_SAVE_FAILED.into());
+            self.session.show_toast(lines.join(" · "), true);
+            cx.notify();
+            return;
+        };
+        let probe = save.clone();
+        let checked = self.store.call(move |store| probe.failed(store));
+        let generation = self.session.toast_generation();
+        cx.spawn(async move |this, cx| {
+            let failed = checked.await.unwrap_or(false);
+            let _ = this.update(cx, |inbox, cx| {
+                if inbox.session.toast_generation() != generation {
+                    return;
+                }
+                let note = if failed && inbox.closed_draft_save.as_ref() == Some(&save) {
+                    inbox.closed_draft_save = None;
+                    FAILED_DRAFT_CLOSE
+                } else {
+                    SERVER_DRAFT_SAVE_FAILED
+                };
+                lines.insert(0, note.into());
+                inbox.session.show_toast(lines.join(" · "), true);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Say so in the status bar when a review window an agent opened closes,
     /// so the person knows the draft was kept and nothing was sent.
     fn watch_reviews(&self, cx: &mut Context<Self>) {
@@ -2772,12 +2811,23 @@ impl Inbox {
         cx.spawn(async move |this, cx| {
             while events.next().await.is_some() {
                 while events.try_recv().is_ok() {}
-                let closed = match hub.take_close_notices().pop() {
-                    Some(notice) if notice.needs_mailbox() => {
+                let mut server_save = None;
+                let closed = if let Some(notice) = hub.take_close_notices().pop() {
+                    let notice = if notice.needs_local_write() {
+                        cx.background_executor()
+                            .spawn(async move { notice.after_local_write() })
+                            .await
+                    } else {
+                        notice
+                    };
+                    server_save = notice.server_save().cloned();
+                    if server_save.is_some() {
                         store.call(move |store| notice.resolve(store)).await.ok()
+                    } else {
+                        Some(notice.into_line())
                     }
-                    Some(notice) => Some(notice.into_line()),
-                    None => None,
+                } else {
+                    None
                 };
                 let alive = this
                     .update(cx, |inbox, cx| {
@@ -2787,6 +2837,8 @@ impl Inbox {
                             inbox.request_threads(ReadIntent::default(), cx);
                         }
                         if let Some((mut line, warn)) = closed {
+                            inbox.closed_draft_save = server_save
+                                .filter(|_| line != fell_core::compose::FAILED_DRAFT_CLOSE);
                             if inbox.session.in_drafts()
                                 && let Some(trimmed) = line.strip_suffix("  ·  gd drafts")
                             {
@@ -3599,9 +3651,13 @@ impl Inbox {
                             error = &err as &dyn std::error::Error
                         );
                         let text = match err {
-                            fell_core::Error::DraftBodyUnavailable => err.to_string(),
-                            _ if creating => "Couldn't start a draft.".into(),
-                            _ => "Couldn't open the draft.".into(),
+                            fell_core::Error::DraftBodyUnavailable
+                            | fell_core::Error::DraftNoLongerInFolder
+                            | fell_core::Error::DraftUnavailable
+                            | fell_core::Error::DraftAttachmentLimit => err.to_string(),
+                            _ if creating => format!("Couldn't start a draft. {err}"),
+                            _ if !remote_open => format!("Couldn't open the draft. {err}"),
+                            _ => "Couldn't open the server draft. Try opening it again.".into(),
                         };
                         inbox.session.show_toast(text, true);
                     }

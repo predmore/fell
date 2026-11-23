@@ -141,7 +141,11 @@ pub(super) fn replay_with(
         ) => {
             return Err(Error::Backend(message));
         }
-        Err(Stop::Connection(err) | Stop::AppendCheckDisconnected(err)) => {
+        Err(
+            Stop::Connection(err)
+            | Stop::AppendCheckDisconnected(err)
+            | Stop::DraftCleanupDisconnected(err),
+        ) => {
             report.interrupted = Some(err.to_string());
         }
         // Write-back was turned off by another process mid-pass.
@@ -157,6 +161,7 @@ enum Stop {
     AppendRetry(String),
     AppendRefused(String),
     DraftCleanupRefused(String),
+    DraftCleanupDisconnected(Error),
     AppendCheck(String),
     AppendCheckDisconnected(Error),
     /// The row is no longer in this write-back generation: send nothing more.
@@ -310,6 +315,10 @@ impl Pass<'_> {
             Err(Stop::AppendRefused(message)) => {
                 self.retry_append(index, &message, AppendRetry::Refused)
             }
+            Err(Stop::DraftCleanupDisconnected(error)) => {
+                self.retry_append(index, &error.to_string(), AppendRetry::CleanupRefused)?;
+                Err(Stop::Connection(error))
+            }
             Err(Stop::DraftCleanupRefused(message)) => {
                 self.retry_append(index, &message, AppendRetry::CleanupRefused)
             }
@@ -390,19 +399,21 @@ impl Pass<'_> {
         let uid = if validity == copy.validity {
             copy.uid
         } else {
-            let pending = || {
-                Stop::AppendRetry(
+            let unconfirmed = || {
+                Stop::DraftCleanupRefused(
                     "Drafts mailbox changed and the old copy could not be verified".into(),
                 )
             };
-            let message_id = message_id.ok_or_else(pending)?;
-            let search_error = |error| match error {
-                WriteError::Refused(_) => pending(),
-                WriteError::Connection(error) => Stop::Connection(error),
-            };
+            let message_id = message_id.ok_or_else(unconfirmed)?;
             let candidates = session
                 .search_message_id(message_id, APPEND_UID_LIMIT)
-                .map_err(search_error)?;
+                .map_err(|error| match error {
+                    WriteError::Refused(_) => unconfirmed(),
+                    WriteError::Connection(error) => Stop::DraftCleanupDisconnected(error),
+                })?;
+            if candidates.is_empty() {
+                return Ok(());
+            }
             let (found, complete) = Self::check_append_headers(
                 session,
                 message_id,
@@ -411,11 +422,13 @@ impl Pass<'_> {
                 &candidates,
             )
             .map_err(|stop| match stop {
-                Stop::AppendCheck(_) => pending(),
-                Stop::AppendCheckDisconnected(error) => Stop::Connection(error),
+                Stop::AppendCheck(_) => unconfirmed(),
+                Stop::AppendCheckDisconnected(error) | Stop::Connection(error) => {
+                    Stop::DraftCleanupDisconnected(error)
+                }
                 stop => stop,
             })?;
-            found.filter(|_| complete).ok_or_else(pending)?
+            found.filter(|_| complete).ok_or_else(unconfirmed)?
         };
         let cleanup = |session: &mut WriteSession| {
             if drafts::pending(self.store, entry)?.is_none() {

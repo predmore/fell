@@ -3985,15 +3985,10 @@ fn server_draft_cleanup_after_uidvalidity_reset_requires_an_exact_message_id() {
     };
     let unrelated = b"Subject: Unrelated\r\nMessage-ID: <other@x>\r\n\r\nKeep";
     fx.deliver(SERVER_DRAFTS, 1, unrelated.to_vec());
+    fx.deliver(SERVER_DRAFTS, 9, original);
     fx.store
         .discard_compose_drafts(&fx.account.id, &["draft-test".into()])
         .unwrap();
-    assert_eq!(fx.replay().sent, 0);
-    assert_eq!(fx.on_server(SERVER_DRAFTS), [(1, "Unrelated".into())]);
-    assert!(!fx.commands().iter().any(|cmd| cmd.contains("UID STORE 1")));
-
-    fx.deliver(SERVER_DRAFTS, 9, original);
-    fx.make_due();
     assert_eq!(fx.replay().sent, 1);
     assert_eq!(fx.on_server(SERVER_DRAFTS), [(1, "Unrelated".into())]);
     assert!(
@@ -4053,5 +4048,165 @@ fn server_draft_close_uses_the_durable_failure_and_leaves_unchanged_edits_local(
             .unwrap()
             .iter()
             .all(|entry| entry.state != OutboxState::Pending)
+    );
+}
+
+#[test]
+fn server_draft_cleanup_settles_an_empty_message_id_search_after_uidvalidity_reset() {
+    let dir = tempfile::tempdir().unwrap();
+    let fx = draft_fixture(Store::open(dir.path().join("mail.db")).unwrap());
+    let hub = draft_hub(&dir.path().join("drafts"), &fx);
+    queue_draft_body(&hub, "Original");
+    assert_eq!(fx.replay().sent, 1);
+    {
+        let mut state = fx.server.state.lock().unwrap();
+        state.mailboxes[1].uidvalidity += 1;
+        state.mailboxes[1].messages.clear();
+    }
+
+    queue_draft_body(&hub, "Replacement");
+    let report = fx.replay();
+    assert_eq!(report.sent, 1);
+    assert!(report.dropped.is_empty());
+    assert_eq!(fx.on_server(SERVER_DRAFTS), [(2, "Weekly notes".into())]);
+
+    queue_draft_body(&hub, "Later revision");
+    assert_eq!(fx.replay().sent, 1);
+    assert_eq!(fx.on_server(SERVER_DRAFTS), [(3, "Weekly notes".into())]);
+}
+
+#[test]
+fn server_draft_refused_or_incomplete_search_after_uidvalidity_reset_uses_the_budget() {
+    for refused in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let fx = draft_fixture(Store::open(dir.path().join("mail.db")).unwrap());
+        let hub = draft_hub(&dir.path().join("drafts"), &fx);
+        queue_draft_body(&hub, "Original");
+        assert_eq!(fx.replay().sent, 1);
+        fx.server.state.lock().unwrap().mailboxes[1].uidvalidity += 1;
+        {
+            let mut writes = fx.server.writes.lock().unwrap();
+            writes.refuse_search = refused;
+            writes.omit_message_id_header = (!refused).then_some(1);
+        }
+
+        queue_draft_body(&hub, "Replacement");
+        assert_eq!(fx.replay().sent, 0);
+        queue_draft_body(&hub, "Later revision");
+        for _ in 1..super::write_back::MAX_ATTEMPTS - 1 {
+            fx.make_due();
+            assert!(fx.replay().dropped.is_empty());
+            assert_eq!(draft_appends(&fx), 2);
+        }
+        fx.make_due();
+        let report = fx.replay();
+        assert_eq!(report.dropped.len(), 1);
+        assert_eq!(report.dropped[0].reason, DropReason::UnconfirmedAppend);
+        assert_eq!(report.sent, 1);
+        assert_eq!(
+            fx.on_server(SERVER_DRAFTS),
+            [(1, "Weekly notes".into()), (3, "Weekly notes".into())]
+        );
+    }
+}
+
+#[test]
+fn server_draft_with_an_empty_plain_alternative_uses_html_or_refuses_the_import() {
+    let fx = draft_fixture(Store::open_in_memory().unwrap());
+    for (uid, subject, html) in [
+        (1, "Hello draft", "<p>Hello</p>"),
+        (2, "Empty draft", "<p></p>"),
+    ] {
+        let mime = format!(
+            "From: Reader <c@x>\r\nSubject: {subject}\r\nMessage-ID: <alternate-{uid}@x>\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=alt\r\n\r\n--alt\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n--alt\r\nContent-Type: text/html; charset=utf-8\r\n\r\n{html}\r\n--alt--\r\n"
+        );
+        fx.deliver(SERVER_DRAFTS, uid, mime.into_bytes());
+    }
+    fx.sync();
+    let config = fx.account_config();
+    config
+        .import_server_draft(
+            &fx.store,
+            &fx.thread(SERVER_DRAFTS, "Hello draft"),
+            "hello-draft",
+        )
+        .unwrap();
+    assert_eq!(
+        fx.store.load_compose("hello-draft").unwrap().unwrap().body,
+        "Hello"
+    );
+    let result = config.import_server_draft(
+        &fx.store,
+        &fx.thread(SERVER_DRAFTS, "Empty draft"),
+        "empty-draft",
+    );
+    assert!(
+        matches!(result, Err(crate::Error::DraftBodyUnavailable)),
+        "{result:?}"
+    );
+    assert!(fx.store.load_compose("empty-draft").unwrap().is_none());
+    assert_eq!(fx.subjects(SERVER_DRAFTS), ["Empty draft"]);
+}
+
+#[test]
+fn server_draft_close_before_debounce_tracks_failure_of_the_queued_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let fx = draft_fixture(Store::open(dir.path().join("mail.db")).unwrap());
+    let hub = draft_hub(&dir.path().join("drafts"), &fx);
+    assert!(hub.show("draft-test"));
+    hub.note_shown("draft-test");
+    set_draft_body(&hub, "Keep the close edit".into());
+    hub.poll_server_draft("draft-test", 0);
+    assert_eq!(fx.replay().sent, 0);
+
+    hub.note_hidden("draft-test");
+    let notice = hub.take_close_notices().pop().unwrap().after_local_write();
+    let receipt = notice.server_save().unwrap();
+    assert!(!receipt.failed(&fx.store));
+
+    fx.server.writes.lock().unwrap().refuse_append = true;
+    for _ in 0..super::write_back::MAX_ATTEMPTS {
+        fx.make_due();
+        fx.replay();
+    }
+    assert!(receipt.failed(&fx.store));
+    assert_eq!(
+        notice.resolve(&fx.store),
+        ("Kept in Fell · not on the server".into(), true)
+    );
+}
+
+#[test]
+fn server_draft_import_reports_missing_source_and_attachment_limit() {
+    let fx = draft_fixture(Store::open_in_memory().unwrap());
+    let mut mime = b"From: Reader <c@x>\r\nSubject: Files\r\nMessage-ID: <files-draft@x>\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=parts\r\n\r\n--parts\r\nContent-Type: text/plain\r\n\r\nHello\r\n".to_vec();
+    for _ in 0..=crate::compose::MAX_ATTACHMENT_FILES {
+        mime.extend(b"--parts\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=map.txt\r\n\r\na\r\n");
+    }
+    mime.extend(b"--parts--\r\n");
+    fx.deliver(SERVER_DRAFTS, 1, mime);
+    fx.sync();
+    let config = fx.account_config();
+    let thread = fx.thread(SERVER_DRAFTS, "Files");
+    let result = config.import_server_draft(&fx.store, &thread, "files-draft");
+    assert!(
+        matches!(result, Err(crate::Error::DraftAttachmentLimit)),
+        "{result:?}"
+    );
+    assert_eq!(fx.subjects(SERVER_DRAFTS), ["Files"]);
+
+    fx.server.state.lock().unwrap().mailboxes[1]
+        .messages
+        .clear();
+    let result = config.import_server_draft(&fx.store, &thread, "files-draft");
+    assert!(
+        matches!(result, Err(crate::Error::DraftUnavailable)),
+        "{result:?}"
+    );
+    let missing = ThreadId("missing-thread".into());
+    let result = config.import_server_draft(&fx.store, &missing, "files-draft");
+    assert!(
+        matches!(result, Err(crate::Error::DraftNoLongerInFolder)),
+        "{result:?}"
     );
 }

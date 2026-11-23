@@ -148,21 +148,24 @@ pub(crate) fn parse_draft(
             .map(str::to_string),
         ..DraftFields::default()
     };
-    let mut body = match joined(parsed.text_body(), |kind| matches!(kind, PartKind::Text)) {
-        Some(plain) => plain.replace("\r\n", "\n"),
-        None if parsed
+    let plain = joined(parsed.text_body(), |kind| matches!(kind, PartKind::Text));
+    let mut body = if let Some(plain) = plain.filter(|text| !text.trim().is_empty()) {
+        plain.replace("\r\n", "\n")
+    } else {
+        let mut html_parts = parsed
             .html_body()
-            .any(|part| matches!(part.kind(), PartKind::Html)) =>
-        {
-            let html = joined(parsed.html_body(), |kind| matches!(kind, PartKind::Html))
-                .unwrap_or_default();
+            .filter(|part| matches!(part.kind(), PartKind::Html))
+            .peekable();
+        if html_parts.peek().is_some() {
+            let html = joined(html_parts, |_| true).unwrap_or_default();
             let text = html_draft_body(&html);
             if text.trim().is_empty() {
                 return Err(crate::Error::DraftBodyUnavailable);
             }
             text
+        } else {
+            String::new()
         }
-        None => String::new(),
     };
     let references = parsed
         .references()
@@ -177,9 +180,7 @@ pub(crate) fn parse_draft(
         if index > crate::compose::MAX_ATTACHMENT_FILES
             || bytes > crate::compose::MAX_ATTACHMENT_BYTES
         {
-            return Err(crate::Error::Action(
-                "Server draft exceeds compose attachment limits".into(),
-            ));
+            return Err(crate::Error::DraftAttachmentLimit);
         }
         let mime = mime_type(&part);
         let name = crate::parts::sanitize_filename(part.attachment_name(), &mime);

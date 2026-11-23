@@ -52,30 +52,74 @@ fn sentence_case(text: &str) -> String {
     }
 }
 
-const FAILED_DRAFT_CLOSE: &str = "Kept in Fell · not on the server";
+pub const FAILED_DRAFT_CLOSE: &str = "Kept in Fell · not on the server";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClosedDraftSave {
+    account: crate::AccountId,
+    draft: String,
+    digest: [u8; 32],
+}
+
+impl ClosedDraftSave {
+    pub fn draft(&self) -> &str {
+        &self.draft
+    }
+
+    pub fn failed(&self, store: &crate::Store) -> bool {
+        matches!(
+            store.server_draft_save_status(&self.account, &self.draft, &self.digest),
+            Ok(Some(super::DraftSaveStatus::ServerFailed))
+        )
+    }
+}
 
 /// A notice whose result can be checked on the mailbox worker after close.
 pub struct DraftCloseNotice {
     text: String,
     alert: bool,
-    server_save: Option<(crate::AccountId, String, [u8; 32])>,
+    server_save: Option<ClosedDraftSave>,
+    pending_write: Option<(crate::AccountId, String, u64, super::SaveWaiter)>,
 }
 
 impl DraftCloseNotice {
+    pub fn after_local_write(mut self) -> Self {
+        if let Some((account, draft, revision, waiter)) = self.pending_write.take() {
+            match waiter.wait_for_receipt(revision) {
+                Some(super::SaveReceipt::Server(digest)) => {
+                    self.server_save = Some(ClosedDraftSave {
+                        account,
+                        draft,
+                        digest,
+                    });
+                }
+                Some(super::SaveReceipt::ServerFailed) => {
+                    self.text = FAILED_DRAFT_CLOSE.into();
+                    self.alert = true;
+                }
+                _ => {}
+            }
+        }
+        self
+    }
+
+    pub fn needs_local_write(&self) -> bool {
+        self.pending_write.is_some()
+    }
+
+    pub fn server_save(&self) -> Option<&ClosedDraftSave> {
+        self.server_save.as_ref()
+    }
+
     pub fn resolve(self, store: &crate::Store) -> (String, bool) {
-        if let Some((account, draft, digest)) = &self.server_save
-            && matches!(
-                store.server_draft_save_status(account, draft, digest),
-                Ok(Some(super::DraftSaveStatus::ServerFailed))
-            )
+        if self
+            .server_save
+            .as_ref()
+            .is_some_and(|save| save.failed(store))
         {
             return (FAILED_DRAFT_CLOSE.into(), true);
         }
-        (self.text, self.alert)
-    }
-
-    pub fn needs_mailbox(&self) -> bool {
-        self.server_save.is_some()
+        self.into_line()
     }
 
     pub fn into_line(self) -> (String, bool) {
@@ -338,6 +382,7 @@ impl DraftHub {
             text: format!("{}  ·  u", action.summary),
             alert: false,
             server_save: None,
+            pending_write: None,
         });
         self.emit();
         Ok(())
@@ -459,11 +504,16 @@ impl DraftHub {
         // on the save debounce is saved now.
         let wake = was_shown.then(|| self.server_draft_wake()).flatten();
         let summary = self.with_session(id, |session| {
-            let receipt = session.save_receipt();
             if let Some(wake) = &wake {
                 session.flush_server_if_due(None, wake);
             }
             let _ = session.flush_pending();
+            let receipt = session.save_receipt();
+            let pending_write = (wake.is_some()
+                && matches!(receipt, None | Some(super::SaveReceipt::Pending)))
+            .then(|| session.save_waiter())
+            .flatten()
+            .map(|waiter| (session.revision(), waiter));
             session.close_editor();
             let snap = session.snapshot();
             (
@@ -472,10 +522,14 @@ impl DraftHub {
                 snap.send_requested_by.is_some(),
                 snap.subject.clone(),
                 receipt,
+                pending_write,
                 session.account_id().clone(),
             )
         });
-        if was_shown && let Some((locked, unreviewed, asked, subject, receipt, account)) = summary {
+        if was_shown
+            && let Some((locked, unreviewed, asked, subject, receipt, pending_write, account)) =
+                summary
+        {
             let sent = locked == Some(SendLock::Sent.reason());
             let failed = locked.is_none() && receipt == Some(super::SaveReceipt::ServerFailed);
             let line = match locked {
@@ -500,7 +554,11 @@ impl DraftHub {
             };
             let server_save = match receipt {
                 Some(super::SaveReceipt::Server(digest)) if locked.is_none() => {
-                    Some((account, id.to_owned(), digest))
+                    Some(ClosedDraftSave {
+                        account: account.clone(),
+                        draft: id.to_owned(),
+                        digest,
+                    })
                 }
                 _ => None,
             };
@@ -511,6 +569,9 @@ impl DraftHub {
                     text: line,
                     alert: failed || locked == Some(SendLock::MaybeSent.reason()),
                     server_save,
+                    pending_write: pending_write
+                        .filter(|_| locked.is_none())
+                        .map(|(revision, waiter)| (account, id.to_owned(), revision, waiter)),
                 },
             );
         }
@@ -563,6 +624,7 @@ impl DraftHub {
                 text: line,
                 alert: warn,
                 server_save: None,
+                pending_write: None,
             },
         );
     }

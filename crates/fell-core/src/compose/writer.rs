@@ -268,6 +268,18 @@ impl SaveWaiter {
         self.wait_for(true)
     }
 
+    pub(crate) fn wait_for_receipt(self, revision: u64) -> Option<SaveReceipt> {
+        let shared = Arc::clone(&self.shared);
+        self.wait_for_mailbox().ok()?;
+        shared
+            .progress
+            .lock()
+            .expect("draft writer")
+            .receipt
+            .filter(|(saved, _)| *saved == revision)
+            .map(|(_, receipt)| receipt)
+    }
+
     fn wait_for(self, mailbox: bool) -> Result<(), String> {
         let mut progress = self.shared.progress.lock().expect("draft writer");
         while progress.completed < self.until {

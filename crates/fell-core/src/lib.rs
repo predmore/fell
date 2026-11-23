@@ -92,6 +92,12 @@ pub enum Error {
     Action(String),
     #[error("This draft has no text Fell can edit. The copy is still on the server.")]
     DraftBodyUnavailable,
+    #[error("This message is no longer in Drafts.")]
+    DraftNoLongerInFolder,
+    #[error("This draft is no longer available on the server.")]
+    DraftUnavailable,
+    #[error("This draft has too many attachments or its attachments are too large.")]
+    DraftAttachmentLimit,
     #[error("{0} is not implemented yet")]
     NotImplemented(&'static str),
     #[error("send requires explicit UI confirmation")]
