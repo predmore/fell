@@ -4852,6 +4852,102 @@ fn reader_stores_metadata_and_bodies_before_the_sync_pass_finishes() {
     pass.join().unwrap();
 }
 
+#[test]
+fn header_and_structure_backfill_set_the_paperclip_before_downloading_bodies() {
+    let id = crate::MessageId::new("files@example.test");
+    let fixture = super::mime_fixtures::mixed_two_attachments(id.as_str());
+    let structure = concat!(
+        r#"(("TEXT" "PLAIN" NIL NIL NIL "7BIT" 19 1 NIL NIL)"#,
+        r#"("APPLICATION" "PDF" NIL NIL NIL "BASE64" 4180 NIL ("ATTACHMENT" ("FILENAME" "report.pdf")))"#,
+        r#"("TEXT" "CSV" NIL NIL NIL "QUOTED-PRINTABLE" 36 2 NIL ("ATTACHMENT" ("FILENAME" "totals.csv"))) "MIXED")"#,
+    );
+    let server = TestServer::spawn_parallel(
+        inbox_state(vec![(1, fixture.raw)]),
+        [(1, structure.to_owned())].into_iter().collect(),
+    );
+    let config = crate::AccountConfig::parse(&format!(
+        concat!(
+            "id = \"reader\"\nemail = \"reader@example.test\"\nbackend = \"imap\"\n",
+            "host = \"127.0.0.1\"\nport = {}\nsecurity = \"plain\"\n",
+            "username = \"caleb\"\npassword = \"secret\"\n"
+        ),
+        server.addr.port()
+    ))
+    .unwrap();
+    let account = config.account();
+    let backend = config.backend().unwrap();
+    let store = Store::open_in_memory().unwrap();
+    let sees = |parts, state| {
+        assert_eq!(store.reader_parts(&account.id, id.as_str()).unwrap(), parts);
+        assert_eq!(
+            store
+                .body_states(&account.id, std::slice::from_ref(&id))
+                .unwrap(),
+            [state]
+        );
+        assert!(store.folder_threads(&account.id, "INBOX").unwrap()[0].has_attachment);
+        let files = store
+            .message_attachments(&account.id, &id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].filename.as_deref(), Some("report.pdf"));
+        assert_eq!(files[1].filename.as_deref(), Some("totals.csv"));
+    };
+    let mut saw_headers = false;
+    sync_with_progress(&account, backend.as_ref(), &store, &mut |_| {
+        if !saw_headers && !store.list_threads(&account.id).unwrap().is_empty() {
+            sees(
+                crate::ReaderParts::Listed { html: false },
+                crate::BodyState::Pending,
+            );
+            saw_headers = true;
+        }
+    })
+    .unwrap();
+    assert!(saw_headers);
+    sees(crate::ReaderParts::Ready, crate::BodyState::Stored);
+    let logged = commands(&server);
+    assert!(
+        logged
+            .iter()
+            .any(|command| command.contains("BODY.PEEK[HEADER] BODYSTRUCTURE"))
+    );
+
+    store.conn.execute_batch(
+        "DELETE FROM message_parts; DELETE FROM message_bodies;
+         UPDATE messages SET has_attachment = 0, attachment_names = '';
+         INSERT INTO body_backfill (account_id, message_id) SELECT account_id, message_id FROM messages;",
+    ).unwrap();
+    server.state.lock().unwrap().commands.clear();
+
+    let mut structures = crate::ReaderBodyFetcher::default();
+    assert_eq!(structures.backfill_structures(&config, &store).unwrap(), 1);
+    sees(
+        crate::ReaderParts::Listed { html: false },
+        crate::BodyState::Stored,
+    );
+    assert_eq!(structures.backfill_structures(&config, &store).unwrap(), 0);
+    let logged = commands(&server);
+    assert!(
+        logged
+            .iter()
+            .any(|command| command.contains("UID FETCH 1 (UID BODYSTRUCTURE)"))
+    );
+    assert!(
+        logged
+            .iter()
+            .all(|command| !command.contains("BODY.PEEK[]"))
+    );
+
+    assert_eq!(
+        crate::fetch_missing_bodies(&account.id, backend.as_ref(), &store, 1).unwrap(),
+        1
+    );
+    sees(crate::ReaderParts::Ready, crate::BodyState::Stored);
+    assert!(store.missing_bodies(&account.id, 1).unwrap().is_empty());
+}
+
 fn temp_cache(tag: &str) -> (std::path::PathBuf, crate::parts::PartCache) {
     let root = std::env::temp_dir().join(format!(
         "fell-part-fetch-{tag}-{}-{:?}",

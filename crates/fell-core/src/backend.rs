@@ -155,6 +155,8 @@ pub struct MailboxDelta {
     pub messages: Vec<Message>,
     /// Clock-skew candidates for undated arrivals, keyed by server copy.
     pub deferred_dates: HashMap<crate::RemoteId, DeferredMailDate>,
+    /// Metadata returned with the headers, keyed by the copy that supplied it.
+    pub body_structures: HashMap<crate::RemoteId, crate::BodyStructure>,
     pub flags: Vec<FlagUpdate>,
     pub links: Vec<CopyLink>,
     /// Virtual mailboxes from the latest successful LIST.

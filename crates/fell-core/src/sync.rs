@@ -401,7 +401,7 @@ impl ReaderBodyFetcher {
                 return Err(crate::imap::body_fetch_cancelled());
             }
             if !structures.is_empty() {
-                store.store_structures(&account, &structures)?;
+                store.store_structures(&account, &structures, true)?;
                 stored();
             }
             for (id, _, _) in structures {
@@ -469,6 +469,20 @@ impl ReaderBodyFetcher {
             }
         }
         Ok(failed)
+    }
+
+    /// List the attachments for a batch of old mail in newest-first order.
+    /// Leaves the body queue in place for the full source, which can
+    /// confirm inline roles and decoded sizes.
+    pub fn backfill_structures(
+        &mut self,
+        config: &crate::AccountConfig,
+        store: &Store,
+    ) -> Result<usize> {
+        let account = AccountId(config.id.clone());
+        let wanted = store.missing_structures(&account, BODY_BATCH)?;
+        let (fetched, _) = self.structures(config, &crate::CancelBodyFetch::default(), wanted)?;
+        store.store_structures(&account, &fetched, false)
     }
 
     fn structures(

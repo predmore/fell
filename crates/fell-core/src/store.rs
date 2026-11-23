@@ -913,6 +913,12 @@ impl Store {
                     inbox_arrivals.push(message.headers.message_id.clone());
                 }
             }
+            if let Some(structure) = delta.body_structures.get(&message.remote_id)
+                && let Some(id) = canonical_id_on(&tx, account_id, &message.headers.message_id)?
+                && bodies::write_structure(&tx, account_id, &id, &message.remote_id, structure)?
+            {
+                set_attachments_from_list(&tx, account_id, &id, &structure.parts)?;
+            }
             if let Some(date) = delta.deferred_dates.get(&message.remote_id)
                 && message.headers.date_unix == 0
                 && let Some(id) = canonical_id_on(&tx, account_id, &message.headers.message_id)?
@@ -1340,7 +1346,15 @@ impl Store {
     /// Up to `limit` messages stored before parts were kept, newest first,
     /// with the server copies to fetch them from.
     pub fn missing_bodies(&self, account_id: &AccountId, limit: usize) -> Result<Vec<BodyRequest>> {
-        bodies::missing(&self.conn, account_id, limit)
+        bodies::missing(&self.conn, account_id, limit, false)
+    }
+
+    pub(crate) fn missing_structures(
+        &self,
+        account: &AccountId,
+        limit: usize,
+    ) -> Result<Vec<BodyRequest>> {
+        bodies::missing(&self.conn, account, limit, true)
     }
 
     /// Repair one batch of cached HTML-only previews from the original parts
@@ -1370,17 +1384,28 @@ impl Store {
         &self,
         account: &AccountId,
         fetched: &[(MessageId, RemoteId, crate::imap::BodyStructure)],
-    ) -> Result<()> {
-        let tx = immediate_transaction(&self.conn)?;
+        foreground: bool,
+    ) -> Result<usize> {
+        if fetched.is_empty() {
+            return Ok(0);
+        }
+        let tx = if foreground {
+            immediate_transaction(&self.conn)?
+        } else {
+            self.lock_wait
+                .behind_waiting_writes(|| immediate_transaction(&self.conn))?
+        };
+        let mut changed = 0;
         for (id, copy, structure) in fetched {
             if let Some(id) = canonical_id_on(&tx, account, id)?
                 && bodies::write_structure(&tx, account, &id, copy, structure)?
             {
                 set_attachments_from_list(&tx, account, &id, &structure.parts)?;
+                changed += 1;
             }
         }
         tx.commit()?;
-        Ok(())
+        Ok(changed)
     }
 
     /// The server copies to fetch for one message with no stored body part

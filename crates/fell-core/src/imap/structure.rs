@@ -4,8 +4,9 @@ use crate::{Disposition, MimePart, PartRole, TransferEncoding};
 
 use super::rfc822::{CidReferences, clean_name, section};
 
-#[derive(Debug, Default)]
-pub(crate) struct BodyStructure {
+/// The body formats and non-body parts reported by an IMAP server.
+#[derive(Debug, Clone, Default)]
+pub struct BodyStructure {
     pub html: bool,
     pub parts: Vec<MimePart>,
 }
