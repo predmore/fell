@@ -240,6 +240,13 @@ fn flag_unchanged(
     column: &str,
     expected: i64,
 ) -> Result<bool> {
+    let (kind, written_value) = if column == "unread" {
+        ("seen", 1 - expected)
+    } else {
+        ("flagged", expected)
+    };
+    // A legacy fold can leave a stale write even after sync restored the
+    // snapshot value. Let undo retire that write without changing the flag.
     Ok(!conn
         .prepare_cached(&format!(
             "{RESOLVED_SNAPSHOTS}
@@ -248,10 +255,22 @@ fn flag_unchanged(
             JOIN messages m ON m.account_id = ?2 AND m.message_id = s.live_id
             WHERE s.{column} IS NOT NULL
               AND s.{column} <> ?3 AND m.{column} IS NOT ?3
+              AND NOT (s.message_id <> s.live_id AND m.{column} = s.{column}
+                  AND EXISTS (
+                      SELECT 1 FROM server_outbox o
+                      WHERE o.account_id = ?2 AND o.message_id = s.message_id
+                        AND o.kind = ?4 AND o.state = 'pending' AND o.flag_value = ?5
+                  ))
         )"
         ))?
         .query_row(
-            params![action.id, action.account_id.as_str(), expected],
+            params![
+                action.id,
+                action.account_id.as_str(),
+                expected,
+                kind,
+                written_value,
+            ],
             |row| row.get::<_, bool>(0),
         )?)
 }

@@ -1413,10 +1413,9 @@ fn undo_messages(conn: &Connection, account_id: &AccountId, action: &RecordedAct
         ),
         _ => return Err(Error::Action(format!("unknown action {}", action.kind))),
     };
-    let flag_states = match flags {
-        Some(flag) => flag_changes(conn, account_id, action.id, flag)?,
-        None => Vec::new(),
-    };
+    if let Some(flag) = flags {
+        restore_flag_writes(conn, account_id, action.id, flag)?;
+    }
     conn.execute(
         &format!(
             "{resolved}
@@ -1427,18 +1426,6 @@ fn undo_messages(conn: &Connection, account_id: &AccountId, action: &RecordedAct
         ),
         params![action.id, account_id.as_str()],
     )?;
-    for (snapshot_id, message_id, unread, starred) in flag_states {
-        if snapshot_id != message_id
-            && let Some(kind) = unread
-                .map(|_| crate::outbox::OutboxKind::Seen)
-                .or_else(|| starred.map(|_| crate::outbox::OutboxKind::Flagged))
-        {
-            // Older folds left writes on the snapshot ID. Repoint them so
-            // queuing the undo supersedes them and retains any STORE recovery.
-            crate::outbox::flags::repoint(conn, account_id, &snapshot_id, &message_id, Some(kind))?;
-        }
-        crate::store::intents::record(conn, account_id, &message_id, unread, starred)?;
-    }
     Ok(())
 }
 
@@ -1475,29 +1462,31 @@ fn snooze_changed_error() -> Error {
     Error::Action("Cannot undo snooze · snooze changed".into())
 }
 
-/// Messages whose read state or star undo of `action_id` changes, as
-/// `(snapshot_id, live_id, unread, starred)`; `None` where that flag stays as it is. A row
-/// logged before stars were recorded restores no star.
-type FlagRestore = (String, String, Option<bool>, Option<bool>);
-
 enum FlagUndo {
     Unread,
     Star,
 }
 
-fn flag_changes(
+fn restore_flag_writes(
     conn: &Connection,
     account_id: &AccountId,
     action_id: i64,
     flag: FlagUndo,
-) -> Result<Vec<FlagRestore>> {
+) -> Result<()> {
+    use crate::outbox::{OutboxKind, flags};
+    use crate::store::intents;
+
+    let kind = match flag {
+        FlagUndo::Unread => OutboxKind::Seen,
+        FlagUndo::Star => OutboxKind::Flagged,
+    };
     let mut stmt = conn.prepare_cached(&format!(
         "{resolved}
          SELECT s.message_id, s.live_id,
-                CASE WHEN ?3 AND m.unread != s.unread THEN s.unread END,
-                CASE WHEN NOT ?3 AND m.starred != s.starred THEN s.starred END
+                CASE WHEN ?3 THEN s.unread ELSE s.starred END,
+                CASE WHEN ?3 THEN m.unread ELSE m.starred END
          FROM resolved s
-         JOIN messages m ON m.account_id = ?2 AND m.message_id = s.live_id",
+         LEFT JOIN messages m ON m.account_id = ?2 AND m.message_id = s.live_id",
         resolved = undo_conflicts::RESOLVED_SNAPSHOTS,
     ))?;
     let rows = stmt.query_map(
@@ -1509,13 +1498,48 @@ fn flag_changes(
         |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<i64>>(2)?.map(|unread| unread != 0),
-                row.get::<_, Option<i64>>(3)?.map(|starred| starred != 0),
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<bool>>(2)?,
+                row.get::<_, Option<bool>>(3)?,
             ))
         },
     )?;
-    rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+    let snapshots = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    for (snapshot, live, before, current) in snapshots {
+        let (unread, starred) = match flag {
+            FlagUndo::Unread => (before, None),
+            FlagUndo::Star => (None, before),
+        };
+        if let Some(message) = live.as_deref()
+            && before.is_some()
+            && before != current
+        {
+            if snapshot != message {
+                flags::repoint(conn, account_id, &snapshot, message, Some(kind))?;
+            }
+            intents::record(conn, account_id, message, unread, starred)?;
+        } else {
+            let restored_value = before.map(|value| {
+                if kind == OutboxKind::Seen {
+                    !value
+                } else {
+                    value
+                }
+            });
+            let queued = flags::cancel_for_undo(
+                conn,
+                account_id,
+                &snapshot,
+                live.as_deref(),
+                kind,
+                restored_value,
+            )?;
+            if queued && let Some(message) = live.as_deref() {
+                intents::remember_correction(conn, account_id, message, unread, starred)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn undo_draft(conn: &Connection, account_id: &AccountId, action_id: i64) -> Result<()> {
@@ -2106,34 +2130,7 @@ mod tests {
             store
                 .set_agent_grant(&account.id, "fern", AgentGrant::enabled(false, true, false))
                 .unwrap();
-            let sent = Message {
-                remote_id: RemoteId("imap:1:10:INBOX".into()),
-                ..message(
-                    "a1",
-                    "sent@x",
-                    None,
-                    "Hello",
-                    "hello body",
-                    true,
-                    &["INBOX"],
-                    &[],
-                    10,
-                )
-            };
-            let echo = Message {
-                remote_id: RemoteId("imap:1:20:INBOX".into()),
-                ..message(
-                    "a1",
-                    "list@x",
-                    None,
-                    "[list] Hello",
-                    "hello body",
-                    true,
-                    &["INBOX"],
-                    &[],
-                    10,
-                )
-            };
+            let (sent, echo) = flag_fold_messages();
             let thread = store.upsert_message(&sent).unwrap();
             let keeper_thread = store.upsert_message(&echo).unwrap();
             let action = if kind == OutboxKind::Seen {
@@ -2157,19 +2154,12 @@ mod tests {
                 .unwrap();
             assert_eq!(initial.flag_value, Some(true));
             assert_eq!(initial.uid, Some(10));
-            store
-                .conn
-                .execute(
-                    "UPDATE messages SET list_id = 'list.example' WHERE message_id = 'list@x'",
-                    [],
-                )
-                .unwrap();
-            let arrived = Message {
-                remote_id: RemoteId("imap:1:30:Sent".into()),
-                folders: vec!["Sent".into()],
-                ..sent
-            };
-            store.upsert_message(&arrived).unwrap();
+            let retry = 9_999_999_999_i64;
+            store.conn.execute(
+                "UPDATE server_outbox SET retry_unix = ?2, attempts = 3, sent = ?3 WHERE id = ?1",
+                params![initial.id, retry, legacy],
+            ).unwrap();
+            fold_into_echo(&store, sent);
             // Sync still sees the server's old flags on the newly folded row.
             store.upsert_message(&echo).unwrap();
             let intents = store.pending_flag_changes(&account.id).unwrap();
@@ -2193,6 +2183,34 @@ mod tests {
             assert_eq!(folded.message_id, "list@x");
             assert_eq!(folded.uid, initial.uid);
             assert_eq!(folded.state, OutboxState::Pending);
+            assert_eq!(
+                (folded.retry_unix, folded.attempts, folded.sent),
+                (retry, 3, legacy)
+            );
+            let active: bool = store
+                .conn
+                .query_row(
+                    "SELECT NOT flag_superseded FROM server_outbox WHERE id = ?1",
+                    [initial.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(active);
+            let writes = store
+                .outbox(&account.id)
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.kind == kind)
+                .map(|row| (row.message_id, row.uid, row.flag_value))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                writes,
+                [
+                    ("list@x".into(), Some(10), Some(true)),
+                    ("list@x".into(), Some(20), Some(true)),
+                    ("list@x".into(), Some(30), Some(true)),
+                ]
+            );
 
             if legacy {
                 // Simulate a row left keyed to the deleted ID by an older build,
@@ -2269,6 +2287,247 @@ mod tests {
                 );
             } else {
                 assert!(outbox.iter().all(|row| row.id != initial.id));
+            }
+        }
+    }
+
+    fn flag_fold_messages() -> (Message, Message) {
+        let sent = Message {
+            remote_id: RemoteId("imap:1:10:INBOX".into()),
+            ..message(
+                "a1",
+                "sent@x",
+                None,
+                "Hello",
+                "hello body",
+                true,
+                &["INBOX"],
+                &[],
+                10,
+            )
+        };
+        let echo = Message {
+            remote_id: RemoteId("imap:1:20:INBOX".into()),
+            ..message(
+                "a1",
+                "list@x",
+                None,
+                "[list] Hello",
+                "hello body",
+                true,
+                &["INBOX"],
+                &[],
+                10,
+            )
+        };
+        (sent, echo)
+    }
+
+    fn fold_into_echo(store: &Store, sent: Message) {
+        store
+            .conn
+            .execute(
+                "UPDATE messages SET list_id = 'list.example' WHERE message_id = 'list@x'",
+                [],
+            )
+            .unwrap();
+        store
+            .upsert_message(&Message {
+                remote_id: RemoteId("imap:1:30:Sent".into()),
+                folders: vec!["Sent".into()],
+                ..sent
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn folded_conflicting_flags_keep_unread_and_starred_in_both_orders() {
+        use crate::outbox::{OutboxKind, OutboxState};
+
+        for keep_echo in [true, false] {
+            let store = Store::open_in_memory().unwrap();
+            let account = account("a1");
+            store.upsert_account(&account).unwrap();
+            store.set_write_back(&account.id, true).unwrap();
+            let (sent, echo) = flag_fold_messages();
+            let sent = Message {
+                remote_id: RemoteId("imap:1:10:Sent".into()),
+                folders: vec!["Sent".into()],
+                unread: false,
+                ..sent
+            };
+            let echo = Message {
+                starred: true,
+                ..echo
+            };
+            let sent_thread = store.upsert_message(&sent).unwrap();
+            let echo_thread = store.upsert_message(&echo).unwrap();
+            store
+                .mark_thread_unread(&account.id, &sent_thread, "user")
+                .unwrap()
+                .unwrap();
+            store
+                .star_thread(&account.id, &sent_thread, true, "user")
+                .unwrap()
+                .unwrap();
+            store
+                .mark_thread_read(&account.id, &echo_thread, "user")
+                .unwrap()
+                .unwrap();
+            store
+                .star_thread(&account.id, &echo_thread, false, "user")
+                .unwrap()
+                .unwrap();
+            let (keeper, arriving_uid) = if keep_echo {
+                fold_into_echo(&store, sent);
+                ("list@x", 30)
+            } else {
+                store
+                    .upsert_message(&Message {
+                        remote_id: RemoteId("imap:1:40:INBOX".into()),
+                        list_id: Some("list.example".into()),
+                        ..echo
+                    })
+                    .unwrap();
+                ("sent@x", 40)
+            };
+            let intents = store.pending_flag_changes(&account.id).unwrap();
+            assert_eq!(intents.len(), 1);
+            assert_eq!(intents[0].message_id, keeper);
+            assert_eq!(
+                (intents[0].unread, intents[0].starred),
+                (Some(true), Some(true))
+            );
+            let message = store
+                .message(&account.id, &MessageId::new(keeper))
+                .unwrap()
+                .unwrap();
+            assert!(message.unread && message.starred);
+            let outbox = store.outbox(&account.id).unwrap();
+            for (kind, value) in [(OutboxKind::Seen, false), (OutboxKind::Flagged, true)] {
+                let mut uids = outbox
+                    .iter()
+                    .filter(|row| row.kind == kind)
+                    .map(|row| {
+                        assert_eq!(row.state, OutboxState::Pending);
+                        assert_eq!(row.message_id, keeper);
+                        assert_eq!(row.flag_value, Some(value));
+                        row.uid.unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                uids.sort_unstable();
+                assert_eq!(uids, [10, 20, arriving_uid]);
+            }
+        }
+    }
+
+    #[test]
+    fn folded_flag_undo_cleans_legacy_writes_when_the_flag_already_matches() {
+        use crate::outbox::{OutboxKind, OutboxState, flags};
+
+        for kind in [OutboxKind::Seen, OutboxKind::Flagged] {
+            for sent_to_server in [false, true] {
+                let store = Store::open_in_memory().unwrap();
+                let account = account("a1");
+                store.upsert_account(&account).unwrap();
+                store.set_write_back(&account.id, true).unwrap();
+                store
+                    .set_agent_grant(&account.id, "fern", AgentGrant::enabled(false, true, false))
+                    .unwrap();
+                let (sent, echo) = flag_fold_messages();
+                let thread = store.upsert_message(&sent).unwrap();
+                store.upsert_message(&echo).unwrap();
+                let action = if kind == OutboxKind::Seen {
+                    store.mark_thread_read(&account.id, &thread, "agent:fern")
+                } else {
+                    store.star_thread(&account.id, &thread, true, "agent:fern")
+                }
+                .unwrap()
+                .unwrap();
+                let original = store.outbox(&account.id).unwrap()[0].id;
+                fold_into_echo(&store, sent);
+                // Recreate an older fold followed by sync observing the before state.
+                store
+                    .conn
+                    .execute("DELETE FROM server_outbox WHERE id <> ?1", [original])
+                    .unwrap();
+                store
+                    .conn
+                    .execute("DELETE FROM local_flag_intents", [])
+                    .unwrap();
+                store
+                    .conn
+                    .execute("UPDATE messages SET unread = 1, starred = 0", [])
+                    .unwrap();
+                store
+                    .conn
+                    .execute(
+                        "UPDATE server_outbox SET message_id = 'sent@x', sent = ?2 WHERE id = ?1",
+                        params![original, sent_to_server],
+                    )
+                    .unwrap();
+                assert!(
+                    store
+                        .undo_agent_activity(&account.id, action.id, None)
+                        .unwrap()
+                        .undone
+                );
+                let message = store
+                    .message(&account.id, &MessageId::new("list@x"))
+                    .unwrap()
+                    .unwrap();
+                assert!(message.unread && !message.starred);
+                let outbox = store.outbox(&account.id).unwrap();
+                if sent_to_server {
+                    assert_eq!(outbox.len(), 2);
+                    let superseded: bool = store
+                        .conn
+                        .query_row(
+                            "SELECT flag_superseded FROM server_outbox WHERE id = ?1",
+                            [original],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert!(superseded);
+                    let corrective = &outbox[1];
+                    assert_eq!(corrective.message_id, "list@x");
+                    assert_eq!(corrective.kind, kind);
+                    assert_eq!(corrective.uid, Some(10));
+                    assert_eq!(corrective.flag_value, Some(false));
+                    assert_eq!(corrective.state, OutboxState::Pending);
+                    let intents = store.pending_flag_changes(&account.id).unwrap();
+                    assert_eq!(intents.len(), 1);
+                    if kind == OutboxKind::Seen {
+                        assert_eq!(intents[0].unread, Some(true));
+                    } else {
+                        assert_eq!(intents[0].starred, Some(false));
+                    }
+                    assert!(matches!(
+                        flags::observe(
+                            &store,
+                            &account.id,
+                            &outbox[0],
+                            flags::Observation::Stored(Some(12))
+                        )
+                        .unwrap(),
+                        flags::Progress::Retired
+                    ));
+                    let corrective = store.outbox(&account.id).unwrap().pop().unwrap();
+                    assert!(matches!(
+                        flags::observe(
+                            &store,
+                            &account.id,
+                            &corrective,
+                            flags::Observation::Stored(Some(13))
+                        )
+                        .unwrap(),
+                        flags::Progress::Applied
+                    ));
+                    assert!(store.pending_flag_changes(&account.id).unwrap().is_empty());
+                } else {
+                    assert!(outbox.is_empty());
+                    assert!(store.pending_flag_changes(&account.id).unwrap().is_empty());
+                }
             }
         }
     }

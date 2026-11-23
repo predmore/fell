@@ -2802,16 +2802,25 @@ fn insert_message(
     message: &Message,
     roles: &mut MergeRoles<'_>,
 ) -> Result<bool> {
-    let inserted = insert_arrival(conn, message, roles)?;
+    let arrival = insert_arrival(conn, message, roles)?;
     copies::record(conn, message)?;
-    Ok(inserted)
+    if let ArrivalWrite::Folded(keeper) = &arrival {
+        intents::finish_fold(conn, &message.account_id, keeper)?;
+    }
+    Ok(matches!(arrival, ArrivalWrite::Inserted))
+}
+
+enum ArrivalWrite {
+    Inserted,
+    Updated,
+    Folded(String),
 }
 
 fn insert_arrival(
     conn: &Connection,
     message: &Message,
     roles: &mut MergeRoles<'_>,
-) -> Result<bool> {
+) -> Result<ArrivalWrite> {
     let fingerprint = message_fingerprint(message);
     if let Some((stored, via_alias)) =
         find_stored(conn, &message.account_id, &message.headers.message_id)?
@@ -2828,18 +2837,18 @@ fn insert_arrival(
             )?
         {
             absorb_duplicate(conn, message, &stored, &other)?;
-        } else {
-            write_kept(conn, message, &stored, via_alias, &[], None)?;
+            return Ok(ArrivalWrite::Folded(other.canonical_id));
         }
-        return Ok(false);
+        write_kept(conn, message, &stored, via_alias, &[], None)?;
+        return Ok(ArrivalWrite::Updated);
     }
     if let Some(stored) = find_list_collapse(conn, message, &fingerprint, None, false, roles)? {
         remember_alias(conn, message, &stored.canonical_id)?;
         write_kept(conn, message, &stored, true, &[], None)?;
-        return Ok(false);
+        return Ok(ArrivalWrite::Folded(stored.canonical_id));
     }
     insert_new(conn, message, &fingerprint)?;
-    Ok(true)
+    Ok(ArrivalWrite::Inserted)
 }
 
 fn insert_new(conn: &Connection, message: &Message, fingerprint: &str) -> Result<ThreadId> {
@@ -3602,6 +3611,7 @@ fn merge_backfilled_duplicates(conn: &Connection) -> Result<()> {
                 continue;
             };
             absorb_duplicate(&tx, message, &stored, &other)?;
+            intents::finish_fold(&tx, &message.account_id, &other.canonical_id)?;
         }
         tx.commit()?;
     }

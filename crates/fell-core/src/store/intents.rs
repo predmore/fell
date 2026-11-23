@@ -4,11 +4,13 @@
 //! reports the same value. Until then a sync pass that still reports the old
 //! one does not write it over the local change. One row can stand for several
 //! server copies (INBOX and Sent, an alias merged by fingerprint), so the
-//! intent is dropped only once every copy recorded for the row has reported
+//! intent is dropped once every copy affected by the change has reported
 //! the new value since it was set. After that, later server changes win again.
 //!
 //! The write-back outbox settles both flags. Read-only sync can settle a
 //! local read intent when no write is queued.
+
+use std::collections::HashSet;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -27,7 +29,7 @@ CREATE TABLE IF NOT EXISTS local_flag_intents (
 );
 
 -- Server copies (by remote id) that have reported the pending read state
--- since it was set.
+-- since it was set, or fall outside a targeted correction.
 CREATE TABLE IF NOT EXISTS local_flag_intent_copies (
     account_id TEXT NOT NULL,
     message_id TEXT NOT NULL,
@@ -47,6 +49,17 @@ END;
 /// flag's intent as it was. A new read state starts over: no copy has
 /// reported it yet.
 pub(crate) fn record(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_id: &str,
+    unread: Option<bool>,
+    starred: Option<bool>,
+) -> Result<()> {
+    remember(conn, account_id, message_id, unread, starred)?;
+    outbox::flags::queue(conn, account_id, message_id, unread, starred)
+}
+
+fn remember(
     conn: &Connection,
     account_id: &AccountId,
     message_id: &str,
@@ -75,46 +88,103 @@ pub(crate) fn record(
             params![account_id.as_str(), message_id],
         )?;
     }
-    outbox::flags::queue(conn, account_id, message_id, unread, starred)
+    Ok(())
 }
 
-/// Merge intents before the duplicate is deleted. Keep the survivor's
-/// value for a flag edited on both rows and carry over independent edits.
+/// Hold the local value while the corrective writes settle. A no-op undo
+/// only repairs copies whose original STORE may have reached the server.
+pub(crate) fn remember_correction(
+    conn: &Connection,
+    account: &AccountId,
+    message: &str,
+    unread: Option<bool>,
+    starred: Option<bool>,
+) -> Result<()> {
+    remember(conn, account, message, unread, starred)?;
+    if unread.is_none() {
+        return Ok(());
+    }
+    let scope = params![account.as_str(), message];
+    let mut pending = conn.prepare_cached(
+        "SELECT source_mailbox, uidvalidity, uid FROM server_outbox
+         WHERE account_id = ?1 AND message_id = ?2 AND kind = 'seen'
+           AND state = 'pending' AND flag_superseded = 0",
+    )?;
+    let targets = pending
+        .query_map(scope, |row| {
+            let mailbox: String = row.get(0)?;
+            let validity: u32 = row.get(1)?;
+            let uid: u32 = row.get(2)?;
+            let escaped = crate::imap::escape_mailbox(&mailbox);
+            Ok(format!("imap:{validity}:{uid}:{escaped}"))
+        })?
+        .collect::<rusqlite::Result<HashSet<_>>>()?;
+    let mut copies = conn.prepare_cached(
+        "SELECT 'imap:' || uidvalidity || ':' || uid || ':' || mailbox
+         FROM message_copies WHERE account_id = ?1 AND message_id = ?2",
+    )?;
+    let mut mark = conn.prepare_cached(
+        "INSERT OR IGNORE INTO local_flag_intent_copies (account_id, message_id, remote_id)
+         VALUES (?1, ?2, ?3)",
+    )?;
+    for copy in copies.query_map(scope, |row| row.get::<_, String>(0))? {
+        let copy = copy?;
+        if !targets.contains(&copy) {
+            mark.execute(params![account.as_str(), message, copy])?;
+        }
+    }
+    Ok(())
+}
+
+/// Merge intents before the duplicate is deleted. Unread and starred each
+/// win a conflict regardless of which row survives.
 pub(super) fn merge(conn: &Connection, account: &AccountId, from: &str, to: &str) -> Result<()> {
     let scope = params![account.as_str(), from, to];
-    let (unread, starred): (Option<bool>, Option<bool>) = conn
-        .prepare_cached(
-            "SELECT CASE WHEN k.unread <> d.unread THEN k.unread END,
-                    CASE WHEN k.starred <> d.starred THEN k.starred END
-             FROM local_flag_intents d
+    conn.prepare_cached(
+        "DELETE FROM local_flag_intent_copies WHERE account_id = ?1 AND message_id = ?3
+         AND EXISTS (
+             SELECT 1 FROM local_flag_intents d
              JOIN local_flag_intents k ON k.account_id = d.account_id AND k.message_id = ?3
-             WHERE d.account_id = ?1 AND d.message_id = ?2",
-        )?
-        .query_row(scope, |row| Ok((row.get(0)?, row.get(1)?)))
-        .optional()?
-        .unwrap_or_default();
+             WHERE d.account_id = ?1 AND d.message_id = ?2 AND d.unread = 1 AND k.unread = 0
+         )",
+    )?
+    .execute(scope)?;
     let merged = conn
         .prepare_cached(
             "INSERT INTO local_flag_intents (account_id, message_id, unread, starred)
          SELECT account_id, ?3, unread, starred FROM local_flag_intents
          WHERE account_id = ?1 AND message_id = ?2
          ON CONFLICT(account_id, message_id) DO UPDATE SET
-             unread = COALESCE(local_flag_intents.unread, excluded.unread),
-             starred = COALESCE(local_flag_intents.starred, excluded.starred)",
+             unread = COALESCE(MAX(local_flag_intents.unread, excluded.unread),
+                               local_flag_intents.unread, excluded.unread),
+             starred = COALESCE(MAX(local_flag_intents.starred, excluded.starred),
+                                local_flag_intents.starred, excluded.starred)",
         )?
         .execute(scope)?;
-    if merged != 0 && unread.is_none() {
+    if merged != 0 {
         conn.prepare_cached(
             "INSERT OR IGNORE INTO local_flag_intent_copies (account_id, message_id, remote_id)
-             SELECT account_id, ?3, remote_id FROM local_flag_intent_copies
-             WHERE account_id = ?1 AND message_id = ?2",
+             SELECT c.account_id, ?3, c.remote_id FROM local_flag_intent_copies c
+             JOIN local_flag_intents d ON d.account_id = c.account_id AND d.message_id = c.message_id
+             JOIN local_flag_intents k ON k.account_id = d.account_id AND k.message_id = ?3
+             WHERE c.account_id = ?1 AND c.message_id = ?2 AND d.unread = k.unread",
         )?
         .execute(scope)?;
     }
-    outbox::flags::repoint(conn, account, from, to, None)?;
-    // Conflicting values cannot both play on the merged set of copies.
-    // Reuse the normal queue to retain recovery for any STORE already sent.
-    record(conn, account, to, unread, starred)
+    outbox::flags::repoint(conn, account, from, to, None)
+}
+
+/// Include the arriving UID, which is recorded after the merge.
+pub(super) fn finish_fold(conn: &Connection, account: &AccountId, keeper: &str) -> Result<()> {
+    let intent = conn.prepare_cached(
+        "SELECT unread, starred FROM local_flag_intents WHERE account_id = ?1 AND message_id = ?2",
+    )?.query_row(params![account.as_str(), keeper], |row| {
+        Ok((row.get::<_, Option<bool>>(0)?, row.get::<_, Option<bool>>(1)?))
+    }).optional()?;
+    if let Some((unread, starred)) = intent {
+        outbox::flags::complete_fold(conn, account, keeper, unread, starred)?;
+    }
+    Ok(())
 }
 
 /// The unread value the server copy `remote_id` may write to `message_id`:
