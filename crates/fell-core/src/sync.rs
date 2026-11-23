@@ -4,8 +4,9 @@ use crate::Result;
 use crate::account::{Account, AccountId};
 use crate::backend::MailBackend;
 use crate::folders::FolderRole;
-use crate::imap::decode_cursor;
+use crate::imap::{decode_cursor, encode_cursor};
 use crate::message::{MessageId, MessageParts, RemoteId};
+use crate::outbox::drafts;
 pub use crate::store::inbox_arrivals::InboxArrival;
 use crate::store::inbox_arrivals::Observer;
 use crate::store::{BodyRequest, ReplyToVerification, Store};
@@ -75,7 +76,13 @@ pub fn sync_with_arrivals(
     arrivals: Option<&mut dyn FnMut(Result<Vec<InboxArrival>>)>,
 ) -> Result<SyncReport> {
     store.upsert_account(account)?;
-    let cursor = store.sync_cursor(&account.id)?;
+    let mut cursor = store.sync_cursor(&account.id)?;
+    let rescans = drafts::rescans(store, &account.id)?;
+    if !rescans.is_empty() {
+        let mut checkpoints = decode_cursor(cursor.as_ref());
+        checkpoints.retain(|(mailbox, _)| rescans.iter().all(|(_, name)| name != mailbox));
+        cursor = Some(encode_cursor(account.id.as_str(), &checkpoints));
+    }
     let mut observer = arrivals.and_then(|send| {
         let inbox = FolderRole::Inbox.default_name();
         let (_, checkpoint) = decode_cursor(cursor.as_ref())
@@ -110,6 +117,18 @@ pub fn sync_with_arrivals(
         }
         Ok(())
     })?;
+    if !rescans.is_empty() {
+        let checkpoints = decode_cursor(store.sync_cursor(&account.id)?.as_ref());
+        drafts::finish_rescans(
+            store,
+            rescans.into_iter().filter_map(|(id, mailbox)| {
+                checkpoints
+                    .iter()
+                    .any(|(name, checkpoint)| name == &mailbox && checkpoint.floor.is_none())
+                    .then_some(id)
+            }),
+        )?;
+    }
     // Repair a bounded page of undated mail after a successful sync pass.
     if let Ok(changed) = repair_internal_dates(&account.id, backend, store) {
         report.changed |= changed;

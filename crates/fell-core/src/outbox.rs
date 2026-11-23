@@ -1224,6 +1224,7 @@ pub(crate) enum Outcome<'a> {
     },
     Dropped {
         error: &'a str,
+        draft_cleanup: bool,
     },
 }
 
@@ -1330,11 +1331,19 @@ pub(crate) fn settle(
                 Settled::Recorded
             });
         }
-        Outcome::Dropped { error } => {
+        Outcome::Dropped {
+            error,
+            draft_cleanup,
+        } => {
+            if draft_cleanup {
+                drafts::abandon_cleanup(store, &tx, account_id, entry)?;
+            }
             tx.execute(
-                "UPDATE server_outbox SET state = 'dropped', append_mime = NULL, error = ?2, settled_unix = ?3
+                "UPDATE server_outbox
+                 SET state = 'dropped', append_mime = NULL, error = ?2, settled_unix = ?3,
+                     append_checks = CASE WHEN ?4 THEN 0 ELSE append_checks END
                  WHERE id = ?1",
-                params![entry.id, error, now],
+                params![entry.id, error, now, draft_cleanup],
             )?;
             tx.commit()?;
             return Ok(Settled::Recorded);

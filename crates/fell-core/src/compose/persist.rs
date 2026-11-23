@@ -109,7 +109,7 @@ pub(crate) fn mark_discarded(
         params![account.as_str(), id, action_id, SEND_SENT],
     )?;
     if changed == 1 {
-        crate::outbox::drafts::cancel_unsent(conn, account, id)?;
+        crate::outbox::drafts::discard(conn, account, id)?;
     }
     Ok(changed == 1)
 }

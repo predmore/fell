@@ -41,6 +41,7 @@ pub(in crate::imap) struct WriteFixture {
     pub lose_before_store: bool,
     pub before_store: Option<Box<dyn FnOnce() + Send>>,
     pub refuse_store_uid: Option<u32>,
+    pub read_only_mailbox: Option<String>,
     pub modified_no: bool,
     pub omit_store_modseq: bool,
     pub omit_fetch_flags: bool,
@@ -72,15 +73,25 @@ pub(super) fn handle(
 ) -> bool {
     let reply = match verb {
         "SELECT" => {
-            let (hook, nomodseq) = {
+            let (hook, nomodseq, read_only) = {
                 let mut writes = writes.lock().expect("writes");
-                (writes.before_refusing_select.take(), writes.nomodseq)
+                (
+                    writes.before_refusing_select.take(),
+                    writes.nomodseq,
+                    writes.read_only_mailbox.as_deref() == Some(mailbox_name(rest).as_str()),
+                )
             };
             if let Some(hook) = hook {
                 hook();
                 format!("{tag} NO SELECT refused\r\n")
             } else {
-                select(tag, rest, &state.lock().expect("state"), nomodseq)
+                select(
+                    tag,
+                    rest,
+                    &state.lock().expect("state"),
+                    nomodseq,
+                    read_only,
+                )
             }
         }
         "STATUS" => status(tag, rest, &state.lock().expect("state")),
@@ -116,6 +127,12 @@ pub(super) fn handle(
             } else if let Some(args) = strip_prefix_ignore(rest, "STORE ") {
                 if !selected_write {
                     format!("{tag} BAD STORE requires SELECT\r\n")
+                } else if writes
+                    .read_only_mailbox
+                    .as_deref()
+                    .is_some_and(|mailbox| selected(&state).as_deref() == Some(mailbox))
+                {
+                    format!("{tag} NO [READ-ONLY] STORE refused\r\n")
                 } else {
                     if std::mem::take(&mut writes.lose_before_store) {
                         let _ = out.stream.shutdown(std::net::Shutdown::Both);
@@ -248,7 +265,7 @@ pub(super) fn append(
     let _ = out.flush();
 }
 
-fn select(tag: &str, rest: &str, state: &TestState, nomodseq: bool) -> String {
+fn select(tag: &str, rest: &str, state: &TestState, nomodseq: bool, read_only: bool) -> String {
     let name = mailbox_name(rest);
     let Some(mailbox) = state.mailboxes.iter().find(|item| item.name == name) else {
         return format!("{tag} NO no such mailbox\r\n");
@@ -268,9 +285,10 @@ fn select(tag: &str, rest: &str, state: &TestState, nomodseq: bool) -> String {
         let highest = mailbox.messages.iter().map(|m| m.modseq).max().unwrap_or(1);
         format!("* OK [HIGHESTMODSEQ {highest}] highest\r\n")
     };
+    let access = if read_only { "READ-ONLY" } else { "READ-WRITE" };
     format!(
         "* {} EXISTS\r\n* OK [UIDVALIDITY {}] UIDs valid\r\n{next}\
-         {revision}{tag} OK [READ-WRITE] SELECT completed\r\n",
+         {revision}{tag} OK [{access}] SELECT completed\r\n",
         mailbox.messages.len(),
         mailbox.uidvalidity
     )

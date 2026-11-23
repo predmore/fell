@@ -2547,6 +2547,8 @@ fn delete_demo_account(conn: &Connection, id: &str) -> Result<()> {
         "account_folders",
         "sent_bcc",
         "server_outbox",
+        "server_draft_copies",
+        "server_draft_rescans",
         "write_back_accounts",
         "agent_grants",
         "agent_actions",

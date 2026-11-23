@@ -18,6 +18,12 @@ pub(super) fn ensure_schema(conn: &Connection) -> Result<()> {
             PRIMARY KEY (account_id, draft_id),
             UNIQUE (account_id, mailbox, uidvalidity, uid)
          ) WITHOUT ROWID;
+         CREATE TABLE IF NOT EXISTS server_draft_rescans (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             account_id TEXT NOT NULL,
+             mailbox TEXT NOT NULL,
+             UNIQUE (account_id, mailbox)
+         );
          CREATE INDEX IF NOT EXISTS idx_outbox_draft
              ON server_outbox(account_id, draft_id, id) WHERE draft_id IS NOT NULL;",
     )?;
@@ -69,12 +75,17 @@ pub(crate) fn queue(
     }
     let rearmed = rearm_recovery(&tx, account, draft)?;
     let latest: Option<Vec<u8>> = tx.query_row(
-        "SELECT COALESCE(
+        "WITH cleanup AS (
+             SELECT max(id) AS last_delete FROM server_outbox
+             WHERE account_id = ?1 AND draft_id = ?2 AND kind = 'delete_draft' AND state = 'pending'
+         )
+         SELECT COALESCE(
              (SELECT draft_digest FROM server_outbox WHERE account_id = ?1 AND draft_id = ?2
                 AND kind = 'append_draft' AND state = 'pending' AND append_mime IS NOT NULL
-                ORDER BY id DESC LIMIT 1),
-             (SELECT digest FROM server_draft_copies WHERE account_id = ?1 AND draft_id = ?2)
-         )",
+                AND id > COALESCE(cleanup.last_delete, 0) ORDER BY id DESC LIMIT 1),
+             (SELECT digest FROM server_draft_copies WHERE account_id = ?1 AND draft_id = ?2
+                AND cleanup.last_delete IS NULL)
+         ) FROM cleanup",
         params![account.as_str(), draft],
         |row| row.get(0),
     )?;
@@ -122,6 +133,49 @@ pub(crate) fn cancel_unsent(conn: &Connection, account: &AccountId, draft: &str)
          AND kind = 'append_draft' AND state = 'pending' AND NOT sent",
         params![account.as_str(), draft],
     )?;
+    Ok(())
+}
+
+pub(crate) fn discard(conn: &Connection, account: &AccountId, draft: &str) -> Result<()> {
+    if enabled(conn, account)? {
+        queue_delete(conn, account, draft)
+    } else {
+        release_copy(conn, account, draft)
+    }
+}
+
+/// The next sync must revisit the mailbox: its cursor can already be
+/// past the UID whose synced representation was removed on import.
+fn release_copy(conn: &Connection, account: &AccountId, draft: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO server_draft_rescans (account_id, mailbox)
+         SELECT account_id, mailbox FROM server_draft_copies
+         WHERE account_id = ?1 AND draft_id = ?2",
+        params![account.as_str(), draft],
+    )?;
+    conn.execute(
+        "DELETE FROM server_draft_copies WHERE account_id = ?1 AND draft_id = ?2",
+        params![account.as_str(), draft],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn rescans(store: &Store, account: &AccountId) -> Result<Vec<(i64, String)>> {
+    let mut stmt = store
+        .connection()
+        .prepare_cached("SELECT id, mailbox FROM server_draft_rescans WHERE account_id = ?1")?;
+    Ok(stmt
+        .query_map([account.as_str()], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+pub(crate) fn finish_rescans(store: &Store, ids: impl Iterator<Item = i64>) -> Result<()> {
+    for id in ids {
+        // If a discard raced this sync, REPLACE assigned it a different ID.
+        store
+            .connection()
+            .execute("DELETE FROM server_draft_rescans WHERE id = ?1", [id])?;
+    }
     Ok(())
 }
 
@@ -196,27 +250,6 @@ pub(crate) fn finish(store: &Store, entry: &OutboxEntry) -> Result<bool> {
     let tx = crate::store::immediate_transaction(store.connection())?;
     let changed = super::complete_append_in(&tx, entry)?;
     if changed {
-        let placed = tx
-            .query_row(
-                "SELECT account_id, target_mailbox, placed_uidvalidity, placed_uid
-             FROM server_outbox WHERE id = ?1 AND placed_uid IS NOT NULL",
-                [entry.id],
-                |row| {
-                    Ok((
-                        AccountId(row.get(0)?),
-                        Copy {
-                            mailbox: row.get(1)?,
-                            validity: row.get(2)?,
-                            uid: row.get(3)?,
-                        },
-                    ))
-                },
-            )
-            .optional()?;
-        if let Some((account, copy)) = placed {
-            store.hide_server_draft_copy(&tx, &account, &copy)?;
-        }
-
         if entry.kind == super::OutboxKind::DeleteDraft {
             tx.execute(
                 "DELETE FROM server_draft_copies WHERE (account_id, draft_id) =
@@ -224,18 +257,61 @@ pub(crate) fn finish(store: &Store, entry: &OutboxEntry) -> Result<bool> {
                 [entry.id],
             )?;
         } else {
-            tx.execute(
-                "INSERT INTO server_draft_copies (account_id, draft_id, mailbox, uidvalidity, uid, digest)
-                 SELECT account_id, draft_id, target_mailbox, placed_uidvalidity, placed_uid, draft_digest
-                 FROM server_outbox WHERE id = ?1 AND placed_uid IS NOT NULL
-                 ON CONFLICT(account_id, draft_id) DO UPDATE SET mailbox = excluded.mailbox,
-                     uidvalidity = excluded.uidvalidity, uid = excluded.uid, digest = excluded.digest",
-                [entry.id],
-            )?;
+            promote_placed(store, &tx, entry)?;
         }
     }
     tx.commit()?;
     Ok(changed)
+}
+
+/// Stop retrying a refused cleanup. The old copy can be rediscovered
+/// if the server still has it. An already confirmed APPEND remains the
+/// current copy so later saves replace that UID.
+pub(super) fn abandon_cleanup(
+    store: &Store,
+    tx: &Connection,
+    account: &AccountId,
+    entry: &OutboxEntry,
+) -> Result<()> {
+    let draft: String = tx.query_row(
+        "SELECT draft_id FROM server_outbox WHERE id = ?1",
+        [entry.id],
+        |row| row.get(0),
+    )?;
+    release_copy(tx, account, &draft)?;
+    promote_placed(store, tx, entry)
+}
+
+fn promote_placed(store: &Store, tx: &Connection, entry: &OutboxEntry) -> Result<()> {
+    let placed = tx
+        .query_row(
+            "SELECT account_id, target_mailbox, placed_uidvalidity, placed_uid
+             FROM server_outbox WHERE id = ?1 AND placed_uid IS NOT NULL",
+            [entry.id],
+            |row| {
+                Ok((
+                    AccountId(row.get(0)?),
+                    Copy {
+                        mailbox: row.get(1)?,
+                        validity: row.get(2)?,
+                        uid: row.get(3)?,
+                    },
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((account, copy)) = placed {
+        store.hide_server_draft_copy(tx, &account, &copy)?;
+        tx.execute(
+            "INSERT INTO server_draft_copies (account_id, draft_id, mailbox, uidvalidity, uid, digest)
+             SELECT account_id, draft_id, target_mailbox, placed_uidvalidity, placed_uid, draft_digest
+             FROM server_outbox WHERE id = ?1
+             ON CONFLICT(account_id, draft_id) DO UPDATE SET mailbox = excluded.mailbox,
+                 uidvalidity = excluded.uidvalidity, uid = excluded.uid, digest = excluded.digest",
+            [entry.id],
+        )?;
+    }
+    Ok(())
 }
 
 pub(crate) fn local_id(
@@ -296,6 +372,7 @@ pub(crate) fn hides(
              UNION ALL
              SELECT 1 FROM server_outbox WHERE account_id = ?1 AND message_id = ?5
                AND kind = 'append_draft' AND sent AND target_mailbox = ?2
+               AND (state = 'pending' OR (state = 'dropped' AND append_checks > 0))
                AND ((placed_uidvalidity = ?3 AND placed_uid = ?4)
                     OR (placed_uid IS NULL AND target_uidvalidity = ?3 AND target_uidnext <= ?4))
          )",

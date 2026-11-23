@@ -134,7 +134,10 @@ pub(super) fn replay_with(
         Ok(()) => {}
         Err(Stop::Store(err)) => return Err(err),
         Err(
-            Stop::AppendRetry(message) | Stop::AppendRefused(message) | Stop::AppendCheck(message),
+            Stop::AppendRetry(message)
+            | Stop::AppendRefused(message)
+            | Stop::DraftCleanupRefused(message)
+            | Stop::AppendCheck(message),
         ) => {
             return Err(Error::Backend(message));
         }
@@ -153,6 +156,7 @@ enum Stop {
     Store(Error),
     AppendRetry(String),
     AppendRefused(String),
+    DraftCleanupRefused(String),
     AppendCheck(String),
     AppendCheckDisconnected(Error),
     /// The row is no longer in this write-back generation: send nothing more.
@@ -172,6 +176,7 @@ fn append_check_error(error: WriteError) -> Stop {
 enum AppendRetry {
     Deferred,
     Refused,
+    CleanupRefused,
     Inconclusive { checks: u32 },
 }
 
@@ -305,6 +310,9 @@ impl Pass<'_> {
             Err(Stop::AppendRefused(message)) => {
                 self.retry_append(index, &message, AppendRetry::Refused)
             }
+            Err(Stop::DraftCleanupRefused(message)) => {
+                self.retry_append(index, &message, AppendRetry::CleanupRefused)
+            }
             Err(Stop::AppendCheck(message)) => {
                 self.retry_append(index, &message, AppendRetry::Inconclusive { checks })
             }
@@ -372,7 +380,7 @@ impl Pass<'_> {
         copy: &drafts::Copy,
     ) -> Result<(), Stop> {
         let write_error = |error| match error {
-            WriteError::Refused(_) => Stop::AppendRetry("Drafts cleanup refused".into()),
+            WriteError::Refused(message) => Stop::DraftCleanupRefused(message),
             WriteError::Connection(error) => Stop::Connection(error),
         };
         self.selected = None;
@@ -381,17 +389,31 @@ impl Pass<'_> {
         if validity != copy.validity {
             return Ok(());
         }
-        if drafts::pending(self.store, entry)?.is_none() {
-            return Err(Stop::Stale);
-        }
-        session.mark_deleted(copy.uid).map_err(write_error)?;
-        if session.has_uid_expunge() {
+        let cleanup = |session: &mut WriteSession| {
             if drafts::pending(self.store, entry)?.is_none() {
                 return Err(Stop::Stale);
             }
-            session.expunge_uid(copy.uid).map_err(write_error)?;
+            session.mark_deleted(copy.uid).map_err(write_error)?;
+            if session.has_uid_expunge() {
+                if drafts::pending(self.store, entry)?.is_none() {
+                    return Err(Stop::Stale);
+                }
+                session.expunge_uid(copy.uid).map_err(write_error)?;
+            }
+            Ok(())
+        };
+        match cleanup(session) {
+            // A server may refuse STORE or EXPUNGE after someone already
+            // removed the UID. Only an explicit empty listing settles it.
+            Err(Stop::DraftCleanupRefused(_))
+                if session
+                    .search_uid_range(copy.uid, copy.uid, 1)
+                    .is_ok_and(|uids| uids.is_empty()) =>
+            {
+                Ok(())
+            }
+            result => result,
         }
-        Ok(())
     }
 
     fn append(
@@ -609,12 +631,34 @@ impl Pass<'_> {
             "Drafts write could not be confirmed"
         };
         let attempts = match retry {
-            AppendRetry::Deferred | AppendRetry::Refused => entry.attempts,
+            AppendRetry::Deferred | AppendRetry::Refused | AppendRetry::CleanupRefused => {
+                entry.attempts
+            }
             AppendRetry::Inconclusive { checks } => checks,
         };
         match retry {
             AppendRetry::Refused if attempts + 1 >= MAX_ATTEMPTS => {
                 return self.drop_row(index, DropReason::Refused, message);
+            }
+            AppendRetry::CleanupRefused if attempts + 1 >= MAX_ATTEMPTS => {
+                let settled = outbox::settle(
+                    self.store,
+                    self.account_id,
+                    entry,
+                    None,
+                    None,
+                    Outcome::Dropped {
+                        error: message,
+                        draft_cleanup: true,
+                    },
+                )?;
+                match settled {
+                    Settled::Stale => return Err(Stop::Stale),
+                    Settled::Recorded => self.note_drop(index, DropReason::UnconfirmedAppend),
+                    _ => {}
+                }
+                self.settled[index] = true;
+                return Ok(());
             }
             AppendRetry::Inconclusive { .. } if attempts + 1 >= MAX_APPEND_CHECKS => {
                 return self.drop_row(index, DropReason::UnconfirmedAppend, message);
@@ -632,7 +676,9 @@ impl Pass<'_> {
             Outcome::Retry {
                 error: message,
                 retry_unix: self.now + wait,
-                counts: refused,
+                // Cleanup follows a confirmed APPEND. Keep its sent
+                // marker so queueing a later revision cannot cancel it.
+                counts: refused || matches!(retry, AppendRetry::CleanupRefused),
                 refused,
                 append_check: matches!(retry, AppendRetry::Inconclusive { .. }),
             },
@@ -1254,6 +1300,11 @@ impl Pass<'_> {
         if self.drop_quietly(index, message)? == Settled::Retired {
             return Ok(());
         }
+        self.note_drop(index, reason);
+        Ok(())
+    }
+
+    fn note_drop(&mut self, index: usize, reason: DropReason) {
         let entry = &self.entries[index];
         self.report.dropped.push(DroppedWrite {
             kind: entry.kind,
@@ -1261,7 +1312,6 @@ impl Pass<'_> {
             target_folder: entry.target_folder.clone(),
             reason,
         });
-        Ok(())
     }
 
     /// Drop the row without a notice: the user has nothing to learn from it.
@@ -1274,7 +1324,10 @@ impl Pass<'_> {
             entry,
             None,
             None,
-            Outcome::Dropped { error: message },
+            Outcome::Dropped {
+                error: message,
+                draft_cleanup: false,
+            },
         )?;
         if settled == Settled::Stale {
             return Err(Stop::Stale);

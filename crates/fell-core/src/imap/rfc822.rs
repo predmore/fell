@@ -108,9 +108,8 @@ pub(super) fn keywords(flags: &[String]) -> Vec<String> {
 
 /// Read the draft's editable plain part and decoded files from the same MIME.
 pub(crate) fn parse_draft(
-    account: &AccountId,
+    account: &crate::Account,
     id: &str,
-    from: &str,
     raw: &[u8],
 ) -> crate::Result<crate::compose::StoredCompose> {
     use crate::compose::{DraftFields, ReplyParts, ResolvedFile, StoredCompose};
@@ -120,30 +119,45 @@ pub(crate) fn parse_draft(
         .ok_or_else(|| crate::Error::Action("Couldn't read the server draft".into()))?;
     let addresses = |list| {
         address_list(list)
-            .iter()
-            .map(crate::compose::format_address)
+            .into_iter()
+            .map(|mut address| {
+                address.name = address
+                    .name
+                    .map(|name| crate::notes::display_safe(&name, false));
+                crate::compose::format_address(&address)
+            })
             .collect()
     };
     let fields = DraftFields {
-        from: address_list(parsed.from())
-            .iter()
-            .find(|address| address.email.eq_ignore_ascii_case(from))
-            .map(crate::compose::format_address)
-            .unwrap_or_else(|| from.to_string()),
+        from: account.compose_from(),
         to: addresses(parsed.to()),
         cc: addresses(parsed.cc()),
         bcc: addresses(parsed.bcc()),
-        subject: parsed.subject().unwrap_or_default().into(),
+        subject: crate::notes::display_safe(parsed.subject().unwrap_or_default(), false),
         in_reply_to: parsed
             .in_reply_to()
             .and_then(|ids| ids.first())
             .map(str::to_string),
         ..DraftFields::default()
     };
-    let mut body = joined(parsed.text_body(), |kind| matches!(kind, PartKind::Text))
-        .or_else(|| parsed.body_text(0).map(|text| text.into_owned()))
-        .unwrap_or_default()
-        .replace("\r\n", "\n");
+    let mut body = match joined(parsed.text_body(), |kind| matches!(kind, PartKind::Text)) {
+        Some(plain) => plain.replace("\r\n", "\n"),
+        None if parsed
+            .html_body()
+            .any(|part| matches!(part.kind(), PartKind::Html)) =>
+        {
+            let html = joined(parsed.html_body(), |kind| matches!(kind, PartKind::Html))
+                .unwrap_or_default();
+            let text = fell_render::html_to_document(&html).plain_text();
+            if text.trim().is_empty() {
+                return Err(crate::Error::Action(
+                    "Server draft HTML has no editable text".into(),
+                ));
+            }
+            text
+        }
+        None => String::new(),
+    };
     let references = parsed
         .references()
         .map(|ids| ids.iter().map(str::to_string).collect())
@@ -186,11 +200,11 @@ pub(crate) fn parse_draft(
     }
     Ok(StoredCompose {
         id: id.to_string(),
-        account_id: account.clone(),
+        account_id: account.id.clone(),
         fields,
         body,
         files,
-        identities: crate::compose::email_of(from).into_iter().collect(),
+        identities: vec![account.email.clone()],
         owner: String::new(),
         reply: ReplyParts {
             references,

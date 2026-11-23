@@ -581,7 +581,7 @@ impl AccountConfig {
         ));
         let raw = crate::imap::part_fetch::fetch_draft(&self.imap_config()?, &remote)?
             .ok_or_else(|| crate::Error::Action("Server draft is no longer available".into()))?;
-        let draft = crate::imap::rfc822::parse_draft(&account.id, draft_id, &account.email, &raw)?;
+        let draft = crate::imap::rfc822::parse_draft(&account, draft_id, &raw)?;
         store.import_server_draft(&copy, &draft)
     }
 

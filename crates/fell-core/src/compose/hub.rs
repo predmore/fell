@@ -300,6 +300,9 @@ impl DraftHub {
         }
         drop(opening);
         drop(sessions);
+        if let Some(wake) = self.server_draft_wake() {
+            wake();
+        }
         self.closed
             .lock()
             .expect("closed")
