@@ -3,8 +3,7 @@
 use std::sync::Arc;
 
 use fell_core::agent::{
-    ActivityBlocker, ActivityDirection, ActivityGrant, AgentActivity, AgentActivityPage,
-    BULK_UNDO_THRESHOLD,
+    ActivityBlocker, ActivityDirection, AgentActivity, AgentActivityPage, BULK_UNDO_THRESHOLD,
 };
 use fell_core::{AccountId, AgentSummary, Store};
 
@@ -168,7 +167,7 @@ impl Activity {
         }
         self.blocker_notice = None;
         let entry = self.selected_entry()?;
-        if entry.action.undone || entry.draft_discarded || entry.missing_grant.is_some() {
+        if entry.action.undone || entry.draft_discarded {
             return None;
         }
         if let Some(blocker) = entry.blocker.clone() {
@@ -308,16 +307,6 @@ impl Activity {
         (false, retry)
     }
 
-    pub fn mark_grant_missing(&mut self, id: i64, grant: ActivityGrant) {
-        if let Some(entry) = Arc::make_mut(&mut self.page)
-            .entries
-            .iter_mut()
-            .find(|entry| entry.action.id == id)
-        {
-            entry.missing_grant = Some(grant);
-        }
-    }
-
     pub fn selected_entry(&self) -> Option<&AgentActivity> {
         self.page.entries.get(self.selected)
     }
@@ -328,11 +317,9 @@ impl Activity {
                 Action::UndoAgentActivity,
                 "u",
                 !self.pending
-                    && self.selected_entry().is_some_and(|entry| {
-                        !entry.action.undone
-                            && !entry.draft_discarded
-                            && entry.missing_grant.is_none()
-                    }),
+                    && self
+                        .selected_entry()
+                        .is_some_and(|entry| !entry.action.undone && !entry.draft_discarded),
             ),
             (Action::PageDown, "Ctrl-d", self.page.has_older),
             (Action::PageUp, "Ctrl-u", self.page.has_newer),
@@ -501,7 +488,7 @@ mod tests {
             blocker: None,
             draft_discarded: false,
             snooze_retired: false,
-            missing_grant: None,
+            agent_off: false,
         };
         activity.loaded(
             AgentActivityPage {

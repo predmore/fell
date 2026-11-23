@@ -106,12 +106,6 @@ pub enum Error {
     AgentActivityBlocked(agent::ActivityBlocker),
     #[error("Action already undone")]
     AgentActivityAlreadyUndone { snooze_retired: bool },
-    #[error("agent {agent_id} does not have {scope} access")]
-    AgentActivityGrant {
-        agent_id: String,
-        enabled: bool,
-        scope: &'static str,
-    },
     #[error("{0} is not implemented yet")]
     NotImplemented(&'static str),
     #[error("send requires explicit UI confirmation")]

@@ -457,6 +457,32 @@ pub(super) fn upgrade_undo_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Undo changes only the edited label's membership. Other memberships may
+/// have changed during sync while the edited membership remained intact.
+pub(crate) fn agent_label_unchanged(
+    conn: &Connection,
+    account: &AccountId,
+    action_id: i64,
+    summary: &str,
+) -> Result<bool> {
+    let edit = LabelEdit::from_summary(summary)?;
+    let expected = matches!(edit, LabelEdit::Added(_));
+    let mut stmt =
+        conn.prepare_cached("SELECT message_id FROM agent_action_messages WHERE action_id = ?1")?;
+    let mut rows = stmt.query([action_id])?;
+    while let Some(row) = rows.next()? {
+        if let Some((stored, _)) = find_stored(conn, account, &MessageId(row.get(0)?))?
+            && split_field(&stored.labels)
+                .iter()
+                .any(|label| label == edit.label())
+                != expected
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 pub(crate) fn undo_label_action(
     conn: &Connection,
     account_id: &AccountId,

@@ -5237,7 +5237,7 @@ impl Render for Inbox {
                             card.unwrap_or_else(|| {
                                 activity::card_height(viewport_height - CARD_TOP_PX - 16.0)
                             }),
-                            width < 460.,
+                            width < 500.,
                             live.then_some((&self.activity_motion, now)),
                             cx,
                         )),

@@ -8,56 +8,77 @@ use crate::Result;
 use crate::folders::{FolderRole, FolderRoles};
 use crate::store::{join_tokens, listed_folder_roles, split_field};
 
-pub(super) fn folder_blocker(
+/// Scope the guard to the same message fields as the undo writer.
+#[derive(Clone, Copy)]
+enum Field {
+    Folder,
+    Label,
+    Read(i64),
+    Star(i64),
+    Snooze,
+}
+
+impl Field {
+    fn for_action(kind: &str) -> Option<Self> {
+        Some(match kind {
+            "archive" | "move" => Self::Folder,
+            "label" | "unlabel" => Self::Label,
+            "mark_read" => Self::Read(0),
+            "mark_unread" => Self::Read(1),
+            "star" => Self::Star(1),
+            "unstar" => Self::Star(0),
+            "snooze" | "unsnooze" => Self::Snooze,
+            _ => return None,
+        })
+    }
+
+    fn agent_kinds(self) -> &'static str {
+        match self {
+            Self::Folder => "'archive', 'move'",
+            Self::Label => "'label', 'unlabel'",
+            Self::Read(_) => "'mark_read', 'mark_unread'",
+            Self::Star(_) => "'star', 'unstar'",
+            Self::Snooze => "'snooze', 'unsnooze'",
+        }
+    }
+
+    fn local_scope(self) -> Option<(&'static str, &'static str, &'static str)> {
+        Some(match self {
+            Self::Folder => (
+                "local_action_messages",
+                "'archive', 'move', 'delete', 'spam', 'not_spam'",
+                "(s.after_folders IS NULL OR s.folders <> s.after_folders)
+                 AND (l.removed OR l.folders <> l.after_folders)",
+            ),
+            Self::Label => (
+                "local_action_messages",
+                "'label'",
+                "l.labels <> l.after_labels",
+            ),
+            Self::Read(_) => ("local_action_flags", "'read', 'unread'", "1"),
+            Self::Star(_) => (
+                "local_action_flags",
+                "'star', 'unstar', 'delete', 'spam', 'not_spam'",
+                "s.starred IS NOT NULL",
+            ),
+            Self::Snooze => return None,
+        })
+    }
+}
+
+pub(super) fn blocker(
     conn: &Connection,
     action: &RecordedAction,
 ) -> Result<Option<ActivityBlocker>> {
-    let args = params![action.id, action.account_id.as_str()];
-    let agent = conn.prepare_cached(
-        "SELECT n.id, n.actor, n.kind, n.created_unix FROM agent_action_messages s
-         JOIN agent_action_messages newer ON newer.message_id = s.message_id AND newer.action_id > ?1
-         JOIN agent_actions n ON n.id = newer.action_id AND n.account_id = ?2 AND n.undone = 0
-         WHERE s.action_id = ?1 AND n.kind IN ('archive', 'move')
-         ORDER BY n.id DESC LIMIT 1",
-    )?.query_row(args, |row| map_blocker(row, 0)).optional()?.flatten();
-
-    // The local undo log is initialized lazily. The watermarks provide ordering
-    // across logs even when actions share the same wall-clock second.
-    let has_local: bool = conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE name = 'local_actions')",
-        [],
-        |row| row.get(0),
-    )?;
-    let local = if has_local {
-        conn.prepare_cached(
-            "SELECT n.id, 'local', n.kind, n.created_unix FROM agent_actions a
-             JOIN agent_action_messages s ON s.action_id = a.id
-             JOIN local_action_messages l ON l.message_id = s.message_id
-             JOIN local_actions n ON n.id = l.action_id AND n.account_id = ?2 AND n.undone = 0
-             WHERE a.id = ?1 AND n.kind IN ('archive', 'move')
-               AND (n.id > a.local_action_floor OR
-                    (a.local_action_floor IS NULL AND n.created_unix >= a.created_unix))
-             ORDER BY n.id DESC LIMIT 1",
-        )?
-        .query_row(args, |row| map_blocker(row, 0))
-        .optional()?
-        .flatten()
+    let Some(field) = Field::for_action(&action.kind) else {
+        return Ok(None);
+    };
+    let (agent, local) = newer_actions(conn, action, field)?;
+    let outbox = if matches!(field, Field::Folder) {
+        pending_move(conn, action)?
     } else {
         None
     };
-    let outbox = conn
-        .prepare_cached(
-            "SELECT n.id, 'outbox', n.kind, n.created_unix FROM agent_actions a
-         JOIN agent_action_messages s ON s.action_id = a.id
-         JOIN server_outbox n ON n.message_id = s.message_id AND n.account_id = ?2
-         WHERE a.id = ?1 AND n.kind = 'move' AND n.state = 'pending'
-           AND (n.id > a.outbox_floor OR
-                (a.outbox_floor IS NULL AND n.created_unix >= a.created_unix))
-         ORDER BY n.id DESC LIMIT 1",
-        )?
-        .query_row(args, |row| map_blocker(row, 0))
-        .optional()?
-        .flatten();
     if let Some(blocker) = agent
         .into_iter()
         .chain(local.or(outbox))
@@ -66,34 +87,216 @@ pub(super) fn folder_blocker(
         return Ok(Some(blocker));
     }
 
+    let unchanged = match field {
+        Field::Folder => folder_snapshots(conn, action)?
+            .iter()
+            .all(FolderSnapshot::unchanged),
+        Field::Label => crate::store::keywords::agent_label_unchanged(
+            conn,
+            &action.account_id,
+            action.id,
+            &action.summary,
+        )?,
+        Field::Read(expected) => flag_unchanged(conn, action, "unread", expected)?,
+        Field::Star(expected) => flag_unchanged(conn, action, "starred", expected)?,
+        // A snooze with no open replacement can be retired without a write.
+        Field::Snooze => true,
+    };
+    Ok((!unchanged).then(|| ActivityBlocker {
+        id: action.id,
+        actor: String::new(),
+        kind: BLOCKER_MAILBOX_CHANGED.into(),
+        created_unix: 0,
+    }))
+}
+
+fn newer_actions(
+    conn: &Connection,
+    action: &RecordedAction,
+    field: Field,
+) -> Result<(Option<ActivityBlocker>, Option<ActivityBlocker>)> {
+    // Label undo resolves merged aliases before changing a label membership.
+    // Include the full alias class when looking for overlapping label edits.
+    let snapshots = if matches!(field, Field::Label) {
+        "WITH canonical AS (
+             SELECT s.*, COALESCE(a.canonical_message_id, s.message_id) AS canonical_id
+             FROM agent_action_messages s
+             LEFT JOIN message_aliases a ON a.account_id = ?2 AND a.message_id = s.message_id
+             WHERE s.action_id = ?1
+         ), targets AS (
+             SELECT canonical_id AS target_id, c.* FROM canonical c
+             UNION ALL
+             SELECT a.message_id AS target_id, c.* FROM canonical c
+             JOIN message_aliases a ON a.account_id = ?2 AND a.canonical_message_id = c.canonical_id
+         )"
+    } else {
+        "WITH targets AS (
+             SELECT message_id AS target_id, s.* FROM agent_action_messages s WHERE s.action_id = ?1
+         )"
+    };
+    let overlap = match field {
+        Field::Folder => "(((s.after_folders IS NULL OR s.folders <> s.after_folders)
+                            AND (later.after_folders IS NULL OR later.folders <> later.after_folders))
+                           OR ((s.after_archived IS NULL OR s.archived <> s.after_archived)
+                            AND (later.after_archived IS NULL OR later.archived <> later.after_archived)))",
+        Field::Star(_) => "s.starred IS NOT NULL",
+        _ => "1",
+    };
+    let args = params![action.id, action.account_id.as_str()];
+    let agent_actions = conn
+        .prepare_cached(&format!(
+            "{snapshots}
+         SELECT n.id, n.actor, n.kind, n.created_unix FROM targets s
+         JOIN agent_action_messages later ON later.message_id = s.target_id AND later.action_id > ?1
+         JOIN agent_actions n ON n.id = later.action_id AND n.account_id = ?2 AND n.undone = 0
+         WHERE n.kind IN ({kinds}) AND {overlap}
+         ORDER BY n.id DESC LIMIT 1",
+            kinds = field.agent_kinds(),
+        ))?
+        .query_row(args, |row| map_blocker(row, 0))
+        .optional()?
+        .flatten();
+
+    // The local undo log is initialized lazily. IDs order new actions across
+    // logs even within one second. Older snapshots have only their timestamp.
+    let mut local_actions = None;
+    if let Some((table, kinds, overlap)) = field.local_scope()
+        && conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE name = ?1)",
+            [table],
+            |row| row.get::<_, bool>(0),
+        )?
+    {
+        local_actions = conn
+            .prepare_cached(&format!(
+                "{snapshots}
+             SELECT n.id, 'local', n.kind, n.created_unix FROM targets s
+             JOIN agent_actions a ON a.id = s.action_id
+             JOIN {table} l ON l.message_id = s.target_id
+             JOIN local_actions n ON n.id = l.action_id AND n.account_id = ?2 AND n.undone = 0
+             WHERE n.kind IN ({kinds}) AND {overlap}
+               AND n.id > COALESCE(a.local_action_floor, 0)
+               AND (a.local_action_floor IS NOT NULL OR n.created_unix >= a.created_unix)
+             ORDER BY n.id DESC LIMIT 1"
+            ))?
+            .query_row(args, |row| map_blocker(row, 0))
+            .optional()?
+            .flatten();
+    }
+    Ok((agent_actions, local_actions))
+}
+
+fn pending_move(conn: &Connection, action: &RecordedAction) -> Result<Option<ActivityBlocker>> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT n.id, 'outbox', n.kind, n.created_unix FROM agent_actions a
+         JOIN agent_action_messages s ON s.action_id = a.id
+         JOIN server_outbox n ON n.message_id = s.message_id AND n.account_id = ?2
+         WHERE a.id = ?1 AND n.kind = 'move' AND n.state = 'pending'
+           AND (s.after_folders IS NULL OR s.folders <> s.after_folders)
+           AND n.id > COALESCE(a.outbox_floor, 0)
+           AND (a.outbox_floor IS NOT NULL OR n.created_unix >= a.created_unix)
+         ORDER BY n.id DESC LIMIT 1",
+        )?
+        .query_row(params![action.id, action.account_id.as_str()], |row| {
+            map_blocker(row, 0)
+        })
+        .optional()?
+        .flatten())
+}
+
+fn flag_unchanged(
+    conn: &Connection,
+    action: &RecordedAction,
+    column: &str,
+    expected: i64,
+) -> Result<bool> {
+    Ok(!conn
+        .prepare_cached(&format!(
+            "SELECT EXISTS (
+            SELECT 1 FROM agent_action_messages s
+            JOIN messages m ON m.account_id = ?2 AND m.message_id = s.message_id
+            WHERE s.action_id = ?1 AND s.{column} IS NOT NULL
+              AND s.{column} <> ?3 AND m.{column} IS NOT ?3
+        )"
+        ))?
+        .query_row(
+            params![action.id, action.account_id.as_str(), expected],
+            |row| row.get::<_, bool>(0),
+        )?)
+}
+
+struct FolderSnapshot {
+    message_id: String,
+    before: (String, bool),
+    written: Option<(String, bool)>,
+    live: (String, bool),
+}
+
+impl FolderSnapshot {
+    fn unchanged(&self) -> bool {
+        self.written.as_ref().is_some_and(|after| {
+            (same_folders(&self.before.0, &after.0) || same_folders(&self.live.0, &after.0))
+                && (self.before.1 == after.1 || self.live.1 == after.1)
+        })
+    }
+}
+
+pub(super) fn restore_folders(conn: &Connection, action: &RecordedAction) -> Result<()> {
+    for row in folder_snapshots(conn, action)? {
+        let Some(after) = row.written else {
+            continue;
+        };
+        if !same_folders(&row.before.0, &after.0) {
+            conn.prepare_cached(
+                "UPDATE messages SET folders = ?3 WHERE account_id = ?1 AND message_id = ?2",
+            )?
+            .execute(params![
+                action.account_id.as_str(),
+                row.message_id,
+                row.before.0
+            ])?;
+        }
+        if row.before.1 != after.1 {
+            conn.prepare_cached(
+                "UPDATE messages SET archived = ?3 WHERE account_id = ?1 AND message_id = ?2",
+            )?
+            .execute(params![
+                action.account_id.as_str(),
+                row.message_id,
+                row.before.1
+            ])?;
+        }
+    }
+    Ok(())
+}
+
+fn folder_snapshots(conn: &Connection, action: &RecordedAction) -> Result<Vec<FolderSnapshot>> {
     let mut statement = conn.prepare_cached(
-        "SELECT s.folders, s.archived, s.after_folders, s.after_archived, m.folders, m.archived
+        "SELECT s.message_id, s.folders, s.archived, s.after_folders, s.after_archived, m.folders, m.archived
          FROM agent_action_messages s
          JOIN messages m ON m.account_id = ?2 AND m.message_id = s.message_id
          WHERE s.action_id = ?1",
     )?;
-    let mut rows = statement.query(args)?;
+    let mut rows = statement.query(params![action.id, action.account_id.as_str()])?;
+    let mut snapshots = Vec::new();
     while let Some(row) = rows.next()? {
-        let live: (String, bool) = (row.get(4)?, row.get(5)?);
+        let before: (String, bool) = (row.get(1)?, row.get(2)?);
         let written = match (
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, Option<bool>>(3)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<bool>>(4)?,
         ) {
             (Some(folders), Some(archived)) => Some((folders, archived)),
-            _ => legacy_folder_result(conn, action, row.get(0)?, row.get(1)?)?,
+            _ => legacy_folder_result(conn, action, &before.0, before.1)?,
         };
-        if !written.is_some_and(|(folders, archived)| {
-            archived == live.1 && same_folders(&folders, &live.0)
-        }) {
-            return Ok(Some(ActivityBlocker {
-                id: action.id,
-                actor: String::new(),
-                kind: BLOCKER_MAILBOX_CHANGED.into(),
-                created_unix: 0,
-            }));
-        }
+        snapshots.push(FolderSnapshot {
+            message_id: row.get(0)?,
+            before,
+            written,
+            live: (row.get(5)?, row.get(6)?),
+        });
     }
-    Ok(None)
+    Ok(snapshots)
 }
 
 fn same_folders(a: &str, b: &str) -> bool {
@@ -113,10 +316,10 @@ fn same_folders(a: &str, b: &str) -> bool {
 fn legacy_folder_result(
     conn: &Connection,
     action: &RecordedAction,
-    before: String,
+    before: &str,
     archived: bool,
 ) -> Result<Option<(String, bool)>> {
-    let mut folders = split_field(&before);
+    let mut folders = split_field(before);
     if action.kind == "archive" {
         folders.retain(|folder| !folder.eq_ignore_ascii_case("INBOX"));
         return Ok(Some((join_tokens(&folders), true)));

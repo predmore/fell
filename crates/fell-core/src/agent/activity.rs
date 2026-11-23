@@ -5,8 +5,7 @@ use std::collections::HashMap;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::{
-    ACTION_COLS, RecordedAction, SNOOZE_RETIRED, UndoSelection, WriteScope, map_action, read_grant,
-    require_token,
+    ACTION_COLS, ActionUndoState, RecordedAction, UndoSelection, map_action_with_state, read_grant,
 };
 use crate::{AccountId, Error, Result, Store};
 
@@ -29,22 +28,6 @@ pub struct ActivityBlocker {
     pub created_unix: i64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ActivityGrant {
-    pub enabled: bool,
-    pub scope: &'static str,
-}
-
-impl ActivityGrant {
-    fn missing(grant: crate::AgentGrant, scope: WriteScope) -> Option<Self> {
-        let (allowed, scope) = scope.permission(grant);
-        (!grant.enabled || !allowed).then_some(Self {
-            enabled: grant.enabled,
-            scope,
-        })
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentActivity {
     pub action: RecordedAction,
@@ -53,7 +36,7 @@ pub struct AgentActivity {
     pub blocker: Option<ActivityBlocker>,
     pub draft_discarded: bool,
     pub snooze_retired: bool,
-    pub missing_grant: Option<ActivityGrant>,
+    pub agent_off: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -144,7 +127,7 @@ impl Store {
         let sql_limit = (limit + 1) as i64;
         let mut stmt = self.conn.prepare_cached(&format!(
             "SELECT {ACTION_COLS}, {SUBJECT}, {CONVERSATIONS}, ({discarded}),
-                    blocking_id, blocking_actor, blocking_kind, blocking_time, (undone = {SNOOZE_RETIRED})
+                    blocking_id, blocking_actor, blocking_kind, blocking_time
              FROM (
                  SELECT a.*, CASE WHEN a.undone = 0 AND NOT ({discarded})
                                   THEN ({newer}) END AS blocker_id
@@ -163,14 +146,15 @@ impl Store {
         ))?;
         let entries =
             stmt.query_map(params![account.as_str(), actor, anchor, sql_limit], |row| {
+                let (action, state) = map_action_with_state(row)?;
                 Ok(AgentActivity {
-                    action: map_action(row)?,
+                    action,
                     subject: row.get(7)?,
                     conversations: row.get(8)?,
                     draft_discarded: row.get(9)?,
                     blocker: map_blocker(row, 10)?,
-                    snooze_retired: row.get(14)?,
-                    missing_grant: None,
+                    snooze_retired: state == ActionUndoState::SnoozeRetired,
+                    agent_off: false,
                 })
             })?;
         let mut entries = entries.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -193,10 +177,9 @@ impl Store {
                 grants.insert(id.to_owned(), grant);
                 grant
             };
-            entry.missing_grant =
-                ActivityGrant::missing(grant, WriteScope::for_undo(&entry.action.kind));
-            if entry.blocker.is_none() && matches!(entry.action.kind.as_str(), "archive" | "move") {
-                entry.blocker = super::undo_conflicts::folder_blocker(&self.conn, &entry.action)?;
+            entry.agent_off = !grant.enabled;
+            if entry.blocker.is_none() {
+                entry.blocker = super::undo_conflicts::blocker(&self.conn, &entry.action)?;
             }
         }
         let (has_newer, has_older) = match direction {
@@ -226,7 +209,7 @@ impl Store {
     }
 
     /// Undo the selected activity on this account through the same write
-    /// transaction and grant check as other agent undos.
+    /// transaction as other agent undos. The person acts with mailbox access.
     pub fn undo_agent_activity(
         &self,
         account: &AccountId,
@@ -247,19 +230,24 @@ pub(super) fn check_undo(
     id: i64,
     confirmed_bulk: Option<u32>,
 ) -> Result<RecordedAction> {
-    let (action, conversations, snooze_retired) = conn
+    let (action, conversations, state) = conn
         .query_row(
             &format!(
-                "SELECT {ACTION_COLS}, {CONVERSATIONS}, (undone = {SNOOZE_RETIRED}) FROM agent_actions a
+                "SELECT {ACTION_COLS}, {CONVERSATIONS} FROM agent_actions a
                   WHERE {AGENT_ROWS} AND id = ?2"
             ),
             params![account.as_str(), id],
-            |row| Ok((map_action(row)?, row.get::<_, u32>(7)?, row.get(8)?)),
+            |row| {
+                let (action, state) = map_action_with_state(row)?;
+                Ok((action, row.get::<_, u32>(7)?, state))
+            },
         )
         .optional()?
         .ok_or_else(|| Error::Action("Action is no longer available".into()))?;
     if action.undone {
-        return Err(Error::AgentActivityAlreadyUndone { snooze_retired });
+        return Err(Error::AgentActivityAlreadyUndone {
+            snooze_retired: state == ActionUndoState::SnoozeRetired,
+        });
     }
     let blocker = conn.query_row(
         &format!(
@@ -280,22 +268,4 @@ pub(super) fn check_undo(
         return Err(Error::Action("Confirm undo for this bulk action".into()));
     }
     Ok(action)
-}
-
-pub(super) fn check_grant(
-    conn: &Connection,
-    account: &AccountId,
-    actor: &str,
-    scope: WriteScope,
-) -> Result<()> {
-    let agent_id = require_token(actor.strip_prefix("agent:").unwrap_or_default(), "agent id")?;
-    let grant = read_grant(conn, account, agent_id)?;
-    if let Some(ActivityGrant { enabled, scope }) = ActivityGrant::missing(grant, scope) {
-        return Err(Error::AgentActivityGrant {
-            agent_id: agent_id.into(),
-            enabled,
-            scope,
-        });
-    }
-    Ok(())
 }

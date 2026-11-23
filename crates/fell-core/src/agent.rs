@@ -17,8 +17,8 @@ use crate::{Error, Result};
 mod activity;
 mod undo_conflicts;
 pub use activity::{
-    ActivityBlocker, ActivityDirection, ActivityGrant, AgentActivity, AgentActivityPage,
-    BLOCKER_MAILBOX_CHANGED, BULK_UNDO_THRESHOLD,
+    ActivityBlocker, ActivityDirection, AgentActivity, AgentActivityPage, BLOCKER_MAILBOX_CHANGED,
+    BULK_UNDO_THRESHOLD,
 };
 
 const ACTION_COLS: &str = "id, account_id, actor, kind, summary, undone, created_unix";
@@ -710,7 +710,7 @@ impl crate::Store {
         let (mut action, check_grant) = match selection {
             UndoSelection::Activity { id, confirmed_bulk } => (
                 activity::check_undo(&tx, account_id, id, confirmed_bulk)?,
-                true,
+                false,
             ),
             UndoSelection::Latest | UndoSelection::Expected(_) => {
                 let action =
@@ -724,12 +724,12 @@ impl crate::Store {
             }
         };
         if check_grant {
-            let scope = WriteScope::for_undo(&action.kind);
-            if interactive {
-                activity::check_grant(&tx, account_id, &action.actor, scope)?;
-            } else {
-                check_actor_grant(&tx, account_id, &action.actor, scope)?;
-            }
+            check_actor_grant(
+                &tx,
+                account_id,
+                &action.actor,
+                WriteScope::for_undo(&action.kind),
+            )?;
         }
         let result = undo_action(&tx, account_id, &action);
         let result = match result {
@@ -899,13 +899,11 @@ fn undo_action(
     account_id: &AccountId,
     action: &RecordedAction,
 ) -> Result<UndoEffect> {
-    if matches!(action.kind.as_str(), "archive" | "move")
-        && let Some(blocker) = undo_conflicts::folder_blocker(conn, action)?
-    {
+    if let Some(blocker) = undo_conflicts::blocker(conn, action)? {
         return Err(Error::AgentActivityBlocked(blocker));
     }
     let effect = if matches!(action.kind.as_str(), "snooze" | "unsnooze")
-        && !check_snooze_undo(conn, account_id, action)?
+        && !snooze_unchanged(conn, account_id, action)?
     {
         UndoEffect::SnoozeChanged
     } else {
@@ -1287,8 +1285,7 @@ pub(crate) fn insert_action(
             account_id, actor, kind, summary, undone, created_unix, target_subject, conversation_count,
             local_action_floor, outbox_floor
          ) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, 1,
-                   CASE WHEN ?3 IN ('archive', 'move') THEN
-                       COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'local_actions'), 0) END,
+                   COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'local_actions'), 0),
                    CASE WHEN ?3 IN ('archive', 'move') THEN
                        COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'server_outbox'), 0) END)",
         params![account_id.as_str(), actor, kind, summary, created_unix, subject],
@@ -1332,16 +1329,38 @@ fn find_open_action(
     Ok(row)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActionUndoState {
+    Open,
+    Undone,
+    SnoozeRetired,
+}
+
 fn map_action(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecordedAction> {
-    Ok(RecordedAction {
-        id: row.get(0)?,
-        account_id: AccountId(row.get(1)?),
-        actor: row.get(2)?,
-        kind: row.get(3)?,
-        summary: row.get(4)?,
-        undone: row.get::<_, i64>(5)? != 0,
-        created_unix: row.get(6)?,
-    })
+    map_action_with_state(row).map(|(action, _)| action)
+}
+
+fn map_action_with_state(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(RecordedAction, ActionUndoState)> {
+    let state = match row.get::<_, i64>(5)? {
+        0 => ActionUndoState::Open,
+        1 => ActionUndoState::Undone,
+        SNOOZE_RETIRED => ActionUndoState::SnoozeRetired,
+        value => return Err(rusqlite::Error::IntegralValueOutOfRange(5, value)),
+    };
+    Ok((
+        RecordedAction {
+            id: row.get(0)?,
+            account_id: AccountId(row.get(1)?),
+            actor: row.get(2)?,
+            kind: row.get(3)?,
+            summary: row.get(4)?,
+            undone: state != ActionUndoState::Open,
+            created_unix: row.get(6)?,
+        },
+        state,
+    ))
 }
 
 fn map_draft(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewDraft> {
@@ -1365,7 +1384,7 @@ fn map_draft(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewDraft> {
 fn undo_messages(conn: &Connection, account_id: &AccountId, action: &RecordedAction) -> Result<()> {
     // The snapshot holds all fields, but undo owns only the fields this
     // action changed. A user or sync may have edited the others since.
-    let (restore, flags) = match action.kind.as_str() {
+    let (restore, flags, touched) = match action.kind.as_str() {
         "label" | "unlabel" => {
             return keywords::undo_label_action(
                 conn,
@@ -1375,13 +1394,22 @@ fn undo_messages(conn: &Connection, account_id: &AccountId, action: &RecordedAct
                 LabelHistory::Agent,
             );
         }
-        "archive" | "move" => ("folders = s.folders, archived = s.archived", None),
-        "snooze" | "unsnooze" => ("snooze_until = s.snooze_until", None),
-        "mark_read" | "mark_unread" => ("unread = s.unread", Some(FlagUndo::Unread)),
+        "archive" | "move" => return undo_conflicts::restore_folders(conn, action),
+        "snooze" | "unsnooze" => (
+            "snooze_until = s.snooze_until",
+            None,
+            "m.snooze_until IS NOT s.snooze_until",
+        ),
+        "mark_read" | "mark_unread" => (
+            "unread = s.unread",
+            Some(FlagUndo::Unread),
+            "m.unread IS NOT s.unread",
+        ),
         // Messages logged before the starred column may have no star to restore.
         "star" | "unstar" => (
-            "starred = COALESCE(s.starred, m.starred)",
+            "starred = s.starred",
             Some(FlagUndo::Star),
+            "s.starred IS NOT NULL AND m.starred IS NOT s.starred",
         ),
         _ => return Err(Error::Action(format!("unknown action {}", action.kind))),
     };
@@ -1393,7 +1421,8 @@ fn undo_messages(conn: &Connection, account_id: &AccountId, action: &RecordedAct
         &format!(
             "UPDATE messages AS m SET {restore}
              FROM agent_action_messages AS s
-             WHERE s.action_id = ?1 AND m.account_id = ?2 AND m.message_id = s.message_id"
+             WHERE s.action_id = ?1 AND m.account_id = ?2 AND m.message_id = s.message_id
+               AND ({touched})"
         ),
         params![action.id, account_id.as_str()],
     )?;
@@ -1403,7 +1432,7 @@ fn undo_messages(conn: &Connection, account_id: &AccountId, action: &RecordedAct
     Ok(())
 }
 
-fn check_snooze_undo(
+fn snooze_unchanged(
     conn: &Connection,
     account_id: &AccountId,
     action: &RecordedAction,
@@ -1419,22 +1448,6 @@ fn check_snooze_undo(
     } else {
         return Ok(false);
     };
-    let blocker = conn.query_row(
-        "SELECT n.id, n.actor, n.kind, n.created_unix
-         FROM agent_action_messages s
-         JOIN messages m ON m.account_id = ?2 AND m.message_id = s.message_id
-         JOIN agent_action_messages saved ON saved.message_id = m.message_id AND saved.action_id > ?1
-         JOIN agent_actions n ON n.id = saved.action_id AND n.account_id = ?2 AND n.undone = 0
-         WHERE s.action_id = ?1 AND m.snooze_until IS NOT ?3
-           AND ((n.kind = 'unsnooze' AND m.snooze_until IS NULL)
-                OR (n.kind = 'snooze' AND n.summary = ?4 || m.snooze_until))
-         ORDER BY n.id DESC LIMIT 1",
-        params![action.id, account_id.as_str(), until, SNOOZE_SUMMARY_PREFIX],
-        |row| activity::map_blocker(row, 0),
-    ).optional()?.flatten();
-    if let Some(blocker) = blocker {
-        return Err(Error::AgentActivityBlocked(blocker));
-    }
     // A missing row needs no restore.
     Ok(!conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM agent_action_messages s
@@ -1598,7 +1611,7 @@ mod tests {
     }
 
     #[test]
-    fn activity_undo_targets_the_id_and_rechecks_the_grant() {
+    fn activity_undo_uses_mailbox_access_and_mcp_rechecks_the_grant() {
         let (store, account, thread) = seeded();
         let grant = AgentGrant::enabled(false, true, false);
         store.set_agent_grant(&account, "fern", grant).unwrap();
@@ -1625,12 +1638,14 @@ mod tests {
             .set_agent_grant(&account, "fern", AgentGrant::DISABLED)
             .unwrap();
         assert!(matches!(
-            store.undo_agent_activity(&account, starred.id, None),
-            Err(Error::AgentActivityGrant { agent_id, enabled: false, scope: "Triage" })
-                if agent_id == "fern"
+            store.undo_actor_action(&account, "agent:fern", starred.id),
+            Err(Error::Invalid(message)) if message == "agent fern is disabled"
         ));
         assert!(only_message(&store, &account, &thread)[0].starred);
-        store.set_agent_grant(&account, "fern", grant).unwrap();
+        let page = store
+            .agent_activity(&account, Some("fern"), ActivityDirection::Latest, 10)
+            .unwrap();
+        assert!(page.entries[0].agent_off);
         assert_eq!(
             store
                 .undo_agent_activity(&account, starred.id, None)
@@ -1750,6 +1765,195 @@ mod tests {
             read.id
         );
         assert!(!page().entries[0].action.undone);
+    }
+
+    #[test]
+    fn activity_archive_undo_preserves_a_newer_agents_label_and_star() {
+        let (store, account, thread) = seeded();
+        for agent in ["fern", "reed"] {
+            store
+                .set_agent_grant(&account, agent, AgentGrant::enabled(false, true, false))
+                .unwrap();
+        }
+        let archive = store
+            .agent_archive_thread(&account, &thread, "agent:fern")
+            .unwrap()
+            .unwrap();
+        let label = store
+            .add_thread_label(&account, &thread, "review", "agent:reed")
+            .unwrap()
+            .unwrap();
+        let star = store
+            .star_thread(&account, &thread, true, "agent:reed")
+            .unwrap()
+            .unwrap();
+
+        store
+            .undo_agent_activity(&account, archive.id, None)
+            .unwrap();
+        assert!(
+            only_message(&store, &account, &thread)
+                .iter()
+                .all(|message| {
+                    !message.archived
+                        && message.folders.iter().any(|folder| folder == "INBOX")
+                        && message.labels.iter().any(|label| label == "review")
+                        && message.starred
+                })
+        );
+        assert_eq!(
+            store
+                .latest_open_action(&account, "agent:reed")
+                .unwrap()
+                .unwrap()
+                .id,
+            star.id
+        );
+        assert!(
+            !store
+                .list_actions(&account)
+                .unwrap()
+                .into_iter()
+                .find(|action| action.id == label.id)
+                .unwrap()
+                .undone
+        );
+    }
+
+    #[test]
+    fn activity_move_undo_keeps_an_archive_bit_the_move_did_not_touch() {
+        let (store, account, thread) = seeded();
+        store
+            .set_agent_grant(&account, "fern", AgentGrant::enabled(false, true, false))
+            .unwrap();
+        let moved = store
+            .agent_move_thread(&account, &thread, "INBOX", "Work", "agent:fern")
+            .unwrap()
+            .unwrap();
+        store
+            .conn
+            .execute("UPDATE messages SET archived = 1", [])
+            .unwrap();
+        store.undo_agent_activity(&account, moved.id, None).unwrap();
+        assert!(
+            only_message(&store, &account, &thread).iter().all(|mail| {
+                mail.archived && mail.folders.iter().any(|folder| folder == "INBOX")
+            })
+        );
+    }
+
+    #[test]
+    fn activity_flag_undo_blocks_a_newer_local_write_to_the_same_flag() {
+        let (store, account, thread) = seeded();
+        store
+            .set_agent_grant(&account, "fern", AgentGrant::enabled(false, true, false))
+            .unwrap();
+        let flag = store
+            .mark_thread_unread(&account, &thread, "agent:fern")
+            .unwrap()
+            .unwrap();
+        let local = store
+            .flag_threads(
+                &account,
+                std::slice::from_ref(&thread),
+                "INBOX",
+                crate::FlagChange::Read,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(matches!(store.undo_agent_activity(&account, flag.id, None),
+            Err(Error::AgentActivityBlocked(blocker)) if blocker.actor == "local" && blocker.id == local.id));
+        store.undo(&account).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE messages SET unread = 0 WHERE message_id = 'reply@x'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(store.undo_agent_activity(&account, flag.id, None),
+            Err(Error::AgentActivityBlocked(blocker)) if blocker.kind == BLOCKER_MAILBOX_CHANGED));
+    }
+
+    #[test]
+    fn activity_label_undo_blocks_a_newer_edit_to_the_same_messages() {
+        let (store, account, thread) = seeded();
+        store
+            .set_agent_grant(&account, "fern", AgentGrant::enabled(false, true, false))
+            .unwrap();
+        let label = store
+            .add_thread_label(&account, &thread, "review", "agent:fern")
+            .unwrap()
+            .unwrap();
+        let local = store
+            .label_thread(
+                &account,
+                &thread,
+                crate::actions::LabelChange::Remove("review".into()),
+            )
+            .unwrap();
+        assert!(
+            matches!(store.undo_agent_activity(&account, label.id, None),
+            Err(Error::AgentActivityBlocked(blocker)) if blocker.actor == "local" && blocker.id == local.id)
+        );
+        store.undo(&account).unwrap();
+        store.undo_agent_activity(&account, label.id, None).unwrap();
+    }
+
+    #[test]
+    fn activity_reloads_open_undone_and_retired_rows_from_disk() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("activity.db");
+        let (store, account, thread) = seed(Store::open(&db).unwrap());
+        let grant = AgentGrant::enabled(false, true, false);
+        for agent in ["juniper", "fern", "reed"] {
+            store.set_agent_grant(&account, agent, grant).unwrap();
+        }
+        let snooze = store
+            .snooze_thread(&account, &thread, now_unix() + 3600, "agent:juniper")
+            .unwrap()
+            .unwrap();
+        store
+            .conn
+            .execute("UPDATE messages SET snooze_until = NULL", [])
+            .unwrap();
+        store
+            .undo_agent_activity(&account, snooze.id, None)
+            .unwrap();
+        let star = store
+            .star_thread(&account, &thread, true, "agent:fern")
+            .unwrap()
+            .unwrap();
+        store.undo_agent_activity(&account, star.id, None).unwrap();
+        let read = store
+            .mark_thread_read(&account, &thread, "agent:reed")
+            .unwrap()
+            .unwrap();
+        drop(store);
+
+        let reopened = Store::open(&db).unwrap();
+        let page = reopened
+            .agent_activity(&account, None, ActivityDirection::Latest, 10)
+            .unwrap();
+        let states: Vec<_> = page
+            .entries
+            .iter()
+            .map(|entry| (entry.action.id, entry.action.undone, entry.snooze_retired))
+            .collect();
+        assert_eq!(
+            states,
+            [
+                (read.id, false, false),
+                (star.id, true, false),
+                (snooze.id, true, true)
+            ]
+        );
+        assert!(matches!(
+            reopened.undo_agent_activity(&account, snooze.id, None),
+            Err(Error::AgentActivityAlreadyUndone {
+                snooze_retired: true
+            })
+        ));
     }
 
     #[test]
