@@ -735,7 +735,7 @@ fn chip_layout(
         .map(|(item, (_, key))| {
             let label = match &item.action {
                 Suggestion::Snooze(until) => {
-                    format!("Snooze {}", present::note_snooze_date(*until))
+                    format!("Snooze {}", present::absolute_date(*until))
                 }
                 action => display_safe(&action.title(), false),
             };

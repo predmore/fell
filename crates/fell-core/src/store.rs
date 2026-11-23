@@ -156,6 +156,7 @@ CREATE TABLE IF NOT EXISTS agent_actions (
     actor TEXT NOT NULL,
     kind TEXT NOT NULL,
     summary TEXT NOT NULL,
+    -- 0 is open, 1 is undone, 2 is a snooze retired without restoring it.
     undone INTEGER NOT NULL DEFAULT 0,
     created_unix INTEGER NOT NULL,
     target_subject TEXT,
@@ -165,6 +166,8 @@ CREATE TABLE IF NOT EXISTS agent_actions (
 CREATE INDEX IF NOT EXISTS idx_agent_actions_account ON agent_actions(account_id, id);
 CREATE INDEX IF NOT EXISTS idx_agent_actions_actor_time
 ON agent_actions(account_id, actor, created_unix);
+CREATE INDEX IF NOT EXISTS idx_agent_actions_actor_open
+ON agent_actions(account_id, actor, id) WHERE undone = 0;
 
 CREATE TABLE IF NOT EXISTS agent_action_messages (
     action_id INTEGER NOT NULL,

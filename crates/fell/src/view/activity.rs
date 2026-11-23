@@ -1,60 +1,106 @@
 //! The paged agent activity card and its exact-action undo controls.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use fell_core::agent::{AgentActivity, SNOOZE_CHANGED_NOTICE};
 use gpui::{
     Context, Div, FontWeight, InteractiveElement, MouseButton, ParentElement, ScrollHandle,
-    StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px, rgb,
+    StatefulInteractiveElement, Styled, div, point, prelude::FluentBuilder, px, rgb,
 };
 
 use super::{Inbox, ReadIntent, now_unix};
+use crate::inbox_motion::SELECTION_FROM;
 use crate::keymap::KeyId;
 use crate::model::{
     Overlay,
     activity::{Activity, Request},
 };
-use crate::motion::{self, ListShift, Motion, Transition};
-use crate::present::{display_safe, relative_date};
+use crate::motion::{self, Motion, Transition};
+use crate::present::{absolute_date, display_safe, relative_date};
 use crate::theme::{Theme, ensure_all};
 
 const ROW_HEIGHT: f32 = 54.;
 const TITLE_HEIGHT: f32 = 48.;
-const FOOTER_HEIGHT: f32 = 72.;
+const FOOTER_HEIGHT: f32 = 84.;
+const LOADING_DELAY: Duration = Duration::from_millis(150);
+
+pub(super) fn card_height(available_height: f32) -> f32 {
+    (TITLE_HEIGHT + 7. * ROW_HEIGHT + FOOTER_HEIGHT + 2.).min(available_height.max(158.))
+}
+
+struct PageFade {
+    activity: Activity,
+    offset: f32,
+    fade: Transition,
+}
+
+#[derive(PartialEq, Eq)]
+enum FooterState {
+    Confirm(i64),
+    Undo,
+    Notice,
+    Idle,
+}
 
 #[derive(Default)]
 pub(super) struct ActivityMotion {
     revision: u64,
-    confirmation: Option<i64>,
-    rows: Option<ListShift<()>>,
+    page: Option<PageFade>,
+    arrival: Option<Transition>,
+    selection: Option<i64>,
+    selection_fade: Option<(Option<i64>, Transition)>,
+    footer_state: Option<FooterState>,
     footer: Option<Transition>,
+    undone: Option<(i64, Transition)>,
 }
 
 impl ActivityMotion {
     pub(super) fn settle(&mut self) {
-        self.rows = None;
+        self.arrival = None;
+        self.selection_fade = None;
         self.footer = None;
     }
 
     pub(super) fn frame(&mut self, activity: &Activity, motion: &Motion, now: Instant) -> bool {
         if self.revision != activity.page_revision {
             self.revision = activity.page_revision;
-            self.rows = ListShift::start(motion, vec![], vec![], vec![], 0., true, now);
+            self.arrival = motion.start(motion::QUICK, now);
         }
-        let confirmation = activity.confirmation.as_ref().map(|prompt| prompt.id);
-        if self.confirmation != confirmation {
-            self.confirmation = confirmation;
+        let selected = activity.selected_entry().map(|entry| entry.action.id);
+        if self.selection != selected {
+            let before = std::mem::replace(&mut self.selection, selected);
+            self.selection_fade = motion.start(motion::FADE, now).map(|fade| (before, fade));
+        }
+        let footer = if let Some(prompt) = &activity.confirmation {
+            FooterState::Confirm(prompt.id)
+        } else if activity.blocker_notice.is_some() || activity.load_failed {
+            FooterState::Notice
+        } else if can_undo(activity) {
+            FooterState::Undo
+        } else {
+            FooterState::Idle
+        };
+        if self.footer_state.as_ref() != Some(&footer) {
+            self.footer_state = Some(footer);
             self.footer = motion.start(motion::FADE, now);
         }
-        self.rows.as_ref().is_some_and(|rows| rows.running(now))
+        self.page = self.page.take().filter(|page| page.fade.running(now));
+        self.page.is_some()
+            || self.arrival.is_some_and(|fade| fade.running(now))
             || self.footer.is_some_and(|fade| fade.running(now))
+            || self
+                .selection_fade
+                .is_some_and(|(_, fade)| fade.running(now))
+            || self.undone.is_some_and(|(_, fade)| fade.running(now))
     }
 
-    fn row(&mut self, entry: &AgentActivity, now: Instant) -> f32 {
-        self.rows.as_mut().map_or(1., |rows| {
-            rows.row(&entry.action.id.to_string(), 0., ROW_HEIGHT, [], now)
-                .opacity
-        })
+    fn selection(&self, id: i64, selected: bool, now: Instant) -> f32 {
+        match self.selection_fade {
+            Some((_, fade)) if selected => motion::lerp(SELECTION_FROM, 1., fade.progress(now)),
+            Some((Some(before), fade)) if before == id => SELECTION_FROM * fade.remaining(now),
+            _ if selected => 1.,
+            _ => 0.,
+        }
     }
 }
 
@@ -64,6 +110,18 @@ impl Inbox {
         match request {
             Request::Load { direction, .. } => {
                 let account = self.account_id.clone();
+                let delay = cx.background_executor().timer(LOADING_DELAY);
+                cx.spawn(async move |this, cx| {
+                    delay.await;
+                    let _ = this.update(cx, |inbox, cx| {
+                        let activity = &mut inbox.session.activity;
+                        if activity.generation == generation && activity.pending {
+                            activity.loading_slow = true;
+                            cx.notify();
+                        }
+                    });
+                })
+                .detach();
                 let reply = self.store.call(move |store| request.load(store, &account));
                 cx.spawn(async move |this, cx| {
                     let reply = reply.await;
@@ -72,19 +130,27 @@ impl Inbox {
                         if activity.generation != generation {
                             return;
                         }
+                        let before = activity.clone();
                         activity.pending = false;
+                        activity.loading_slow = false;
                         match reply {
                             Ok(Ok(page)) => {
                                 activity.loaded(page, direction);
+                                if before.page_revision != activity.page_revision {
+                                    let now = inbox.motion.clock.now();
+                                    inbox.activity_motion.page = (!before.page.entries.is_empty())
+                                        .then(|| inbox.motion.motion.start(motion::QUICK, now))
+                                        .flatten()
+                                        .map(|fade| PageFade {
+                                            activity: before,
+                                            offset: inbox.activity_scroll.offset().y.into(),
+                                            fade,
+                                        });
+                                    inbox.activity_scroll.set_offset(point(px(0.), px(0.)));
+                                }
                                 inbox.activity_scroll.scroll_to_item(activity.selected);
                             }
-                            _ => {
-                                activity.load_failed = true;
-                                inbox
-                                    .session
-                                    .show_toast("Could not load agent activity", true);
-                                inbox.expire_action_notice(cx);
-                            }
+                            _ => activity.load_failed = true,
                         }
                         cx.notify();
                     });
@@ -101,22 +167,49 @@ impl Inbox {
                     move |store| store.undo_agent_activity(&account, id, confirmed_bulk),
                     move |inbox, result, cx| {
                         let activity = &mut inbox.session.activity;
-                        if activity.generation == generation {
+                        let current = activity.generation == generation;
+                        if current {
                             activity.pending = false;
                         }
                         let (notice, error, changed) = match result {
                             Ok(action) => {
-                                activity.mark_undone(action.id);
+                                let retired = action.summary == SNOOZE_CHANGED_NOTICE;
+                                activity.mark_undone(action.id, retired);
+                                let now = inbox.motion.clock.now();
+                                inbox.activity_motion.undone = inbox
+                                    .motion
+                                    .motion
+                                    .start(motion::FADE, now)
+                                    .map(|fade| (action.id, fade));
+                                inbox.activity_motion.footer =
+                                    inbox.motion.motion.start(motion::FADE, now);
                                 if viewing_account {
                                     inbox.note_generation = inbox.note_generation.wrapping_add(1);
                                     inbox.send_to_server();
                                 }
-                                let notice = if action.summary == SNOOZE_CHANGED_NOTICE {
-                                    SNOOZE_CHANGED_NOTICE
+                                let notice = if retired {
+                                    "Undone · snooze was already changed, left as is."
                                 } else {
                                     "Agent action undone"
                                 };
                                 (notice.into(), false, viewing_account)
+                            }
+                            Err(fell_core::Error::AgentActivityBlocked(blocker)) if current => {
+                                activity.record_blocker(id, blocker);
+                                return None;
+                            }
+                            Err(fell_core::Error::AgentActivityGrant {
+                                agent_id,
+                                enabled,
+                                scope,
+                            }) => {
+                                let name = agent_name(&agent_id);
+                                let reason = if enabled {
+                                    format!("{scope} is off for {name}.")
+                                } else {
+                                    format!("{name} is turned off.")
+                                };
+                                (format!("{reason} Turn on {scope} to undo."), true, false)
                             }
                             Err(
                                 fell_core::Error::Action(message)
@@ -152,141 +245,89 @@ pub(super) fn card(
     theme: &Theme,
     activity: &Activity,
     scroll: Option<&ScrollHandle>,
-    available_height: f32,
-    mut motion: Option<(&mut ActivityMotion, Instant)>,
+    height: f32,
+    frame: Option<(&ActivityMotion, Instant)>,
     cx: &mut Context<Inbox>,
 ) -> Div {
     let live = scroll.is_some();
     let now = now_unix();
     let dim = ensure_all(theme.dimmed, &[theme.surface], 4.65);
-    let footer_alpha = motion.as_ref().map_or(1., |(motion, now)| {
+    let leaving = frame.and_then(|(motion, time)| Some((motion.page.as_ref()?, time)));
+    let arrival = frame.map_or(1., |(motion, time)| {
+        motion::progress(motion.arrival.as_ref(), time)
+    });
+    let footer_alpha = frame.map_or(1., |(motion, time)| {
         motion::lerp(
             motion::ARRIVE_FROM,
             1.,
-            motion::progress(motion.footer.as_ref(), *now),
+            motion::progress(motion.footer.as_ref(), time),
         )
     });
-    let selected = activity.page.entries.get(activity.selected);
     let rows = div()
-        .id("agent-activity-list")
+        .relative()
         .flex_1()
         .min_h(px(0.))
-        .overflow_y_scroll()
-        .when_some(scroll, |list, scroll| list.track_scroll(scroll))
-        .children(
-            activity
-                .page
-                .entries
-                .iter()
-                .enumerate()
-                .map(|(index, entry)| {
-                    let opacity = motion
-                        .as_mut()
-                        .map_or(1., |(motion, now)| motion.row(entry, *now));
-                    row(theme, entry, index == activity.selected, now)
-                        .opacity(opacity)
-                        .when(live, |row| {
-                            row.on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |inbox, _, _, cx| {
-                                    if inbox.session.overlay == Overlay::AgentActivity {
-                                        inbox.session.activity.select(index);
-                                        cx.notify();
-                                    }
-                                }),
-                            )
-                        })
-                }),
-        )
-        .when(activity.page.entries.is_empty(), |list| {
-            let text = if activity.pending {
-                "Loading activity…"
-            } else if activity.load_failed {
-                "Activity is unavailable"
-            } else {
-                "No agent activity yet"
-            };
+        .overflow_hidden()
+        .when_some(leaving, |list, (old, time)| {
             list.child(
                 div()
-                    .px(px(16.))
-                    .py(px(16.))
-                    .text_color(rgb(dim))
-                    .child(text),
+                    .absolute()
+                    .left(px(0.))
+                    .right(px(0.))
+                    .top(px(old.offset))
+                    .opacity(old.fade.remaining(time))
+                    .children(
+                        (0..old.activity.page.entries.len())
+                            .map(|index| row(theme, &old.activity, index, now, None)),
+                    ),
             )
-        });
-    let bottom = div()
-        .flex_none()
-        .h(px(FOOTER_HEIGHT))
-        .border_t(px(1.))
-        .border_color(rgb(theme.border))
-        .px(px(12.))
-        .flex()
-        .flex_col()
-        .justify_center();
-    let footer = if let Some(prompt) = &activity.confirmation {
-        bottom.child(
+        })
+        .child(
             div()
-                .flex()
-                .flex_col()
-                .gap(px(4.))
-                .opacity(footer_alpha)
-                .child(div().font_weight(FontWeight::SEMIBOLD).child(format!(
-                    "Undo this action for {} conversations?",
-                    prompt.conversations
-                )))
-                .child(
-                    div()
-                        .flex()
-                        .justify_end()
-                        .gap(px(6.))
-                        .child(button(theme, "Cancel", KeyId::Escape, live, cx))
-                        .child(button(theme, "Undo · y", KeyId::Char('y'), live, cx)),
-                ),
-        )
-    } else {
-        bottom.child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(6.))
-                .opacity(footer_alpha)
-                .when(activity.page.has_newer, |line| {
-                    line.child(button(
-                        theme,
-                        "Newer",
-                        KeyId::Ctrl('u'),
-                        live && !activity.pending,
-                        cx,
-                    ))
-                })
-                .when(activity.page.has_older, |line| {
-                    line.child(button(
-                        theme,
-                        "Older",
-                        KeyId::Ctrl('d'),
-                        live && !activity.pending,
-                        cx,
-                    ))
-                })
-                .child(div().flex_1())
-                .when(selected.is_some_and(|entry| !entry.action.undone), |line| {
-                    line.child(button(
-                        theme,
-                        "Undo action",
-                        KeyId::Char('u'),
-                        live && !activity.pending,
-                        cx,
-                    ))
+                .id("agent-activity-list")
+                .relative()
+                .top(px(motion::RISE_PX * (1. - arrival)))
+                .size_full()
+                .overflow_y_scroll()
+                .opacity(motion::lerp(motion::ARRIVE_FROM, 1., arrival))
+                .when_some(scroll, |list, scroll| list.track_scroll(scroll))
+                .children((0..activity.page.entries.len()).map(|index| {
+                    row(theme, activity, index, now, frame).when(live, |row| {
+                        row.on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |inbox, _, _, cx| {
+                                if inbox.session.overlay == Overlay::AgentActivity {
+                                    inbox.session.activity.select(index);
+                                    cx.notify();
+                                }
+                            }),
+                        )
+                    })
+                }))
+                .when(activity.page.entries.is_empty(), |list| {
+                    let text = if activity.pending {
+                        activity.loading_slow.then_some("Loading activity…")
+                    } else if activity.load_failed {
+                        Some("Could not load agent activity")
+                    } else {
+                        Some("No agent activity yet")
+                    };
+                    list.when_some(text, |list, text| {
+                        list.child(
+                            div()
+                                .px(px(16.))
+                                .py(px(16.))
+                                .text_color(rgb(dim))
+                                .child(text),
+                        )
+                    })
                 }),
-        )
-    };
+        );
     div()
-        .w(px(560.))
+        .w(px(super::AGENT_CARD_WIDTH))
         .max_w_full()
         .mx(px(10.))
-        .h(px(
-            (TITLE_HEIGHT + 7. * ROW_HEIGHT + FOOTER_HEIGHT).min(available_height.max(158.))
-        ))
+        .h(px(height))
         .bg(rgb(theme.surface))
         .border_1()
         .border_color(rgb(theme.border))
@@ -319,14 +360,152 @@ pub(super) fn card(
                     header.child(
                         div()
                             .min_w_0()
-                            .truncate()
+                            .line_clamp(1)
+                            .text_ellipsis()
                             .text_color(rgb(dim))
                             .child(agent_name(&agent.agent_id)),
                     )
                 }),
         )
         .child(rows)
-        .child(footer)
+        .child(
+            div()
+                .relative()
+                .flex_none()
+                .h(px(FOOTER_HEIGHT))
+                .border_t(px(1.))
+                .border_color(rgb(theme.border))
+                .when_some(leaving, |bottom, (old, time)| {
+                    bottom.child(
+                        footer(theme, &old.activity, false, now, cx)
+                            .absolute()
+                            .inset_0()
+                            .opacity(old.fade.remaining(time)),
+                    )
+                })
+                .child(
+                    footer(theme, activity, live, now, cx)
+                        .opacity(footer_alpha * motion::lerp(motion::ARRIVE_FROM, 1., arrival)),
+                ),
+        )
+}
+
+fn can_undo(activity: &Activity) -> bool {
+    !activity.pending
+        && activity.selected_entry().is_some_and(|entry| {
+            !entry.action.undone && !entry.draft_discarded && entry.blocker.is_none()
+        })
+}
+
+fn footer(
+    theme: &Theme,
+    activity: &Activity,
+    live: bool,
+    now: i64,
+    cx: &mut Context<Inbox>,
+) -> Div {
+    let dim = ensure_all(theme.dimmed, &[theme.surface], 4.65);
+    let base = div()
+        .size_full()
+        .px(px(14.))
+        .flex()
+        .flex_col()
+        .justify_center()
+        .gap(px(3.));
+    if let Some(prompt) = activity.confirmation.as_ref()
+        && let Some(entry) = activity.selected_entry()
+    {
+        let (effect, consequence) = match entry.action.kind.as_str() {
+            "archive" => ("Unarchive", "They return to Inbox"),
+            "move" => ("Move back", "They return to their previous folders"),
+            "label" | "unlabel" => ("Restore labels on", "Their previous label state returns"),
+            "star" | "unstar" => ("Restore stars on", "Their previous star state returns"),
+            "mark_read" | "mark_unread" => (
+                "Restore read status on",
+                "Their previous read state returns",
+            ),
+            "snooze" | "unsnooze" => ("Restore snooze on", "Their previous snooze state returns"),
+            _ => ("Undo the change to", "Their previous state returns"),
+        };
+        return base
+            .child(
+                div()
+                    .line_clamp(1)
+                    .text_ellipsis()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(format!(
+                        "{effect} {} conversations from {}?",
+                        prompt.conversations,
+                        actor_name(&entry.action.actor),
+                    )),
+            )
+            .child(
+                div()
+                    .line_clamp(1)
+                    .text_ellipsis()
+                    .text_color(rgb(dim))
+                    .child(consequence),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(6.))
+                    .child(button(theme, "Cancel", KeyId::Escape, live, cx))
+                    .child(button(theme, "Undo · y", KeyId::Char('y'), live, cx)),
+            );
+    }
+    let notice = if let Some((actor, blocker)) = &activity.blocker_notice {
+        Some(format!(
+            "Undo {}’s {} ({}) first",
+            actor_name(actor),
+            action_name(&blocker.kind),
+            relative_date(now, blocker.created_unix)
+        ))
+    } else if activity.load_failed && !activity.page.entries.is_empty() {
+        Some("Could not load agent activity".into())
+    } else if activity.pending && activity.loading_slow && !activity.page.entries.is_empty() {
+        Some("Loading activity…".into())
+    } else {
+        None
+    };
+    base.when_some(notice, |base, text| {
+        base.child(
+            div()
+                .line_clamp(1)
+                .text_ellipsis()
+                .text_color(rgb(dim))
+                .child(text),
+        )
+    })
+    .child(
+        div()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .when(activity.page.has_newer, |line| {
+                line.child(button(
+                    theme,
+                    "Newer",
+                    KeyId::Ctrl('u'),
+                    live && !activity.pending,
+                    cx,
+                ))
+            })
+            .when(activity.page.has_older, |line| {
+                line.child(button(
+                    theme,
+                    "Older",
+                    KeyId::Ctrl('d'),
+                    live && !activity.pending,
+                    cx,
+                ))
+            })
+            .child(div().flex_1())
+            .when(can_undo(activity), |line| {
+                line.child(button(theme, "Undo action", KeyId::Char('u'), live, cx))
+            }),
+    )
 }
 
 fn button(
@@ -355,21 +534,40 @@ fn button(
         })
 }
 
-fn row(theme: &Theme, entry: &AgentActivity, selected: bool, now: i64) -> Div {
-    let (bg, fg, muted) = if selected {
-        (theme.selection, theme.on_selection, theme.on_selection_dim)
-    } else {
-        (theme.surface, theme.foreground, theme.dimmed)
-    };
-    let dim = ensure_all(muted, &[bg], 4.65);
-    let name = agent_name(
-        entry
-            .action
-            .actor
-            .strip_prefix("agent:")
-            .unwrap_or_default(),
+fn row(
+    theme: &Theme,
+    activity: &Activity,
+    index: usize,
+    now: i64,
+    frame: Option<(&ActivityMotion, Instant)>,
+) -> Div {
+    let entry = &activity.page.entries[index];
+    let selected = index == activity.selected;
+    let selection = frame.map_or(f32::from(u8::from(selected)), |(motion, time)| {
+        motion.selection(entry.action.id, selected, time)
+    });
+    let bg = motion::mix(theme.surface, theme.selection, selection);
+    let fg = ensure_all(
+        motion::mix(theme.foreground, theme.on_selection, selection),
+        &[bg],
+        4.65,
     );
-    let target = target_name(entry);
+    let dim = ensure_all(
+        motion::mix(theme.dimmed, theme.on_selection_dim, selection),
+        &[bg],
+        4.65,
+    );
+    let date = if selected && entry.action.created_unix > 0 {
+        absolute_date(entry.action.created_unix)
+    } else {
+        relative_date(now, entry.action.created_unix)
+    };
+    let status_alpha = frame
+        .and_then(|(motion, time)| {
+            let (id, fade) = motion.undone?;
+            (id == entry.action.id).then(|| fade.progress(time))
+        })
+        .unwrap_or(1.);
     div()
         .h(px(ROW_HEIGHT))
         .px(px(16.))
@@ -377,7 +575,9 @@ fn row(theme: &Theme, entry: &AgentActivity, selected: bool, now: i64) -> Div {
         .flex_col()
         .justify_center()
         .gap(px(2.))
-        .border_b(px(1.))
+        .when(index + 1 < activity.page.entries.len(), |row| {
+            row.border_b(px(1.))
+        })
         .border_color(rgb(theme.border))
         .bg(rgb(bg))
         .text_color(rgb(fg))
@@ -385,56 +585,105 @@ fn row(theme: &Theme, entry: &AgentActivity, selected: bool, now: i64) -> Div {
             div()
                 .flex()
                 .items_center()
-                .gap(px(8.))
+                .gap(px(6.))
+                .when(activity.filter.is_none(), |line| {
+                    line.child(super::agent_notes::marker(theme, selected))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .line_clamp(1)
+                                .text_ellipsis()
+                                .child(actor_name(&entry.action.actor)),
+                        )
+                        .child(div().flex_none().text_color(rgb(dim)).child("·"))
+                })
                 .child(
                     div()
                         .flex_none()
                         .font_weight(FontWeight::SEMIBOLD)
                         .child(action_name(&entry.action.kind)),
                 )
-                .child(
-                    div()
-                        .min_w_0()
-                        .flex_1()
-                        .truncate()
-                        .text_color(rgb(dim))
-                        .child(name),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .text_color(rgb(dim))
-                        .child(relative_date(now, entry.action.created_unix)),
-                ),
+                .child(div().flex_1())
+                .child(div().flex_none().text_color(rgb(dim)).child(date)),
         )
         .child(
             div()
                 .flex()
                 .items_center()
-                .gap(px(8.))
-                .child(div().min_w_0().flex_1().truncate().child(target))
-                .when(entry.action.undone, |line| {
-                    line.child(div().flex_none().text_color(rgb(dim)).child("Undone"))
+                .gap(px(5.))
+                .when(activity.filter.is_none(), |line| {
+                    line.pl(px(super::agent_notes::MARKER_SLOT + 6.))
+                })
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .line_clamp(1)
+                                .text_ellipsis()
+                                .child(target_name(entry)),
+                        )
+                        .when(
+                            entry.conversations > 1 && entry.subject.is_some(),
+                            |target| {
+                                target.child(
+                                    div()
+                                        .flex_none()
+                                        .text_color(rgb(dim))
+                                        .child(format!("+ {} more", entry.conversations - 1)),
+                                )
+                            },
+                        ),
+                )
+                .when_some(row_status(entry), |line, status| {
+                    line.child(
+                        div()
+                            .flex_none()
+                            .text_color(rgb(dim))
+                            .opacity(status_alpha)
+                            .child(status),
+                    )
                 }),
         )
 }
 
+fn actor_name(actor: &str) -> String {
+    agent_name(actor.strip_prefix("agent:").unwrap_or(actor))
+}
+
 fn agent_name(name: &str) -> String {
-    let name = display_safe(name);
-    if name.trim().is_empty() {
-        "Agent".into()
+    let safe = display_safe(name);
+    let mut chars = safe.chars();
+    let Some(first) = chars.next().filter(|_| !safe.trim().is_empty()) else {
+        return "Agent".into();
+    };
+    first.to_uppercase().chain(chars).collect()
+}
+
+fn row_status(entry: &AgentActivity) -> Option<&'static str> {
+    if entry.snooze_retired {
+        Some("Retired · snooze had changed")
+    } else if entry.action.undone {
+        Some("Undone")
+    } else if entry.draft_discarded {
+        Some("Draft discarded")
+    } else if entry.blocker.is_some() {
+        Some("Undo newer first")
     } else {
-        name
+        None
     }
 }
 
 fn target_name(entry: &AgentActivity) -> String {
-    if entry.conversations > 1 {
-        return format!("{} conversations", entry.conversations);
-    }
     match entry.subject.as_deref().map(display_safe) {
         Some(subject) if !subject.trim().is_empty() => subject,
         Some(_) => "(No subject)".into(),
+        None if entry.conversations > 1 => format!("{} conversations", entry.conversations),
         None if entry.action.kind == "draft" => "Review draft".into(),
         None => "Conversation unavailable".into(),
     }
@@ -477,18 +726,27 @@ mod tests {
             },
             subject: Some("Trip\n plan\u{200b}".into()),
             conversations: 1,
+            blocker: None,
+            draft_discarded: false,
+            snooze_retired: false,
         };
         assert_eq!(
             agent_name(entry.action.actor.strip_prefix("agent:").unwrap()),
             "Fern"
         );
         assert_eq!(target_name(&entry), "Trip plan");
+        let mut snooze = entry.clone();
+        snooze.action.kind = "snooze".into();
+        snooze.action.undone = true;
+        assert_eq!(row_status(&snooze), Some("Undone"));
+        snooze.snooze_retired = true;
+        assert_eq!(row_status(&snooze), Some("Retired · snooze had changed"));
         assert_eq!(
             target_name(&AgentActivity {
                 conversations: 12,
                 ..entry
             }),
-            "12 conversations"
+            "Trip plan"
         );
     }
 }

@@ -5220,7 +5220,13 @@ impl Render for Inbox {
                             &theme,
                             &session.agents,
                             live.then_some(&self.agents_scroll),
-                            viewport_height - CARD_TOP_PX - 16.0,
+                            card.unwrap_or_else(|| {
+                                agents::card_height(
+                                    &session.agents,
+                                    viewport_height - CARD_TOP_PX - 16.0,
+                                )
+                            }),
+                            width < 460.,
                             live.then_some((&self.agents_motion, now)),
                             cx,
                         )),
@@ -5228,8 +5234,10 @@ impl Render for Inbox {
                             &theme,
                             &session.activity,
                             live.then_some(&self.activity_scroll),
-                            viewport_height - CARD_TOP_PX - 16.0,
-                            live.then_some((&mut self.activity_motion, now)),
+                            card.unwrap_or_else(|| {
+                                activity::card_height(viewport_height - CARD_TOP_PX - 16.0)
+                            }),
+                            live.then_some((&self.activity_motion, now)),
                             cx,
                         )),
                         _ => None,
@@ -10051,6 +10059,7 @@ const PICKER_ROW_MARGIN: f32 = 4.0;
 const PICKER_ROW_PAD: f32 = 10.0;
 /// Where the palette, folder picker and help card sit below the window's top.
 const CARD_TOP_PX: f32 = 72.0;
+const AGENT_CARD_WIDTH: f32 = 560.0;
 
 /// How tall the open palette or folder picker should be to hold its items
 /// (its border, the 44 px query line and 4 px above and below the rows),
@@ -10084,6 +10093,8 @@ fn card_fit(
                 room,
             ))
         }
+        Overlay::Agents => Some(agents::card_height(&session.agents, room)),
+        Overlay::AgentActivity => Some(activity::card_height(room)),
         _ => None,
     }
 }

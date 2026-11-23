@@ -15,11 +15,14 @@ use crate::threading::ThreadId;
 use crate::{Error, Result};
 
 mod activity;
-pub use activity::{ActivityDirection, AgentActivity, AgentActivityPage, BULK_UNDO_THRESHOLD};
+pub use activity::{
+    ActivityBlocker, ActivityDirection, AgentActivity, AgentActivityPage, BULK_UNDO_THRESHOLD,
+};
 
 const ACTION_COLS: &str = "id, account_id, actor, kind, summary, undone, created_unix";
 const SNOOZE_SUMMARY_PREFIX: &str = "snoozed thread until ";
 pub const SNOOZE_CHANGED_NOTICE: &str = "Snooze already changed";
+const SNOOZE_RETIRED: i64 = 2;
 
 enum UndoSelection {
     Latest,
@@ -161,6 +164,16 @@ pub(crate) enum WriteScope {
     Triage,
     Draft,
     Annotate,
+}
+
+impl WriteScope {
+    fn permission(self, grant: AgentGrant) -> (bool, &'static str) {
+        match self {
+            Self::Triage => (grant.triage, "Triage"),
+            Self::Draft => (grant.draft, "Draft"),
+            Self::Annotate => (grant.annotate, "Annotate"),
+        }
+    }
 }
 
 impl crate::Store {
@@ -697,6 +710,7 @@ impl crate::Store {
     ) -> Result<RecordedAction> {
         let tx = crate::store::immediate_transaction(&self.conn)?;
         require_account(&tx, account_id)?;
+        let interactive = matches!(selection, UndoSelection::Activity { .. });
         let (mut action, check_grant) = match selection {
             UndoSelection::Activity { id, confirmed_bulk } => (
                 activity::check_undo(&tx, account_id, id, confirmed_bulk)?,
@@ -719,7 +733,11 @@ impl crate::Store {
                 "annotate" => WriteScope::Annotate,
                 _ => WriteScope::Triage,
             };
-            check_actor_grant(&tx, account_id, &action.actor, scope)?;
+            if interactive {
+                activity::check_grant(&tx, account_id, &action.actor, scope)?;
+            } else {
+                check_actor_grant(&tx, account_id, &action.actor, scope)?;
+            }
         }
         if undo_action(&tx, account_id, &action)? == UndoEffect::SnoozeChanged {
             action.summary = SNOOZE_CHANGED_NOTICE.into();
@@ -889,8 +907,15 @@ fn undo_action(
         UndoEffect::Restored
     };
     conn.execute(
-        "UPDATE agent_actions SET undone = 1 WHERE id = ?1",
-        [action.id],
+        "UPDATE agent_actions SET undone = ?2 WHERE id = ?1",
+        [
+            action.id,
+            if effect == UndoEffect::SnoozeChanged {
+                SNOOZE_RETIRED
+            } else {
+                1
+            },
+        ],
     )?;
     Ok(effect)
 }
@@ -959,14 +984,11 @@ pub(crate) fn check_write_grant(
     if !grant.enabled {
         return Err(Error::Invalid(format!("agent {agent_id} is disabled")));
     }
-    let (allowed, name) = match scope {
-        WriteScope::Triage => (grant.triage, "triage"),
-        WriteScope::Draft => (grant.draft, "draft"),
-        WriteScope::Annotate => (grant.annotate, "annotate"),
-    };
+    let (allowed, name) = scope.permission(grant);
     if !allowed {
         return Err(Error::Invalid(format!(
-            "agent {agent_id} lacks the {name} scope"
+            "agent {agent_id} lacks the {} scope",
+            name.to_ascii_lowercase()
         )));
     }
     Ok(())
@@ -1498,6 +1520,10 @@ mod tests {
         let older = read(None, ActivityDirection::Older(second.id));
         assert_eq!(ids(&older), [first.id]);
         assert!(older.has_newer && !older.has_older);
+        assert_eq!(older.entries[0].blocker.as_ref().unwrap().id, last.id);
+        let jump = read(None, ActivityDirection::At(last.id));
+        assert_eq!(ids(&jump), ids(&latest));
+        assert!(!jump.has_newer && jump.has_older);
         assert_eq!(older.entries[0].subject.as_deref(), Some("Invoice March"));
         assert_eq!(older.entries[0].conversations, 1);
         assert_eq!(
@@ -1527,13 +1553,12 @@ mod tests {
         let (store, account, thread) = seeded();
         let grant = AgentGrant::enabled(false, true, false);
         store.set_agent_grant(&account, "fern", grant).unwrap();
-        store.set_agent_grant(&account, "reed", grant).unwrap();
         let read = store
             .mark_thread_read(&account, &thread, "agent:fern")
             .unwrap()
             .unwrap();
         let starred = store
-            .star_thread(&account, &thread, true, "agent:reed")
+            .star_thread(&account, &thread, true, "agent:fern")
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -1543,18 +1568,20 @@ mod tests {
                 .to_string(),
             "Undo the newer action first"
         );
-        store
-            .set_agent_grant(&account, "reed", AgentGrant::DISABLED)
+        let page = store
+            .agent_activity(&account, Some("fern"), ActivityDirection::Latest, 10)
             .unwrap();
-        assert_eq!(
-            store
-                .undo_agent_activity(&account, starred.id, None)
-                .unwrap_err()
-                .to_string(),
-            "agent reed is disabled"
-        );
+        assert_eq!(page.entries[1].blocker.as_ref().unwrap().id, starred.id);
+        store
+            .set_agent_grant(&account, "fern", AgentGrant::DISABLED)
+            .unwrap();
+        assert!(matches!(
+            store.undo_agent_activity(&account, starred.id, None),
+            Err(Error::AgentActivityGrant { agent_id, enabled: false, scope: "Triage" })
+                if agent_id == "fern"
+        ));
         assert!(only_message(&store, &account, &thread)[0].starred);
-        store.set_agent_grant(&account, "reed", grant).unwrap();
+        store.set_agent_grant(&account, "fern", grant).unwrap();
         assert_eq!(
             store
                 .undo_agent_activity(&account, starred.id, None)
@@ -1579,6 +1606,101 @@ mod tests {
             read.id
         );
         assert!(only_message(&store, &account, &thread)[0].unread);
+    }
+
+    #[test]
+    fn activity_undo_ignores_a_newer_action_by_a_disabled_agent() {
+        let (store, account, thread) = seeded();
+        let grant = AgentGrant::enabled(false, true, false);
+        store.set_agent_grant(&account, "fern", grant).unwrap();
+        store.set_agent_grant(&account, "reed", grant).unwrap();
+        let read = store
+            .mark_thread_read(&account, &thread, "agent:fern")
+            .unwrap()
+            .unwrap();
+        store
+            .star_thread(&account, &thread, true, "agent:reed")
+            .unwrap();
+        store
+            .set_agent_grant(&account, "reed", AgentGrant::DISABLED)
+            .unwrap();
+
+        let page = store
+            .agent_activity(&account, None, ActivityDirection::Latest, 10)
+            .unwrap();
+        assert!(page.entries[1].blocker.is_none());
+        assert_eq!(
+            store
+                .undo_agent_activity(&account, read.id, None)
+                .unwrap()
+                .id,
+            read.id
+        );
+        let message = &only_message(&store, &account, &thread)[0];
+        assert!(message.unread && message.starred);
+    }
+
+    #[test]
+    fn activity_undo_ignores_a_newer_discarded_review_draft() {
+        let (store, account, thread) = seeded();
+        store
+            .set_agent_grant(&account, "fern", AgentGrant::enabled(false, true, true))
+            .unwrap();
+        let read = store
+            .mark_thread_read(&account, &thread, "agent:fern")
+            .unwrap()
+            .unwrap();
+        let draft = store
+            .create_review_draft(
+                ReviewDraftInput {
+                    account_id: account.clone(),
+                    to: vec!["demo@example.com".into()],
+                    cc: vec![],
+                    bcc: vec![],
+                    subject: "Demo subject".into(),
+                    body: "Demo body".into(),
+                    in_reply_to: None,
+                    thread_id: None,
+                },
+                "agent:fern",
+            )
+            .unwrap();
+        store
+            .save_compose(&crate::compose::StoredCompose {
+                id: format!("r{}", draft.draft.id),
+                account_id: account.clone(),
+                fields: Default::default(),
+                body: draft.draft.body.clone(),
+                files: vec![],
+                identities: vec![],
+                owner: draft.draft.actor.clone(),
+                reply: Default::default(),
+            })
+            .unwrap();
+        let page = || {
+            store
+                .agent_activity(&account, Some("fern"), ActivityDirection::Latest, 10)
+                .unwrap()
+        };
+        assert_eq!(
+            page().entries[1].blocker.as_ref().unwrap().id,
+            draft.action.id
+        );
+        store
+            .discard_compose_drafts(&account, &[format!("r{}", draft.draft.id)])
+            .unwrap();
+
+        let discarded = page();
+        assert!(discarded.entries[0].draft_discarded);
+        assert!(discarded.entries[1].blocker.is_none());
+        assert_eq!(
+            store
+                .undo_agent_activity(&account, read.id, None)
+                .unwrap()
+                .id,
+            read.id
+        );
+        assert!(!page().entries[0].action.undone);
     }
 
     #[test]
@@ -2567,6 +2689,12 @@ mod tests {
         assert_eq!(retired.summary, "Snooze already changed");
         assert!(retired.undone);
         assert_eq!(only_message(&store, &account, &thread), folded);
+        let activity = store
+            .agent_activity(&account, Some("ada"), ActivityDirection::Latest, 10)
+            .unwrap();
+        assert!(activity.entries[0].snooze_retired);
+        assert!(activity.entries[0].action.undone);
+        assert!(activity.entries[1].blocker.is_none());
 
         let undone = store.agent_undo(&account).unwrap();
         assert_eq!(undone.id, older.id);

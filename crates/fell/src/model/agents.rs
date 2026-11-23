@@ -12,15 +12,19 @@ pub enum Control {
     Triage,
     Draft,
     Annotate,
+    Activity,
     Revoke,
 }
 
 impl Control {
-    pub const ALL: [Self; 5] = [
+    pub const SCOPES: [Self; 4] = [Self::Read, Self::Triage, Self::Draft, Self::Annotate];
+
+    const ALL: [Self; 6] = [
         Self::Read,
         Self::Triage,
         Self::Draft,
         Self::Annotate,
+        Self::Activity,
         Self::Revoke,
     ];
 
@@ -30,6 +34,7 @@ impl Control {
             Self::Triage => "Triage",
             Self::Draft => "Draft",
             Self::Annotate => "Annotate",
+            Self::Activity => "Activity",
             Self::Revoke => "Revoke",
         }
     }
@@ -40,6 +45,7 @@ impl Control {
             Self::Triage => "Toggle agent triage access",
             Self::Draft => "Toggle agent draft access",
             Self::Annotate => "Toggle agent annotation access",
+            Self::Activity => "Agent activity",
             Self::Revoke => "Revoke agent access",
         }
     }
@@ -50,6 +56,7 @@ impl Control {
             Self::Triage => "Archive, label, star, snooze, mark read. No deletes.",
             Self::Draft => "Write drafts for review. Only you can send.",
             Self::Annotate => "Leave thread notes and suggest actions.",
+            Self::Activity => "View this agent’s activity.",
             Self::Revoke => "Remove all access to this account.",
         }
     }
@@ -60,6 +67,7 @@ impl Control {
             Self::Triage => 't',
             Self::Draft => 'd',
             Self::Annotate => 'a',
+            Self::Activity => 'o',
             Self::Revoke => 'x',
         }
     }
@@ -70,7 +78,7 @@ impl Control {
             Self::Triage => grant.triage,
             Self::Draft => grant.draft,
             Self::Annotate => grant.annotate,
-            Self::Revoke => return None,
+            Self::Activity | Self::Revoke => return None,
         };
         Some(grant.enabled && granted)
     }
@@ -86,7 +94,7 @@ impl Control {
             Self::Triage => &mut grant.triage,
             Self::Draft => &mut grant.draft,
             Self::Annotate => &mut grant.annotate,
-            Self::Revoke => return grant,
+            Self::Activity | Self::Revoke => return grant,
         };
         *scope = !*scope;
         grant.enabled = grant.read || grant.triage || grant.draft || grant.annotate;
@@ -218,14 +226,17 @@ impl Agents {
     }
 
     pub fn palette(&self, query: &str) -> Vec<PaletteItem> {
-        let commands = Control::ALL.map(|control| (Action::AgentControl(control), control.key()));
-        let mut items = commands
+        let mut items = Control::ALL
             .into_iter()
-            .map(|(action, key)| (action, key.to_string()))
-            .chain([
-                (Action::UndoAgentRevoke, "u".into()),
-                (Action::AgentActivity, "Enter".into()),
-            ])
+            .map(|control| {
+                let action = if control == Control::Activity {
+                    Action::AgentActivity
+                } else {
+                    Action::AgentControl(control)
+                };
+                (action, control.key().to_string())
+            })
+            .chain([(Action::UndoAgentRevoke, "u".into())])
             .filter_map(|(action, binding)| {
                 let label = action.label();
                 fuzzy(query, label).map(|score| {
@@ -261,7 +272,7 @@ impl Agents {
                 self.column = (self.column + 1).min(self.controls() - 1);
             }
             KeyId::Left | KeyId::Char('h') => self.column = self.column.saturating_sub(1),
-            KeyId::Space => return self.activate(self.selected, self.control()),
+            KeyId::Enter | KeyId::Space => return self.activate(self.selected, self.control()),
             KeyId::Char('u') => return self.undo(),
             KeyId::Char(key) => {
                 if let Some(control) = Control::ALL
@@ -277,7 +288,7 @@ impl Agents {
     }
 
     pub fn activate(&mut self, index: usize, control: Control) -> Option<Request> {
-        if self.pending || self.confirm.is_some() {
+        if control == Control::Activity || self.pending || self.confirm.is_some() {
             return None;
         }
         let row = self.rows.get(index)?.clone();

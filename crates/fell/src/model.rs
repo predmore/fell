@@ -2100,7 +2100,13 @@ impl Session {
             KeyId::Char(':') | KeyId::CtrlShiftP if self.agents.confirm.is_none() => {
                 self.run(Action::Palette, page_rows)
             }
-            KeyId::Enter if self.agents.confirm.is_none() => {
+            KeyId::Char('o') if self.agents.confirm.is_none() => {
+                self.run(Action::AgentActivity, page_rows)
+            }
+            KeyId::Enter | KeyId::Space
+                if self.agents.confirm.is_none()
+                    && self.agents.control() == agents::Control::Activity =>
+            {
                 self.run(Action::AgentActivity, page_rows)
             }
             _ => Step {

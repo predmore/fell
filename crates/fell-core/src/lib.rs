@@ -102,6 +102,14 @@ pub enum Error {
     DraftAttachmentLimit,
     #[error("This draft exceeds the 32 MiB message limit. The copy is still on the server.")]
     DraftMessageLimit,
+    #[error("Undo the newer action first")]
+    AgentActivityBlocked(agent::ActivityBlocker),
+    #[error("agent {agent_id} does not have {scope} access")]
+    AgentActivityGrant {
+        agent_id: String,
+        enabled: bool,
+        scope: &'static str,
+    },
     #[error("{0} is not implemented yet")]
     NotImplemented(&'static str),
     #[error("send requires explicit UI confirmation")]
