@@ -258,24 +258,19 @@ pub(super) fn card(
     theme: &Theme,
     agents: &Agents,
     scroll: Option<&ScrollHandle>,
-    available_height: f32,
+    height: f32,
+    compact: bool,
     frame: Option<(&AgentMotion, Instant)>,
     cx: &mut Context<Inbox>,
 ) -> Div {
     let live = scroll.is_some();
     let now = now_unix();
     let populated = !agents.rows.is_empty();
-    let list_height = if populated {
-        ROW_HEIGHT * agents.rows.len() as f32 + FOOTER_HEIGHT
-    } else {
-        EMPTY_HEIGHT
-    };
-    let height = TITLE_HEIGHT + list_height + 2.;
     div()
-        .w(px(580.))
+        .w(px(super::AGENT_CARD_WIDTH))
         .max_w_full()
         .mx(px(10.))
-        .h(px(height.min(available_height.max(120.))))
+        .h(px(height))
         .bg(rgb(theme.surface))
         .border_1()
         .border_color(rgb(theme.border))
@@ -313,7 +308,7 @@ pub(super) fn card(
                         agents,
                         row,
                         index,
-                        now,
+                        (now, compact),
                         frame,
                         live.then_some(&mut *cx),
                     )
@@ -355,6 +350,15 @@ pub(super) fn card(
         })
 }
 
+pub(super) fn card_height(agents: &Agents, available_height: f32) -> f32 {
+    let list_height = if agents.rows.is_empty() {
+        EMPTY_HEIGHT
+    } else {
+        ROW_HEIGHT * agents.rows.len() as f32 + FOOTER_HEIGHT
+    };
+    (TITLE_HEIGHT + list_height + 2.).min(available_height.max(120.))
+}
+
 fn row_dimmed(theme: &Theme, bg: u32, selection: f32) -> u32 {
     let dim = motion::mix(theme.dimmed, theme.on_selection_dim, selection);
     ensure_all(dim, &[bg], ROW_TEXT_CONTRAST)
@@ -369,7 +373,7 @@ fn agent_row(
     agents: &Agents,
     row: &AgentSummary,
     index: usize,
-    now: i64,
+    (now, compact): (i64, bool),
     frame: Option<(&AgentMotion, Instant)>,
     mut cx: Option<&mut Context<Inbox>>,
 ) -> Div {
@@ -386,6 +390,13 @@ fn agent_row(
         let (before, fade) = motion.focus_fade?;
         Some((before, fade.progress(now)))
     });
+    let control_border = |control| {
+        let border = focused.border(index, control, bg, fg, theme.dimmed);
+        focus_fade.map_or(border, |(before, progress)| {
+            let before = before.border(index, control, bg, fg, theme.dimmed);
+            motion::mix(before, border, progress)
+        })
+    };
     let previous = frame.and_then(|(motion, now)| {
         let (rows, fade) = motion.switches.as_ref()?;
         let previous = rows
@@ -398,9 +409,10 @@ fn agent_row(
         |time| format!("Last action · {}", relative_date(now, time)),
     );
     let show_account = agents.show_accounts();
+    let controls = Control::SCOPES.into_iter().chain([Control::Revoke]);
     div()
         .h(px(ROW_HEIGHT))
-        .px(px(14.))
+        .px(px(if compact { 12. } else { 14. }))
         .py(px(8.))
         .border_b(px(1.))
         .border_color(rgb(theme.border))
@@ -436,7 +448,8 @@ fn agent_row(
                             |name| name.w(relative(0.30)).flex_none(),
                             |name| name.flex_1(),
                         )
-                        .truncate()
+                        .line_clamp(1)
+                        .text_ellipsis()
                         .font_weight(FontWeight::SEMIBOLD)
                         .child(display_safe(&row.agent_id)),
                 )
@@ -463,21 +476,47 @@ fn agent_row(
                         .text_size(px(theme.ui_px - 2.))
                         .text_color(rgb(dim))
                         .child(last_action),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .px(px(5.))
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(control_border(Control::Activity)))
+                        .text_size(px(theme.ui_px - 2.))
+                        .text_color(rgb(fg))
+                        .child("Activity")
+                        .when_some(cx.as_deref_mut(), |button, cx| {
+                            button.cursor_pointer().on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |inbox, _, _, cx| {
+                                    cx.stop_propagation();
+                                    if inbox.session.overlay == Overlay::Agents
+                                        && inbox.session.agents.confirm.is_none()
+                                    {
+                                        inbox.session.agents.select(index);
+                                        let before = inbox.before_step();
+                                        let step = inbox.session.perform(
+                                            crate::keymap::Action::AgentActivity,
+                                            inbox.page_rows(),
+                                        );
+                                        inbox.apply_step(step, before, cx);
+                                    }
+                                }),
+                            )
+                        }),
                 ),
         )
         .child(
             div()
                 .flex()
                 .items_center()
-                .gap(px(8.))
-                .children(Control::ALL.into_iter().map(|control| {
+                .gap(px(if compact { 4. } else { 8. }))
+                .children(controls.map(|control| {
                     let scope = control.scope(row.grant);
                     let actionable = scope.is_some() || row.grant.enabled;
-                    let border = focused.border(index, control, bg, fg, theme.dimmed);
-                    let border = focus_fade.map_or(border, |(before, progress)| {
-                        let before = before.border(index, control, bg, fg, theme.dimmed);
-                        motion::mix(before, border, progress)
-                    });
+                    let border = control_border(control);
                     let label = if actionable {
                         control.label()
                     } else {
@@ -490,7 +529,7 @@ fn agent_row(
                     div()
                         .flex_none()
                         .h(px(27.))
-                        .px(px(5.))
+                        .px(px(if compact { 4. } else { 5. }))
                         .rounded_md()
                         .border_1()
                         .border_color(rgb(border))
@@ -498,7 +537,7 @@ fn agent_row(
                         .text_size(px(theme.ui_px - 2.))
                         .flex()
                         .items_center()
-                        .gap(px(4.))
+                        .gap(px(if compact { 3. } else { 4. }))
                         .when(control == Control::Revoke, |button| {
                             button
                                 .ml_auto()
@@ -712,7 +751,15 @@ mod tests {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             div().w(px(self.width)).flex().flex_col().children(
                 self.agents.rows.iter().enumerate().map(|(index, row)| {
-                    agent_row(&self.theme, &self.agents, row, index, 0, None, None)
+                    agent_row(
+                        &self.theme,
+                        &self.agents,
+                        row,
+                        index,
+                        (0, false),
+                        None,
+                        None,
+                    )
                 }),
             )
         }

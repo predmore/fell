@@ -1113,9 +1113,21 @@ pub fn local_offset(unix: i64) -> i64 {
     }
 }
 
-pub(crate) fn note_snooze_date(unix: i64) -> String {
+pub(crate) fn absolute_date(unix: i64) -> String {
     let (year, month, day, hour, min, _) = local_parts(unix);
     format!("{} {day}, {year} · {hour:02}:{min:02}", month_name(month))
+}
+
+pub(crate) fn activity_time(now: i64, unix: i64) -> String {
+    let (year, month, day, hour, min, _) = local_parts(unix);
+    let (this_year, this_month, this_day, _, _, _) = local_parts(now);
+    if (year, month, day) == (this_year, this_month, this_day) {
+        format!("Today · {hour:02}:{min:02}")
+    } else if year == this_year {
+        format!("{} {day} · {hour:02}:{min:02}", month_name(month))
+    } else {
+        absolute_date(unix)
+    }
 }
 
 fn local_parts(unix: i64) -> (i32, u8, u8, u8, u8, u8) {

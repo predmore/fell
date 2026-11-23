@@ -14,9 +14,26 @@ use crate::store::{SELECT_MESSAGE_COLS, join_tokens, row_to_message, split_field
 use crate::threading::ThreadId;
 use crate::{Error, Result};
 
+mod activity;
+mod undo_conflicts;
+pub use activity::{
+    ActivityBlocker, ActivityDirection, AgentActivity, AgentActivityPage, BLOCKER_MAILBOX_CHANGED,
+    BULK_UNDO_THRESHOLD,
+};
+
 const ACTION_COLS: &str = "id, account_id, actor, kind, summary, undone, created_unix";
 const SNOOZE_SUMMARY_PREFIX: &str = "snoozed thread until ";
-pub(crate) const SNOOZE_CHANGED_NOTICE: &str = "Snooze already changed";
+pub const SNOOZE_CHANGED_NOTICE: &str = "Snooze already changed";
+const SNOOZE_RETIRED: i64 = 2;
+
+enum UndoSelection {
+    Latest,
+    Expected(i64),
+    Activity {
+        id: i64,
+        confirmed_bulk: Option<u32>,
+    },
+}
 
 /// Per-agent access to one account. Missing rows are [`AgentGrant::DISABLED`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +166,24 @@ pub(crate) enum WriteScope {
     Triage,
     Draft,
     Annotate,
+}
+
+impl WriteScope {
+    fn for_undo(kind: &str) -> Self {
+        match kind {
+            "draft" => Self::Draft,
+            "annotate" => Self::Annotate,
+            _ => Self::Triage,
+        }
+    }
+
+    fn permission(self, grant: AgentGrant) -> (bool, &'static str) {
+        match self {
+            Self::Triage => (grant.triage, "Triage"),
+            Self::Draft => (grant.draft, "Draft"),
+            Self::Annotate => (grant.annotate, "Annotate"),
+        }
+    }
 }
 
 impl crate::Store {
@@ -462,33 +497,19 @@ impl crate::Store {
         }
         let roles = self.folder_roles(account_id)?;
         check_agent_move(&roles, &from, &to)?;
-        let to_inbox = same_folder(&to, "INBOX");
         let to_archive = role_with_alias(&roles, &to) == Some(FolderRole::Archive)
             || same_folder(&to, "Archive");
-        let from_inbox = same_folder(&from, "INBOX");
         let summary = format!("moved thread from {from} to {to}");
         let mut found = false;
         let action =
             self.mutate_thread(account_id, thread_id, actor, "move", summary, |message| {
-                let implied_inbox = from_inbox && message.folders.is_empty() && !message.archived;
-                let before = message.folders.len();
-                message.folders.retain(|folder| !same_folder(folder, &from));
-                if message.folders.len() == before && !implied_inbox {
-                    return;
-                }
-                found = true;
-                if !message
-                    .folders
-                    .iter()
-                    .any(|folder| same_folder(folder, &to))
-                {
-                    message.folders.push(to.clone());
-                }
-                if to_inbox {
-                    message.archived = false;
-                } else if to_archive {
-                    message.archived = true;
-                }
+                found |= move_folders(
+                    &mut message.folders,
+                    &mut message.archived,
+                    &from,
+                    &to,
+                    to_archive,
+                );
             })?;
         if !found {
             return Err(Error::Invalid(format!("no messages in {from}")));
@@ -557,7 +578,14 @@ impl crate::Store {
         )?;
         let draft_id = tx.last_insert_rowid();
         let summary = format!("saved review draft {draft_id}");
-        let action = insert_action(&tx, &input.account_id, actor, "draft", &summary)?;
+        let action = insert_action(
+            &tx,
+            &input.account_id,
+            actor,
+            "draft",
+            &summary,
+            Some(&input.subject),
+        )?;
         tx.execute(
             "INSERT INTO agent_action_drafts (action_id, draft_id) VALUES (?1, ?2)",
             params![action.id, draft_id],
@@ -662,39 +690,57 @@ impl crate::Store {
         self.undo_checked(
             account_id,
             Some(require_token(actor, "actor")?),
-            Some(expected),
+            UndoSelection::Expected(expected),
         )
     }
 
     fn undo_inner(&self, account_id: &AccountId, actor: Option<&str>) -> Result<RecordedAction> {
-        self.undo_checked(account_id, actor, None)
+        self.undo_checked(account_id, actor, UndoSelection::Latest)
     }
 
     fn undo_checked(
         &self,
         account_id: &AccountId,
         actor: Option<&str>,
-        expected: Option<i64>,
+        selection: UndoSelection,
     ) -> Result<RecordedAction> {
         let tx = crate::store::immediate_transaction(&self.conn)?;
         require_account(&tx, account_id)?;
-        let Some(mut action) = find_open_action(&tx, account_id, actor)? else {
-            return Err(Error::NothingToUndo);
+        let interactive = matches!(selection, UndoSelection::Activity { .. });
+        let (mut action, check_grant) = match selection {
+            UndoSelection::Activity { id, confirmed_bulk } => (
+                activity::check_undo(&tx, account_id, id, confirmed_bulk)?,
+                false,
+            ),
+            UndoSelection::Latest | UndoSelection::Expected(_) => {
+                let action =
+                    find_open_action(&tx, account_id, actor)?.ok_or(Error::NothingToUndo)?;
+                if matches!(selection, UndoSelection::Expected(id) if id != action.id) {
+                    return Err(Error::Action(
+                        "The latest action changed; retry undo".into(),
+                    ));
+                }
+                (action, actor.is_some())
+            }
         };
-        if expected.is_some_and(|id| id != action.id) {
-            return Err(Error::Action(
-                "The latest action changed; retry undo".into(),
-            ));
+        if check_grant {
+            check_actor_grant(
+                &tx,
+                account_id,
+                &action.actor,
+                WriteScope::for_undo(&action.kind),
+            )?;
         }
-        if let Some(actor) = actor {
-            let scope = match action.kind.as_str() {
-                "draft" => WriteScope::Draft,
-                "annotate" => WriteScope::Annotate,
-                _ => WriteScope::Triage,
-            };
-            check_actor_grant(&tx, account_id, actor, scope)?;
-        }
-        if undo_action(&tx, account_id, &action)? == UndoEffect::SnoozeChanged {
+        let result = undo_action(&tx, account_id, &action);
+        let result = match result {
+            Err(Error::AgentActivityBlocked(_))
+                if !interactive && matches!(action.kind.as_str(), "snooze" | "unsnooze") =>
+            {
+                Err(snooze_changed_error())
+            }
+            result => result,
+        };
+        if result? == UndoEffect::SnoozeChanged {
             action.summary = SNOOZE_CHANGED_NOTICE.into();
         } else if action.kind == "snooze" {
             crate::notes::undo_snooze_acceptance(&tx, action.id)?;
@@ -779,7 +825,10 @@ fn mutate_thread_in(
     if writes.is_empty() {
         return Ok(None);
     }
-    let action = insert_action(conn, account_id, actor, kind, summary)?;
+    let subject = messages
+        .first()
+        .map(|message| message.headers.subject.as_str());
+    let action = insert_action(conn, account_id, actor, kind, summary, subject)?;
     for (old, new) in &writes {
         let was_keyword = label_edit
             .map(|edit| keywords::record_edit(conn, account_id, &new.message_id, edit, &old.labels))
@@ -787,8 +836,8 @@ fn mutate_thread_in(
         conn.execute(
             "INSERT INTO agent_action_messages (
                     action_id, message_id, labels, folders, unread, archived, snooze_until,
-                    starred, label_was_keyword
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    starred, label_was_keyword, after_folders, after_archived
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 action.id,
                 old.message_id,
@@ -799,6 +848,8 @@ fn mutate_thread_in(
                 old.snooze_until,
                 old.starred,
                 was_keyword,
+                matches!(kind, "archive" | "move").then_some(&new.folders),
+                matches!(kind, "archive" | "move").then_some(new.archived),
             ],
         )?;
         if let Some(edit) = label_edit {
@@ -806,14 +857,14 @@ fn mutate_thread_in(
             keywords::set_message_labels(conn, account_id, &new.message_id, &new.labels)?;
             continue;
         }
+        if old.folders != new.folders {
+            crate::actions::write_message_folders(conn, account_id, &new.message_id, &new.folders)?;
+        }
         conn.execute(
             "UPDATE messages
-                 SET labels = ?1, folders = ?2, unread = ?3, archived = ?4, snooze_until = ?5,
-                     starred = ?6
-                 WHERE account_id = ?7 AND message_id = ?8",
+                 SET unread = ?1, archived = ?2, snooze_until = ?3, starred = ?4
+                 WHERE account_id = ?5 AND message_id = ?6",
             params![
-                new.labels,
-                new.folders,
                 new.unread,
                 new.archived,
                 new.snooze_until,
@@ -848,7 +899,12 @@ fn undo_action(
     account_id: &AccountId,
     action: &RecordedAction,
 ) -> Result<UndoEffect> {
-    let effect = if action.kind == "snooze" && !check_snooze_undo(conn, account_id, action)? {
+    if let Some(blocker) = undo_conflicts::blocker(conn, action)? {
+        return Err(Error::AgentActivityBlocked(blocker));
+    }
+    let effect = if matches!(action.kind.as_str(), "snooze" | "unsnooze")
+        && !snooze_unchanged(conn, account_id, action)?
+    {
         UndoEffect::SnoozeChanged
     } else {
         match action.kind.as_str() {
@@ -859,8 +915,15 @@ fn undo_action(
         UndoEffect::Restored
     };
     conn.execute(
-        "UPDATE agent_actions SET undone = 1 WHERE id = ?1",
-        [action.id],
+        "UPDATE agent_actions SET undone = ?2 WHERE id = ?1",
+        [
+            action.id,
+            if effect == UndoEffect::SnoozeChanged {
+                SNOOZE_RETIRED
+            } else {
+                1
+            },
+        ],
     )?;
     Ok(effect)
 }
@@ -878,7 +941,15 @@ pub(crate) fn undo_recorded(
     if action.undone {
         return Ok(UndoEffect::Restored);
     }
-    undo_action(conn, account_id, &action)
+    undo_action(conn, account_id, &action).map_err(|err| {
+        if matches!(err, Error::AgentActivityBlocked(_))
+            && matches!(action.kind.as_str(), "snooze" | "unsnooze")
+        {
+            snooze_changed_error()
+        } else {
+            err
+        }
+    })
 }
 
 pub(crate) fn read_grant(
@@ -929,14 +1000,11 @@ pub(crate) fn check_write_grant(
     if !grant.enabled {
         return Err(Error::Invalid(format!("agent {agent_id} is disabled")));
     }
-    let (allowed, name) = match scope {
-        WriteScope::Triage => (grant.triage, "triage"),
-        WriteScope::Draft => (grant.draft, "draft"),
-        WriteScope::Annotate => (grant.annotate, "annotate"),
-    };
+    let (allowed, name) = scope.permission(grant);
     if !allowed {
         return Err(Error::Invalid(format!(
-            "agent {agent_id} lacks the {name} scope"
+            "agent {agent_id} lacks the {} scope",
+            name.to_ascii_lowercase()
         )));
     }
     Ok(())
@@ -1049,6 +1117,30 @@ fn canonical_folder(folder: &str) -> Result<String> {
 }
 
 /// Same folder, ignoring ASCII case and folder aliases (Archive/Archived).
+fn move_folders(
+    folders: &mut Vec<String>,
+    archived: &mut bool,
+    from: &str,
+    to: &str,
+    to_archive: bool,
+) -> bool {
+    let implied_inbox = same_folder(from, "INBOX") && folders.is_empty() && !*archived;
+    let before = folders.len();
+    folders.retain(|folder| !same_folder(folder, from));
+    if folders.len() == before && !implied_inbox {
+        return false;
+    }
+    if !folders.iter().any(|folder| same_folder(folder, to)) {
+        folders.push(to.to_owned());
+    }
+    if same_folder(to, "INBOX") {
+        *archived = false;
+    } else if to_archive {
+        *archived = true;
+    }
+    true
+}
+
 fn same_folder(a: &str, b: &str) -> bool {
     if a.eq_ignore_ascii_case(b) {
         return true;
@@ -1185,13 +1277,18 @@ pub(crate) fn insert_action(
     actor: &str,
     kind: &str,
     summary: &str,
+    subject: Option<&str>,
 ) -> Result<RecordedAction> {
     let created_unix = now_unix();
     conn.execute(
         "INSERT INTO agent_actions (
-            account_id, actor, kind, summary, undone, created_unix
-         ) VALUES (?1, ?2, ?3, ?4, 0, ?5)",
-        params![account_id.as_str(), actor, kind, summary, created_unix],
+            account_id, actor, kind, summary, undone, created_unix, target_subject, conversation_count,
+            local_action_floor, outbox_floor
+         ) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, 1,
+                   COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'local_actions'), 0),
+                   CASE WHEN ?3 IN ('archive', 'move') THEN
+                       COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'server_outbox'), 0) END)",
+        params![account_id.as_str(), actor, kind, summary, created_unix, subject],
     )?;
     Ok(RecordedAction {
         id: conn.last_insert_rowid(),
@@ -1232,16 +1329,38 @@ fn find_open_action(
     Ok(row)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActionUndoState {
+    Open,
+    Undone,
+    SnoozeRetired,
+}
+
 fn map_action(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecordedAction> {
-    Ok(RecordedAction {
-        id: row.get(0)?,
-        account_id: AccountId(row.get(1)?),
-        actor: row.get(2)?,
-        kind: row.get(3)?,
-        summary: row.get(4)?,
-        undone: row.get::<_, i64>(5)? != 0,
-        created_unix: row.get(6)?,
-    })
+    map_action_with_state(row).map(|(action, _)| action)
+}
+
+fn map_action_with_state(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(RecordedAction, ActionUndoState)> {
+    let state = match row.get::<_, i64>(5)? {
+        0 => ActionUndoState::Open,
+        1 => ActionUndoState::Undone,
+        SNOOZE_RETIRED => ActionUndoState::SnoozeRetired,
+        value => return Err(rusqlite::Error::IntegralValueOutOfRange(5, value)),
+    };
+    Ok((
+        RecordedAction {
+            id: row.get(0)?,
+            account_id: AccountId(row.get(1)?),
+            actor: row.get(2)?,
+            kind: row.get(3)?,
+            summary: row.get(4)?,
+            undone: state != ActionUndoState::Open,
+            created_unix: row.get(6)?,
+        },
+        state,
+    ))
 }
 
 fn map_draft(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewDraft> {
@@ -1265,7 +1384,7 @@ fn map_draft(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewDraft> {
 fn undo_messages(conn: &Connection, account_id: &AccountId, action: &RecordedAction) -> Result<()> {
     // The snapshot holds all fields, but undo owns only the fields this
     // action changed. A user or sync may have edited the others since.
-    let (restore, flags) = match action.kind.as_str() {
+    let (restore, flags, touched) = match action.kind.as_str() {
         "label" | "unlabel" => {
             return keywords::undo_label_action(
                 conn,
@@ -1275,103 +1394,101 @@ fn undo_messages(conn: &Connection, account_id: &AccountId, action: &RecordedAct
                 LabelHistory::Agent,
             );
         }
-        "archive" | "move" => ("folders = s.folders, archived = s.archived", None),
-        "snooze" | "unsnooze" => ("snooze_until = s.snooze_until", None),
-        "mark_read" | "mark_unread" => ("unread = s.unread", Some(FlagUndo::Unread)),
+        "archive" | "move" => return undo_conflicts::restore_folders(conn, action),
+        "snooze" | "unsnooze" => (
+            "snooze_until = s.snooze_until",
+            None,
+            "m.snooze_until IS NOT s.snooze_until",
+        ),
+        "mark_read" | "mark_unread" => (
+            "unread = s.unread",
+            Some(FlagUndo::Unread),
+            "m.unread IS NOT s.unread",
+        ),
         // Messages logged before the starred column may have no star to restore.
         "star" | "unstar" => (
-            "starred = COALESCE(s.starred, m.starred)",
+            "starred = s.starred",
             Some(FlagUndo::Star),
+            "s.starred IS NOT NULL AND m.starred IS NOT s.starred",
         ),
         _ => return Err(Error::Action(format!("unknown action {}", action.kind))),
     };
-    let flag_states = match flags {
-        Some(flag) => flag_changes(conn, account_id, action.id, flag)?,
-        None => Vec::new(),
-    };
+    if let Some(flag) = flags {
+        restore_flag_writes(conn, account_id, action.id, flag)?;
+    }
     conn.execute(
         &format!(
-            "UPDATE messages AS m SET {restore}
-             FROM agent_action_messages AS s
-             WHERE s.action_id = ?1 AND m.account_id = ?2 AND m.message_id = s.message_id"
+            "{resolved}
+             UPDATE messages AS m SET {restore}
+             FROM resolved AS s
+             WHERE m.account_id = ?2 AND m.message_id = s.live_id AND ({touched})",
+            resolved = undo_conflicts::RESOLVED_SNAPSHOTS,
         ),
         params![action.id, account_id.as_str()],
     )?;
-    for (message_id, unread, starred) in flag_states {
-        crate::store::intents::record(conn, account_id, &message_id, unread, starred)?;
-    }
     Ok(())
 }
 
-fn check_snooze_undo(
+fn snooze_unchanged(
     conn: &Connection,
     account_id: &AccountId,
     action: &RecordedAction,
 ) -> Result<bool> {
-    // Existing log entries already record the written timestamp in the summary.
-    let Some(until) = action
+    let until = if action.kind == "unsnooze" {
+        None
+    } else if let Some(until) = action
         .summary
         .strip_prefix(SNOOZE_SUMMARY_PREFIX)
         .and_then(|value| value.parse::<i64>().ok())
-    else {
+    {
+        Some(until)
+    } else {
         return Ok(false);
     };
-    // A missing row needs no restore. Prefer a mismatch with a newer
-    // undoable write over one that can only be retired.
-    let newer_write: Option<bool> = conn
-        .query_row(
-            "SELECT EXISTS (
-                SELECT 1 FROM agent_actions AS newer
-                JOIN agent_action_messages AS saved ON saved.action_id = newer.id
-                WHERE newer.account_id = ?2 AND newer.id > ?1 AND newer.undone = 0
-                  AND saved.message_id = m.message_id
-                  AND ((newer.kind = 'unsnooze' AND m.snooze_until IS NULL)
-                    OR (newer.kind = 'snooze' AND newer.summary = ?4 || m.snooze_until))
-             )
-             FROM agent_action_messages AS s
-             JOIN messages AS m ON m.account_id = ?2 AND m.message_id = s.message_id
-             WHERE s.action_id = ?1 AND m.snooze_until IS NOT ?3
-             ORDER BY 1 DESC LIMIT 1",
-            params![action.id, account_id.as_str(), until, SNOOZE_SUMMARY_PREFIX],
-            |row| row.get(0),
-        )
-        .optional()?;
-    match newer_write {
-        Some(true) => Err(snooze_changed_error()),
-        Some(false) => Ok(false),
-        None => Ok(true),
-    }
+    Ok(!conn.query_row(
+        &format!(
+            "{resolved}
+             SELECT EXISTS (SELECT 1 FROM resolved s
+             JOIN messages m ON m.account_id = ?2 AND m.message_id = s.live_id
+             WHERE m.snooze_until IS NOT ?3)",
+            resolved = undo_conflicts::RESOLVED_SNAPSHOTS,
+        ),
+        params![action.id, account_id.as_str(), until],
+        |row| row.get::<_, bool>(0),
+    )?)
 }
 
 fn snooze_changed_error() -> Error {
     Error::Action("Cannot undo snooze · snooze changed".into())
 }
 
-/// Messages whose read state or star undo of `action_id` changes, as
-/// `(id, unread, starred)`; `None` where that flag stays as it is. A row
-/// logged before stars were recorded restores no star.
-type FlagRestore = (String, Option<bool>, Option<bool>);
-
 enum FlagUndo {
     Unread,
     Star,
 }
 
-fn flag_changes(
+fn restore_flag_writes(
     conn: &Connection,
     account_id: &AccountId,
     action_id: i64,
     flag: FlagUndo,
-) -> Result<Vec<FlagRestore>> {
-    let mut stmt = conn.prepare(
-        "SELECT s.message_id,
-                CASE WHEN ?3 AND m.unread != s.unread THEN s.unread END,
-                CASE WHEN NOT ?3 AND m.starred != s.starred
-                     THEN s.starred END
-         FROM agent_action_messages s
-         JOIN messages m ON m.account_id = ?2 AND m.message_id = s.message_id
-         WHERE s.action_id = ?1",
-    )?;
+) -> Result<()> {
+    use crate::outbox::{OutboxKind, flags};
+    use crate::store::intents;
+
+    let kind = match flag {
+        FlagUndo::Unread => OutboxKind::Seen,
+        FlagUndo::Star => OutboxKind::Flagged,
+    };
+    let mut stmt = conn.prepare_cached(&format!(
+        "{resolved}
+         SELECT s.message_id, s.live_id,
+                CASE WHEN ?3 THEN s.unread ELSE s.starred END,
+                CASE WHEN ?3 THEN m.unread ELSE m.starred END
+         FROM resolved s
+         LEFT JOIN messages m ON m.account_id = ?2 AND m.message_id = s.live_id",
+        resolved = undo_conflicts::RESOLVED_SNAPSHOTS,
+    ))?;
     let rows = stmt.query_map(
         params![
             action_id,
@@ -1381,12 +1498,48 @@ fn flag_changes(
         |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, Option<i64>>(1)?.map(|unread| unread != 0),
-                row.get::<_, Option<i64>>(2)?.map(|starred| starred != 0),
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<bool>>(2)?,
+                row.get::<_, Option<bool>>(3)?,
             ))
         },
     )?;
-    rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+    let snapshots = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    for (snapshot, live, before, current) in snapshots {
+        let (unread, starred) = match flag {
+            FlagUndo::Unread => (before, None),
+            FlagUndo::Star => (None, before),
+        };
+        if let Some(message) = live.as_deref()
+            && before.is_some()
+            && before != current
+        {
+            if snapshot != message {
+                flags::repoint(conn, account_id, &snapshot, message, Some(kind))?;
+            }
+            intents::record(conn, account_id, message, unread, starred)?;
+        } else {
+            let restored_value = before.map(|value| {
+                if kind == OutboxKind::Seen {
+                    !value
+                } else {
+                    value
+                }
+            });
+            let queued = flags::cancel_for_undo(
+                conn,
+                account_id,
+                &snapshot,
+                live.as_deref(),
+                kind,
+                restored_value,
+            )?;
+            if queued && let Some(message) = live.as_deref() {
+                intents::remember_correction(conn, account_id, message, unread, starred)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn undo_draft(conn: &Connection, account_id: &AccountId, action_id: i64) -> Result<()> {
@@ -1423,6 +1576,1254 @@ mod tests {
     use crate::Store;
     use crate::account::{Account, BackendKind};
     use crate::message::{Address, MessageHeaders, RemoteId};
+
+    #[test]
+    fn activity_lists_and_pages_agent_rows_by_account_and_actor() {
+        let (store, account, thread) = seeded();
+        for agent in ["fern", "reed"] {
+            store
+                .set_agent_grant(&account, agent, AgentGrant::enabled(false, true, false))
+                .unwrap();
+        }
+        let first = store
+            .mark_thread_read(&account, &thread, "agent:fern")
+            .unwrap()
+            .unwrap();
+        let second = store
+            .star_thread(&account, &thread, true, "agent:reed")
+            .unwrap()
+            .unwrap();
+        let last = store
+            .agent_archive_thread(&account, &thread, "agent:fern")
+            .unwrap()
+            .unwrap();
+        store.mark_thread_unread(&account, &thread, "user").unwrap();
+        // Simulate a row written before activity began storing targets.
+        store
+            .conn
+            .execute(
+                "UPDATE agent_actions SET target_subject = NULL, conversation_count = NULL
+                            WHERE id = ?1",
+                [first.id],
+            )
+            .unwrap();
+        let read = |agent, direction| store.agent_activity(&account, agent, direction, 2).unwrap();
+        let ids = |page: &AgentActivityPage| {
+            page.entries
+                .iter()
+                .map(|entry| entry.action.id)
+                .collect::<Vec<_>>()
+        };
+        let latest = read(None, ActivityDirection::Latest);
+        assert_eq!(ids(&latest), [last.id, second.id]);
+        assert!(!latest.has_newer && latest.has_older);
+        let older = read(None, ActivityDirection::Older(second.id));
+        assert_eq!(ids(&older), [first.id]);
+        assert!(older.has_newer && !older.has_older);
+        assert_eq!(older.entries[0].blocker.as_ref().unwrap().id, last.id);
+        let jump = read(None, ActivityDirection::At(last.id));
+        assert_eq!(ids(&jump), ids(&latest));
+        assert!(!jump.has_newer && jump.has_older);
+        assert_eq!(older.entries[0].subject.as_deref(), Some("Invoice March"));
+        assert_eq!(older.entries[0].conversations, 1);
+        assert_eq!(
+            ids(&read(None, ActivityDirection::Newer(first.id))),
+            ids(&latest)
+        );
+        assert_eq!(
+            ids(&read(Some("fern"), ActivityDirection::Latest)),
+            [last.id, first.id]
+        );
+        assert!(
+            store
+                .agent_activity(
+                    &AccountId("other".into()),
+                    None,
+                    ActivityDirection::Latest,
+                    2
+                )
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn activity_undo_uses_mailbox_access_and_mcp_rechecks_the_grant() {
+        let (store, account, thread) = seeded();
+        let grant = AgentGrant::enabled(false, true, false);
+        store.set_agent_grant(&account, "fern", grant).unwrap();
+        let read = store
+            .mark_thread_read(&account, &thread, "agent:fern")
+            .unwrap()
+            .unwrap();
+        let starred = store
+            .star_thread(&account, &thread, true, "agent:fern")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .undo_agent_activity(&account, read.id, None)
+                .unwrap_err()
+                .to_string(),
+            "Undo the newer action first"
+        );
+        let page = store
+            .agent_activity(&account, Some("fern"), ActivityDirection::Latest, 10)
+            .unwrap();
+        assert_eq!(page.entries[1].blocker.as_ref().unwrap().id, starred.id);
+        store
+            .set_agent_grant(&account, "fern", AgentGrant::DISABLED)
+            .unwrap();
+        assert!(matches!(
+            store.undo_actor_action(&account, "agent:fern", starred.id),
+            Err(Error::Invalid(message)) if message == "agent fern is disabled"
+        ));
+        assert!(only_message(&store, &account, &thread)[0].starred);
+        let page = store
+            .agent_activity(&account, Some("fern"), ActivityDirection::Latest, 10)
+            .unwrap();
+        assert!(page.entries[0].agent_off);
+        assert_eq!(
+            store
+                .undo_agent_activity(&account, starred.id, None)
+                .unwrap()
+                .id,
+            starred.id
+        );
+        let messages = only_message(&store, &account, &thread);
+        assert!(!messages[0].starred && !messages[0].unread);
+        assert_eq!(
+            store
+                .undo_agent_activity(&account, starred.id, None)
+                .unwrap_err()
+                .to_string(),
+            "Action already undone"
+        );
+        assert_eq!(
+            store
+                .undo_agent_activity(&account, read.id, None)
+                .unwrap()
+                .id,
+            read.id
+        );
+        assert!(only_message(&store, &account, &thread)[0].unread);
+    }
+
+    #[test]
+    fn activity_undo_ignores_a_newer_action_by_a_disabled_agent() {
+        let (store, account, thread) = seeded();
+        let grant = AgentGrant::enabled(false, true, false);
+        store.set_agent_grant(&account, "fern", grant).unwrap();
+        store.set_agent_grant(&account, "reed", grant).unwrap();
+        let read = store
+            .mark_thread_read(&account, &thread, "agent:fern")
+            .unwrap()
+            .unwrap();
+        store
+            .star_thread(&account, &thread, true, "agent:reed")
+            .unwrap();
+        store
+            .set_agent_grant(&account, "reed", AgentGrant::DISABLED)
+            .unwrap();
+
+        let page = store
+            .agent_activity(&account, None, ActivityDirection::Latest, 10)
+            .unwrap();
+        assert!(page.entries[1].blocker.is_none());
+        assert_eq!(
+            store
+                .undo_agent_activity(&account, read.id, None)
+                .unwrap()
+                .id,
+            read.id
+        );
+        let message = &only_message(&store, &account, &thread)[0];
+        assert!(message.unread && message.starred);
+    }
+
+    #[test]
+    fn activity_undo_ignores_a_newer_discarded_review_draft() {
+        let (store, account, thread) = seeded();
+        store
+            .set_agent_grant(&account, "fern", AgentGrant::enabled(false, true, true))
+            .unwrap();
+        let read = store
+            .mark_thread_read(&account, &thread, "agent:fern")
+            .unwrap()
+            .unwrap();
+        let draft = store
+            .create_review_draft(
+                ReviewDraftInput {
+                    account_id: account.clone(),
+                    to: vec!["demo@example.com".into()],
+                    cc: vec![],
+                    bcc: vec![],
+                    subject: "Demo subject".into(),
+                    body: "Demo body".into(),
+                    in_reply_to: None,
+                    thread_id: None,
+                },
+                "agent:fern",
+            )
+            .unwrap();
+        store
+            .save_compose(&crate::compose::StoredCompose {
+                id: format!("r{}", draft.draft.id),
+                account_id: account.clone(),
+                fields: Default::default(),
+                body: draft.draft.body.clone(),
+                files: vec![],
+                identities: vec![],
+                owner: draft.draft.actor.clone(),
+                reply: Default::default(),
+            })
+            .unwrap();
+        let page = || {
+            store
+                .agent_activity(&account, Some("fern"), ActivityDirection::Latest, 10)
+                .unwrap()
+        };
+        assert_eq!(
+            page().entries[1].blocker.as_ref().unwrap().id,
+            draft.action.id
+        );
+        store
+            .discard_compose_drafts(&account, &[format!("r{}", draft.draft.id)])
+            .unwrap();
+
+        let discarded = page();
+        assert!(discarded.entries[0].draft_discarded);
+        assert!(discarded.entries[1].blocker.is_none());
+        assert_eq!(
+            store
+                .undo_agent_activity(&account, read.id, None)
+                .unwrap()
+                .id,
+            read.id
+        );
+        assert!(!page().entries[0].action.undone);
+    }
+
+    #[test]
+    fn activity_archive_undo_preserves_a_newer_agents_label_and_star() {
+        let (store, account, thread) = seeded();
+        for agent in ["fern", "reed"] {
+            store
+                .set_agent_grant(&account, agent, AgentGrant::enabled(false, true, false))
+                .unwrap();
+        }
+        let archive = store
+            .agent_archive_thread(&account, &thread, "agent:fern")
+            .unwrap()
+            .unwrap();
+        let label = store
+            .add_thread_label(&account, &thread, "review", "agent:reed")
+            .unwrap()
+            .unwrap();
+        let star = store
+            .star_thread(&account, &thread, true, "agent:reed")
+            .unwrap()
+            .unwrap();
+
+        store
+            .undo_agent_activity(&account, archive.id, None)
+            .unwrap();
+        assert!(
+            only_message(&store, &account, &thread)
+                .iter()
+                .all(|message| {
+                    !message.archived
+                        && message.folders.iter().any(|folder| folder == "INBOX")
+                        && message.labels.iter().any(|label| label == "review")
+                        && message.starred
+                })
+        );
+        assert_eq!(
+            store
+                .latest_open_action(&account, "agent:reed")
+                .unwrap()
+                .unwrap()
+                .id,
+            star.id
+        );
+        assert!(
+            !store
+                .list_actions(&account)
+                .unwrap()
+                .into_iter()
+                .find(|action| action.id == label.id)
+                .unwrap()
+                .undone
+        );
+    }
+
+    #[test]
+    fn activity_move_undo_keeps_an_archive_bit_the_move_did_not_touch() {
+        let (store, account, thread) = seeded();
+        store
+            .set_agent_grant(&account, "fern", AgentGrant::enabled(false, true, false))
+            .unwrap();
+        let moved = store
+            .agent_move_thread(&account, &thread, "INBOX", "Work", "agent:fern")
+            .unwrap()
+            .unwrap();
+        store
+            .conn
+            .execute("UPDATE messages SET archived = 1", [])
+            .unwrap();
+        store.undo_agent_activity(&account, moved.id, None).unwrap();
+        assert!(
+            only_message(&store, &account, &thread).iter().all(|mail| {
+                mail.archived && mail.folders.iter().any(|folder| folder == "INBOX")
+            })
+        );
+    }
+
+    #[test]
+    fn activity_flag_undo_blocks_a_newer_local_write_to_the_same_flag() {
+        let (store, account, thread) = seeded();
+        store
+            .set_agent_grant(&account, "fern", AgentGrant::enabled(false, true, false))
+            .unwrap();
+        let flag = store
+            .mark_thread_unread(&account, &thread, "agent:fern")
+            .unwrap()
+            .unwrap();
+        let local = store
+            .flag_threads(
+                &account,
+                std::slice::from_ref(&thread),
+                "INBOX",
+                crate::FlagChange::Read,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(matches!(store.undo_agent_activity(&account, flag.id, None),
+            Err(Error::AgentActivityBlocked(blocker)) if blocker.actor == "local" && blocker.id == local.id));
+        store.undo(&account).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE messages SET unread = 0 WHERE message_id = 'reply@x'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(store.undo_agent_activity(&account, flag.id, None),
+            Err(Error::AgentActivityBlocked(blocker)) if blocker.kind == BLOCKER_MAILBOX_CHANGED));
+    }
+
+    #[test]
+    fn activity_label_undo_blocks_a_newer_edit_to_the_same_messages() {
+        let (store, account, thread) = seeded();
+        store
+            .set_agent_grant(&account, "fern", AgentGrant::enabled(false, true, false))
+            .unwrap();
+        let label = store
+            .add_thread_label(&account, &thread, "review", "agent:fern")
+            .unwrap()
+            .unwrap();
+        let local = store
+            .label_thread(
+                &account,
+                &thread,
+                crate::actions::LabelChange::Remove("review".into()),
+            )
+            .unwrap();
+        assert!(
+            matches!(store.undo_agent_activity(&account, label.id, None),
+            Err(Error::AgentActivityBlocked(blocker)) if blocker.actor == "local" && blocker.id == local.id)
+        );
+        store.undo(&account).unwrap();
+        store.undo_agent_activity(&account, label.id, None).unwrap();
+    }
+
+    #[test]
+    fn activity_reloads_open_undone_and_retired_rows_from_disk() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("activity.db");
+        let (store, account, thread) = seed(Store::open(&db).unwrap());
+        let grant = AgentGrant::enabled(false, true, false);
+        for agent in ["juniper", "fern", "reed"] {
+            store.set_agent_grant(&account, agent, grant).unwrap();
+        }
+        let snooze = store
+            .snooze_thread(&account, &thread, now_unix() + 3600, "agent:juniper")
+            .unwrap()
+            .unwrap();
+        store
+            .conn
+            .execute("UPDATE messages SET snooze_until = NULL", [])
+            .unwrap();
+        store
+            .undo_agent_activity(&account, snooze.id, None)
+            .unwrap();
+        let star = store
+            .star_thread(&account, &thread, true, "agent:fern")
+            .unwrap()
+            .unwrap();
+        store.undo_agent_activity(&account, star.id, None).unwrap();
+        let read = store
+            .mark_thread_read(&account, &thread, "agent:reed")
+            .unwrap()
+            .unwrap();
+        drop(store);
+
+        let reopened = Store::open(&db).unwrap();
+        let page = reopened
+            .agent_activity(&account, None, ActivityDirection::Latest, 10)
+            .unwrap();
+        let states: Vec<_> = page
+            .entries
+            .iter()
+            .map(|entry| (entry.action.id, entry.action.undone, entry.snooze_retired))
+            .collect();
+        assert_eq!(
+            states,
+            [
+                (read.id, false, false),
+                (star.id, true, false),
+                (snooze.id, true, true)
+            ]
+        );
+        assert!(matches!(
+            reopened.undo_agent_activity(&account, snooze.id, None),
+            Err(Error::AgentActivityAlreadyUndone {
+                snooze_retired: true
+            })
+        ));
+    }
+
+    #[test]
+    fn activity_undo_follows_a_message_that_sync_folds_into_its_echo() {
+        for kind in ["archive", "star", "snooze"] {
+            let store = Store::open_in_memory().unwrap();
+            let account = account("a1");
+            store.upsert_account(&account).unwrap();
+            store
+                .set_agent_grant(&account.id, "fern", AgentGrant::enabled(false, true, false))
+                .unwrap();
+            let sent = message(
+                "a1",
+                "sent@x",
+                None,
+                "Hello",
+                "hello body",
+                true,
+                &["INBOX"],
+                &[],
+                1_700_000_000,
+            );
+            let echo = message(
+                "a1",
+                "list@x",
+                None,
+                "[list] Hello",
+                "hello body",
+                true,
+                &["INBOX"],
+                &[],
+                1_700_000_000,
+            );
+            let thread = store.upsert_message(&sent).unwrap();
+            store.upsert_message(&echo).unwrap();
+            let action = match kind {
+                "archive" => store.agent_archive_thread(&account.id, &thread, "agent:fern"),
+                "star" => store.star_thread(&account.id, &thread, true, "agent:fern"),
+                _ => store.snooze_thread(&account.id, &thread, 1_893_456_000, "agent:fern"),
+            }
+            .unwrap()
+            .unwrap();
+            // The next sync learns the list identity and folds the snapshotted
+            // row into the keeper through the ordinary arrival path.
+            store
+                .conn
+                .execute(
+                    "UPDATE messages SET list_id = 'list.example' WHERE message_id = 'list@x'",
+                    [],
+                )
+                .unwrap();
+            let arrived = Message {
+                folders: vec!["Sent".into()],
+                ..sent
+            };
+            store.upsert_message(&arrived).unwrap();
+            let aliases: String = store.conn.query_row(
+                "SELECT canonical_message_id FROM message_aliases WHERE account_id = ?1 AND message_id = 'sent@x'",
+                [account.id.as_str()], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(aliases, "list@x");
+            let keeper = || {
+                store
+                    .message(&account.id, &MessageId::new("list@x"))
+                    .unwrap()
+                    .unwrap()
+            };
+            let before = keeper();
+            match kind {
+                "archive" => assert!(
+                    before.archived && !before.folders.iter().any(|folder| folder == "INBOX")
+                ),
+                "star" => assert!(before.starred),
+                _ => assert_eq!(before.snooze_until, Some(1_893_456_000)),
+            }
+            if kind == "archive" {
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO message_aliases (account_id, message_id, canonical_message_id)
+                     VALUES (?1, 'other-copy@x', 'list@x')",
+                        [account.id.as_str()],
+                    )
+                    .unwrap();
+                store.conn.execute(
+                    "INSERT INTO server_outbox
+                     (account_id, kind, state, message_id, source_folder, target_folder, created_unix)
+                     VALUES (?1, 'move', 'pending', 'other-copy@x', 'Sent', 'Later', ?2)",
+                    params![account.id.as_str(), action.created_unix],
+                ).unwrap();
+                assert!(
+                    matches!(store.undo_agent_activity(&account.id, action.id, None),
+                    Err(Error::AgentActivityBlocked(blocker)) if blocker.actor == "outbox")
+                );
+                store
+                    .conn
+                    .execute("UPDATE server_outbox SET state = 'done'", [])
+                    .unwrap();
+            }
+            assert!(
+                store
+                    .undo_agent_activity(&account.id, action.id, None)
+                    .unwrap()
+                    .undone
+            );
+            let after = keeper();
+            match kind {
+                "archive" => {
+                    assert!(!after.archived && after.folders.iter().any(|folder| folder == "INBOX"))
+                }
+                "star" => assert!(!after.starred),
+                _ => assert_eq!(after.snooze_until, None),
+            }
+            assert!(after.folders.iter().any(|folder| folder == "Sent"));
+        }
+    }
+
+    #[test]
+    fn activity_undo_reverses_a_folded_star_with_write_back() {
+        assert_folded_flag_undo(crate::outbox::OutboxKind::Flagged);
+    }
+
+    #[test]
+    fn activity_undo_reverses_a_folded_read_with_write_back() {
+        assert_folded_flag_undo(crate::outbox::OutboxKind::Seen);
+    }
+
+    fn assert_folded_flag_undo(kind: crate::outbox::OutboxKind) {
+        use crate::outbox::{OutboxKind, OutboxState, flags};
+
+        for legacy in [false, true] {
+            let store = Store::open_in_memory().unwrap();
+            let account = account("a1");
+            store.upsert_account(&account).unwrap();
+            store.set_write_back(&account.id, true).unwrap();
+            store
+                .set_agent_grant(&account.id, "fern", AgentGrant::enabled(false, true, false))
+                .unwrap();
+            let (sent, echo) = flag_fold_messages();
+            let thread = store.upsert_message(&sent).unwrap();
+            let keeper_thread = store.upsert_message(&echo).unwrap();
+            let action = if kind == OutboxKind::Seen {
+                store
+                    .star_thread(&account.id, &keeper_thread, true, "user")
+                    .unwrap();
+                store.mark_thread_read(&account.id, &thread, "agent:fern")
+            } else {
+                store
+                    .mark_thread_read(&account.id, &keeper_thread, "user")
+                    .unwrap();
+                store.star_thread(&account.id, &thread, true, "agent:fern")
+            }
+            .unwrap()
+            .unwrap();
+            let initial = store
+                .outbox(&account.id)
+                .unwrap()
+                .into_iter()
+                .find(|row| row.kind == kind && row.message_id == "sent@x")
+                .unwrap();
+            assert_eq!(initial.flag_value, Some(true));
+            assert_eq!(initial.uid, Some(10));
+            let retry = 9_999_999_999_i64;
+            store.conn.execute(
+                "UPDATE server_outbox SET retry_unix = ?2, attempts = 3, sent = ?3 WHERE id = ?1",
+                params![initial.id, retry, legacy],
+            ).unwrap();
+            fold_into_echo(&store, sent);
+            // Sync still sees the server's old flags on the newly folded row.
+            store.upsert_message(&echo).unwrap();
+            let intents = store.pending_flag_changes(&account.id).unwrap();
+            assert_eq!(intents.len(), 1);
+            assert_eq!(intents[0].message_id, "list@x");
+            assert_eq!(
+                (intents[0].unread, intents[0].starred),
+                (Some(false), Some(true))
+            );
+            let keeper = store
+                .message(&account.id, &MessageId::new("list@x"))
+                .unwrap()
+                .unwrap();
+            assert!(!keeper.unread && keeper.starred);
+            let folded = store
+                .outbox(&account.id)
+                .unwrap()
+                .into_iter()
+                .find(|row| row.id == initial.id)
+                .unwrap();
+            assert_eq!(folded.message_id, "list@x");
+            assert_eq!(folded.uid, initial.uid);
+            assert_eq!(folded.state, OutboxState::Pending);
+            assert_eq!(
+                (folded.retry_unix, folded.attempts, folded.sent),
+                (retry, 3, legacy)
+            );
+            let active: bool = store
+                .conn
+                .query_row(
+                    "SELECT NOT flag_superseded FROM server_outbox WHERE id = ?1",
+                    [initial.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(active);
+            let writes = store
+                .outbox(&account.id)
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.kind == kind)
+                .map(|row| (row.message_id, row.uid, row.flag_value))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                writes,
+                [
+                    ("list@x".into(), Some(10), Some(true)),
+                    ("list@x".into(), Some(20), Some(true)),
+                    ("list@x".into(), Some(30), Some(true)),
+                ]
+            );
+
+            if legacy {
+                // Simulate a row left keyed to the deleted ID by an older build,
+                // with the original STORE potentially already on the wire.
+                store
+                    .conn
+                    .execute(
+                        "UPDATE server_outbox SET message_id = 'sent@x', sent = 1 WHERE id = ?1",
+                        [initial.id],
+                    )
+                    .unwrap();
+            }
+            assert!(
+                store
+                    .undo_agent_activity(&account.id, action.id, None)
+                    .unwrap()
+                    .undone
+            );
+            let outbox = store.outbox(&account.id).unwrap();
+            assert!(
+                outbox
+                    .iter()
+                    .all(|row| row.state != OutboxState::Pending || row.message_id != "sent@x")
+            );
+            let replacements = outbox
+                .iter()
+                .filter(|row| row.kind == kind && row.flag_value == Some(false))
+                .map(|row| (row.message_id.as_str(), row.state, row.uid))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                replacements,
+                [
+                    ("list@x", OutboxState::Pending, Some(10)),
+                    ("list@x", OutboxState::Pending, Some(20)),
+                    ("list@x", OutboxState::Pending, Some(30)),
+                ]
+            );
+            let keeper = store
+                .message(&account.id, &MessageId::new("list@x"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(keeper.unread, kind == OutboxKind::Seen);
+            assert_eq!(keeper.starred, kind == OutboxKind::Seen);
+            if legacy {
+                let superseded: bool = store
+                    .conn
+                    .query_row(
+                        "SELECT flag_superseded FROM server_outbox WHERE id = ?1",
+                        [initial.id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert!(superseded);
+                // A response for the original ID still rebases the replacement.
+                assert!(matches!(
+                    flags::observe(
+                        &store,
+                        &account.id,
+                        &initial,
+                        flags::Observation::Stored(Some(12))
+                    )
+                    .unwrap(),
+                    flags::Progress::Retired
+                ));
+                assert!(
+                    store
+                        .outbox(&account.id)
+                        .unwrap()
+                        .iter()
+                        .any(|row| row.kind == kind
+                            && row.uid == Some(10)
+                            && row.flag_value == Some(false)
+                            && row.flag_modseq == Some(12))
+                );
+            } else {
+                assert!(outbox.iter().all(|row| row.id != initial.id));
+            }
+        }
+    }
+
+    fn flag_fold_messages() -> (Message, Message) {
+        let sent = Message {
+            remote_id: RemoteId("imap:1:10:INBOX".into()),
+            ..message(
+                "a1",
+                "sent@x",
+                None,
+                "Hello",
+                "hello body",
+                true,
+                &["INBOX"],
+                &[],
+                10,
+            )
+        };
+        let echo = Message {
+            remote_id: RemoteId("imap:1:20:INBOX".into()),
+            ..message(
+                "a1",
+                "list@x",
+                None,
+                "[list] Hello",
+                "hello body",
+                true,
+                &["INBOX"],
+                &[],
+                10,
+            )
+        };
+        (sent, echo)
+    }
+
+    fn fold_into_echo(store: &Store, sent: Message) {
+        store
+            .conn
+            .execute(
+                "UPDATE messages SET list_id = 'list.example' WHERE message_id = 'list@x'",
+                [],
+            )
+            .unwrap();
+        store
+            .upsert_message(&Message {
+                remote_id: RemoteId("imap:1:30:Sent".into()),
+                folders: vec!["Sent".into()],
+                ..sent
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn folded_conflicting_flags_keep_unread_and_starred_in_both_orders() {
+        use crate::outbox::{OutboxKind, OutboxState};
+
+        for keep_echo in [true, false] {
+            let store = Store::open_in_memory().unwrap();
+            let account = account("a1");
+            store.upsert_account(&account).unwrap();
+            store.set_write_back(&account.id, true).unwrap();
+            let (sent, echo) = flag_fold_messages();
+            let sent = Message {
+                remote_id: RemoteId("imap:1:10:Sent".into()),
+                folders: vec!["Sent".into()],
+                unread: false,
+                ..sent
+            };
+            let echo = Message {
+                starred: true,
+                ..echo
+            };
+            let sent_thread = store.upsert_message(&sent).unwrap();
+            let echo_thread = store.upsert_message(&echo).unwrap();
+            store
+                .mark_thread_unread(&account.id, &sent_thread, "user")
+                .unwrap()
+                .unwrap();
+            store
+                .star_thread(&account.id, &sent_thread, true, "user")
+                .unwrap()
+                .unwrap();
+            store
+                .mark_thread_read(&account.id, &echo_thread, "user")
+                .unwrap()
+                .unwrap();
+            store
+                .star_thread(&account.id, &echo_thread, false, "user")
+                .unwrap()
+                .unwrap();
+            let (keeper, arriving_uid) = if keep_echo {
+                fold_into_echo(&store, sent);
+                ("list@x", 30)
+            } else {
+                store
+                    .upsert_message(&Message {
+                        remote_id: RemoteId("imap:1:40:INBOX".into()),
+                        list_id: Some("list.example".into()),
+                        ..echo
+                    })
+                    .unwrap();
+                ("sent@x", 40)
+            };
+            let intents = store.pending_flag_changes(&account.id).unwrap();
+            assert_eq!(intents.len(), 1);
+            assert_eq!(intents[0].message_id, keeper);
+            assert_eq!(
+                (intents[0].unread, intents[0].starred),
+                (Some(true), Some(true))
+            );
+            let message = store
+                .message(&account.id, &MessageId::new(keeper))
+                .unwrap()
+                .unwrap();
+            assert!(message.unread && message.starred);
+            let outbox = store.outbox(&account.id).unwrap();
+            for (kind, value) in [(OutboxKind::Seen, false), (OutboxKind::Flagged, true)] {
+                let mut uids = outbox
+                    .iter()
+                    .filter(|row| row.kind == kind)
+                    .map(|row| {
+                        assert_eq!(row.state, OutboxState::Pending);
+                        assert_eq!(row.message_id, keeper);
+                        assert_eq!(row.flag_value, Some(value));
+                        row.uid.unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                uids.sort_unstable();
+                assert_eq!(uids, [10, 20, arriving_uid]);
+            }
+        }
+    }
+
+    #[test]
+    fn folded_flag_undo_cleans_legacy_writes_when_the_flag_already_matches() {
+        use crate::outbox::{OutboxKind, OutboxState, flags};
+
+        for kind in [OutboxKind::Seen, OutboxKind::Flagged] {
+            for sent_to_server in [false, true] {
+                let store = Store::open_in_memory().unwrap();
+                let account = account("a1");
+                store.upsert_account(&account).unwrap();
+                store.set_write_back(&account.id, true).unwrap();
+                store
+                    .set_agent_grant(&account.id, "fern", AgentGrant::enabled(false, true, false))
+                    .unwrap();
+                let (sent, echo) = flag_fold_messages();
+                let thread = store.upsert_message(&sent).unwrap();
+                store.upsert_message(&echo).unwrap();
+                let action = if kind == OutboxKind::Seen {
+                    store.mark_thread_read(&account.id, &thread, "agent:fern")
+                } else {
+                    store.star_thread(&account.id, &thread, true, "agent:fern")
+                }
+                .unwrap()
+                .unwrap();
+                let original = store.outbox(&account.id).unwrap()[0].id;
+                fold_into_echo(&store, sent);
+                // Recreate an older fold followed by sync observing the before state.
+                store
+                    .conn
+                    .execute("DELETE FROM server_outbox WHERE id <> ?1", [original])
+                    .unwrap();
+                store
+                    .conn
+                    .execute("DELETE FROM local_flag_intents", [])
+                    .unwrap();
+                store
+                    .conn
+                    .execute("UPDATE messages SET unread = 1, starred = 0", [])
+                    .unwrap();
+                store
+                    .conn
+                    .execute(
+                        "UPDATE server_outbox SET message_id = 'sent@x', sent = ?2 WHERE id = ?1",
+                        params![original, sent_to_server],
+                    )
+                    .unwrap();
+                assert!(
+                    store
+                        .undo_agent_activity(&account.id, action.id, None)
+                        .unwrap()
+                        .undone
+                );
+                let message = store
+                    .message(&account.id, &MessageId::new("list@x"))
+                    .unwrap()
+                    .unwrap();
+                assert!(message.unread && !message.starred);
+                let outbox = store.outbox(&account.id).unwrap();
+                if sent_to_server {
+                    assert_eq!(outbox.len(), 2);
+                    let superseded: bool = store
+                        .conn
+                        .query_row(
+                            "SELECT flag_superseded FROM server_outbox WHERE id = ?1",
+                            [original],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert!(superseded);
+                    let corrective = &outbox[1];
+                    assert_eq!(corrective.message_id, "list@x");
+                    assert_eq!(corrective.kind, kind);
+                    assert_eq!(corrective.uid, Some(10));
+                    assert_eq!(corrective.flag_value, Some(false));
+                    assert_eq!(corrective.state, OutboxState::Pending);
+                    let intents = store.pending_flag_changes(&account.id).unwrap();
+                    assert_eq!(intents.len(), 1);
+                    if kind == OutboxKind::Seen {
+                        assert_eq!(intents[0].unread, Some(true));
+                    } else {
+                        assert_eq!(intents[0].starred, Some(false));
+                    }
+                    assert!(matches!(
+                        flags::observe(
+                            &store,
+                            &account.id,
+                            &outbox[0],
+                            flags::Observation::Stored(Some(12))
+                        )
+                        .unwrap(),
+                        flags::Progress::Retired
+                    ));
+                    let corrective = store.outbox(&account.id).unwrap().pop().unwrap();
+                    assert!(matches!(
+                        flags::observe(
+                            &store,
+                            &account.id,
+                            &corrective,
+                            flags::Observation::Stored(Some(13))
+                        )
+                        .unwrap(),
+                        flags::Progress::Applied
+                    ));
+                    assert!(store.pending_flag_changes(&account.id).unwrap().is_empty());
+                } else {
+                    assert!(outbox.is_empty());
+                    assert!(store.pending_flag_changes(&account.id).unwrap().is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn activity_undo_remains_open_when_every_snapshot_has_lost_its_message() {
+        let (store, account, thread) = seeded();
+        store
+            .set_agent_grant(&account, "fern", AgentGrant::enabled(false, true, false))
+            .unwrap();
+        let action = store
+            .star_thread(&account, &thread, true, "agent:fern")
+            .unwrap()
+            .unwrap();
+        store
+            .conn
+            .execute("DELETE FROM message_aliases", [])
+            .unwrap();
+        store.conn.execute("DELETE FROM messages", []).unwrap();
+        assert!(
+            matches!(store.undo_agent_activity(&account, action.id, None),
+            Err(Error::AgentActivityBlocked(blocker)) if blocker.kind == BLOCKER_MAILBOX_CHANGED)
+        );
+        assert!(!store.list_actions(&account).unwrap().last().unwrap().undone);
+    }
+
+    #[test]
+    fn activity_move_undo_keeps_a_later_folder_and_updates_search_terms() {
+        let store = Store::open_in_memory().unwrap();
+        let account = account("a1");
+        store.upsert_account(&account).unwrap();
+        store
+            .set_agent_grant(&account.id, "fern", AgentGrant::enabled(false, true, false))
+            .unwrap();
+        let mail = message(
+            "a1",
+            "root@x",
+            None,
+            "Hello",
+            "hello body",
+            true,
+            &["Quasarbox"],
+            &[],
+            10,
+        );
+        let thread = store.upsert_message(&mail).unwrap();
+        let count = |term| {
+            store
+                .conn
+                .query_row(
+                    "SELECT df FROM search_terms WHERE account_id = ?1 AND term = ?2",
+                    params![account.id.as_str(), term],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap()
+                .unwrap_or_default()
+        };
+        assert_eq!(count("quasarbox"), 1);
+        let action = store
+            .agent_move_thread(
+                &account.id,
+                &thread,
+                "Quasarbox",
+                "Transitbox",
+                "agent:fern",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!((count("quasarbox"), count("transitbox")), (0, 1));
+        let extra = Message {
+            folders: vec!["Sent".into()],
+            ..mail
+        };
+        store.upsert_message(&extra).unwrap();
+        store
+            .undo_agent_activity(&account.id, action.id, None)
+            .unwrap();
+        let restored = store
+            .message(&account.id, &MessageId::new("root@x"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.folders, ["Quasarbox", "Sent"]);
+        assert_eq!(
+            (count("quasarbox"), count("transitbox"), count("sent")),
+            (1, 0, 1)
+        );
+    }
+
+    #[test]
+    fn activity_folder_undo_preserves_a_newer_agents_move() {
+        let (store, account, thread) = seeded();
+        for agent in ["fern", "reed"] {
+            store
+                .set_agent_grant(&account, agent, AgentGrant::enabled(false, true, false))
+                .unwrap();
+        }
+        let fern = store
+            .agent_move_thread(&account, &thread, "INBOX", "Work", "agent:fern")
+            .unwrap()
+            .unwrap();
+        let reed = store
+            .agent_move_thread(&account, &thread, "Work", "Later", "agent:reed")
+            .unwrap()
+            .unwrap();
+        let live = only_message(&store, &account, &thread);
+        let page = store
+            .agent_activity(&account, Some("fern"), ActivityDirection::Latest, 10)
+            .unwrap();
+        assert_eq!(page.entries[0].blocker.as_ref().unwrap().id, reed.id);
+        assert!(matches!(store.undo_agent_activity(&account, fern.id, None),
+            Err(Error::AgentActivityBlocked(blocker)) if blocker.id == reed.id && blocker.actor == "agent:reed"));
+        assert_eq!(only_message(&store, &account, &thread), live);
+        store.undo_agent_activity(&account, reed.id, None).unwrap();
+        store.undo_agent_activity(&account, fern.id, None).unwrap();
+    }
+
+    #[test]
+    fn activity_folder_undo_preserves_a_newer_local_move() {
+        let (store, account, thread) = seeded();
+        store
+            .set_agent_grant(&account, "fern", AgentGrant::enabled(false, true, false))
+            .unwrap();
+        let fern = store
+            .agent_move_thread(&account, &thread, "INBOX", "Work", "agent:fern")
+            .unwrap()
+            .unwrap();
+        let local = store
+            .move_thread(&account, &thread, "Work", "Later")
+            .unwrap();
+        let live = only_message(&store, &account, &thread);
+        assert!(matches!(store.undo_agent_activity(&account, fern.id, None),
+            Err(Error::AgentActivityBlocked(blocker)) if blocker.id == local.id && blocker.actor == "local"));
+        assert_eq!(only_message(&store, &account, &thread), live);
+        store.undo(&account).unwrap();
+        store.undo_agent_activity(&account, fern.id, None).unwrap();
+    }
+
+    #[test]
+    fn activity_archive_undo_checks_pending_moves_and_changes_without_history() {
+        let (store, account, thread) = seeded();
+        store
+            .set_agent_grant(&account, "fern", AgentGrant::enabled(false, true, false))
+            .unwrap();
+        let archive = store
+            .agent_archive_thread(&account, &thread, "agent:fern")
+            .unwrap()
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO server_outbox
+             (account_id, kind, state, message_id, source_folder, target_folder, created_unix)
+             SELECT ?2, 'move', 'pending', message_id, 'Work', 'Later', ?3
+             FROM agent_action_messages WHERE action_id = ?1 LIMIT 1",
+                params![archive.id, account.as_str(), archive.created_unix],
+            )
+            .unwrap();
+        assert!(
+            matches!(store.undo_agent_activity(&account, archive.id, None),
+            Err(Error::AgentActivityBlocked(blocker)) if blocker.actor == "outbox")
+        );
+        store
+            .conn
+            .execute("UPDATE server_outbox SET state = 'done'", [])
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE messages SET archived = 0 WHERE account_id = ?1",
+                [account.as_str()],
+            )
+            .unwrap();
+        let live = only_message(&store, &account, &thread);
+        assert!(
+            matches!(store.undo_agent_activity(&account, archive.id, None),
+            Err(Error::AgentActivityBlocked(blocker)) if blocker.kind == BLOCKER_MAILBOX_CHANGED)
+        );
+        assert_eq!(only_message(&store, &account, &thread), live);
+    }
+
+    #[test]
+    fn activity_unsnooze_undo_preserves_a_newer_agents_snooze() {
+        let (store, account, thread) = seeded();
+        for agent in ["ada", "bo"] {
+            store
+                .set_agent_grant(&account, agent, AgentGrant::enabled(false, true, false))
+                .unwrap();
+        }
+        let before = now_unix() + 3600;
+        store
+            .snooze_thread(&account, &thread, before, "agent:ada")
+            .unwrap();
+        let cleared = store
+            .unsnooze_thread(&account, &thread, "agent:ada")
+            .unwrap()
+            .unwrap();
+        let newer = store
+            .snooze_thread(&account, &thread, before + 3600, "agent:bo")
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(store.undo_agent_activity(&account, cleared.id, None),
+            Err(Error::AgentActivityBlocked(blocker)) if blocker.id == newer.id && blocker.actor == "agent:bo")
+        );
+        assert!(
+            only_message(&store, &account, &thread)
+                .iter()
+                .all(|mail| mail.snooze_until == Some(before + 3600))
+        );
+        store.undo_agent_activity(&account, newer.id, None).unwrap();
+        store
+            .undo_agent_activity(&account, cleared.id, None)
+            .unwrap();
+    }
+
+    #[test]
+    fn activity_bulk_undo_requires_confirmation_for_the_displayed_count() {
+        let (store, account, _) = seeded();
+        store
+            .set_agent_grant(&account, "fern", AgentGrant::enabled(false, true, false))
+            .unwrap();
+        let mut threads = Vec::new();
+        let mut actions = Vec::new();
+        for index in 0..=BULK_UNDO_THRESHOLD {
+            let thread = store
+                .upsert_message(&message(
+                    account.as_str(),
+                    &format!("bulk-{index}@example.test"),
+                    None,
+                    &format!("Item {index}"),
+                    "Demo body",
+                    false,
+                    &["INBOX"],
+                    &[],
+                    10,
+                ))
+                .unwrap();
+            let action = store
+                .agent_archive_thread(&account, &thread, "agent:fern")
+                .unwrap()
+                .unwrap();
+            threads.push(thread);
+            actions.push(action.id);
+        }
+        // The public tools only accept one thread. Group snapshots in a fixture
+        // to exercise the bulk path through the real archive undo.
+        let id = actions.pop().unwrap();
+        for other in actions {
+            store
+                .conn
+                .execute(
+                    "UPDATE agent_action_messages SET action_id = ?1 WHERE action_id = ?2",
+                    params![id, other],
+                )
+                .unwrap();
+            store
+                .conn
+                .execute("DELETE FROM agent_actions WHERE id = ?1", [other])
+                .unwrap();
+        }
+        store
+            .conn
+            .execute(
+                "UPDATE agent_actions SET target_subject = NULL, conversation_count = NULL
+                            WHERE id = ?1",
+                [id],
+            )
+            .unwrap();
+        let page = store
+            .agent_activity(&account, None, ActivityDirection::Latest, 2)
+            .unwrap();
+        assert_eq!(page.entries[0].conversations, BULK_UNDO_THRESHOLD + 1);
+        for confirmed in [None, Some(BULK_UNDO_THRESHOLD)] {
+            assert_eq!(
+                store
+                    .undo_agent_activity(&account, id, confirmed)
+                    .unwrap_err()
+                    .to_string(),
+                "Confirm undo for this bulk action"
+            );
+        }
+        assert!(
+            threads
+                .iter()
+                .all(|thread| only_message(&store, &account, thread)[0].archived)
+        );
+        store
+            .undo_agent_activity(&account, id, Some(BULK_UNDO_THRESHOLD + 1))
+            .unwrap();
+        assert!(
+            threads
+                .iter()
+                .all(|thread| !only_message(&store, &account, thread)[0].archived)
+        );
+    }
 
     fn account(id: &str) -> Account {
         Account {
@@ -2322,11 +3723,19 @@ mod tests {
         assert_eq!(folded[0].snooze_until, echo.snooze_until);
         assert_eq!(folded[1].snooze_until, Some(until));
 
-        let retired = store.agent_undo(&account).unwrap();
+        let retired = store
+            .undo_agent_activity(&account, snooze.id, None)
+            .unwrap();
         assert_eq!(retired.id, snooze.id);
         assert_eq!(retired.summary, "Snooze already changed");
         assert!(retired.undone);
         assert_eq!(only_message(&store, &account, &thread), folded);
+        let activity = store
+            .agent_activity(&account, Some("ada"), ActivityDirection::Latest, 10)
+            .unwrap();
+        assert!(activity.entries[0].snooze_retired);
+        assert!(activity.entries[0].action.undone);
+        assert!(activity.entries[1].blocker.is_none());
 
         let undone = store.agent_undo(&account).unwrap();
         assert_eq!(undone.id, older.id);

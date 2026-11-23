@@ -14,6 +14,29 @@ use crate::store::{
 };
 use crate::{Error, Result};
 
+/// Keep pending writes attached to their live message. The stored UID and
+/// revision still identify the same server copy after a local fold.
+pub(crate) fn repoint(
+    conn: &Connection,
+    account: &AccountId,
+    from: &str,
+    to: &str,
+    kind: Option<OutboxKind>,
+) -> Result<()> {
+    conn.prepare_cached(
+        "UPDATE server_outbox SET message_id = ?3
+         WHERE account_id = ?1 AND message_id = ?2 AND state = 'pending'
+           AND kind IN ('seen', 'flagged') AND (?4 IS NULL OR kind = ?4)",
+    )?
+    .execute(params![
+        account.as_str(),
+        from,
+        to,
+        kind.map(OutboxKind::as_str)
+    ])?;
+    Ok(())
+}
+
 /// Record the new intent in the same transaction as the local edit. A sent
 /// row may have reached the server and is kept only to recover its revision.
 pub(crate) fn queue(
@@ -23,7 +46,30 @@ pub(crate) fn queue(
     unread: Option<bool>,
     starred: Option<bool>,
 ) -> Result<()> {
-    if !enabled(conn, account)? {
+    queue_intents(conn, account, message, unread, starred, false)
+}
+
+/// Fill the merged intent across the known server copies. Keep an existing
+/// write for the chosen value, including its retry and recovery state.
+pub(crate) fn complete_fold(
+    conn: &Connection,
+    account: &AccountId,
+    message: &str,
+    unread: Option<bool>,
+    starred: Option<bool>,
+) -> Result<()> {
+    queue_intents(conn, account, message, unread, starred, true)
+}
+
+fn queue_intents(
+    conn: &Connection,
+    account: &AccountId,
+    message: &str,
+    unread: Option<bool>,
+    starred: Option<bool>,
+    preserve_matching: bool,
+) -> Result<()> {
+    if (unread.is_none() && starred.is_none()) || !enabled(conn, account)? {
         return Ok(());
     }
     let generation = generation(conn, account)?;
@@ -32,61 +78,138 @@ pub(crate) fn queue(
         (OutboxKind::Flagged, starred),
     ] {
         let Some(value) = value else { continue };
-        let scope = params![account.as_str(), message, kind.as_str()];
-        conn.execute(
-            "DELETE FROM server_outbox
-             WHERE account_id = ?1 AND message_id = ?2 AND kind = ?3
-               AND state = 'pending' AND sent = 0",
-            scope,
+        retire_pending(
+            conn,
+            account,
+            message,
+            kind,
+            preserve_matching.then_some(value),
         )?;
-        conn.execute(
-            "UPDATE server_outbox SET flag_superseded = 1, retry_unix = 0
-             WHERE account_id = ?1 AND message_id = ?2 AND kind = ?3 AND state = 'pending'",
-            scope,
-        )?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT mailbox, uidvalidity, uid, folder, modseq,
-                    CASE ?3 WHEN 'seen' THEN seen ELSE flagged END
-             FROM message_copies WHERE account_id = ?1 AND message_id = ?2 ORDER BY mailbox, uidvalidity, uid",
-        )?;
-        let rows = stmt.query_map(scope, |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, u32>(1)?,
-                row.get::<_, u32>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, Option<[u8; 8]>>(4)?,
-                row.get::<_, Option<bool>>(5)?,
-            ))
-        })?;
-        let mut insert = conn.prepare_cached(
-            "INSERT INTO server_outbox
-                (account_id, kind, state, message_id, source_folder, source_mailbox,
-                 uidvalidity, uid, target_folder, created_unix, generation, flag_value, flag_modseq, flag_base)
-             VALUES (?1, ?2, 'pending', ?3, ?4, ?5, ?6, ?7, '', ?8, ?9, ?10, ?11, ?12)",
-        )?;
-        let now = now_unix();
-        for row in rows {
-            let (escaped, uidvalidity, uid, folder, modseq, base) = row?;
-            let mailbox = unescape_mailbox(&escaped)
-                .ok_or_else(|| Error::Action("invalid mailbox in flag copy".into()))?;
-            insert.execute(params![
-                account.as_str(),
-                kind.as_str(),
-                message,
-                folder,
-                mailbox,
-                uidvalidity,
-                uid,
-                now,
-                generation,
-                value,
-                modseq,
-                base,
-            ])?;
-        }
+        append_missing(conn, account, message, (kind, value), generation, None)?;
     }
     Ok(())
+}
+
+fn retire_pending(
+    conn: &Connection,
+    account: &AccountId,
+    message: &str,
+    kind: OutboxKind,
+    keep_value: Option<bool>,
+) -> Result<()> {
+    let scope = params![account.as_str(), message, kind.as_str(), keep_value];
+    conn.prepare_cached(
+        "DELETE FROM server_outbox
+         WHERE account_id = ?1 AND message_id = ?2 AND kind = ?3
+           AND state = 'pending' AND sent = 0 AND (?4 IS NULL OR flag_value IS NOT ?4)",
+    )?
+    .execute(scope)?;
+    conn.prepare_cached(
+        "UPDATE server_outbox SET flag_superseded = 1, retry_unix = 0
+         WHERE account_id = ?1 AND message_id = ?2 AND kind = ?3
+           AND state = 'pending' AND (?4 IS NULL OR flag_value IS NOT ?4)",
+    )?
+    .execute(scope)?;
+    Ok(())
+}
+
+/// Retire writes from the original snapshot when the local flag needs no
+/// change. Only copies with a potentially sent opposite write need repair.
+pub(crate) fn cancel_for_undo(
+    conn: &Connection,
+    account: &AccountId,
+    snapshot: &str,
+    live: Option<&str>,
+    kind: OutboxKind,
+    restored_value: Option<bool>,
+) -> Result<bool> {
+    retire_pending(conn, account, snapshot, kind, None)?;
+    let Some(live) = live else { return Ok(false) };
+    let queued = if let Some(value) = restored_value
+        && enabled(conn, account)?
+    {
+        append_missing(
+            conn,
+            account,
+            live,
+            (kind, value),
+            generation(conn, account)?,
+            Some(snapshot),
+        )?
+    } else {
+        false
+    };
+    if snapshot != live {
+        repoint(conn, account, snapshot, live, Some(kind))?;
+    }
+    Ok(queued)
+}
+
+fn append_missing(
+    conn: &Connection,
+    account: &AccountId,
+    message: &str,
+    (kind, value): (OutboxKind, bool),
+    generation: i64,
+    recover_from: Option<&str>,
+) -> Result<bool> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT mailbox, uidvalidity, uid, folder, modseq,
+                CASE ?3 WHEN 'seen' THEN seen ELSE flagged END
+         FROM message_copies WHERE account_id = ?1 AND message_id = ?2 ORDER BY mailbox, uidvalidity, uid",
+    )?;
+    let rows = stmt.query_map(params![account.as_str(), message, kind.as_str()], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, u32>(1)?,
+            row.get::<_, u32>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Option<[u8; 8]>>(4)?,
+            row.get::<_, Option<bool>>(5)?,
+        ))
+    })?;
+    let mut insert = conn.prepare_cached(
+        "INSERT INTO server_outbox
+            (account_id, kind, state, message_id, source_folder, source_mailbox,
+             uidvalidity, uid, target_folder, created_unix, generation, flag_value, flag_modseq, flag_base)
+         SELECT ?1, ?2, 'pending', ?3, ?4, ?5, ?6, ?7, '', ?8, ?9, ?10, ?11, ?12
+         WHERE NOT EXISTS (
+             SELECT 1 FROM server_outbox
+             WHERE account_id = ?1 AND kind = ?2 AND message_id = ?3
+               AND source_mailbox = ?5 AND uidvalidity = ?6 AND uid = ?7
+               AND generation = ?9 AND state = 'pending' AND flag_superseded = 0
+               AND flag_value = ?10
+         ) AND (?13 IS NULL OR EXISTS (
+             SELECT 1 FROM server_outbox
+             WHERE account_id = ?1 AND kind = ?2 AND message_id = ?13
+               AND source_mailbox = ?5 AND uidvalidity = ?6 AND uid = ?7
+               AND generation = ?9 AND state = 'pending' AND sent = 1
+               AND flag_value IS NOT ?10
+         ))",
+    )?;
+    let mut queued = false;
+    let now = now_unix();
+    for row in rows {
+        let (escaped, uidvalidity, uid, folder, modseq, base) = row?;
+        let mailbox = unescape_mailbox(&escaped)
+            .ok_or_else(|| Error::Action("invalid mailbox in flag copy".into()))?;
+        queued |= insert.execute(params![
+            account.as_str(),
+            kind.as_str(),
+            message,
+            folder,
+            mailbox,
+            uidvalidity,
+            uid,
+            now,
+            generation,
+            value,
+            modseq,
+            base,
+            recover_from,
+        ])? != 0;
+    }
+    Ok(queued)
 }
 
 /// Sync keeps a queued read edit until replay has settled it, even when the
@@ -194,14 +317,20 @@ pub(crate) fn observe(
     if !current(&tx, account, entry)? {
         return Ok(Progress::Stale);
     }
-    let live: Option<bool> = tx
+    let live: Option<(String, bool)> = tx
         .query_row(
-            "SELECT NOT flag_superseded FROM server_outbox
+            "SELECT message_id, NOT flag_superseded FROM server_outbox
              WHERE account_id = ?1 AND id = ?2 AND state = 'pending'",
             params![account.as_str(), entry.id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
+    // A sync fold can retarget the row while STORE is on the wire.
+    let (message, active) = live
+        .as_ref()
+        .map_or((entry.message_id.as_str(), false), |(id, active)| {
+            (id.as_str(), *active)
+        });
     let (Some(mailbox), Some(validity), Some(uid), Some(value)) = (
         &entry.source_mailbox,
         entry.uidvalidity,
@@ -258,7 +387,6 @@ pub(crate) fn observe(
             (flags, None, confirmed, progress)
         }
     };
-    let active = live == Some(true);
     copies::observe_flags(
         &tx,
         account,
@@ -271,7 +399,15 @@ pub(crate) fn observe(
             before_store,
         },
     )?;
-    advance(&tx, account, entry, flags, before_store, confirms_previous)?;
+    advance(
+        &tx,
+        account,
+        entry,
+        message,
+        flags,
+        before_store,
+        confirms_previous,
+    )?;
 
     let result = match progress {
         Progress::Unconfirmed if live.is_some() => Progress::Unconfirmed,
@@ -290,14 +426,14 @@ pub(crate) fn observe(
         }
         Progress::Applied => {
             complete(&tx, entry.id)?;
-            acknowledge(&tx, account, entry, &remote_id, value)?;
+            acknowledge(&tx, account, message, entry.kind, &remote_id, value)?;
             Progress::Applied
         }
         Progress::Conflict { .. } => {
             let server = flag_value(flags, entry.kind)
                 .ok_or_else(|| Error::Action("flag conflict needs a server value".into()))?;
             Progress::Conflict {
-                changed: settle_conflict(&tx, account, entry, server)?,
+                changed: settle_conflict(&tx, account, message, entry.kind, server)?,
             }
         }
         other => other,
@@ -331,12 +467,13 @@ fn complete(conn: &Connection, id: i64) -> Result<()> {
 fn acknowledge(
     conn: &Connection,
     account: &AccountId,
-    entry: &OutboxEntry,
+    message: &str,
+    kind: OutboxKind,
     remote_id: &str,
     value: bool,
 ) -> Result<()> {
-    if entry.kind == OutboxKind::Seen {
-        return intents::acknowledge_unread(conn, account, &entry.message_id, remote_id, !value);
+    if kind == OutboxKind::Seen {
+        return intents::acknowledge_unread(conn, account, message, remote_id, !value);
     }
     let pending: bool = conn.query_row(
         "SELECT EXISTS(
@@ -344,11 +481,11 @@ fn acknowledge(
              WHERE account_id = ?1 AND message_id = ?2
                AND kind = 'flagged' AND state = 'pending' AND flag_superseded = 0
          )",
-        params![account.as_str(), entry.message_id],
+        params![account.as_str(), message],
         |row| row.get(0),
     )?;
     if !pending {
-        intents::clear_flag(conn, account, &entry.message_id, entry.kind)?;
+        intents::clear_flag(conn, account, message, kind)?;
     }
     Ok(())
 }
@@ -356,11 +493,10 @@ fn acknowledge(
 fn settle_conflict(
     conn: &Connection,
     account: &AccountId,
-    entry: &OutboxEntry,
+    message: &str,
+    kind: OutboxKind,
     server: bool,
 ) -> Result<bool> {
-    let message = &entry.message_id;
-    let kind = entry.kind;
     conn.execute(
         "UPDATE server_outbox
          SET state = 'dropped', error = 'server flag won a conflict', settled_unix = ?4
@@ -396,6 +532,7 @@ fn advance(
     conn: &Connection,
     account: &AccountId,
     entry: &OutboxEntry,
+    message: &str,
     flags: CopyFlags,
     before_store: Option<u64>,
     confirms_previous: bool,
@@ -420,7 +557,7 @@ fn advance(
     for kind in [OutboxKind::Seen, OutboxKind::Flagged] {
         update.execute(params![
             account.as_str(),
-            entry.message_id,
+            message,
             entry.source_mailbox,
             entry.uidvalidity,
             entry.uid,

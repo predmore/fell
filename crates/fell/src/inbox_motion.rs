@@ -114,7 +114,8 @@ pub struct Layer {
     folder_index: usize,
     folder_intent: FolderIntent,
     agents: Option<crate::model::agents::Agents>,
-    palette_from_agents: bool,
+    activity: Option<crate::model::activity::Activity>,
+    palette_origin: Overlay,
     pub label_target: Option<String>,
     pub picker_choices: Vec<PickerChoice>,
     pub label_marks: f32,
@@ -135,8 +136,13 @@ impl Layer {
             folder_query: session.folder_query.clone(),
             folder_index: session.folder_index,
             folder_intent: session.folder_intent,
-            agents: (session.overlay == Overlay::Agents).then(|| session.agents.clone()),
-            palette_from_agents: session.palette_from_agents,
+            agents: (session.overlay == Overlay::Agents
+                || session.palette_origin == Overlay::Agents)
+                .then(|| session.agents.clone()),
+            activity: (session.overlay == Overlay::AgentActivity
+                || session.palette_origin == Overlay::AgentActivity)
+                .then(|| session.activity.clone()),
+            palette_origin: session.palette_origin.clone(),
             label_target: session.label_target(),
             picker_choices,
             label_marks,
@@ -156,10 +162,10 @@ impl Layer {
         if let Some(agents) = &mut self.agents {
             std::mem::swap(agents, &mut session.agents);
         }
-        std::mem::swap(
-            &mut self.palette_from_agents,
-            &mut session.palette_from_agents,
-        );
+        if let Some(activity) = &mut self.activity {
+            std::mem::swap(activity, &mut session.activity);
+        }
+        std::mem::swap(&mut self.palette_origin, &mut session.palette_origin);
     }
 }
 
@@ -440,16 +446,25 @@ impl InboxMotion {
 
         let overlay = session.visible_overlay();
         if overlay != self.last_overlay {
-            if overlay == Overlay::None {
+            let replacing_agent_card = matches!(
+                (&self.last_overlay, &overlay),
+                (Overlay::Agents, Overlay::AgentActivity)
+                    | (Overlay::AgentActivity, Overlay::Agents)
+            );
+            if overlay == Overlay::None || replacing_agent_card {
                 // Gone for input at once; only its pixels fade.
-                self.overlay = None;
-                self.card_to = self.card_height(now);
-                self.card_glide = None;
                 self.overlay_out = self
                     .last_layer
                     .clone()
                     .filter(|layer| layer.overlay != Overlay::None)
                     .and_then(|layer| start(motion::FADE).map(|fade| (layer, fade)));
+                if replacing_agent_card {
+                    self.overlay = start(motion::FADE);
+                } else {
+                    self.overlay = None;
+                    self.card_to = self.card_height(now);
+                    self.card_glide = None;
+                }
             } else {
                 self.overlay = start(motion::FADE);
                 self.overlay_out = None;
@@ -1051,7 +1066,12 @@ impl InboxMotion {
     /// Opacity and drop (pixels still to travel down) of an overlay.
     pub fn overlay(&self, now: Instant) -> (f32, f32) {
         let p = motion::progress(self.overlay.as_ref(), now);
-        (p, motion::RISE_PX * (1.0 - p))
+        let drop = if self.overlay_out.is_some() {
+            0.0
+        } else {
+            motion::RISE_PX * (1.0 - p)
+        };
+        (p, drop)
     }
 
     /// An overlay that just closed, as it was, and its opacity.
@@ -2011,6 +2031,35 @@ mod tests {
         session.overlay = Overlay::Palette;
         motion.observe(&session, (true, true), later(now, 20));
         assert!(motion.closing_overlay(later(now, 20)).is_none());
+    }
+
+    #[test]
+    fn agent_cards_crossfade_at_the_same_gliding_height() {
+        let mut motion = InboxMotion::new(Motion::new(true));
+        let mut session = session();
+        let now = Instant::now();
+        session.overlay = Overlay::Agents;
+        motion.observe(&session, (true, true), now);
+        motion.fit_card(Some(300.), now);
+        motion.settle(later(now, 200));
+
+        let switched = later(now, 220);
+        session.overlay = Overlay::AgentActivity;
+        motion.observe(&session, (true, true), switched);
+        motion.fit_card(Some(510.), switched);
+        let (leaving, opacity) = motion.closing_overlay(switched).unwrap();
+        assert_eq!(leaving.overlay, Overlay::Agents);
+        assert_eq!(opacity, 1.);
+        assert_eq!(motion.overlay(switched), (0., 0.));
+        assert_eq!(motion.card_height(switched), Some(300.));
+
+        let midpoint = later(switched, 60);
+        assert!(motion.closing_overlay(midpoint).unwrap().1 > 0.);
+        assert!(motion.overlay(midpoint).0 > 0.);
+        assert!((300. ..510.).contains(&motion.card_height(midpoint).unwrap()));
+        motion.tick(later(switched, 120));
+        assert!(motion.closing_overlay(later(switched, 120)).is_none());
+        assert_eq!(motion.card_height(later(switched, 120)), Some(510.));
     }
 
     #[test]

@@ -156,13 +156,20 @@ CREATE TABLE IF NOT EXISTS agent_actions (
     actor TEXT NOT NULL,
     kind TEXT NOT NULL,
     summary TEXT NOT NULL,
+    -- 0 is open, 1 is undone, 2 is a snooze retired without restoring it.
     undone INTEGER NOT NULL DEFAULT 0,
-    created_unix INTEGER NOT NULL
+    created_unix INTEGER NOT NULL,
+    target_subject TEXT,
+    conversation_count INTEGER,
+    local_action_floor INTEGER,
+    outbox_floor INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_agent_actions_account ON agent_actions(account_id, id);
 CREATE INDEX IF NOT EXISTS idx_agent_actions_actor_time
 ON agent_actions(account_id, actor, created_unix);
+CREATE INDEX IF NOT EXISTS idx_agent_actions_actor_open
+ON agent_actions(account_id, actor, id) WHERE undone = 0;
 
 CREATE TABLE IF NOT EXISTS agent_action_messages (
     action_id INTEGER NOT NULL,
@@ -175,14 +182,21 @@ CREATE TABLE IF NOT EXISTS agent_action_messages (
     -- NULL on rows logged before star was undoable: undo leaves the star.
     starred INTEGER,
     label_was_keyword INTEGER,
+    after_folders TEXT,
+    after_archived INTEGER,
     FOREIGN KEY(action_id) REFERENCES agent_actions(id)
 );
+
+CREATE INDEX IF NOT EXISTS idx_agent_action_messages_action ON agent_action_messages(action_id);
+CREATE INDEX IF NOT EXISTS idx_agent_action_messages_message ON agent_action_messages(message_id, action_id);
 
 CREATE TABLE IF NOT EXISTS agent_action_drafts (
     action_id INTEGER NOT NULL,
     draft_id INTEGER NOT NULL,
     FOREIGN KEY(action_id) REFERENCES agent_actions(id)
 );
+
+CREATE INDEX IF NOT EXISTS idx_agent_action_drafts_action ON agent_action_drafts(action_id);
 
 CREATE TABLE IF NOT EXISTS review_drafts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2788,16 +2802,25 @@ fn insert_message(
     message: &Message,
     roles: &mut MergeRoles<'_>,
 ) -> Result<bool> {
-    let inserted = insert_arrival(conn, message, roles)?;
+    let arrival = insert_arrival(conn, message, roles)?;
     copies::record(conn, message)?;
-    Ok(inserted)
+    if let ArrivalWrite::Folded(keeper) = &arrival {
+        intents::finish_fold(conn, &message.account_id, keeper)?;
+    }
+    Ok(matches!(arrival, ArrivalWrite::Inserted))
+}
+
+enum ArrivalWrite {
+    Inserted,
+    Updated,
+    Folded(String),
 }
 
 fn insert_arrival(
     conn: &Connection,
     message: &Message,
     roles: &mut MergeRoles<'_>,
-) -> Result<bool> {
+) -> Result<ArrivalWrite> {
     let fingerprint = message_fingerprint(message);
     if let Some((stored, via_alias)) =
         find_stored(conn, &message.account_id, &message.headers.message_id)?
@@ -2814,18 +2837,18 @@ fn insert_arrival(
             )?
         {
             absorb_duplicate(conn, message, &stored, &other)?;
-        } else {
-            write_kept(conn, message, &stored, via_alias, &[], None)?;
+            return Ok(ArrivalWrite::Folded(other.canonical_id));
         }
-        return Ok(false);
+        write_kept(conn, message, &stored, via_alias, &[], None)?;
+        return Ok(ArrivalWrite::Updated);
     }
     if let Some(stored) = find_list_collapse(conn, message, &fingerprint, None, false, roles)? {
         remember_alias(conn, message, &stored.canonical_id)?;
         write_kept(conn, message, &stored, true, &[], None)?;
-        return Ok(false);
+        return Ok(ArrivalWrite::Folded(stored.canonical_id));
     }
     insert_new(conn, message, &fingerprint)?;
-    Ok(true)
+    Ok(ArrivalWrite::Inserted)
 }
 
 fn insert_new(conn: &Connection, message: &Message, fingerprint: &str) -> Result<ThreadId> {
@@ -3467,6 +3490,18 @@ fn absorb_duplicate(
 ) -> Result<ThreadId> {
     let extra_folders = split_field(&doomed.folders);
     let labels = keywords::merge(conn, &message.account_id, doomed, keeper, &message.labels)?;
+    copies::repoint(
+        conn,
+        &message.account_id,
+        &doomed.canonical_id,
+        &keeper.canonical_id,
+    )?;
+    intents::merge(
+        conn,
+        &message.account_id,
+        &doomed.canonical_id,
+        &keeper.canonical_id,
+    )?;
     let keeper = fold_doomed_local_state(keeper, doomed);
     let thread = write_kept(conn, message, &keeper, true, &extra_folders, Some(labels))?;
     // The stored parts of the doomed row fill what the keeper lacks; the
@@ -3519,12 +3554,6 @@ fn absorb_duplicate(
             message.account_id.as_str(),
             doomed.canonical_id,
         ],
-    )?;
-    copies::repoint(
-        conn,
-        &message.account_id,
-        &doomed.canonical_id,
-        &keeper.canonical_id,
     )?;
     Ok(thread)
 }
@@ -3582,6 +3611,7 @@ fn merge_backfilled_duplicates(conn: &Connection) -> Result<()> {
                 continue;
             };
             absorb_duplicate(&tx, message, &stored, &other)?;
+            intents::finish_fold(&tx, &message.account_id, &other.canonical_id)?;
         }
         tx.commit()?;
     }
@@ -4348,16 +4378,38 @@ fn ensure_compose_columns(conn: &Connection) -> Result<()> {
 }
 
 fn ensure_agent_action_columns(conn: &Connection) -> Result<()> {
-    let have = column_names(conn, "agent_action_messages")?;
-    if have.iter().any(|column| column == "starred") {
-        return Ok(());
+    let actions = column_names(conn, "agent_actions")?;
+    for (name, kind) in [
+        ("target_subject", "TEXT"),
+        ("conversation_count", "INTEGER"),
+        ("local_action_floor", "INTEGER"),
+        ("outbox_floor", "INTEGER"),
+    ] {
+        if !actions.iter().any(|column| column == name)
+            && let Err(err) = conn.execute(
+                &format!("ALTER TABLE agent_actions ADD COLUMN {name} {kind}"),
+                [],
+            )
+            && !duplicate_column(&err)
+        {
+            return Err(err.into());
+        }
     }
-    if let Err(err) = conn.execute(
-        "ALTER TABLE agent_action_messages ADD COLUMN starred INTEGER",
-        [],
-    ) && !duplicate_column(&err)
-    {
-        return Err(err.into());
+    let have = column_names(conn, "agent_action_messages")?;
+    for (name, kind) in [
+        ("starred", "INTEGER"),
+        ("after_folders", "TEXT"),
+        ("after_archived", "INTEGER"),
+    ] {
+        if !have.iter().any(|column| column == name)
+            && let Err(err) = conn.execute(
+                &format!("ALTER TABLE agent_action_messages ADD COLUMN {name} {kind}"),
+                [],
+            )
+            && !duplicate_column(&err)
+        {
+            return Err(err.into());
+        }
     }
     Ok(())
 }

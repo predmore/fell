@@ -102,6 +102,12 @@ pub enum Error {
     DraftAttachmentLimit,
     #[error("This draft exceeds the 32 MiB message limit. The copy is still on the server.")]
     DraftMessageLimit,
+    #[error("Undo the newer action first")]
+    AgentActivityBlocked(agent::ActivityBlocker),
+    #[error("Action already undone")]
+    AgentActivityAlreadyUndone { snooze_retired: bool },
+    #[error("Confirm undo for this bulk action")]
+    AgentActivityNeedsConfirmation { conversations: u32 },
     #[error("{0} is not implemented yet")]
     NotImplemented(&'static str),
     #[error("send requires explicit UI confirmation")]
