@@ -1444,14 +1444,7 @@ fn restore_row(
             &split_tokens(&snapshot.after_folders),
             true,
         ));
-        let old_terms = terms_of(&current);
-        let new_terms = terms_with(&current, &folders, &current.labels);
-        let changed = conn.execute(
-            "UPDATE messages SET folders = ?1 WHERE account_id = ?2 AND message_id = ?3",
-            params![folders, account_id.as_str(), saved.message_id],
-        )?;
-        expect_one(changed, &saved.message_id)?;
-        sync_terms(conn, account_id.as_str(), &old_terms, &new_terms)?;
+        write_folders(conn, account_id, &current, &folders)?;
         return Ok(Some(ThreadId(current.thread_id)));
     }
     if let Some(canonical_id) = live_alias_target(conn, account_id, &saved.message_id)? {
@@ -1939,6 +1932,34 @@ fn canonical_token(raw: &str, empty: &str, reserved: &str) -> Result<String> {
     Ok(token.to_string())
 }
 
+pub(crate) fn write_message_folders(
+    conn: &Connection,
+    account: &AccountId,
+    message_id: &str,
+    folders: &str,
+) -> Result<()> {
+    let current = load_one(conn, account, message_id)?
+        .ok_or_else(|| Error::Action("Message changed while undoing".into()))?;
+    write_folders(conn, account, &current, folders)
+}
+
+fn write_folders(
+    conn: &Connection,
+    account: &AccountId,
+    current: &SavedRow,
+    folders: &str,
+) -> Result<()> {
+    let old_terms = terms_of(current);
+    let new_terms = terms_with(current, folders, &current.labels);
+    let changed = conn
+        .prepare_cached(
+            "UPDATE messages SET folders = ?1 WHERE account_id = ?2 AND message_id = ?3",
+        )?
+        .execute(params![folders, account.as_str(), current.message_id])?;
+    expect_one(changed, &current.message_id)?;
+    sync_terms(conn, account.as_str(), &old_terms, &new_terms)
+}
+
 fn terms_of(row: &SavedRow) -> HashSet<String> {
     terms_with(row, &row.folders, &row.labels)
 }
@@ -2189,7 +2210,7 @@ fn insert_snapshot(
 ///
 /// Tokens that showed up on the row after the action stay, in the order they
 /// have now. When nothing else changed, the result follows the earlier list.
-fn invert_tokens(
+pub(crate) fn invert_tokens(
     current: &[String],
     before: &[String],
     after: &[String],

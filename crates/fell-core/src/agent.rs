@@ -857,14 +857,14 @@ fn mutate_thread_in(
             keywords::set_message_labels(conn, account_id, &new.message_id, &new.labels)?;
             continue;
         }
+        if old.folders != new.folders {
+            crate::actions::write_message_folders(conn, account_id, &new.message_id, &new.folders)?;
+        }
         conn.execute(
             "UPDATE messages
-                 SET labels = ?1, folders = ?2, unread = ?3, archived = ?4, snooze_until = ?5,
-                     starred = ?6
-                 WHERE account_id = ?7 AND message_id = ?8",
+                 SET unread = ?1, archived = ?2, snooze_until = ?3, starred = ?4
+                 WHERE account_id = ?5 AND message_id = ?6",
             params![
-                new.labels,
-                new.folders,
                 new.unread,
                 new.archived,
                 new.snooze_until,
@@ -1419,10 +1419,11 @@ fn undo_messages(conn: &Connection, account_id: &AccountId, action: &RecordedAct
     };
     conn.execute(
         &format!(
-            "UPDATE messages AS m SET {restore}
-             FROM agent_action_messages AS s
-             WHERE s.action_id = ?1 AND m.account_id = ?2 AND m.message_id = s.message_id
-               AND ({touched})"
+            "{resolved}
+             UPDATE messages AS m SET {restore}
+             FROM resolved AS s
+             WHERE m.account_id = ?2 AND m.message_id = s.live_id AND ({touched})",
+            resolved = undo_conflicts::RESOLVED_SNAPSHOTS,
         ),
         params![action.id, account_id.as_str()],
     )?;
@@ -1448,11 +1449,14 @@ fn snooze_unchanged(
     } else {
         return Ok(false);
     };
-    // A missing row needs no restore.
     Ok(!conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM agent_action_messages s
-         JOIN messages m ON m.account_id = ?2 AND m.message_id = s.message_id
-         WHERE s.action_id = ?1 AND m.snooze_until IS NOT ?3)",
+        &format!(
+            "{resolved}
+             SELECT EXISTS (SELECT 1 FROM resolved s
+             JOIN messages m ON m.account_id = ?2 AND m.message_id = s.live_id
+             WHERE m.snooze_until IS NOT ?3)",
+            resolved = undo_conflicts::RESOLVED_SNAPSHOTS,
+        ),
         params![action.id, account_id.as_str(), until],
         |row| row.get::<_, bool>(0),
     )?)
@@ -1478,15 +1482,15 @@ fn flag_changes(
     action_id: i64,
     flag: FlagUndo,
 ) -> Result<Vec<FlagRestore>> {
-    let mut stmt = conn.prepare(
-        "SELECT s.message_id,
+    let mut stmt = conn.prepare_cached(&format!(
+        "{resolved}
+         SELECT s.live_id,
                 CASE WHEN ?3 AND m.unread != s.unread THEN s.unread END,
-                CASE WHEN NOT ?3 AND m.starred != s.starred
-                     THEN s.starred END
-         FROM agent_action_messages s
-         JOIN messages m ON m.account_id = ?2 AND m.message_id = s.message_id
-         WHERE s.action_id = ?1",
-    )?;
+                CASE WHEN NOT ?3 AND m.starred != s.starred THEN s.starred END
+         FROM resolved s
+         JOIN messages m ON m.account_id = ?2 AND m.message_id = s.live_id",
+        resolved = undo_conflicts::RESOLVED_SNAPSHOTS,
+    ))?;
     let rows = stmt.query_map(
         params![
             action_id,
@@ -1954,6 +1958,206 @@ mod tests {
                 snooze_retired: true
             })
         ));
+    }
+
+    #[test]
+    fn activity_undo_follows_a_message_that_sync_folds_into_its_echo() {
+        for kind in ["archive", "star", "snooze"] {
+            let store = Store::open_in_memory().unwrap();
+            let account = account("a1");
+            store.upsert_account(&account).unwrap();
+            store
+                .set_agent_grant(&account.id, "fern", AgentGrant::enabled(false, true, false))
+                .unwrap();
+            let sent = message(
+                "a1",
+                "sent@x",
+                None,
+                "Hello",
+                "hello body",
+                true,
+                &["INBOX"],
+                &[],
+                1_700_000_000,
+            );
+            let echo = message(
+                "a1",
+                "list@x",
+                None,
+                "[list] Hello",
+                "hello body",
+                true,
+                &["INBOX"],
+                &[],
+                1_700_000_000,
+            );
+            let thread = store.upsert_message(&sent).unwrap();
+            store.upsert_message(&echo).unwrap();
+            let action = match kind {
+                "archive" => store.agent_archive_thread(&account.id, &thread, "agent:fern"),
+                "star" => store.star_thread(&account.id, &thread, true, "agent:fern"),
+                _ => store.snooze_thread(&account.id, &thread, 1_893_456_000, "agent:fern"),
+            }
+            .unwrap()
+            .unwrap();
+            // The next sync learns the list identity and folds the snapshotted
+            // row into the keeper through the ordinary arrival path.
+            store
+                .conn
+                .execute(
+                    "UPDATE messages SET list_id = 'list.example' WHERE message_id = 'list@x'",
+                    [],
+                )
+                .unwrap();
+            let arrived = Message {
+                folders: vec!["Sent".into()],
+                ..sent
+            };
+            store.upsert_message(&arrived).unwrap();
+            let aliases: String = store.conn.query_row(
+                "SELECT canonical_message_id FROM message_aliases WHERE account_id = ?1 AND message_id = 'sent@x'",
+                [account.id.as_str()], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(aliases, "list@x");
+            let keeper = || {
+                store
+                    .message(&account.id, &MessageId::new("list@x"))
+                    .unwrap()
+                    .unwrap()
+            };
+            let before = keeper();
+            match kind {
+                "archive" => assert!(
+                    before.archived && !before.folders.iter().any(|folder| folder == "INBOX")
+                ),
+                "star" => assert!(before.starred),
+                _ => assert_eq!(before.snooze_until, Some(1_893_456_000)),
+            }
+            if kind == "archive" {
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO message_aliases (account_id, message_id, canonical_message_id)
+                     VALUES (?1, 'other-copy@x', 'list@x')",
+                        [account.id.as_str()],
+                    )
+                    .unwrap();
+                store.conn.execute(
+                    "INSERT INTO server_outbox
+                     (account_id, kind, state, message_id, source_folder, target_folder, created_unix)
+                     VALUES (?1, 'move', 'pending', 'other-copy@x', 'Sent', 'Later', ?2)",
+                    params![account.id.as_str(), action.created_unix],
+                ).unwrap();
+                assert!(
+                    matches!(store.undo_agent_activity(&account.id, action.id, None),
+                    Err(Error::AgentActivityBlocked(blocker)) if blocker.actor == "outbox")
+                );
+                store
+                    .conn
+                    .execute("UPDATE server_outbox SET state = 'done'", [])
+                    .unwrap();
+            }
+            assert!(
+                store
+                    .undo_agent_activity(&account.id, action.id, None)
+                    .unwrap()
+                    .undone
+            );
+            let after = keeper();
+            match kind {
+                "archive" => {
+                    assert!(!after.archived && after.folders.iter().any(|folder| folder == "INBOX"))
+                }
+                "star" => assert!(!after.starred),
+                _ => assert_eq!(after.snooze_until, None),
+            }
+            assert!(after.folders.iter().any(|folder| folder == "Sent"));
+        }
+    }
+
+    #[test]
+    fn activity_undo_remains_open_when_every_snapshot_has_lost_its_message() {
+        let (store, account, thread) = seeded();
+        store
+            .set_agent_grant(&account, "fern", AgentGrant::enabled(false, true, false))
+            .unwrap();
+        let action = store
+            .star_thread(&account, &thread, true, "agent:fern")
+            .unwrap()
+            .unwrap();
+        store
+            .conn
+            .execute("DELETE FROM message_aliases", [])
+            .unwrap();
+        store.conn.execute("DELETE FROM messages", []).unwrap();
+        assert!(
+            matches!(store.undo_agent_activity(&account, action.id, None),
+            Err(Error::AgentActivityBlocked(blocker)) if blocker.kind == BLOCKER_MAILBOX_CHANGED)
+        );
+        assert!(!store.list_actions(&account).unwrap().last().unwrap().undone);
+    }
+
+    #[test]
+    fn activity_move_undo_keeps_a_later_folder_and_updates_search_terms() {
+        let store = Store::open_in_memory().unwrap();
+        let account = account("a1");
+        store.upsert_account(&account).unwrap();
+        store
+            .set_agent_grant(&account.id, "fern", AgentGrant::enabled(false, true, false))
+            .unwrap();
+        let mail = message(
+            "a1",
+            "root@x",
+            None,
+            "Hello",
+            "hello body",
+            true,
+            &["Quasarbox"],
+            &[],
+            10,
+        );
+        let thread = store.upsert_message(&mail).unwrap();
+        let count = |term| {
+            store
+                .conn
+                .query_row(
+                    "SELECT df FROM search_terms WHERE account_id = ?1 AND term = ?2",
+                    params![account.id.as_str(), term],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap()
+                .unwrap_or_default()
+        };
+        assert_eq!(count("quasarbox"), 1);
+        let action = store
+            .agent_move_thread(
+                &account.id,
+                &thread,
+                "Quasarbox",
+                "Transitbox",
+                "agent:fern",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!((count("quasarbox"), count("transitbox")), (0, 1));
+        let extra = Message {
+            folders: vec!["Sent".into()],
+            ..mail
+        };
+        store.upsert_message(&extra).unwrap();
+        store
+            .undo_agent_activity(&account.id, action.id, None)
+            .unwrap();
+        let restored = store
+            .message(&account.id, &MessageId::new("root@x"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.folders, ["Quasarbox", "Sent"]);
+        assert_eq!(
+            (count("quasarbox"), count("transitbox"), count("sent")),
+            (1, 0, 1)
+        );
     }
 
     #[test]

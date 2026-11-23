@@ -170,13 +170,13 @@ impl Activity {
         if entry.action.undone || entry.draft_discarded {
             return None;
         }
-        if let Some(blocker) = entry.blocker.clone() {
+        if let Some(blocker) = entry.blocker.clone()
+            && blocker.actor.starts_with("agent:")
+        {
             let id = entry.action.id;
-            if blocker.actor.starts_with("agent:")
-                && self.page.entries.iter().any(|entry| {
-                    entry.action.id == blocker.id && (entry.action.undone || entry.draft_discarded)
-                })
-            {
+            if self.page.entries.iter().any(|entry| {
+                entry.action.id == blocker.id && (entry.action.undone || entry.draft_discarded)
+            }) {
                 self.clear_blocker(blocker.id);
             } else {
                 return self.follow_blocker(id, blocker);
@@ -188,11 +188,30 @@ impl Activity {
             id: entry.action.id,
             conversations: entry.conversations,
         };
-        if entry.conversations > BULK_UNDO_THRESHOLD {
+        // Recheck local, outbox, and mailbox conflicts at the store. A bulk
+        // reversal still requires confirmation once the conflict clears.
+        if entry.conversations > BULK_UNDO_THRESHOLD && entry.blocker.is_none() {
             self.confirmation = Some(target);
             return None;
         }
         Some(self.undo_request(target, None))
+    }
+
+    pub fn request_confirmation(&mut self, id: i64, conversations: u32) {
+        let Some(entry) = Arc::make_mut(&mut self.page)
+            .entries
+            .get_mut(self.selected)
+            .filter(|entry| entry.action.id == id)
+        else {
+            return;
+        };
+        entry.blocker = None;
+        entry.conversations = conversations;
+        self.confirmation = Some(Confirmation {
+            account: entry.action.account_id.clone(),
+            id,
+            conversations,
+        });
     }
 
     pub fn confirm(&mut self, yes: bool) -> Option<Request> {
@@ -574,5 +593,31 @@ mod tests {
         assert!(!show);
         assert!(matches!(retry, Some(Request::Undo { id, .. }) if id == read.id));
         assert!(session.activity.selected_entry().unwrap().blocker.is_none());
+    }
+
+    #[test]
+    fn activity_rechecks_a_cached_local_blocker_before_showing_bulk_confirmation() {
+        let (store, account, mut session) = session();
+        let thread = store.list_threads(&account).unwrap().remove(0).thread_id;
+        store
+            .set_agent_grant(&account, "fern", AgentGrant::enabled(false, true, false))
+            .unwrap();
+        let action = store
+            .agent_move_thread(&account, &thread, "INBOX", "Work", "agent:fern")
+            .unwrap()
+            .unwrap();
+        store
+            .move_thread(&account, &thread, "Work", "Later")
+            .unwrap();
+        let mut page = store
+            .agent_activity(&account, None, ActivityDirection::Latest, 10)
+            .unwrap();
+        assert_eq!(page.entries[0].blocker.as_ref().unwrap().actor, "local");
+        page.entries[0].conversations = BULK_UNDO_THRESHOLD + 1;
+        session.activity.loaded(page, ActivityDirection::Latest);
+        assert!(
+            matches!(session.activity.undo(), Some(Request::Undo { id, confirmed_bulk: None, .. }) if id == action.id)
+        );
+        assert!(session.activity.confirmation.is_none());
     }
 }

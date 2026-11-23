@@ -7,7 +7,7 @@ use fell_core::agent::{
 };
 use gpui::{
     Context, Div, FontWeight, InteractiveElement, MouseButton, ParentElement, ScrollHandle,
-    StatefulInteractiveElement, Styled, div, point, prelude::FluentBuilder, px, rgb,
+    StatefulInteractiveElement, Styled, Window, div, point, prelude::FluentBuilder, px, rgb,
 };
 
 use super::{Inbox, ReadIntent, now_unix};
@@ -23,7 +23,7 @@ use crate::theme::{Theme, ensure_all};
 
 const ROW_HEIGHT: f32 = 54.;
 const TITLE_HEIGHT: f32 = 48.;
-const FOOTER_HEIGHT: f32 = 64.;
+const FOOTER_HEIGHT: f32 = 48.;
 const LOADING_DELAY: Duration = Duration::from_millis(150);
 
 pub(super) fn card_height(available_height: f32) -> f32 {
@@ -61,7 +61,7 @@ struct FooterText {
 struct Footer {
     text: FooterText,
     buttons: [Option<FooterButton>; 3],
-    pending: bool,
+    enabled: [bool; 3],
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -93,6 +93,8 @@ struct SlotMotion {
     button: Option<FooterButton>,
     leaving: Option<Leaving<FooterButton>>,
     incoming: Option<(f32, Transition)>,
+    enabled: bool,
+    enable_fade: Option<(f32, Transition)>,
 }
 
 impl SlotMotion {
@@ -112,7 +114,25 @@ impl SlotMotion {
         })
     }
 
-    fn update(&mut self, next: Option<FooterButton>, motion: &Motion, now: Instant) -> bool {
+    fn enabled_at(&self, now: Instant) -> f32 {
+        let target = if self.enabled { 1. } else { 0. };
+        self.enable_fade.map_or(target, |(before, fade)| {
+            motion::lerp(before, target, fade.progress(now))
+        })
+    }
+
+    fn update(
+        &mut self,
+        next: Option<FooterButton>,
+        enabled: bool,
+        motion: &Motion,
+        now: Instant,
+    ) -> bool {
+        if self.enabled != enabled {
+            let before = self.enabled_at(now);
+            self.enabled = enabled;
+            self.enable_fade = motion.start(motion::FADE, now).map(|fade| (before, fade));
+        }
         if self.button != next {
             let drawn = self.frame(now);
             self.button = next;
@@ -146,7 +166,9 @@ impl SlotMotion {
             }
         }
         self.leaving = self.leaving.take().filter(|old| old.fade.running(now));
-        self.leaving.is_some() || self.incoming.is_some_and(|(_, fade)| fade.running(now))
+        self.leaving.is_some()
+            || self.incoming.is_some_and(|(_, fade)| fade.running(now))
+            || self.enable_fade.is_some_and(|(_, fade)| fade.running(now))
     }
 }
 
@@ -164,6 +186,20 @@ pub(super) struct ActivityMotion {
 }
 
 impl ActivityMotion {
+    fn for_open(activity: &Activity, now: i64) -> Self {
+        let footer = Footer::of(activity, now);
+        Self {
+            selection: activity.selected_entry().map(|entry| entry.action.id),
+            text: footer.text,
+            slots: std::array::from_fn(|index| SlotMotion {
+                button: footer.buttons[index],
+                enabled: footer.enabled[index],
+                ..SlotMotion::default()
+            }),
+            ..Self::default()
+        }
+    }
+
     pub(super) fn settle(&mut self) {
         self.selection_fade = None;
     }
@@ -207,6 +243,7 @@ impl ActivityMotion {
         let footer = Footer::of(activity, now_unix());
         if self.text != footer.text {
             let before = std::mem::replace(&mut self.text, footer.text);
+            let entering_confirm = self.text.consequence.is_some() && before.consequence.is_none();
             let alpha = motion::progress(self.text_in.as_ref(), now);
             let (before, alpha) = match self.old_text.take() {
                 Some(old) if old.opacity(now) > alpha => {
@@ -223,7 +260,7 @@ impl ActivityMotion {
                     alpha,
                     fade,
                 });
-            let delay = if self.old_text.is_some() {
+            let delay = if self.old_text.is_some() || entering_confirm {
                 CONTENT_DELAY
             } else {
                 Duration::ZERO
@@ -233,8 +270,9 @@ impl ActivityMotion {
         self.old_text = self.old_text.take().filter(|text| text.fade.running(now));
         self.page = self.page.take().filter(|page| page.fade.running(now));
         let mut slots_animating = false;
-        for (slot, button) in self.slots.iter_mut().zip(footer.buttons) {
-            slots_animating |= slot.update(button, motion, now);
+        for (index, slot) in self.slots.iter_mut().enumerate() {
+            slots_animating |=
+                slot.update(footer.buttons[index], footer.enabled[index], motion, now);
         }
         slots_animating
             || self.page.is_some()
@@ -267,6 +305,12 @@ impl Inbox {
                 ..
             } => {
                 let account_wide = filter.is_none();
+                let opening = direction == fell_core::agent::ActivityDirection::Latest;
+                if opening {
+                    self.activity_motion =
+                        ActivityMotion::for_open(&self.session.activity, now_unix());
+                    self.activity_scroll.set_offset(point(px(0.), px(0.)));
+                }
                 let account = self.account_id.clone();
                 let delay = cx.background_executor().timer(LOADING_DELAY);
                 cx.spawn(async move |this, cx| {
@@ -307,7 +351,10 @@ impl Inbox {
                                     }
                                 }
                                 activity.loaded(page, direction);
-                                if before.page_revision != activity.page_revision {
+                                if opening {
+                                    inbox.activity_motion =
+                                        ActivityMotion::for_open(activity, now_unix());
+                                } else if before.page_revision != activity.page_revision {
                                     let now = inbox.motion.clock.now();
                                     inbox.activity_motion.change_page(
                                         before,
@@ -342,6 +389,18 @@ impl Inbox {
                         }
                         let (notice, error, changed) = match result {
                             Ok(action) => {
+                                let row_visible = inbox.session.overlay == Overlay::AgentActivity
+                                    && activity
+                                        .page
+                                        .entries
+                                        .iter()
+                                        .position(|entry| entry.action.id == id)
+                                        .and_then(|index| {
+                                            inbox.activity_scroll.bounds_for_item(index)
+                                        })
+                                        .is_some_and(|bounds| {
+                                            bounds.intersects(&inbox.activity_scroll.bounds())
+                                        });
                                 let retired = action.summary == SNOOZE_CHANGED_NOTICE;
                                 activity.mark_undone(action.id, retired);
                                 let now = inbox.motion.clock.now();
@@ -355,7 +414,8 @@ impl Inbox {
                                     inbox.send_to_server();
                                 }
                                 (
-                                    (!retired).then(|| "Agent action undone".into()),
+                                    (!retired && (confirmed_bulk.is_some() || !row_visible))
+                                        .then(|| "Agent action undone".into()),
                                     false,
                                     viewing_account,
                                 )
@@ -368,6 +428,12 @@ impl Inbox {
                                 {
                                     inbox.request_agent_activity(request, cx);
                                 }
+                                return None;
+                            }
+                            Err(fell_core::Error::AgentActivityNeedsConfirmation {
+                                conversations,
+                            }) if current && inbox.session.overlay == Overlay::AgentActivity => {
+                                activity.request_confirmation(id, conversations);
                                 return None;
                             }
                             Err(fell_core::Error::AgentActivityAlreadyUndone {
@@ -412,9 +478,9 @@ pub(super) fn card(
     theme: &Theme,
     activity: &Activity,
     scroll: Option<&ScrollHandle>,
-    height: f32,
-    compact: bool,
+    (height, compact): (f32, bool),
     frame: Option<(&ActivityMotion, Instant)>,
+    window: &Window,
     cx: &mut Context<Inbox>,
 ) -> Div {
     let live = scroll.is_some();
@@ -538,7 +604,7 @@ pub(super) fn card(
                 .border_t(px(1.))
                 .border_color(rgb(theme.border))
                 .overflow_hidden()
-                .child(footer.render(theme, compact, frame, live, cx)),
+                .child(footer.render(theme, compact, frame, live, window, cx)),
         )
 }
 
@@ -546,12 +612,12 @@ impl Footer {
     fn of(activity: &Activity, now: i64) -> Self {
         let mut footer = Self {
             text: FooterText::default(),
-            buttons: [
-                activity.page.has_newer.then_some(FooterButton::Newer),
-                activity.page.has_older.then_some(FooterButton::Older),
-                None,
+            buttons: [None, Some(FooterButton::Newer), Some(FooterButton::Older)],
+            enabled: [
+                false,
+                activity.page.has_newer && !activity.pending,
+                activity.page.has_older && !activity.pending,
             ],
-            pending: activity.pending,
         };
         if let Some(prompt) = &activity.confirmation
             && let Some(entry) = activity.selected_entry()
@@ -582,6 +648,7 @@ impl Footer {
                 Some(FooterButton::Cancel),
                 Some(FooterButton::Confirm),
             ];
+            footer.enabled = [false, true, true];
             return footer;
         }
         let entry = activity.selected_entry();
@@ -590,7 +657,8 @@ impl Footer {
                 !entry.action.undone && !entry.draft_discarded && entry.blocker.is_none()
             })
         {
-            footer.buttons[2] = Some(FooterButton::Undo);
+            footer.buttons[0] = Some(FooterButton::Undo);
+            footer.enabled[0] = true;
         }
         footer.text.text = if let Some(blocker) = &activity.blocker_notice {
             footer.text.compact = Some(blocker_notice(blocker, now, true));
@@ -615,133 +683,138 @@ impl Footer {
         compact: bool,
         frame: Option<(&ActivityMotion, Instant)>,
         live: bool,
+        window: &Window,
         cx: &mut Context<Inbox>,
     ) -> Div {
+        const GAP: f32 = 6.;
+        let pad = if compact { 10. } else { 14. };
+        let width = |labels: &[&str], minimum: f32| {
+            (labels
+                .iter()
+                .map(|label| {
+                    super::bar_px(window, label, theme.ui_px - 1., theme.ui_family.as_ref())
+                })
+                .fold(0., f32::max)
+                .ceil()
+                + 22.)
+                .max(minimum)
+        };
+        let widths = [
+            width(
+                &[FooterButton::Undo.label(compact).0],
+                if compact { 76. } else { 108. },
+            ),
+            width(&["Newer", "Cancel"], if compact { 64. } else { 68. }),
+            width(&["Older", "Undo · y"], if compact { 64. } else { 68. }),
+        ];
         let incoming = frame.map_or(1., |(motion, now)| {
             motion::progress(motion.text_in.as_ref(), now)
         });
         let leaving = frame.and_then(|(motion, now)| Some((motion.old_text.as_ref()?, now)));
-        let widths = if compact {
-            [53., 53., 65.]
-        } else {
-            [62., 62., 100.]
-        };
-        let first_slot_opacity = frame
-            .and_then(|(motion, now)| motion.slots[0].frame(now))
-            .map_or(0., |(_, alpha)| alpha);
-        div()
-            .size_full()
-            .px(px(if compact { 10. } else { 14. }))
-            .pb(px(10.))
-            .flex()
-            .items_end()
-            .gap(px(if compact { 4. } else { 6. }))
-            .child(
-                div()
-                    .relative()
-                    .h_full()
-                    .flex_1()
-                    .min_w_0()
-                    .when_some(leaving, |text, (old, now)| {
-                        text.child(old.content.render(
-                            theme,
-                            compact,
-                            widths[0],
-                            first_slot_opacity,
-                            old.opacity(now),
-                        ))
-                    })
-                    .child(
-                        self.text
-                            .render(theme, compact, widths[0], first_slot_opacity, incoming)
-                            .bottom(px(-CONTENT_RISE * (1. - incoming))),
-                    ),
+        let panel =
+            (f32::from(window.viewport_size().width) - 20.).min(super::AGENT_CARD_WIDTH) - 2.;
+        let text_layer = |text: &FooterText, alpha, rise| {
+            let reserved = if text.consequence.is_some() {
+                widths[1..].iter().sum::<f32>() + 2. * GAP
+            } else {
+                widths.iter().sum::<f32>() + 3. * GAP
+            };
+            text.render(
+                theme,
+                compact,
+                (panel - 2. * pad - reserved).max(0.),
+                window,
             )
-            .children(widths.into_iter().enumerate().map(|(index, width)| {
-                let selected = self.buttons[index];
-                let shown = match frame {
-                    Some((motion, now)) => motion.slots[index].frame(now),
-                    None => selected.map(|button| (button, 1.)),
-                };
-                div()
-                    .w(px(width))
-                    .flex_none()
-                    .when_some(shown, |slot, (control, alpha)| {
-                        let (label, key) = control.label(compact);
-                        slot.child(
-                            button(
-                                theme,
-                                label,
-                                key,
-                                live && !self.pending && selected == Some(control),
-                                cx,
+            .absolute()
+            .left(px(pad))
+            .right(px(pad + reserved))
+            .top(px(rise))
+            .bottom(px(-rise))
+            .opacity(alpha)
+        };
+        div()
+            .relative()
+            .size_full()
+            .px(px(pad))
+            .flex()
+            .items_center()
+            .when_some(leaving, |footer, (old, now)| {
+                footer.child(text_layer(&old.content, old.opacity(now), 0.))
+            })
+            .child(text_layer(
+                &self.text,
+                incoming,
+                CONTENT_RISE * (1. - incoming),
+            ))
+            .child(div().flex_1())
+            .child(div().flex().flex_none().gap(px(GAP)).children(
+                widths.into_iter().enumerate().map(|(index, width)| {
+                    let selected = self.buttons[index];
+                    let shown = match frame {
+                        Some((motion, now)) => motion.slots[index].frame(now),
+                        None => selected.map(|button| (button, 1.)),
+                    };
+                    let enabled = self.enabled[index];
+                    let strength = frame.map_or(if enabled { 1. } else { 0. }, |(motion, now)| {
+                        motion.slots[index].enabled_at(now)
+                    });
+                    div()
+                        .w(px(width))
+                        .flex_none()
+                        .when_some(shown, |slot, (control, alpha)| {
+                            let (label, key) = control.label(compact);
+                            slot.child(
+                                button(
+                                    theme,
+                                    label,
+                                    key,
+                                    strength,
+                                    live && enabled && selected == Some(control),
+                                    cx,
+                                )
+                                .w_full()
+                                .opacity(alpha),
                             )
-                            .w_full()
-                            .text_center()
-                            .opacity(alpha),
-                        )
-                    })
-            }))
+                        })
+                }),
+            ))
     }
 }
 
 impl FooterText {
-    fn render(
-        &self,
-        theme: &Theme,
-        compact: bool,
-        first_slot_width: f32,
-        first_slot_opacity: f32,
-        opacity: f32,
-    ) -> Div {
+    fn render(&self, theme: &Theme, compact: bool, room: f32, window: &Window) -> Div {
         let dim = ensure_all(theme.dimmed, &[theme.surface], 4.65);
         let text = if compact {
             self.compact.as_ref().unwrap_or(&self.text)
         } else {
             &self.text
         };
+        let style = super::conversation_line_style(window, theme, px(theme.ui_px - 1.));
+        let weight = if self.consequence.is_some() {
+            FontWeight::SEMIBOLD
+        } else {
+            FontWeight::NORMAL
+        };
+        let color = if self.consequence.is_some() {
+            theme.foreground
+        } else {
+            dim
+        };
+        let title = super::clip_shaped(window, &style, text, room, weight, Some(color))
+            .map(|line| super::shaped_text(line, window).h(px(theme.ui_px + 3.)));
+        let detail = self
+            .consequence
+            .and_then(|text| {
+                super::clip_shaped(window, &style, text, room, FontWeight::NORMAL, Some(dim))
+            })
+            .map(|line| super::shaped_text(line, window).h(px(theme.ui_px + 3.)));
         div()
-            .absolute()
-            .inset_0()
-            .when(self.consequence.is_some() && !compact, |text| {
-                // Confirmation can use the space vacated by Newer while
-                // the controls stay aligned to their slots.
-                text.right(px(-first_slot_width))
-                    .opacity(if first_slot_opacity > 0.5 {
-                        opacity.min(0.5)
-                    } else {
-                        opacity
-                    })
-            })
-            .when(self.consequence.is_none() || compact, |text| {
-                text.opacity(opacity)
-            })
             .flex()
             .flex_col()
-            .justify_end()
-            .gap(px(2.))
-            .child(
-                div()
-                    .line_clamp(1)
-                    .text_ellipsis()
-                    .text_size(px(theme.ui_px - 1.))
-                    .when_else(
-                        self.consequence.is_some(),
-                        |text| text.font_weight(FontWeight::SEMIBOLD),
-                        |text| text.text_color(rgb(dim)),
-                    )
-                    .child(text.clone()),
-            )
-            .when_some(self.consequence, |text, consequence| {
-                text.child(
-                    div()
-                        .line_clamp(1)
-                        .text_ellipsis()
-                        .text_size(px(theme.ui_px - 1.))
-                        .text_color(rgb(dim))
-                        .child(consequence),
-                )
-            })
+            .justify_center()
+            .overflow_hidden()
+            .children(title)
+            .children(detail)
     }
 }
 
@@ -778,18 +851,23 @@ fn button(
     theme: &Theme,
     label: &'static str,
     key: KeyId,
+    strength: f32,
     live: bool,
     cx: &mut Context<Inbox>,
 ) -> Div {
+    let outline = theme.label_outline(theme.surface);
+    let dim = motion::mix(theme.surface, theme.dimmed, 0.4);
+    let faint_outline = motion::mix(theme.surface, outline, 0.5);
     div()
-        .px(px(2.))
+        .px(px(10.))
         .h(px(28.))
         .flex()
         .justify_center()
         .items_center()
         .rounded_md()
         .border_1()
-        .border_color(rgb(theme.label_outline(theme.surface)))
+        .border_color(rgb(motion::mix(faint_outline, outline, strength)))
+        .text_color(rgb(motion::mix(dim, theme.foreground, strength)))
         .text_size(px(theme.ui_px - 1.))
         .child(label)
         .when(live, |button| {

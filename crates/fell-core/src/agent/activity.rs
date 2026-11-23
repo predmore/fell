@@ -265,7 +265,10 @@ pub(super) fn check_undo(
     if conversations > BULK_UNDO_THRESHOLD
         && confirmed_bulk.is_none_or(|approved| conversations > approved)
     {
-        return Err(Error::Action("Confirm undo for this bulk action".into()));
+        if let Some(blocker) = super::undo_conflicts::blocker(conn, &action)? {
+            return Err(Error::AgentActivityBlocked(blocker));
+        }
+        return Err(Error::AgentActivityNeedsConfirmation { conversations });
     }
     Ok(action)
 }

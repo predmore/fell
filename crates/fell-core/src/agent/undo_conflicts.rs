@@ -8,6 +8,54 @@ use crate::Result;
 use crate::folders::{FolderRole, FolderRoles};
 use crate::store::{join_tokens, listed_folder_roles, split_field};
 
+// Prefer an exact live ID. A sync fold repoints all aliases at the keeper.
+pub(super) const RESOLVED_SNAPSHOTS: &str = "WITH resolved AS (
+    SELECT s.*, COALESCE(direct.message_id, keeper.message_id) AS live_id
+    FROM agent_action_messages s
+    LEFT JOIN messages direct ON direct.account_id = ?2 AND direct.message_id = s.message_id
+    LEFT JOIN message_aliases a ON a.account_id = ?2 AND a.message_id = s.message_id
+        AND direct.message_id IS NULL
+    LEFT JOIN messages keeper ON keeper.account_id = ?2 AND keeper.message_id = a.canonical_message_id
+    WHERE s.action_id = ?1
+)";
+
+const TARGETS: &str = "targets AS (
+    SELECT COALESCE(s.live_id, s.message_id) AS target_id, s.* FROM resolved s
+    UNION ALL
+    SELECT a.message_id AS target_id, s.* FROM resolved s
+    JOIN message_aliases a ON a.account_id = ?2 AND a.canonical_message_id = s.live_id
+)";
+
+fn snapshot_conflict(conn: &Connection, action: &RecordedAction, field: Field) -> Result<bool> {
+    // Multiple historical snapshots converging on one row may disagree
+    // about what to restore. Leave that decision to the user. Label undo
+    // applies one membership edit, which can safely be retried on a keeper.
+    Ok(conn
+        .prepare_cached(&format!(
+            "{RESOLVED_SNAPSHOTS}
+         SELECT (COUNT(*) > 0 AND COUNT(live_id) = 0)
+             OR (?3 AND COUNT(live_id) > COUNT(DISTINCT live_id))
+         FROM resolved"
+        ))?
+        .query_row(
+            params![
+                action.id,
+                action.account_id.as_str(),
+                !matches!(field, Field::Label)
+            ],
+            |row| row.get(0),
+        )?)
+}
+
+fn mailbox_changed(action: &RecordedAction) -> ActivityBlocker {
+    ActivityBlocker {
+        id: action.id,
+        actor: String::new(),
+        kind: BLOCKER_MAILBOX_CHANGED.into(),
+        created_unix: 0,
+    }
+}
+
 /// Scope the guard to the same message fields as the undo writer.
 #[derive(Clone, Copy)]
 enum Field {
@@ -73,6 +121,9 @@ pub(super) fn blocker(
     let Some(field) = Field::for_action(&action.kind) else {
         return Ok(None);
     };
+    if snapshot_conflict(conn, action, field)? {
+        return Ok(Some(mailbox_changed(action)));
+    }
     let (agent, local) = newer_actions(conn, action, field)?;
     let outbox = if matches!(field, Field::Folder) {
         pending_move(conn, action)?
@@ -102,12 +153,7 @@ pub(super) fn blocker(
         // A snooze with no open replacement can be retired without a write.
         Field::Snooze => true,
     };
-    Ok((!unchanged).then(|| ActivityBlocker {
-        id: action.id,
-        actor: String::new(),
-        kind: BLOCKER_MAILBOX_CHANGED.into(),
-        created_unix: 0,
-    }))
+    Ok((!unchanged).then(|| mailbox_changed(action)))
 }
 
 fn newer_actions(
@@ -115,25 +161,6 @@ fn newer_actions(
     action: &RecordedAction,
     field: Field,
 ) -> Result<(Option<ActivityBlocker>, Option<ActivityBlocker>)> {
-    // Label undo resolves merged aliases before changing a label membership.
-    // Include the full alias class when looking for overlapping label edits.
-    let snapshots = if matches!(field, Field::Label) {
-        "WITH canonical AS (
-             SELECT s.*, COALESCE(a.canonical_message_id, s.message_id) AS canonical_id
-             FROM agent_action_messages s
-             LEFT JOIN message_aliases a ON a.account_id = ?2 AND a.message_id = s.message_id
-             WHERE s.action_id = ?1
-         ), targets AS (
-             SELECT canonical_id AS target_id, c.* FROM canonical c
-             UNION ALL
-             SELECT a.message_id AS target_id, c.* FROM canonical c
-             JOIN message_aliases a ON a.account_id = ?2 AND a.canonical_message_id = c.canonical_id
-         )"
-    } else {
-        "WITH targets AS (
-             SELECT message_id AS target_id, s.* FROM agent_action_messages s WHERE s.action_id = ?1
-         )"
-    };
     let overlap = match field {
         Field::Folder => "(((s.after_folders IS NULL OR s.folders <> s.after_folders)
                             AND (later.after_folders IS NULL OR later.folders <> later.after_folders))
@@ -145,7 +172,7 @@ fn newer_actions(
     let args = params![action.id, action.account_id.as_str()];
     let agent_actions = conn
         .prepare_cached(&format!(
-            "{snapshots}
+            "{RESOLVED_SNAPSHOTS}, {TARGETS}
          SELECT n.id, n.actor, n.kind, n.created_unix FROM targets s
          JOIN agent_action_messages later ON later.message_id = s.target_id AND later.action_id > ?1
          JOIN agent_actions n ON n.id = later.action_id AND n.account_id = ?2 AND n.undone = 0
@@ -169,7 +196,7 @@ fn newer_actions(
     {
         local_actions = conn
             .prepare_cached(&format!(
-                "{snapshots}
+                "{RESOLVED_SNAPSHOTS}, {TARGETS}
              SELECT n.id, 'local', n.kind, n.created_unix FROM targets s
              JOIN agent_actions a ON a.id = s.action_id
              JOIN {table} l ON l.message_id = s.target_id
@@ -188,16 +215,18 @@ fn newer_actions(
 
 fn pending_move(conn: &Connection, action: &RecordedAction) -> Result<Option<ActivityBlocker>> {
     Ok(conn
-        .prepare_cached(
-            "SELECT n.id, 'outbox', n.kind, n.created_unix FROM agent_actions a
-         JOIN agent_action_messages s ON s.action_id = a.id
-         JOIN server_outbox n ON n.message_id = s.message_id AND n.account_id = ?2
+        .prepare_cached(&format!(
+            "{RESOLVED_SNAPSHOTS}, {TARGETS}
+         SELECT n.id, 'outbox', n.kind, n.created_unix FROM agent_actions a
+         JOIN targets s ON s.action_id = a.id
+         JOIN server_outbox n ON n.account_id = ?2
+             AND n.message_id = s.target_id
          WHERE a.id = ?1 AND n.kind = 'move' AND n.state = 'pending'
            AND (s.after_folders IS NULL OR s.folders <> s.after_folders)
            AND n.id > COALESCE(a.outbox_floor, 0)
            AND (a.outbox_floor IS NOT NULL OR n.created_unix >= a.created_unix)
-         ORDER BY n.id DESC LIMIT 1",
-        )?
+         ORDER BY n.id DESC LIMIT 1"
+        ))?
         .query_row(params![action.id, action.account_id.as_str()], |row| {
             map_blocker(row, 0)
         })
@@ -213,10 +242,11 @@ fn flag_unchanged(
 ) -> Result<bool> {
     Ok(!conn
         .prepare_cached(&format!(
-            "SELECT EXISTS (
-            SELECT 1 FROM agent_action_messages s
-            JOIN messages m ON m.account_id = ?2 AND m.message_id = s.message_id
-            WHERE s.action_id = ?1 AND s.{column} IS NOT NULL
+            "{RESOLVED_SNAPSHOTS}
+            SELECT EXISTS (
+            SELECT 1 FROM resolved s
+            JOIN messages m ON m.account_id = ?2 AND m.message_id = s.live_id
+            WHERE s.{column} IS NOT NULL
               AND s.{column} <> ?3 AND m.{column} IS NOT ?3
         )"
         ))?
@@ -236,10 +266,24 @@ struct FolderSnapshot {
 impl FolderSnapshot {
     fn unchanged(&self) -> bool {
         self.written.as_ref().is_some_and(|after| {
-            (same_folders(&self.before.0, &after.0) || same_folders(&self.live.0, &after.0))
+            folder_delta_unchanged(&self.live.0, &self.before.0, &after.0)
                 && (self.before.1 == after.1 || self.live.1 == after.1)
         })
     }
+}
+
+fn folder_delta_unchanged(current: &str, before: &str, after: &str) -> bool {
+    let current = split_field(current);
+    let before = split_field(before);
+    let after = split_field(after);
+    let has =
+        |list: &[String], token: &str| list.iter().any(|item| item.eq_ignore_ascii_case(token));
+    before
+        .iter()
+        .all(|token| has(&after, token) || !has(&current, token))
+        && after
+            .iter()
+            .all(|token| has(&before, token) || has(&current, token))
 }
 
 pub(super) fn restore_folders(conn: &Connection, action: &RecordedAction) -> Result<()> {
@@ -248,14 +292,18 @@ pub(super) fn restore_folders(conn: &Connection, action: &RecordedAction) -> Res
             continue;
         };
         if !same_folders(&row.before.0, &after.0) {
-            conn.prepare_cached(
-                "UPDATE messages SET folders = ?3 WHERE account_id = ?1 AND message_id = ?2",
-            )?
-            .execute(params![
-                action.account_id.as_str(),
-                row.message_id,
-                row.before.0
-            ])?;
+            let folders = join_tokens(&crate::actions::invert_tokens(
+                &split_field(&row.live.0),
+                &split_field(&row.before.0),
+                &split_field(&after.0),
+                true,
+            ));
+            crate::actions::write_message_folders(
+                conn,
+                &action.account_id,
+                &row.message_id,
+                &folders,
+            )?;
         }
         if row.before.1 != after.1 {
             conn.prepare_cached(
@@ -272,12 +320,12 @@ pub(super) fn restore_folders(conn: &Connection, action: &RecordedAction) -> Res
 }
 
 fn folder_snapshots(conn: &Connection, action: &RecordedAction) -> Result<Vec<FolderSnapshot>> {
-    let mut statement = conn.prepare_cached(
-        "SELECT s.message_id, s.folders, s.archived, s.after_folders, s.after_archived, m.folders, m.archived
-         FROM agent_action_messages s
-         JOIN messages m ON m.account_id = ?2 AND m.message_id = s.message_id
-         WHERE s.action_id = ?1",
-    )?;
+    let mut statement = conn.prepare_cached(&format!(
+        "{RESOLVED_SNAPSHOTS}
+         SELECT s.live_id, s.folders, s.archived, s.after_folders, s.after_archived, m.folders, m.archived
+         FROM resolved s
+         JOIN messages m ON m.account_id = ?2 AND m.message_id = s.live_id"
+    ))?;
     let mut rows = statement.query(params![action.id, action.account_id.as_str()])?;
     let mut snapshots = Vec::new();
     while let Some(row) = rows.next()? {
@@ -303,8 +351,14 @@ fn same_folders(a: &str, b: &str) -> bool {
     if a == b {
         return true;
     }
-    let mut a = split_field(a);
-    let mut b = split_field(b);
+    let folded = |value| {
+        split_field(value)
+            .into_iter()
+            .map(|token| token.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+    };
+    let mut a = folded(a);
+    let mut b = folded(b);
     a.sort_unstable();
     b.sort_unstable();
     a == b

@@ -106,6 +106,8 @@ pub enum Error {
     AgentActivityBlocked(agent::ActivityBlocker),
     #[error("Action already undone")]
     AgentActivityAlreadyUndone { snooze_retired: bool },
+    #[error("Confirm undo for this bulk action")]
+    AgentActivityNeedsConfirmation { conversations: u32 },
     #[error("{0} is not implemented yet")]
     NotImplemented(&'static str),
     #[error("send requires explicit UI confirmation")]

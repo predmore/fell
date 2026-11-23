@@ -5234,11 +5234,14 @@ impl Render for Inbox {
                             &theme,
                             &session.activity,
                             live.then_some(&self.activity_scroll),
-                            card.unwrap_or_else(|| {
-                                activity::card_height(viewport_height - CARD_TOP_PX - 16.0)
-                            }),
-                            width < 500.,
+                            (
+                                card.unwrap_or_else(|| {
+                                    activity::card_height(viewport_height - CARD_TOP_PX - 16.0)
+                                }),
+                                width < 500.,
+                            ),
                             live.then_some((&self.activity_motion, now)),
+                            window,
                             cx,
                         )),
                         _ => None,
