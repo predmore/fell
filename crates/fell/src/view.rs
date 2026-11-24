@@ -8214,6 +8214,7 @@ impl ReaderBodies {
                         BodyBlock::Text(text)
                         | BodyBlock::Quote(text)
                         | BodyBlock::Signature(text) => !text.trim().is_empty(),
+                        BodyBlock::List(blocks) => !blocks.is_empty(),
                         BodyBlock::Markdown { .. } => true,
                     });
                 if text {
