@@ -13,7 +13,7 @@
 //! `Content-Location`, and nothing is launched or executed.
 
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::ops::ControlFlow;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -22,7 +22,6 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
-use xattr::FileExt;
 
 use crate::account::AccountId;
 use crate::backend::MailBackend;
@@ -41,7 +40,7 @@ const MAX_FILE_NAME: usize = 120;
 
 /// A partial write older than this was left by a process that stopped.
 const STALE_PARTIAL: Duration = Duration::from_secs(60 * 60);
-const PROVISIONAL_PART_ATTR: &str = "user.fell.part";
+const PROVISIONAL_PART_INFO: &str = ".fell-provisional";
 
 /// One part to fetch: which message, which part, and the server copies that
 /// hold it, best first. From [`crate::Store::part_request`].
@@ -191,11 +190,14 @@ impl PartCache {
         let matches = if request.decoded_size_known {
             meta.len() == request.part.size
         } else {
-            file.get_xattr(PROVISIONAL_PART_ATTR)
-                .ok()
-                .flatten()
-                .as_deref()
-                == Some(provisional_part_key(request, stamp, meta.len()).as_slice())
+            let mut recorded = [0; 32];
+            fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(dir.join(PROVISIONAL_PART_INFO))
+                .and_then(|mut file| file.read_exact(&mut recorded))
+                .is_ok()
+                && recorded == provisional_part_key(request, stamp, &meta)
         };
         if !matches {
             drop(file);
@@ -246,16 +248,19 @@ impl PartCache {
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_nanos());
         let partial = dir.join(format!(".partial-{}-{nanos}", std::process::id()));
+        let partial_info = partial.with_extension("info");
         let written: io::Result<_> = (|| {
             let mut file = create_private_file(&partial)?;
             file.write_all(bytes)?;
-            if !request.decoded_size_known {
-                // Bind the observed length to this file before publication.
-                // A filesystem without user attributes can still save the file.
-                let key = provisional_part_key(request, stamp, bytes.len() as u64);
-                let _ = file.set_xattr(PROVISIONAL_PART_ATTR, &key);
-            }
             file.sync_all()?;
+            if !request.decoded_size_known {
+                // Publish the record first. It is bound to the new file's
+                // inode, so interruption before the rename leaves a miss.
+                let mut info = create_private_file(&partial_info)?;
+                info.write_all(&provisional_part_key(request, stamp, &file.metadata()?))?;
+                info.sync_all()?;
+                fs::rename(&partial_info, dir.join(PROVISIONAL_PART_INFO))?;
+            }
             let file = fs::OpenOptions::new()
                 .read(true)
                 .custom_flags(O_NOFOLLOW | libc::O_NONBLOCK)
@@ -265,6 +270,7 @@ impl PartCache {
         })();
         let file = written.inspect_err(|_| {
             let _ = fs::remove_file(&partial);
+            let _ = fs::remove_file(&partial_info);
         })?;
         self.trim(&dir);
         Ok(CachedPart {
@@ -311,18 +317,20 @@ impl PartCache {
     }
 }
 
-fn provisional_part_key(request: &PartRequest, stamp: [u8; 16], decoded_size: u64) -> [u8; 32] {
+fn provisional_part_key(request: &PartRequest, stamp: [u8; 16], file: &fs::Metadata) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(stamp);
     hash.update(request.part.encoded_size.to_le_bytes());
-    hash.update(decoded_size.to_le_bytes());
+    hash.update(file.len().to_le_bytes());
+    hash.update(file.dev().to_le_bytes());
+    hash.update(file.ino().to_le_bytes());
     hash.update([match request.part.encoding {
         TransferEncoding::Identity => 0,
         TransferEncoding::Base64 => 1,
         TransferEncoding::QuotedPrintable => 2,
     }]);
     for copy in &request.copies {
-        hash.update(copy.0.len().to_le_bytes());
+        hash.update((copy.0.len() as u64).to_le_bytes());
         hash.update(copy.0.as_bytes());
     }
     hash.finalize().into()
