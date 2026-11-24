@@ -169,9 +169,9 @@ impl PartCache {
         }
     }
 
-    /// The cached copy of `request`, when there is one. Marks it used. A
-    /// file that is not the part's listed size (cut short, or changed on
-    /// disk) is removed and counts as a miss.
+    /// The cached copy of `request`, when there is one. Marks it used.
+    /// A file downloaded from a provisional list must still match its
+    /// recorded part metadata, including after a full source is parsed.
     fn lookup_locked(&self, request: &PartRequest, stamp: [u8; 16]) -> Option<CachedPart> {
         let dir = self.request_dir(request);
         if !fs::symlink_metadata(&dir).is_ok_and(|meta| meta.is_dir()) {
@@ -187,18 +187,20 @@ impl PartCache {
         if !meta.is_file() || meta.uid() != user_id() {
             return None;
         }
-        let matches = if request.decoded_size_known {
-            meta.len() == request.part.size
-        } else {
-            let mut recorded = [0; 32];
-            fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(dir.join(PROVISIONAL_PART_INFO))
-                .and_then(|mut file| file.read_exact(&mut recorded))
-                .is_ok()
-                && recorded == provisional_part_key(request, stamp, &meta)
+        let record = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(dir.join(PROVISIONAL_PART_INFO));
+        let record_matches = match record {
+            Ok(mut record) => {
+                let mut recorded = [0; 32];
+                record.read_exact(&mut recorded).is_ok()
+                    && recorded == provisional_part_key(request, stamp, &meta)
+            }
+            Err(err) => request.decoded_size_known && err.kind() == io::ErrorKind::NotFound,
         };
+        let matches =
+            record_matches && (!request.decoded_size_known || meta.len() == request.part.size);
         if !matches {
             // A mismatched provisional record may describe a different
             // version of the part. Leave it for a verified replacement.
@@ -248,6 +250,14 @@ impl PartCache {
         let dir = self.request_dir(request);
         create_private_dir(&dir)?;
         let path = entry_path(&dir, request);
+        let part_info = dir.join(PROVISIONAL_PART_INFO);
+        // Keep verifying recorded entries after a full-source download.
+        // Removing the record could expose an older file under another name.
+        let write_record = match fs::symlink_metadata(&part_info) {
+            Ok(_) => true,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => !request.decoded_size_known,
+            Err(err) => return Err(err),
+        };
         let nanos = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_nanos());
@@ -257,13 +267,13 @@ impl PartCache {
             let mut file = create_private_file(&partial)?;
             file.write_all(bytes)?;
             file.sync_all()?;
-            if !request.decoded_size_known {
+            if write_record {
                 // Publish the record first. It is bound to the new file's
                 // inode, so interruption before the rename leaves a miss.
                 let mut info = create_private_file(&partial_info)?;
                 info.write_all(&provisional_part_key(request, stamp, &file.metadata()?))?;
                 info.sync_all()?;
-                fs::rename(&partial_info, dir.join(PROVISIONAL_PART_INFO))?;
+                fs::rename(&partial_info, part_info)?;
             }
             let file = fs::OpenOptions::new()
                 .read(true)
@@ -513,19 +523,19 @@ fn download_part(
 ) -> Result<Vec<u8>> {
     let mut differed = false;
     for copy in &request.copies {
-        let Some(raw) = backend.fetch_part(
-            copy,
-            &request.part.section,
-            request.part.encoded_size,
-            progress,
-        )?
-        else {
+        let raw = if request.decoded_size_known {
+            backend.fetch_part(
+                copy,
+                &request.part.section,
+                request.part.encoded_size,
+                progress,
+            )?
+        } else {
+            backend.fetch_provisional_part(copy, &request.part, progress)?
+        };
+        let Some(raw) = raw else {
             continue;
         };
-        if !request.decoded_size_known && raw.len() as u64 != request.part.encoded_size {
-            differed = true;
-            continue;
-        }
         let bytes = decode_part(request.part.encoding, &raw);
         drop(raw);
         // A copy merged from another delivery (a list echo with a footer)
@@ -542,6 +552,12 @@ fn download_part(
     } else {
         "no server copy of this message has the part any more".into()
     }))
+}
+
+pub(crate) fn unverified_part() -> Error {
+    Error::Backend(
+        "the attachment's MIME metadata could not be verified against the server copy".into(),
+    )
 }
 
 /// Fetch the images an HTML body shows by `cid:` (role
@@ -896,9 +912,38 @@ mod tests {
             panic!("cache-only part missed cache")
         })
         .unwrap();
+        let mut verified = request.clone();
+        verified.decoded_size_known = true;
+        verified.part.size = hit.size;
+        fetch_cached_part(&cache, &store, &verified, || {
+            panic!("matching verified part missed cache")
+        })
+        .unwrap();
         request.part.encoded_size += 4;
         assert!(fetch_cached_part(&cache, &store, &request, || Err(part_removed())).is_err());
         assert_eq!(fs::read(hit.path).unwrap(), b"data");
+    }
+
+    #[test]
+    fn verified_part_lookup_rejects_changed_provisional_metadata_at_the_same_size() {
+        let (_root, cache, store, mut provisional) =
+            super::cleanup_tests::listed_fixture("verified-after-provisional");
+        provisional.decoded_size_known = false;
+        let old = fetch_cached_part(&cache, &store, &provisional, || Ok(b"old!".to_vec())).unwrap();
+        provisional.part.encoded_size += 4;
+        assert!(fetch_cached_part(&cache, &store, &provisional, || Err(part_removed())).is_err());
+        assert_eq!(fs::read(&old.path).unwrap(), b"old!");
+
+        let mut verified = provisional;
+        verified.decoded_size_known = true;
+        verified.part.size = 4;
+        let new = fetch_cached_part(&cache, &store, &verified, || Ok(b"new!".to_vec())).unwrap();
+        assert_eq!(old.path, new.path);
+        assert_eq!(fs::read(&new.path).unwrap(), b"new!");
+        fetch_cached_part(&cache, &store, &verified, || {
+            panic!("replacement missed cache")
+        })
+        .unwrap();
     }
 
     #[test]

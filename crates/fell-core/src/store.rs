@@ -2130,14 +2130,7 @@ fn fill_fetched_body_text(
     snippet: &str,
     fingerprint: &str,
 ) -> Result<()> {
-    let Some(row) = conn
-        .prepare_cached(&format!(
-            "SELECT {ARRIVAL_COLS} FROM messages m
-             WHERE m.account_id = ?1 AND m.message_id = ?2 AND typeof(m.body_text) = 'null'"
-        ))?
-        .query_row(params![account.as_str(), canonical], map_arrival)
-        .optional()?
-    else {
+    let Some(row) = arrival_without_body(conn, account.as_str(), canonical)? else {
         return Ok(());
     };
     // FillGap can keep the text from a different copy. Index only the text
@@ -2161,6 +2154,20 @@ fn fill_fetched_body_text(
     ])?;
     sync_terms(conn, account.as_str(), &old, &new)?;
     invalidate_message_embedding(conn, account.as_str(), canonical, body)
+}
+
+fn arrival_without_body(
+    conn: &Connection,
+    account: &str,
+    message: &str,
+) -> Result<Option<Arrival>> {
+    Ok(conn
+        .prepare_cached(&format!(
+            "SELECT {ARRIVAL_COLS} FROM messages m
+             WHERE m.account_id = ?1 AND m.message_id = ?2 AND typeof(m.body_text) = 'null'"
+        ))?
+        .query_row(params![account, message], map_arrival)
+        .optional()?)
 }
 
 #[cfg(test)]
@@ -5036,6 +5043,69 @@ mod tests {
                 ),
                 1
             );
+        }
+    }
+
+    #[test]
+    fn html_backfill_then_reader_store_matches_sync_vocabulary() {
+        let account = account();
+        let sync = Store::open_in_memory().unwrap();
+        let reader = Store::open_in_memory().unwrap();
+        // The renderer separates the heading from the paragraph. The sync
+        // text has an adjoining word and also shares terms with the snippet.
+        let raw = concat!(
+            "From: demo@example.test\r\nSubject: Garden\r\nMessage-ID: <garden@x>\r\n",
+            "Content-Type: text/html\r\n\r\n<h1>Periwinkle</h1><p>Color is blue.</p>"
+        );
+        let full =
+            crate::imap::to_message(&account.id, "INBOX", "INBOX", 7, 1, &[], raw.as_bytes());
+        let mut header = full.clone();
+        header.parts = None;
+        header.body_text = None;
+        header.snippet.clear();
+        for store in [&sync, &reader] {
+            store.upsert_account(&account).unwrap();
+            let mut other = msg("other@x", None, None, "Flowers", "Periwinkle is purple.");
+            other.remote_id = RemoteId("imap:7:2:INBOX".into());
+            store.upsert_message(&other).unwrap();
+        }
+        sync.upsert_message(&full).unwrap();
+        reader.upsert_message(&header).unwrap();
+        let fetched = [(full.headers.message_id.clone(), full.parts.clone())];
+        reader.store_fetched_parts(&account.id, &fetched).unwrap();
+        let df = |term: &str| {
+            reader
+                .conn
+                .query_row(
+                    "SELECT df FROM search_terms WHERE account_id = ?1 AND term = ?2",
+                    params![account.id.as_str(), term],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(df("periwinkle"), 2, "both preview and body count");
+        assert_eq!(df("blue"), 1, "the backfill indexed the shared term");
+        reader
+            .store_fetched_parts_with(&account.id, &fetched, true)
+            .unwrap();
+        assert_eq!(df("periwinkle"), 1, "the other message still counts");
+        let rows = |store: &Store, sql: &str| {
+            store
+                .conn
+                .prepare(sql)
+                .unwrap()
+                .query_map([account.id.as_str()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        for sql in [
+            "SELECT term, CAST(df AS TEXT) FROM search_terms WHERE account_id = ?1 ORDER BY term",
+            "SELECT trigram, term FROM search_trigrams WHERE account_id = ?1 ORDER BY trigram, term",
+        ] {
+            assert_eq!(rows(&reader, sql), rows(&sync, sql));
         }
     }
 

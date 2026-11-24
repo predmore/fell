@@ -868,14 +868,15 @@ fn handle(
     }
 }
 
-/// `BODY.PEEK[<section>]<offset.len>` in a UID FETCH, for a numeric section.
+/// `BODY.PEEK[<section>]<offset.len>` for a part or its MIME headers.
 fn part_request(upper: &str) -> Option<(String, Option<(usize, usize)>)> {
     let start = upper.find("BODY.PEEK[")? + "BODY.PEEK[".len();
     let end = start + upper[start..].find(']')?;
     let section = &upper[start..end];
     let after = &upper[end + 1..];
+    let part = section.strip_suffix(".MIME").unwrap_or(section);
     if (section.is_empty() && !after.starts_with('<'))
-        || !section.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        || !part.bytes().all(|b| b.is_ascii_digit() || b == b'.')
     {
         return None;
     }
@@ -898,6 +899,14 @@ fn write_part(
 ) {
     let bytes = if section.is_empty() {
         Some(message.raw.clone())
+    } else if let Some(part) = section.strip_suffix(".MIME") {
+        section_entity(&message.raw, part)
+            .filter(|_| message.body_form != BodyForm::Absent)
+            .map(|entity| {
+                let mut mime = split_entity(entity).0.to_vec();
+                mime.extend_from_slice(b"\r\n");
+                mime
+            })
     } else {
         section_body(&message.raw, section)
     };
@@ -940,6 +949,10 @@ fn write_part(
 /// The body of IMAP part `section` of `raw`, found with a small MIME walk of
 /// its own (not the client's parser), so tests check the client's numbering.
 pub(super) fn section_body(raw: &[u8], section: &str) -> Option<Vec<u8>> {
+    Some(split_entity(section_entity(raw, section)?).1.to_vec())
+}
+
+fn section_entity<'a>(raw: &'a [u8], section: &str) -> Option<&'a [u8]> {
     let mut entity = raw;
     let mut top = true;
     for number in section.split('.') {
@@ -947,7 +960,7 @@ pub(super) fn section_body(raw: &[u8], section: &str) -> Option<Vec<u8>> {
         entity = *children(entity, top).get(number.checked_sub(1)?)?;
         top = false;
     }
-    Some(split_entity(entity).1.to_vec())
+    Some(entity)
 }
 
 /// What IMAP numbers `.1`, `.2`, … under `entity`. A whole message that is

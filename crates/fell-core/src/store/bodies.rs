@@ -32,6 +32,7 @@ use crate::imap::{SNIPPET_BYTES, cap_snippet, html_snippet_text};
 use crate::message::{
     Disposition, MessageId, MessageParts, MimePart, PartRole, RemoteId, TransferEncoding,
 };
+use crate::search::{sync_terms, terms_for_indexed};
 use crate::{BodyState, Error, Result, ThreadId};
 
 pub(super) mod cid_upgrade;
@@ -922,13 +923,17 @@ pub(super) fn repair_html_snippets(conn: &Connection) -> Result<Option<bool>> {
     }
     let mut changed = false;
     for (account, message, old, stamp, snippet) in updates {
-        changed |= tx.execute(
+        let wrote = tx.execute(
             "UPDATE messages SET snippet = ?5
              WHERE account_id = ?1 AND message_id = ?2 AND snippet = ?3
                AND (SELECT stamp FROM message_body_stamps
                     WHERE account_id = ?1 AND message_id = ?2) IS ?4",
             params![account, message, old, stamp, snippet],
         )? > 0;
+        if wrote {
+            sync_snippet_terms(&tx, &account, &message, &old, &snippet)?;
+            changed = true;
+        }
     }
     tx.execute(
         "INSERT INTO meta (key, value) VALUES (?1, ?2)
@@ -1016,18 +1021,36 @@ pub(super) fn fill_fetched_html_snippet(
             |row| row.get(0),
         )
         .optional()?;
-    let snippet = old.and_then(|old| {
-        if old.is_empty() {
-            Some(cap_snippet(full_snippet))
-        } else {
-            spacing_repair(&old, full_snippet)
-        }
-    });
+    let Some(old) = old else {
+        return Ok(());
+    };
+    let snippet = if old.is_empty() {
+        Some(cap_snippet(full_snippet))
+    } else {
+        spacing_repair(&old, full_snippet)
+    };
     if let Some(snippet) = snippet {
         conn.prepare_cached(
             "UPDATE messages SET snippet = ?3 WHERE account_id = ?1 AND message_id = ?2",
         )?
         .execute(params![account.as_str(), message, snippet])?;
+        sync_snippet_terms(conn, account.as_str(), message, &old, snippet)?;
+    }
+    Ok(())
+}
+
+fn sync_snippet_terms(
+    conn: &Connection,
+    account: &str,
+    message: &str,
+    old: &str,
+    new: &str,
+) -> Result<()> {
+    // Search indexes the snippet until the full text is stored.
+    if let Some(row) = super::arrival_without_body(conn, account, message)? {
+        let old = terms_for_indexed(row.indexed_text(old));
+        let new = terms_for_indexed(row.indexed_text(new));
+        sync_terms(conn, account, &old, &new)?;
     }
     Ok(())
 }

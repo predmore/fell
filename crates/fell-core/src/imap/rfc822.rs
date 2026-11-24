@@ -775,6 +775,33 @@ fn mime_type(part: &mail_parser::MessagePart<'_>) -> String {
     })
 }
 
+/// Verify the descriptor independently of BODYSTRUCTURE's size estimate.
+pub(super) fn part_header_matches(raw: &[u8], expected: &MimePart) -> Option<bool> {
+    let parsed = MessageParser::new().parse(raw)?;
+    let part = parsed.root_part();
+    part.content_type()?.subtype()?;
+    let encoding = match part
+        .content_transfer_encoding()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "base64" => TransferEncoding::Base64,
+        "quoted-printable" => TransferEncoding::QuotedPrintable,
+        _ => TransferEncoding::Identity,
+    };
+    let content_id = part
+        .content_id()
+        .and_then(|id| clean_name(id.trim().trim_matches(['<', '>'])));
+    Some(
+        mime_type(&part) == expected.mime_type
+            && part.attachment_name().and_then(clean_name) == expected.filename
+            && content_id == expected.content_id
+            && encoding == expected.encoding,
+    )
+}
+
 /// One line, no control or bidi-override characters, at most 255 bytes.
 pub(super) fn clean_name(raw: &str) -> Option<String> {
     let cleaned: String = raw

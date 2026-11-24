@@ -5101,6 +5101,127 @@ fn a_part_whose_copy_is_gone_is_an_error_and_caches_nothing() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[test]
+fn provisional_wire_size_mismatches_check_the_part_mime_headers() {
+    use crate::{BodyState, MessageId, ReaderParts, RemoteId};
+
+    let id = MessageId::new("tentative@x");
+    let fixture = crate::imap::mime_fixtures::mixed_two_attachments(id.as_str());
+    let pdf = &super::parts_from_raw(&fixture.raw).mime_parts[0];
+    for (delta, listed_name, mime_available) in [
+        (-3, "report.pdf", true),
+        (3, "report.pdf", true),
+        (3, "other.pdf", true),
+        (3, "report.pdf", false),
+    ] {
+        let reported = pdf.encoded_size.checked_add_signed(delta).unwrap();
+        let structure = |size| {
+            format!(
+                concat!(
+                    "((\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 19 1 NIL NIL)",
+                    "(\"APPLICATION\" \"PDF\" NIL NIL NIL \"BASE64\" {} NIL ",
+                    "(\"ATTACHMENT\" (\"FILENAME\" \"{}\"))) \"MIXED\")"
+                ),
+                size, listed_name
+            )
+        };
+        let contents = super::structure::parse(&structure(reported), std::iter::empty()).unwrap();
+        let mut state = inbox_state(vec![(1, fixture.raw.clone())]);
+        let server_size = if mime_available {
+            reported
+        } else {
+            state.mailboxes[0].messages[0].body_form = BodyForm::Absent;
+            pdf.encoded_size
+        };
+        let server = TestServer::spawn_parallel(state, [(1, structure(server_size))].into());
+        let acct = account("a1", BackendKind::Imap);
+        let backend = ImapBackend {
+            account_id: acct.id.clone(),
+            config: config(server.addr.port()),
+            smtp: unused_smtp(),
+        };
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&acct).unwrap();
+        let mut message = super::to_message(&acct.id, "INBOX", "INBOX", 20, 1, &[], &fixture.raw);
+        message.parts = None;
+        message.body_text = None;
+        message.snippet.clear();
+        let copy = message.remote_id.clone();
+        assert_eq!(copy, RemoteId("imap:20:1:INBOX".into()));
+        store
+            .apply_delta(
+                &acct.id,
+                &crate::MailboxDelta {
+                    messages: vec![message],
+                    too_large: vec![id.clone()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .store_structures(&acct.id, &[(id.clone(), copy, contents)])
+            .unwrap();
+        assert_eq!(
+            store
+                .body_states(&acct.id, std::slice::from_ref(&id))
+                .unwrap(),
+            [BodyState::TooLarge]
+        );
+        assert_eq!(
+            store.reader_parts(&acct.id, id.as_str()).unwrap(),
+            ReaderParts::Listed { html: false }
+        );
+        let request = store.part_request(&acct.id, &id, "2").unwrap().unwrap();
+        assert!(!request.decoded_size_known);
+        let scratch = tempfile::tempdir().unwrap();
+        let cache = crate::parts::PartCache::open(scratch.path().join("parts"), 64 * 1024).unwrap();
+        // An underestimate ending on a full window used to stop the read
+        // at exactly the advertised size, before the last few bytes.
+        super::part_fetch::set_window(reported as usize);
+        if delta < 0 {
+            let truncated = backend
+                .fetch_part(&request.copies[0], "2", reported, &mut |_| {
+                    std::ops::ControlFlow::Continue(())
+                })
+                .unwrap()
+                .unwrap();
+            assert_eq!(truncated.len() as u64, reported);
+            assert!(truncated.len() as u64 != pdf.encoded_size);
+            server.state.lock().unwrap().commands.clear();
+        }
+        let fetched = crate::parts::fetch_part(&backend, &cache, &store, &request, &mut |_| {});
+        super::part_fetch::set_window(2 * 1024 * 1024);
+        let commands = commands(&server);
+        assert!(
+            commands
+                .iter()
+                .any(|line| line.contains("BODY.PEEK[2.MIME]"))
+        );
+        let rechecks = commands
+            .iter()
+            .filter(|line| line.contains("BODYSTRUCTURE"))
+            .count();
+        if listed_name == "report.pdf" {
+            let cached = fetched.unwrap();
+            assert_eq!(std::fs::read(cached.path).unwrap(), fixture.bytes[0].1);
+            assert_eq!(rechecks, usize::from(!mime_available));
+            server.state.lock().unwrap().commands.clear();
+            crate::parts::fetch_part(&backend, &cache, &store, &request, &mut |_| {}).unwrap();
+            assert!(server.state.lock().unwrap().commands.is_empty());
+        } else {
+            assert!(
+                fetched
+                    .unwrap_err()
+                    .to_string()
+                    .contains("could not be verified")
+            );
+            assert_eq!(rechecks, 1);
+            assert!(cache.lookup(&request).is_none());
+        }
+        assert_read_only(&server);
+    }
+}
+
 /// Sync `fixture` from a server that honours `<offset.len>` or ignores it,
 /// and the request for its part 2.
 fn part_server(

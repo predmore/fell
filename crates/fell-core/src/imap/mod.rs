@@ -22,7 +22,9 @@ pub(crate) use session::{TlsStream, is_loopback_host as host_is_loopback, wrap_t
 
 pub use bodies::CancelBodyFetch;
 pub(crate) use bodies::{BodyConnection, cancelled as body_fetch_cancelled, fetch_bodies};
-pub(crate) use part_fetch::{CANCELLED as PART_FETCH_CANCELLED, fetch_part};
+pub(crate) use part_fetch::{
+    CANCELLED as PART_FETCH_CANCELLED, fetch_part, fetch_provisional_part,
+};
 /// The parser sync stores fetched mail with, for tests that read back what
 /// Fell sends.
 #[cfg(test)]

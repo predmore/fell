@@ -10,7 +10,7 @@
 use std::ops::ControlFlow;
 
 use crate::Error;
-use crate::message::RemoteId;
+use crate::message::{MimePart, RemoteId};
 
 use super::{ImapConfig, parse_remote_id, session, unescape_mailbox};
 
@@ -22,6 +22,8 @@ const WINDOW: usize = 2 * 1024 * 1024;
 
 /// A part never grows past this on the wire; anything longer is refused.
 pub(crate) const MAX_ENCODED_PART: usize = 96 * 1024 * 1024;
+
+const MAX_MIME_HEADER: usize = 64 * 1024;
 
 fn window() -> usize {
     #[cfg(test)]
@@ -69,17 +71,46 @@ pub(crate) fn fetch_part(
     encoded_size: u64,
     progress: &mut dyn FnMut(u64) -> ControlFlow<()>,
 ) -> Result<Option<Vec<u8>>, Error> {
+    fetch_section(config, copy, section, encoded_size, None, progress)
+}
+
+pub(crate) fn fetch_provisional_part(
+    config: &ImapConfig,
+    copy: &RemoteId,
+    part: &MimePart,
+    progress: &mut dyn FnMut(u64) -> ControlFlow<()>,
+) -> Result<Option<Vec<u8>>, Error> {
+    // Read through the last window. An underestimated size can otherwise
+    // make a full window look like the end of the attachment.
+    fetch_section(config, copy, &part.section, 0, Some(part), progress)
+}
+
+fn fetch_section(
+    config: &ImapConfig,
+    copy: &RemoteId,
+    section: &str,
+    encoded_size: u64,
+    provisional: Option<&MimePart>,
+    progress: &mut dyn FnMut(u64) -> ControlFlow<()>,
+) -> Result<Option<Vec<u8>>, Error> {
     if !valid_section(section) {
         return Err(Error::Backend(format!(
             "imap: {section:?} is not a part number"
         )));
     }
-    fetch_copy(config, copy, section, encoded_size, progress)
+    fetch_copy(config, copy, section, encoded_size, provisional, progress)
 }
 
 /// Read the full draft in the same bounded windows as attachment fetches.
 pub(crate) fn fetch_draft(config: &ImapConfig, copy: &RemoteId) -> Result<Option<Vec<u8>>, Error> {
-    fetch_copy(config, copy, "", 0, &mut |_| ControlFlow::Continue(()))
+    fetch_copy(
+        config,
+        copy,
+        "",
+        0,
+        None,
+        &mut |_| ControlFlow::Continue(()),
+    )
 }
 
 fn fetch_copy(
@@ -87,6 +118,7 @@ fn fetch_copy(
     copy: &RemoteId,
     section: &str,
     encoded_size: u64,
+    provisional: Option<&MimePart>,
     progress: &mut dyn FnMut(u64) -> ControlFlow<()>,
 ) -> Result<Option<Vec<u8>>, Error> {
     let Some((mailbox, uidvalidity, uid)) = parse_remote_id(&copy.0)
@@ -104,9 +136,60 @@ fn fetch_copy(
         section,
         expected,
         progress,
-    );
+    )
+    .and_then(|raw| {
+        if let (Some(part), Some(raw)) = (provisional, raw.as_ref())
+            && raw.len() as u64 != part.encoded_size
+        {
+            verify_provisional_part(&mut session, uid, part, raw.len() as u64)?;
+        }
+        Ok(raw)
+    });
     session.logout();
     result
+}
+
+fn verify_provisional_part(
+    session: &mut session::Session,
+    uid: u32,
+    part: &MimePart,
+    encoded_size: u64,
+) -> Result<(), Error> {
+    let section = format!("{}.MIME", part.section);
+    let header_matches = session
+        .uid_fetch_part(uid, &section, 0, MAX_MIME_HEADER + 1, None)
+        .ok()
+        .flatten()
+        .filter(|reply| {
+            reply.origin.unwrap_or_default() == 0 && reply.bytes.len() <= MAX_MIME_HEADER
+        })
+        .and_then(|reply| super::rfc822::part_header_matches(&reply.bytes, part));
+    if header_matches == Some(true) {
+        return Ok(());
+    }
+    // Give a missing or stale response one fresh BODYSTRUCTURE. A definite
+    // disagreement with the MIME header taints these bytes either way.
+    let confirmed = session
+        .uid_structures(&uid.to_string())
+        .is_ok_and(|structures| {
+            structures
+                .into_iter()
+                .filter(|(id, _)| *id == uid)
+                .any(|(_, structure)| {
+                    structure.parts.into_iter().any(|mut candidate| {
+                        if candidate.encoded_size != encoded_size {
+                            return false;
+                        }
+                        candidate.encoded_size = part.encoded_size;
+                        candidate.size = part.size;
+                        candidate == *part
+                    })
+                })
+        });
+    if confirmed && header_matches.is_none() {
+        return Ok(());
+    }
+    Err(crate::parts::unverified_part())
 }
 
 fn fetch_windows(
