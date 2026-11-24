@@ -663,6 +663,7 @@ struct Inbox {
     attachment_busy: bool,
     attachment_retry: Option<AttachmentRequest>,
     attachment_download: Option<(String, String, Download)>,
+    attachment_metadata: attachment_chips::MetadataMotion,
     failed_attachments: HashSet<(String, String)>,
     reveal_attachment: bool,
     forwarding_attachments: bool,
@@ -897,6 +898,7 @@ impl Inbox {
             attachment_busy: false,
             attachment_retry: None,
             attachment_download: None,
+            attachment_metadata: attachment_chips::MetadataMotion::default(),
             failed_attachments: HashSet::new(),
             reveal_attachment: false,
             forwarding_attachments: false,
@@ -2779,14 +2781,14 @@ impl Inbox {
             _job: job,
         });
         cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(reader_body_worker::SHOW_AFTER)
-                .await;
-            let _ = this.update(cx, |inbox, cx| {
-                if inbox.reader_bodies.generation == generation {
-                    cx.notify();
+            for delay in [reader_body_worker::SHOW_AFTER, READER_CHIPS_AFTER] {
+                cx.background_executor()
+                    .timer(delay.saturating_sub(started.elapsed()))
+                    .await;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
                 }
-            });
+            }
         })
         .detach();
         cx.spawn(async move |this, cx| {
@@ -5249,7 +5251,12 @@ impl Render for Inbox {
             anchor: returning.map(|(anchor, _)| anchor).or(anchor),
             frames: self.frames.clone(),
             attachment_download: self.attachment_download.clone(),
-            failed_attachments: self.failed_attachments.clone(),
+            attachment_metadata: self.attachment_metadata.frame(
+                self.attachment_download.as_ref(),
+                &self.failed_attachments,
+                self.motion.motion,
+                now,
+            ),
             reveal_attachment,
             preview_current,
             quiet_preview: self.quiet_search_preview(),
@@ -5296,6 +5303,10 @@ impl Render for Inbox {
             | self.body_landing.is_some()
             | conv.missing_fade.is_some()
             | conv.part_status.values().any(|status| status.running)
+            | conv
+                .attachment_metadata
+                .values()
+                .any(|status| status.running)
             | conv.match_line.animating
             | self.row_widths.running(now)
             | self
@@ -5592,7 +5603,7 @@ struct ConvFrame {
     anchor: Option<ScrollAnchor>,
     frames: Option<SharedFrameLog>,
     attachment_download: Option<(String, String, Download)>,
-    failed_attachments: HashSet<(String, String)>,
+    attachment_metadata: HashMap<(String, String), attachment_chips::MetadataFrame>,
     reveal_attachment: bool,
     preview_current: bool,
     quiet_preview: bool,
@@ -8090,6 +8101,9 @@ struct ReaderRequest {
     _job: reader_body_worker::Job,
 }
 
+const READER_CHIPS_AFTER: Duration = Duration::from_millis(400);
+const READER_LABEL_MINIMUM: Duration = Duration::from_millis(300);
+
 #[derive(Default)]
 struct ReaderBodies {
     active: Option<ReaderRequest>,
@@ -8119,7 +8133,7 @@ enum ReaderLabel {
 #[derive(Default)]
 struct ReaderStatus {
     label: Option<ReaderLabel>,
-    since: Option<Instant>,
+    visible_since: Option<Instant>,
     arrival: Option<Transition>,
     leaving: Option<(ReaderLabel, f32, Transition)>,
 }
@@ -8137,29 +8151,36 @@ impl ReaderStatus {
         now: Instant,
         motion: Motion,
     ) -> ReaderStatusFrame {
-        // The fade gives a brief loading state a soft exit. With motion off,
-        // hold it long enough to read and change wording immediately.
-        let holding = !motion.enabled()
-            && wanted.is_none()
-            && self.since.is_some_and(|since| {
-                now.saturating_duration_since(since) < Duration::from_millis(300)
-            });
+        // Count from the first painted label, even if its wording changes.
+        // A label still at zero opacity can disappear without flashing.
+        let holding = wanted.is_none()
+            && self
+                .visible_since
+                .is_some_and(|since| now.saturating_duration_since(since) < READER_LABEL_MINIMUM);
         if !holding && wanted != self.label {
             self.leaving = self
                 .label
+                .filter(|_| self.visible_since.is_some())
                 .zip(motion.start(motion::FADE, now))
                 .map(|(label, fade)| (label, motion::progress(self.arrival.as_ref(), now), fade));
             self.arrival = wanted.and_then(|_| motion.start(motion::FADE, now));
             self.label = wanted;
-            self.since = wanted.map(|_| now);
+            if wanted.is_none() {
+                self.visible_since = None;
+            }
         }
         self.leaving = self.leaving.filter(|(_, _, fade)| fade.running(now));
+        let current = self
+            .label
+            .map(|label| (label, motion::progress(self.arrival.as_ref(), now)));
+        if current.is_some_and(|(_, alpha)| alpha > 0.) {
+            self.visible_since.get_or_insert(now);
+        }
         ReaderStatusFrame {
             layers: [
                 self.leaving
                     .map(|(label, from, fade)| (label, from * (1. - fade.progress(now)))),
-                self.label
-                    .map(|label| (label, motion::progress(self.arrival.as_ref(), now))),
+                current,
             ],
             show_chips: true,
             running: holding
@@ -8223,9 +8244,9 @@ impl ReaderBodies {
                         .or_insert(real);
                 }
                 self.body_probes.entry(message.id.clone()).or_default();
-                let past_gate = started.is_some_and(|started| {
-                    real.saturating_duration_since(*started) >= reader_body_worker::SHOW_AFTER
-                }) && !self.fast_completed.contains(&message.id);
+                let elapsed = started.map(|started| real.saturating_duration_since(*started));
+                let past_gate =
+                    elapsed.is_some_and(|elapsed| elapsed >= reader_body_worker::SHOW_AFTER);
                 let label = match parts {
                     Unavailable { html } => Some(ReaderLabel::failed(html && text)),
                     _ if message.needs_reader_parts()
@@ -8249,6 +8270,7 @@ impl ReaderBodies {
                         })
                     }
                     _ if !past_gate => None,
+                    Unknown if self.fast_completed.contains(&message.id) => None,
                     Unknown if text => Some(ReaderLabel::Checking),
                     Unknown => Some(ReaderLabel::Loading),
                     Listed { .. } if !message.needs_reader_parts() => None,
@@ -8264,20 +8286,15 @@ impl ReaderBodies {
                     motion.motion,
                 );
                 let settled = parts == Ready && message.rich != Rich::Pending;
+                let terminal = matches!(parts, Unavailable { .. })
+                    || message.body_state == fell_core::BodyState::TooLarge
+                    || self.failed.contains_key(&message.id);
                 frame.show_chips = !message.attachments.is_empty()
                     && (self.shown_chips.contains(&message.id)
-                        || past_gate
                         || settled
-                        || matches!(parts, Unavailable { .. })
-                        || message.body_state == fell_core::BodyState::TooLarge
-                        || self.failed.contains_key(&message.id));
+                        || elapsed.map_or(terminal, |elapsed| elapsed >= READER_CHIPS_AFTER));
                 if frame.show_chips && self.shown_chips.insert(message.id.clone()) {
-                    let from = if settled && !past_gate {
-                        motion::ARRIVE_FROM
-                    } else {
-                        0.
-                    };
-                    motion.attachments_arrived(&message.id, from, now);
+                    motion.attachments_arrived(&message.id, settled, now);
                 } else if message.attachments.is_empty() {
                     self.shown_chips.remove(&message.id);
                 }
@@ -8300,14 +8317,7 @@ impl ReaderBodies {
     }
 
     fn body_arrival_height(&self, old: &ConvMessage, new: &ConvMessage) -> Option<f32> {
-        let fast_arrival_with_chips = !new.attachments.is_empty()
-            && !self.shown_chips.contains(&new.id)
-            && (self.fast_completed.contains(&new.id)
-                || self
-                    .started
-                    .get(&new.id)
-                    .is_some_and(|at| at.elapsed() < reader_body_worker::SHOW_AFTER));
-        if fast_arrival_with_chips {
+        if !new.attachments.is_empty() && !self.shown_chips.contains(&new.id) {
             None
         } else {
             self.body_height(old)
@@ -8451,7 +8461,7 @@ impl BodyRefresh {
                 }
                 let managed = reader.body_probes.contains_key(id);
                 if !managed && old.attachments.is_empty() && !new.attachments.is_empty() {
-                    motion.attachments_arrived(id, 0., now);
+                    motion.attachments_arrived(id, false, now);
                 }
                 let prepared =
                     matches!(new.rich, Rich::Html(_) | Rich::PlainPart(_)) && new.rich != old.rich;
@@ -12454,6 +12464,7 @@ mod tests {
             layer(&mut status, loading, 0),
             [None, Some((ReaderLabel::Loading, 0.))]
         );
+        assert!(layer(&mut status, loading, 16)[1].unwrap().1 > 0.);
         assert_eq!(
             layer(&mut status, checking, 120),
             [
@@ -12466,9 +12477,21 @@ mod tests {
         assert!((0.0..1.0).contains(&new.unwrap().1));
         assert_eq!(
             layer(&mut status, None, 240),
+            [None, Some((ReaderLabel::Checking, 1.))]
+        );
+        assert_eq!(
+            layer(&mut status, None, 315),
+            [None, Some((ReaderLabel::Checking, 1.))]
+        );
+        assert_eq!(
+            layer(&mut status, None, 316),
             [Some((ReaderLabel::Checking, 1.)), None]
         );
-        assert_eq!(layer(&mut status, None, 360), [None, None]);
+        assert_eq!(layer(&mut status, None, 436), [None, None]);
+
+        let mut status = ReaderStatus::default();
+        layer(&mut status, loading, 0);
+        assert_eq!(layer(&mut status, None, 20), [None, None]);
 
         let mut status = ReaderStatus::default();
         let motion = motion::Motion::new(false);
@@ -12486,6 +12509,107 @@ mod tests {
             [None, Some((ReaderLabel::Loading, 1.))]
         );
         assert_eq!(layer(&mut status, None, 300), [None, None]);
+    }
+
+    #[test]
+    fn a_fast_fetch_leaves_the_gates_open_for_slow_html_preparation() {
+        use super::{BodyRefresh, InboxMotion, ReaderBodies, ReaderLabel, Rich, Session};
+        use crate::{fixtures, keymap::Keymap};
+        use fell_core::{
+            BodyState, Disposition, FolderRoles, MimePart, PartRole, ReaderParts, Store,
+            TransferEncoding,
+        };
+
+        let store = Store::open_in_memory().unwrap();
+        let account = fixtures::fixture_account();
+        store.upsert_account(&account).unwrap();
+        fixtures::seed_if_empty(&store, &account).unwrap();
+        let thread = &store.list_threads(&account.id).unwrap()[0].thread_id;
+        let mut message = super::read_conversation(
+            &store,
+            &account.id,
+            thread,
+            (&account.email, &FolderRoles::default(), &[], "INBOX"),
+        )
+        .unwrap()
+        .remove(0);
+        let id = message.id.clone();
+        message.expanded = true;
+        message.reader_parts = ReaderParts::Unknown;
+        message.rich = Rich::Pending;
+        message.body_state = BodyState::Pending;
+        message.body.blocks.clear();
+        message.attachments.push(MimePart {
+            section: "2".into(),
+            role: PartRole::Attachment,
+            mime_type: "text/plain".into(),
+            filename: Some("Release checklist.txt".into()),
+            size: 8,
+            encoded_size: 8,
+            encoding: TransferEncoding::Identity,
+            content_id: None,
+            disposition: Disposition::Attachment,
+            nested: false,
+        });
+        let mut session = Session::new(
+            String::new(),
+            account.email,
+            SyncKind::LocalOffline,
+            Keymap::default(),
+        );
+        session.set_messages(vec![message]);
+        let now = Instant::now();
+        let at = |ms| now + Duration::from_millis(ms);
+        let mut reader = ReaderBodies::default();
+        reader.started.insert(id.clone(), now);
+        reader.fast_completed.insert(id.clone());
+        let mut motion = InboxMotion::new(motion::Motion::new(false));
+
+        let waiting = reader.labels(&session, at(110), at(110), &mut motion);
+        assert_eq!(
+            waiting[&id].layers,
+            [None, None],
+            "no stale structure check after a fast fetch"
+        );
+        assert!(!waiting[&id].show_chips);
+
+        session.messages[0].reader_parts = ReaderParts::Ready;
+        session.messages[0].body_state = BodyState::Stored;
+        let waiting = reader.labels(&session, at(399), at(399), &mut motion);
+        assert_eq!(
+            waiting[&id].layers,
+            [None, Some((ReaderLabel::Loading, 1.))]
+        );
+        assert!(!waiting[&id].show_chips);
+        assert!(reader.labels(&session, at(400), at(400), &mut motion)[&id].show_chips);
+
+        let mut reader = ReaderBodies::default();
+        let mut motion = InboxMotion::new(motion::Motion::new(true));
+        reader.started.insert(id.clone(), now);
+        let pending = reader.labels(&session, at(180), at(180), &mut motion);
+        assert!(
+            !pending[&id].show_chips,
+            "serve the body and attachments together in the middle band"
+        );
+        reader.body_probes[&id].set(60.);
+        BodyRefresh {
+            rich: [(id.clone(), Rich::Plain)].into(),
+            ..BodyRefresh::default()
+        }
+        .apply(
+            &mut session,
+            &mut motion,
+            at(200),
+            |_| None,
+            false,
+            &mut reader,
+        );
+        assert!(reader.labels(&session, at(200), at(200), &mut motion)[&id].show_chips);
+        assert!(motion.body_heights(at(200)).is_empty());
+        assert_eq!(
+            motion.body_alphas(at(250))[&id],
+            motion.attachment_alphas(at(250))[&id]
+        );
     }
 
     #[test]

@@ -1230,9 +1230,21 @@ impl InboxMotion {
         }
     }
 
-    pub fn attachments_arrived(&mut self, id: &str, from: f32, now: Instant) {
-        if let Some(fade) = self.motion.start(motion::FADE, now) {
-            self.attachment_fades.insert(id.to_owned(), (fade, from));
+    pub fn attachments_arrived(&mut self, id: &str, with_body: bool, now: Instant) {
+        let fade = if with_body && let Some(body) = self.bodies.get(id) {
+            let from = if body.text.is_some() {
+                0.
+            } else {
+                motion::ARRIVE_FROM
+            };
+            Some((body.fade, from))
+        } else {
+            self.motion
+                .start(motion::FADE, now)
+                .map(|fade| (fade, if with_body { motion::ARRIVE_FROM } else { 0. }))
+        };
+        if let Some(fade) = fade {
+            self.attachment_fades.insert(id.to_owned(), fade);
         }
     }
 

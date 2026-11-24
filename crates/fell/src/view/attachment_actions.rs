@@ -12,7 +12,8 @@ use gpui::{AsyncApp, Context, WeakEntity};
 use super::Inbox;
 use crate::attachments::{self, Download, Fetcher, Opened, Request, Target};
 use crate::keymap::{self, Action};
-use crate::present::{NOTICE_DOT, display_safe};
+use crate::model::Toast;
+use crate::present::display_safe;
 use crate::store_actor::StoreClient;
 
 impl Inbox {
@@ -89,27 +90,13 @@ impl Inbox {
             Request::Open(target) => std::slice::from_ref(target),
             Request::Save(targets) => targets.as_slice(),
         };
-        let chip_visible = self.painted_reader.is_some()
-            && targets.iter().any(|target| {
-                self.session.messages.iter().any(|message| {
-                    message.expanded
-                        && message.id == target.message
-                        && message
-                            .attachments
-                            .iter()
-                            .any(|part| part.section == target.part.section)
-                })
-            });
         self.failed_attachments.extend(targets.iter().map(part_key));
         self.attachment_retry = Some(retry);
         self.session.attachment_error = Some(format!("{line}\n{}", display_safe(&detail)));
-        let toast = if chip_visible {
-            line
-        } else {
-            let key = keymap::binding_text(&self.session.keymap, Action::RetryAttachment);
-            format!("{line}{NOTICE_DOT}{key} retry")
-        };
-        self.session.show_toast(toast, true);
+        let key = keymap::binding_text(&self.session.keymap, Action::RetryAttachment);
+        let mut toast = Toast::with_hint(line, key, " to retry");
+        toast.alert = true;
+        self.session.set_toast(toast);
     }
 
     // Some xdg-open implementations wait for the viewer to exit. Reap the

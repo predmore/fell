@@ -1,5 +1,8 @@
 //! The wrapping file chips beneath an expanded message.
 
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
+
 use fell_core::MimePart;
 use gpui::{
     AnyElement, Context, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement,
@@ -7,12 +10,87 @@ use gpui::{
 };
 
 use super::{ConvFrame, Inbox, LayoutProbe, LayoutSlot, Live, conversation_line_style};
-use crate::attachments::{self, Request, Target};
-use crate::keymap::{self, Action};
+use crate::attachments::{self, Download, Request, Target};
 use crate::model::Session;
+use crate::motion::{self, Motion, Transition};
 use crate::present::ConvMessage;
 
 use crate::theme::Theme;
+
+type Key = (String, String);
+
+#[derive(Clone, Copy, Default)]
+enum Metadata {
+    #[default]
+    Size,
+    Download(Download),
+    Failed,
+}
+
+#[derive(Default)]
+pub(super) struct MetadataMotion(HashMap<Key, MetadataFade>);
+
+#[derive(Default)]
+struct MetadataFade {
+    current: Metadata,
+    change: Option<(Metadata, Transition)>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct MetadataFrame {
+    layers: [Option<(Metadata, f32)>; 2],
+    pub(super) running: bool,
+}
+
+impl MetadataMotion {
+    pub(super) fn frame(
+        &mut self,
+        download: Option<&(String, String, Download)>,
+        failed: &HashSet<Key>,
+        motion: Motion,
+        now: Instant,
+    ) -> HashMap<Key, MetadataFrame> {
+        let download =
+            download.map(|(id, section, progress)| ((id.clone(), section.clone()), *progress));
+        for key in failed.iter().chain(download.iter().map(|(key, _)| key)) {
+            self.0.entry(key.clone()).or_default();
+        }
+        let mut frames = HashMap::new();
+        self.0.retain(|key, state| {
+            let current = match download.as_ref() {
+                Some((downloading, progress)) if key == downloading => {
+                    Metadata::Download(*progress)
+                }
+                _ if failed.contains(key) => Metadata::Failed,
+                _ => Metadata::Size,
+            };
+            if std::mem::discriminant(&state.current) != std::mem::discriminant(&current) {
+                state.change = motion
+                    .start(motion::FADE, now)
+                    .map(|fade| (state.current, fade));
+            }
+            state.current = current;
+            state.change = state.change.filter(|(_, fade)| fade.running(now));
+            let alpha = state.change.map_or(1., |(_, fade)| fade.progress(now));
+            let running = state.change.is_some();
+            if !running && matches!(current, Metadata::Size) {
+                return false;
+            }
+            frames.insert(
+                key.clone(),
+                MetadataFrame {
+                    layers: [
+                        state.change.map(|(old, _)| (old, 1. - alpha)),
+                        Some((current, alpha)),
+                    ],
+                    running,
+                },
+            );
+            true
+        });
+        frames
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn row(
@@ -32,14 +110,13 @@ pub(super) fn row(
         .filter(|target| target.message == message.id);
     let max_width = width.min(338.0);
     let font_size = (theme.ui_px - 1.0).max(12.0);
+    let name_style = conversation_line_style(window, theme, px(font_size));
     let style = conversation_line_style(window, theme, px(font_size - 1.0));
     let measure =
         |text: &str| super::line_px_with_style(window, &style, text, FontWeight::NORMAL).ceil();
-    let retry = format!(
-        "Failed · {} retry",
-        keymap::binding_text(&session.keymap, Action::RetryAttachment)
-    );
-    let status_width = ["Downloading", "↓ 100%", &retry]
+    // Size and status take turns in one column. Their content never changes
+    // the width available to the filename or moves a chip onto another row.
+    let metadata_width = ["999.9 MiB", "Downloading", "↓ 100%", "Failed"]
         .into_iter()
         .map(measure)
         .fold(0.0, f32::max);
@@ -89,18 +166,16 @@ pub(super) fn row(
                         .map(|((old, fade), now)| {
                             (attachments::size_label(old), fade.progress(now))
                         });
-                    let failed = download.is_none() && frame.failed_attachments.contains(&key);
-                    let status = if let Some(progress) = download {
-                        if progress.total == 0 {
-                            "Downloading".to_owned()
-                        } else {
-                            format!("↓ {}", progress.label())
-                        }
-                    } else if failed {
-                        retry.clone()
-                    } else {
-                        String::new()
-                    };
+                    let layers = frame
+                        .attachment_metadata
+                        .get(&key)
+                        .map_or([None, Some((Metadata::Size, 1.))], |metadata| {
+                            metadata.layers
+                        });
+                    // Two borders, two pads, two gaps, and the file icon.
+                    let name_room = (max_width - metadata_width - 48.).max(0.);
+                    let name =
+                        fit_filename(&attachments::name(part), name_room, &name_style, window);
                     let accent = theme.accent;
                     let icon = file_icon(part, meta);
                     let chip = div()
@@ -162,39 +237,48 @@ pub(super) fn row(
                                 )
                         })
                         .child(icon)
-                        .child(
-                            div()
-                                .min_w(px(0.))
-                                .truncate()
-                                .child(attachments::name(part)),
-                        )
+                        .child(div().min_w(px(0.)).whitespace_nowrap().child(name))
                         .child(
                             div()
                                 .relative()
                                 .flex_shrink_0()
-                                .w(px(measure("999 MB").max(measure(&size))))
+                                .w(px(metadata_width))
+                                .h(px(font_size * 1.3))
                                 .text_right()
                                 .text_color(rgb(meta))
                                 .text_size(px(font_size - 1.0))
                                 .whitespace_nowrap()
-                                .child(
-                                    div()
-                                        .opacity(fading.as_ref().map_or(1.0, |(_, alpha)| *alpha))
-                                        .child(size),
-                                )
-                                .children(fading.map(|(old, alpha)| {
-                                    div().absolute().inset_0().opacity(1.0 - alpha).child(old)
+                                .children(layers.into_iter().flatten().map(|(metadata, alpha)| {
+                                    let layer = div().absolute().inset_0().opacity(alpha);
+                                    match metadata {
+                                        Metadata::Size => layer
+                                            .child(
+                                                div()
+                                                    .opacity(
+                                                        fading
+                                                            .as_ref()
+                                                            .map_or(1., |(_, alpha)| *alpha),
+                                                    )
+                                                    .child(size.clone()),
+                                            )
+                                            .children(fading.as_ref().map(|(old, alpha)| {
+                                                div()
+                                                    .absolute()
+                                                    .inset_0()
+                                                    .opacity(1. - alpha)
+                                                    .child(old.clone())
+                                            })),
+                                        Metadata::Download(progress) if progress.total == 0 => {
+                                            layer.child("Downloading")
+                                        }
+                                        Metadata::Download(progress) => {
+                                            layer.child(format!("↓ {}", progress.label()))
+                                        }
+                                        Metadata::Failed => {
+                                            layer.text_color(rgb(theme.error)).child("Failed")
+                                        }
+                                    }
                                 })),
-                        )
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .w(px(status_width))
-                                .text_right()
-                                .text_color(rgb(if failed { theme.error } else { meta }))
-                                .text_size(px(font_size - 1.0))
-                                .whitespace_nowrap()
-                                .child(status),
                         )
                         .children(download.map(|progress| {
                             let shown = if progress.total == 0 {
@@ -228,6 +312,23 @@ pub(super) fn row(
                     }
                 }),
         )
+}
+
+fn fit_filename(name: &str, width: f32, style: &gpui::TextStyle, window: &Window) -> String {
+    let fit = |text: &str, width| super::clip_line(window, style, text, width, FontWeight::NORMAL);
+    let measure = |text: &str| super::line_px_with_style(window, style, text, FontWeight::NORMAL);
+    let clipped = fit(name, width);
+    if clipped != name
+        && let Some((stem, extension)) = name.rsplit_once('.')
+    {
+        let tail = format!(".{extension}");
+        let stem = fit(stem, (width - measure(&tail)).max(0.));
+        let kept = format!("{stem}{tail}");
+        if stem.ends_with('…') && stem != "…" && measure(&kept) <= width {
+            return kept;
+        }
+    }
+    clipped
 }
 
 fn file_icon(part: &MimePart, color: u32) -> AnyElement {
