@@ -5283,7 +5283,7 @@ fn provisional_wire_size_mismatches_check_the_part_mime_headers() {
             )
             .unwrap();
         store
-            .store_structures(&acct.id, &[(id.clone(), copy, contents)])
+            .store_structures(&acct.id, &[(id.clone(), copy, contents)], true)
             .unwrap();
         assert_eq!(
             store
@@ -5440,6 +5440,74 @@ fn a_part_exactly_one_window_long_is_fetched_once() {
         commands(&server)
     );
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn opening_a_server_draft_waits_for_the_attachment_session_to_close() {
+    use std::ops::ControlFlow;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let fixture = super::mime_fixtures::mixed_two_attachments("draft@example.test");
+    let server =
+        TestServer::spawn_parallel(inbox_state(vec![(1, fixture.raw)]), Default::default());
+    let config = config(server.addr.port());
+    let copy = crate::RemoteId("imap:20:1:INBOX".into());
+    let (arrived, attachment_active) = mpsc::channel();
+    let (release, attachment_release) = mpsc::channel();
+    let (opening, draft_started) = mpsc::channel();
+    let (done, draft_finished) = mpsc::channel();
+    std::thread::scope(|scope| {
+        let attachment_config = &config;
+        let attachment_copy = &copy;
+        scope.spawn(move || {
+            let mut arrived = Some(arrived);
+            super::part_fetch::fetch_part(attachment_config, attachment_copy, "2", 0, &mut |_| {
+                if let Some(arrived) = arrived.take() {
+                    arrived.send(()).unwrap();
+                    attachment_release
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                }
+                ControlFlow::Continue(())
+            })
+            .unwrap()
+            .unwrap();
+        });
+        attachment_active
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let draft_config = &config;
+        let draft_copy = &copy;
+        scope.spawn(move || {
+            opening.send(()).unwrap();
+            done.send(super::part_fetch::fetch_draft(draft_config, draft_copy))
+                .unwrap();
+        });
+        draft_started.recv_timeout(Duration::from_secs(5)).unwrap();
+        let early = draft_finished.recv_timeout(Duration::from_millis(150));
+        release.send(()).unwrap();
+        assert!(matches!(early, Err(mpsc::RecvTimeoutError::Timeout)));
+        assert!(
+            draft_finished
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .is_some()
+        );
+    });
+    let commands = commands(&server);
+    let logins: Vec<_> = commands
+        .iter()
+        .enumerate()
+        .filter(|(_, command)| command.contains("LOGIN"))
+        .collect();
+    let logout = commands
+        .iter()
+        .position(|command| command.contains(" LOGOUT"))
+        .unwrap();
+    assert_eq!(logins.len(), 2, "{commands:?}");
+    assert!(logins[0].0 < logout && logout < logins[1].0, "{commands:?}");
 }
 
 #[test]

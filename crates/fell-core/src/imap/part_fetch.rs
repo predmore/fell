@@ -7,7 +7,9 @@
 //! (up to the 32 MB literal cap). The bytes come back still
 //! transfer-encoded; decoding is the caller's job.
 
+use std::collections::HashMap;
 use std::ops::ControlFlow;
+use std::sync::{Arc, Mutex, OnceLock, TryLockError, Weak};
 
 use crate::Error;
 use crate::message::{MimePart, RemoteId};
@@ -24,6 +26,22 @@ const WINDOW: usize = 2 * 1024 * 1024;
 pub(crate) const MAX_ENCODED_PART: usize = 96 * 1024 * 1024;
 
 const MAX_MIME_HEADER: usize = 64 * 1024;
+
+type DownloadAccount = (String, u16, String);
+type DownloadLanes = HashMap<DownloadAccount, Weak<Mutex<()>>>;
+
+fn download_lane(config: &ImapConfig) -> Arc<Mutex<()>> {
+    static LANES: OnceLock<Mutex<DownloadLanes>> = OnceLock::new();
+    let mut lanes = LANES.get_or_init(Mutex::default).lock().unwrap();
+    let account = (config.host.clone(), config.port, config.username.clone());
+    if let Some(lane) = lanes.get(&account).and_then(Weak::upgrade) {
+        return lane;
+    }
+    lanes.retain(|_, lane| lane.strong_count() != 0);
+    let lane = Arc::new(Mutex::new(()));
+    lanes.insert(account, Arc::downgrade(&lane));
+    lane
+}
 
 fn window() -> usize {
     #[cfg(test)]
@@ -125,6 +143,22 @@ fn fetch_copy(
         .and_then(|copy| Some((unescape_mailbox(&copy.mailbox)?, copy.uidvalidity, copy.uid)))
     else {
         return Ok(None);
+    };
+    // Draft imports and attachment downloads share a session slot, even
+    // when their callers use different workers or backend instances.
+    let lane = download_lane(config);
+    let _slot = match lane.try_lock() {
+        Ok(slot) => slot,
+        Err(TryLockError::Poisoned(err)) => err.into_inner(),
+        Err(TryLockError::WouldBlock) => {
+            let slot = lane
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if progress(0).is_break() {
+                return Err(Error::Backend(CANCELLED.into()));
+            }
+            slot
+        }
     };
     let mut session = session::Session::open(config)?;
     let expected = usize::try_from(encoded_size).unwrap_or(usize::MAX);
