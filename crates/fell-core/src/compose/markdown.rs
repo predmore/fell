@@ -87,12 +87,17 @@ pub(crate) fn document_to_markdown(blocks: &[fell_render::Block]) -> String {
                     )
                 }
                 Block::Paragraph { inlines } => markdown_inlines(inlines),
-                Block::List { ordered, items } => items
+                Block::List {
+                    ordered,
+                    start,
+                    style,
+                    items,
+                } => items
                     .iter()
                     .enumerate()
                     .map(|(index, item)| {
                         let prefix = if *ordered {
-                            format!("{}. ", index + 1)
+                            format!("{} ", style.label(start.saturating_add(index as u64)))
                         } else {
                             "- ".into()
                         };

@@ -7595,7 +7595,7 @@ fn tabular_style(window: &Window, theme: &Theme, size: f32) -> TextStyle {
     style
 }
 
-fn tabular_figures() -> gpui::FontFeatures {
+pub(crate) fn tabular_figures() -> gpui::FontFeatures {
     static FEATURES: OnceLock<gpui::FontFeatures> = OnceLock::new();
     FEATURES
         .get_or_init(|| gpui::FontFeatures(Arc::new(vec![("tnum".into(), 1)])))
@@ -8817,6 +8817,7 @@ fn expanded_message(
                 live: live.0,
             },
             frame,
+            window,
             cx,
         ))
         .when(!message.attachments.is_empty(), |card| {
@@ -8872,12 +8873,17 @@ fn message_body(
     message: &ConvMessage,
     folds: FoldView,
     frame: &ConvFrame,
+    window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
     let (alpha, outgoing) = frame.body_labels(message);
     let body = match present::missing_body_line(message.body_state, frame.syncing) {
         Some(line) => missing_message_body(theme, folds.columns, &line, alpha),
-        None => stored_message_body(theme, message, folds, frame, alpha, cx),
+        None => {
+            let style = conversation_line_style(window, theme, px(theme.ui_px));
+            let markers = crate::render::ListMarkerFont::new(window, style);
+            stored_message_body(theme, message, folds, frame, alpha, &markers, cx)
+        }
     };
     let Some(line) = outgoing else {
         return body;
@@ -8942,13 +8948,14 @@ fn stored_message_body(
     folds: FoldView,
     frame: &ConvFrame,
     alpha: f32,
+    markers: &crate::render::ListMarkerFont,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
     let reveal = frame.disclosures().quotes.get(&message.id).copied();
     if let Rich::Html(body) = &message.rich {
         return div()
             .opacity(alpha)
-            .children(html_sections(theme, body, folds, reveal, cx))
+            .children(html_sections(theme, body, folds, reveal, markers, cx))
             .into_any_element();
     }
     let blocks: Vec<gpui::AnyElement> = match &message.rich {
@@ -8962,16 +8969,23 @@ fn stored_message_body(
             let palette = mail_body::palette(theme);
             let quiet = mail_body::history_palette(theme);
             let mut runs: Vec<(usize, Option<fell_render::Fold>, Vec<&str>)> = Vec::new();
-            let mut drafts = HashMap::new();
             let body = match &message.rich {
                 Rich::PlainPart(plain) => plain,
                 _ => &message.body,
             };
+            let markers = markers.with_top_level_lists(
+                body.blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        BodyBlock::List(blocks) => Some(blocks.iter()),
+                        _ => None,
+                    })
+                    .flatten(),
+            );
             for (at, block) in body.blocks.iter().enumerate() {
                 let (kind, text) = match block {
                     BodyBlock::Text(text) => (None, text.as_str()),
-                    BodyBlock::Markdown { doc, agent } => {
-                        drafts.insert(at, (doc, *agent));
+                    BodyBlock::List(_) | BodyBlock::Markdown { .. } => {
                         runs.push((at, None, Vec::new()));
                         continue;
                     }
@@ -8995,6 +9009,22 @@ fn stored_message_body(
             runs.into_iter()
                 .enumerate()
                 .map(|(run, (at, kind, texts))| match kind {
+                    None if let BodyBlock::List(blocks) = &body.blocks[at] => div()
+                        .pt(px(14.))
+                        .pb(px(22.))
+                        .child(
+                            crate::render::blocks_column_spaced(
+                                blocks,
+                                &palette,
+                                false,
+                                &crate::render::ImageGallery::default(),
+                                folds.columns.blocks(folds.fill),
+                                crate::render::BLOCK_GAP,
+                                &markers,
+                            )
+                            .line_height(px(theme.ui_px * 1.45)),
+                        )
+                        .into_any_element(),
                     None => {
                         let text = texts.concat();
                         folds.columns.flow(
@@ -9003,11 +9033,11 @@ fn stored_message_body(
                                 div()
                                     .pb(px(8.))
                                     .line_height(px(theme.ui_px * 1.45))
-                                    .map(|block| match drafts.get(&at) {
-                                        Some((doc, agent)) => block.child(
+                                    .map(|block| match &body.blocks[at] {
+                                        BodyBlock::Markdown { doc, agent } => block.child(
                                             crate::compose_ui::render_draft_doc(doc, *agent, theme),
                                         ),
-                                        None => block.child(crate::render::plain_text(
+                                        _ => block.child(crate::render::plain_text(
                                             text.clone(),
                                             palette,
                                         )),
@@ -9064,12 +9094,14 @@ fn html_sections(
     body: &HtmlBody,
     folds: FoldView,
     reveal: Option<f32>,
+    markers: &crate::render::ListMarkerFont,
     cx: &mut Context<Inbox>,
 ) -> Vec<gpui::AnyElement> {
     let palette = mail_body::palette(theme);
     let quiet = mail_body::history_palette(theme);
     let line = px(theme.ui_px * 1.45);
     let folded = &body.folded;
+    let top_level_markers = markers.with_top_level_lists(&folded.document.blocks);
     let columns = folds.columns;
     let first_fold = folded
         .sections
@@ -9097,7 +9129,7 @@ fn html_sections(
                         None,
                         &quiet,
                         &body.gallery,
-                        (theme, rtl, layout),
+                        (theme, rtl, layout, markers),
                     ))
                     .into_any_element(),
                 // A short signature shown in place ("Sent from my iPhone")
@@ -9116,6 +9148,7 @@ fn html_sections(
                             &body.gallery,
                             layout,
                             crate::render::BLOCK_GAP,
+                            &top_level_markers,
                         )
                         .line_height(line),
                     )
@@ -9139,7 +9172,7 @@ fn html_sections(
                                 Some(kind),
                                 &history,
                                 &body.gallery,
-                                (theme, rtl, layout),
+                                (theme, rtl, layout, markers),
                             )
                         },
                         cx,
@@ -9155,7 +9188,12 @@ fn history_section(
     kind: Option<fell_render::Fold>,
     palette: &crate::render::Palette,
     gallery: &crate::render::ImageGallery,
-    (theme, rtl, layout): (&Theme, bool, crate::render::BlockColumns),
+    (theme, rtl, layout, markers): (
+        &Theme,
+        bool,
+        crate::render::BlockColumns,
+        &crate::render::ListMarkerFont,
+    ),
 ) -> gpui::AnyElement {
     let (rule, layout) = layout.quote(
         div(),
@@ -9170,7 +9208,7 @@ fn history_section(
             kind,
             palette,
             gallery,
-            (theme, rtl, layout),
+            (theme, rtl, layout, markers),
         ))
         .into_any_element()
 }
@@ -9199,7 +9237,12 @@ fn history_blocks(
     kind: Option<fell_render::Fold>,
     history: &crate::render::Palette,
     gallery: &crate::render::ImageGallery,
-    (theme, rtl, layout): (&Theme, bool, crate::render::BlockColumns),
+    (theme, rtl, layout, markers): (
+        &Theme,
+        bool,
+        crate::render::BlockColumns,
+        &crate::render::ListMarkerFont,
+    ),
 ) -> gpui::AnyElement {
     use fell_render::{Block, Fold};
     let nested = matches!(
@@ -9208,7 +9251,7 @@ fn history_blocks(
     );
     let line_height = px(theme.ui_px * 1.4);
     let column = |run: &[Block], layout| {
-        crate::render::blocks_column_spaced(run, history, false, gallery, layout, 8.)
+        crate::render::blocks_column_spaced(run, history, false, gallery, layout, 8., markers)
             .line_height(line_height)
     };
     div()

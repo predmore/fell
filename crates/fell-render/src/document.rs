@@ -20,6 +20,9 @@ pub enum Block {
     },
     List {
         ordered: bool,
+        /// The sender's first ordinal for an ordered list.
+        start: u64,
+        style: ListLabelStyle,
         items: Vec<ListItem>,
     },
     Quote {
@@ -68,6 +71,68 @@ pub enum Align {
     Center,
     End,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ListLabelStyle {
+    #[default]
+    Decimal,
+    LowerAlpha,
+    UpperAlpha,
+    LowerRoman,
+    UpperRoman,
+}
+
+impl ListLabelStyle {
+    /// The label as it appears in the reader, including the period.
+    pub fn label(self, value: u64) -> String {
+        let mut label = match self {
+            Self::LowerAlpha | Self::UpperAlpha if value > 0 => {
+                let base = if self == Self::LowerAlpha { b'a' } else { b'A' };
+                let mut value = value;
+                let mut letters = Vec::new();
+                while value > 0 {
+                    value -= 1;
+                    letters.push(char::from(base + (value % 26) as u8));
+                    value /= 26;
+                }
+                letters.into_iter().rev().collect()
+            }
+            Self::LowerRoman | Self::UpperRoman if (1..=3999).contains(&value) => {
+                let mut remaining = value;
+                let mut label = String::new();
+                for (number, letters) in ROMAN_DIGITS {
+                    while remaining >= number {
+                        label.push_str(letters);
+                        remaining -= number;
+                    }
+                }
+                if self == Self::UpperRoman {
+                    label.make_ascii_uppercase();
+                }
+                label
+            }
+            _ => value.to_string(),
+        };
+        label.push('.');
+        label
+    }
+}
+
+pub(crate) const ROMAN_DIGITS: [(u64, &str); 13] = [
+    (1000, "m"),
+    (900, "cm"),
+    (500, "d"),
+    (400, "cd"),
+    (100, "c"),
+    (90, "xc"),
+    (50, "l"),
+    (40, "xl"),
+    (10, "x"),
+    (9, "ix"),
+    (5, "v"),
+    (4, "iv"),
+    (1, "i"),
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListItem {
@@ -130,8 +195,17 @@ fn push_block(out: &mut String, block: &Block) {
             push_inlines(out, inlines);
             out.push('\n');
         }
-        Block::List { items, .. } => {
-            for item in items {
+        Block::List {
+            ordered,
+            start,
+            style,
+            items,
+        } => {
+            for (index, item) in items.iter().enumerate() {
+                if *ordered {
+                    out.push_str(&style.label(start.saturating_add(index as u64)));
+                    out.push(' ');
+                }
                 for child in &item.blocks {
                     push_block(out, child);
                 }

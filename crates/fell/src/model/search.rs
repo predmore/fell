@@ -927,6 +927,9 @@ fn folded_match(message: &ConvMessage, preview: &SearchPreview) -> bool {
             for block in &body.blocks {
                 match block {
                     BodyBlock::Text(text) => include(false, text),
+                    BodyBlock::List(blocks) => {
+                        include(false, &fell_render::StyledDocument::blocks_text(blocks))
+                    }
                     BodyBlock::Quote(text) | BodyBlock::Signature(text) => include(true, text),
                     BodyBlock::Markdown { .. } => {}
                 }

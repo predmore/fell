@@ -1,6 +1,6 @@
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
-use crate::document::{Block, Inline, ListItem, StyledDocument};
+use crate::document::{Block, Inline, ListItem, ListLabelStyle, StyledDocument};
 use crate::html::image_source_from_markdown;
 
 /// Markdown the composer will edit, turned into the same tree HTML mail uses.
@@ -25,12 +25,20 @@ pub fn markdown_to_document(markdown: &str) -> StyledDocument {
                 }
             }
             Event::Start(Tag::List(first)) => stack.push(Frame::List {
-                ordered: first.is_some(),
+                start: first,
                 items: Vec::new(),
             }),
             Event::End(TagEnd::List(_)) => {
-                if let Some(Frame::List { ordered, items }) = stack.pop() {
-                    push_block(&mut stack, Block::List { ordered, items });
+                if let Some(Frame::List { start, items }) = stack.pop() {
+                    push_block(
+                        &mut stack,
+                        Block::List {
+                            ordered: start.is_some(),
+                            start: start.unwrap_or(1),
+                            style: ListLabelStyle::Decimal,
+                            items,
+                        },
+                    );
                 }
             }
             Event::Start(Tag::Item) => stack.push(Frame::Item(Vec::new())),
@@ -118,10 +126,19 @@ pub fn markdown_to_document(markdown: &str) -> StyledDocument {
 enum Frame {
     Blocks(Vec<Block>),
     Item(Vec<Block>),
-    List { ordered: bool, items: Vec<ListItem> },
+    List {
+        start: Option<u64>,
+        items: Vec<ListItem>,
+    },
     Inlines(Vec<Inline>),
-    Link { href: String, children: Vec<Inline> },
-    Image { src: String, alt: String },
+    Link {
+        href: String,
+        children: Vec<Inline>,
+    },
+    Image {
+        src: String,
+        alt: String,
+    },
 }
 
 enum Wrap {

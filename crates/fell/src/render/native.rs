@@ -4,7 +4,7 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use fell_render::{Align, Block, ImageSource, Inline, ListItem, StyledDocument};
+use fell_render::{Align, Block, ImageSource, Inline, ListItem, ListLabelStyle, StyledDocument};
 use gpui::{
     AnyElement, App, Bounds, Element, ElementId, FontStyle, FontWeight, GlobalElementId,
     HighlightStyle, InspectorElementId, IntoElement, LayoutId, Pixels, RenderImage, SharedString,
@@ -28,6 +28,7 @@ struct CachedImage {
     height: f32,
 }
 
+#[derive(Default)]
 pub struct ImageGallery {
     decoded: HashMap<usize, CachedImage>,
     held: Vec<Arc<RenderImage>>,
@@ -35,10 +36,7 @@ pub struct ImageGallery {
 
 impl ImageGallery {
     pub fn from_document(document: &StyledDocument) -> Self {
-        let mut gallery = Self {
-            decoded: HashMap::new(),
-            held: Vec::new(),
-        };
+        let mut gallery = Self::default();
         let mut used = 0u64;
         let mut visit = |source: &ImageSource| {
             let ImageSource::Data { bytes, .. } = source else {
@@ -188,15 +186,23 @@ pub fn document_column(
     allow_remote: bool,
     gallery: &ImageGallery,
     width: f32,
+    markers: &ListMarkerFont,
 ) -> gpui::Div {
     if document.is_empty() {
-        return blocks_column(&[], palette, allow_remote, gallery, width).child(
+        return blocks_column(&[], palette, allow_remote, gallery, width, markers).child(
             div()
                 .text_color(paint(palette.dimmed))
                 .child("This message has no body."),
         );
     }
-    blocks_column(&document.blocks, palette, allow_remote, gallery, width)
+    blocks_column(
+        &document.blocks,
+        palette,
+        allow_remote,
+        gallery,
+        width,
+        markers,
+    )
 }
 
 /// A run of a document's blocks, as [`document_column`] paints them. The
@@ -208,7 +214,9 @@ pub fn blocks_column(
     allow_remote: bool,
     gallery: &ImageGallery,
     width: f32,
+    markers: &ListMarkerFont,
 ) -> gpui::Div {
+    let markers = markers.with_top_level_lists(blocks);
     blocks_column_spaced(
         blocks,
         palette,
@@ -216,6 +224,7 @@ pub fn blocks_column(
         gallery,
         BlockColumn::full(width),
         BLOCK_GAP,
+        &markers,
     )
 }
 
@@ -227,6 +236,7 @@ pub(crate) struct BlockColumn {
     wide_inset: f32,
     reader: Option<ReaderTable>,
     quote_color: Option<u32>,
+    list_depth: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -246,6 +256,7 @@ impl BlockColumn {
             wide_inset: 0.0,
             reader: None,
             quote_color: None,
+            list_depth: 0,
         }
     }
 
@@ -268,6 +279,7 @@ impl BlockColumn {
                 pane_right,
             }),
             quote_color: None,
+            list_depth: 0,
         }
     }
 
@@ -284,6 +296,14 @@ impl BlockColumn {
                 width: (self.width - indent).max(0.0),
                 ..self
             },
+        }
+    }
+
+    fn list_marker_width(self, local: f32, top_level: f32) -> f32 {
+        if self.list_depth == 0 {
+            local.max(top_level)
+        } else {
+            local
         }
     }
 
@@ -508,6 +528,65 @@ fn uses_wide_column(block: &Block) -> bool {
 /// A comfortable line of mail text, about 72 characters.
 pub(crate) const READING_MEASURE_PX: f32 = 600.0;
 
+/// The reader's font before the parent element applies it during layout.
+#[derive(Clone)]
+pub struct ListMarkerFont<'a> {
+    window: &'a Window,
+    style: gpui::TextStyle,
+    top_level_width: f32,
+}
+
+impl<'a> ListMarkerFont<'a> {
+    pub fn new(window: &'a Window, mut style: gpui::TextStyle) -> Self {
+        style.font_features = crate::view::tabular_figures();
+        Self {
+            window,
+            style,
+            top_level_width: LIST_MIN_MARKER_PX,
+        }
+    }
+
+    pub(crate) fn with_top_level_lists<'b>(
+        &self,
+        blocks: impl IntoIterator<Item = &'b Block>,
+    ) -> Self {
+        Self {
+            top_level_width: widest_top_level_marker(blocks, |label| self.width(label)),
+            ..self.clone()
+        }
+    }
+
+    fn with_size(&self, font_size: Pixels) -> Self {
+        let mut style = self.style.clone();
+        style.font_size = font_size.into();
+        Self {
+            style,
+            ..self.clone()
+        }
+    }
+
+    fn size(&self) -> Pixels {
+        self.style.font_size.to_pixels(self.window.rem_size())
+    }
+
+    fn width(&self, label: &SharedString) -> f32 {
+        let run = self.style.to_run(label.len());
+        self.window
+            .text_system()
+            .shape_line(label.clone(), self.size(), &[run], None)
+            .width
+            .into()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BlockPaint<'a> {
+    palette: &'a Palette,
+    allow_remote: bool,
+    gallery: &'a ImageGallery,
+    markers: &'a ListMarkerFont<'a>,
+}
+
 /// [`blocks_column`] with `gap` between blocks instead of [`BLOCK_GAP`]:
 /// opened history sits tighter than the sender's own paragraphs.
 pub(crate) fn blocks_column_spaced(
@@ -517,11 +596,18 @@ pub(crate) fn blocks_column_spaced(
     gallery: &ImageGallery,
     layout: impl Into<BlockColumns>,
     gap: f32,
+    markers: &ListMarkerFont,
 ) -> gpui::Div {
     // A short letter should reach the lower part of the pane. The gaps and
     // line height do that without adding a fake closing rule.
     let mut column = div().flex().flex_col().line_height(px(22.));
     let layout = layout.into();
+    let context = BlockPaint {
+        palette,
+        allow_remote,
+        gallery,
+        markers,
+    };
     let mut previous: Option<&Block> = None;
     for (start, end) in column_runs(blocks, allow_remote, gallery) {
         let run = &blocks[start..end];
@@ -533,20 +619,13 @@ pub(crate) fn blocks_column_spaced(
             },
         ] = run
         {
-            render_table(header, rows, align, palette, allow_remote, gallery, layout)
+            render_table(header, rows, align, context, layout)
         } else {
             layout.draw(run, |layout| {
                 if end - start == 2 {
-                    sketch_with_caption(
-                        &blocks[start],
-                        &blocks[start + 1],
-                        palette,
-                        allow_remote,
-                        gallery,
-                        layout,
-                    )
+                    sketch_with_caption(&blocks[start], &blocks[start + 1], context, layout)
                 } else {
-                    render_block(&blocks[start], palette, allow_remote, gallery, layout)
+                    render_block(&blocks[start], context, layout)
                 }
             })
         };
@@ -589,23 +668,15 @@ fn gap_between(above: &Block, block: &Block) -> f32 {
 fn sketch_with_caption(
     sketch: &Block,
     caption: &Block,
-    palette: &Palette,
-    allow_remote: bool,
-    gallery: &ImageGallery,
+    context: BlockPaint,
     layout: BlockColumn,
 ) -> AnyElement {
     div()
         .flex()
         .flex_col()
         .gap(px(CAPTION_GAP))
-        .child(render_block(sketch, palette, allow_remote, gallery, layout))
-        .child(render_block(
-            caption,
-            palette,
-            allow_remote,
-            gallery,
-            layout,
-        ))
+        .child(render_block(sketch, context, layout))
+        .child(render_block(caption, context, layout))
         .into_any_element()
 }
 
@@ -674,13 +745,13 @@ fn paints_placeholder(source: &ImageSource, allow_remote: bool, gallery: &ImageG
     }
 }
 
-fn render_block(
-    block: &Block,
-    palette: &Palette,
-    allow_remote: bool,
-    gallery: &ImageGallery,
-    layout: BlockColumn,
-) -> AnyElement {
+fn render_block(block: &Block, context: BlockPaint, layout: BlockColumn) -> AnyElement {
+    let BlockPaint {
+        palette,
+        allow_remote,
+        gallery,
+        markers,
+    } = context;
     match block {
         Block::Heading { level, inlines } => {
             let mut heading = div().font_weight(FontWeight::BOLD);
@@ -719,6 +790,12 @@ fn render_block(
                 foreground: palette.dimmed,
                 ..*palette
             };
+            let small = markers.with_size(px(FINE_PRINT_PX));
+            let context = BlockPaint {
+                palette: &quiet,
+                markers: &small,
+                ..context
+            };
             div()
                 .text_size(px(FINE_PRINT_PX))
                 .line_height(px(18.))
@@ -729,7 +806,7 @@ fn render_block(
                 .children(
                     blocks
                         .iter()
-                        .map(|child| render_block(child, &quiet, allow_remote, gallery, layout)),
+                        .map(|child| render_block(child, context, layout)),
                 )
                 .into_any_element()
         }
@@ -740,7 +817,7 @@ fn render_block(
             .children(
                 blocks
                     .iter()
-                    .map(|child| render_block(child, palette, allow_remote, gallery, layout)),
+                    .map(|child| render_block(child, context, layout)),
             )
             .into_any_element(),
         Block::Quote { blocks } => {
@@ -754,26 +831,38 @@ fn render_block(
                 .children(
                     blocks
                         .iter()
-                        .map(|child| render_block(child, palette, allow_remote, gallery, layout)),
+                        .map(|child| render_block(child, context, layout)),
                 )
                 .into_any_element()
         }
-        Block::List { ordered, items } => div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .children(items.iter().enumerate().map(|(index, item)| {
-                list_item(
-                    index,
-                    *ordered,
-                    item,
-                    palette,
-                    allow_remote,
-                    gallery,
-                    layout,
+        Block::List {
+            ordered,
+            start,
+            style,
+            items,
+        } => {
+            let labels: Vec<_> =
+                list_labels(*ordered, *start, *style, items.len(), layout.list_depth).collect();
+            let distinct_labels = if *ordered {
+                labels.as_slice()
+            } else {
+                &labels[..labels.len().min(1)]
+            };
+            let local_width =
+                marker_width(distinct_labels.iter().map(|label| markers.width(label)));
+            let marker_width = layout.list_marker_width(local_width, markers.top_level_width);
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .children(
+                    items
+                        .iter()
+                        .zip(labels)
+                        .map(|(item, label)| list_item(item, label, marker_width, context, layout)),
                 )
-            }))
-            .into_any_element(),
+                .into_any_element()
+        }
         Block::Code { text, large: false } => layout
             .wide(
                 div().child(
@@ -807,15 +896,7 @@ fn render_block(
             header,
             rows,
             align,
-        } => render_table(
-            header,
-            rows,
-            align,
-            palette,
-            allow_remote,
-            gallery,
-            layout.into(),
-        ),
+        } => render_table(header, rows, align, context, layout.into()),
         Block::Image { source, alt } => {
             image_el(source, alt, palette, allow_remote, gallery, layout)
         }
@@ -827,21 +908,64 @@ fn render_block(
 
 const QUOTE_RULE_PX: f32 = 3.;
 const QUOTE_INSET_PX: f32 = QUOTE_RULE_PX + 16.;
-const LIST_MARKER_PX: f32 = 19.;
+const LIST_MARKER_GAP_PX: f32 = 6.;
+const LIST_MIN_MARKER_PX: f32 = 18.;
+const LIST_BULLETS: [&str; 3] = ["•", "◦", "▪"];
+
+fn list_labels(
+    ordered: bool,
+    start: u64,
+    style: ListLabelStyle,
+    len: usize,
+    depth: usize,
+) -> impl Iterator<Item = SharedString> {
+    (0..len).map(move |index| {
+        if ordered {
+            style.label(start.saturating_add(index as u64)).into()
+        } else {
+            LIST_BULLETS[depth % LIST_BULLETS.len()].into()
+        }
+    })
+}
+
+fn marker_width(widths: impl Iterator<Item = f32>) -> f32 {
+    widths.fold(LIST_MIN_MARKER_PX, f32::max).ceil()
+}
+
+fn widest_top_level_marker<'a>(
+    blocks: impl IntoIterator<Item = &'a Block>,
+    mut measure: impl FnMut(&SharedString) -> f32,
+) -> f32 {
+    let labels = blocks.into_iter().filter_map(|block| {
+        let Block::List {
+            ordered,
+            start,
+            style,
+            items,
+        } = block
+        else {
+            return None;
+        };
+        let len = if *ordered {
+            items.len()
+        } else {
+            items.len().min(1)
+        };
+        Some(list_labels(*ordered, *start, *style, len, 0))
+    });
+    marker_width(labels.flatten().map(|label| measure(&label)))
+}
 
 fn list_item(
-    index: usize,
-    ordered: bool,
     item: &ListItem,
-    palette: &Palette,
-    allow_remote: bool,
-    gallery: &ImageGallery,
+    label: SharedString,
+    marker_width: f32,
+    context: BlockPaint,
     layout: BlockColumn,
 ) -> AnyElement {
-    let marker = if ordered {
-        format!("{}.", index + 1)
-    } else {
-        "•".to_string()
+    let nested = BlockColumn {
+        list_depth: layout.list_depth + 1,
+        ..layout.indented(marker_width + LIST_MARKER_GAP_PX, false)
     };
     // Top-aligned with the same line height, so the marker sits on the
     // first line's baseline however many lines the item wraps to.
@@ -849,15 +973,20 @@ fn list_item(
         .relative()
         .flex()
         .items_start()
+        .gap(px(LIST_MARKER_GAP_PX))
         .child(
             div()
-                .w(px(LIST_MARKER_PX))
+                .w(px(marker_width))
                 .when_some(layout.prose, |marker, (_, inset)| {
                     marker.absolute().top_0().left(px(inset))
                 })
                 .flex_shrink_0()
-                .text_color(paint(palette.foreground))
-                .child(marker),
+                .whitespace_nowrap()
+                .text_right()
+                .font(context.markers.style.font())
+                .text_size(context.markers.size())
+                .text_color(paint(context.palette.foreground))
+                .child(label),
         )
         .child(
             div()
@@ -865,16 +994,12 @@ fn list_item(
                 .min_w(px(0.))
                 .flex()
                 .flex_col()
-                .gap_1()
-                .children(item.blocks.iter().map(|block| {
-                    render_block(
-                        block,
-                        palette,
-                        allow_remote,
-                        gallery,
-                        layout.indented(LIST_MARKER_PX, false),
-                    )
-                })),
+                .gap_2()
+                .children(
+                    item.blocks
+                        .iter()
+                        .map(|block| render_block(block, context, nested)),
+                ),
         )
         .into_any_element()
 }
@@ -883,9 +1008,7 @@ fn render_table(
     header: &[Vec<Block>],
     rows: &[Vec<Vec<Block>>],
     align: &[Align],
-    palette: &Palette,
-    allow_remote: bool,
-    gallery: &ImageGallery,
+    context: BlockPaint,
     columns: BlockColumns,
 ) -> AnyElement {
     let make = |layout: BlockColumn| {
@@ -896,15 +1019,11 @@ fn render_table(
                 .flex()
                 .flex_col()
                 .gap_2()
-                .children(blocks.iter().map(|block| {
-                    render_block(
-                        block,
-                        palette,
-                        allow_remote,
-                        gallery,
-                        BlockColumn::full(layout.width),
-                    )
-                }))
+                .children(
+                    blocks
+                        .iter()
+                        .map(|block| render_block(block, context, BlockColumn::full(layout.width))),
+                )
                 .into_any_element();
             TableCell {
                 content,
@@ -919,7 +1038,7 @@ fn render_table(
                 .map(|row| row.iter().map(cell).collect())
                 .collect(),
             align: align.to_vec(),
-            palette: *palette,
+            palette: *context.palette,
             layout,
             alternate: None,
             inner: None,
@@ -3615,15 +3734,35 @@ mod decode_tests {
     }
 
     #[test]
+    fn root_lists_share_the_widest_marker_across_prose() {
+        use super::{BlockColumn, LIST_MARKER_GAP_PX, widest_top_level_marker};
+
+        let doc = fell_render::html_to_document(
+            "<ol><li>First</li><li>Second <ol start='100'><li>Nested</li></ol></li></ol>\
+             <p>Continue after review.</p><ol start='9'><li>Ninth</li><li>Tenth</li></ol>",
+        );
+        let shared = widest_top_level_marker(&doc.blocks, |label| label.len() as f32 * 9.);
+        assert_eq!(shared, 27.);
+        let column = BlockColumn::reading((740., 0.), (600., 70.), (740., 1.), (670., 740.), 0);
+        for local in [18., 27.] {
+            let indent = column.list_marker_width(local, shared) + LIST_MARKER_GAP_PX;
+            assert_eq!(column.indented(indent, false).prose, Some((567., 103.)));
+        }
+        let nested = BlockColumn {
+            list_depth: 1,
+            ..column
+        };
+        assert_eq!(nested.list_marker_width(18., shared), 18.);
+    }
+
+    #[test]
     fn a_list_marker_indents_prose_without_narrowing_wide_blocks() {
-        use super::{BlockColumn, ColumnWidth, LIST_MARKER_PX};
+        use super::{BlockColumn, ColumnWidth, LIST_MARKER_GAP_PX, LIST_MIN_MARKER_PX};
+        let indent = LIST_MIN_MARKER_PX + LIST_MARKER_GAP_PX;
 
         let layout = BlockColumn::reading((740., 0.), (600., 70.), (740., 1.), (670., 740.), 0);
-        let item = layout.indented(LIST_MARKER_PX, false);
-        assert_eq!(
-            item.prose,
-            Some((600. - LIST_MARKER_PX, 70. + LIST_MARKER_PX))
-        );
+        let item = layout.indented(indent, false);
+        assert_eq!(item.prose, Some((600. - indent, 70. + indent)));
         assert_eq!((item.width, item.wide_inset), (740., 0.));
         let columns = [ColumnWidth {
             min: 104.,

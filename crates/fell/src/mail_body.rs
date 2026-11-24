@@ -1015,6 +1015,47 @@ mod tests {
     }
 
     #[test]
+    fn typed_lists_render_from_stored_text_and_the_plain_alternative() {
+        use crate::text_render::BodyBlock;
+        use fell_render::Block;
+
+        let plain = include_str!("../../fell-render/fixtures/word-list.txt");
+        let id = "typed-list@example.test";
+        let mut message = mail(id, id, 0, None);
+        message.headers.subject = "Fwd: Release checklist".into();
+        message.body_text = Some(plain.into());
+        let store = store_with(std::slice::from_ref(&message));
+        let view = open(&store, id);
+        let [
+            BodyBlock::Text(_),
+            BodyBlock::List(blocks),
+            BodyBlock::Text(_),
+        ] = view[0].body.blocks.as_slice()
+        else {
+            panic!(
+                "expected prose and a list in the forward: {:?}",
+                view[0].body
+            );
+        };
+        let [Block::List { items, .. }] = blocks.as_ref() else {
+            panic!("expected a list, got {blocks:?}");
+        };
+        assert!(matches!(&items[0].blocks[1], Block::List { .. }));
+
+        let mut parts = html_parts("<p hidden>Empty alternative</p>", &[]);
+        parts.plain = Some(plain.into());
+        message.parts = Some(parts);
+        store.upsert_message(&message).unwrap();
+        let prepared = read_job(&store, &account().id, &view[0].id, &view[0].mail_headers)
+            .unwrap()
+            .prepare();
+        let Rich::PlainPart(body) = prepared.rich() else {
+            panic!("expected the plain alternative");
+        };
+        assert_eq!(body.blocks, view[0].body.blocks);
+    }
+
+    #[test]
     fn plain_forwards_stay_open_in_storage_and_as_the_empty_html_fallback() {
         use crate::text_render::BodyBlock;
 

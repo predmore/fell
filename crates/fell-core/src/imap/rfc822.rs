@@ -1004,6 +1004,16 @@ mod tests {
     use crate::account::AccountId;
 
     #[test]
+    fn html_only_draft_text_keeps_ordered_list_styles() {
+        let html = "<ol type='a' start='3'><li>Outline</li><li>Revise</li></ol>\
+                    <ol type='I' start='2'><li>Read</li><li>Send</li></ol>";
+        assert_eq!(
+            html_draft_body(html),
+            "c. Outline\nd. Revise\n\nII. Read\nIII. Send"
+        );
+    }
+
+    #[test]
     fn dates_allow_one_day_of_clock_skew() {
         let now = 1_707_519_600;
         let latest = now + 86_400;
