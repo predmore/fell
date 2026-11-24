@@ -133,6 +133,12 @@ impl SelectedSession {
 }
 
 impl BodyConnection {
+    pub(crate) fn logout(&mut self) {
+        if let Some(mut selected) = self.0.take() {
+            selected.session.logout();
+        }
+    }
+
     fn run<T>(
         &mut self,
         config: impl Fn() -> Result<ImapConfig, Error>,

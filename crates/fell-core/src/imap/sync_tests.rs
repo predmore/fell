@@ -4861,9 +4861,23 @@ fn header_and_structure_backfill_set_the_paperclip_before_downloading_bodies() {
         r#"("APPLICATION" "PDF" NIL NIL NIL "BASE64" 4180 NIL ("ATTACHMENT" ("FILENAME" "report.pdf")))"#,
         r#"("TEXT" "CSV" NIL NIL NIL "QUOTED-PRINTABLE" 36 2 NIL ("ATTACHMENT" ("FILENAME" "totals.csv"))) "MIXED")"#,
     );
+    let malformed = raw_message(
+        "malformed@example.test",
+        None,
+        "Checklist",
+        "Demo <demo@example.test>",
+        "Check stage",
+        "",
+    );
+    let mut state = inbox_state(vec![(1, fixture.raw), (2, malformed)]);
+    state.mailboxes[0].messages[0]
+        .flags
+        .push("\\Flagged".into());
     let server = TestServer::spawn_parallel(
-        inbox_state(vec![(1, fixture.raw)]),
-        [(1, structure.to_owned())].into_iter().collect(),
+        state,
+        [(1, structure.to_owned()), (2, "(TEXT)".to_owned())]
+            .into_iter()
+            .collect(),
     );
     let config = crate::AccountConfig::parse(&format!(
         concat!(
@@ -4885,7 +4899,17 @@ fn header_and_structure_backfill_set_the_paperclip_before_downloading_bodies() {
                 .unwrap(),
             [state]
         );
-        assert!(store.folder_threads(&account.id, "INBOX").unwrap()[0].has_attachment);
+        let row = store
+            .folder_threads(&account.id, "INBOX")
+            .unwrap()
+            .into_iter()
+            .find(|row| row.thread_id == ThreadId::from_message_id(&id))
+            .unwrap();
+        assert!(row.has_attachment);
+        assert!(
+            row.starred,
+            "FLAGS arrive with structure in a separate response"
+        );
         let files = store
             .message_attachments(&account.id, &id)
             .unwrap()
@@ -4921,18 +4945,23 @@ fn header_and_structure_backfill_set_the_paperclip_before_downloading_bodies() {
     ).unwrap();
     server.state.lock().unwrap().commands.clear();
 
-    let mut structures = crate::ReaderBodyFetcher::default();
-    assert_eq!(structures.backfill_structures(&config, &store).unwrap(), 1);
+    let backfill = || crate::ReaderBodyFetcher::backfill_structures(&config, &store).unwrap();
+    assert_eq!(backfill(), 2);
     sees(
         crate::ReaderParts::Listed { html: false },
         crate::BodyState::Stored,
     );
-    assert_eq!(structures.backfill_structures(&config, &store).unwrap(), 0);
+    assert_eq!(
+        backfill(),
+        0,
+        "the malformed structure is skipped on the next pass"
+    );
+    assert_eq!(store.missing_bodies(&account.id, 10).unwrap().len(), 2);
     let logged = commands(&server);
     assert!(
         logged
             .iter()
-            .any(|command| command.contains("UID FETCH 1 (UID BODYSTRUCTURE)"))
+            .any(|command| command.contains("UID FETCH 1,2 (UID BODYSTRUCTURE)"))
     );
     assert!(
         logged
@@ -4940,9 +4969,10 @@ fn header_and_structure_backfill_set_the_paperclip_before_downloading_bodies() {
             .all(|command| !command.contains("BODY.PEEK[]"))
     );
 
+    assert!(logged.iter().any(|command| command.contains(" LOGOUT")));
     assert_eq!(
         crate::fetch_missing_bodies(&account.id, backend.as_ref(), &store, 1).unwrap(),
-        1
+        2
     );
     sees(crate::ReaderParts::Ready, crate::BodyState::Stored);
     assert!(store.missing_bodies(&account.id, 1).unwrap().is_empty());

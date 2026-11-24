@@ -403,7 +403,6 @@ fn fill_old_mail(
     let Ok(backend) = config.backend() else {
         return None;
     };
-    let mut structures = ReaderBodyFetcher::default();
     let mut more_structures = true;
     let (mut more_headers, mut more_bodies) = (true, true);
     for _ in 0..BACKFILL_BATCHES_AFTER_PASS {
@@ -413,9 +412,8 @@ fn fill_old_mail(
             Err(TryRecvError::Empty) => {}
         }
         if more_structures {
-            more_structures = structures
-                .backfill_structures(config, store)
-                .is_ok_and(|count| count > 0);
+            more_structures =
+                ReaderBodyFetcher::backfill_structures(config, store).is_ok_and(|count| count > 0);
             if more_structures {
                 let _ = events.unbounded_send(SyncEvent::BodiesStored);
             }
@@ -440,7 +438,7 @@ fn fill_old_mail(
                 let _ = events.unbounded_send(SyncEvent::BodiesStored);
             }
         }
-        if !more_headers && !more_bodies {
+        if !more_headers && !more_bodies && !more_structures {
             break;
         }
     }

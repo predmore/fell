@@ -1357,6 +1357,32 @@ impl Store {
         bodies::missing(&self.conn, account, limit, true)
     }
 
+    /// A completed structure fetch could not list these messages. Leave
+    /// them queued for the full source and move on to older structures.
+    pub(crate) fn skip_missing_structures(
+        &self,
+        account: &AccountId,
+        requests: &[BodyRequest],
+    ) -> Result<()> {
+        if requests.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .lock_wait
+            .behind_waiting_writes(|| immediate_transaction(&self.conn))?;
+        {
+            let mut mark = tx.prepare_cached(
+                "UPDATE body_backfill SET structure_unavailable = 1
+                 WHERE account_id = ?1 AND message_id = ?2",
+            )?;
+            for request in requests {
+                mark.execute(params![account.as_str(), request.message_id.as_str()])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Repair one batch of cached HTML-only previews from the original parts
     /// on the sync lane. Returns whether the batch changed previews, or
     /// `None` after the cache is up to date.

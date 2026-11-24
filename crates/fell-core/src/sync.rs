@@ -474,15 +474,18 @@ impl ReaderBodyFetcher {
     /// List the attachments for a batch of old mail in newest-first order.
     /// Leaves the body queue in place for the full source, which can
     /// confirm inline roles and decoded sizes.
-    pub fn backfill_structures(
-        &mut self,
-        config: &crate::AccountConfig,
-        store: &Store,
-    ) -> Result<usize> {
+    pub fn backfill_structures(config: &crate::AccountConfig, store: &Store) -> Result<usize> {
         let account = AccountId(config.id.clone());
         let wanted = store.missing_structures(&account, BODY_BATCH)?;
-        let (fetched, _) = self.structures(config, &crate::CancelBodyFetch::default(), wanted)?;
-        store.store_structures(&account, &fetched, false)
+        let mut fetcher = Self::default();
+        let result = fetcher.structures(config, &crate::CancelBodyFetch::default(), wanted);
+        // The next background fetch opens its own connection. Finish this
+        // session first so it never competes for another server login.
+        fetcher.connection.logout();
+        let (fetched, missing) = result?;
+        let stored = store.store_structures(&account, &fetched, false)?;
+        store.skip_missing_structures(&account, &missing)?;
+        Ok(stored + missing.len())
     }
 
     fn structures(

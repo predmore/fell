@@ -61,6 +61,26 @@ pub(super) struct Fetched {
     pub internal_date: Option<i64>,
 }
 
+impl Fetched {
+    /// IMAP can send the fields of one header fetch in separate untagged
+    /// responses. A field omitted from a later reply keeps its earlier value.
+    pub(super) fn merge_header_fields(&mut self, update: Self) {
+        if update.flags_present {
+            self.flags_present = true;
+            self.flags = update.flags;
+        }
+        self.modseq = update.modseq.or(self.modseq);
+        if !update.body_missing && (self.body_missing || self.skipped) {
+            self.body_missing = false;
+            self.skipped = update.skipped;
+            self.body = update.body;
+        }
+        self.structure = update.structure.or_else(|| self.structure.take());
+        self.size = update.size.or(self.size);
+        self.internal_date = update.internal_date.or(self.internal_date);
+    }
+}
+
 /// One reply to [`Session::uid_fetch_part`].
 #[derive(Debug)]
 pub(super) struct PartWindow {

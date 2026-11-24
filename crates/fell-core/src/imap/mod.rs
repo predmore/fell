@@ -1019,44 +1019,38 @@ fn walk_down(
         } else {
             Some(range)
         };
-        let mut rows: Vec<session::Fetched> = Vec::new();
+        let mut by_uid = std::collections::BTreeMap::new();
         if let Some(set) = header_set {
-            let mut structures = HashMap::new();
-            let mut receive = |mut item: session::Fetched| {
-                if (low..=high).contains(&item.uid) {
-                    // Servers can send the requested items in more than one
-                    // FETCH response. Keep the header and structure by UID.
-                    if let Some(structure) = item.structure.take() {
-                        structures.insert(item.uid, structure);
+            let mut fetch = |session: &mut session::Session, items| {
+                by_uid.clear();
+                session.uid_fetch_each(&set, None, items, |item| {
+                    if (low..=high).contains(&item.uid) {
+                        use std::collections::btree_map::Entry;
+                        match by_uid.entry(item.uid) {
+                            Entry::Vacant(entry) => {
+                                entry.insert(item);
+                            }
+                            Entry::Occupied(mut entry) => entry.get_mut().merge_header_fields(item),
+                        }
                     }
-                    if !item.body_missing || item.flags_present {
-                        rows.push(item);
-                    }
-                }
-                Ok(())
+                    Ok(())
+                })
             };
-            let mut stop =
-                session.uid_fetch_each(&set, None, session::FetchItems::Headers, &mut receive)?;
+            let mut stop = fetch(session, session::FetchItems::Headers)?;
             if matches!(stop, session::FetchStop::Refused) {
                 // A provider that rejects a combined request can still
                 // deliver its headers. Body parsing supplies the list later.
-                stop = session.uid_fetch_each(
-                    &set,
-                    None,
-                    session::FetchItems::HeadersOnly,
-                    &mut receive,
-                )?;
+                stop = fetch(session, session::FetchItems::HeadersOnly)?;
             }
             if !matches!(stop, session::FetchStop::Done) {
                 pass.complete = false;
                 return Ok(Walked::Stopped);
             }
-            for row in &mut rows {
-                row.structure = structures.remove(&row.uid);
-            }
         }
-        rows.sort_by_key(|row| (row.uid, row.body_missing));
-        rows.dedup_by_key(|row| row.uid);
+        let rows: Vec<_> = by_uid
+            .into_values()
+            .filter(|row| !row.body_missing || row.flags_present)
+            .collect();
         // A tagged OK can end a short FETCH. SEARCH lists the UIDs that
         // actually exist in the range, including across gaps in the UID space.
         // Search after the fetch so an expunged UID does not hold up the walk.
