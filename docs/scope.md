@@ -11,7 +11,7 @@ Settled with Jon on 2026-11-15.
 
 ## Pillars
 1. **Fast.** Opens to the inbox from the local store, renders every action on the next frame, syncs in the background. Speed budgets below are enforced by CI benchmarks.
-2. **IMAP/SMTP, any account.** IMAP sync with IDLE and incremental resync (CONDSTORE/QRESYNC where supported); SMTP send; drafts saved to Drafts. Proton Bridge is the primary test target, but any IMAP account that signs in with a password or app password works in v1 (Fastmail, Dovecot, Gmail with an app password...), with per-provider quirks (e.g. Gmail labels). OAuth sign-in for Gmail and Outlook comes after v1 (decided 2026-11-17, see #88); v1 makes the IMAP/SMTP path as good as it can be instead. Multiple accounts and per-address identities. Labels/folders map so one message can carry several labels and stay one thread. A direct Proton API backend comes later behind the same trait.
+2. **IMAP/SMTP through Proton Bridge.** IMAP sync with IDLE and incremental resync (CONDSTORE/QRESYNC where supported); SMTP send; drafts saved to Drafts. v1 is built and tested against IMAP and SMTP as Proton Bridge exposes them (decided 2026-11-24). Onboarding leads with Bridge. A generic, standards-only IMAP path stays (SPECIAL-USE folders, no provider presets), but other servers are not a v1 test target. Third-party providers and their quirks (Gmail labels, Fastmail, iCloud, Outlook, OAuth sign-in, see #88) are out of v1. Multiple Bridge accounts and per-address identities. Labels/folders map so one message can carry several labels and stay one thread. A direct Proton API backend comes later behind the same trait.
 3. **Excellent threading.** JWZ on Message-ID/References/In-Reply-To with careful subject fallback; threads span folders so Sent replies appear inline; collapse read messages and quoted text; manual split/merge; mute. **Duplicates collapse to one message:** Sent copy plus mailing-list/alias echo, and copies delivered to several aliases, show once (Message-ID first, body fingerprint when a list rewrites headers); the merged message shows every folder, label and address it arrived through. A messy real-world thread corpus guards regressions.
 4. **Offline indexing.** Full bodies and headers in local SQLite; incremental indexing off the UI thread, recent mail first, progress shown. Attachment text extraction later.
 5. **Search.** FTS5 + BM25 grouped by thread; operators `from: to: subject: in: label: has:attachment is:unread before: after:`; misspelling tolerance via trigram index + did-you-mean; semantic search with a **local embedding model by default**, hybrid-ranked with keyword results. A cloud embedding API is an explicit per-account opt-in that warns message text leaves the machine. Results update as you type.
@@ -39,7 +39,7 @@ In Drafts, `#` discards the selected local drafts, including agent review drafts
 The move action itself ships in M3. PR3 only leaves room for it.
 
 ## Out of scope for v1
-Direct Proton API backend; Gmail and Outlook OAuth sign-in (#88); calendar, contacts, rules/filters; a WYSIWYG toolbar or HTML-source compose (v1 composes styled Markdown with inline images, see docs/ux.md); in-app agent panel; mobile/Windows/macOS builds (core stays portable; Linux on Hyprland is the supported target); PGP for non-Proton recipients beyond what Bridge does.
+Direct Proton API backend; third-party providers and their quirks (Gmail labels and All Mail semantics, provider presets, Gmail and Outlook OAuth sign-in, #88); calendar, contacts, rules/filters; a WYSIWYG toolbar or HTML-source compose (v1 composes styled Markdown with inline images, see docs/ux.md); in-app agent panel; mobile/Windows/macOS builds (core stays portable; Linux on Hyprland is the supported target); PGP for non-Proton recipients beyond what Bridge does.
 
 ## Packaging
 Linux x86_64. Flatpak, .deb, and .rpm are skipped for now.
@@ -53,7 +53,7 @@ Linux x86_64. Flatpak, .deb, and .rpm are skipped for now.
 - **M0 Foundation**: merged in #1.
 - **M1 Read your mail**: read-only IMAP sync into the store (Bridge first, generic IMAP path), threaded inbox, conversation view with native HTML-to-text rendering and web view fallback, vim navigation. PR3 needs the leader key and which-key with a few real chords, plus the palette over the M1 actions. The full chord set grows with later milestones. Fix #2 and #3.
 - **M2 Find anything**: full-text search with operators, typo tolerance, offline indexing at scale.
-- **M3 Act and reply**: archive, move, label, delete, undo, compose/reply, SMTP send; other IMAP/SMTP providers with password sign-in. The move action itself (`m`) ships here; PR3 only leaves room for it.
+- **M3 Act and reply**: archive, move, label, delete, undo, compose/reply, SMTP send; generic IMAP/SMTP with password sign-in. The move action itself (`m`) ships here; PR3 only leaves room for it.
 - **M4 Agents**: MCP server with search, read, triage, draft tools, scoped access, action log.
 - **M5 Semantic search**: local embeddings, hybrid ranking, opt-in cloud embeddings.
 - **M6 Daily driver**: budgets enforced in CI, keymap config, AUR (`fell-git` and `fell-bin`), GitHub Release tarball, and AppImage.

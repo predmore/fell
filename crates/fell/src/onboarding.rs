@@ -32,7 +32,6 @@ const BRIDGE_URL: &str = "https://proton.me/mail/bridge";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Control {
     Provider(Provider),
-    Other,
     Install,
     Field(Field),
     Servers,
@@ -161,17 +160,15 @@ impl Onboarding {
         use Control::{Back, Field as Input, Inline, Next, Servers};
         match self.form.step {
             Step::Provider => {
-                let mut controls = vec![Control::Provider(Provider::Bridge), Control::Other];
+                let mut controls = vec![
+                    Control::Provider(Provider::Bridge),
+                    Control::Provider(Provider::Custom),
+                ];
                 if self.bridge == Bridge::Offline {
                     controls.insert(1, Control::Install);
                 }
                 controls
             }
-            Step::Preset => Provider::PRESETS
-                .into_iter()
-                .map(Control::Provider)
-                .chain([Back])
-                .collect(),
             Step::Identity => {
                 let mut controls = vec![
                     Input(Field::Email),
@@ -242,9 +239,7 @@ impl Onboarding {
         let confirming = matches!(self.form.storage, Storage::ConfirmInline(_));
         self.form.back();
         let control = match (before, self.form.step) {
-            (Step::Preset, Step::Provider) => Control::Other,
-            (_, Step::Provider) => Control::Provider(Provider::Bridge),
-            (_, Step::Preset) => Control::Provider(self.form.provider),
+            (_, Step::Provider) => Control::Provider(self.form.provider),
             (Step::Servers, Step::Identity) => Control::Next,
             (_, Step::Identity | Step::Servers | Step::Connection) => Control::Next,
             (_, Step::Done) if confirming => Control::Next,
@@ -259,15 +254,6 @@ impl Onboarding {
             Control::Provider(provider) => {
                 self.form.choose(provider);
                 self.change_step(before, Control::Field(Field::Email), cx);
-            }
-            Control::Other => {
-                self.form.step = Step::Preset;
-                let first = if self.form.provider == Provider::Bridge {
-                    Provider::Fastmail
-                } else {
-                    self.form.provider
-                };
-                self.change_step(before, Control::Provider(first), cx);
             }
             Control::Install => cx.open_url(BRIDGE_URL),
             Control::StartTls(service) => {
