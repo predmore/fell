@@ -16,6 +16,7 @@ use crate::keymap::KeyId;
 use crate::model::{Banner, FolderIntent, Overlay, PickerChoice, Session, Toast};
 use crate::motion::{self, Ghost, Glide, ListShift, Motion, Transition};
 use crate::present::{ConvMessage, Pane, ThreadRow};
+use crate::text_render::RenderedBody;
 use crate::worker::Worker;
 
 /// The old selection's highlight starts its fade from this much, so on a
@@ -99,7 +100,7 @@ struct BodyArrival {
     height: Option<(f32, Transition)>,
     /// Whether the outgoing pending label said the body was downloading.
     placeholder: Option<bool>,
-    text: bool,
+    text: Option<RenderedBody>,
 }
 
 /// What an overlay or which-key showed, kept from the frame before it
@@ -1190,6 +1191,28 @@ impl InboxMotion {
         } else {
             motion::QUICK
         };
+        self.start_body_arrival(id, height, placeholder, None, duration, now);
+    }
+
+    pub fn reader_body_arrived(
+        &mut self,
+        id: &str,
+        height: Option<f32>,
+        text: Option<RenderedBody>,
+        now: Instant,
+    ) {
+        self.start_body_arrival(id, height, None, text, motion::FADE, now);
+    }
+
+    fn start_body_arrival(
+        &mut self,
+        id: &str,
+        height: Option<f32>,
+        placeholder: Option<bool>,
+        text: Option<RenderedBody>,
+        duration: Duration,
+        now: Instant,
+    ) {
         if !self.message_fades.contains_key(id)
             && let Some(fade) = self.motion.start(duration, now)
         {
@@ -1200,7 +1223,7 @@ impl InboxMotion {
                     fade,
                     height,
                     placeholder,
-                    text: false,
+                    text,
                 },
             );
         }
@@ -1212,12 +1235,6 @@ impl InboxMotion {
         }
     }
 
-    pub fn body_text_replaced(&mut self, id: &str) {
-        if let Some(body) = self.bodies.get_mut(id) {
-            body.text = true;
-        }
-    }
-
     pub fn attachment_alphas(&self, now: Instant) -> HashMap<String, f32> {
         self.attachment_fades
             .iter()
@@ -1225,11 +1242,10 @@ impl InboxMotion {
             .collect()
     }
 
-    pub fn replacing_body_text(&self) -> HashSet<String> {
+    pub fn replacing_body_text(&self) -> HashMap<String, RenderedBody> {
         self.bodies
             .iter()
-            .filter(|(_, body)| body.text)
-            .map(|(id, _)| id.clone())
+            .filter_map(|(id, body)| Some((id.clone(), body.text.clone()?)))
             .collect()
     }
 
@@ -1311,7 +1327,7 @@ impl InboxMotion {
                 } else {
                     body.fade.progress(now)
                 };
-                let alpha = if body.placeholder.is_some() || body.text {
+                let alpha = if body.placeholder.is_some() || body.text.is_some() {
                     shown
                 } else {
                     motion::lerp(motion::ARRIVE_FROM, 1.0, shown)
@@ -2383,6 +2399,17 @@ mod tests {
         let shown = motion.disclosures(&session, now);
         assert!(shown.quotes.is_empty() && shown.recipients.is_empty());
         assert!(!motion.tick(now));
+    }
+
+    #[test]
+    fn reader_body_fades_in_without_clipping_an_empty_card() {
+        let mut motion = InboxMotion::new(Motion::new(true));
+        let now = Instant::now();
+        motion.reader_body_arrived("a", None, None, now);
+        assert_eq!(motion.body_alphas(now)["a"], motion::ARRIVE_FROM);
+        assert!(motion.body_heights(now).is_empty());
+        assert!(motion.body_alphas(later(now, 100))["a"] < 1.0);
+        assert_eq!(motion.body_alphas(later(now, 120))["a"], 1.0);
     }
 
     #[test]

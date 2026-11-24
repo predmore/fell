@@ -63,7 +63,7 @@ use crate::scroll_anchor::{
 use crate::store_actor::StoreClient;
 use crate::sync_worker::{self, SyncEvent, SyncHandle};
 use crate::text_cut;
-use crate::text_render::BodyBlock;
+use crate::text_render::{BodyBlock, RenderedBody};
 use crate::theme::{self, Theme};
 use crate::ui_trace::UiTrace;
 use crate::worker::Worker;
@@ -2602,10 +2602,12 @@ impl Inbox {
                 .find(|old| old.id == message.id)
                 && old.body_state == fell_core::BodyState::Stored
                 && message.body_state == fell_core::BodyState::Stored
-                && old.rich != Rich::Pending
-                && old.reader_parts == fell_core::ReaderParts::Ready
             {
-                message.rich = old.rich.clone();
+                if old.rich != Rich::Pending && old.reader_parts == fell_core::ReaderParts::Ready {
+                    message.rich = old.rich.clone();
+                } else if self.reader_bodies.fallback_since.contains_key(&old.id) {
+                    message.body = old.body.clone();
+                }
             }
         }
     }
@@ -2829,6 +2831,14 @@ impl Inbox {
         for id in active.ids {
             match &result {
                 Ok(failed) if !failed.contains(&id) => {
+                    if self
+                        .reader_bodies
+                        .started
+                        .get(&id.0)
+                        .is_some_and(|at| at.elapsed() < reader_body_worker::SHOW_AFTER)
+                    {
+                        self.reader_bodies.fast_completed.insert(id.0.clone());
+                    }
                     self.reader_bodies.completed.insert(id.0);
                 }
                 outcome => {
@@ -5556,7 +5566,7 @@ struct ConvFrame {
     /// Bodies fading in, by message id: their opacity.
     alphas: HashMap<String, f32>,
     attachment_alphas: HashMap<String, f32>,
-    replacing_text: HashSet<String>,
+    replacing_text: HashMap<String, RenderedBody>,
     body_probes: HashMap<String, Rc<Cell<f32>>>,
     fallback_text: HashSet<String>,
     attachment_sizes: HashMap<(String, String), AttachmentSize>,
@@ -8072,6 +8082,7 @@ struct ReaderBodies {
     generation: u64,
     failed: HashMap<String, reader_body_worker::Failure>,
     completed: HashSet<String>,
+    fast_completed: HashSet<String>,
     started: HashMap<String, Instant>,
     fallback_since: HashMap<String, Instant>,
     body_probes: HashMap<String, Rc<Cell<f32>>>,
@@ -8120,14 +8131,19 @@ impl ReaderBodies {
                     return None;
                 }
                 let html_ready = matches!(message.rich, Rich::Html(_) | Rich::PlainPart(_));
-                if !html_ready
+                let text = !html_ready
                     && message.body_state == fell_core::BodyState::Stored
-                    && message.rich != Rich::Pending
-                    && !message.body.blocks.is_empty()
-                {
+                    && (message.rich != Rich::Pending
+                        || self.fallback_since.contains_key(&message.id))
+                    && message.body.blocks.iter().any(|block| match block {
+                        BodyBlock::Text(text)
+                        | BodyBlock::Quote(text)
+                        | BodyBlock::Signature(text) => !text.trim().is_empty(),
+                        BodyBlock::Markdown { .. } => true,
+                    });
+                if text {
                     self.fallback_since.entry(message.id.clone()).or_insert(now);
                 }
-                let text = self.fallback_since.contains_key(&message.id);
                 self.body_probes.entry(message.id.clone()).or_default();
                 let label = match parts {
                     Unavailable { html } => ReaderLabel::Failed {
@@ -8139,6 +8155,9 @@ impl ReaderBodies {
                         now.saturating_duration_since(*started) < reader_body_worker::SHOW_AFTER
                     }) =>
                     {
+                        ReaderLabel::Hidden
+                    }
+                    _ if parts != Ready && self.fast_completed.contains(&message.id) => {
                         ReaderLabel::Hidden
                     }
                     _ if message.needs_reader_parts()
@@ -8168,6 +8187,13 @@ impl ReaderBodies {
         self.fallback_since
             .get(id)
             .is_some_and(|at| at.elapsed() >= reader_body_worker::SHOW_AFTER)
+    }
+
+    fn body_height(&self, message: &ConvMessage) -> Option<f32> {
+        self.body_probes
+            .get(&message.id)
+            .map(|slot| slot.get())
+            .filter(|height| *height > 0. || !message.attachments.is_empty())
     }
 
     fn reconcile_sizes(
@@ -8314,11 +8340,10 @@ impl BodyRefresh {
                     // Metadata and a staged HTML read leave the displayed text
                     // and the existing chips unchanged.
                     if prepared || (new.rich != Rich::Pending && old.body != new.body) {
-                        let height = reader.body_probes.get(id).map(|slot| slot.get());
-                        motion.body_arrived(id, height, None, now);
-                        if prepared && reader.fallback_was_visible(id) {
-                            motion.body_text_replaced(id);
-                        }
+                        let height = reader.body_height(old);
+                        let outgoing =
+                            (prepared && reader.fallback_was_visible(id)).then(|| old.body.clone());
+                        motion.reader_body_arrived(id, height, outgoing, now);
                     }
                 } else {
                     let placeholder = (old.body_state == fell_core::BodyState::Pending
@@ -8334,17 +8359,18 @@ impl BodyRefresh {
                     && ready != message.rich
                 {
                     if message.expanded {
-                        let measured = reader.body_probes.get(&message.id).map(|slot| slot.get());
-                        motion.body_arrived(
-                            &message.id,
-                            measured.or_else(|| height(index)),
-                            None,
-                            now,
-                        );
-                        if reader.fallback_was_visible(&message.id)
-                            && matches!(ready, Rich::Html(_) | Rich::PlainPart(_))
-                        {
-                            motion.body_text_replaced(&message.id);
+                        if reader.body_probes.contains_key(&message.id) {
+                            let outgoing = (reader.fallback_was_visible(&message.id)
+                                && matches!(ready, Rich::Html(_) | Rich::PlainPart(_)))
+                            .then(|| message.body.clone());
+                            motion.reader_body_arrived(
+                                &message.id,
+                                reader.body_height(message),
+                                outgoing,
+                                now,
+                            );
+                        } else {
+                            motion.body_arrived(&message.id, height(index), None, now);
                         }
                     }
                     message.rich = ready;
@@ -9348,9 +9374,12 @@ fn message_body(
     };
     let old = if let Some(line) = outgoing {
         missing_message_body(theme, folds.columns, &line, 1.0 - alpha)
-    } else if frame.replacing_text.contains(&message.id) && alpha < 1.0 {
+    } else if let Some(text) = frame.replacing_text.get(&message.id)
+        && alpha < 1.0
+    {
         let mut previous = message.clone();
         previous.rich = Rich::Plain;
+        previous.body = text.clone();
         stored_message_body(
             theme,
             &previous,
