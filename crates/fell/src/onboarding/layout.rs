@@ -247,40 +247,15 @@ impl Onboarding {
                         cx,
                     ))
                     .child(self.choice(
-                        Control::Other,
+                        Control::Provider(Provider::Custom),
                         "Other IMAP account",
-                        "Choose a preset or enter your server settings.",
+                        "Enter your IMAP and SMTP server settings.",
                         live,
                         None,
                         cx,
                     )),
                 [None, None],
             ),
-            Step::Preset => {
-                let descriptions = [
-                    "Fastmail app password",
-                    "Google app password",
-                    "Apple app-specific password",
-                    "Enter IMAP and SMTP settings",
-                ];
-                (
-                    "Choose a provider",
-                    "Presets fill in the incoming and outgoing servers.",
-                    column().children(Provider::PRESETS.into_iter().zip(descriptions).map(
-                        |(provider, desc)| {
-                            self.choice(
-                                Control::Provider(provider),
-                                provider.name(),
-                                desc,
-                                live,
-                                None,
-                                cx,
-                            )
-                        },
-                    )),
-                    self.footer("Back", None, live, cx),
-                )
-            }
             Step::Identity => {
                 let more = self.form.needs_servers();
                 let user = self.form.text(Field::Email);

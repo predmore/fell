@@ -18,7 +18,7 @@
 //! # smtp_port = 1025            # Bridge's SMTP port; 587 or 465 for imap
 //! # smtp_security = "starttls"  # "plain" only for a loopback address
 //! # sent_folder = "Sent Items"  # only for a server that does not mark its folders
-//! # save_sent = "auto"        # "append" or "server" overrides provider detection
+//! # save_sent = "auto"        # "append" or "server" overrides the backend default
 //! # write_back = true           # send local changes to the server (off by default)
 //! # notifications = "on"       # "on", "private", or "off"
 //! ```
@@ -30,8 +30,8 @@
 //! for that role and win over both.
 //!
 //! After SMTP confirms a send, Fell immediately saves a local Sent copy.
-//! `save_sent = "auto"` lets Proton Bridge and Gmail file their own copies
-//! and selects `"append"` elsewhere. Set `"server"` to let your provider
+//! `save_sent = "auto"` lets Proton Bridge file its own copy and selects
+//! `"append"` for generic IMAP. Set `"server"` to let your provider
 //! file the copy, or `"append"` to have Fell file it with IMAP.
 //!
 //! With `write_back = true`, Fell queues drafts, Sent appends, moves, and read and
@@ -509,20 +509,7 @@ impl AccountConfig {
             && match self.save_sent {
                 SaveSent::Append => true,
                 SaveSent::Server => false,
-                SaveSent::Auto => {
-                    let gmail = |host: &str| {
-                        matches!(
-                            host.trim_end_matches('.').to_ascii_lowercase().as_str(),
-                            "imap.gmail.com"
-                                | "imap.googlemail.com"
-                                | "smtp.gmail.com"
-                                | "smtp.googlemail.com"
-                        )
-                    };
-                    self.backend != BackendKind::Bridge
-                        && !gmail(&self.host)
-                        && !self.smtp_host.as_deref().is_some_and(gmail)
-                }
+                SaveSent::Auto => self.backend != BackendKind::Bridge,
             }
     }
 
@@ -944,15 +931,15 @@ mod tests {
     }
 
     #[test]
-    fn save_sent_modes_parse_and_choose_by_provider() {
+    fn save_sent_modes_parse_and_choose_by_backend() {
         let base = "backend = \"imap\"\nemail = \"demo@example.com\"\npassword = \"fixture\"\nwrite_back = true\n";
         let parse =
             |host, mode| AccountConfig::parse(&format!("{base}host = \"{host}\"\n{mode}")).unwrap();
         assert!(parse("imap.example.com", "").append_sent());
-        assert!(!parse("IMAP.GMAIL.COM.", "save_sent = \"auto\"\n").append_sent());
-        assert!(!parse("imap.googlemail.com", "").append_sent());
-        assert!(!parse("imap.example.com", "smtp_host = \"smtp.gmail.com\"\n").append_sent());
-        let append = parse("imap.gmail.com", "save_sent = \"append\"\n");
+        assert!(parse("imap.example.com", "save_sent = \"auto\"\n").append_sent());
+        let bridge = AccountConfig::parse(&base.replacen("\"imap\"", "\"bridge\"", 1)).unwrap();
+        assert!(!bridge.append_sent());
+        let append = parse("imap.example.com", "save_sent = \"append\"\n");
         let server = parse("imap.example.com", "save_sent = \"server\"\n");
         assert!(append.append_sent());
         assert!(!server.append_sent());

@@ -105,7 +105,7 @@ A confirmed send appears in the conversation and in Sent immediately. The `save_
 
 | Setting | Server Sent copy |
 | --- | --- |
-| `"auto"` (default) | Proton Bridge and Gmail file their own copies. For other providers, Fell uses append mode. |
+| `"auto"` (default) | Proton Bridge files its own copy. Generic IMAP uses append mode. |
 | `"append"` | Fell appends a read copy to the account’s Sent folder when `write_back = true`. Use `sent_folder` to name the folder if the server’s listing does not identify it. |
 | `"server"` | The provider files its own copy. |
 

@@ -9,7 +9,6 @@ use crate::setup::SaveAccountError;
 pub(super) enum Step {
     #[default]
     Provider,
-    Preset,
     Identity,
     Servers,
     Connection,
@@ -19,7 +18,7 @@ pub(super) enum Step {
 impl Step {
     pub fn number(self) -> usize {
         match self {
-            Self::Provider | Self::Preset => 1,
+            Self::Provider => 1,
             Self::Identity | Self::Servers => 2,
             Self::Connection => 3,
             Self::Done => 4,
@@ -31,21 +30,13 @@ impl Step {
 pub(super) enum Provider {
     #[default]
     Bridge,
-    Fastmail,
-    Gmail,
-    ICloud,
     Custom,
 }
 
 impl Provider {
-    pub const PRESETS: [Self; 4] = [Self::Fastmail, Self::Gmail, Self::ICloud, Self::Custom];
-
     pub fn name(self) -> &'static str {
         match self {
             Self::Bridge => "Proton Mail Bridge",
-            Self::Fastmail => "Fastmail",
-            Self::Gmail => "Gmail",
-            Self::ICloud => "iCloud Mail",
             Self::Custom => "Generic IMAP",
         }
     }
@@ -53,11 +44,6 @@ impl Provider {
     pub fn password_hint(self) -> &'static str {
         match self {
             Self::Bridge => "Copy the IMAP username and password from Mailbox details in Bridge.",
-            Self::Fastmail => "Create an app password in Fastmail’s Privacy & Security settings.",
-            Self::Gmail => {
-                "Use a Google app password. Your Google Account needs 2-Step Verification."
-            }
-            Self::ICloud => "Use an app-specific password from your Apple Account.",
             Self::Custom => "Use the mail password or app password your provider gives you.",
         }
     }
@@ -66,15 +52,6 @@ impl Provider {
         use ImapSecurity::{StartTls, Tls};
         let (imap, smtp) = match self {
             Self::Bridge => (("127.0.0.1", 1143, StartTls), ("127.0.0.1", 1025, StartTls)),
-            Self::Fastmail => (
-                ("imap.fastmail.com", 993, Tls),
-                ("smtp.fastmail.com", 465, Tls),
-            ),
-            Self::Gmail => (("imap.gmail.com", 993, Tls), ("smtp.gmail.com", 465, Tls)),
-            Self::ICloud => (
-                ("imap.mail.me.com", 993, Tls),
-                ("smtp.mail.me.com", 587, StartTls),
-            ),
             Self::Custom => (("", 993, Tls), ("", 587, StartTls)),
         };
         [Endpoint::new(imap), Endpoint::new(smtp)]
@@ -391,9 +368,7 @@ impl Form {
     pub fn back(&mut self) {
         self.step = match self.step {
             Step::Provider => Step::Provider,
-            Step::Preset => Step::Provider,
-            Step::Identity if self.provider == Provider::Bridge => Step::Provider,
-            Step::Identity => Step::Preset,
+            Step::Identity => Step::Provider,
             Step::Servers => Step::Identity,
             Step::Connection if self.checked_from_servers => Step::Servers,
             Step::Connection => Step::Identity,
@@ -662,61 +637,6 @@ mod tests {
         assert!(form.begin_save().is_none());
         form.back();
         assert_eq!(form.step, Step::Done);
-    }
-
-    #[test]
-    fn presets_set_both_endpoints_and_do_not_reuse_another_providers_credentials() {
-        for (preset, imap, smtp, port, security) in [
-            (
-                Provider::Fastmail,
-                "imap.fastmail.com",
-                "smtp.fastmail.com",
-                465,
-                ImapSecurity::Tls,
-            ),
-            (
-                Provider::Gmail,
-                "imap.gmail.com",
-                "smtp.gmail.com",
-                465,
-                ImapSecurity::Tls,
-            ),
-            (
-                Provider::ICloud,
-                "imap.mail.me.com",
-                "smtp.mail.me.com",
-                587,
-                ImapSecurity::StartTls,
-            ),
-        ] {
-            let mut form = Form::default();
-            identity(&mut form);
-            form.set_text(Field::Username, "bridge-user".into());
-            form.step = Step::Preset;
-            form.choose(preset);
-            assert!(form.text(Field::Username).is_empty());
-            assert!(form.text(Field::Password).is_empty());
-            form.back();
-            assert_eq!(form.step, Step::Preset);
-            form.choose(preset);
-            assert!(!form.needs_servers());
-            identity(&mut form);
-            let config = form.begin_check().unwrap();
-            assert_eq!(config.backend, BackendKind::Imap);
-            assert_eq!(
-                (config.host.as_str(), config.port, config.security),
-                (imap, 993, ImapSecurity::Tls)
-            );
-            let submission = config.smtp_config();
-            assert_eq!(
-                (
-                    submission.host.as_str(),
-                    submission.port,
-                    submission.security
-                ),
-                (smtp, port, security)
-            );
-        }
     }
 
     #[test]
