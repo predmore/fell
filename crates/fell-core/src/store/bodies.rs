@@ -112,6 +112,7 @@ CREATE TABLE IF NOT EXISTS body_backfill (
     account_id TEXT NOT NULL,
     message_id TEXT NOT NULL,
     refresh_cid_roles INTEGER NOT NULL DEFAULT 0,
+    structure_unavailable INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (account_id, message_id)
 ) WITHOUT ROWID;
 
@@ -151,6 +152,11 @@ pub(super) fn ensure_bodies(conn: &Connection) -> Result<()> {
     if !has_column(&tx, "body_backfill", "refresh_cid_roles")? {
         tx.execute_batch(
             "ALTER TABLE body_backfill ADD COLUMN refresh_cid_roles INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
+    if !has_column(&tx, "body_backfill", "structure_unavailable")? {
+        tx.execute_batch(
+            "ALTER TABLE body_backfill ADD COLUMN structure_unavailable INTEGER NOT NULL DEFAULT 0",
         )?;
     }
     tx.commit()?;
@@ -1149,14 +1155,31 @@ const MISSING_SQL: &str = "SELECT q.message_id FROM body_backfill q
      ORDER BY m.date_unix DESC
      LIMIT ?2";
 
+const MISSING_STRUCTURES_SQL: &str = "SELECT q.message_id FROM body_backfill q
+     CROSS JOIN messages m
+       ON m.account_id = q.account_id AND m.message_id = q.message_id
+     WHERE q.account_id = ?1 AND q.structure_unavailable = 0
+       AND NOT EXISTS (
+           SELECT 1 FROM message_bodies b WHERE b.account_id = q.account_id
+            AND b.message_id = q.message_id AND b.parts_listed != 0
+       )
+     ORDER BY m.date_unix DESC
+     LIMIT ?2";
+
 /// Up to `limit` queued messages, newest first, with their server copies.
 /// A queued message with no copy left is dropped from the queue.
 pub(super) fn missing(
     conn: &Connection,
     account_id: &AccountId,
     limit: usize,
+    structure_only: bool,
 ) -> Result<Vec<BodyRequest>> {
-    let mut stmt = conn.prepare(MISSING_SQL)?;
+    let sql = if structure_only {
+        MISSING_STRUCTURES_SQL
+    } else {
+        MISSING_SQL
+    };
+    let mut stmt = conn.prepare(sql)?;
     let ids = stmt
         .query_map(params![account_id.as_str(), limit as i64], |row| {
             row.get::<_, String>(0)

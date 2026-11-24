@@ -53,7 +53,7 @@ pub use embed::{
     LocalHashV1, embed_body,
 };
 pub use folders::{FolderRole, FolderRoles, RoleFolder, RoleSource};
-pub use imap::{CancelBodyFetch, ImapConfig, ImapSecurity, InboxWait};
+pub use imap::{BodyStructure, CancelBodyFetch, ImapConfig, ImapSecurity, InboxWait};
 pub use message::{
     Address, BodyState, Disposition, Message, MessageHeaders, MessageId, MessageParts, MimePart,
     PartRole, RemoteId, TransferEncoding,

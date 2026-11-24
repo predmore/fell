@@ -19,8 +19,9 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fell_core::{
-    Account, AccountConfig, BackendKind, DroppedWrite, InboxWait, ReplyToBackfill, ReplyToProgress,
-    Store, SyncFailureKind, SyncReport, diagnostic, fetch_missing_bodies, sync_with_arrivals,
+    Account, AccountConfig, BackendKind, DroppedWrite, InboxWait, ReaderBodyFetcher,
+    ReplyToBackfill, ReplyToProgress, Store, SyncFailureKind, SyncReport, diagnostic,
+    fetch_missing_bodies, sync_with_arrivals,
 };
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 
@@ -402,12 +403,20 @@ fn fill_old_mail(
     let Ok(backend) = config.backend() else {
         return None;
     };
+    let mut more_structures = true;
     let (mut more_headers, mut more_bodies) = (true, true);
     for _ in 0..BACKFILL_BATCHES_AFTER_PASS {
         match wake.try_recv() {
             Ok(ask) => return Some(Woke::Asked(ask)),
             Err(TryRecvError::Disconnected) => return Some(Woke::Closed),
             Err(TryRecvError::Empty) => {}
+        }
+        if more_structures {
+            more_structures =
+                ReaderBodyFetcher::backfill_structures(config, store).is_ok_and(|count| count > 0);
+            if more_structures {
+                let _ = events.unbounded_send(SyncEvent::BodiesStored);
+            }
         }
         if more_headers {
             more_headers = matches!(
@@ -429,7 +438,7 @@ fn fill_old_mail(
                 let _ = events.unbounded_send(SyncEvent::BodiesStored);
             }
         }
-        if !more_headers && !more_bodies {
+        if !more_headers && !more_bodies && !more_structures {
             break;
         }
     }

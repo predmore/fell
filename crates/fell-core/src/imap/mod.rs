@@ -35,7 +35,7 @@ pub(crate) use rfc822::{
     snippet as plain_snippet,
 };
 pub(crate) use stored_metadata::{fetch_internal_dates, fetch_reply_to};
-pub(crate) use structure::BodyStructure;
+pub use structure::BodyStructure;
 
 #[cfg(test)]
 mod bridge_sync_tests;
@@ -1019,22 +1019,38 @@ fn walk_down(
         } else {
             Some(range)
         };
-        let mut rows: Vec<session::Fetched> = Vec::new();
+        let mut by_uid = std::collections::BTreeMap::new();
         if let Some(set) = header_set {
-            let stop =
-                session.uid_fetch_each(&set, None, session::FetchItems::Headers, |item| {
+            let mut fetch = |session: &mut session::Session, items| {
+                by_uid.clear();
+                session.uid_fetch_each(&set, None, items, |item| {
                     if (low..=high).contains(&item.uid) {
-                        rows.push(item);
+                        use std::collections::btree_map::Entry;
+                        match by_uid.entry(item.uid) {
+                            Entry::Vacant(entry) => {
+                                entry.insert(item);
+                            }
+                            Entry::Occupied(mut entry) => entry.get_mut().merge_header_fields(item),
+                        }
                     }
                     Ok(())
-                })?;
+                })
+            };
+            let mut stop = fetch(session, session::FetchItems::Headers)?;
+            if matches!(stop, session::FetchStop::Refused) {
+                // A provider that rejects a combined request can still
+                // deliver its headers. Body parsing supplies the list later.
+                stop = fetch(session, session::FetchItems::HeadersOnly)?;
+            }
             if !matches!(stop, session::FetchStop::Done) {
                 pass.complete = false;
                 return Ok(Walked::Stopped);
             }
         }
-        rows.sort_by_key(|row| row.uid);
-        rows.dedup_by_key(|row| row.uid);
+        let rows: Vec<_> = by_uid
+            .into_values()
+            .filter(|row| !row.body_missing || row.flags_present)
+            .collect();
         // A tagged OK can end a short FETCH. SEARCH lists the UIDs that
         // actually exist in the range, including across gaps in the UID space.
         // Search after the fetch so an expunged UID does not hold up the walk.
@@ -1061,7 +1077,7 @@ fn walk_down(
         let mut header_ids: HashMap<u32, crate::MessageId> = HashMap::new();
         // Newest first, with RFC822.SIZE.
         let mut wanted: Vec<(u32, u32)> = Vec::new();
-        for row in rows.into_iter().rev() {
+        for mut row in rows.into_iter().rev() {
             if stored.binary_search(&row.uid).is_ok() {
                 flags.push(flag_update(checkpoint.uidvalidity, &escaped, &row, mode));
                 continue;
@@ -1070,13 +1086,14 @@ fn walk_down(
                 continue;
             }
             if !row.skipped && !row.body_missing {
-                let header = rfc822::headers_message(
+                let mut header = rfc822::headers_message(
                     pass.account_id,
                     mailbox,
                     checkpoint.uidvalidity,
                     &row,
                     !mode.keywords,
                 );
+                header.structure = row.structure.take();
                 header_ids.insert(row.uid, header.message.headers.message_id.clone());
                 let learned = arrival_flags(checkpoint.uidvalidity, &escaped, &row, mode);
                 headers.push((header, learned));
@@ -1958,15 +1975,20 @@ fn progress_delta(
     pairs.sort_by(|left, right| left.0.cmp(&right.0));
     let mut messages = Vec::with_capacity(fetched.len());
     let mut deferred_dates = HashMap::new();
+    let mut body_structures = HashMap::new();
     for item in fetched {
         if let Some(date) = item.deferred_date {
             deferred_dates.insert(item.message.remote_id.clone(), date);
+        }
+        if let Some(structure) = item.structure {
+            body_structures.insert(item.message.remote_id.clone(), structure);
         }
         messages.push(item.message);
     }
     MailboxDelta {
         messages,
         deferred_dates,
+        body_structures,
         flags,
         cursor: Some(encode_cursor(snapshot.account_id.as_str(), &pairs)),
         removals,

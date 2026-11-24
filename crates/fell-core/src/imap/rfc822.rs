@@ -272,6 +272,7 @@ pub(crate) fn to_message(
 pub(super) struct FetchedMessage {
     pub message: Message,
     pub deferred_date: Option<crate::backend::DeferredMailDate>,
+    pub structure: Option<super::BodyStructure>,
 }
 
 pub(super) fn fetched_message(
@@ -305,6 +306,7 @@ pub(super) fn fetched_message(
     FetchedMessage {
         message,
         deferred_date,
+        structure: None,
     }
 }
 
@@ -437,9 +439,8 @@ fn effective_date(header: i64, arrival: Option<i64>, latest: i64) -> i64 {
 /// A list row from a message's header alone, before its body is fetched.
 ///
 /// It has no snippet, body or parts, so the store writes no body row for it
-/// and the fetch of the whole message fills them in place. The attachment
-/// marker waits for the body too: telling a file from an inline image needs
-/// the HTML.
+/// unless BODYSTRUCTURE also arrived. Its provisional list is stored
+/// alongside the header and is confirmed when the body is parsed.
 pub(super) fn headers_message(
     account_id: &AccountId,
     mailbox: &session::Listed,

@@ -618,14 +618,15 @@ fn handle(
                     }
                     let seq = index + 1;
                     let upper_cmd = rest.to_ascii_uppercase();
-                    if let Some(structures) = structures
-                        && upper_cmd.contains("BODYSTRUCTURE")
-                        && let Some(structure) = structures.get(&message.uid)
-                    {
+                    let structure = structures
+                        .filter(|_| upper_cmd.contains("BODYSTRUCTURE"))
+                        .and_then(|structures| structures.get(&message.uid));
+                    if let Some(structure) = structure {
                         let _ = write.write_all(
                             format!(
-                                "* {seq} FETCH (BODYSTRUCTURE {structure} UID {})\r\n",
-                                message.uid
+                                "* {seq} FETCH (BODYSTRUCTURE {structure} UID {} FLAGS ({}))\r\n",
+                                message.uid,
+                                message.flags.join(" "),
                             )
                             .as_bytes(),
                         );
@@ -711,9 +712,14 @@ fn handle(
                             .position(|window| window == b"\r\n\r\n")
                             .map_or(message.raw.len(), |at| at + 4);
                         let header = &message.raw[..end];
+                        let flags_field = if structure.is_none() {
+                            format!(" FLAGS ({flags})")
+                        } else {
+                            String::new()
+                        };
                         let _ = write.write_all(
                             format!(
-                                "* {seq} FETCH (UID {} RFC822.SIZE {} FLAGS ({flags}){revision}{internal_date} BODY[HEADER] {{{}}}\r\n",
+                                "* {seq} FETCH (UID {} RFC822.SIZE {}{flags_field}{revision}{internal_date} BODY[HEADER] {{{}}}\r\n",
                                 message.uid,
                                 message.raw.len(),
                                 header.len()

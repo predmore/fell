@@ -4852,6 +4852,130 @@ fn reader_stores_metadata_and_bodies_before_the_sync_pass_finishes() {
     pass.join().unwrap();
 }
 
+#[test]
+fn header_and_structure_backfill_set_the_paperclip_before_downloading_bodies() {
+    let id = crate::MessageId::new("files@example.test");
+    let fixture = super::mime_fixtures::mixed_two_attachments(id.as_str());
+    let structure = concat!(
+        r#"(("TEXT" "PLAIN" NIL NIL NIL "7BIT" 19 1 NIL NIL)"#,
+        r#"("APPLICATION" "PDF" NIL NIL NIL "BASE64" 4180 NIL ("ATTACHMENT" ("FILENAME" "report.pdf")))"#,
+        r#"("TEXT" "CSV" NIL NIL NIL "QUOTED-PRINTABLE" 36 2 NIL ("ATTACHMENT" ("FILENAME" "totals.csv"))) "MIXED")"#,
+    );
+    let malformed = raw_message(
+        "malformed@example.test",
+        None,
+        "Checklist",
+        "Demo <demo@example.test>",
+        "Check stage",
+        "",
+    );
+    let mut state = inbox_state(vec![(1, fixture.raw), (2, malformed)]);
+    state.mailboxes[0].messages[0].flags.push("\\Seen".into());
+    let server = TestServer::spawn_parallel(
+        state,
+        [(1, structure.to_owned()), (2, "(TEXT)".to_owned())]
+            .into_iter()
+            .collect(),
+    );
+    let config = crate::AccountConfig::parse(&format!(
+        concat!(
+            "id = \"reader\"\nemail = \"reader@example.test\"\nbackend = \"imap\"\n",
+            "host = \"127.0.0.1\"\nport = {}\nsecurity = \"plain\"\n",
+            "username = \"caleb\"\npassword = \"secret\"\n"
+        ),
+        server.addr.port()
+    ))
+    .unwrap();
+    let account = config.account();
+    let backend = config.backend().unwrap();
+    let store = Store::open_in_memory().unwrap();
+    let sees = |parts, state| {
+        assert_eq!(store.reader_parts(&account.id, id.as_str()).unwrap(), parts);
+        assert_eq!(
+            store
+                .body_states(&account.id, std::slice::from_ref(&id))
+                .unwrap(),
+            [state]
+        );
+        let row = store
+            .folder_threads(&account.id, "INBOX")
+            .unwrap()
+            .into_iter()
+            .find(|row| row.thread_id == ThreadId::from_message_id(&id))
+            .unwrap();
+        assert!(row.has_attachment);
+        assert!(
+            !row.unread,
+            "FLAGS arrive with structure in a separate response"
+        );
+        let files = store
+            .message_attachments(&account.id, &id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].filename.as_deref(), Some("report.pdf"));
+        assert_eq!(files[1].filename.as_deref(), Some("totals.csv"));
+    };
+    let mut saw_headers = false;
+    sync_with_progress(&account, backend.as_ref(), &store, &mut |_| {
+        if !saw_headers && !store.list_threads(&account.id).unwrap().is_empty() {
+            sees(
+                crate::ReaderParts::Listed { html: false },
+                crate::BodyState::Pending,
+            );
+            saw_headers = true;
+        }
+    })
+    .unwrap();
+    assert!(saw_headers);
+    sees(crate::ReaderParts::Ready, crate::BodyState::Stored);
+    let logged = commands(&server);
+    assert!(
+        logged
+            .iter()
+            .any(|command| command.contains("BODY.PEEK[HEADER] BODYSTRUCTURE"))
+    );
+
+    store.conn.execute_batch(
+        "DELETE FROM message_parts; DELETE FROM message_bodies;
+         UPDATE messages SET has_attachment = 0, attachment_names = '';
+         INSERT INTO body_backfill (account_id, message_id) SELECT account_id, message_id FROM messages;",
+    ).unwrap();
+    server.state.lock().unwrap().commands.clear();
+
+    let backfill = || crate::ReaderBodyFetcher::backfill_structures(&config, &store).unwrap();
+    assert_eq!(backfill(), 2);
+    sees(
+        crate::ReaderParts::Listed { html: false },
+        crate::BodyState::Stored,
+    );
+    assert_eq!(
+        backfill(),
+        0,
+        "the malformed structure is skipped on the next pass"
+    );
+    assert_eq!(store.missing_bodies(&account.id, 10).unwrap().len(), 2);
+    let logged = commands(&server);
+    assert!(
+        logged
+            .iter()
+            .any(|command| command.contains("UID FETCH 1,2 (UID BODYSTRUCTURE)"))
+    );
+    assert!(
+        logged
+            .iter()
+            .all(|command| !command.contains("BODY.PEEK[]"))
+    );
+
+    assert!(logged.iter().any(|command| command.contains(" LOGOUT")));
+    assert_eq!(
+        crate::fetch_missing_bodies(&account.id, backend.as_ref(), &store, 1).unwrap(),
+        2
+    );
+    sees(crate::ReaderParts::Ready, crate::BodyState::Stored);
+    assert!(store.missing_bodies(&account.id, 1).unwrap().is_empty());
+}
+
 fn temp_cache(tag: &str) -> (std::path::PathBuf, crate::parts::PartCache) {
     let root = std::env::temp_dir().join(format!(
         "fell-part-fetch-{tag}-{}-{:?}",
@@ -5159,7 +5283,7 @@ fn provisional_wire_size_mismatches_check_the_part_mime_headers() {
             )
             .unwrap();
         store
-            .store_structures(&acct.id, &[(id.clone(), copy, contents)])
+            .store_structures(&acct.id, &[(id.clone(), copy, contents)], true)
             .unwrap();
         assert_eq!(
             store
@@ -5316,6 +5440,74 @@ fn a_part_exactly_one_window_long_is_fetched_once() {
         commands(&server)
     );
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn opening_a_server_draft_waits_for_the_attachment_session_to_close() {
+    use std::ops::ControlFlow;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let fixture = super::mime_fixtures::mixed_two_attachments("draft@example.test");
+    let server =
+        TestServer::spawn_parallel(inbox_state(vec![(1, fixture.raw)]), Default::default());
+    let config = config(server.addr.port());
+    let copy = crate::RemoteId("imap:20:1:INBOX".into());
+    let (arrived, attachment_active) = mpsc::channel();
+    let (release, attachment_release) = mpsc::channel();
+    let (opening, draft_started) = mpsc::channel();
+    let (done, draft_finished) = mpsc::channel();
+    std::thread::scope(|scope| {
+        let attachment_config = &config;
+        let attachment_copy = &copy;
+        scope.spawn(move || {
+            let mut arrived = Some(arrived);
+            super::part_fetch::fetch_part(attachment_config, attachment_copy, "2", 0, &mut |_| {
+                if let Some(arrived) = arrived.take() {
+                    arrived.send(()).unwrap();
+                    attachment_release
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                }
+                ControlFlow::Continue(())
+            })
+            .unwrap()
+            .unwrap();
+        });
+        attachment_active
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let draft_config = &config;
+        let draft_copy = &copy;
+        scope.spawn(move || {
+            opening.send(()).unwrap();
+            done.send(super::part_fetch::fetch_draft(draft_config, draft_copy))
+                .unwrap();
+        });
+        draft_started.recv_timeout(Duration::from_secs(5)).unwrap();
+        let early = draft_finished.recv_timeout(Duration::from_millis(150));
+        release.send(()).unwrap();
+        assert!(matches!(early, Err(mpsc::RecvTimeoutError::Timeout)));
+        assert!(
+            draft_finished
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .is_some()
+        );
+    });
+    let commands = commands(&server);
+    let logins: Vec<_> = commands
+        .iter()
+        .enumerate()
+        .filter(|(_, command)| command.contains("LOGIN"))
+        .collect();
+    let logout = commands
+        .iter()
+        .position(|command| command.contains(" LOGOUT"))
+        .unwrap();
+    assert_eq!(logins.len(), 2, "{commands:?}");
+    assert!(logins[0].0 < logout && logout < logins[1].0, "{commands:?}");
 }
 
 #[test]

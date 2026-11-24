@@ -48,6 +48,8 @@ pub(super) struct Fetched {
     pub flags_present: bool,
     pub modseq: Option<u64>,
     pub body: Vec<u8>,
+    /// Provisional part metadata, if requested with a header.
+    pub structure: Option<super::BodyStructure>,
     /// The body was larger than the cap. The UID is kept so the checkpoint
     /// can move past it; the bytes were not stored.
     pub skipped: bool,
@@ -57,6 +59,26 @@ pub(super) struct Fetched {
     /// `RFC822.SIZE`, when the reply had it.
     pub size: Option<u32>,
     pub internal_date: Option<i64>,
+}
+
+impl Fetched {
+    /// IMAP can send the fields of one header fetch in separate untagged
+    /// responses. A field omitted from a later reply keeps its earlier value.
+    pub(super) fn merge_header_fields(&mut self, update: Self) {
+        if update.flags_present {
+            self.flags_present = true;
+            self.flags = update.flags;
+        }
+        self.modseq = update.modseq.or(self.modseq);
+        if !update.body_missing && (self.body_missing || self.skipped) {
+            self.body_missing = false;
+            self.skipped = update.skipped;
+            self.body = update.body;
+        }
+        self.structure = update.structure.or_else(|| self.structure.take());
+        self.size = update.size.or(self.size);
+        self.internal_date = update.internal_date.or(self.internal_date);
+    }
 }
 
 /// One reply to [`Session::uid_fetch_part`].
@@ -99,6 +121,8 @@ pub(super) enum FetchItems {
     Bodies,
     /// Enough for a list row and threading, before the body is fetched.
     Headers,
+    /// Fallback if the server refuses a header fetch with BODYSTRUCTURE.
+    HeadersOnly,
     /// Identity headers, to link copies without their bodies.
     MessageId { bridge: bool },
     /// The original Reply-To header only, for legacy rows.
@@ -332,26 +356,13 @@ impl Session {
         let mut found = Vec::new();
         for line in reply.untagged {
             let upper = line.text.to_ascii_uppercase();
-            let Some(value) = fetch_item(&line.text, &upper, "BODYSTRUCTURE", '(') else {
+            let Ok(Some(structure)) = response_structure(&line.text, &upper, &line.literals) else {
                 continue;
             };
             let Some(uid) = fetch_number(&line.text, &upper, "UID") else {
                 continue;
             };
-            let before = line.text.len() - value.len() - 1;
-            let literals = line
-                .literals
-                .iter()
-                .skip(literals_before(&line.text[..before]));
-            if let Some(structure) = super::structure::parse(
-                &line.text[before..],
-                literals.map(|literal| match literal {
-                    LiteralBytes::Kept(bytes) => Some(bytes.as_slice()),
-                    LiteralBytes::Discarded => None,
-                }),
-            ) {
-                found.push((uid, structure));
-            }
+            found.push((uid, structure));
         }
         Ok(found)
     }
@@ -388,7 +399,8 @@ impl Session {
         let body = match items {
             FetchItems::Flags => "",
             FetchItems::Bodies => " INTERNALDATE BODY.PEEK[]",
-            FetchItems::Headers => " RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER]",
+            FetchItems::Headers => " RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER] BODYSTRUCTURE",
+            FetchItems::HeadersOnly => " RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER]",
             FetchItems::MessageId { bridge } => {
                 identity = format!(" BODY.PEEK[{}]", identity_section(bridge));
                 &identity
@@ -446,7 +458,15 @@ impl Session {
                 continue;
             }
             let fetched = match items {
-                FetchItems::Bodies | FetchItems::Headers | FetchItems::InternalDate => {
+                FetchItems::Headers => {
+                    let upper = text.to_ascii_uppercase();
+                    let structure = response_structure(&text, &upper, &literals).ok().flatten();
+                    parse_fetch(&text, literals).map(|mut item| {
+                        item.structure = structure;
+                        item
+                    })
+                }
+                FetchItems::Bodies | FetchItems::HeadersOnly | FetchItems::InternalDate => {
                     parse_fetch(&text, literals)
                 }
                 FetchItems::MessageId { bridge } => {
@@ -1796,7 +1816,7 @@ fn parse_fetch_with_section(
     if !upper.contains(" FETCH ") && !upper.contains(" FETCH(") {
         return None;
     }
-    let uid = number_after(&upper, "UID ")?;
+    let uid = fetch_number(text, &upper, "UID")?;
     let flags = fetch_flags(text, &upper);
     let (body, skipped, body_missing) = body_after_body_key(text, &mut literals, section);
     Some(Fetched {
@@ -1805,6 +1825,7 @@ fn parse_fetch_with_section(
         flags: flags.unwrap_or_default(),
         modseq: fetch_modseq(&upper),
         body,
+        structure: None,
         skipped,
         body_missing,
         size: number_after(&upper, "RFC822.SIZE "),
@@ -1827,6 +1848,7 @@ fn parse_flags(text: &str) -> Option<Fetched> {
         flags_present: true,
         modseq: fetch_modseq(&upper),
         body: Vec::new(),
+        structure: None,
         skipped: false,
         body_missing: false,
         size: None,
@@ -1859,6 +1881,27 @@ fn fetch_internal_date(text: &str, upper: &str) -> Option<i64> {
     let (month, rest) = rest.split_once('-')?;
     let date = mail_parser::DateTime::parse_rfc822(&format!("{day} {month} {rest}"))?;
     super::rfc822::valid_date(&date)
+}
+
+fn response_structure(
+    text: &str,
+    upper: &str,
+    literals: &[LiteralBytes],
+) -> Result<Option<super::BodyStructure>, Error> {
+    let Some(value) = fetch_item(text, upper, "BODYSTRUCTURE", '(') else {
+        return Ok(None);
+    };
+    let before = text.len() - value.len() - 1;
+    let literals = literals.iter().skip(literals_before(&text[..before]));
+    super::structure::parse(
+        &text[before..],
+        literals.map(|literal| match literal {
+            LiteralBytes::Kept(bytes) => Some(bytes.as_slice()),
+            LiteralBytes::Discarded => None,
+        }),
+    )
+    .map(Some)
+    .ok_or_else(|| imap_err("invalid BODYSTRUCTURE reply"))
 }
 
 fn fetch_number<T: std::str::FromStr>(text: &str, upper: &str, key: &str) -> Option<T> {

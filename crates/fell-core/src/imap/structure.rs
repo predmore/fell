@@ -4,8 +4,9 @@ use crate::{Disposition, MimePart, PartRole, TransferEncoding};
 
 use super::rfc822::{CidReferences, clean_name, section};
 
-#[derive(Debug, Default)]
-pub(crate) struct BodyStructure {
+/// The body formats and non-body parts reported by an IMAP server.
+#[derive(Debug, Clone, Default)]
+pub struct BodyStructure {
     pub html: bool,
     pub parts: Vec<MimePart>,
 }
@@ -241,6 +242,11 @@ fn walk(
     };
     part.size = part.estimated_decoded_size();
     part.role = CidReferences::new(None).role_for(&part);
+    // Until the body confirms references, CID images are presumed inline
+    // unless the sender explicitly marked them as attachments.
+    if part.role == PartRole::Attachment && part.cid_image_id().is_some() {
+        part.role = PartRole::Inline;
+    }
     out.parts.push(part);
     if is_message && nested < 4 {
         let inner = items.get(8)?.list()?;
@@ -252,4 +258,20 @@ fn walk(
         walk(inner, &prefix, nested + 1, false, out)?;
     }
     Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn provisional_cid_images_are_inline_unless_explicit_attachments() {
+        let structure = concat!(
+            r#"(("TEXT" "HTML" NIL NIL NIL "7BIT" 40 1)"#,
+            r#"("IMAGE" "PNG" NIL "<logo@example.test>" NIL "BASE64" 20 NIL NIL)"#,
+            r#"("IMAGE" "PNG" NIL "<file@example.test>" NIL "BASE64" 20 NIL ("ATTACHMENT" ("FILENAME" "file.png"))) "RELATED")"#,
+        );
+        let actual = super::parse(structure, std::iter::empty()).unwrap();
+        assert!(actual.html);
+        assert_eq!(actual.parts[0].role, crate::PartRole::Inline);
+        assert_eq!(actual.parts[1].role, crate::PartRole::Attachment);
+    }
 }
