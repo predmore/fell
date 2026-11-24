@@ -205,7 +205,9 @@ pub(super) fn row(
                             gpui::canvas(
                                 |_, _, _| (),
                                 move |mut bounds, (), window, _| {
-                                    bounds.size.width = (bounds.size.width * shown).max(px(1.));
+                                    bounds.size.width = (bounds.size.width * shown)
+                                        .max(px(10.))
+                                        .min(bounds.size.width);
                                     window.paint_quad(gpui::fill(bounds, rgb(accent)));
                                 },
                             )

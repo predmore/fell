@@ -2325,7 +2325,7 @@ impl Inbox {
             return;
         }
         if self.open_thread.as_deref() != Some(id.as_str()) {
-            self.reader_bodies.clear();
+            self.reader_bodies.active = None;
         }
         if let Some(draft) = self.session.cursor_draft() {
             self.first_preview.take();
@@ -4046,6 +4046,7 @@ impl Inbox {
     fn mark_open(&mut self, id: String, latest_note: Option<i64>) {
         self.conversation_revision = self.conversation_revision.wrapping_add(1);
         if self.open_thread.as_deref() != Some(&id) {
+            self.reader_bodies.clear();
             let notes = &self.session.agent_notes;
             self.note_pin = agent_notes::NotePin::opened(
                 notes.current(Some(&id)).map(|note| note.id),
@@ -5585,6 +5586,12 @@ impl ConvFrame {
             .get(id)
             .copied()
             .unwrap_or(1.0)
+    }
+
+    fn show_attachment_row(&self, message: &ConvMessage) -> bool {
+        !message.attachments.is_empty()
+            && !(message.body_state == fell_core::BodyState::Pending
+                && matches!(self.part_status.get(&message.id), Some(ReaderLabel::Hidden)))
     }
 
     fn attachment_alpha(&self, id: &str) -> f32 {
@@ -8113,7 +8120,11 @@ impl ReaderBodies {
                     return None;
                 }
                 let html_ready = matches!(message.rich, Rich::Html(_) | Rich::PlainPart(_));
-                if !html_ready && message.rich != Rich::Pending && !message.body.blocks.is_empty() {
+                if !html_ready
+                    && message.body_state == fell_core::BodyState::Stored
+                    && message.rich != Rich::Pending
+                    && !message.body.blocks.is_empty()
+                {
                     self.fallback_since.entry(message.id.clone()).or_insert(now);
                 }
                 let text = self.fallback_since.contains_key(&message.id);
@@ -9221,7 +9232,7 @@ fn expanded_message(
                 cx,
             ),
         ))
-        .when(!message.attachments.is_empty(), |card| {
+        .when(frame.show_attachment_row(message), |card| {
             card.child(
                 div()
                     .id("attachment-layout")
@@ -9422,9 +9433,7 @@ fn stored_message_body(
     }
     let blocks: Vec<gpui::AnyElement> = match &message.rich {
         Rich::Html(_) => unreachable!(),
-        Rich::Pending if message.body.blocks.is_empty() => {
-            return missing_message_body(theme, folds.columns, "Preparing message…", alpha);
-        }
+        Rich::Pending if message.body.blocks.is_empty() => return div().into_any_element(),
         Rich::Pending | Rich::Plain | Rich::PlainPart(_) | Rich::Missing => {
             // A signature and the quote next to it fold as one, as in HTML.
             // A draft's markdown is painted as its compose window shows it.
