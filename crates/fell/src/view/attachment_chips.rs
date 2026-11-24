@@ -36,7 +36,7 @@ pub(super) fn row(
     let measure =
         |text: &str| super::line_px_with_style(window, &style, text, FontWeight::NORMAL).ceil();
     let retry = format!(
-        "Failed · {}",
+        "Failed · {} retry",
         keymap::binding_text(&session.keymap, Action::RetryAttachment)
     );
     let status_width = ["Downloading", "↓ 100%", &retry]

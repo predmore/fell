@@ -1334,7 +1334,7 @@ impl Inbox {
                                     .refresh_reply_checks(cx.global::<ReplyChecks>().pending(), cx);
                             }
                             inbox.reader_bodies.failed.retain(|_, failure| {
-                                !matches!(failure, reader_body_worker::Failure::Offline)
+                                !matches!(failure, reader_body_worker::Failure::Connection)
                             });
                         }
                         let open_pending = inbox.first_preview.sync_changed(&kind);
@@ -2791,7 +2791,7 @@ impl Inbox {
         .detach();
         cx.spawn(async move |this, cx| {
             while let Some(event) = events.next().await {
-                let finished = matches!(event, reader_body_worker::Event::Finished(_));
+                let finished = matches!(event, reader_body_worker::Event::Finished(..));
                 let live = this.update(cx, |inbox, cx| {
                     if !inbox.reader_bodies.is_active(generation) {
                         return false;
@@ -2801,8 +2801,8 @@ impl Inbox {
                             inbox.reread_open_thread(cx);
                             inbox.request_threads(ReadIntent::default(), cx);
                         }
-                        reader_body_worker::Event::Finished(result) => {
-                            inbox.finish_reader_parts(result, cx);
+                        reader_body_worker::Event::Finished(result, at) => {
+                            inbox.finish_reader_parts(result, at, cx);
                         }
                     }
                     true
@@ -2813,7 +2813,11 @@ impl Inbox {
             }
             let _ = this.update(cx, |inbox, cx| {
                 if inbox.reader_bodies.is_active(generation) {
-                    inbox.finish_reader_parts(Err(reader_body_worker::Failure::Failed), cx);
+                    inbox.finish_reader_parts(
+                        Err(reader_body_worker::Failure::Failed),
+                        Instant::now(),
+                        cx,
+                    );
                 }
             });
         })
@@ -2823,6 +2827,7 @@ impl Inbox {
     fn finish_reader_parts(
         &mut self,
         result: Result<Vec<MessageId>, reader_body_worker::Failure>,
+        at: Instant,
         cx: &mut Context<Self>,
     ) {
         let Some(active) = self.reader_bodies.active.take() else {
@@ -2835,7 +2840,9 @@ impl Inbox {
                         .reader_bodies
                         .started
                         .get(&id.0)
-                        .is_some_and(|at| at.elapsed() < reader_body_worker::SHOW_AFTER)
+                        .is_some_and(|started| {
+                            at.saturating_duration_since(*started) < reader_body_worker::SHOW_AFTER
+                        })
                     {
                         self.reader_bodies.fast_completed.insert(id.0.clone());
                     }
@@ -4327,6 +4334,8 @@ impl Inbox {
         }
         if step.sync_now {
             self.reader_bodies.failed.clear();
+            self.reader_bodies.completed.clear();
+            self.reader_bodies.fast_completed.clear();
             match &self.sync {
                 Some(handle) => {
                     handle.sync_now();
@@ -5216,7 +5225,9 @@ impl Render for Inbox {
         let conv = ConvFrame {
             syncing: self.pending_bodies.downloading(&self.session.sync),
             missing_fade: self.pending_bodies.fade(now),
-            part_status: self.reader_bodies.labels(&self.session, real),
+            part_status: self
+                .reader_bodies
+                .labels(&self.session, real, now, &mut self.motion),
             agent_note,
             pin,
             note_details_only,
@@ -5284,6 +5295,7 @@ impl Render for Inbox {
             | status_labels.count_fade.is_some()
             | self.body_landing.is_some()
             | conv.missing_fade.is_some()
+            | conv.part_status.values().any(|status| status.running)
             | conv.match_line.animating
             | self.row_widths.running(now)
             | self
@@ -5562,7 +5574,7 @@ struct ConvFrame {
     return_glide: Option<LandingGlide>,
     syncing: bool,
     missing_fade: Option<f32>,
-    part_status: HashMap<String, ReaderLabel>,
+    part_status: HashMap<String, ReaderStatusFrame>,
     /// Bodies fading in, by message id: their opacity.
     alphas: HashMap<String, f32>,
     attachment_alphas: HashMap<String, f32>,
@@ -5600,8 +5612,10 @@ impl ConvFrame {
 
     fn show_attachment_row(&self, message: &ConvMessage) -> bool {
         !message.attachments.is_empty()
-            && !(message.body_state == fell_core::BodyState::Pending
-                && matches!(self.part_status.get(&message.id), Some(ReaderLabel::Hidden)))
+            && self
+                .part_status
+                .get(&message.id)
+                .is_none_or(|status| status.show_chips)
     }
 
     fn attachment_alpha(&self, id: &str) -> f32 {
@@ -8087,19 +8101,72 @@ struct ReaderBodies {
     fallback_since: HashMap<String, Instant>,
     body_probes: HashMap<String, Rc<Cell<f32>>>,
     sizes: HashMap<(String, String), AttachmentSize>,
+    statuses: HashMap<String, ReaderStatus>,
+    shown_chips: HashSet<String>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReaderLabel {
-    Hidden,
     Checking,
     Formatted,
     Loading,
-    Failed {
-        offline: bool,
-        html: bool,
-        unknown: bool,
-    },
+    Failed,
+    FormatFailed,
+    Unreachable,
+    Offline,
+}
+
+#[derive(Default)]
+struct ReaderStatus {
+    label: Option<ReaderLabel>,
+    since: Option<Instant>,
+    arrival: Option<Transition>,
+    leaving: Option<(ReaderLabel, f32, Transition)>,
+}
+
+struct ReaderStatusFrame {
+    layers: [Option<(ReaderLabel, f32)>; 2],
+    show_chips: bool,
+    running: bool,
+}
+
+impl ReaderStatus {
+    fn frame(
+        &mut self,
+        wanted: Option<ReaderLabel>,
+        now: Instant,
+        motion: Motion,
+    ) -> ReaderStatusFrame {
+        // The fade gives a brief loading state a soft exit. With motion off,
+        // hold it long enough to read and change wording immediately.
+        let holding = !motion.enabled()
+            && wanted.is_none()
+            && self.since.is_some_and(|since| {
+                now.saturating_duration_since(since) < Duration::from_millis(300)
+            });
+        if !holding && wanted != self.label {
+            self.leaving = self
+                .label
+                .zip(motion.start(motion::FADE, now))
+                .map(|(label, fade)| (label, motion::progress(self.arrival.as_ref(), now), fade));
+            self.arrival = wanted.and_then(|_| motion.start(motion::FADE, now));
+            self.label = wanted;
+            self.since = wanted.map(|_| now);
+        }
+        self.leaving = self.leaving.filter(|(_, _, fade)| fade.running(now));
+        ReaderStatusFrame {
+            layers: [
+                self.leaving
+                    .map(|(label, from, fade)| (label, from * (1. - fade.progress(now)))),
+                self.label
+                    .map(|label| (label, motion::progress(self.arrival.as_ref(), now))),
+            ],
+            show_chips: true,
+            running: holding
+                || self.leaving.is_some()
+                || self.arrival.is_some_and(|fade| fade.running(now)),
+        }
+    }
 }
 
 impl ReaderBodies {
@@ -8117,7 +8184,13 @@ impl ReaderBodies {
             .is_some_and(|active| active.generation == generation)
     }
 
-    fn labels(&mut self, session: &Session, now: Instant) -> HashMap<String, ReaderLabel> {
+    fn labels(
+        &mut self,
+        session: &Session,
+        real: Instant,
+        now: Instant,
+        motion: &mut InboxMotion,
+    ) -> HashMap<String, ReaderStatusFrame> {
         use fell_core::ReaderParts::*;
         session
             .messages
@@ -8126,7 +8199,9 @@ impl ReaderBodies {
             .filter_map(|message| {
                 let parts = message.reader_parts;
                 let started = self.started.get(&message.id);
-                let managed = started.is_some() || parts != Ready;
+                let managed = self.body_probes.contains_key(&message.id)
+                    || started.is_some()
+                    || parts != Ready;
                 if !managed {
                     return None;
                 }
@@ -8142,43 +8217,70 @@ impl ReaderBodies {
                         BodyBlock::Markdown { .. } => true,
                     });
                 if text {
-                    self.fallback_since.entry(message.id.clone()).or_insert(now);
+                    self.fallback_since
+                        .entry(message.id.clone())
+                        .or_insert(real);
                 }
                 self.body_probes.entry(message.id.clone()).or_default();
+                let past_gate = started.is_some_and(|started| {
+                    real.saturating_duration_since(*started) >= reader_body_worker::SHOW_AFTER
+                }) && !self.fast_completed.contains(&message.id);
                 let label = match parts {
-                    Unavailable { html } => ReaderLabel::Failed {
-                        offline: false,
-                        html,
-                        unknown: false,
-                    },
-                    _ if started.is_none_or(|started| {
-                        now.saturating_duration_since(*started) < reader_body_worker::SHOW_AFTER
-                    }) =>
-                    {
-                        ReaderLabel::Hidden
-                    }
-                    _ if parts != Ready && self.fast_completed.contains(&message.id) => {
-                        ReaderLabel::Hidden
-                    }
+                    Unavailable { html } => Some(ReaderLabel::failed(html && text)),
                     _ if message.needs_reader_parts()
                         && let Some(failure) = self.failed.get(&message.id) =>
                     {
-                        ReaderLabel::Failed {
-                            offline: matches!(failure, reader_body_worker::Failure::Offline),
-                            html: matches!(parts, Listed { html: true }),
-                            unknown: parts == Unknown,
-                        }
+                        Some(match failure {
+                            reader_body_worker::Failure::Connection
+                                if matches!(
+                                    session.sync,
+                                    SyncKind::Failed(_)
+                                        | SyncKind::LocalOffline
+                                        | SyncKind::FixtureOffline
+                                ) =>
+                            {
+                                ReaderLabel::Offline
+                            }
+                            reader_body_worker::Failure::Connection => ReaderLabel::Unreachable,
+                            reader_body_worker::Failure::Failed => {
+                                ReaderLabel::failed(text && matches!(parts, Listed { html: true }))
+                            }
+                        })
                     }
-                    Unknown if text => ReaderLabel::Checking,
-                    Unknown => ReaderLabel::Loading,
-                    Listed { .. } if !message.needs_reader_parts() => ReaderLabel::Hidden,
-                    Listed { html: true } if text => ReaderLabel::Formatted,
-                    Listed { .. } => ReaderLabel::Loading,
-                    Ready if message.rich == Rich::Pending && text => ReaderLabel::Formatted,
-                    Ready if message.rich == Rich::Pending => ReaderLabel::Loading,
-                    Ready => ReaderLabel::Hidden,
+                    _ if !past_gate => None,
+                    Unknown if text => Some(ReaderLabel::Checking),
+                    Unknown => Some(ReaderLabel::Loading),
+                    Listed { .. } if !message.needs_reader_parts() => None,
+                    Listed { html: true } if text => Some(ReaderLabel::Formatted),
+                    Listed { .. } => Some(ReaderLabel::Loading),
+                    Ready if message.rich == Rich::Pending && text => Some(ReaderLabel::Formatted),
+                    Ready if message.rich == Rich::Pending => Some(ReaderLabel::Loading),
+                    Ready => None,
                 };
-                Some((message.id.clone(), label))
+                let mut frame = self.statuses.entry(message.id.clone()).or_default().frame(
+                    label,
+                    real,
+                    motion.motion,
+                );
+                let settled = parts == Ready && message.rich != Rich::Pending;
+                frame.show_chips = !message.attachments.is_empty()
+                    && (self.shown_chips.contains(&message.id)
+                        || past_gate
+                        || settled
+                        || matches!(parts, Unavailable { .. })
+                        || message.body_state == fell_core::BodyState::TooLarge
+                        || self.failed.contains_key(&message.id));
+                if frame.show_chips && self.shown_chips.insert(message.id.clone()) {
+                    let from = if settled && !past_gate {
+                        motion::ARRIVE_FROM
+                    } else {
+                        0.
+                    };
+                    motion.attachments_arrived(&message.id, from, now);
+                } else if message.attachments.is_empty() {
+                    self.shown_chips.remove(&message.id);
+                }
+                Some((message.id.clone(), frame))
             })
             .collect()
     }
@@ -8193,7 +8295,22 @@ impl ReaderBodies {
         self.body_probes
             .get(&message.id)
             .map(|slot| slot.get())
-            .filter(|height| *height > 0. || !message.attachments.is_empty())
+            .filter(|height| *height > 0. || self.shown_chips.contains(&message.id))
+    }
+
+    fn body_arrival_height(&self, old: &ConvMessage, new: &ConvMessage) -> Option<f32> {
+        let fast_arrival_with_chips = !new.attachments.is_empty()
+            && !self.shown_chips.contains(&new.id)
+            && (self.fast_completed.contains(&new.id)
+                || self
+                    .started
+                    .get(&new.id)
+                    .is_some_and(|at| at.elapsed() < reader_body_worker::SHOW_AFTER));
+        if fast_arrival_with_chips {
+            None
+        } else {
+            self.body_height(old)
+        }
     }
 
     fn reconcile_sizes(
@@ -8213,7 +8330,9 @@ impl ReaderBodies {
                     && old.filename == part.filename
                     && old.mime_type == part.mime_type
             }) {
-                let close = part.size.abs_diff(previous.size) <= part.size / 10;
+                let difference = part.size.abs_diff(previous.size);
+                let close = difference <= part.size / 10
+                    || (difference <= 8 && part.size < 1024 && previous.size < 1024);
                 let size = if close { previous.size } else { part.size };
                 let transition = (!close).then(|| motion.start(motion::FADE, now)).flatten();
                 self.sizes.insert(
@@ -8235,31 +8354,30 @@ struct AttachmentSize {
 }
 
 impl ReaderLabel {
-    fn text(self, session: &Session) -> Option<(String, bool)> {
-        let retry = || keymap::binding_text(&session.keymap, Action::SyncNow);
-        Some(match self {
-            Self::Hidden => return None,
+    fn failed(formatted: bool) -> Self {
+        if formatted {
+            Self::FormatFailed
+        } else {
+            Self::Failed
+        }
+    }
+
+    fn text(self, retry: &str) -> (String, bool) {
+        match self {
             Self::Checking => ("Checking for attachments…".into(), false),
             Self::Formatted => ("Loading formatted version…".into(), false),
             Self::Loading => ("Loading message…".into(), false),
-            Self::Failed { offline: true, .. } => (
-                format!(
-                    "Offline · attachments and formatting not loaded · {} retry",
-                    retry()
-                ),
-                true,
-            ),
-            Self::Failed { html, unknown, .. } => {
-                let missing = if unknown {
-                    "Attachments and formatting"
-                } else if html {
-                    "Formatted version"
-                } else {
-                    "Message"
+            failure => {
+                let reason = match failure {
+                    Self::Failed => "Message couldn’t load",
+                    Self::FormatFailed => "Formatted version couldn’t load",
+                    Self::Unreachable => "Couldn’t reach the server",
+                    Self::Offline => "Offline · attachments and formatting not loaded",
+                    _ => unreachable!(),
                 };
-                (format!("{missing} couldn’t load · {} retry", retry()), true)
+                (format!("{reason} · {retry} retry"), true)
             }
-        })
+        }
     }
 }
 
@@ -8330,17 +8448,17 @@ impl BodyRefresh {
                 if !old.expanded {
                     continue;
                 }
-                if old.attachments.is_empty() && !new.attachments.is_empty() {
-                    motion.attachments_arrived(id, now);
-                }
                 let managed = reader.body_probes.contains_key(id);
+                if !managed && old.attachments.is_empty() && !new.attachments.is_empty() {
+                    motion.attachments_arrived(id, 0., now);
+                }
                 let prepared =
                     matches!(new.rich, Rich::Html(_) | Rich::PlainPart(_)) && new.rich != old.rich;
                 if managed {
                     // Metadata and a staged HTML read leave the displayed text
                     // and the existing chips unchanged.
                     if prepared || (new.rich != Rich::Pending && old.body != new.body) {
-                        let height = reader.body_height(old);
+                        let height = reader.body_arrival_height(old, new);
                         let outgoing =
                             (prepared && reader.fallback_was_visible(id)).then(|| old.body.clone());
                         motion.reader_body_arrived(id, height, outgoing, now);
@@ -8365,7 +8483,7 @@ impl BodyRefresh {
                             .then(|| message.body.clone());
                             motion.reader_body_arrived(
                                 &message.id,
-                                reader.body_height(message),
+                                reader.body_arrival_height(message, message),
                                 outgoing,
                                 now,
                             );
@@ -8964,33 +9082,53 @@ fn expanded_header_flow(
     )
 }
 
-fn reader_status_text(theme: &Theme, text: &str, failed: bool, width: f32) -> gpui::Div {
+type ReaderStatusSlot<'a> = (&'a ReaderStatusFrame, &'a str);
+
+fn reader_status_width(theme: &Theme, retry: &str, limit: f32, window: &Window) -> f32 {
+    let style = conversation_line_style(window, theme, px(13.));
+    let (longest, _) = ReaderLabel::Offline.text(retry);
+    line_px_with_style(window, &style, &longest, FontWeight::NORMAL)
+        .ceil()
+        .min(limit.max(0.))
+}
+
+fn reader_status_text(
+    theme: &Theme,
+    (status, retry): ReaderStatusSlot<'_>,
+    width: f32,
+) -> gpui::Div {
     div()
         .w(px(width))
         .flex_none()
+        .relative()
+        .h(px(18.))
         .text_right()
         .text_size(px(13.))
-        .text_color(rgb(if failed { theme.error } else { theme.dimmed }))
-        .truncate()
-        .child(text.to_owned())
+        .children(status.layers.into_iter().flatten().map(|(label, alpha)| {
+            let (text, failed) = label.text(retry);
+            div()
+                .absolute()
+                .inset_0()
+                .opacity(alpha)
+                .text_color(rgb(if failed { theme.error } else { theme.dimmed }))
+                .truncate()
+                .child(text)
+        }))
 }
 
 fn expanded_message_header(
     theme: &Theme,
     message: &ConvMessage,
     columns: ReaderColumns,
-    status: Option<&(String, bool)>,
+    status: Option<ReaderStatusSlot<'_>>,
     window: &Window,
 ) -> gpui::Div {
     let style = conversation_line_style(window, theme, px(theme.ui_px - 1.));
     let sender_style = conversation_line_style(window, theme, px(theme.ui_px));
     let date = present::relative_date(now_unix(), message.date_unix);
     let date_width = line_px_with_style(window, &sender_style, &date, FontWeight::NORMAL).ceil();
-    let status_style = conversation_line_style(window, theme, px(13.));
-    let status_width = status.map_or(0.0, |(text, _)| {
-        line_px_with_style(window, &status_style, text, FontWeight::NORMAL)
-            .ceil()
-            .min((columns.card.width - date_width - 96.).max(0.))
+    let status_width = status.map_or(0.0, |(_, retry)| {
+        reader_status_width(theme, retry, columns.card.width - date_width - 96., window)
     });
     let sender = present::display_safe(&message.sender);
     let email = present::display_safe(&message.email);
@@ -9115,11 +9253,7 @@ fn expanded_message_header(
                 .justify_end()
                 .gap(px(MESSAGE_HEADER_GAP_PX))
                 .overflow_hidden()
-                .children(
-                    status.map(|(text, failed)| {
-                        reader_status_text(theme, text, *failed, status_width)
-                    }),
-                )
+                .children(status.map(|slot| reader_status_text(theme, slot, status_width)))
                 .child(shaped_text(line, window))
         }),
     )
@@ -9139,10 +9273,9 @@ fn expanded_message(
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
-    let status = frame
-        .part_status
-        .get(&message.id)
-        .and_then(|label| label.text(session));
+    let status = frame.part_status.get(&message.id);
+    let retry = status.map(|_| keymap::binding_text(&session.keymap, Action::SyncNow));
+    let status = status.zip(retry.as_deref());
     let dim = theme.dimmed;
     div()
         .id(gpui::ElementId::named_usize("message", index))
@@ -9178,35 +9311,27 @@ fn expanded_message(
             theme,
             message,
             columns,
-            status.as_ref().filter(|_| message.recipients.is_none()),
+            status.filter(|_| message.recipients.is_none()),
             window,
         ))
         .children(message.recipients.as_ref().map(|line| {
             div()
                 .id(gpui::ElementId::named_usize("recipients", index))
-                .child(columns.flow(
-                    |columns| ReaderColumn {
-                        width: columns.header.width.min(680.),
-                        ..columns.header
-                    },
-                    |width, active| {
-                        recipient_lines(
-                            theme,
-                            line,
-                            frame.leaving.as_ref().map_or_else(
-                                || session.recipients_are_open(&message.id),
-                                |(reader, _)| reader.recipients.contains(&message.id),
-                            ),
-                            frame.disclosures().recipients.get(&message.id).copied(),
-                            index,
-                            width,
-                            status.as_ref(),
-                            Live(live.0 && active),
-                            window,
-                            cx,
-                        )
-                    },
-                ))
+                .child(columns.card.place(recipient_lines(
+                    theme,
+                    line,
+                    frame.leaving.as_ref().map_or_else(
+                        || session.recipients_are_open(&message.id),
+                        |(reader, _)| reader.recipients.contains(&message.id),
+                    ),
+                    frame.disclosures().recipients.get(&message.id).copied(),
+                    index,
+                    columns.card.width,
+                    status,
+                    live,
+                    window,
+                    cx,
+                )))
         }))
         .child(
             columns.card.place(
@@ -9908,7 +10033,7 @@ fn recipient_lines(
     reveal: Option<f32>,
     index: usize,
     width: f32,
-    status: Option<&(String, bool)>,
+    status: Option<ReaderStatusSlot<'_>>,
     live: Live,
     window: &Window,
     cx: &mut Context<Inbox>,
@@ -9926,19 +10051,16 @@ fn recipient_lines(
     let size = px(theme.ui_px - 1.0);
     let style = conversation_line_style(window, theme, size);
     let space = line_px_with_style(window, &style, " ", FontWeight::NORMAL);
-    let status_style = conversation_line_style(window, theme, px(13.));
-    let status_width = status.map_or(0.0, |(text, _)| {
-        line_px_with_style(window, &status_style, text, FontWeight::NORMAL)
-            .ceil()
-            .min((width - 54.).max(0.))
+    let status_width = status.map_or(0.0, |(_, retry)| {
+        reader_status_width(theme, retry, width - 54., window)
     });
-    let status =
-        status.map(|(text, failed)| reader_status_text(theme, text, *failed, status_width));
-    let recipient_width = if status_width > 0.0 {
+    let status = status.map(|slot| reader_status_text(theme, slot, status_width));
+    let recipient_width = (if status_width > 0.0 {
         width - status_width - 8.
     } else {
         width
-    };
+    })
+    .min(680.);
     let details = || {
         div()
             .flex()
@@ -10028,7 +10150,7 @@ fn recipient_lines(
             .into_any_element()
     };
     div()
-        .max_w(px(680.))
+        .w(px(width))
         .pb(px(10.))
         .text_size(size)
         .child(
@@ -12311,6 +12433,58 @@ mod tests {
                 previous_height = target_height;
             }
         });
+    }
+
+    #[test]
+    fn reader_status_fades_and_reduced_motion_keeps_a_readable_minimum() {
+        use super::{ReaderLabel, ReaderStatus};
+
+        let now = Instant::now();
+        let motion = motion::Motion::new(true);
+        let mut status = ReaderStatus::default();
+        let layer = |status: &mut ReaderStatus, label, after| {
+            status
+                .frame(label, now + Duration::from_millis(after), motion)
+                .layers
+        };
+        let loading = Some(ReaderLabel::Loading);
+        let checking = Some(ReaderLabel::Checking);
+        assert_eq!(
+            layer(&mut status, loading, 0),
+            [None, Some((ReaderLabel::Loading, 0.))]
+        );
+        assert_eq!(
+            layer(&mut status, checking, 120),
+            [
+                Some((ReaderLabel::Loading, 1.)),
+                Some((ReaderLabel::Checking, 0.))
+            ]
+        );
+        let [old, new] = layer(&mut status, checking, 180);
+        assert!((0.0..1.0).contains(&old.unwrap().1));
+        assert!((0.0..1.0).contains(&new.unwrap().1));
+        assert_eq!(
+            layer(&mut status, None, 240),
+            [Some((ReaderLabel::Checking, 1.)), None]
+        );
+        assert_eq!(layer(&mut status, None, 360), [None, None]);
+
+        let mut status = ReaderStatus::default();
+        let motion = motion::Motion::new(false);
+        let layer = |status: &mut ReaderStatus, label, after| {
+            status
+                .frame(label, now + Duration::from_millis(after), motion)
+                .layers
+        };
+        assert_eq!(
+            layer(&mut status, loading, 0),
+            [None, Some((ReaderLabel::Loading, 1.))]
+        );
+        assert_eq!(
+            layer(&mut status, None, 299),
+            [None, Some((ReaderLabel::Loading, 1.))]
+        );
+        assert_eq!(layer(&mut status, None, 300), [None, None]);
     }
 
     #[test]

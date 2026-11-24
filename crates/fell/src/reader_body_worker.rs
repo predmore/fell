@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fell_core::{
     AccountConfig, CancelBodyFetch, MessageId, ReaderBodyFetcher, SyncFailureKind,
@@ -15,12 +15,27 @@ pub const SHOW_AFTER: Duration = Duration::from_millis(100);
 #[derive(Clone, Copy)]
 pub enum Failure {
     Failed,
-    Offline,
+    Connection,
+}
+
+fn classify_failure(err: &fell_core::Error) -> Failure {
+    let transport_closed = matches!(err, fell_core::Error::Backend(message) if [
+        "imap: connection to ",
+        "imap: connection closed",
+        "imap: read from ",
+        "imap: write to ",
+        "imap: flush to ",
+    ].iter().any(|prefix| message.starts_with(prefix)));
+    if transport_closed || classify_sync_error(err) == SyncFailureKind::Unreachable {
+        Failure::Connection
+    } else {
+        Failure::Failed
+    }
 }
 
 pub enum Event {
     Stored,
-    Finished(Result<Vec<MessageId>, Failure>),
+    Finished(Result<Vec<MessageId>, Failure>, Instant),
 }
 
 pub struct Job(CancelBodyFetch);
@@ -87,10 +102,7 @@ pub fn start(config: AccountConfig, path: PathBuf) -> Handle {
                             "Reader body fetch failed",
                             error = &err as &dyn std::error::Error
                         );
-                        match classify_sync_error(&err) {
-                            SyncFailureKind::Unreachable => Failure::Offline,
-                            _ => Failure::Failed,
-                        }
+                        classify_failure(&err)
                     }),
                     Err(_) => {
                         store = None;
@@ -98,7 +110,9 @@ pub fn start(config: AccountConfig, path: PathBuf) -> Handle {
                         Err(Failure::Failed)
                     }
                 };
-                let _ = request.events.unbounded_send(Event::Finished(result));
+                let _ = request
+                    .events
+                    .unbounded_send(Event::Finished(result, Instant::now()));
             }
         })
         .expect("spawn reader body worker");

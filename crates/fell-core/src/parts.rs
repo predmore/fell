@@ -22,6 +22,7 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
+use xattr::FileExt;
 
 use crate::account::AccountId;
 use crate::backend::MailBackend;
@@ -40,6 +41,7 @@ const MAX_FILE_NAME: usize = 120;
 
 /// A partial write older than this was left by a process that stopped.
 const STALE_PARTIAL: Duration = Duration::from_secs(60 * 60);
+const PROVISIONAL_PART_ATTR: &str = "user.fell.part";
 
 /// One part to fetch: which message, which part, and the server copies that
 /// hold it, best first. From [`crate::Store::part_request`].
@@ -171,7 +173,7 @@ impl PartCache {
     /// The cached copy of `request`, when there is one. Marks it used. A
     /// file that is not the part's listed size (cut short, or changed on
     /// disk) is removed and counts as a miss.
-    fn lookup_locked(&self, request: &PartRequest) -> Option<CachedPart> {
+    fn lookup_locked(&self, request: &PartRequest, stamp: [u8; 16]) -> Option<CachedPart> {
         let dir = self.request_dir(request);
         if !fs::symlink_metadata(&dir).is_ok_and(|meta| meta.is_dir()) {
             return None;
@@ -186,7 +188,16 @@ impl PartCache {
         if !meta.is_file() || meta.uid() != user_id() {
             return None;
         }
-        if meta.len() != request.part.size {
+        let matches = if request.decoded_size_known {
+            meta.len() == request.part.size
+        } else {
+            file.get_xattr(PROVISIONAL_PART_ATTR)
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some(provisional_part_key(request, stamp, meta.len()).as_slice())
+        };
+        if !matches {
             drop(file);
             let _ = fs::remove_file(&path);
             return None;
@@ -213,7 +224,7 @@ impl PartCache {
             return Err(part_removed());
         }
         let cached = self
-            .write_locked(request, bytes)
+            .write_locked(request, stamp, bytes)
             .map_err(|err| Error::Backend(format!("part cache: {err}")))?;
         if store.cached_part_state(request)? != Some((stamp, false)) {
             store.clean_part_cache_locked(self, &lock, Some(request))?;
@@ -222,7 +233,12 @@ impl PartCache {
         Ok(cached)
     }
 
-    fn write_locked(&self, request: &PartRequest, bytes: &[u8]) -> io::Result<CachedPart> {
+    fn write_locked(
+        &self,
+        request: &PartRequest,
+        stamp: [u8; 16],
+        bytes: &[u8],
+    ) -> io::Result<CachedPart> {
         let dir = self.request_dir(request);
         create_private_dir(&dir)?;
         let path = entry_path(&dir, request);
@@ -233,6 +249,12 @@ impl PartCache {
         let written: io::Result<_> = (|| {
             let mut file = create_private_file(&partial)?;
             file.write_all(bytes)?;
+            if !request.decoded_size_known {
+                // Bind the observed length to this file before publication.
+                // A filesystem without user attributes can still save the file.
+                let key = provisional_part_key(request, stamp, bytes.len() as u64);
+                let _ = file.set_xattr(PROVISIONAL_PART_ATTR, &key);
+            }
             file.sync_all()?;
             let file = fs::OpenOptions::new()
                 .read(true)
@@ -287,6 +309,23 @@ impl PartCache {
             }
         }
     }
+}
+
+fn provisional_part_key(request: &PartRequest, stamp: [u8; 16], decoded_size: u64) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(stamp);
+    hash.update(request.part.encoded_size.to_le_bytes());
+    hash.update(decoded_size.to_le_bytes());
+    hash.update([match request.part.encoding {
+        TransferEncoding::Identity => 0,
+        TransferEncoding::Base64 => 1,
+        TransferEncoding::QuotedPrintable => 2,
+    }]);
+    for copy in &request.copies {
+        hash.update(copy.0.len().to_le_bytes());
+        hash.update(copy.0.as_bytes());
+    }
+    hash.finalize().into()
 }
 
 fn entry_path(dir: &Path, request: &PartRequest) -> PathBuf {
@@ -430,9 +469,7 @@ fn fetch_cached_part(
         if store.cached_part_state(request)? != Some((stamp, false)) {
             return Err(part_removed());
         }
-        if request.decoded_size_known
-            && let Some(hit) = cache.lookup_locked(request)
-        {
+        if let Some(hit) = cache.lookup_locked(request, stamp) {
             return Ok(hit);
         }
         stamp
@@ -705,12 +742,12 @@ mod tests {
     impl PartCache {
         pub(crate) fn lookup(&self, request: &PartRequest) -> Option<CachedPart> {
             let _lock = self.lock().unwrap();
-            self.lookup_locked(request)
+            self.lookup_locked(request, [0; 16])
         }
 
         pub(super) fn seed(&self, request: &PartRequest, bytes: &[u8]) -> io::Result<CachedPart> {
             let _lock = self.lock()?;
-            self.write_locked(request, bytes)
+            self.write_locked(request, [0; 16], bytes)
         }
     }
 
@@ -807,6 +844,24 @@ mod tests {
             None,
             "tests never use a real cache"
         );
+    }
+
+    #[test]
+    fn a_provisional_cache_hit_uses_the_observed_size_and_server_copy() {
+        let (_root, cache, store, mut request) =
+            super::cleanup_tests::listed_fixture("provisional-hit");
+        request.decoded_size_known = false;
+        request.part.encoding = TransferEncoding::Base64;
+        request.part.size = 8;
+        request.part.encoded_size = 8;
+        let backend = Serves(b"ZGF0YQ==", || {});
+        let fetched = fetch_part(&backend, &cache, &store, &request, &mut |_| {}).unwrap();
+        assert_eq!(fetched.size, 4);
+        let hit = fetch_cached_part(&cache, &store, &request, || panic!("cache miss")).unwrap();
+        assert_eq!(hit.size, 4);
+        request.copies[0] = RemoteId("imap:1:2:INBOX".into());
+        let hit = fetch_cached_part(&cache, &store, &request, || Ok(b"new!".to_vec())).unwrap();
+        assert_eq!(fs::read(hit.path).unwrap(), b"new!");
     }
 
     #[test]

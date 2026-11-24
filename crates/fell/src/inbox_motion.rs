@@ -254,7 +254,7 @@ pub struct InboxMotion {
     arrival_pending: bool,
     /// Bodies settling into the open thread, by message id.
     bodies: HashMap<String, BodyArrival>,
-    attachment_fades: HashMap<String, Transition>,
+    attachment_fades: HashMap<String, (Transition, f32)>,
     /// Sent cards already laid out but hidden until the compose hand-off.
     messages_pending: HashSet<String>,
     message_fades: HashMap<String, Transition>,
@@ -722,7 +722,8 @@ impl InboxMotion {
         running |= self.quotes.tick(now);
         running |= self.recipients.tick(now);
         self.message_fades.retain(|_, fade| fade.running(now));
-        self.attachment_fades.retain(|_, fade| fade.running(now));
+        self.attachment_fades
+            .retain(|_, (fade, _)| fade.running(now));
         running |= !self.bodies.is_empty()
             || !self.message_fades.is_empty()
             || !self.attachment_fades.is_empty();
@@ -1229,16 +1230,16 @@ impl InboxMotion {
         }
     }
 
-    pub fn attachments_arrived(&mut self, id: &str, now: Instant) {
+    pub fn attachments_arrived(&mut self, id: &str, from: f32, now: Instant) {
         if let Some(fade) = self.motion.start(motion::FADE, now) {
-            self.attachment_fades.insert(id.to_owned(), fade);
+            self.attachment_fades.insert(id.to_owned(), (fade, from));
         }
     }
 
     pub fn attachment_alphas(&self, now: Instant) -> HashMap<String, f32> {
         self.attachment_fades
             .iter()
-            .map(|(id, fade)| (id.clone(), fade.progress(now)))
+            .map(|(id, (fade, from))| (id.clone(), motion::lerp(*from, 1., fade.progress(now))))
             .collect()
     }
 

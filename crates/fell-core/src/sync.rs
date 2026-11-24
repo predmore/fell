@@ -459,6 +459,15 @@ impl ReaderBodyFetcher {
                 stored();
             }
         }
+        // A size cap can leave the full source withheld. That is only a
+        // settled result once the message has a part list to show.
+        for id in ids {
+            if !failed.contains(id)
+                && store.reader_parts(&account, id.as_str())? == ReaderParts::Unknown
+            {
+                failed.push(id.clone());
+            }
+        }
         Ok(failed)
     }
 

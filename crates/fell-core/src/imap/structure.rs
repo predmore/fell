@@ -104,6 +104,19 @@ pub(super) fn parse<'a>(
     Some(structure)
 }
 
+#[cfg(test)]
+#[test]
+fn nil_encoding_keeps_the_attachment_list() {
+    let structure = parse(
+        r#"("APPLICATION" "PDF" NIL NIL NIL NIL 24 NIL ("ATTACHMENT" ("FILENAME" "map.pdf")))"#,
+        std::iter::empty(),
+    )
+    .unwrap();
+    assert_eq!(structure.parts.len(), 1);
+    assert_eq!(structure.parts[0].encoding, TransferEncoding::Identity);
+    assert_eq!(structure.parts[0].encoded_size, 24);
+}
+
 fn filename(parameters: Option<&Value>, name: &str) -> Option<String> {
     let (pairs, _) = parameters?.list()?.as_chunks::<2>();
     let mut header = String::from("Content-Disposition: attachment");
@@ -195,10 +208,13 @@ fn walk(
         return Some(());
     }
     let encoded_size = items.get(6)?.text()?.parse::<u32>().ok()? as u64;
-    let encoding = match items.get(5)?.text()?.to_ascii_lowercase().as_str() {
-        "base64" => TransferEncoding::Base64,
-        "quoted-printable" => TransferEncoding::QuotedPrintable,
-        _ => TransferEncoding::Identity,
+    let encoding = match items.get(5)? {
+        Value::Text(value) if value.eq_ignore_ascii_case("base64") => TransferEncoding::Base64,
+        Value::Text(value) if value.eq_ignore_ascii_case("quoted-printable") => {
+            TransferEncoding::QuotedPrintable
+        }
+        Value::Text(_) | Value::Nil => TransferEncoding::Identity,
+        Value::List(_) => return None,
     };
     let content_id = items
         .get(3)
