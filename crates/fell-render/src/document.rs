@@ -79,6 +79,7 @@ pub enum ListLabelStyle {
     LowerAlpha,
     UpperAlpha,
     LowerRoman,
+    UpperRoman,
 }
 
 impl ListLabelStyle {
@@ -96,7 +97,7 @@ impl ListLabelStyle {
                 }
                 letters.into_iter().rev().collect()
             }
-            Self::LowerRoman if (1..=3999).contains(&value) => {
+            Self::LowerRoman | Self::UpperRoman if (1..=3999).contains(&value) => {
                 let mut remaining = value;
                 let mut label = String::new();
                 for (number, letters) in ROMAN_DIGITS {
@@ -104,6 +105,9 @@ impl ListLabelStyle {
                         label.push_str(letters);
                         remaining -= number;
                     }
+                }
+                if self == Self::UpperRoman {
+                    label.make_ascii_uppercase();
                 }
                 label
             }

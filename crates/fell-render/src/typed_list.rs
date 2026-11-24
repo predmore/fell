@@ -29,8 +29,15 @@ pub(crate) fn marker(text: &str) -> Option<Marker<'_>> {
 
 impl Marker<'_> {
     pub(crate) fn has_padding(&self) -> bool {
-        self.gap.contains(['\u{a0}', '\t'])
-            || (!self.gap.contains(['\r', '\n']) && self.gap.starts_with("  "))
+        let letters = self
+            .label
+            .ordinal
+            .is_some_and(|ordinal| ordinal.style != ListLabelStyle::Decimal);
+        let nbsp = if letters { 2 } else { 1 };
+        let spaces = if letters { "   " } else { "  " };
+        self.gap.matches('\u{a0}').take(nbsp).count() == nbsp
+            || (!self.gap.contains(['\r', '\n'])
+                && (self.gap.contains('\t') || self.gap.contains(spaces)))
     }
 }
 
@@ -44,7 +51,7 @@ struct Ordinal {
 pub(crate) struct Label {
     ordinal: Option<Ordinal>,
     // A single Roman digit can also be an alphabetic label.
-    roman: Option<u64>,
+    roman: Option<Ordinal>,
 }
 
 fn parse_label(token: &str) -> Option<Label> {
@@ -59,14 +66,17 @@ fn parse_label(token: &str) -> Option<Label> {
         });
     }
     let text = token.strip_suffix('.')?;
-    let roman = roman_value(text);
+    let roman = roman_ordinal(text);
     let (style, value) = match text.as_bytes() {
         [letter @ b'a'..=b'z'] => (ListLabelStyle::LowerAlpha, u64::from(letter - b'a' + 1)),
         [letter @ b'A'..=b'Z'] => (ListLabelStyle::UpperAlpha, u64::from(letter - b'A' + 1)),
         [b'1'..=b'9', ..] if text.len() <= 3 && text.bytes().all(|byte| byte.is_ascii_digit()) => {
             (ListLabelStyle::Decimal, text.parse().ok()?)
         }
-        _ => (ListLabelStyle::LowerRoman, roman?),
+        _ => {
+            let ordinal = roman?;
+            (ordinal.style, ordinal.value)
+        }
     };
     Some(Label {
         ordinal: Some(Ordinal { style, value }),
@@ -74,11 +84,19 @@ fn parse_label(token: &str) -> Option<Label> {
     })
 }
 
-fn roman_value(text: &str) -> Option<u64> {
-    if text.is_empty() || text.len() > 15 || !text.bytes().all(|byte| b"ivxlcdm".contains(&byte)) {
+fn roman_ordinal(text: &str) -> Option<Ordinal> {
+    if text.is_empty() || text.len() > 15 {
         return None;
     }
-    let mut rest = text;
+    let style = if text.bytes().all(|byte| b"ivxlcdm".contains(&byte)) {
+        ListLabelStyle::LowerRoman
+    } else if text.bytes().all(|byte| b"IVXLCDM".contains(&byte)) {
+        ListLabelStyle::UpperRoman
+    } else {
+        return None;
+    };
+    let lower = text.to_ascii_lowercase();
+    let mut rest = lower.as_str();
     let mut value = 0;
     for (number, digits) in ROMAN_DIGITS {
         while let Some(after) = rest.strip_prefix(digits) {
@@ -86,8 +104,8 @@ fn roman_value(text: &str) -> Option<u64> {
             value += number;
         }
     }
-    (rest.is_empty() && ListLabelStyle::LowerRoman.label(value).strip_suffix('.') == Some(text))
-        .then_some(value)
+    (rest.is_empty() && style.label(value).strip_suffix('.') == Some(text))
+        .then_some(Ordinal { style, value })
 }
 
 #[derive(Clone, Copy)]
@@ -122,6 +140,18 @@ impl<T> ListRun<T> {
         self.levels.is_empty()
     }
 
+    /// An incompatible root marker starts a new candidate run. A previously
+    /// rejected singleton then falls back to its original source.
+    pub(crate) fn starts_new_root(&mut self, indent: Indent, label: Label) -> bool {
+        self.levels.first_mut().is_some_and(|root| {
+            if indent.level > root.indent.level {
+                return false;
+            }
+            let ordinal = root.resolve_ordinal(label);
+            !root.accepts(ordinal)
+        })
+    }
+
     pub(crate) fn item(
         &mut self,
         indent: Indent,
@@ -130,9 +160,6 @@ impl<T> ListRun<T> {
         blocks: Vec<Block>,
         original: T,
     ) {
-        self.confirmed |= explicit_indent || !self.is_empty();
-        self.keep_original(original);
-
         // Office uses at most nine levels. Cap inferred nesting as well so
         // arbitrary mail indent values cannot create an unbounded tree.
         const MAX_LEVELS: usize = 9;
@@ -154,12 +181,20 @@ impl<T> ListRun<T> {
             let level = self.levels.last_mut().expect("a list level is open");
             ordinal = level.resolve_ordinal(label);
             if level.accepts(ordinal) {
+                self.confirmed = true;
+                self.fallback.clear();
                 level.indent.level = level.indent.level.min(indent.level);
                 level.indent.text = indent.text;
                 level.items.push(ListItem { blocks });
                 return;
             }
             self.close_list();
+        }
+        self.confirmed |= explicit_indent;
+        if self.confirmed {
+            self.fallback.clear();
+        } else {
+            self.keep_original(original);
         }
         self.levels.push(OpenList {
             indent,
@@ -231,7 +266,7 @@ impl<T> ListRun<T> {
 struct OpenList {
     indent: Indent,
     start: Option<Ordinal>,
-    first_roman: Option<u64>,
+    first_roman: Option<Ordinal>,
     items: Vec<ListItem>,
 }
 
@@ -247,22 +282,17 @@ impl OpenList {
         let Some(roman) = label.roman else {
             return label.ordinal;
         };
-        let style = ListLabelStyle::LowerRoman;
-        if current.style == style {
-            return Some(Ordinal {
-                style,
-                value: roman,
-            });
+        if current.style == roman.style {
+            return Some(roman);
         }
         // A following unambiguous Roman label resolves a first "i." or "v.".
         if self.items.len() == 1
-            && label.ordinal.is_some_and(|ordinal| ordinal.style == style)
-            && let Some(first) = self.first_roman.filter(|first| *first + 1 == roman)
+            && label.ordinal == Some(roman)
+            && let Some(first) = self
+                .first_roman
+                .filter(|first| first.style == roman.style && first.value + 1 == roman.value)
         {
-            self.start = Some(Ordinal {
-                style,
-                value: first,
-            });
+            self.start = Some(first);
         }
         label.ordinal
     }
@@ -326,7 +356,7 @@ pub fn plain_list_runs(body: &str) -> Vec<(Range<usize>, Vec<Block>)> {
             Some((start, line))
         })
         .peekable();
-    let mut lists = Vec::new();
+    let mut lists: Vec<(Range<usize>, Vec<Block>)> = Vec::new();
     while let Some((start, line)) = lines.next() {
         let indent = plain_indent(line);
         let Some(marker) = plain_item(line) else {
@@ -351,8 +381,12 @@ pub fn plain_list_runs(body: &str) -> Vec<(Range<usize>, Vec<Block>)> {
                 } else {
                     indent
                 };
+                let item_indent = plain_list_indent(level, indent, &marker);
+                if run.starts_new_root(item_indent, marker.label) {
+                    break;
+                }
                 run.item(
-                    plain_list_indent(level, indent, &marker),
+                    item_indent,
                     marker.label,
                     indent > 0,
                     plain_paragraph(marker.content),
@@ -367,7 +401,14 @@ pub fn plain_list_runs(body: &str) -> Vec<(Range<usize>, Vec<Block>)> {
             lines.next();
         }
         if let Ok(blocks) = run.finish() {
-            lists.push((start..end, blocks));
+            if let Some((range, previous)) = lists.last_mut()
+                && range.end == start
+            {
+                range.end = end;
+                previous.extend(blocks);
+            } else {
+                lists.push((start..end, blocks));
+            }
         }
     }
     lists

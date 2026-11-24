@@ -8973,6 +8973,15 @@ fn stored_message_body(
                 Rich::PlainPart(plain) => plain,
                 _ => &message.body,
             };
+            let markers = markers.with_top_level_lists(
+                body.blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        BodyBlock::List(blocks) => Some(blocks.iter()),
+                        _ => None,
+                    })
+                    .flatten(),
+            );
             for (at, block) in body.blocks.iter().enumerate() {
                 let (kind, text) = match block {
                     BodyBlock::Text(text) => (None, text.as_str()),
@@ -9011,7 +9020,7 @@ fn stored_message_body(
                                 &crate::render::ImageGallery::default(),
                                 folds.columns.blocks(folds.fill),
                                 crate::render::BLOCK_GAP,
-                                markers,
+                                &markers,
                             )
                             .line_height(px(theme.ui_px * 1.45)),
                         )
@@ -9092,6 +9101,7 @@ fn html_sections(
     let quiet = mail_body::history_palette(theme);
     let line = px(theme.ui_px * 1.45);
     let folded = &body.folded;
+    let top_level_markers = markers.with_top_level_lists(&folded.document.blocks);
     let columns = folds.columns;
     let first_fold = folded
         .sections
@@ -9138,7 +9148,7 @@ fn html_sections(
                             &body.gallery,
                             layout,
                             crate::render::BLOCK_GAP,
-                            markers,
+                            &top_level_markers,
                         )
                         .line_height(line),
                     )

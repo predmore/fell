@@ -90,14 +90,14 @@ pub(crate) fn document_to_markdown(blocks: &[fell_render::Block]) -> String {
                 Block::List {
                     ordered,
                     start,
+                    style,
                     items,
-                    ..
                 } => items
                     .iter()
                     .enumerate()
                     .map(|(index, item)| {
                         let prefix = if *ordered {
-                            format!("{}. ", start.saturating_add(index as u64))
+                            format!("{} ", style.label(start.saturating_add(index as u64)))
                         } else {
                             "- ".into()
                         };

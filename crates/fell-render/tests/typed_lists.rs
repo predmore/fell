@@ -92,7 +92,7 @@ fn plain_word_padding_and_indentation_create_nested_lists() {
     assert!(item_text(verify).starts_with("Verify the preview link.\nhttps://"));
     assert_eq!(item_text(second_look), "Ask for a second look.");
     assert_eq!(item_text(second), "Publish the guide.");
-    let indented = plain_to_document("1.\tFirst\r\n  a.  Nested\r\n2.\tLast");
+    let indented = plain_to_document("1.\tFirst\r\n  a.   Nested\r\n2.\tLast");
     let [first, _] = list(&indented.blocks[0], true) else {
         panic!("expected two top-level numbers");
     };
@@ -124,13 +124,13 @@ fn ambiguous_markers_remain_prose() {
 #[test]
 fn an_unindented_run_qualifies_and_a_same_level_kind_change_starts_a_new_list() {
     let document = html_to_document(
-        "<p>-&nbsp;Check the notes.</p><p>-  Check the editors.</p><p>1.&nbsp;Publish the release.</p>",
+        "<p>-&nbsp;Check the notes.</p><p>-  Check the editors.</p><p>1.&nbsp;Publish the release.</p><p>2.&nbsp;Tell the team.</p>",
     );
     let [bullets, numbers] = &document.blocks[..] else {
         panic!("expected two lists: {document:?}");
     };
     assert_eq!(list(bullets, false).len(), 2);
-    assert_eq!(list(numbers, true).len(), 1);
+    assert_eq!(list(numbers, true).len(), 2);
 }
 
 #[test]
@@ -173,8 +173,8 @@ fn year_headings_and_long_numbers_keep_the_original_text() {
 fn ordered_labels_keep_their_start_and_style_in_both_formats() {
     use fell_render::ListLabelStyle::*;
 
-    let html = "<p>3.&nbsp;Review the guide.</p><p style='margin-left:1in'>a.&nbsp;Check the layout.</p>\
-                <p style='margin-left:1in'>b.&nbsp;Proofread the text.</p><p>4.&nbsp;Share it.</p>\
+    let html = "<p>3.&nbsp;Review the guide.</p><p style='margin-left:1in'>a.&nbsp;&nbsp;Check the layout.</p>\
+                <p style='margin-left:1in'>b.&nbsp;&nbsp;Proofread the text.</p><p>4.&nbsp;Share it.</p>\
                 <p>Later</p><p>10.&nbsp;Publish it.</p><p>11.&nbsp;Announce it.</p>";
     let plain = "3.\tReview the guide.\n    a.\tCheck the layout.\n    b.\tProofread the text.\n4.\tShare it.\n\nLater\n\n10.\tPublish it.\n11.\tAnnounce it.";
     for doc in [html_to_document(html), plain_to_document(plain)] {
@@ -213,7 +213,7 @@ fn ordered_labels_keep_their_start_and_style_in_both_formats() {
     }
 
     let doc = plain_to_document(
-        "C.\tCapital C\nD.\tCapital D\ni.\tOne\nii.\tTwo\niii.\tThree\niv.\tFour\nv.\tFive\n8.\tEight\n11.\tEleven",
+        "C.\tCapital C\nD.\tCapital D\ni.\tOne\nii.\tTwo\niii.\tThree\niv.\tFour\nv.\tFive\n8.\tEight\n9.\tNine\n11.\tEleven\n12.\tTwelve",
     );
     assert!(
         matches!(
@@ -245,7 +245,7 @@ fn ordered_labels_keep_their_start_and_style_in_both_formats() {
     );
     assert!(
         doc.plain_text()
-            .contains("iv. Four\nv. Five\n8. Eight\n11. Eleven")
+            .contains("iv. Four\nv. Five\n8. Eight\n9. Nine\n11. Eleven\n12. Twelve")
     );
 }
 
@@ -270,7 +270,7 @@ fn plain_continuations_follow_the_text_column() {
     );
     assert_eq!(item_text(next), "Next");
 
-    let body = "-\u{a0}Parent\no\tChild\n A separate note";
+    let body = "-\u{a0}Parent\no\tChild\no\tSibling\n A separate note";
     let doc = plain_to_document(body);
     assert!(matches!(
         doc.blocks.as_slice(),
@@ -303,4 +303,153 @@ fn html_blank_paragraphs_and_parent_continuations_keep_the_list_open() {
         doc.plain_text(),
         "1. Parent\na. Child\nParent link\n2. Next"
     );
+}
+
+#[test]
+fn incompatible_unindented_markers_do_not_confirm_each_other() {
+    let html = "<p>-&nbsp;Not a list, just a dash.</p><p>1.&nbsp;This sentence is separate.</p>";
+    let doc = html_to_document(html);
+    assert!(matches!(
+        doc.blocks.as_slice(),
+        [Block::Paragraph { .. }, Block::Paragraph { .. }]
+    ));
+    assert_eq!(
+        doc.plain_text(),
+        "-\u{a0}Not a list, just a dash.\n1.\u{a0}This sentence is separate."
+    );
+    let text = "-  Not a list\n1.  Separate";
+    let doc = plain_to_document(text);
+    assert!(matches!(doc.blocks.as_slice(), [Block::Paragraph { .. }]));
+    assert_eq!(doc.plain_text(), text);
+
+    let doc = plain_to_document("-  First\n-  Second\n1.  Separate");
+    assert!(matches!(
+        doc.blocks.as_slice(),
+        [Block::List { .. }, Block::Paragraph { .. }]
+    ));
+    assert!(doc.plain_text().ends_with("\n1.  Separate"));
+}
+
+#[test]
+fn initials_and_roman_prose_need_stronger_padding() {
+    for padding in [" ", "  ", "\u{a0}"] {
+        for (first, second) in [("A.", "B."), ("i.", "ii."), ("I.", "II.")] {
+            let text = format!("{first}{padding}First thought\n{second}{padding}Another");
+            let doc = plain_to_document(&text);
+            assert!(
+                matches!(doc.blocks.as_slice(), [Block::Paragraph { .. }]),
+                "{doc:?}"
+            );
+            assert_eq!(doc.plain_text(), text);
+
+            let html =
+                format!("<p>{first}{padding}First thought</p><p>{second}{padding}Another</p>");
+            let doc = html_to_document(&html);
+            assert!(
+                matches!(
+                    doc.blocks.as_slice(),
+                    [Block::Paragraph { .. }, Block::Paragraph { .. }]
+                ),
+                "{doc:?}"
+            );
+        }
+    }
+    let singleton = html_to_document("<p style='margin-left:0.5in'>A.&nbsp;Lincoln said so.</p>");
+    assert!(matches!(
+        singleton.blocks.as_slice(),
+        [Block::Paragraph { .. }]
+    ));
+    assert_eq!(singleton.plain_text(), "A.\u{a0}Lincoln said so.");
+
+    for padding in ["\t", "   ", "\u{a0}\u{a0}"] {
+        let text = format!("A.{padding}First step\nB.{padding}Next step");
+        assert_eq!(list(&plain_to_document(&text).blocks[0], true).len(), 2);
+    }
+}
+
+#[test]
+fn courier_markers_are_removed_without_stripping_inline_code_in_items() {
+    let doc = html_to_document(
+        "<p style='margin-left:0.5in'><span style=\"font-family:'Courier New'\">1.</span><span>&nbsp;&nbsp;&nbsp;</span>Use <code>1.</code> in the example.</p>\
+         <p style='margin-left:0.5in'><span style=\"font-family:'Courier New'\">2.</span><span>&nbsp;&nbsp;&nbsp;</span>Next step.</p>",
+    );
+    let [first, second] = list(&doc.blocks[0], true) else {
+        panic!("expected two items: {doc:?}");
+    };
+    assert_eq!(item_text(first), "Use 1. in the example.");
+    assert!(
+        matches!(&first.blocks[0], Block::Paragraph { inlines } if inlines.iter().any(|inline| matches!(inline, Inline::Code(text) if text == "1.")))
+    );
+    assert_eq!(item_text(second), "Next step.");
+}
+
+#[test]
+fn upper_roman_and_upper_alpha_are_distinguished_by_the_next_item() {
+    use fell_render::ListLabelStyle::{UpperAlpha, UpperRoman};
+    let roman = plain_to_document("I.\tIntroduction\nII.\tMethods\nIII.\tResults");
+    let html_roman = html_to_document(
+        "<p>I.&nbsp;&nbsp;Introduction</p><p>II.&nbsp;&nbsp;Methods</p><p>III.&nbsp;&nbsp;Results</p>",
+    );
+    let alpha = plain_to_document("I.\tFirst\nJ.\tNext");
+    let html_alpha = html_to_document("<p>I.   First</p><p>J.   Next</p>");
+    for doc in [roman, html_roman] {
+        assert!(
+            matches!(
+                doc.blocks.as_slice(),
+                [Block::List {
+                    start: 1,
+                    style: UpperRoman,
+                    ..
+                }]
+            ),
+            "{doc:?}"
+        );
+        assert_eq!(
+            doc.plain_text(),
+            "I. Introduction\nII. Methods\nIII. Results"
+        );
+    }
+    for doc in [alpha, html_alpha] {
+        assert!(
+            matches!(
+                doc.blocks.as_slice(),
+                [Block::List {
+                    start: 9,
+                    style: UpperAlpha,
+                    ..
+                }]
+            ),
+            "{doc:?}"
+        );
+        assert_eq!(doc.plain_text(), "I. First\nJ. Next");
+    }
+}
+
+#[test]
+fn native_lists_recognize_upper_roman_and_clamp_nondecimal_starts() {
+    let doc = html_to_document("<ol type='I' start='2'><li>Read</li><li>Send</li></ol>");
+    assert!(matches!(
+        doc.blocks.as_slice(),
+        [Block::List {
+            start: 2,
+            style: fell_render::ListLabelStyle::UpperRoman,
+            ..
+        }]
+    ));
+    assert_eq!(doc.plain_text(), "II. Read\nIII. Send");
+    for (kind, first, second) in [
+        ("a", "a.", "b."),
+        ("A", "A.", "B."),
+        ("i", "i.", "ii."),
+        ("I", "I.", "II."),
+    ] {
+        let doc = html_to_document(&format!(
+            "<ol type='{kind}' start='0'><li>Read</li><li>Send</li></ol>"
+        ));
+        assert!(matches!(
+            doc.blocks.as_slice(),
+            [Block::List { start: 1, .. }]
+        ));
+        assert_eq!(doc.plain_text(), format!("{first} Read\n{second} Send"));
+    }
 }

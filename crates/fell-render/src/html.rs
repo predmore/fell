@@ -600,7 +600,7 @@ impl<'a> Lines<'a> {
             && strip_list_marker(&mut inlines, "")
         {
             let blocks = styled_blocks(node, element, paragraph(inlines));
-            self.list.item(indent, label, true, blocks, node);
+            self.list_item(node, depth, indent, label, blocks);
             return true;
         }
         if let Some(marker) = marker
@@ -610,8 +610,7 @@ impl<'a> Lines<'a> {
             let mut inlines = collect_inlines(node, depth);
             if strip_list_marker(&mut inlines, marker.token) {
                 let blocks = styled_blocks(node, element, paragraph(inlines));
-                self.list
-                    .item(indent, marker.label, list_level > 0, blocks, node);
+                self.list_item(node, depth, indent, marker.label, blocks);
                 return true;
             }
         }
@@ -626,6 +625,21 @@ impl<'a> Lines<'a> {
                 .continuation(indent.text, || node_blocks(node, depth), node);
         }
         false
+    }
+
+    fn list_item(
+        &mut self,
+        node: ego_tree::NodeRef<'a, Node>,
+        depth: u32,
+        indent: Indent,
+        label: typed_list::Label,
+        blocks: Vec<Block>,
+    ) {
+        if self.list.starts_new_root(indent, label) {
+            self.flush_list(depth);
+        }
+        self.list
+            .item(indent, label, indent.level > 0, blocks, node);
     }
 
     fn flush_list(&mut self, depth: u32) {
@@ -779,14 +793,26 @@ fn outlook_list_marker(
 /// Check the displayed prefix before cutting it. Normalization can shrink
 /// the original padding, and the marker and gap can cross style spans.
 fn strip_list_marker(inlines: &mut Vec<Inline>, token: &str) -> bool {
-    fn text_prefix<'a>(inlines: &'a mut [Inline], parts: &mut Vec<&'a mut String>) -> bool {
+    fn text_prefix<'a>(
+        inlines: &'a mut [Inline],
+        token: &str,
+        parts: &mut Vec<&'a mut String>,
+    ) -> bool {
         inlines.iter_mut().all(|inline| match inline {
             Inline::Text(text) => {
                 parts.push(text);
                 true
             }
+            // Courier New list glyphs are styled as code before we strip
+            // the marker. Inline code within the item still ends the prefix.
+            Inline::Code(text)
+                if text == token && parts.iter().all(|part| part.trim().is_empty()) =>
+            {
+                parts.push(text);
+                true
+            }
             Inline::Emphasis(children) | Inline::Strong(children) | Inline::Strike(children) => {
-                text_prefix(children, parts)
+                text_prefix(children, token, parts)
             }
             Inline::Code(_) | Inline::Image { .. } | Inline::Link { .. } | Inline::LineBreak => {
                 false
@@ -794,7 +820,7 @@ fn strip_list_marker(inlines: &mut Vec<Inline>, token: &str) -> bool {
         })
     }
     let mut parts = Vec::new();
-    let all_text = text_prefix(inlines, &mut parts);
+    let all_text = text_prefix(inlines, token, &mut parts);
     let prefix: String = parts.iter().map(|text| text.as_str()).collect();
     let lead = prefix.trim_start();
     let Some(rest) = lead.strip_prefix(token) else {
@@ -1277,7 +1303,7 @@ fn list_block(node: ego_tree::NodeRef<'_, Node>, ordered: bool, depth: u32) -> B
         }
     }
     let element = node.value().as_element();
-    let start = element
+    let start: u64 = element
         .and_then(|element| element.attr("start"))
         .and_then(|start| start.trim().parse().ok())
         .unwrap_or(1);
@@ -1285,7 +1311,13 @@ fn list_block(node: ego_tree::NodeRef<'_, Node>, ordered: bool, depth: u32) -> B
         Some("a") => ListLabelStyle::LowerAlpha,
         Some("A") => ListLabelStyle::UpperAlpha,
         Some("i") => ListLabelStyle::LowerRoman,
+        Some("I") => ListLabelStyle::UpperRoman,
         _ => ListLabelStyle::Decimal,
+    };
+    let start = if style == ListLabelStyle::Decimal {
+        start
+    } else {
+        start.max(1)
     };
     Block::List {
         ordered,
@@ -1754,7 +1786,7 @@ pub(crate) fn finish_inlines(inlines: &mut Vec<Inline>) {
     }
     fn prune(inlines: &mut Vec<Inline>) {
         inlines.retain_mut(|inline| match inline {
-            Inline::Text(text) => !text.is_empty(),
+            Inline::Text(text) | Inline::Code(text) => !text.is_empty(),
             Inline::Emphasis(children)
             | Inline::Strong(children)
             | Inline::Strike(children)
@@ -1762,7 +1794,7 @@ pub(crate) fn finish_inlines(inlines: &mut Vec<Inline>) {
                 prune(children);
                 !children.is_empty()
             }
-            Inline::Code(_) | Inline::Image { .. } | Inline::LineBreak => true,
+            Inline::Image { .. } | Inline::LineBreak => true,
         });
     }
     forward(inlines, &mut true);

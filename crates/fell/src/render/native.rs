@@ -4,7 +4,7 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use fell_render::{Align, Block, ImageSource, Inline, ListItem, StyledDocument};
+use fell_render::{Align, Block, ImageSource, Inline, ListItem, ListLabelStyle, StyledDocument};
 use gpui::{
     AnyElement, App, Bounds, Element, ElementId, FontStyle, FontWeight, GlobalElementId,
     HighlightStyle, InspectorElementId, IntoElement, LayoutId, Pixels, RenderImage, SharedString,
@@ -216,6 +216,7 @@ pub fn blocks_column(
     width: f32,
     markers: &ListMarkerFont,
 ) -> gpui::Div {
+    let markers = markers.with_top_level_lists(blocks);
     blocks_column_spaced(
         blocks,
         palette,
@@ -223,7 +224,7 @@ pub fn blocks_column(
         gallery,
         BlockColumn::full(width),
         BLOCK_GAP,
-        markers,
+        &markers,
     )
 }
 
@@ -295,6 +296,14 @@ impl BlockColumn {
                 width: (self.width - indent).max(0.0),
                 ..self
             },
+        }
+    }
+
+    fn list_marker_width(self, local: f32, top_level: f32) -> f32 {
+        if self.list_depth == 0 {
+            local.max(top_level)
+        } else {
+            local
         }
     }
 
@@ -520,23 +529,39 @@ fn uses_wide_column(block: &Block) -> bool {
 pub(crate) const READING_MEASURE_PX: f32 = 600.0;
 
 /// The reader's font before the parent element applies it during layout.
+#[derive(Clone)]
 pub struct ListMarkerFont<'a> {
     window: &'a Window,
     style: gpui::TextStyle,
+    top_level_width: f32,
 }
 
 impl<'a> ListMarkerFont<'a> {
     pub fn new(window: &'a Window, mut style: gpui::TextStyle) -> Self {
         style.font_features = crate::view::tabular_figures();
-        Self { window, style }
+        Self {
+            window,
+            style,
+            top_level_width: LIST_MIN_MARKER_PX,
+        }
+    }
+
+    pub(crate) fn with_top_level_lists<'b>(
+        &self,
+        blocks: impl IntoIterator<Item = &'b Block>,
+    ) -> Self {
+        Self {
+            top_level_width: widest_top_level_marker(blocks, |label| self.width(label)),
+            ..self.clone()
+        }
     }
 
     fn with_size(&self, font_size: Pixels) -> Self {
         let mut style = self.style.clone();
         style.font_size = font_size.into();
         Self {
-            window: self.window,
             style,
+            ..self.clone()
         }
     }
 
@@ -816,28 +841,16 @@ fn render_block(block: &Block, context: BlockPaint, layout: BlockColumn) -> AnyE
             style,
             items,
         } => {
-            let bullet = LIST_BULLETS[layout.list_depth % LIST_BULLETS.len()];
-            let labels: Vec<SharedString> = items
-                .iter()
-                .enumerate()
-                .map(|(index, _)| {
-                    if *ordered {
-                        style.label(start.saturating_add(index as u64)).into()
-                    } else {
-                        bullet.into()
-                    }
-                })
-                .collect();
+            let labels: Vec<_> =
+                list_labels(*ordered, *start, *style, items.len(), layout.list_depth).collect();
             let distinct_labels = if *ordered {
                 labels.as_slice()
             } else {
                 &labels[..labels.len().min(1)]
             };
-            let marker_width = distinct_labels
-                .iter()
-                .map(|label| markers.width(label))
-                .fold(LIST_MIN_MARKER_PX, f32::max)
-                .ceil();
+            let local_width =
+                marker_width(distinct_labels.iter().map(|label| markers.width(label)));
+            let marker_width = layout.list_marker_width(local_width, markers.top_level_width);
             div()
                 .flex()
                 .flex_col()
@@ -898,6 +911,50 @@ const QUOTE_INSET_PX: f32 = QUOTE_RULE_PX + 16.;
 const LIST_MARKER_GAP_PX: f32 = 6.;
 const LIST_MIN_MARKER_PX: f32 = 18.;
 const LIST_BULLETS: [&str; 3] = ["•", "◦", "▪"];
+
+fn list_labels(
+    ordered: bool,
+    start: u64,
+    style: ListLabelStyle,
+    len: usize,
+    depth: usize,
+) -> impl Iterator<Item = SharedString> {
+    (0..len).map(move |index| {
+        if ordered {
+            style.label(start.saturating_add(index as u64)).into()
+        } else {
+            LIST_BULLETS[depth % LIST_BULLETS.len()].into()
+        }
+    })
+}
+
+fn marker_width(widths: impl Iterator<Item = f32>) -> f32 {
+    widths.fold(LIST_MIN_MARKER_PX, f32::max).ceil()
+}
+
+fn widest_top_level_marker<'a>(
+    blocks: impl IntoIterator<Item = &'a Block>,
+    mut measure: impl FnMut(&SharedString) -> f32,
+) -> f32 {
+    let labels = blocks.into_iter().filter_map(|block| {
+        let Block::List {
+            ordered,
+            start,
+            style,
+            items,
+        } = block
+        else {
+            return None;
+        };
+        let len = if *ordered {
+            items.len()
+        } else {
+            items.len().min(1)
+        };
+        Some(list_labels(*ordered, *start, *style, len, 0))
+    });
+    marker_width(labels.flatten().map(|label| measure(&label)))
+}
 
 fn list_item(
     item: &ListItem,
@@ -3674,6 +3731,28 @@ mod decode_tests {
         assert_eq!(rtl_rule, Some(1000.));
         assert_eq!(rtl_quote.prose, Some((588., 402.)));
         assert_eq!(placement(rtl_quote, 900.), placement(quote, 900.));
+    }
+
+    #[test]
+    fn root_lists_share_the_widest_marker_across_prose() {
+        use super::{BlockColumn, LIST_MARKER_GAP_PX, widest_top_level_marker};
+
+        let doc = fell_render::html_to_document(
+            "<ol><li>First</li><li>Second <ol start='100'><li>Nested</li></ol></li></ol>\
+             <p>Continue after review.</p><ol start='9'><li>Ninth</li><li>Tenth</li></ol>",
+        );
+        let shared = widest_top_level_marker(&doc.blocks, |label| label.len() as f32 * 9.);
+        assert_eq!(shared, 27.);
+        let column = BlockColumn::reading((740., 0.), (600., 70.), (740., 1.), (670., 740.), 0);
+        for local in [18., 27.] {
+            let indent = column.list_marker_width(local, shared) + LIST_MARKER_GAP_PX;
+            assert_eq!(column.indented(indent, false).prose, Some((567., 103.)));
+        }
+        let nested = BlockColumn {
+            list_depth: 1,
+            ..column
+        };
+        assert_eq!(nested.list_marker_width(18., shared), 18.);
     }
 
     #[test]
