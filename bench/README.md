@@ -16,7 +16,7 @@ Keyword search runs all five query shapes with hybrid ranking disabled. If pinne
 
 Each row has two thresholds in [`budgets.toml`](budgets.toml).
 
-- **Fail above.** The product target from [docs/scope.md](../docs/scope.md) and the table below. A row above it fails the job. Hosted runners measure 2.5× or more below every fail limit, so a failure means Fell got slower, not that the runner did.
+- **Fail above.** A product target: the scope budgets in [docs/scope.md](../docs/scope.md) for threads, keyword search and memory, and 5 ms for a 100-row folder page, which leaves the rest of the 8 ms key-to-frame budget for layout and paint. Hybrid search is the exception: it fails at twice its 150 ms target (see below). A row above its fail limit fails the job. Hosted runners measure 2.5× or more below every store limit, and about 1.7× below the hybrid limit on the slowest MiniLM path seen, so a failure means Fell got slower, not that the runner did.
 - **Watch.** A hosted-runner reference value plus 20%. A row above it is marked **Watch**, gets a GitHub warning annotation, and is listed under the table, but the job passes. Hosted runner CPUs differ by more than 20% (an AMD EPYC 7763 runner measured the Inbox middle page at 0.93 ms where Intel Xeon 8573C runners measure 0.62–0.66 ms), so a tight reference can only be a hint. Look at Watch rows when a PR touches the store, search, or presentation code.
 
 The gate used to fail at the reference values. It flaked on runner hardware again and again (#220, #228, #247, and #278), so only product targets fail now. Store open is informational because the 300 ms product budget also covers app startup and rendering. The job publishes the table before returning a failure.

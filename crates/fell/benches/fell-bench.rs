@@ -68,30 +68,35 @@ struct Budgets {
 impl Budgets {
     fn read(path: &Path) -> Result<Self, Box<dyn Error>> {
         let budgets: Self = toml::from_str(&fs::read_to_string(path)?)?;
+        // Compare each fail limit with the watch threshold its row applies.
         for (name, watch, max) in [
             (
                 "folder_page",
-                budgets.folder_page_p95_ms,
+                budgets.folder_page_p95_ms * WATCH_HEADROOM,
                 budgets.folder_page_max_ms,
             ),
             (
                 "thread_open",
-                budgets.thread_open_p95_ms,
+                budgets.thread_open_p95_ms * WATCH_HEADROOM,
                 budgets.thread_open_max_ms,
             ),
             (
                 "keyword_search",
-                budgets.keyword_search_p95_ms,
+                budgets.keyword_search_p95_ms * WATCH_HEADROOM,
                 budgets.keyword_search_max_ms,
             ),
-            ("rss", budgets.rest_rss_mb, budgets.rss_max_mb),
+            (
+                "rss",
+                budgets.rest_rss_mb * WATCH_HEADROOM,
+                budgets.rss_max_mb,
+            ),
             (
                 "hybrid_search",
                 HYBRID_PRODUCT_TARGET_MS,
                 budgets.hybrid_search_max_ms,
             ),
         ] {
-            if !(watch > 0.0 && max.is_finite() && watch * WATCH_HEADROOM <= max) {
+            if !(watch > 0.0 && max.is_finite() && watch <= max) {
                 return Err(format!(
                     "{name}: watch values must be positive and below the fail limit in {}",
                     path.display()
