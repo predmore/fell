@@ -2528,6 +2528,11 @@ impl Inbox {
                 // A read of the same messages still belongs to the reader.
                 let in_place = (same || !view.is_empty())
                     && present::same_messages(&inbox.session.messages, &view);
+                if same || in_place {
+                    inbox
+                        .reader_bodies
+                        .recheck_moved_parts(&inbox.session.messages, &view);
+                }
                 let follow = if in_place {
                     inbox.keep_shown_text(&mut view);
                     inbox.queue_conversation_refresh(view, generation);
@@ -8237,6 +8242,21 @@ impl ReaderStatus {
 }
 
 impl ReaderBodies {
+    fn recheck_moved_parts(&mut self, old: &[ConvMessage], new: &[ConvMessage]) {
+        use fell_core::ReaderParts::{Listed, Unavailable, Unknown};
+        for message in new.iter().filter(|message| message.reader_parts == Unknown) {
+            if old.iter().any(|previous| {
+                previous.id == message.id
+                    && matches!(previous.reader_parts, Listed { .. } | Unavailable { .. })
+            }) {
+                self.completed.remove(&message.id);
+                self.fast_completed.remove(&message.id);
+                self.failed.remove(&message.id);
+                self.started.remove(&message.id);
+            }
+        }
+    }
+
     fn clear(&mut self) {
         let generation = self.generation;
         *self = Self {
@@ -12174,6 +12194,16 @@ mod tests {
     pub(super) fn with_pending_inbox(
         test: impl FnOnce(&mut super::Inbox, &mut gpui::Context<super::Inbox>),
     ) {
+        let (mut app, inbox) = pending_inbox();
+        inbox
+            .update(&mut app, |inbox, _, cx| {
+                test(inbox, cx);
+                assert!(!inbox.pending_bodies.downloading(&inbox.session.sync));
+            })
+            .unwrap();
+    }
+
+    pub(super) fn pending_inbox() -> (gpui::TestAppContext, gpui::WindowHandle<super::Inbox>) {
         use gpui::TestAppContext;
 
         let store = fell_core::Store::open_in_memory().unwrap();
@@ -12221,7 +12251,7 @@ mod tests {
             )
         });
         inbox
-            .update(&mut app, |inbox, _, cx| {
+            .update(&mut app, |inbox, _, _| {
                 inbox.motion = super::InboxMotion::new(motion::Motion::new(true));
                 inbox.session.set_messages(messages);
                 inbox.session.cursor_id = Some(row.id.clone());
@@ -12229,10 +12259,9 @@ mod tests {
                 inbox.session.set_threads(vec![row]);
                 inbox.pending_bodies.wait_for_read(0);
                 inbox.conv_gen.store(1, std::sync::atomic::Ordering::SeqCst);
-                test(inbox, cx);
-                assert!(!inbox.pending_bodies.downloading(&inbox.session.sync));
             })
             .unwrap();
+        (app, inbox)
     }
 
     #[test]

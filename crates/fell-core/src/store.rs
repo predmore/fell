@@ -1284,8 +1284,8 @@ impl Store {
     }
 
     /// What [`crate::parts::fetch_part`] needs to fetch one part: the part
-    /// and the message's server copies. `None` when the message, the part,
-    /// or any server copy is missing.
+    /// and the verified server copies. With no verified copy, a listed
+    /// part can still use a cache hit. `None` when the message or part is gone.
     pub fn part_request(
         &self,
         account_id: &AccountId,
@@ -1299,7 +1299,7 @@ impl Store {
     }
 
     /// A [`crate::parts::PartRequest`] for every listed part of one message,
-    /// in document order. Empty when none are listed or no copy is left.
+    /// in document order. A request with no verified copy is cache-only.
     pub fn part_requests(
         &self,
         account_id: &AccountId,
@@ -1312,9 +1312,6 @@ impl Store {
             return Ok(Vec::new());
         };
         let (copies, decoded_size_known) = bodies::part_copies(&self.conn, account_id, &canonical)?;
-        if copies.is_empty() {
-            return Ok(Vec::new());
-        }
         Ok(list
             .into_iter()
             .map(|part| crate::parts::PartRequest {
@@ -1547,8 +1544,30 @@ impl Store {
                     .unwrap_or_default();
                 let full_snippet = parts.as_ref().and_then(crate::imap::html_only_snippet_text);
                 let plain = parts.as_ref().and_then(|parts| parts.plain.as_deref());
-                let snippet = plain.map(crate::imap::plain_snippet);
-                (message_id, stored, full_snippet, plain, snippet)
+                let body = plain
+                    .map(Cow::Borrowed)
+                    .or_else(|| {
+                        if !foreground {
+                            return None;
+                        }
+                        let html = parts.as_ref()?.html.as_deref()?;
+                        Some(Cow::Owned(mail_parser::decoders::html::html_to_text(html)))
+                    })
+                    .filter(|body| !body.trim().is_empty());
+                let text = body.map(|body| {
+                    let snippet = plain
+                        .map(crate::imap::plain_snippet)
+                        .or_else(|| {
+                            full_snippet
+                                .as_deref()
+                                .map(crate::imap::cap_snippet)
+                                .map(str::to_owned)
+                        })
+                        .unwrap_or_default();
+                    let fingerprint = fingerprint_of(Some(&body));
+                    (body, snippet, fingerprint)
+                });
+                (message_id, stored, full_snippet, text)
             })
             .collect();
         // A CID-only answer can require inspecting the kept HTML again.
@@ -1579,9 +1598,7 @@ impl Store {
                 .behind_waiting_writes(|| immediate_transaction(&self.conn))?
         };
         let mut filled = 0;
-        for ((message_id, parts, full_snippet, plain, snippet), repair) in
-            compressed.iter().zip(repairs)
-        {
+        for ((message_id, parts, full_snippet, text), repair) in compressed.iter().zip(repairs) {
             let Some(canonical) = canonical_id_on(&tx, account_id, message_id)? else {
                 continue;
             };
@@ -1592,20 +1609,19 @@ impl Store {
                 filled += 1;
             }
             let listed = bodies::write(&tx, account_id, &canonical, parts, bodies::Write::FillGap)?;
-            if let (Some(plain), Some(snippet)) = (plain, snippet) {
-                tx.prepare_cached(
-                    "UPDATE messages SET body_text = ?3, snippet = ?4
-                     WHERE account_id = ?1 AND message_id = ?2
-                       AND body_text IS NULL AND snippet = ''",
-                )?
-                .execute(params![
-                    account_id.as_str(),
-                    canonical,
-                    plain,
-                    snippet
-                ])?;
+            if let Some((body, snippet, fingerprint)) = text {
+                fill_fetched_body_text(
+                    &tx,
+                    account_id,
+                    &canonical,
+                    parts,
+                    body,
+                    snippet,
+                    fingerprint,
+                )?;
             }
-            if let Some(full_snippet) = full_snippet {
+            if !foreground && let Some(full_snippet) = full_snippet {
+                // Retain the legacy spacing repair on the background lane.
                 bodies::fill_fetched_html_snippet(
                     &tx,
                     account_id,
@@ -1613,20 +1629,6 @@ impl Store {
                     parts,
                     full_snippet,
                 )?;
-                if foreground {
-                    // Header-first sync can now skip this copy. Make the
-                    // newly stored HTML searchable even if sync never does
-                    // a second download of the same source.
-                    tx.prepare_cached(
-                        "UPDATE messages SET body_text = ?3 WHERE account_id = ?1
-                         AND message_id = ?2 AND body_text IS NULL",
-                    )?
-                    .execute(params![
-                        account_id.as_str(),
-                        canonical,
-                        full_snippet
-                    ])?;
-                }
             }
             if listed && let Some(list) = parts.mime_parts() {
                 // The first list replaces flags an older classifier set.
@@ -2117,6 +2119,48 @@ impl Store {
     ) -> Result<Option<ListKey>> {
         summaries::folder_key_of(&self.conn, account_id, folder, thread)
     }
+}
+
+fn fill_fetched_body_text(
+    conn: &Connection,
+    account: &AccountId,
+    canonical: &str,
+    parts: &bodies::StoredParts,
+    body: &str,
+    snippet: &str,
+    fingerprint: &str,
+) -> Result<()> {
+    let Some(row) = conn
+        .prepare_cached(&format!(
+            "SELECT {ARRIVAL_COLS} FROM messages m
+             WHERE m.account_id = ?1 AND m.message_id = ?2 AND typeof(m.body_text) = 'null'"
+        ))?
+        .query_row(params![account.as_str(), canonical], map_arrival)
+        .optional()?
+    else {
+        return Ok(());
+    };
+    // FillGap can keep the text from a different copy. Index only the text
+    // that the store actually accepted.
+    if !parts.matches_search_body(conn, account, canonical)? {
+        return Ok(());
+    }
+    let old = terms_for_indexed(row.indexed_text(&row.snippet));
+    let new = terms_for_indexed(row.indexed_text(body));
+    conn.prepare_cached(
+        "UPDATE messages SET body_text = ?3, body_fingerprint = ?4,
+         snippet = CASE WHEN snippet = '' THEN ?5 ELSE snippet END
+         WHERE account_id = ?1 AND message_id = ?2",
+    )?
+    .execute(params![
+        account.as_str(),
+        canonical,
+        body,
+        fingerprint,
+        snippet
+    ])?;
+    sync_terms(conn, account.as_str(), &old, &new)?;
+    invalidate_message_embedding(conn, account.as_str(), canonical, body)
 }
 
 #[cfg(test)]
@@ -3218,17 +3262,7 @@ fn write_kept(
     } else {
         message.remote_id.0.clone()
     };
-    let old_terms = terms_for_indexed(IndexedText {
-        subject: &stored.subject,
-        from_name: stored.from_name.as_deref(),
-        from_email: &stored.from_email,
-        body: &stored.body,
-        to_line: &stored.to_line,
-        cc_line: &stored.cc_line,
-        bcc_line: &stored.bcc_line,
-        folders: &stored.folders,
-        labels: &stored.labels,
-    });
+    let old_terms = terms_for_indexed(stored.indexed_text(&stored.body));
     let indexed = body_text.as_deref().unwrap_or(&snippet);
     let new_terms = terms_for_indexed(IndexedText {
         subject: &subject,
@@ -3340,6 +3374,22 @@ struct Arrival {
     list_id: Option<String>,
     reply_to_line: String,
     attachment_names: String,
+}
+
+impl Arrival {
+    fn indexed_text<'a>(&'a self, body: &'a str) -> IndexedText<'a> {
+        IndexedText {
+            subject: &self.subject,
+            from_name: self.from_name.as_deref(),
+            from_email: &self.from_email,
+            body,
+            to_line: &self.to_line,
+            cc_line: &self.cc_line,
+            bcc_line: &self.bcc_line,
+            folders: &self.folders,
+            labels: &self.labels,
+        }
+    }
 }
 
 const ARRIVAL_COLS: &str = "m.message_id, m.remote_id, m.proton_conversation_id, m.in_reply_to,
@@ -4891,6 +4941,101 @@ mod tests {
             display_name: "Caleb".into(),
             email: "c@x".into(),
             backend_kind: BackendKind::Bridge,
+        }
+    }
+
+    #[test]
+    fn reader_fetched_text_indexes_header_rows_with_snippets() {
+        let store = Store::open_in_memory().unwrap();
+        let account = account();
+        store.upsert_account(&account).unwrap();
+        let cases = [
+            (
+                "text@x",
+                "periwinkle",
+                "Content-Type: text/plain\r\n\r\nThe text mentions periwinkle.",
+            ),
+            (
+                "html@x",
+                "chrysanthemum",
+                "Content-Type: text/html\r\n\r\n<p>A chrysanthemum.</p>",
+            ),
+            (
+                "multipart@x",
+                "nasturtium",
+                concat!(
+                    "Content-Type: multipart/alternative; boundary=b\r\n\r\n",
+                    "--b\r\nContent-Type: text/plain\r\n\r\nThe plain part names nasturtium.\r\n",
+                    "--b\r\nContent-Type: text/html\r\n\r\n<p>The HTML names geranium.</p>\r\n",
+                    "--b--\r\n",
+                ),
+            ),
+        ];
+        for (index, (id, term, mime)) in cases.into_iter().enumerate() {
+            let raw = format!(
+                "From: demo@example.test\r\nSubject: Garden\r\nMessage-ID: <{id}>\r\n{mime}"
+            );
+            let mut row = crate::imap::to_message(
+                &account.id,
+                "INBOX",
+                "INBOX",
+                7,
+                index as u32 + 1,
+                &[],
+                raw.as_bytes(),
+            );
+            let expected = row.body_text.take().unwrap();
+            let parts = row.parts.take();
+            row.snippet = "Initial preview".into();
+            store.upsert_message(&row).unwrap();
+            dequeue_message(&store.conn, account.id.as_str(), id).unwrap();
+            store
+                .conn
+                .execute(
+                    "INSERT INTO message_embeddings
+                    (account_id, message_id, model, model_version, dims, body_hash, vector)
+                 VALUES (?1, ?2, 'test', '1', 1, 'preview', x'00000000')",
+                    params![account.id.as_str(), id],
+                )
+                .unwrap();
+            let count = |sql: &str, key: &str| -> i64 {
+                store
+                    .conn
+                    .query_row(sql, params![account.id.as_str(), key], |row| row.get(0))
+                    .unwrap()
+            };
+            let term_count = "SELECT COALESCE((SELECT df FROM search_terms WHERE account_id = ?1 AND term = ?2), 0)";
+            assert_eq!(count(term_count, term), 0);
+            assert!(store.search(&account.id, term).unwrap().hits.is_empty());
+            store
+                .store_fetched_parts_with(&account.id, &[(MessageId::new(id), parts)], true)
+                .unwrap();
+            let shown = store
+                .message(&account.id, &MessageId::new(id))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                shown.body_text.as_deref().map(str::trim),
+                Some(expected.trim())
+            );
+            assert_eq!(shown.snippet, "Initial preview");
+            assert_eq!(count(term_count, term), 1);
+            assert_eq!(count(term_count, "initial"), 0);
+            assert_eq!(store.search(&account.id, term).unwrap().hits.len(), 1);
+            assert_eq!(
+                count(
+                    "SELECT count(*) FROM message_embeddings WHERE account_id = ?1 AND message_id = ?2",
+                    id
+                ),
+                0
+            );
+            assert_eq!(
+                count(
+                    "SELECT count(*) FROM embedding_queue WHERE account_id = ?1 AND message_id = ?2",
+                    id
+                ),
+                1
+            );
         }
     }
 

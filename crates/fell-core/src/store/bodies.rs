@@ -459,13 +459,18 @@ pub enum ReaderParts {
 // A complete list comes from a full source. Only other states need to
 // check whether there is still a server copy to read from.
 const READER_STATES_SQL: &str = "
-    SELECT m.message_id, m.body_text IS NULL AND m.snippet = '',
-           b.parts_listed, b.html IS NOT NULL, b.plain IS NOT NULL,
+    SELECT m.message_id, typeof(m.body_text) = 'null' AND m.snippet = '',
+           b.parts_listed, typeof(b.html) != 'null', typeof(b.plain) != 'null',
            b.withheld IS 1,
            CASE WHEN b.parts_listed = 1 THEN 0 ELSE EXISTS (
                SELECT 1 FROM message_copies c
                WHERE c.account_id = m.account_id AND c.message_id = m.message_id
-           ) END
+           ) END,
+           CASE WHEN b.parts_listed IN (2, 3) THEN EXISTS (
+               SELECT 1 FROM message_copies c
+               WHERE c.account_id = m.account_id AND c.message_id = m.message_id
+                 AND b.structure_copy = 'imap:' || c.uidvalidity || ':' || c.uid || ':' || c.mailbox
+           ) ELSE 0 END
     FROM messages m LEFT JOIN message_bodies b USING (account_id, message_id)
     WHERE m.account_id = ?1";
 
@@ -476,6 +481,7 @@ fn reader_states_from_row(row: &Row<'_>) -> rusqlite::Result<(BodyState, ReaderP
     let plain: bool = row.get(4)?;
     let withheld: bool = row.get(5)?;
     let has_copy: bool = row.get(6)?;
+    let has_structure_copy: bool = row.get(7)?;
     let provisional = matches!(code, Some(2 | 3));
     let has_body = code.is_some() && (!provisional || html || plain);
     let state = if no_preview && withheld {
@@ -486,10 +492,10 @@ fn reader_states_from_row(row: &Row<'_>) -> rusqlite::Result<(BodyState, ReaderP
         BodyState::Stored
     };
     let needs_html = code == Some(3) && !html;
-    let parts = match (code.unwrap_or(0), has_copy) {
-        (0, true) => ReaderParts::Unknown,
-        (2 | 3, true) => ReaderParts::Listed { html: needs_html },
-        (2 | 3, false) => ReaderParts::Unavailable { html: needs_html },
+    let parts = match (code.unwrap_or(0), has_copy, has_structure_copy) {
+        (0, true, _) | (2 | 3, true, false) => ReaderParts::Unknown,
+        (2 | 3, true, true) => ReaderParts::Listed { html: needs_html },
+        (2 | 3, false, _) => ReaderParts::Unavailable { html: needs_html },
         _ => ReaderParts::Ready,
     };
     Ok((state, parts))
@@ -540,8 +546,8 @@ pub(crate) fn parts_listed(
     Ok(list_code(conn, account_id, message_id)? == 1)
 }
 
-/// Write provisional metadata only while the original server copy is still
-/// recorded. A full source stored by sync always wins.
+/// Write provisional metadata from a live copy, replacing a provisional list
+/// whose source disappeared. A full source stored by sync always wins.
 pub(super) fn write_structure(
     conn: &Connection,
     account: &AccountId,
@@ -549,7 +555,14 @@ pub(super) fn write_structure(
     copy: &RemoteId,
     structure: &crate::imap::BodyStructure,
 ) -> Result<bool> {
-    if list_code(conn, account, id)? != 0 || !copies_of(conn, account, id)?.contains(copy) {
+    let (code, source) = structure_source(conn, account, id)?;
+    if code == 1 {
+        return Ok(false);
+    }
+    let copies = copies_of(conn, account, id)?;
+    if !copies.contains(copy)
+        || source.is_some_and(|source| copies.iter().any(|copy| copy.0 == source))
+    {
         return Ok(false);
     }
     conn.execute(
@@ -609,19 +622,29 @@ pub(super) fn part_copies(
     account: &AccountId,
     id: &str,
 ) -> Result<(Vec<RemoteId>, bool)> {
-    let (code, source): (i64, Option<String>) = conn
+    let (code, source) = structure_source(conn, account, id)?;
+    let mut copies = copies_of(conn, account, id)?;
+    if code != 1 {
+        copies.retain(|copy| Some(&copy.0) == source.as_ref());
+    }
+    Ok((copies, code == 1))
+}
+
+fn structure_source(
+    conn: &Connection,
+    account: &AccountId,
+    id: &str,
+) -> Result<(i64, Option<String>)> {
+    Ok(conn
         .prepare_cached(
             "SELECT parts_listed, structure_copy FROM message_bodies
          WHERE account_id = ?1 AND message_id = ?2",
         )?
         .query_row(params![account.as_str(), id], |row| {
             Ok((row.get(0)?, row.get(1)?))
-        })?;
-    let mut copies = copies_of(conn, account, id)?;
-    if code != 1 {
-        copies.retain(|copy| Some(&copy.0) == source.as_ref());
-    }
-    Ok((copies, code == 1))
+        })
+        .optional()?
+        .unwrap_or_default())
 }
 
 /// The recorded part list of a canonical message id, in document order.
@@ -945,6 +968,34 @@ fn spacing_repair<'a>(old: &str, full: &'a str) -> Option<&'a str> {
         .then_some(new)
 }
 
+impl StoredParts {
+    pub(super) fn matches_search_body(
+        &self,
+        conn: &Connection,
+        account: &AccountId,
+        message: &str,
+    ) -> Result<bool> {
+        Ok(conn
+            .prepare_cached(
+                "SELECT EXISTS (
+                     SELECT 1 FROM message_bodies
+                     WHERE account_id = ?1 AND message_id = ?2 AND codec = ?3
+                       AND (plain = ?4 OR (?4 IS NULL AND plain IS NULL AND html = ?5))
+                 )",
+            )?
+            .query_row(
+                params![
+                    account.as_str(),
+                    message,
+                    CODEC_DEFLATE,
+                    self.plain,
+                    self.html
+                ],
+                |row| row.get(0),
+            )?)
+    }
+}
+
 pub(super) fn fill_fetched_html_snippet(
     conn: &Connection,
     account: &AccountId,
@@ -1245,6 +1296,8 @@ mod tests {
                  DELETE FROM message_bodies WHERE message_id = 'unknown@x';
                  UPDATE message_bodies SET parts_listed = 3, html = NULL, plain = NULL
                  WHERE message_id IN ('listed@x', 'gone@x');
+                 UPDATE message_bodies SET structure_copy = 'imap:7:3:INBOX'
+                 WHERE message_id = 'listed@x';
                  UPDATE message_bodies SET parts_listed = 0, html = NULL, plain = NULL, withheld = 1
                  WHERE message_id = 'withheld@x';
                  DELETE FROM message_copies WHERE message_id = 'gone@x';",

@@ -4,7 +4,7 @@ use std::process::Child;
 use std::time::Duration;
 
 use fell_core::compose::{MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_FILES, ResolvedFile};
-use fell_core::parts::{CachedPart, PartEvent, PartRequest};
+use fell_core::parts::{CachedPart, PartEvent};
 use fell_core::{AccountId, MessageId, MimePart, PartRole};
 use futures::StreamExt;
 use gpui::{AsyncApp, Context, WeakEntity};
@@ -78,7 +78,7 @@ impl Inbox {
                         line,
                         detail,
                         retry,
-                    } => inbox.attachment_failed(line, detail, retry),
+                    } => inbox.attachment_failed(line, detail, retry, cx),
                 }
                 cx.notify();
             });
@@ -91,7 +91,13 @@ impl Inbox {
         self.dismiss_notice_after(self.session.toast_generation(), Duration::from_secs(3), cx);
     }
 
-    fn attachment_failed(&mut self, line: String, detail: String, retry: Request) {
+    fn attachment_failed(
+        &mut self,
+        line: String,
+        detail: String,
+        retry: Request,
+        cx: &mut Context<Self>,
+    ) {
         let (action, targets) = match &retry {
             Request::Open(target) => (FailedAction::Open, std::slice::from_ref(target)),
             Request::Save(targets) => (FailedAction::Save, targets.as_slice()),
@@ -109,6 +115,7 @@ impl Inbox {
             self.session.clear_toast();
         } else {
             self.session.set_toast(self.attachment_retry_notice(line));
+            self.expire_action_notice(cx);
         }
     }
 
@@ -163,6 +170,7 @@ impl Inbox {
                     "Couldn't open attachment".into(),
                     detail,
                     Request::Open(target),
+                    cx,
                 );
                 cx.notify();
             });
@@ -306,28 +314,15 @@ impl AttachmentSource {
         let request = self
             .store
             .call(move |store| {
-                let request = store.part_request(&account, &id, &expected.section)?;
-                if request.is_some() {
-                    return Ok(request.filter(|request| {
-                        let mut actual = request.part.clone();
-                        if expected.size == expected.estimated_decoded_size() {
-                            actual.size = expected.size;
-                        }
-                        actual == expected
-                    }));
-                }
-                // A local copy without server coordinates can still use bytes
-                // previously cached for this canonical message.
                 Ok::<_, fell_core::Error>(
                     store
-                        .message_attachments(&account, &id)?
-                        .filter(|parts| parts.contains(&expected))
-                        .map(|_| PartRequest {
-                            account_id: account,
-                            message_id: id,
-                            part: expected,
-                            copies: Vec::new(),
-                            decoded_size_known: true,
+                        .part_request(&account, &id, &expected.section)?
+                        .filter(|request| {
+                            let mut actual = request.part.clone();
+                            if expected.size == expected.estimated_decoded_size() {
+                                actual.size = expected.size;
+                            }
+                            actual == expected
                         }),
                 )
             })
@@ -432,5 +427,81 @@ impl AttachmentSource {
             }
         }
         (files, omitted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fell_core::{Disposition, TransferEncoding};
+
+    #[test]
+    fn focused_failure_notice_and_retry_agree_in_both_event_orders() {
+        for focus_first in [false, true] {
+            let (mut app, inbox) = super::super::tests::pending_inbox();
+            inbox
+                .update(&mut app, |inbox, _, cx| {
+                    let index = inbox.session.message_cursor;
+                    let message = &mut inbox.session.messages[index];
+                    let first = Target {
+                        message: message.id.clone(),
+                        part: MimePart {
+                            section: "2".into(),
+                            role: PartRole::Attachment,
+                            mime_type: "text/plain".into(),
+                            filename: Some("route.txt".into()),
+                            size: 8,
+                            encoded_size: 8,
+                            encoding: TransferEncoding::Identity,
+                            content_id: None,
+                            disposition: Disposition::Attachment,
+                            nested: false,
+                        },
+                    };
+                    let mut second = first.clone();
+                    second.part.section = "3".into();
+                    second.part.filename = Some("notes.txt".into());
+                    message.expanded = true;
+                    message.attachments = vec![first.part.clone(), second.part.clone()];
+                    if focus_first {
+                        inbox.session.focus_attachment(index, first.part.clone());
+                    }
+                    let retry = Request::Save(vec![first.clone(), second]);
+                    inbox.attachment_failed(
+                        "Saved 1, 2 failed".into(),
+                        "fixture error".into(),
+                        retry.clone(),
+                        cx,
+                    );
+                    if !focus_first {
+                        assert_eq!(
+                            inbox.session.status_notice().unwrap().text,
+                            "Saved 1, 2 failed"
+                        );
+                        assert_eq!(inbox.attachment_to_retry(), Some(retry));
+                        inbox.session.focus_attachment(index, first.part.clone());
+                    }
+                    inbox.session.attachment_retry_notice = inbox.focused_attachment_retry_notice();
+                    let notice = inbox.session.status_notice().unwrap();
+                    assert_eq!(notice.text, "Couldn't save “route.txt”");
+                    assert_eq!(notice.hint.as_ref().unwrap().0, "space a R");
+                    assert_eq!(
+                        inbox.attachment_to_retry(),
+                        Some(Request::Save(vec![first]))
+                    );
+                })
+                .unwrap();
+
+            app.run_until_parked();
+            app.executor().advance_clock(Duration::from_secs(3));
+            app.run_until_parked();
+            inbox
+                .update(&mut app, |inbox, _, _| {
+                    inbox.session.leave_attachments();
+                    inbox.session.attachment_retry_notice = inbox.focused_attachment_retry_notice();
+                    assert!(inbox.session.status_notice().is_none());
+                })
+                .unwrap();
+        }
     }
 }

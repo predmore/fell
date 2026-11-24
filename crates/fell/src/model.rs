@@ -644,9 +644,9 @@ impl Session {
     }
 
     pub fn status_notice(&self) -> Option<&Toast> {
-        self.toast
+        self.attachment_retry_notice
             .as_ref()
-            .or(self.attachment_retry_notice.as_ref())
+            .or(self.toast.as_ref())
             .or_else(|| self.search.as_ref()?.error.as_ref())
             .or(self.startup_crash_notice.as_ref())
     }

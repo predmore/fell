@@ -200,8 +200,12 @@ impl PartCache {
                 && recorded == provisional_part_key(request, stamp, &meta)
         };
         if !matches {
-            drop(file);
-            let _ = fs::remove_file(&path);
+            // A mismatched provisional record may describe a different
+            // version of the part. Leave it for a verified replacement.
+            if request.decoded_size_known {
+                drop(file);
+                let _ = fs::remove_file(&path);
+            }
             return None;
         }
         let _ = file.set_modified(SystemTime::now());
@@ -329,9 +333,23 @@ fn provisional_part_key(request: &PartRequest, stamp: [u8; 16], file: &fs::Metad
         TransferEncoding::Base64 => 1,
         TransferEncoding::QuotedPrintable => 2,
     }]);
-    for copy in &request.copies {
-        hash.update((copy.0.len() as u64).to_le_bytes());
-        hash.update(copy.0.as_bytes());
+    // The directory already identifies the canonical message and section.
+    // Revalidate the part's descriptor after a move, without binding a
+    // verified download to the UID that originally served it.
+    hash.update([
+        request.part.role as u8,
+        request.part.disposition as u8,
+        u8::from(request.part.nested),
+    ]);
+    for field in [
+        Some(request.part.mime_type.as_str()),
+        request.part.filename.as_deref(),
+        request.part.content_id.as_deref(),
+    ] {
+        hash.update([u8::from(field.is_some())]);
+        let field = field.unwrap_or_default();
+        hash.update((field.len() as u64).to_le_bytes());
+        hash.update(field.as_bytes());
     }
     hash.finalize().into()
 }
@@ -855,7 +873,7 @@ mod tests {
     }
 
     #[test]
-    fn a_provisional_cache_hit_uses_the_observed_size_and_server_copy() {
+    fn a_provisional_cache_hit_uses_the_observed_size_across_copy_changes() {
         let (_root, cache, store, mut request) =
             super::cleanup_tests::listed_fixture("provisional-hit");
         request.decoded_size_known = false;
@@ -868,8 +886,19 @@ mod tests {
         let hit = fetch_cached_part(&cache, &store, &request, || panic!("cache miss")).unwrap();
         assert_eq!(hit.size, 4);
         request.copies[0] = RemoteId("imap:1:2:INBOX".into());
-        let hit = fetch_cached_part(&cache, &store, &request, || Ok(b"new!".to_vec())).unwrap();
-        assert_eq!(fs::read(hit.path).unwrap(), b"new!");
+        let hit = fetch_cached_part(&cache, &store, &request, || {
+            panic!("copied part missed cache")
+        })
+        .unwrap();
+        assert_eq!(fs::read(&hit.path).unwrap(), b"data");
+        request.copies.clear();
+        fetch_cached_part(&cache, &store, &request, || {
+            panic!("cache-only part missed cache")
+        })
+        .unwrap();
+        request.part.encoded_size += 4;
+        assert!(fetch_cached_part(&cache, &store, &request, || Err(part_removed())).is_err());
+        assert_eq!(fs::read(hit.path).unwrap(), b"data");
     }
 
     #[test]

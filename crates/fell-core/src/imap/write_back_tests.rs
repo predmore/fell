@@ -99,7 +99,10 @@ impl Fixture {
     }
 
     fn with(store: Store, state: TestState) -> Self {
-        let server = TestServer::spawn(state);
+        Self::with_server(store, TestServer::spawn(state))
+    }
+
+    fn with_server(store: Store, server: TestServer) -> Self {
         {
             let mut writes = server.writes.lock().unwrap();
             writes.moves = true;
@@ -298,6 +301,135 @@ fn without_tags(commands: &[String]) -> Vec<String> {
                 .to_string()
         })
         .collect()
+}
+
+#[test]
+fn archiving_a_withheld_message_rechecks_provisional_parts_and_can_save_them() {
+    use crate::parts::{PartCache, fetch_part};
+    use crate::{BodyState, CancelBodyFetch, MessageId, ReaderBodyFetcher, ReaderParts, RemoteId};
+
+    let id = MessageId::new("provisional@x");
+    let message = super::mime_fixtures::mixed_two_attachments(id.as_str());
+    let parts = super::parts_from_raw(&message.raw).mime_parts;
+    let structure = format!(
+        concat!(
+            "((\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 19 1 NIL NIL)",
+            "(\"APPLICATION\" \"PDF\" NIL NIL NIL \"BASE64\" {} NIL (\"ATTACHMENT\" (\"FILENAME\" \"report.pdf\")))",
+            "(\"TEXT\" \"CSV\" NIL NIL NIL \"QUOTED-PRINTABLE\" {} 2 NIL (\"ATTACHMENT\" (\"FILENAME\" \"totals.csv\")))",
+            " \"MIXED\")"
+        ),
+        parts[0].encoded_size, parts[1].encoded_size
+    );
+    let mut initial = state();
+    initial.mailboxes[0].messages.clear();
+    let server =
+        TestServer::spawn_parallel(initial, [(1, structure.clone()), (2, structure)].into());
+    let fx = Fixture::with_server(Store::open_in_memory().unwrap(), server);
+    fx.server.state.lock().unwrap().mailboxes[0]
+        .messages
+        .push(FixtureMessage {
+            uid: 2,
+            flags: Vec::new(),
+            modseq: 1,
+            body_form: BodyForm::Literal,
+            raw: message.raw.clone(),
+        });
+    let account = &fx.account.id;
+    let mut header = super::to_message(account, "INBOX", "INBOX", 7, 2, &[], &message.raw);
+    header.parts = None;
+    header.body_text = None;
+    header.snippet.clear();
+    header.has_attachment = false;
+    header.attachment_names.clear();
+    fx.store
+        .apply_delta(
+            account,
+            &crate::MailboxDelta {
+                messages: vec![header],
+                too_large: vec![id.clone()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut reader = ReaderBodyFetcher::default();
+    let config = fx.account_config();
+    let cancel = CancelBodyFetch::default();
+    let open = |reader: &mut ReaderBodyFetcher| {
+        assert!(
+            reader
+                .fetch(
+                    &config,
+                    &fx.store,
+                    std::slice::from_ref(&id),
+                    &cancel,
+                    || {}
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            fx.store
+                .body_states(account, std::slice::from_ref(&id))
+                .unwrap(),
+            [BodyState::TooLarge]
+        );
+    };
+    open(&mut reader);
+    let request = |section| {
+        fx.store
+            .part_request(account, &id, section)
+            .unwrap()
+            .unwrap()
+    };
+    let old = request("3");
+    assert_eq!(old.copies, [RemoteId("imap:7:2:INBOX".into())]);
+    assert!(!old.decoded_size_known);
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = PartCache::open(tmp.path().join("parts"), 64 * 1024).unwrap();
+    let saved = fetch_part(&fx.backend, &cache, &fx.store, &old, &mut |_| {}).unwrap();
+    assert_ne!(saved.size, old.part.size);
+
+    fx.store
+        .archive_thread(account, &fx.thread("INBOX", "Two files"), "INBOX")
+        .unwrap();
+    assert_eq!(fx.replay().sent, 1);
+    assert_eq!(
+        fx.store.reader_parts(account, id.as_str()).unwrap(),
+        ReaderParts::Unknown
+    );
+    let stale = request("3");
+    assert!(stale.copies.is_empty(), "old sections are cache-only");
+    assert!(!stale.decoded_size_known);
+    fx.clear_commands();
+    let hit = fetch_part(&fx.backend, &cache, &fx.store, &stale, &mut |_| {}).unwrap();
+    assert_eq!(hit.path, saved.path);
+    assert!(fx.commands().is_empty());
+
+    open(&mut reader);
+    let moved = request("2");
+    assert_eq!(moved.copies, [RemoteId("imap:30:1:Archive".into())]);
+    assert!(!moved.decoded_size_known);
+    assert!(
+        fx.commands()
+            .iter()
+            .any(|command| command.contains("BODYSTRUCTURE"))
+    );
+    assert!(
+        fx.commands()
+            .iter()
+            .all(|command| !command.contains("BODY.PEEK[]"))
+    );
+    let mut part = fetch_part(&fx.backend, &cache, &fx.store, &moved, &mut |_| {}).unwrap();
+    let path = tmp.path().join("report.pdf");
+    std::io::copy(&mut part.file, &mut std::fs::File::create(&path).unwrap()).unwrap();
+    assert_eq!(std::fs::read(path).unwrap(), message.bytes[0].1);
+    fx.clear_commands();
+    let hit = fetch_part(&fx.backend, &cache, &fx.store, &request("3"), &mut |_| {}).unwrap();
+    assert_eq!(hit.path, saved.path);
+    assert!(
+        fx.commands().is_empty(),
+        "verified cache hit survived the move"
+    );
 }
 
 #[test]
