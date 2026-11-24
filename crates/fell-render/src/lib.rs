@@ -21,7 +21,8 @@ pub use choose::{MailHeaders, PreparedMail, RenderMode, choose_view, layout_is_c
 pub use cid::visit_cid_image_urls;
 pub use corpus::corpus;
 pub use document::{
-    Align, Block, ImageSource, Inline, ListItem, MAX_DATA_IMAGE_BYTES, StyledDocument,
+    Align, Block, ImageSource, Inline, ListItem, ListLabelStyle, MAX_DATA_IMAGE_BYTES,
+    StyledDocument,
 };
 pub use fixtures::{Fixture, fixture, fixtures};
 pub use history::{

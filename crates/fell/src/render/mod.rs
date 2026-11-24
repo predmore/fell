@@ -14,7 +14,9 @@ mod theme;
 mod webview;
 
 pub use body::{BodyModel, MessageBody, prepare_stored, round_trip_body};
-pub use native::{BLOCK_GAP, ImageGallery, blocks_column, document_column, is_right_to_left};
+pub use native::{
+    BLOCK_GAP, ImageGallery, ListMarkerFont, blocks_column, document_column, is_right_to_left,
+};
 pub(crate) use native::{
     BlockColumn, BlockColumns, READING_MEASURE_PX, blocks_column_spaced, plain_text,
 };
@@ -486,12 +488,16 @@ fn message_body(
             )
         }
     } else {
+        let mut style = window.text_style();
+        style.font_family = "Inter".into();
+        let markers = ListMarkerFont::new(window, style);
         body.child(document_column(
             reader.model.document(),
             palette,
             reader.model.remote_images_allowed(),
             &reader.gallery,
             (f32::from(window.viewport_size().width) - 2. * NATIVE_BODY_PAD_PX).max(0.),
+            &markers,
         ))
     }
 }

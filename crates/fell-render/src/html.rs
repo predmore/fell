@@ -3,8 +3,10 @@ use std::ops::Deref;
 use scraper::Html;
 use scraper::node::Node;
 
-use crate::document::{Align, Block, ImageSource, Inline, ListItem, StyledDocument};
-use crate::typed_list::{self, ListRun};
+use crate::document::{
+    Align, Block, ImageSource, Inline, ListItem, ListLabelStyle, StyledDocument,
+};
+use crate::typed_list::{self, Indent, ListRun};
 
 /// How deep the native walk and the web serializer will recurse.
 ///
@@ -586,15 +588,19 @@ impl<'a> Lines<'a> {
         let margin = list_margin(&style);
         // Use the same units for Outlook levels and the usual Word margins
         // so a regular indented paragraph can continue an Outlook item.
-        let indent = level.map_or(margin, |level| level * 48 * 16);
+        let list_level = level.map_or(margin, |level| level * 48 * 16);
+        let indent = Indent {
+            level: list_level,
+            text: if margin > 0 { margin } else { list_level },
+        };
         let text = visible(&raw_text(node));
         let marker = typed_list::marker(&text);
         if level.is_some()
-            && let Some((ordered, mut inlines)) = outlook_list_marker(node, depth, marker.as_ref())
+            && let Some((label, mut inlines)) = outlook_list_marker(node, depth, marker.as_ref())
             && strip_list_marker(&mut inlines, "")
         {
             let blocks = styled_blocks(node, element, paragraph(inlines));
-            self.list.item(indent, ordered, true, blocks, node);
+            self.list.item(indent, label, true, blocks, node);
             return true;
         }
         if let Some(marker) = marker
@@ -605,16 +611,19 @@ impl<'a> Lines<'a> {
             if strip_list_marker(&mut inlines, marker.token) {
                 let blocks = styled_blocks(node, element, paragraph(inlines));
                 self.list
-                    .item(indent, marker.ordered, indent > 0, blocks, node);
+                    .item(indent, marker.label, list_level > 0, blocks, node);
                 return true;
             }
         }
-        if marker.is_none() && self.list.accepts_continuation(indent) {
-            let blocks = node_blocks(node, depth);
-            if blocks.iter().any(|block| !block_is_empty(block)) {
-                self.list.continuation(blocks, node);
+        if marker.is_none() && !self.list.is_empty() {
+            if text.trim().is_empty() && node_blocks(node, depth).iter().all(block_is_empty) {
+                // Word can put an empty paragraph between two items.
+                self.list.keep_original(node);
                 return true;
             }
+            return self
+                .list
+                .continuation(indent.text, || node_blocks(node, depth), node);
         }
         false
     }
@@ -727,9 +736,9 @@ fn outlook_list_marker(
     node: ego_tree::NodeRef<'_, Node>,
     depth: u32,
     visible_marker: Option<&typed_list::Marker<'_>>,
-) -> Option<(bool, Vec<Inline>)> {
+) -> Option<(typed_list::Label, Vec<Inline>)> {
     let mut children = node.children();
-    let ordered = loop {
+    let label = loop {
         let child = children.next()?;
         let text = match child.value() {
             Node::Text(text) if is_blank_text(text) => continue,
@@ -750,21 +759,21 @@ fn outlook_list_marker(
             }
             _ => return None,
         };
-        let ordered = typed_list::marker(&text)
+        let label = typed_list::marker(&text)
             .filter(|marker| marker.content.is_empty())
-            .map(|marker| marker.ordered)
+            .map(|marker| marker.label)
             .or_else(|| {
                 visible_marker
                     .filter(|marker| marker.token == text.trim())
-                    .map(|marker| marker.ordered)
+                    .map(|marker| marker.label)
             })?;
-        break ordered;
+        break label;
     };
     let mut inlines = Vec::new();
     for child in children {
         push_inline(child, depth + 1, &mut inlines);
     }
-    Some((ordered, inlines))
+    Some((label, inlines))
 }
 
 /// Check the displayed prefix before cutting it. Normalization can shrink
@@ -1202,8 +1211,15 @@ fn split_blank_lines(blocks: Vec<Block>) -> Vec<Block> {
             Block::ReplyHeader { blocks } => out.push(Block::ReplyHeader {
                 blocks: split_blank_lines(blocks),
             }),
-            Block::List { ordered, items } => out.push(Block::List {
+            Block::List {
                 ordered,
+                start,
+                style,
+                items,
+            } => out.push(Block::List {
+                ordered,
+                start,
+                style,
                 items: items
                     .into_iter()
                     .map(|item| ListItem {
@@ -1260,7 +1276,23 @@ fn list_block(node: ego_tree::NodeRef<'_, Node>, ordered: bool, depth: u32) -> B
             items.push(ListItem { blocks });
         }
     }
-    Block::List { ordered, items }
+    let element = node.value().as_element();
+    let start = element
+        .and_then(|element| element.attr("start"))
+        .and_then(|start| start.trim().parse().ok())
+        .unwrap_or(1);
+    let style = match element.and_then(|element| element.attr("type")) {
+        Some("a") => ListLabelStyle::LowerAlpha,
+        Some("A") => ListLabelStyle::UpperAlpha,
+        Some("i") => ListLabelStyle::LowerRoman,
+        _ => ListLabelStyle::Decimal,
+    };
+    Block::List {
+        ordered,
+        start,
+        style,
+        items,
+    }
 }
 
 /// One table cell: its blocks, the alignment it sets, and whether it is
@@ -2380,7 +2412,7 @@ mod tests {
                 &rows[0][1][0],
                 Block::List {
                     ordered: false,
-                    items
+                    items, ..
                 } if items.len() == 2
             ),
             "unordered marker: {:?}",

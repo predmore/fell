@@ -128,7 +128,7 @@ pub(crate) mod outline {
                 text_block(out, depth, &format!("h{level}"), inlines)
             }
             Block::Paragraph { inlines } => text_block(out, depth, "p", inlines),
-            Block::List { ordered, items } => {
+            Block::List { ordered, items, .. } => {
                 line(out, depth, if *ordered { "ol" } else { "ul" });
                 for item in items {
                     line(out, depth + 1, "-");
