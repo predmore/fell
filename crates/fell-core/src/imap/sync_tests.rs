@@ -4680,6 +4680,178 @@ fn inbox_state(messages: Vec<(u32, Vec<u8>)>) -> TestState {
     state
 }
 
+#[test]
+fn reader_stores_metadata_and_bodies_before_the_sync_pass_finishes() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let sample = |uid: u32| {
+        format!(
+            concat!(
+                "From: Demo <sender@example.test>\r\n",
+                "Message-ID: <reader-{}@example.test>\r\n",
+                "Subject: Route notes\r\n",
+                "Content-Type: multipart/mixed; boundary=route\r\n\r\n",
+                "--route\r\nContent-Type: text/html\r\n\r\n<p>Route ready.</p>\r\n",
+                "--route\r\nContent-Type: text/plain\r\n",
+                "Content-Disposition: attachment; filename=route.txt\r\n\r\n",
+                "notes\r\n--route--\r\n"
+            ),
+            uid
+        )
+        .into_bytes()
+    };
+    let structure = concat!(
+        r#"(("TEXT" "HTML" NIL NIL NIL "7BIT" 19 1 NIL NIL)"#,
+        r#"("TEXT" "PLAIN" NIL NIL NIL "7BIT" 5 1 NIL ("ATTACHMENT" ("FILENAME" "route.txt"))) "MIXED")"#,
+    );
+    let server = TestServer::spawn_parallel(
+        inbox_state((1..=6).map(|uid| (uid, sample(uid))).collect()),
+        (1..=6)
+            .map(|uid| (uid, if uid == 4 { "(TEXT)" } else { structure }.into()))
+            .collect(),
+    );
+    let config = crate::AccountConfig::parse(&format!(
+        concat!(
+            "id = \"reader\"\nemail = \"sender@example.test\"\nbackend = \"imap\"\n",
+            "host = \"127.0.0.1\"\nport = {}\nsecurity = \"plain\"\n",
+            "username = \"caleb\"\npassword = \"secret\"\n"
+        ),
+        server.addr.port()
+    ))
+    .unwrap();
+    let account = config.account();
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("mail.db");
+    let store = crate::ReaderBodyFetcher::open_store(&path).unwrap();
+    store.upsert_account(&account).unwrap();
+    let ids = |uid| crate::MessageId::new(format!("reader-{uid}@example.test"));
+    let messages = (1..=5)
+        .map(|uid| {
+            let mut message =
+                crate::imap::to_message(&account.id, "INBOX", "INBOX", 20, uid, &[], &sample(uid));
+            message.parts = None;
+            message.has_attachment = false;
+            message.attachment_names.clear();
+            message
+        })
+        .collect();
+    store
+        .apply_delta(
+            &account.id,
+            &crate::backend::MailboxDelta {
+                messages,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let backend = config.backend().unwrap();
+    let sync_account = account.clone();
+    let (running, pass_started) = mpsc::channel();
+    let (release, finish_pass) = mpsc::channel();
+    let pass = std::thread::spawn(move || {
+        let store = crate::ReaderBodyFetcher::open_store(&path).unwrap();
+        let mut running = Some(running);
+        sync_with_progress(&sync_account, backend.as_ref(), &store, &mut |_| {
+            if let Some(running) = running.take() {
+                running.send(()).unwrap();
+                finish_pass.recv_timeout(Duration::from_secs(20)).unwrap();
+            }
+        })
+        .unwrap()
+    });
+    pass_started.recv_timeout(Duration::from_secs(10)).unwrap();
+    let commands_before = commands(&server).len();
+    let mut reader = crate::ReaderBodyFetcher::default();
+    let cancel = crate::CancelBodyFetch::default();
+    let mut last = Instant::now();
+    let mut commit = 0;
+    let unresolved = reader
+        .fetch(&config, &store, &[ids(1), ids(2)], &cancel, || {
+            if commit == 0 {
+                assert_eq!(
+                    store.reader_parts(&account.id, ids(1).as_str()).unwrap(),
+                    crate::ReaderParts::Listed { html: true }
+                );
+                assert_eq!(
+                    store
+                        .message_attachments(&account.id, &ids(1))
+                        .unwrap()
+                        .unwrap()[0]
+                        .filename
+                        .as_deref(),
+                    Some("route.txt")
+                );
+                assert!(
+                    store
+                        .message_body(&account.id, &ids(1))
+                        .unwrap()
+                        .unwrap()
+                        .html
+                        .is_none()
+                );
+            }
+            eprintln!(
+                "reader commit {} at {:.2?} while sync is held",
+                commit + 1,
+                last.elapsed()
+            );
+            commit += 1;
+        })
+        .unwrap();
+    assert!(unresolved.is_empty());
+    assert_eq!(commit, 2);
+    assert_eq!(
+        store.reader_parts(&account.id, ids(2).as_str()).unwrap(),
+        crate::ReaderParts::Ready
+    );
+    last = Instant::now();
+    assert!(
+        reader
+            .fetch(&config, &store, &[ids(3), ids(4)], &cancel, || {
+                assert_eq!(
+                    store.reader_parts(&account.id, ids(3).as_str()).unwrap()
+                        == crate::ReaderParts::Ready,
+                    store.reader_parts(&account.id, ids(4).as_str()).unwrap()
+                        == crate::ReaderParts::Ready
+                );
+            })
+            .unwrap()
+            .is_empty()
+    );
+    eprintln!(
+        "warm reader stored parts at {:.2?} while sync is held",
+        last.elapsed()
+    );
+    let foreground = commands(&server).split_off(commands_before);
+    let count = |needle: &str| {
+        foreground
+            .iter()
+            .filter(|line| line.contains(needle))
+            .count()
+    };
+    assert_eq!(count("LOGIN"), 1, "{foreground:?}");
+    assert_eq!(count(" EXAMINE "), 1, "{foreground:?}");
+    assert_eq!(count("UID FETCH 1,2 "), 2, "{foreground:?}");
+    assert_eq!(count("UID FETCH 3,4 "), 2, "{foreground:?}");
+    assert_eq!(
+        store.reader_parts(&account.id, ids(4).as_str()).unwrap(),
+        crate::ReaderParts::Ready
+    );
+    let cancelled = crate::CancelBodyFetch::default();
+    cancelled.cancel();
+    assert!(
+        reader
+            .fetch(&config, &store, &[ids(5)], &cancelled, || panic!(
+                "cancelled write"
+            ))
+            .is_err()
+    );
+    assert_eq!(commands(&server).len(), commands_before + foreground.len());
+    release.send(()).unwrap();
+    pass.join().unwrap();
+}
+
 fn temp_cache(tag: &str) -> (std::path::PathBuf, crate::parts::PartCache) {
     let root = std::env::temp_dir().join(format!(
         "fell-part-fetch-{tag}-{}-{:?}",
@@ -4927,6 +5099,127 @@ fn a_part_whose_copy_is_gone_is_an_error_and_caches_nothing() {
             .is_err()
     );
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn provisional_wire_size_mismatches_check_the_part_mime_headers() {
+    use crate::{BodyState, MessageId, ReaderParts, RemoteId};
+
+    let id = MessageId::new("tentative@x");
+    let fixture = crate::imap::mime_fixtures::mixed_two_attachments(id.as_str());
+    let pdf = &super::parts_from_raw(&fixture.raw).mime_parts[0];
+    for (delta, listed_name, mime_available) in [
+        (-3, "report.pdf", true),
+        (3, "report.pdf", true),
+        (3, "other.pdf", true),
+        (3, "report.pdf", false),
+    ] {
+        let reported = pdf.encoded_size.checked_add_signed(delta).unwrap();
+        let structure = |size| {
+            format!(
+                concat!(
+                    "((\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 19 1 NIL NIL)",
+                    "(\"APPLICATION\" \"PDF\" NIL NIL NIL \"BASE64\" {} NIL ",
+                    "(\"ATTACHMENT\" (\"FILENAME\" \"{}\"))) \"MIXED\")"
+                ),
+                size, listed_name
+            )
+        };
+        let contents = super::structure::parse(&structure(reported), std::iter::empty()).unwrap();
+        let mut state = inbox_state(vec![(1, fixture.raw.clone())]);
+        let server_size = if mime_available {
+            reported
+        } else {
+            state.mailboxes[0].messages[0].body_form = BodyForm::Absent;
+            pdf.encoded_size
+        };
+        let server = TestServer::spawn_parallel(state, [(1, structure(server_size))].into());
+        let acct = account("a1", BackendKind::Imap);
+        let backend = ImapBackend {
+            account_id: acct.id.clone(),
+            config: config(server.addr.port()),
+            smtp: unused_smtp(),
+        };
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&acct).unwrap();
+        let mut message = super::to_message(&acct.id, "INBOX", "INBOX", 20, 1, &[], &fixture.raw);
+        message.parts = None;
+        message.body_text = None;
+        message.snippet.clear();
+        let copy = message.remote_id.clone();
+        assert_eq!(copy, RemoteId("imap:20:1:INBOX".into()));
+        store
+            .apply_delta(
+                &acct.id,
+                &crate::MailboxDelta {
+                    messages: vec![message],
+                    too_large: vec![id.clone()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .store_structures(&acct.id, &[(id.clone(), copy, contents)])
+            .unwrap();
+        assert_eq!(
+            store
+                .body_states(&acct.id, std::slice::from_ref(&id))
+                .unwrap(),
+            [BodyState::TooLarge]
+        );
+        assert_eq!(
+            store.reader_parts(&acct.id, id.as_str()).unwrap(),
+            ReaderParts::Listed { html: false }
+        );
+        let request = store.part_request(&acct.id, &id, "2").unwrap().unwrap();
+        assert!(!request.decoded_size_known);
+        let scratch = tempfile::tempdir().unwrap();
+        let cache = crate::parts::PartCache::open(scratch.path().join("parts"), 64 * 1024).unwrap();
+        // An underestimate ending on a full window used to stop the read
+        // at exactly the advertised size, before the last few bytes.
+        super::part_fetch::set_window(reported as usize);
+        if delta < 0 {
+            let truncated = backend
+                .fetch_part(&request.copies[0], "2", reported, &mut |_| {
+                    std::ops::ControlFlow::Continue(())
+                })
+                .unwrap()
+                .unwrap();
+            assert_eq!(truncated.len() as u64, reported);
+            assert!(truncated.len() as u64 != pdf.encoded_size);
+            server.state.lock().unwrap().commands.clear();
+        }
+        let fetched = crate::parts::fetch_part(&backend, &cache, &store, &request, &mut |_| {});
+        super::part_fetch::set_window(2 * 1024 * 1024);
+        let commands = commands(&server);
+        assert!(
+            commands
+                .iter()
+                .any(|line| line.contains("BODY.PEEK[2.MIME]"))
+        );
+        let rechecks = commands
+            .iter()
+            .filter(|line| line.contains("BODYSTRUCTURE"))
+            .count();
+        if listed_name == "report.pdf" {
+            let cached = fetched.unwrap();
+            assert_eq!(std::fs::read(cached.path).unwrap(), fixture.bytes[0].1);
+            assert_eq!(rechecks, usize::from(!mime_available));
+            server.state.lock().unwrap().commands.clear();
+            crate::parts::fetch_part(&backend, &cache, &store, &request, &mut |_| {}).unwrap();
+            assert!(server.state.lock().unwrap().commands.is_empty());
+        } else {
+            assert!(
+                fetched
+                    .unwrap_err()
+                    .to_string()
+                    .contains("could not be verified")
+            );
+            assert_eq!(rechecks, 1);
+            assert!(cache.lookup(&request).is_none());
+        }
+        assert_read_only(&server);
+    }
 }
 
 /// Sync `fixture` from a server that honours `<offset.len>` or ignores it,

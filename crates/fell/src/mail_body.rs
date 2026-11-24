@@ -20,7 +20,6 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Weak};
-use std::time::{Duration, Instant};
 
 use fell_core::{AccountId, PartStamp, Store};
 use fell_render::{FoldedDocument, MailHeaders, fold_history, prepare};
@@ -285,11 +284,22 @@ pub struct BodyReads {
 /// Prepare small expanded bodies above the last message here so they
 /// arrive in place. The window resolves the rest against its live cache
 /// and starts any remaining loads for the revisions returned here.
-pub fn read_bodies(
+#[cfg(test)]
+fn read_bodies(
     store: &Store,
     account: &AccountId,
     messages: &mut [ConvMessage],
     cached: &HashMap<String, PartStamp>,
+) -> BodyReads {
+    read_bodies_with_latest(store, account, messages, cached, false)
+}
+
+pub fn read_bodies_with_latest(
+    store: &Store,
+    account: &AccountId,
+    messages: &mut [ConvMessage],
+    cached: &HashMap<String, PartStamp>,
+    prepare_latest: bool,
 ) -> BodyReads {
     let mut reads = BodyReads::default();
     let ids: Vec<&str> = messages.iter().map(|message| message.id.as_str()).collect();
@@ -310,7 +320,7 @@ pub fn read_bodies(
                 message.rich = Rich::Pending;
                 reads.stamps.insert(message.id.clone(), kinds.stamp);
                 if message.expanded
-                    && index < last
+                    && (index < last || prepare_latest)
                     && kinds.html_bytes <= budget
                     && cached.get(&message.id) != Some(&kinds.stamp)
                 {
@@ -459,52 +469,6 @@ impl BodyLoads {
 
     pub fn is_wanted(&self, id: &str, load: BodyLoad) -> bool {
         self.wanted.get(id) == Some(&load.stamp)
-    }
-}
-
-/// How long after a failed ask (sync not started, no connection) a body
-/// is asked for again.
-pub const ASK_AGAIN_AFTER: Duration = Duration::from_secs(30);
-
-/// Which messages' parts were asked of sync. Only a real answer (parts, or
-/// that the server has none) is final; a failed ask is retried, so a
-/// startup or transport error does not leave a message on plain text for
-/// the rest of the session.
-#[derive(Default)]
-pub struct BodyAsks {
-    asks: HashMap<String, Ask>,
-}
-
-enum Ask {
-    Waiting,
-    Answered,
-    Failed(Instant),
-}
-
-impl BodyAsks {
-    pub fn should_ask(&self, id: &str, now: Instant) -> bool {
-        match self.asks.get(id) {
-            None => true,
-            Some(Ask::Failed(at)) => now.duration_since(*at) >= ASK_AGAIN_AFTER,
-            Some(Ask::Waiting | Ask::Answered) => false,
-        }
-    }
-
-    pub fn asking(&mut self, id: &str) {
-        self.asks.insert(id.to_string(), Ask::Waiting);
-    }
-
-    pub fn answered(&mut self, id: &str) {
-        self.asks.insert(id.to_string(), Ask::Answered);
-    }
-
-    pub fn failed(&mut self, id: &str, at: Instant) {
-        self.asks.insert(id.to_string(), Ask::Failed(at));
-    }
-
-    /// Ask the failed ones again now.
-    pub fn retry_failed(&mut self) {
-        self.asks.retain(|_, ask| !matches!(ask, Ask::Failed(_)));
     }
 }
 
@@ -1152,25 +1116,6 @@ mod tests {
         for id in ["m1@fell.test", "m2@fell.test", "last@fell.test"] {
             assert!(loads.begin(id).is_some());
         }
-    }
-
-    #[test]
-    fn a_failed_ask_is_asked_again_and_an_answer_is_final() {
-        let now = Instant::now();
-        let mut asks = BodyAsks::default();
-        assert!(asks.should_ask("a", now));
-        asks.asking("a");
-        assert!(!asks.should_ask("a", now), "one ask at a time");
-        asks.failed("a", now);
-        assert!(!asks.should_ask("a", now + Duration::from_secs(1)));
-        assert!(asks.should_ask("a", now + ASK_AGAIN_AFTER));
-        asks.failed("a", now);
-        asks.retry_failed();
-        assert!(asks.should_ask("a", now), "sync came back");
-        asks.answered("a");
-        assert!(!asks.should_ask("a", now + ASK_AGAIN_AFTER * 10));
-        asks.retry_failed();
-        assert!(!asks.should_ask("a", now));
     }
 
     #[test]

@@ -601,7 +601,7 @@ impl AccountConfig {
         store.import_server_draft(&copy, &draft, message_id.as_deref())
     }
 
-    fn imap_config(&self) -> Result<ImapConfig> {
+    pub(crate) fn imap_config(&self) -> Result<ImapConfig> {
         Ok(self.imap_config_with_password(self.resolve_password()?))
     }
 

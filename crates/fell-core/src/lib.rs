@@ -53,7 +53,7 @@ pub use embed::{
     LocalHashV1, embed_body,
 };
 pub use folders::{FolderRole, FolderRoles, RoleFolder, RoleSource};
-pub use imap::{ImapConfig, ImapSecurity, InboxWait};
+pub use imap::{CancelBodyFetch, ImapConfig, ImapSecurity, InboxWait};
 pub use message::{
     Address, BodyState, Disposition, Message, MessageHeaders, MessageId, MessageParts, MimePart,
     PartRole, RemoteId, TransferEncoding,
@@ -72,12 +72,13 @@ pub use smtp::SmtpConfig;
 pub use store::PendingFlags;
 pub use store::{
     CidRepairBatch, CidRepairProgress, FolderPage, FolderSpan, FolderThread, ListFilter, ListKey,
-    ListSource, PartKinds, PartStamp, Participant, SearchPage, Store, SyncedDraftPreview,
-    ThreadList, ThreadSummary, folder_aliases,
+    ListSource, PartKinds, PartStamp, Participant, ReaderParts, SearchPage, Store,
+    SyncedDraftPreview, ThreadList, ThreadSummary, folder_aliases,
 };
 pub use sync::{
-    InboxArrival, ReplyToBackfill, ReplyToProgress, SyncReport, fetch_message_bodies,
-    fetch_message_body, fetch_missing_bodies, sync_once, sync_with_arrivals, sync_with_progress,
+    InboxArrival, ReaderBodyFetcher, ReplyToBackfill, ReplyToProgress, SyncReport,
+    fetch_message_bodies, fetch_message_body, fetch_missing_bodies, sync_once, sync_with_arrivals,
+    sync_with_progress,
 };
 pub use threading::{ThreadId, header_parent_thread_id, resolve_thread_id};
 

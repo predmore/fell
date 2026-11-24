@@ -677,7 +677,7 @@ fn walk_children(
     }
 }
 
-fn section(prefix: &str, number: usize) -> String {
+pub(super) fn section(prefix: &str, number: usize) -> String {
     if prefix.is_empty() {
         number.to_string()
     } else {
@@ -775,8 +775,35 @@ fn mime_type(part: &mail_parser::MessagePart<'_>) -> String {
     })
 }
 
+/// Verify the descriptor independently of BODYSTRUCTURE's size estimate.
+pub(super) fn part_header_matches(raw: &[u8], expected: &MimePart) -> Option<bool> {
+    let parsed = MessageParser::new().parse(raw)?;
+    let part = parsed.root_part();
+    part.content_type()?.subtype()?;
+    let encoding = match part
+        .content_transfer_encoding()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "base64" => TransferEncoding::Base64,
+        "quoted-printable" => TransferEncoding::QuotedPrintable,
+        _ => TransferEncoding::Identity,
+    };
+    let content_id = part
+        .content_id()
+        .and_then(|id| clean_name(id.trim().trim_matches(['<', '>'])));
+    Some(
+        mime_type(&part) == expected.mime_type
+            && part.attachment_name().and_then(clean_name) == expected.filename
+            && content_id == expected.content_id
+            && encoding == expected.encoding,
+    )
+}
+
 /// One line, no control or bidi-override characters, at most 255 bytes.
-fn clean_name(raw: &str) -> Option<String> {
+pub(super) fn clean_name(raw: &str) -> Option<String> {
     let cleaned: String = raw
         .chars()
         .map(|ch| if ch.is_control() { ' ' } else { ch })
@@ -994,7 +1021,7 @@ fn collapse_snippet(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn snippet(text: &str) -> String {
+pub(crate) fn snippet(text: &str) -> String {
     cap_snippet(&collapse_snippet(text)).to_owned()
 }
 

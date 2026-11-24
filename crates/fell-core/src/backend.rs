@@ -270,6 +270,24 @@ pub trait MailBackend {
         Ok(None)
     }
 
+    /// Fetch a part whose wire size is provisional. Backends that can
+    /// independently verify its MIME metadata may accept a size mismatch.
+    fn fetch_provisional_part(
+        &self,
+        copy: &crate::RemoteId,
+        part: &crate::MimePart,
+        progress: &mut dyn FnMut(u64) -> std::ops::ControlFlow<()>,
+    ) -> Result<Option<Vec<u8>>> {
+        let raw = self.fetch_part(copy, &part.section, part.encoded_size, progress)?;
+        if raw
+            .as_ref()
+            .is_some_and(|raw| raw.len() as u64 != part.encoded_size)
+        {
+            return Err(crate::parts::unverified_part());
+        }
+        Ok(raw)
+    }
+
     /// Accept a draft for later send. Must not transmit.
     fn submit_draft(&self, draft: Draft) -> Result<PendingSend>;
 
@@ -376,6 +394,15 @@ impl MailBackend for BridgeBackend {
         crate::imap::fetch_part(&self.imap, copy, section, encoded_size, progress)
     }
 
+    fn fetch_provisional_part(
+        &self,
+        copy: &crate::RemoteId,
+        part: &crate::MimePart,
+        progress: &mut dyn FnMut(u64) -> std::ops::ControlFlow<()>,
+    ) -> Result<Option<Vec<u8>>> {
+        crate::imap::fetch_provisional_part(&self.imap, copy, part, progress)
+    }
+
     fn submit_draft(&self, draft: Draft) -> Result<PendingSend> {
         Ok(PendingSend::new("bridge", draft))
     }
@@ -456,6 +483,15 @@ impl MailBackend for ImapBackend {
         progress: &mut dyn FnMut(u64) -> std::ops::ControlFlow<()>,
     ) -> Result<Option<Vec<u8>>> {
         crate::imap::fetch_part(&self.config, copy, section, encoded_size, progress)
+    }
+
+    fn fetch_provisional_part(
+        &self,
+        copy: &crate::RemoteId,
+        part: &crate::MimePart,
+        progress: &mut dyn FnMut(u64) -> std::ops::ControlFlow<()>,
+    ) -> Result<Option<Vec<u8>>> {
+        crate::imap::fetch_provisional_part(&self.config, copy, part, progress)
     }
 
     fn submit_draft(&self, draft: Draft) -> Result<PendingSend> {

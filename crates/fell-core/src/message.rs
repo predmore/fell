@@ -153,6 +153,19 @@ pub struct MimePart {
 }
 
 impl MimePart {
+    /// Estimated decoded size for BODYSTRUCTURE, which reports the wire
+    /// size. MIME base64 normally wraps at 76 columns with CRLF.
+    pub fn estimated_decoded_size(&self) -> u64 {
+        match self.encoding {
+            TransferEncoding::Base64 => {
+                let encoded = self.encoded_size;
+                let unfolded = encoded - encoded / 78 * 2;
+                unfolded - unfolded.div_ceil(4)
+            }
+            TransferEncoding::Identity | TransferEncoding::QuotedPrintable => self.encoded_size,
+        }
+    }
+
     pub(crate) fn cid_image_id(&self) -> Option<&str> {
         self.content_id.as_deref().filter(|_| {
             self.mime_type.starts_with("image/") && self.disposition != Disposition::Attachment

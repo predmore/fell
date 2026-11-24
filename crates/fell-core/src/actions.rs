@@ -130,6 +130,7 @@ CREATE TABLE IF NOT EXISTS local_action_bodies (
     plain BLOB,
     bulk_headers TEXT NOT NULL DEFAULT '',
     parts_listed INTEGER NOT NULL DEFAULT 0,
+    structure_copy TEXT,
     withheld INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (action_id, message_id),
     FOREIGN KEY(action_id) REFERENCES local_actions(id)
@@ -1128,6 +1129,9 @@ pub(crate) fn ensure_action_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(ACTION_SCHEMA)?;
     conn.execute_batch(flags::FLAG_SCHEMA)?;
     ensure_snapshot_columns(conn)?;
+    if !crate::store::bodies::has_column(conn, "local_action_bodies", "structure_copy")? {
+        conn.execute_batch("ALTER TABLE local_action_bodies ADD COLUMN structure_copy TEXT")?;
+    }
     for column in ["parts_listed", "withheld"] {
         if !crate::store::bodies::has_column(conn, "local_action_bodies", column)? {
             conn.execute_batch(&format!(
@@ -1515,8 +1519,8 @@ fn restore_bodies(
     }
     conn.execute(
         "INSERT INTO message_bodies
-            (account_id, message_id, codec, html, plain, bulk_headers, parts_listed, withheld)
-         SELECT ?1, message_id, codec, html, plain, bulk_headers, parts_listed, withheld
+            (account_id, message_id, codec, html, plain, bulk_headers, parts_listed, withheld, structure_copy)
+         SELECT ?1, message_id, codec, html, plain, bulk_headers, parts_listed, withheld, structure_copy
          FROM local_action_bodies
          WHERE action_id = ?3 AND message_id = ?2",
         params![account_id.as_str(), message_id, action_id],
@@ -2152,8 +2156,8 @@ fn insert_snapshot(
         // them for undo as stored.
         conn.execute(
             "INSERT INTO local_action_bodies
-                (action_id, message_id, codec, html, plain, bulk_headers, parts_listed, withheld)
-             SELECT ?1, message_id, codec, html, plain, bulk_headers, parts_listed, withheld
+                (action_id, message_id, codec, html, plain, bulk_headers, parts_listed, withheld, structure_copy)
+             SELECT ?1, message_id, codec, html, plain, bulk_headers, parts_listed, withheld, structure_copy
              FROM message_bodies
              WHERE account_id = ?2 AND message_id = ?3",
             params![action_id, account_id.as_str(), plan.before.message_id],
@@ -4448,6 +4452,38 @@ mod tests {
         store.undo(&account("a1")).unwrap();
         assert_eq!(files_of(&store, "note@x"), Some(vec!["scan.pdf".into()]));
         assert_eq!(names(&store), (true, vec!["scan.pdf".to_string()]));
+    }
+
+    #[test]
+    fn undo_of_expunge_restores_the_provisional_attachment_source() {
+        let store = open(&[("a1", "a@x")]);
+        let account = account("a1");
+        let mut note = sample("a1", "note@x", "Note", "");
+        note.remote_id = crate::RemoteId("imap:7:1:Trash".into());
+        note.folders = vec![FOLDER_TRASH.into()];
+        let id = note.headers.message_id.clone();
+        let thread = store.upsert_message(&note).unwrap();
+        let parts = with_file("body", "route.pdf").mime_parts;
+        let section = parts[0].section.clone();
+        store
+            .store_structures(
+                &account,
+                &[(
+                    id.clone(),
+                    note.remote_id.clone(),
+                    crate::imap::BodyStructure { html: true, parts },
+                )],
+            )
+            .unwrap();
+        expunge(&store, &thread);
+        store.undo(&account).unwrap();
+
+        let request = store
+            .part_request(&account, &id, &section)
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.copies, [note.remote_id]);
+        assert!(!request.decoded_size_known);
     }
 
     #[test]

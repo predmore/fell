@@ -81,6 +81,8 @@ struct Kept {
     unread_change: Option<UnreadChange>,
     /// The star fading in (`starred`) or out.
     star: Option<Transition>,
+    attached: Option<bool>,
+    attachment: Option<Transition>,
     labels: Option<Vec<String>>,
     previous_labels: Option<(Vec<String>, Transition)>,
 }
@@ -102,6 +104,7 @@ impl Kept {
         self.unread_change
             .is_some_and(|change| change.fade.running(now))
             || self.star.is_some_and(|t| t.running(now))
+            || self.attachment.is_some_and(|t| t.running(now))
             || self
                 .previous_labels
                 .as_ref()
@@ -171,6 +174,8 @@ impl RowWidths {
                         starred,
                         unread_change: None,
                         star: None,
+                        attached: None,
+                        attachment: None,
                         labels: None,
                         previous_labels: None,
                     },
@@ -239,11 +244,32 @@ impl RowWidths {
             .map(|(labels, t)| (labels.clone(), t.progress(now)))
     }
 
+    pub fn observe_attachment(&mut self, id: &str, attached: bool, now: Instant) {
+        if let Some(row) = self.rows.get_mut(id) {
+            let previous = row.attached.replace(attached);
+            if previous == Some(false) && attached {
+                row.attachment = self.motion.start(motion::FADE, now);
+            } else if !attached {
+                row.attachment = None;
+            }
+        }
+    }
+
+    pub fn attachment_alpha(&mut self, id: &str, attached: bool, now: Instant, drawn: bool) -> f32 {
+        if drawn {
+            self.observe_attachment(id, attached, now);
+        }
+        self.rows
+            .get(id)
+            .map_or(1.0, |row| motion::progress(row.attachment.as_ref(), now))
+    }
+
     /// A key arrived: finish running transitions before acting on it.
     pub fn settle(&mut self) {
         for kept in self.rows.values_mut() {
             kept.unread_change = None;
             kept.star = None;
+            kept.attachment = None;
             kept.previous_labels = None;
         }
     }

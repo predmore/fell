@@ -142,6 +142,10 @@ impl Render for CachedPreview {
 }
 
 impl SearchView {
+    pub(super) fn invalidate_row_previews(&mut self) {
+        self.rows_previews = self.rows_previews.wrapping_add(1);
+    }
+
     fn correspondent_rows_current(&self, shown: u64) -> bool {
         self.correspondent_menu.is_open()
             && !self.completion_pending

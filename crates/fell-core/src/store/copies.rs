@@ -287,6 +287,8 @@ pub(super) fn stored_uids(
                              SELECT 1 FROM message_bodies b
                              WHERE b.account_id = m.account_id
                                AND b.message_id = m.message_id
+                               AND (b.parts_listed NOT IN (2, 3) OR b.withheld = 1
+                                    OR b.html IS NOT NULL OR b.plain IS NOT NULL)
                          )
                      )
                )

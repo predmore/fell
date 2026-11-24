@@ -44,7 +44,6 @@ pub enum Request {
 pub struct Download {
     pub fetched: u64,
     pub total: u64,
-    pub started: std::time::Instant,
 }
 
 impl Download {

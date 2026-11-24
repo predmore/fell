@@ -439,6 +439,7 @@ pub struct ThreadSummary {
     pub unread: bool,
 }
 
+pub use bodies::ReaderParts;
 pub use bodies::cid_upgrade::{CidRepairBatch, CidRepairProgress};
 
 impl Store {
@@ -531,6 +532,17 @@ impl Store {
         work();
         tx.commit()?;
         Ok(())
+    }
+
+    /// Read related mailbox rows from one WAL snapshot.
+    pub fn read_snapshot<T>(&self, read: impl FnOnce() -> Result<T>) -> Result<T> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Deferred,
+        )?;
+        let result = read()?;
+        tx.commit()?;
+        Ok(result)
     }
 
     pub fn db_path(&self) -> Option<&Path> {
@@ -990,7 +1002,9 @@ impl Store {
     ) -> Result<Vec<crate::BodyState>> {
         messages
             .iter()
-            .map(|id| bodies::state(&self.conn, account_id, id.as_str()))
+            .map(|id| {
+                bodies::reader_states(&self.conn, account_id, id.as_str()).map(|states| states.0)
+            })
             .collect()
     }
 
@@ -1270,8 +1284,8 @@ impl Store {
     }
 
     /// What [`crate::parts::fetch_part`] needs to fetch one part: the part
-    /// and the message's server copies. `None` when the message, the part,
-    /// or any server copy is missing.
+    /// and the verified server copies. With no verified copy, a listed
+    /// part can still use a cache hit. `None` when the message or part is gone.
     pub fn part_request(
         &self,
         account_id: &AccountId,
@@ -1285,7 +1299,7 @@ impl Store {
     }
 
     /// A [`crate::parts::PartRequest`] for every listed part of one message,
-    /// in document order. Empty when none are listed or no copy is left.
+    /// in document order. A request with no verified copy is cache-only.
     pub fn part_requests(
         &self,
         account_id: &AccountId,
@@ -1297,10 +1311,7 @@ impl Store {
         let Some(list) = bodies::list(&self.conn, account_id, &canonical)? else {
             return Ok(Vec::new());
         };
-        let copies = bodies::copies_of(&self.conn, account_id, &canonical)?;
-        if copies.is_empty() {
-            return Ok(Vec::new());
-        }
+        let (copies, decoded_size_known) = bodies::part_copies(&self.conn, account_id, &canonical)?;
         Ok(list
             .into_iter()
             .map(|part| crate::parts::PartRequest {
@@ -1308,6 +1319,7 @@ impl Store {
                 message_id: MessageId(canonical.clone()),
                 part,
                 copies: copies.clone(),
+                decoded_size_known,
             })
             .collect())
     }
@@ -1338,6 +1350,39 @@ impl Store {
         bodies::repair_html_snippets(&self.conn)
     }
 
+    /// Whether the conversation needs to check or download a message's parts.
+    /// `message_id` is canonical, as returned by [`Self::thread_messages`].
+    pub fn reader_parts(&self, account: &AccountId, message_id: &str) -> Result<ReaderParts> {
+        bodies::reader_states(&self.conn, account, message_id).map(|states| states.1)
+    }
+
+    /// Body and MIME-list states by canonical message id. Reads the whole
+    /// thread together without loading the compressed body parts.
+    pub fn thread_reader_states(
+        &self,
+        account: &AccountId,
+        thread: &ThreadId,
+    ) -> Result<HashMap<String, (crate::BodyState, ReaderParts)>> {
+        bodies::thread_reader_states(&self.conn, account, thread)
+    }
+
+    pub(crate) fn store_structures(
+        &self,
+        account: &AccountId,
+        fetched: &[(MessageId, RemoteId, crate::imap::BodyStructure)],
+    ) -> Result<()> {
+        let tx = immediate_transaction(&self.conn)?;
+        for (id, copy, structure) in fetched {
+            if let Some(id) = canonical_id_on(&tx, account, id)?
+                && bodies::write_structure(&tx, account, &id, copy, structure)?
+            {
+                set_attachments_from_list(&tx, account, &id, &structure.parts)?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// The server copies to fetch for one message with no stored body part
     /// or no part list, including one an earlier backfill could not fetch.
     /// `None` when it has both already, or no copy to fetch.
@@ -1349,9 +1394,16 @@ impl Store {
         let Some(canonical) = self.canonical_id(account_id, message_id)? else {
             return Ok(None);
         };
-        if bodies::read(&self.conn, account_id, &canonical)?
-            .is_some_and(|parts| parts.html.is_some() || parts.plain.is_some())
-            && bodies::parts_listed(&self.conn, account_id, &canonical)?
+        if self
+            .conn
+            .prepare_cached(
+                "SELECT EXISTS (SELECT 1 FROM message_bodies
+                            WHERE account_id = ?1 AND message_id = ?2 AND parts_listed = 1
+                              AND (html IS NOT NULL OR plain IS NOT NULL))",
+            )?
+            .query_row(params![account_id.as_str(), canonical], |row| {
+                row.get::<_, bool>(0)
+            })?
         {
             return Ok(None);
         }
@@ -1470,6 +1522,18 @@ impl Store {
         account_id: &AccountId,
         fetched: &[(MessageId, Option<crate::MessageParts>)],
     ) -> Result<usize> {
+        self.store_fetched_parts_with(account_id, fetched, false)
+    }
+
+    pub(crate) fn store_fetched_parts_with(
+        &self,
+        account_id: &AccountId,
+        fetched: &[(MessageId, Option<crate::MessageParts>)],
+        foreground: bool,
+    ) -> Result<usize> {
+        if fetched.is_empty() {
+            return Ok(0);
+        }
         // Deflate and render before the write lock: archive and mark-read wait on it.
         let compressed: Vec<_> = fetched
             .iter()
@@ -1479,7 +1543,31 @@ impl Store {
                     .map(bodies::StoredParts::new)
                     .unwrap_or_default();
                 let full_snippet = parts.as_ref().and_then(crate::imap::html_only_snippet_text);
-                (message_id, stored, full_snippet)
+                let plain = parts.as_ref().and_then(|parts| parts.plain.as_deref());
+                let body = plain
+                    .map(Cow::Borrowed)
+                    .or_else(|| {
+                        if !foreground {
+                            return None;
+                        }
+                        let html = parts.as_ref()?.html.as_deref()?;
+                        Some(Cow::Owned(mail_parser::decoders::html::html_to_text(html)))
+                    })
+                    .filter(|body| !body.trim().is_empty());
+                let text = body.map(|body| {
+                    let snippet = plain
+                        .map(crate::imap::plain_snippet)
+                        .or_else(|| {
+                            full_snippet
+                                .as_deref()
+                                .map(crate::imap::cap_snippet)
+                                .map(str::to_owned)
+                        })
+                        .unwrap_or_default();
+                    let fingerprint = fingerprint_of(Some(&body));
+                    (body, snippet, fingerprint)
+                });
+                (message_id, stored, full_snippet, text)
             })
             .collect();
         // A CID-only answer can require inspecting the kept HTML again.
@@ -1490,7 +1578,7 @@ impl Store {
         )?;
         let repairs = compressed
             .iter()
-            .map(|(id, parts, _)| {
+            .map(|(id, parts, ..)| {
                 let Some(canonical) = canonical_id_on(&read, account_id, id)? else {
                     return Ok(None);
                 };
@@ -1503,11 +1591,14 @@ impl Store {
             })
             .collect::<Result<Vec<_>>>()?;
         read.commit()?;
-        let tx = self
-            .lock_wait
-            .behind_waiting_writes(|| immediate_transaction(&self.conn))?;
+        let tx = if foreground {
+            immediate_transaction(&self.conn)?
+        } else {
+            self.lock_wait
+                .behind_waiting_writes(|| immediate_transaction(&self.conn))?
+        };
         let mut filled = 0;
-        for ((message_id, parts, full_snippet), repair) in compressed.iter().zip(repairs) {
+        for ((message_id, parts, full_snippet, text), repair) in compressed.iter().zip(repairs) {
             let Some(canonical) = canonical_id_on(&tx, account_id, message_id)? else {
                 continue;
             };
@@ -1518,7 +1609,19 @@ impl Store {
                 filled += 1;
             }
             let listed = bodies::write(&tx, account_id, &canonical, parts, bodies::Write::FillGap)?;
-            if let Some(full_snippet) = full_snippet {
+            if let Some((body, snippet, fingerprint)) = text {
+                fill_fetched_body_text(
+                    &tx,
+                    account_id,
+                    &canonical,
+                    parts,
+                    body,
+                    snippet,
+                    fingerprint,
+                )?;
+            }
+            if !foreground && let Some(full_snippet) = full_snippet {
+                // Retain the legacy spacing repair on the background lane.
                 bodies::fill_fetched_html_snippet(
                     &tx,
                     account_id,
@@ -2016,6 +2119,55 @@ impl Store {
     ) -> Result<Option<ListKey>> {
         summaries::folder_key_of(&self.conn, account_id, folder, thread)
     }
+}
+
+fn fill_fetched_body_text(
+    conn: &Connection,
+    account: &AccountId,
+    canonical: &str,
+    parts: &bodies::StoredParts,
+    body: &str,
+    snippet: &str,
+    fingerprint: &str,
+) -> Result<()> {
+    let Some(row) = arrival_without_body(conn, account.as_str(), canonical)? else {
+        return Ok(());
+    };
+    // FillGap can keep the text from a different copy. Index only the text
+    // that the store actually accepted.
+    if !parts.matches_search_body(conn, account, canonical)? {
+        return Ok(());
+    }
+    let old = terms_for_indexed(row.indexed_text(&row.snippet));
+    let new = terms_for_indexed(row.indexed_text(body));
+    conn.prepare_cached(
+        "UPDATE messages SET body_text = ?3, body_fingerprint = ?4,
+         snippet = CASE WHEN snippet = '' THEN ?5 ELSE snippet END
+         WHERE account_id = ?1 AND message_id = ?2",
+    )?
+    .execute(params![
+        account.as_str(),
+        canonical,
+        body,
+        fingerprint,
+        snippet
+    ])?;
+    sync_terms(conn, account.as_str(), &old, &new)?;
+    invalidate_message_embedding(conn, account.as_str(), canonical, body)
+}
+
+fn arrival_without_body(
+    conn: &Connection,
+    account: &str,
+    message: &str,
+) -> Result<Option<Arrival>> {
+    Ok(conn
+        .prepare_cached(&format!(
+            "SELECT {ARRIVAL_COLS} FROM messages m
+             WHERE m.account_id = ?1 AND m.message_id = ?2 AND typeof(m.body_text) = 'null'"
+        ))?
+        .query_row(params![account, message], map_arrival)
+        .optional()?)
 }
 
 #[cfg(test)]
@@ -3117,17 +3269,7 @@ fn write_kept(
     } else {
         message.remote_id.0.clone()
     };
-    let old_terms = terms_for_indexed(IndexedText {
-        subject: &stored.subject,
-        from_name: stored.from_name.as_deref(),
-        from_email: &stored.from_email,
-        body: &stored.body,
-        to_line: &stored.to_line,
-        cc_line: &stored.cc_line,
-        bcc_line: &stored.bcc_line,
-        folders: &stored.folders,
-        labels: &stored.labels,
-    });
+    let old_terms = terms_for_indexed(stored.indexed_text(&stored.body));
     let indexed = body_text.as_deref().unwrap_or(&snippet);
     let new_terms = terms_for_indexed(IndexedText {
         subject: &subject,
@@ -3239,6 +3381,22 @@ struct Arrival {
     list_id: Option<String>,
     reply_to_line: String,
     attachment_names: String,
+}
+
+impl Arrival {
+    fn indexed_text<'a>(&'a self, body: &'a str) -> IndexedText<'a> {
+        IndexedText {
+            subject: &self.subject,
+            from_name: self.from_name.as_deref(),
+            from_email: &self.from_email,
+            body,
+            to_line: &self.to_line,
+            cc_line: &self.cc_line,
+            bcc_line: &self.bcc_line,
+            folders: &self.folders,
+            labels: &self.labels,
+        }
+    }
 }
 
 const ARRIVAL_COLS: &str = "m.message_id, m.remote_id, m.proton_conversation_id, m.in_reply_to,
@@ -4790,6 +4948,164 @@ mod tests {
             display_name: "Caleb".into(),
             email: "c@x".into(),
             backend_kind: BackendKind::Bridge,
+        }
+    }
+
+    #[test]
+    fn reader_fetched_text_indexes_header_rows_with_snippets() {
+        let store = Store::open_in_memory().unwrap();
+        let account = account();
+        store.upsert_account(&account).unwrap();
+        let cases = [
+            (
+                "text@x",
+                "periwinkle",
+                "Content-Type: text/plain\r\n\r\nThe text mentions periwinkle.",
+            ),
+            (
+                "html@x",
+                "chrysanthemum",
+                "Content-Type: text/html\r\n\r\n<p>A chrysanthemum.</p>",
+            ),
+            (
+                "multipart@x",
+                "nasturtium",
+                concat!(
+                    "Content-Type: multipart/alternative; boundary=b\r\n\r\n",
+                    "--b\r\nContent-Type: text/plain\r\n\r\nThe plain part names nasturtium.\r\n",
+                    "--b\r\nContent-Type: text/html\r\n\r\n<p>The HTML names geranium.</p>\r\n",
+                    "--b--\r\n",
+                ),
+            ),
+        ];
+        for (index, (id, term, mime)) in cases.into_iter().enumerate() {
+            let raw = format!(
+                "From: demo@example.test\r\nSubject: Garden\r\nMessage-ID: <{id}>\r\n{mime}"
+            );
+            let mut row = crate::imap::to_message(
+                &account.id,
+                "INBOX",
+                "INBOX",
+                7,
+                index as u32 + 1,
+                &[],
+                raw.as_bytes(),
+            );
+            let expected = row.body_text.take().unwrap();
+            let parts = row.parts.take();
+            row.snippet = "Initial preview".into();
+            store.upsert_message(&row).unwrap();
+            dequeue_message(&store.conn, account.id.as_str(), id).unwrap();
+            store
+                .conn
+                .execute(
+                    "INSERT INTO message_embeddings
+                    (account_id, message_id, model, model_version, dims, body_hash, vector)
+                 VALUES (?1, ?2, 'test', '1', 1, 'preview', x'00000000')",
+                    params![account.id.as_str(), id],
+                )
+                .unwrap();
+            let count = |sql: &str, key: &str| -> i64 {
+                store
+                    .conn
+                    .query_row(sql, params![account.id.as_str(), key], |row| row.get(0))
+                    .unwrap()
+            };
+            let term_count = "SELECT COALESCE((SELECT df FROM search_terms WHERE account_id = ?1 AND term = ?2), 0)";
+            assert_eq!(count(term_count, term), 0);
+            assert!(store.search(&account.id, term).unwrap().hits.is_empty());
+            store
+                .store_fetched_parts_with(&account.id, &[(MessageId::new(id), parts)], true)
+                .unwrap();
+            let shown = store
+                .message(&account.id, &MessageId::new(id))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                shown.body_text.as_deref().map(str::trim),
+                Some(expected.trim())
+            );
+            assert_eq!(shown.snippet, "Initial preview");
+            assert_eq!(count(term_count, term), 1);
+            assert_eq!(count(term_count, "initial"), 0);
+            assert_eq!(store.search(&account.id, term).unwrap().hits.len(), 1);
+            assert_eq!(
+                count(
+                    "SELECT count(*) FROM message_embeddings WHERE account_id = ?1 AND message_id = ?2",
+                    id
+                ),
+                0
+            );
+            assert_eq!(
+                count(
+                    "SELECT count(*) FROM embedding_queue WHERE account_id = ?1 AND message_id = ?2",
+                    id
+                ),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn html_backfill_then_reader_store_matches_sync_vocabulary() {
+        let account = account();
+        let sync = Store::open_in_memory().unwrap();
+        let reader = Store::open_in_memory().unwrap();
+        // The renderer separates the heading from the paragraph. The sync
+        // text has an adjoining word and also shares terms with the snippet.
+        let raw = concat!(
+            "From: demo@example.test\r\nSubject: Garden\r\nMessage-ID: <garden@x>\r\n",
+            "Content-Type: text/html\r\n\r\n<h1>Periwinkle</h1><p>Color is blue.</p>"
+        );
+        let full =
+            crate::imap::to_message(&account.id, "INBOX", "INBOX", 7, 1, &[], raw.as_bytes());
+        let mut header = full.clone();
+        header.parts = None;
+        header.body_text = None;
+        header.snippet.clear();
+        for store in [&sync, &reader] {
+            store.upsert_account(&account).unwrap();
+            let mut other = msg("other@x", None, None, "Flowers", "Periwinkle is purple.");
+            other.remote_id = RemoteId("imap:7:2:INBOX".into());
+            store.upsert_message(&other).unwrap();
+        }
+        sync.upsert_message(&full).unwrap();
+        reader.upsert_message(&header).unwrap();
+        let fetched = [(full.headers.message_id.clone(), full.parts.clone())];
+        reader.store_fetched_parts(&account.id, &fetched).unwrap();
+        let df = |term: &str| {
+            reader
+                .conn
+                .query_row(
+                    "SELECT df FROM search_terms WHERE account_id = ?1 AND term = ?2",
+                    params![account.id.as_str(), term],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(df("periwinkle"), 2, "both preview and body count");
+        assert_eq!(df("blue"), 1, "the backfill indexed the shared term");
+        reader
+            .store_fetched_parts_with(&account.id, &fetched, true)
+            .unwrap();
+        assert_eq!(df("periwinkle"), 1, "the other message still counts");
+        let rows = |store: &Store, sql: &str| {
+            store
+                .conn
+                .prepare(sql)
+                .unwrap()
+                .query_map([account.id.as_str()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        for sql in [
+            "SELECT term, CAST(df AS TEXT) FROM search_terms WHERE account_id = ?1 ORDER BY term",
+            "SELECT trigram, term FROM search_trigrams WHERE account_id = ?1 ORDER BY trigram, term",
+        ] {
+            assert_eq!(rows(&reader, sql), rows(&sync, sql));
         }
     }
 
@@ -9597,6 +9913,50 @@ mod tests {
                 bulk_headers: vec![("List-Id".into(), "<list.example>".into())],
             }
         );
+    }
+
+    #[test]
+    fn absorbing_a_copy_preserves_its_provisional_attachment_source() {
+        let store = Store::open_in_memory().unwrap();
+        let account = account();
+        store.upsert_account(&account).unwrap();
+        let mut source = msg("sent-source@x", None, None, "Route", "unchanged body");
+        source.remote_id = RemoteId("imap:7:1:Sent".into());
+        source.folders = vec!["Sent".into()];
+        let mut kept = msg(
+            "list-source@x",
+            None,
+            None,
+            "[test] Route",
+            "unchanged body",
+        );
+        kept.remote_id = RemoteId("imap:9:2:INBOX".into());
+        kept.folders = vec!["INBOX".into()];
+        store.upsert_message(&source).unwrap();
+        store.upsert_message(&kept).unwrap();
+        let fixture = crate::imap::mime_fixtures::mixed_two_attachments("sent-source@x");
+        let parts = crate::imap::parts_from_raw(&fixture.raw).mime_parts;
+        let section = parts[0].section.clone();
+        store
+            .store_structures(
+                &account.id,
+                &[(
+                    source.headers.message_id.clone(),
+                    source.remote_id.clone(),
+                    crate::imap::BodyStructure { html: true, parts },
+                )],
+            )
+            .unwrap();
+
+        kept.list_id = Some("test.example".into());
+        store.upsert_message(&kept).unwrap();
+        assert_eq!(listed(&store).len(), 1);
+        let request = store
+            .part_request(&account.id, &kept.headers.message_id, &section)
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.copies, [source.remote_id]);
+        assert!(!request.decoded_size_known);
     }
 
     #[test]

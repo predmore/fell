@@ -6,6 +6,7 @@
 //! arrived. Give `uidnext` when the highest UID goes, as a real server keeps
 //! UIDNEXT where it was.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -99,6 +100,8 @@ pub(super) struct TestState {
     pub part_ignores_window: bool,
 }
 
+type Structures = Option<Arc<HashMap<u32, String>>>;
+
 pub(super) struct TestServer {
     pub addr: std::net::SocketAddr,
     pub state: Arc<Mutex<TestState>>,
@@ -114,6 +117,16 @@ pub(super) struct TestServer {
 
 impl TestServer {
     pub(super) fn spawn(state: TestState) -> Self {
+        Self::spawn_with(state, None)
+    }
+
+    /// Serve multiple connections for tests that hold a sync command open
+    /// while another connection reads the mailbox.
+    pub(super) fn spawn_parallel(state: TestState, structures: HashMap<u32, String>) -> Self {
+        Self::spawn_with(state, Some(Arc::new(structures)))
+    }
+
+    fn spawn_with(state: TestState, structures: Structures) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("local addr");
         let state = Arc::new(Mutex::new(state));
@@ -134,6 +147,7 @@ impl TestServer {
                 thread_shutdown,
                 thread_sent,
                 thread_bodies,
+                structures,
             )
         });
         Self {
@@ -165,8 +179,10 @@ fn accept_loop(
     shutdown: Arc<AtomicBool>,
     sent: Arc<AtomicUsize>,
     body_responses: Arc<AtomicUsize>,
+    structures: Structures,
 ) {
     listener.set_nonblocking(false).expect("blocking");
+    let mut connections = Vec::new();
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
@@ -179,10 +195,33 @@ fn accept_loop(
                 // As long as the client's own timeout: a large fetch on a
                 // loaded machine can still be persisting when the reply ends.
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
-                handle(stream, &state, &writes, &sent, &body_responses);
+                if let Some(structures) = &structures {
+                    let (state, writes, sent, body_responses, structures) = (
+                        state.clone(),
+                        writes.clone(),
+                        sent.clone(),
+                        body_responses.clone(),
+                        structures.clone(),
+                    );
+                    connections.push(thread::spawn(move || {
+                        handle(
+                            stream,
+                            &state,
+                            &writes,
+                            &sent,
+                            &body_responses,
+                            Some(&structures),
+                        );
+                    }));
+                } else {
+                    handle(stream, &state, &writes, &sent, &body_responses, None);
+                }
             }
             Err(_) => break,
         }
+    }
+    for connection in connections {
+        let _ = connection.join();
     }
 }
 
@@ -210,6 +249,7 @@ fn handle(
     writes: &Arc<Mutex<WriteFixture>>,
     sent: &Arc<AtomicUsize>,
     body_responses: &AtomicUsize,
+    structures: Option<&HashMap<u32, String>>,
 ) {
     let mut write = Counted {
         stream: stream.try_clone().expect("clone"),
@@ -578,6 +618,22 @@ fn handle(
                     }
                     let seq = index + 1;
                     let upper_cmd = rest.to_ascii_uppercase();
+                    if let Some(structures) = structures
+                        && upper_cmd.contains("BODYSTRUCTURE")
+                        && let Some(structure) = structures.get(&message.uid)
+                    {
+                        let _ = write.write_all(
+                            format!(
+                                "* {seq} FETCH (BODYSTRUCTURE {structure} UID {})\r\n",
+                                message.uid
+                            )
+                            .as_bytes(),
+                        );
+                        if !upper_cmd.contains("BODY.PEEK") {
+                            continue;
+                        }
+                    }
+
                     let internal_date = if upper_cmd.contains("INTERNALDATE") {
                         header_value(&message.raw, "X-Test-Internal-Date")
                             .map_or_else(String::new, |date| format!(" INTERNALDATE \"{date}\""))
@@ -812,14 +868,15 @@ fn handle(
     }
 }
 
-/// `BODY.PEEK[<section>]<offset.len>` in a UID FETCH, for a numeric section.
+/// `BODY.PEEK[<section>]<offset.len>` for a part or its MIME headers.
 fn part_request(upper: &str) -> Option<(String, Option<(usize, usize)>)> {
     let start = upper.find("BODY.PEEK[")? + "BODY.PEEK[".len();
     let end = start + upper[start..].find(']')?;
     let section = &upper[start..end];
     let after = &upper[end + 1..];
+    let part = section.strip_suffix(".MIME").unwrap_or(section);
     if (section.is_empty() && !after.starts_with('<'))
-        || !section.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        || !part.bytes().all(|b| b.is_ascii_digit() || b == b'.')
     {
         return None;
     }
@@ -842,6 +899,14 @@ fn write_part(
 ) {
     let bytes = if section.is_empty() {
         Some(message.raw.clone())
+    } else if let Some(part) = section.strip_suffix(".MIME") {
+        section_entity(&message.raw, part)
+            .filter(|_| message.body_form != BodyForm::Absent)
+            .map(|entity| {
+                let mut mime = split_entity(entity).0.to_vec();
+                mime.extend_from_slice(b"\r\n");
+                mime
+            })
     } else {
         section_body(&message.raw, section)
     };
@@ -884,6 +949,10 @@ fn write_part(
 /// The body of IMAP part `section` of `raw`, found with a small MIME walk of
 /// its own (not the client's parser), so tests check the client's numbering.
 pub(super) fn section_body(raw: &[u8], section: &str) -> Option<Vec<u8>> {
+    Some(split_entity(section_entity(raw, section)?).1.to_vec())
+}
+
+fn section_entity<'a>(raw: &'a [u8], section: &str) -> Option<&'a [u8]> {
     let mut entity = raw;
     let mut top = true;
     for number in section.split('.') {
@@ -891,7 +960,7 @@ pub(super) fn section_body(raw: &[u8], section: &str) -> Option<Vec<u8>> {
         entity = *children(entity, top).get(number.checked_sub(1)?)?;
         top = false;
     }
-    Some(split_entity(entity).1.to_vec())
+    Some(entity)
 }
 
 /// What IMAP numbers `.1`, `.2`, … under `entity`. A whole message that is

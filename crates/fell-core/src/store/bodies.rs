@@ -23,14 +23,17 @@
 //! parts that need their source to be reclassified. New mail never joins
 //! the queue, so a mailbox that is caught up pays nothing per pass.
 
-use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::HashMap;
+
+use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::account::AccountId;
 use crate::imap::{SNIPPET_BYTES, cap_snippet, html_snippet_text};
 use crate::message::{
     Disposition, MessageId, MessageParts, MimePart, PartRole, RemoteId, TransferEncoding,
 };
-use crate::{Error, Result};
+use crate::search::{sync_terms, terms_for_indexed};
+use crate::{BodyState, Error, Result, ThreadId};
 
 pub(super) mod cid_upgrade;
 
@@ -44,8 +47,11 @@ CREATE TABLE IF NOT EXISTS message_bodies (
     plain BLOB,
     -- Bulk-mail headers: name US value, records joined by RS.
     bulk_headers TEXT NOT NULL DEFAULT '',
-    -- 1 once message_parts holds this message's part list (maybe none).
+    -- 0 unknown, 1 parsed from the message, 2/3 from BODYSTRUCTURE
+    -- (without/with HTML). A known list may be empty.
     parts_listed INTEGER NOT NULL DEFAULT 0,
+    -- Only this copy can serve sections from its provisional structure.
+    structure_copy TEXT,
     -- 1 when sync kept no body: the message is larger than it downloads.
     withheld INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (account_id, message_id)
@@ -133,6 +139,9 @@ pub(super) fn ensure_bodies(conn: &Connection) -> Result<()> {
         tx.execute_batch(
             "ALTER TABLE message_bodies ADD COLUMN parts_listed INTEGER NOT NULL DEFAULT 0",
         )?;
+    }
+    if !has_column(&tx, "message_bodies", "structure_copy")? {
+        tx.execute_batch("ALTER TABLE message_bodies ADD COLUMN structure_copy TEXT")?;
     }
     if !has_column(&tx, "message_bodies", "withheld")? {
         tx.execute_batch(
@@ -327,7 +336,7 @@ impl StoredParts {
         };
         for action_id in actions {
             conn.execute(
-                "UPDATE local_action_bodies SET parts_listed = 1
+                "UPDATE local_action_bodies SET parts_listed = 1, structure_copy = NULL
                  WHERE action_id = ?1 AND message_id = ?2",
                 params![action_id, message_id],
             )?;
@@ -434,19 +443,143 @@ fn part_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MimePart> {
     })
 }
 
-/// Whether `message_id` has its part list recorded.
+/// What the reader knows before it downloads the full message.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReaderParts {
+    #[default]
+    Ready,
+    Unknown,
+    Listed {
+        html: bool,
+    },
+    Unavailable {
+        html: bool,
+    },
+}
+
+// A complete list comes from a full source. Only other states need to
+// check whether there is still a server copy to read from.
+const READER_STATES_SQL: &str = "
+    SELECT m.message_id, typeof(m.body_text) = 'null' AND m.snippet = '',
+           b.parts_listed, typeof(b.html) != 'null', typeof(b.plain) != 'null',
+           b.withheld IS 1,
+           CASE WHEN b.parts_listed = 1 THEN 0 ELSE EXISTS (
+               SELECT 1 FROM message_copies c
+               WHERE c.account_id = m.account_id AND c.message_id = m.message_id
+           ) END,
+           CASE WHEN b.parts_listed IN (2, 3) THEN EXISTS (
+               SELECT 1 FROM message_copies c
+               WHERE c.account_id = m.account_id AND c.message_id = m.message_id
+                 AND b.structure_copy = 'imap:' || c.uidvalidity || ':' || c.uid || ':' || c.mailbox
+           ) ELSE 0 END
+    FROM messages m LEFT JOIN message_bodies b USING (account_id, message_id)
+    WHERE m.account_id = ?1";
+
+fn reader_states_from_row(row: &Row<'_>) -> rusqlite::Result<(BodyState, ReaderParts)> {
+    let no_preview: bool = row.get(1)?;
+    let code: Option<i64> = row.get(2)?;
+    let html: bool = row.get(3)?;
+    let plain: bool = row.get(4)?;
+    let withheld: bool = row.get(5)?;
+    let has_copy: bool = row.get(6)?;
+    let has_structure_copy: bool = row.get(7)?;
+    let provisional = matches!(code, Some(2 | 3));
+    let has_body = code.is_some() && (!provisional || html || plain);
+    let state = if no_preview && withheld {
+        BodyState::TooLarge
+    } else if no_preview && !has_body && has_copy {
+        BodyState::Pending
+    } else {
+        BodyState::Stored
+    };
+    let needs_html = code == Some(3) && !html;
+    let parts = match (code.unwrap_or(0), has_copy, has_structure_copy) {
+        (0, true, _) | (2 | 3, true, false) => ReaderParts::Unknown,
+        (2 | 3, true, true) => ReaderParts::Listed { html: needs_html },
+        (2 | 3, false, _) => ReaderParts::Unavailable { html: needs_html },
+        _ => ReaderParts::Ready,
+    };
+    Ok((state, parts))
+}
+
+pub(super) fn reader_states(
+    conn: &Connection,
+    account: &AccountId,
+    id: &str,
+) -> Result<(BodyState, ReaderParts)> {
+    let states = conn
+        .prepare_cached(&format!("{READER_STATES_SQL} AND m.message_id = ?2"))?
+        .query_row(params![account.as_str(), id], reader_states_from_row)
+        .optional()?;
+    Ok(states.unwrap_or((BodyState::Stored, ReaderParts::Ready)))
+}
+
+pub(super) fn thread_reader_states(
+    conn: &Connection,
+    account: &AccountId,
+    thread: &ThreadId,
+) -> Result<HashMap<String, (BodyState, ReaderParts)>> {
+    let mut stmt = conn.prepare_cached(&format!("{READER_STATES_SQL} AND m.thread_id = ?2"))?;
+    let states = stmt
+        .query_map(params![account.as_str(), thread.as_str()], |row| {
+            Ok((row.get(0)?, reader_states_from_row(row)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(states)
+}
+
+fn list_code(conn: &Connection, account_id: &AccountId, message_id: &str) -> Result<i64> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT parts_listed FROM message_bodies WHERE account_id = ?1 AND message_id = ?2",
+        )?
+        .query_row(params![account_id.as_str(), message_id], |row| row.get(0))
+        .optional()?
+        .unwrap_or(0))
+}
+
+/// Whether the part list was parsed from the full source.
 pub(crate) fn parts_listed(
     conn: &Connection,
     account_id: &AccountId,
     message_id: &str,
 ) -> Result<bool> {
-    let listed: Option<i64> = conn
-        .prepare_cached(
-            "SELECT parts_listed FROM message_bodies WHERE account_id = ?1 AND message_id = ?2",
-        )?
-        .query_row(params![account_id.as_str(), message_id], |row| row.get(0))
-        .optional()?;
-    Ok(listed == Some(1))
+    Ok(list_code(conn, account_id, message_id)? == 1)
+}
+
+/// Write provisional metadata from a live copy, replacing a provisional list
+/// whose source disappeared. A full source stored by sync always wins.
+pub(super) fn write_structure(
+    conn: &Connection,
+    account: &AccountId,
+    id: &str,
+    copy: &RemoteId,
+    structure: &crate::imap::BodyStructure,
+) -> Result<bool> {
+    let (code, source) = structure_source(conn, account, id)?;
+    if code == 1 {
+        return Ok(false);
+    }
+    let copies = copies_of(conn, account, id)?;
+    if !copies.contains(copy)
+        || source.is_some_and(|source| copies.iter().any(|copy| copy.0 == source))
+    {
+        return Ok(false);
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO message_bodies (account_id, message_id, codec)
+         VALUES (?1, ?2, ?3)",
+        params![account.as_str(), id, CODEC_DEFLATE],
+    )?;
+    replace_list(
+        conn,
+        account,
+        id,
+        &structure.parts,
+        if structure.html { 3 } else { 2 },
+        Some(&copy.0),
+    )?;
+    Ok(true)
 }
 
 /// Replace the part list of a message whose `message_bodies` row exists.
@@ -455,6 +588,8 @@ fn replace_list(
     account_id: &AccountId,
     message_id: &str,
     list: &[MimePart],
+    code: i64,
+    source: Option<&str>,
 ) -> Result<()> {
     conn.execute(
         "DELETE FROM message_parts WHERE account_id = ?1 AND message_id = ?2",
@@ -474,10 +609,43 @@ fn replace_list(
         )?;
     }
     conn.execute(
-        "UPDATE message_bodies SET parts_listed = 1 WHERE account_id = ?1 AND message_id = ?2",
-        params![account_id.as_str(), message_id],
+        "UPDATE message_bodies SET parts_listed = ?3, structure_copy = ?4
+         WHERE account_id = ?1 AND message_id = ?2",
+        params![account_id.as_str(), message_id, code, source],
     )?;
     Ok(())
+}
+
+/// Copies safe to use for the listed sections. A BODYSTRUCTURE list belongs
+/// to the copy that supplied it, and can report only the encoded byte size.
+pub(super) fn part_copies(
+    conn: &Connection,
+    account: &AccountId,
+    id: &str,
+) -> Result<(Vec<RemoteId>, bool)> {
+    let (code, source) = structure_source(conn, account, id)?;
+    let mut copies = copies_of(conn, account, id)?;
+    if code != 1 {
+        copies.retain(|copy| Some(&copy.0) == source.as_ref());
+    }
+    Ok((copies, code == 1))
+}
+
+fn structure_source(
+    conn: &Connection,
+    account: &AccountId,
+    id: &str,
+) -> Result<(i64, Option<String>)> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT parts_listed, structure_copy FROM message_bodies
+         WHERE account_id = ?1 AND message_id = ?2",
+        )?
+        .query_row(params![account.as_str(), id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .optional()?
+        .unwrap_or_default())
 }
 
 /// The recorded part list of a canonical message id, in document order.
@@ -487,7 +655,7 @@ pub(super) fn list(
     account_id: &AccountId,
     message_id: &str,
 ) -> Result<Option<Vec<MimePart>>> {
-    if !parts_listed(conn, account_id, message_id)? {
+    if list_code(conn, account_id, message_id)? == 0 {
         return Ok(None);
     }
     let mut stmt = conn.prepare_cached(&format!(
@@ -550,7 +718,7 @@ pub(super) fn write(
         && ((mode == Write::Replace && parts.has_body())
             || !parts_listed(conn, account_id, message_id)?)
     {
-        replace_list(conn, account_id, message_id, list)?;
+        replace_list(conn, account_id, message_id, list, 1, None)?;
         replaced = true;
     }
     conn.execute(
@@ -598,45 +766,6 @@ pub(super) fn mark_withheld(
     Ok(())
 }
 
-/// Whether a stored message has its body: see [`crate::BodyState`]. A row
-/// with no body text, no snippet and no `message_bodies` row is one a
-/// first sync listed from its headers; mail with no server copy (a local
-/// write) is never pending.
-pub(super) fn state(
-    conn: &Connection,
-    account_id: &AccountId,
-    message_id: &str,
-) -> Result<crate::BodyState> {
-    let row = conn
-        .prepare_cached(
-            "SELECT m.body_text IS NULL AND m.snippet = '',
-                    b.message_id IS NOT NULL,
-                    IFNULL(b.withheld, 0),
-                    EXISTS (
-                        SELECT 1 FROM message_copies c
-                        WHERE c.account_id = m.account_id AND c.message_id = m.message_id
-                    )
-             FROM messages m
-             LEFT JOIN message_bodies b
-               ON b.account_id = m.account_id AND b.message_id = m.message_id
-             WHERE m.account_id = ?1 AND m.message_id = ?2",
-        )?
-        .query_row(params![account_id.as_str(), message_id], |row| {
-            Ok((
-                row.get::<_, bool>(0)?,
-                row.get::<_, bool>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, bool>(3)?,
-            ))
-        })
-        .optional()?;
-    Ok(match row {
-        Some((true, _, 1, _)) => crate::BodyState::TooLarge,
-        Some((true, false, _, true)) => crate::BodyState::Pending,
-        _ => crate::BodyState::Stored,
-    })
-}
-
 /// A merge is about to delete row `from` in favour of `to`: give `to` the
 /// parts it lacks and carry over any size-limit marker. The kept row leaves
 /// the regular backfill queue when it gains a body or a size-limit marker.
@@ -673,7 +802,9 @@ pub(super) fn move_into(
         )?;
     }
     // The part list goes with it when the kept row has none.
-    if !parts_listed(conn, account_id, to)?
+    let source_list = list_code(conn, account_id, from)?;
+    let kept_list = list_code(conn, account_id, to)?;
+    if (kept_list == 0 || (kept_list != 1 && source_list == 1))
         && let Some(list) = list(conn, account_id, from)?
     {
         conn.execute(
@@ -681,7 +812,10 @@ pub(super) fn move_into(
              VALUES (?1, ?2, ?3)",
             params![account_id.as_str(), to, CODEC_DEFLATE],
         )?;
-        replace_list(conn, account_id, to, &list)?;
+        let source: Option<String> = conn.prepare_cached(
+            "SELECT structure_copy FROM message_bodies WHERE account_id = ?1 AND message_id = ?2",
+        )?.query_row(params![account_id.as_str(), from], |row| row.get(0))?;
+        replace_list(conn, account_id, to, &list, source_list, source.as_deref())?;
         cid_upgrade::inherited_list(conn, account_id, from, to)?;
         conn.execute(
             "INSERT INTO body_backfill (account_id, message_id, refresh_cid_roles)
@@ -789,13 +923,17 @@ pub(super) fn repair_html_snippets(conn: &Connection) -> Result<Option<bool>> {
     }
     let mut changed = false;
     for (account, message, old, stamp, snippet) in updates {
-        changed |= tx.execute(
+        let wrote = tx.execute(
             "UPDATE messages SET snippet = ?5
              WHERE account_id = ?1 AND message_id = ?2 AND snippet = ?3
                AND (SELECT stamp FROM message_body_stamps
                     WHERE account_id = ?1 AND message_id = ?2) IS ?4",
             params![account, message, old, stamp, snippet],
         )? > 0;
+        if wrote {
+            sync_snippet_terms(&tx, &account, &message, &old, &snippet)?;
+            changed = true;
+        }
     }
     tx.execute(
         "INSERT INTO meta (key, value) VALUES (?1, ?2)
@@ -835,6 +973,34 @@ fn spacing_repair<'a>(old: &str, full: &'a str) -> Option<&'a str> {
         .then_some(new)
 }
 
+impl StoredParts {
+    pub(super) fn matches_search_body(
+        &self,
+        conn: &Connection,
+        account: &AccountId,
+        message: &str,
+    ) -> Result<bool> {
+        Ok(conn
+            .prepare_cached(
+                "SELECT EXISTS (
+                     SELECT 1 FROM message_bodies
+                     WHERE account_id = ?1 AND message_id = ?2 AND codec = ?3
+                       AND (plain = ?4 OR (?4 IS NULL AND plain IS NULL AND html = ?5))
+                 )",
+            )?
+            .query_row(
+                params![
+                    account.as_str(),
+                    message,
+                    CODEC_DEFLATE,
+                    self.plain,
+                    self.html
+                ],
+                |row| row.get(0),
+            )?)
+    }
+}
+
 pub(super) fn fill_fetched_html_snippet(
     conn: &Connection,
     account: &AccountId,
@@ -855,18 +1021,36 @@ pub(super) fn fill_fetched_html_snippet(
             |row| row.get(0),
         )
         .optional()?;
-    let snippet = old.and_then(|old| {
-        if old.is_empty() {
-            Some(cap_snippet(full_snippet))
-        } else {
-            spacing_repair(&old, full_snippet)
-        }
-    });
+    let Some(old) = old else {
+        return Ok(());
+    };
+    let snippet = if old.is_empty() {
+        Some(cap_snippet(full_snippet))
+    } else {
+        spacing_repair(&old, full_snippet)
+    };
     if let Some(snippet) = snippet {
         conn.prepare_cached(
             "UPDATE messages SET snippet = ?3 WHERE account_id = ?1 AND message_id = ?2",
         )?
         .execute(params![account.as_str(), message, snippet])?;
+        sync_snippet_terms(conn, account.as_str(), message, &old, snippet)?;
+    }
+    Ok(())
+}
+
+fn sync_snippet_terms(
+    conn: &Connection,
+    account: &str,
+    message: &str,
+    old: &str,
+    new: &str,
+) -> Result<()> {
+    // Search indexes the snippet until the full text is stored.
+    if let Some(row) = super::arrival_without_body(conn, account, message)? {
+        let old = terms_for_indexed(row.indexed_text(old));
+        let new = terms_for_indexed(row.indexed_text(new));
+        sync_terms(conn, account, &old, &new)?;
     }
     Ok(())
 }
@@ -1111,6 +1295,56 @@ mod tests {
         store
             .message_body(&account().id, &MessageId::new(id))
             .unwrap()
+    }
+
+    #[test]
+    fn thread_reader_states_preserve_pending_and_provisional_states() {
+        let root = newsletter("stored@x", "INBOX", 1, "<p>Sale</p>");
+        let thread = root.thread_id.clone();
+        let parent = root.headers.message_id.clone();
+        let mut messages = vec![root];
+        for (uid, id) in (2..).zip(["unknown@x", "listed@x", "gone@x", "withheld@x"]) {
+            let mut reply = newsletter(id, "INBOX", uid, "<p>Sale</p>");
+            reply.headers.in_reply_to = Some(parent.clone());
+            reply.headers.references = vec![parent.clone()];
+            messages.push(reply);
+        }
+        messages.push(newsletter("other@x", "INBOX", 6, "<p>Sale</p>"));
+        let store = store_with(messages);
+        store
+            .conn
+            .execute_batch(
+                "UPDATE messages SET body_text = NULL, snippet = ''
+                 WHERE message_id NOT IN ('stored@x', 'other@x');
+                 DELETE FROM message_bodies WHERE message_id = 'unknown@x';
+                 UPDATE message_bodies SET parts_listed = 3, html = NULL, plain = NULL
+                 WHERE message_id IN ('listed@x', 'gone@x');
+                 UPDATE message_bodies SET structure_copy = 'imap:7:3:INBOX'
+                 WHERE message_id = 'listed@x';
+                 UPDATE message_bodies SET parts_listed = 0, html = NULL, plain = NULL, withheld = 1
+                 WHERE message_id = 'withheld@x';
+                 DELETE FROM message_copies WHERE message_id = 'gone@x';",
+            )
+            .unwrap();
+        let states = store.thread_reader_states(&account().id, &thread).unwrap();
+        assert_eq!(states.len(), 5);
+        assert_eq!(states["stored@x"], (BodyState::Stored, ReaderParts::Ready));
+        assert_eq!(
+            states["unknown@x"],
+            (BodyState::Pending, ReaderParts::Unknown)
+        );
+        assert_eq!(
+            states["listed@x"],
+            (BodyState::Pending, ReaderParts::Listed { html: true })
+        );
+        assert_eq!(
+            states["gone@x"],
+            (BodyState::Stored, ReaderParts::Unavailable { html: true })
+        );
+        assert_eq!(
+            states["withheld@x"],
+            (BodyState::TooLarge, ReaderParts::Unknown)
+        );
     }
 
     #[test]
@@ -1486,7 +1720,7 @@ mod tests {
         full.snippet.clear();
         let store = store_with(vec![headers("old@x", 1), headers("kept@x", 2), full]);
         let account = account().id;
-        let state = |id| state(&store.conn, &account, id).unwrap();
+        let state = |id| reader_states(&store.conn, &account, id).unwrap().0;
         assert_eq!(state("kept@x"), crate::BodyState::Pending);
         mark_withheld(&store.conn, &account, "old@x").unwrap();
 
