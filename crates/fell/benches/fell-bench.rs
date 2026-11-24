@@ -13,17 +13,14 @@ use fell::bench_read_conversation;
 use fell_core::embed::{MINILM_L6_V2_INT8, OnnxEmbedder, default_models_dir, installed_model_dir};
 use fell_core::test_support::mailbox::{self, LONG_MESSAGES, LONG_THREADS};
 use fell_core::{FolderSpan, ListKey, SearchOptions, Store};
-use rusqlite::Connection;
 use serde::Deserialize;
 
 const SAMPLES: usize = 31;
 const PAGE_WARMUPS: usize = 10;
 const PAGE_SAMPLES: usize = 101;
 const THREAD_SAMPLES: usize = 5 * LONG_THREADS;
-const SQLITE_CONTROL_ITERATIONS: usize = 2_048;
-const HEADROOM: f64 = 1.20;
-const MAX_THREAD_SCALE: f64 = 1.25;
-const HYBRID_PRODUCT_MAX_MS: f64 = 150.0;
+const WATCH_HEADROOM: f64 = 1.20;
+const HYBRID_PRODUCT_TARGET_MS: f64 = 150.0;
 const PAGE_SIZE: usize = 100;
 const INBOX: &str = "INBOX";
 const QUERIES: [(&str, &str, Option<&str>); 5] = [
@@ -48,35 +45,70 @@ const HYBRID_QUERIES: [(&str, &str); 4] = [
     ("in:Archive budget meeting", "budget meeting"),
 ];
 
+/// Two thresholds per row. A watch value is a hosted-runner reference: a
+/// row above it plus [`WATCH_HEADROOM`] is flagged but passes, because hosted
+/// CPUs differ by more than that. A `*_max_*` value is a product target (or a
+/// documented allowance above one) and fails the job.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Budgets {
     folder_page_p95_ms: f64,
     thread_open_p95_ms: f64,
-    thread_reference_sqlite_p50_ms: f64,
     keyword_search_p95_ms: f64,
     semantic_residual_p95_ms: f64,
     semantic_graph_p95_ms: f64,
     rest_rss_mb: f64,
+    folder_page_max_ms: f64,
+    thread_open_max_ms: f64,
+    keyword_search_max_ms: f64,
+    hybrid_search_max_ms: f64,
+    rss_max_mb: f64,
 }
 
 impl Budgets {
     fn read(path: &Path) -> Result<Self, Box<dyn Error>> {
         let budgets: Self = toml::from_str(&fs::read_to_string(path)?)?;
-        for (name, value) in [
-            ("folder_page_p95_ms", budgets.folder_page_p95_ms),
-            ("thread_open_p95_ms", budgets.thread_open_p95_ms),
+        // Compare each fail limit with the watch threshold its row applies.
+        for (name, watch, max) in [
             (
-                "thread_reference_sqlite_p50_ms",
-                budgets.thread_reference_sqlite_p50_ms,
+                "folder_page",
+                budgets.folder_page_p95_ms * WATCH_HEADROOM,
+                budgets.folder_page_max_ms,
             ),
-            ("keyword_search_p95_ms", budgets.keyword_search_p95_ms),
+            (
+                "thread_open",
+                budgets.thread_open_p95_ms * WATCH_HEADROOM,
+                budgets.thread_open_max_ms,
+            ),
+            (
+                "keyword_search",
+                budgets.keyword_search_p95_ms * WATCH_HEADROOM,
+                budgets.keyword_search_max_ms,
+            ),
+            (
+                "rss",
+                budgets.rest_rss_mb * WATCH_HEADROOM,
+                budgets.rss_max_mb,
+            ),
+            (
+                "hybrid_search",
+                HYBRID_PRODUCT_TARGET_MS,
+                budgets.hybrid_search_max_ms,
+            ),
+        ] {
+            if !(watch > 0.0 && max.is_finite() && watch <= max) {
+                return Err(format!(
+                    "{name}: watch values must be positive and below the fail limit in {}",
+                    path.display()
+                )
+                .into());
+            }
+        }
+        for (name, value) in [
             ("semantic_residual_p95_ms", budgets.semantic_residual_p95_ms),
             ("semantic_graph_p95_ms", budgets.semantic_graph_p95_ms),
-            ("rest_rss_mb", budgets.rest_rss_mb),
         ] {
-            let max_limit = value * HEADROOM * MAX_THREAD_SCALE;
-            if !(value > 0.0 && max_limit.is_finite()) {
+            if !(value > 0.0 && value.is_finite()) {
                 return Err(
                     format!("{name} must be positive and finite in {}", path.display()).into(),
                 );
@@ -88,15 +120,24 @@ impl Budgets {
 
 #[derive(Clone, Copy)]
 struct Budget {
-    baseline: f64,
-    limit: f64,
+    /// Flag the row above this value; never fails.
+    watch: Option<f64>,
+    /// Fail the job above this value.
+    max: Option<f64>,
 }
 
 impl Budget {
-    fn fixed(baseline: f64) -> Self {
+    fn new(reference: f64, max: f64) -> Self {
         Self {
-            baseline,
-            limit: baseline * HEADROOM,
+            watch: Some(reference * WATCH_HEADROOM),
+            max: Some(max),
+        }
+    }
+
+    fn watch_only(reference: f64) -> Self {
+        Self {
+            watch: Some(reference * WATCH_HEADROOM),
+            max: None,
         }
     }
 }
@@ -161,6 +202,7 @@ fn cpu_report() -> String {
 struct Report {
     out: String,
     failures: Vec<String>,
+    watched: Vec<String>,
 }
 
 impl Report {
@@ -168,10 +210,11 @@ impl Report {
         Self {
             out: format!(
                 "## 100k-message store budgets\n\n{cpu}\
-                 | Operation | Samples | p50 (ms) | p95 (ms) or RSS (MB) | Baseline | Limit | Result |\n\
+                 | Operation | Samples | p50 (ms) | p95 (ms) or RSS (MB) | Watch | Fail above | Result |\n\
                  | --- | ---: | ---: | ---: | ---: | ---: | --- |\n",
             ),
             failures: Vec::new(),
+            watched: Vec::new(),
         }
     }
 
@@ -183,22 +226,30 @@ impl Report {
         measured: f64,
         budget: Option<Budget>,
     ) {
-        let (base, limit, result) = match budget {
-            Some(Budget { baseline, limit }) => {
-                let result = if measured <= limit {
-                    "Pass"
-                } else {
+        let format = |value: Option<f64>| value.map_or_else(|| "—".into(), |v| format!("{v:.3}"));
+        let (watch, max, result) = match budget {
+            Some(Budget { watch, max }) => {
+                let result = if max.is_some_and(|max| measured > max) {
                     self.failures.push(label.into());
                     "**Fail**"
+                } else if let Some(watch) = watch.filter(|watch| measured > *watch) {
+                    // A GitHub Actions annotation; plain output elsewhere.
+                    println!(
+                        "::warning title=Store budget watch::{label}: {measured:.3} is above the {watch:.3} watch value"
+                    );
+                    self.watched.push(label.into());
+                    "Watch"
+                } else {
+                    "Pass"
                 };
-                (format!("{baseline:.3}"), format!("{limit:.3}"), result)
+                (format(watch), format(max), result)
             }
             None => ("—".into(), "—".into(), "Informational"),
         };
         let p50 = p50.map_or_else(|| "—".into(), |value| format!("{value:.3}"));
         writeln!(
             self.out,
-            "| {label} | {samples} | {p50} | {measured:.3} | {base} | {limit} | {result} |"
+            "| {label} | {samples} | {p50} | {measured:.3} | {watch} | {max} | {result} |"
         )
         .unwrap();
     }
@@ -226,7 +277,7 @@ impl Report {
         (p50, p95)
     }
 
-    fn rss(&mut self, label: &str, budget: f64) -> Result<(), Box<dyn Error>> {
+    fn rss(&mut self, label: &str, budget: Budget) -> Result<(), Box<dyn Error>> {
         let stats = fs::read_to_string("/proc/self/smaps_rollup")?;
         let rss_kib: u64 = stats
             .lines()
@@ -234,17 +285,18 @@ impl Report {
             .and_then(|rest| rest.split_whitespace().next())
             .ok_or("no Rss entry in /proc/self/smaps_rollup")?
             .parse()?;
-        self.row(
-            label,
-            1,
-            None,
-            rss_kib as f64 * 1024.0 / 1e6,
-            Some(Budget::fixed(budget)),
-        );
+        self.row(label, 1, None, rss_kib as f64 * 1024.0 / 1e6, Some(budget));
         Ok(())
     }
 
-    fn finish(self) -> Result<(), Box<dyn Error>> {
+    fn finish(mut self) -> Result<(), Box<dyn Error>> {
+        if !self.watched.is_empty() {
+            writeln!(
+                self.out,
+                "\nAbove the hosted reference (watch only, not a failure): {}.",
+                self.watched.join(", ")
+            )?;
+        }
         println!("{}", self.out);
         if let Some(path) = std::env::var_os("GITHUB_STEP_SUMMARY") {
             OpenOptions::new()
@@ -327,12 +379,13 @@ fn run_suite() -> Result<(), Box<dyn Error>> {
 
     let index_lock = mailbox::hold_indexer(&path)?;
     let account = mailbox::account();
+    let rss_budget = Budget::new(budgets.rest_rss_mb, budgets.rss_max_mb);
     let store = Store::open(&path)?;
-    report.rss("RSS after store open", budgets.rest_rss_mb)?;
+    report.rss("RSS after store open", rss_budget)?;
     let top_span = FolderSpan::Top { rows: PAGE_SIZE };
     let top_page = store.folder_page(&account.id, INBOX, &top_span)?;
     assert_eq!(top_page.threads.len(), PAGE_SIZE);
-    report.rss("RSS after first Inbox page", budgets.rest_rss_mb)?;
+    report.rss("RSS after first Inbox page", rss_budget)?;
     let roles = store.folder_roles(&account.id)?;
     let folders = store.folder_names(&account.id)?;
     let read = |store: &Store, index| {
@@ -350,21 +403,17 @@ fn run_suite() -> Result<(), Box<dyn Error>> {
         assert_eq!(view.len(), LONG_MESSAGES);
         last_view = Some(view);
     }
-    report.rss("RSS after opening 20 distinct threads", budgets.rest_rss_mb)?;
+    report.rss("RSS after opening 20 distinct threads", rss_budget)?;
     black_box((top_page, last_view));
 
     // These timings open fresh connections over a recently seeded file. The
     // initial RSS sample above precedes repeated opens and list/search warmups.
     drop(store);
-    let control_p50 = measure_sqlite_control(&mut report)?;
     report.latency("Open populated store", SAMPLES, None, |_| {
         Store::open(&path).unwrap()
     });
-    let thread_scale =
-        (control_p50 / budgets.thread_reference_sqlite_p50_ms).clamp(1.0, MAX_THREAD_SCALE);
-    let mut thread_budget = Budget::fixed(budgets.thread_open_p95_ms);
-    thread_budget.limit *= thread_scale;
-    let folder_budget = Budget::fixed(budgets.folder_page_p95_ms);
+    let thread_budget = Budget::new(budgets.thread_open_p95_ms, budgets.thread_open_max_ms);
+    let folder_budget = Budget::new(budgets.folder_page_p95_ms, budgets.folder_page_max_ms);
     let store = Store::open(&path)?;
     let mut measure_inbox_page = |label: &str, span: &FolderSpan| -> Result<(), Box<dyn Error>> {
         for _ in 0..PAGE_WARMUPS {
@@ -427,7 +476,10 @@ fn run_suite() -> Result<(), Box<dyn Error>> {
         report.latency(
             &label,
             SAMPLES,
-            Some(Budget::fixed(budgets.keyword_search_p95_ms)),
+            Some(Budget::new(
+                budgets.keyword_search_p95_ms,
+                budgets.keyword_search_max_ms,
+            )),
             |_| store.search_with(&account.id, query, options).unwrap(),
         );
     }
@@ -442,23 +494,11 @@ fn run_suite() -> Result<(), Box<dyn Error>> {
     scratch.close()?;
     writeln!(
         report.out,
-        "\nThread limit scaled by {thread_scale:.3} using the in-memory SQLite control p50.\n\n{semantic_note}\n\nFixture generation took {seed_elapsed:.2?} ({disk_mb:.1} MB on disk). Full suite took {:.2?}, including setup and cleanup. Latency rows use nearest-rank percentiles. RSS values are single process snapshots in decimal MB.",
+        "\n{semantic_note}\n\nFixture generation took {seed_elapsed:.2?} ({disk_mb:.1} MB on disk). Full suite took {:.2?}, including setup and cleanup. Latency rows use nearest-rank percentiles. RSS values are single process snapshots in decimal MB.",
         suite_started.elapsed()
     )?;
     report.finish()?;
     semantic.map(|_| ())
-}
-
-fn measure_sqlite_control(report: &mut Report) -> rusqlite::Result<f64> {
-    let conn = Connection::open_in_memory()?;
-    let mut stmt = conn.prepare("SELECT 1")?;
-    let label = format!("SQLite control ({SQLITE_CONTROL_ITERATIONS} × `SELECT 1`)");
-    let (p50, _) = report.latency(&label, SAMPLES, None, |_| {
-        for _ in 0..SQLITE_CONTROL_ITERATIONS {
-            black_box(stmt.query_row([], |row| row.get::<_, i64>(0)).unwrap());
-        }
-    });
-    Ok(p50)
 }
 
 fn measure_semantic(
@@ -477,11 +517,13 @@ fn measure_semantic(
         }
         return Ok("Hybrid search skipped because the pinned local MiniLM model is absent.".into());
     };
+    // The watch value is the product target; the fail limit sits above it
+    // because some CPUs take a much slower MiniLM path (#228, #237).
     let hybrid_budget = Budget {
-        baseline: HYBRID_PRODUCT_MAX_MS,
-        limit: HYBRID_PRODUCT_MAX_MS,
+        watch: Some(HYBRID_PRODUCT_TARGET_MS),
+        max: Some(budgets.hybrid_search_max_ms),
     };
-    let graph_budget = Budget::fixed(budgets.semantic_graph_p95_ms);
+    let graph_budget = Budget::watch_only(budgets.semantic_graph_p95_ms);
     let started = Instant::now();
     let model = OnnxEmbedder::load(&MINILM_L6_V2_INT8, &dir)?;
     mailbox::seed_vectors(store, &model)?;
@@ -527,19 +569,19 @@ fn measure_semantic(
             Some(hybrid_budget),
             |_| store.search(&account.id, query).unwrap(),
         );
-        above_product_target += usize::from(hybrid_p95 > HYBRID_PRODUCT_MAX_MS);
+        above_product_target += usize::from(hybrid_p95 > HYBRID_PRODUCT_TARGET_MS);
         report.row(
             &format!("Hybrid residual · `{query}`"),
             SAMPLES,
             None,
             (hybrid_p95 - graph_p95).max(0.0),
-            Some(Budget::fixed(budgets.semantic_residual_p95_ms)),
+            Some(Budget::watch_only(budgets.semantic_residual_p95_ms)),
         );
     }
     Ok(format!(
         "Hybrid setup took {setup:.2?}, including model load, 100k-vector seeding and search warmup.\n\n\
          Tract matrix kernels in the optimized graph: {kernels}\n\n\
-         Hybrid p95 exceeded the {HYBRID_PRODUCT_MAX_MS:.0} ms product target for {above_product_target} of {} queries. Each residual is the difference between the query's end-to-end p95 and graph p95, floored at zero.",
+         Hybrid p95 exceeded the {HYBRID_PRODUCT_TARGET_MS:.0} ms product target for {above_product_target} of {} queries. Each residual is the difference between the query's end-to-end p95 and graph p95, floored at zero.",
         HYBRID_QUERIES.len()
     ))
 }

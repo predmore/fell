@@ -12,34 +12,37 @@ The suite reports wall-clock p50 and p95 using nearest rank, with 31 samples per
 
 Keyword search runs all five query shapes with hybrid ranking disabled. If pinned MiniLM files are installed in Fell's model directory or in `$FELL_BENCH_MODEL_DIR`, the suite also measures hybrid ranking with real local query inference and 100,000 seeded vectors. It embeds the fixture's topic prefixes and adds deterministic jitter to their vectors to keep vector setup bounded. This models query cost and vector cardinality. The suite reads model files from local disk and reports a skip when the default installation is absent. CI sets `FELL_BENCH_INSTALL_MODEL=1` and passes an explicit model root. The benchmark calls Fell's installer in a child process before seeding, and a model setup or verification failure fails the job. To exercise the same hybrid benchmark locally, use `fell embeddings install` and set `FELL_BENCH_MODEL_DIR` to the model root reported by Fell.
 
-## Calibrate the gate
+## How the gate decides
 
-The gate compares measured p95 latency or RSS in decimal MB to the limits below. Most limits include 20% headroom over the configured baseline. The report shows measured times and effective limits. Store open is informational because the 300 ms product budget also covers app startup and rendering. The job publishes the table before returning a failure when a budget is exceeded. [`budgets.toml`](budgets.toml)
+Each row has two thresholds in [`budgets.toml`](budgets.toml).
 
-Folder, thread, keyword and RSS reference measurements come from the original `ubuntu-latest` (Ubuntu 26.04 x64) calibration at commit `422d92a`. Hybrid measurements come from the optimized hosted run linked below. Product targets are measured on mid-range laptop hardware. [Calibration job](https://github.com/predmore/fell/actions/runs/44645540660/job/135987038248) · [Product scope](../docs/scope.md)
+- **Fail above.** A product target: the scope budgets in [docs/scope.md](../docs/scope.md) for threads, keyword search and memory, and 5 ms for a 100-row folder page, which leaves the rest of the 8 ms key-to-frame budget for layout and paint. Hybrid search is the exception: it fails at twice its 150 ms target (see below). A row above its fail limit fails the job. Hosted runners measure 2.5× or more below every store limit, and about 1.7× below the hybrid limit on the slowest MiniLM path seen, so a failure means Fell got slower, not that the runner did.
+- **Watch.** A hosted-runner reference value plus 20%. A row above it is marked **Watch**, gets a GitHub warning annotation, and is listed under the table, but the job passes. Hosted runner CPUs differ by more than 20% (an AMD EPYC 7763 runner measured the Inbox middle page at 0.93 ms where Intel Xeon 8573C runners measure 0.62–0.66 ms), so a tight reference can only be a hint. Look at Watch rows when a PR touches the store, search, or presentation code.
 
-| Metric | Hosted Ubuntu p95 or RSS | Configured baseline | CI limit before adjustment | Product target |
-| --- | ---: | ---: | ---: | ---: |
-| Folder page p95 | 0.568 ms | 0.75 ms | 0.90 ms | 5 ms |
-| 50-message thread p95 | 2.404 ms | 3.00 ms | 3.60 ms | 16 ms |
-| Keyword search p95 | 19.285 ms | 25.00 ms | 30.00 ms | 50 ms |
-| RSS | 13.365 MB | 18.00 MB | 21.60 MB | 250 MB |
-| Hybrid search p95 per query | 14.862–16.633 ms | 150 ms | 150 ms | 150 ms |
-| MiniLM graph p95 per query | 4.098–6.441 ms | 60 ms | 72 ms | — |
-| Hybrid residual p95 difference per query | 9.474–11.250 ms | 75 ms | 90 ms | — |
+The gate used to fail at the reference values. It flaked on runner hardware again and again (#220, #228, #247, and #278), so only product targets fail now. Store open is informational because the 300 ms product budget also covers app startup and rendering. The job publishes the table before returning a failure.
 
-- **Folder pages.** Both Inbox windows use the fixed 0.90 ms limit. [Issue #247](https://github.com/predmore/fell/issues/247)
-- **Thread read.** Use a standalone in-memory SQLite connection and time 2,048 executions of a prepared `SELECT 1` statement per sample. Multiply the 3.6 ms thread limit by the ratio of the loop's p50 to the 0.10 ms reference, bounded from 1.0 to 1.25. The reference rounds up a local release measurement of 0.079 ms. The adjusted thread limit can reach 4.5 ms. [Issue #220](https://github.com/predmore/fell/issues/220)
-- **Hybrid search.** Warm every query and its graph input, then collect 31 end-to-end and 31 standalone MiniLM samples per query. The benchmark reports the CPU, runtime x86 feature flags, tract's thread count and optimized matrix kernels. Hybrid setup time covers model load, vector seeding and search warmup. The difference between the two p95s, floored at zero, has a 90 ms ceiling on every CPU. The report also counts queries whose end-to-end p95 exceeds the 150 ms product target. [Optimized hosted job](https://github.com/predmore/fell/actions/runs/44856382153/job/136701473396)
-- **CPU diagnostics.** Every report starts with the CPU model, logical CPUs, runtime x86 feature flags (avx, avx2, fma, f16c, avx512f), tract's thread count and the matrix kernels in the optimized MiniLM graph. Every CPU uses the same 72 ms graph, 150 ms end-to-end and 90 ms residual ceilings. Some hosted runs measured the graph at about 160 ms with the same benchmark binary that measures 4–9 ms elsewhere. Those runs predate these diagnostics, so the cause is still open. [Slow hosted attempt](https://github.com/predmore/fell/actions/runs/44861700978/job/136717118203) · [Issue #228](https://github.com/predmore/fell/issues/228)
+Reference measurements come from the original `ubuntu-latest` (Ubuntu 26.04 x64) calibration at commit `422d92a`, and hybrid measurements from the optimized hosted run linked below. [Calibration job](https://github.com/predmore/fell/actions/runs/44645540660/job/135987038248)
 
-The calibration job took 9m54s, including 62s to save an 848 MB cache, 1m24s to build, and 279s to seed the mailbox. A later cold release build exceeded the ten-minute job limit before producing an executable. CI now builds that executable in a prerequisite job and passes it to the budget job from the same run. The ten-minute budget job covers runtime setup, model verification, fixture generation and measurements. The full CI path includes the prerequisite build. [Cold build](https://github.com/predmore/fell/actions/runs/44661013350/job/136038979928)
+| Metric | Hosted Ubuntu p95 or RSS | Watch (reference + 20%) | Fail above |
+| --- | ---: | ---: | ---: |
+| Folder page p95 | 0.568 ms | 0.90 ms | 5 ms |
+| 50-message thread p95 | 2.404 ms | 3.60 ms | 16 ms |
+| Keyword search p95 | 19.285 ms | 30.00 ms | 50 ms |
+| RSS | 13.365 MB | 21.60 MB | 250 MB |
+| Hybrid search p95 per query | 14.862–16.633 ms | 150 ms | 300 ms |
+| MiniLM graph p95 per query | 4.098–6.441 ms | 72 ms | — |
+| Hybrid residual p95 difference per query | 9.474–11.250 ms | 90 ms | — |
+
+- **Hybrid search.** The product target is 150 ms, which is the Watch value. The fail limit is twice that because some hosted CPUs take a MiniLM path about 30× slower than others and measured 172–179 ms end to end with no change to Fell ([Issue #228](https://github.com/predmore/fell/issues/228), [Issue #237](https://github.com/predmore/fell/issues/237)). The graph and residual rows only watch. Warm every query and its graph input, then collect 31 end-to-end and 31 standalone MiniLM samples per query. Hybrid setup time covers model load, vector seeding and search warmup. The report counts queries whose end-to-end p95 exceeds the 150 ms product target. [Optimized hosted job](https://github.com/predmore/fell/actions/runs/44856382153/job/136701473396)
+- **CPU diagnostics.** Every report starts with the CPU model, logical CPUs, runtime x86 feature flags (avx, avx2, fma, f16c, avx512f), tract's thread count and the matrix kernels in the optimized MiniLM graph. Check them first when a row is marked Watch.
+
+CI builds the benchmark executable in a prerequisite job and passes it to the budget job from the same run. The suite itself takes under ten minutes. Both jobs have extra time and apt retries because a slow Ubuntu mirror once took 20 minutes to install build dependencies.
 
 ## Verify the regression gate
 
-In a detached local worktree, run the command above with the checked-in budgets. To check paging, temporarily add `std::thread::sleep(std::time::Duration::from_micros(600));` at the entry to `Store::folder_page` in `crates/fell-core/src/store.rs` and rerun. Both Inbox latency rows should exceed 0.90 ms. Restore paging before running the search checks below.
+In a detached local worktree, run the command above with the checked-in budgets. To check paging, temporarily add `std::thread::sleep(std::time::Duration::from_millis(6));` at the entry to `Store::folder_page` in `crates/fell-core/src/store.rs` and rerun. Both Inbox latency rows should fail. A 0.5 ms sleep should mark them Watch and still pass. Restore paging before running the search checks below.
 
-Local aarch64 runs can exceed the hosted 21.60 MB RSS limit. To isolate a latency failure, use `FELL_BENCH_BUDGETS` to select a local copy of `budgets.toml` with only `rest_rss_mb` raised.
+Local aarch64 runs can exceed the 21.60 MB RSS watch value. That marks the RSS rows Watch and does not fail.
 
 To check search, temporarily add these delays at the entry to `Store::search_with` in `crates/fell-core/src/store.rs` and rerun.
 
@@ -47,14 +50,14 @@ To check search, temporarily add these delays at the entry to `Store::search_wit
 if !options.semantic
     && query == "warranty from:p10@bench.test in:inbox has:attachment after:2023-12-01"
 {
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    std::thread::sleep(std::time::Duration::from_millis(60));
 }
 if options.semantic && query == "in:Archive budget meeting" {
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    std::thread::sleep(std::time::Duration::from_millis(300));
 }
 ```
 
-The keyword text-and-operators row and the filtered hybrid residual row should fail their budgets. A separate 150 ms delay around the shared graph invocation, timed by both the graph and end-to-end rows, should fail both ceilings. A 0.5 ms delay in `Store::open` should leave thread calibration independent of the open timing, and a thread-read delay that crosses its effective ceiling should fail that row. Remove the temporary worktree after the checks.
+The keyword text-and-operators row and the filtered hybrid row should fail. A thread-read delay over 16 ms should fail that row. Remove the temporary worktree after the checks.
 
 ## Replay the inbox
 
