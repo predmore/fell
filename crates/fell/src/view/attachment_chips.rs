@@ -6,9 +6,7 @@ use gpui::{
     PathBuilder, Styled, Window, div, point, prelude::*, px, rgb,
 };
 
-use super::{
-    AttachmentMark, ConvFrame, Inbox, LayoutProbe, LayoutSlot, Live, conversation_line_style,
-};
+use super::{ConvFrame, Inbox, LayoutProbe, LayoutSlot, Live, conversation_line_style};
 use crate::attachments::{self, Request, Target};
 use crate::keymap::{self, Action};
 use crate::model::Session;
@@ -41,7 +39,7 @@ pub(super) fn row(
         "Failed · {}",
         keymap::binding_text(&session.keymap, Action::RetryAttachment)
     );
-    let status_width = ["Listed", "Ready", "Downloading", "↓ 100%", &retry]
+    let status_width = ["Downloading", "↓ 100%", &retry]
         .into_iter()
         .map(measure)
         .fold(0.0, f32::max);
@@ -80,36 +78,37 @@ pub(super) fn row(
                             .and_then(|(id, section, progress)| {
                                 (*id == message.id && *section == part.section).then_some(*progress)
                             });
-                    let size = attachments::size_label(part.size);
+                    let key = (message.id.clone(), part.section.clone());
+                    let displayed = frame.attachment_sizes.get(&key);
+                    let size =
+                        attachments::size_label(displayed.map_or(part.size, |size| size.size));
+                    let fading = displayed
+                        .and_then(|size| size.from)
+                        .zip(frame.now)
+                        .filter(|((_, fade), now)| fade.running(*now))
+                        .map(|((old, fade), now)| {
+                            (attachments::size_label(old), fade.progress(now))
+                        });
+                    let failed = download.is_none() && frame.failed_attachments.contains(&key);
                     let status = if let Some(progress) = download {
                         if progress.total == 0 {
                             "Downloading".to_owned()
                         } else {
                             format!("↓ {}", progress.label())
                         }
+                    } else if failed {
+                        retry.clone()
                     } else {
-                        match frame
-                            .attachment_marks
-                            .get(&(message.id.clone(), part.section.clone()))
-                        {
-                            Some(AttachmentMark::Ready) => "Ready".into(),
-                            Some(AttachmentMark::Failed) => retry.clone(),
-                            None if frame
-                                .cached_files
-                                .contains(&(message.id.clone(), part.section.clone())) =>
-                            {
-                                "Ready".into()
-                            }
-                            None => "Listed".into(),
-                        }
+                        String::new()
                     };
-                    let failed = download.is_none() && status == retry;
+                    let accent = theme.accent;
                     let icon = file_icon(part, meta);
                     let chip = div()
                         .id(gpui::ElementId::named_usize("attachment", part_index))
+                        .relative()
                         .flex()
                         .items_center()
-                        .gap(px(7.))
+                        .gap(px(8.))
                         .h(px(32.))
                         .max_w(px(max_width))
                         .px(px(8.))
@@ -171,28 +170,51 @@ pub(super) fn row(
                         )
                         .child(
                             div()
+                                .relative()
                                 .flex_shrink_0()
                                 .w(px(measure("999 MB").max(measure(&size))))
                                 .text_right()
                                 .text_color(rgb(meta))
                                 .text_size(px(font_size - 1.0))
                                 .whitespace_nowrap()
-                                .child(size),
+                                .child(
+                                    div()
+                                        .opacity(fading.as_ref().map_or(1.0, |(_, alpha)| *alpha))
+                                        .child(size),
+                                )
+                                .children(fading.map(|(old, alpha)| {
+                                    div().absolute().inset_0().opacity(1.0 - alpha).child(old)
+                                })),
                         )
                         .child(
                             div()
                                 .flex_shrink_0()
                                 .w(px(status_width))
                                 .text_right()
-                                .text_color(rgb(if failed && !focused {
-                                    theme.error
-                                } else {
-                                    meta
-                                }))
+                                .text_color(rgb(if failed { theme.error } else { meta }))
                                 .text_size(px(font_size - 1.0))
                                 .whitespace_nowrap()
                                 .child(status),
                         )
+                        .children(download.map(|progress| {
+                            let shown = if progress.total == 0 {
+                                0.0
+                            } else {
+                                (progress.fetched as f32 / progress.total as f32).clamp(0.0, 1.0)
+                            };
+                            gpui::canvas(
+                                |_, _, _| (),
+                                move |mut bounds, (), window, _| {
+                                    bounds.size.width = (bounds.size.width * shown).max(px(1.));
+                                    window.paint_quad(gpui::fill(bounds, rgb(accent)));
+                                },
+                            )
+                            .absolute()
+                            .left(px(2.))
+                            .right(px(2.))
+                            .bottom_0()
+                            .h(px(1.))
+                        }))
                         .into_any_element();
                     match probe.filter(|_| focused) {
                         Some(slot) => LayoutProbe {

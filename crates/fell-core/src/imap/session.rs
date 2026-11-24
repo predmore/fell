@@ -336,22 +336,22 @@ impl Session {
                 continue;
             };
             let Some(uid) = fetch_number(&line.text, &upper, "UID") else {
-                return Err(imap_err("BODYSTRUCTURE reply has no UID"));
+                continue;
             };
             let before = line.text.len() - value.len() - 1;
             let literals = line
                 .literals
                 .iter()
                 .skip(literals_before(&line.text[..before]));
-            let structure = super::structure::parse(
+            if let Some(structure) = super::structure::parse(
                 &line.text[before..],
                 literals.map(|literal| match literal {
                     LiteralBytes::Kept(bytes) => Some(bytes.as_slice()),
                     LiteralBytes::Discarded => None,
                 }),
-            )
-            .ok_or_else(|| imap_err("invalid BODYSTRUCTURE reply"))?;
-            found.push((uid, structure));
+            ) {
+                found.push((uid, structure));
+            }
         }
         Ok(found)
     }

@@ -333,7 +333,7 @@ impl StoredParts {
         };
         for action_id in actions {
             conn.execute(
-                "UPDATE local_action_bodies SET parts_listed = 1
+                "UPDATE local_action_bodies SET parts_listed = 1, structure_copy = NULL
                  WHERE action_id = ?1 AND message_id = ?2",
                 params![action_id, message_id],
             )?;
@@ -449,6 +449,9 @@ pub enum ReaderParts {
     Listed {
         html: bool,
     },
+    Unavailable {
+        html: bool,
+    },
 }
 
 pub(super) fn reader_parts(
@@ -474,7 +477,9 @@ pub(super) fn reader_parts(
         .optional()?;
     Ok(match row {
         Some((0, _, true)) => ReaderParts::Unknown,
-        Some((2 | 3, _, false)) => ReaderParts::Ready,
+        Some((code @ (2 | 3), html, false)) => ReaderParts::Unavailable {
+            html: code == 3 && !html,
+        },
         Some((code @ (2 | 3), html, true)) => ReaderParts::Listed {
             html: code == 3 && !html,
         },
@@ -524,11 +529,7 @@ pub(super) fn write_structure(
         id,
         &structure.parts,
         if structure.html { 3 } else { 2 },
-    )?;
-    conn.execute(
-        "UPDATE message_bodies SET structure_copy = ?3
-         WHERE account_id = ?1 AND message_id = ?2",
-        params![account.as_str(), id, copy.0],
+        Some(&copy.0),
     )?;
     Ok(true)
 }
@@ -540,6 +541,7 @@ fn replace_list(
     message_id: &str,
     list: &[MimePart],
     code: i64,
+    source: Option<&str>,
 ) -> Result<()> {
     conn.execute(
         "DELETE FROM message_parts WHERE account_id = ?1 AND message_id = ?2",
@@ -559,9 +561,9 @@ fn replace_list(
         )?;
     }
     conn.execute(
-        "UPDATE message_bodies SET parts_listed = ?3, structure_copy = NULL
+        "UPDATE message_bodies SET parts_listed = ?3, structure_copy = ?4
          WHERE account_id = ?1 AND message_id = ?2",
-        params![account_id.as_str(), message_id, code],
+        params![account_id.as_str(), message_id, code, source],
     )?;
     Ok(())
 }
@@ -658,7 +660,7 @@ pub(super) fn write(
         && ((mode == Write::Replace && parts.has_body())
             || !parts_listed(conn, account_id, message_id)?)
     {
-        replace_list(conn, account_id, message_id, list, 1)?;
+        replace_list(conn, account_id, message_id, list, 1, None)?;
         replaced = true;
     }
     conn.execute(
@@ -791,7 +793,10 @@ pub(super) fn move_into(
              VALUES (?1, ?2, ?3)",
             params![account_id.as_str(), to, CODEC_DEFLATE],
         )?;
-        replace_list(conn, account_id, to, &list, source_list)?;
+        let source: Option<String> = conn.prepare_cached(
+            "SELECT structure_copy FROM message_bodies WHERE account_id = ?1 AND message_id = ?2",
+        )?.query_row(params![account_id.as_str(), from], |row| row.get(0))?;
+        replace_list(conn, account_id, to, &list, source_list, source.as_deref())?;
         cid_upgrade::inherited_list(conn, account_id, from, to)?;
         conn.execute(
             "INSERT INTO body_backfill (account_id, message_id, refresh_cid_roles)

@@ -80,7 +80,7 @@ impl ConvMessage {
             fell_core::ReaderParts::Listed { .. } => {
                 self.body_state != fell_core::BodyState::TooLarge
             }
-            fell_core::ReaderParts::Ready => false,
+            fell_core::ReaderParts::Ready | fell_core::ReaderParts::Unavailable { .. } => false,
         }
     }
 }

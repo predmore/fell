@@ -223,6 +223,7 @@ fn walk(
         disposition,
         nested: nested > 0,
     };
+    part.size = part.estimated_decoded_size();
     part.role = CidReferences::new(None).role_for(&part);
     out.parts.push(part);
     if is_message && nested < 4 {

@@ -284,11 +284,22 @@ pub struct BodyReads {
 /// Prepare small expanded bodies above the last message here so they
 /// arrive in place. The window resolves the rest against its live cache
 /// and starts any remaining loads for the revisions returned here.
-pub fn read_bodies(
+#[cfg(test)]
+fn read_bodies(
     store: &Store,
     account: &AccountId,
     messages: &mut [ConvMessage],
     cached: &HashMap<String, PartStamp>,
+) -> BodyReads {
+    read_bodies_with_latest(store, account, messages, cached, false)
+}
+
+pub fn read_bodies_with_latest(
+    store: &Store,
+    account: &AccountId,
+    messages: &mut [ConvMessage],
+    cached: &HashMap<String, PartStamp>,
+    prepare_latest: bool,
 ) -> BodyReads {
     let mut reads = BodyReads::default();
     let ids: Vec<&str> = messages.iter().map(|message| message.id.as_str()).collect();
@@ -309,7 +320,7 @@ pub fn read_bodies(
                 message.rich = Rich::Pending;
                 reads.stamps.insert(message.id.clone(), kinds.stamp);
                 if message.expanded
-                    && index < last
+                    && (index < last || prepare_latest)
                     && kinds.html_bytes <= budget
                     && cached.get(&message.id) != Some(&kinds.stamp)
                 {

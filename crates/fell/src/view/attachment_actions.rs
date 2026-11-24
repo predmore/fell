@@ -85,23 +85,31 @@ impl Inbox {
     }
 
     fn attachment_failed(&mut self, line: String, detail: String, retry: Request) {
-        match &retry {
-            Request::Open(target) => {
-                self.attachment_marks
-                    .insert(part_key(target), super::AttachmentMark::Failed);
-            }
-            Request::Save(targets) => {
-                for target in targets {
-                    self.attachment_marks
-                        .insert(part_key(target), super::AttachmentMark::Failed);
-                }
-            }
-        }
-        let key = keymap::binding_text(&self.session.keymap, Action::RetryAttachment);
+        let targets = match &retry {
+            Request::Open(target) => std::slice::from_ref(target),
+            Request::Save(targets) => targets.as_slice(),
+        };
+        let chip_visible = self.painted_reader.is_some()
+            && targets.iter().any(|target| {
+                self.session.messages.iter().any(|message| {
+                    message.expanded
+                        && message.id == target.message
+                        && message
+                            .attachments
+                            .iter()
+                            .any(|part| part.section == target.part.section)
+                })
+            });
+        self.failed_attachments.extend(targets.iter().map(part_key));
         self.attachment_retry = Some(retry);
         self.session.attachment_error = Some(format!("{line}\n{}", display_safe(&detail)));
-        self.session
-            .show_toast(format!("{line}{NOTICE_DOT}{key} retry"), true);
+        let toast = if chip_visible {
+            line
+        } else {
+            let key = keymap::binding_text(&self.session.keymap, Action::RetryAttachment);
+            format!("{line}{NOTICE_DOT}{key} retry")
+        };
+        self.session.show_toast(toast, true);
     }
 
     // Some xdg-open implementations wait for the viewer to exit. Reap the
@@ -269,7 +277,7 @@ impl AttachmentSource {
                 if request.is_some() {
                     return Ok(request.filter(|request| {
                         let mut actual = request.part.clone();
-                        if expected.size == expected.encoded_size {
+                        if expected.size == expected.estimated_decoded_size() {
                             actual.size = expected.size;
                         }
                         actual == expected
@@ -318,15 +326,12 @@ impl AttachmentSource {
                 }
                 PartEvent::Done(result) => {
                     Self::show_download(this, cx, target, None)?;
-                    let mark = if result.is_ok() {
-                        super::AttachmentMark::Ready
-                    } else {
-                        super::AttachmentMark::Failed
-                    };
-                    let _ = this.update(cx, |inbox, cx| {
-                        inbox.attachment_marks.insert(part_key(target), mark);
-                        cx.notify();
-                    });
+                    if result.is_ok() {
+                        let _ = this.update(cx, |inbox, cx| {
+                            inbox.failed_attachments.remove(&part_key(target));
+                            cx.notify();
+                        });
+                    }
                     return result.map_err(|err| err.to_string());
                 }
             }

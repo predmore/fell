@@ -99,7 +99,6 @@ struct BodyArrival {
     height: Option<(f32, Transition)>,
     /// Whether the outgoing pending label said the body was downloading.
     placeholder: Option<bool>,
-    attachments: bool,
     text: bool,
 }
 
@@ -254,6 +253,7 @@ pub struct InboxMotion {
     arrival_pending: bool,
     /// Bodies settling into the open thread, by message id.
     bodies: HashMap<String, BodyArrival>,
+    attachment_fades: HashMap<String, Transition>,
     /// Sent cards already laid out but hidden until the compose hand-off.
     messages_pending: HashSet<String>,
     message_fades: HashMap<String, Transition>,
@@ -396,6 +396,7 @@ impl InboxMotion {
             card_to: None,
             card_glide: None,
             bodies: HashMap::new(),
+            attachment_fades: HashMap::new(),
             messages_pending: HashSet::new(),
             message_fades: HashMap::new(),
             arrival_frame: None,
@@ -602,6 +603,7 @@ impl InboxMotion {
         self.arrival = None;
         self.arrival_pending = true;
         self.bodies.clear();
+        self.attachment_fades.clear();
         self.message_fades.clear();
         self.messages_pending.clear();
         self.arrival_frame = None;
@@ -639,6 +641,7 @@ impl InboxMotion {
         self.arrival_pending = false;
         self.finish_empty_list_entry();
         self.bodies.clear();
+        self.attachment_fades.clear();
         self.message_fades.clear();
         self.messages_pending.clear();
         self.arrival_frame = None;
@@ -718,7 +721,10 @@ impl InboxMotion {
         running |= self.quotes.tick(now);
         running |= self.recipients.tick(now);
         self.message_fades.retain(|_, fade| fade.running(now));
-        running |= !self.bodies.is_empty() || !self.message_fades.is_empty();
+        self.attachment_fades.retain(|_, fade| fade.running(now));
+        running |= !self.bodies.is_empty()
+            || !self.message_fades.is_empty()
+            || !self.attachment_fades.is_empty();
         if self.card_glide.is_some_and(|glide| !glide.running(now)) {
             self.card_glide = None;
         }
@@ -1194,16 +1200,15 @@ impl InboxMotion {
                     fade,
                     height,
                     placeholder,
-                    attachments: false,
                     text: false,
                 },
             );
         }
     }
 
-    pub fn attachments_arrived(&mut self, id: &str) {
-        if let Some(body) = self.bodies.get_mut(id) {
-            body.attachments = true;
+    pub fn attachments_arrived(&mut self, id: &str, now: Instant) {
+        if let Some(fade) = self.motion.start(motion::FADE, now) {
+            self.attachment_fades.insert(id.to_owned(), fade);
         }
     }
 
@@ -1214,10 +1219,9 @@ impl InboxMotion {
     }
 
     pub fn attachment_alphas(&self, now: Instant) -> HashMap<String, f32> {
-        self.bodies
+        self.attachment_fades
             .iter()
-            .filter(|(_, body)| body.attachments)
-            .map(|(id, body)| (id.clone(), body.fade.progress(now)))
+            .map(|(id, fade)| (id.clone(), fade.progress(now)))
             .collect()
     }
 

@@ -390,7 +390,7 @@ impl ReaderBodyFetcher {
             match store.reader_parts(&account, id.as_str())? {
                 ReaderParts::Unknown => unknown.extend(store.body_request(&account, id)?),
                 ReaderParts::Listed { .. } => wanted.extend(store.body_request(&account, id)?),
-                ReaderParts::Ready => {}
+                ReaderParts::Unavailable { .. } | ReaderParts::Ready => {}
             }
         }
 
@@ -405,16 +405,20 @@ impl ReaderBodyFetcher {
                 stored();
             }
             for (id, _, _) in structures {
-                if store.reader_parts(&account, id.as_str())? != ReaderParts::Ready {
+                if matches!(
+                    store.reader_parts(&account, id.as_str())?,
+                    ReaderParts::Listed { .. }
+                ) {
                     wanted.extend(store.body_request(&account, &id)?);
                 }
             }
             for request in missing {
-                // Sync may have filled the gap while the server answered.
+                // A malformed structure does not prevent the full source
+                // from supplying both the body and a verified part list.
                 if store.reader_parts(&account, request.message_id.as_str())?
                     == ReaderParts::Unknown
                 {
-                    failed.push(request.message_id);
+                    wanted.push(request);
                 }
             }
         }

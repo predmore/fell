@@ -112,33 +112,6 @@ impl PartCache {
         &self.root
     }
 
-    /// Check an existing cache entry without creating files or marking it used.
-    /// The reader calls this on its store lane.
-    pub fn is_cached(store: &Store, request: &PartRequest) -> bool {
-        if !request.decoded_size_known {
-            return false;
-        }
-        let Some(root) = Self::default_root() else {
-            return false;
-        };
-        let cache = Self {
-            root,
-            cap: DEFAULT_CACHE_BYTES,
-        };
-        let dir = cache.request_dir(request);
-        let file = dir.join(sanitize_filename(
-            request.part.filename.as_deref(),
-            &request.part.mime_type,
-        ));
-        fs::symlink_metadata(&dir).is_ok_and(|meta| meta.is_dir() && meta.uid() == user_id())
-            && fs::symlink_metadata(file).is_ok_and(|meta| {
-                meta.is_file() && meta.uid() == user_id() && meta.len() == request.part.size
-            })
-            && store
-                .cached_part_state(request)
-                .is_ok_and(|state| state.is_some_and(|(_, pending)| !pending))
-    }
-
     fn entry_dir(&self, account: &str, message: &str, section: &str) -> PathBuf {
         let mut hash = Sha256::new();
         for field in [account, message, section] {

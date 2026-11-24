@@ -1802,6 +1802,22 @@ impl Session {
         for (new, old) in messages.iter_mut().zip(&self.messages) {
             new.expanded = old.expanded;
         }
+        if let Some(target) = &mut self.attachment_focus
+            && let Some((old, new)) = self
+                .messages
+                .iter()
+                .zip(&messages)
+                .find(|(old, _)| old.id == target.message)
+            && matches!(old.reader_parts, fell_core::ReaderParts::Listed { .. })
+            && new.reader_parts == fell_core::ReaderParts::Ready
+            && let Some(part) = new.attachments.iter().find(|part| {
+                part.section == target.part.section
+                    && part.filename == target.part.filename
+                    && part.mime_type == target.part.mime_type
+            })
+        {
+            target.part = part.clone();
+        }
         self.messages = messages;
         if self.focused_attachment().is_none() {
             self.leave_attachments();

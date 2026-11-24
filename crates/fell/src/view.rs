@@ -663,8 +663,7 @@ struct Inbox {
     attachment_busy: bool,
     attachment_retry: Option<AttachmentRequest>,
     attachment_download: Option<(String, String, Download)>,
-    attachment_marks: HashMap<(String, String), AttachmentMark>,
-    cached_files: HashSet<(String, String)>,
+    failed_attachments: HashSet<(String, String)>,
     reveal_attachment: bool,
     forwarding_attachments: bool,
     note_view: agent_notes::NoteView,
@@ -898,8 +897,7 @@ impl Inbox {
             attachment_busy: false,
             attachment_retry: None,
             attachment_download: None,
-            attachment_marks: HashMap::new(),
-            cached_files: HashSet::new(),
+            failed_attachments: HashSet::new(),
             reveal_attachment: false,
             forwarding_attachments: false,
             note_view: agent_notes::NoteView::default(),
@@ -1760,6 +1758,8 @@ impl Inbox {
             self.open_thread.is_some() && present::awaiting_bodies(&self.session.messages);
         for row in &rows {
             self.row_widths.observe_labels(&row.id, &row.labels, now);
+            self.row_widths
+                .observe_attachment(&row.id, row.has_attachment, now);
         }
         self.waiting_for_first_rows &= rows.is_empty();
         self.session.set_page(rows, more_before, more_after, unread);
@@ -1956,6 +1956,7 @@ impl Inbox {
                                         previous_labels: None,
                                         label_scope: None,
                                         unread_note: false,
+                                        attachment_alpha: 1.0,
                                     };
                                     thread_row(
                                         &row_theme,
@@ -2382,20 +2383,41 @@ impl Inbox {
         });
         let cached = self.bodies.stamps();
         let wait_for_body = self.first_preview.waits_for_body();
+        let expanded: HashSet<_> = self
+            .session
+            .messages
+            .iter()
+            .filter(|message| !opening && message.expanded)
+            .map(|message| message.id.clone())
+            .collect();
         let reply = self.store.call(move |store| {
             if current.load(Ordering::SeqCst) != generation {
                 return Ok(None);
             }
-            let mut view =
-                read_conversation(store, &account, &thread, (&me, &roles, &names, &viewing))
-                    .map_err(|err| err.to_string())?;
-            // The automatic preview after setup waits for the last message.
-            // Each sync write refreshes the folder and retries this read.
-            if wait_for_body && !present::newest_body_ready(&view) {
+            let shown = store
+                .read_snapshot(|| {
+                    let mut view = read_conversation(
+                        store,
+                        &account,
+                        &thread,
+                        (&me, &roles, &names, &viewing),
+                    )?;
+                    // The automatic preview after setup waits for the last message.
+                    if wait_for_body && !present::newest_body_ready(&view) {
+                        return Ok(None);
+                    }
+                    for message in &mut view {
+                        message.expanded |= expanded.contains(&message.id);
+                    }
+                    let reads = mail_body::read_bodies_with_latest(
+                        store, &account, &mut view, &cached, !opening,
+                    );
+                    Ok(Some((view, reads)))
+                })
+                .map_err(|err| err.to_string())?;
+            let Some((view, reads)) = shown else {
                 return Ok(None);
-            }
-            let reads = mail_body::read_bodies(store, &account, &mut view, &cached);
-            let cached_files = cached_attachment_keys(store, &account, &view);
+            };
             let matches = query.as_ref().map(|(accepted, query)| {
                 (
                     *accepted,
@@ -2417,7 +2439,6 @@ impl Inbox {
                 view,
                 reads,
                 matches,
-                cached_files,
                 notes,
                 latest_note,
                 note_generation,
@@ -2477,17 +2498,27 @@ impl Inbox {
                 mut view,
                 reads,
                 matches,
-                cached_files,
                 notes,
                 latest_note,
                 note_generation,
             })) => {
-                inbox.cached_files = cached_files;
                 if let Some(notes) = notes {
                     inbox.update_agent_notes(note_generation, &id, notes);
                 }
                 let automatic = inbox.first_preview.take();
                 inbox.body_loads.accept(reads, &mut inbox.bodies, &mut view);
+                if inbox.session.search.is_some() {
+                    let attached = view.iter().any(|message| !message.attachments.is_empty());
+                    if let Some(row) = inbox.session.threads.iter_mut().find(|row| row.id == id)
+                        && row.has_attachment != attached
+                    {
+                        inbox
+                            .row_widths
+                            .observe_attachment(&id, attached, inbox.frame_now);
+                        row.has_attachment = attached;
+                        inbox.search_view.invalidate_row_previews();
+                    }
+                }
                 inbox.session.clear_query_fault(QueryFault::Message);
                 let same = inbox.open_thread.as_deref() == Some(id.as_str());
                 // Sync may rekey the thread as its bodies arrive.
@@ -2732,14 +2763,17 @@ impl Inbox {
 
         self.reader_bodies.generation = self.reader_bodies.generation.wrapping_add(1);
         let generation = self.reader_bodies.generation;
-        self.reader_bodies
-            .reserved
-            .extend(ids.iter().map(|id| id.0.clone()));
+        let started = Instant::now();
+        for id in &ids {
+            self.reader_bodies
+                .started
+                .entry(id.0.clone())
+                .or_insert(started);
+        }
         let (job, mut events) = fetcher.fetch(ids.clone());
         self.reader_bodies.active = Some(ReaderRequest {
             ids,
             generation,
-            started: Instant::now(),
             _job: job,
         });
         cx.spawn(async move |this, cx| {
@@ -2747,7 +2781,7 @@ impl Inbox {
                 .timer(reader_body_worker::SHOW_AFTER)
                 .await;
             let _ = this.update(cx, |inbox, cx| {
-                if inbox.reader_bodies.is_active(generation) {
+                if inbox.reader_bodies.generation == generation {
                     cx.notify();
                 }
             });
@@ -2761,7 +2795,10 @@ impl Inbox {
                         return false;
                     }
                     match event {
-                        reader_body_worker::Event::Stored => inbox.reread_open_thread(cx),
+                        reader_body_worker::Event::Stored => {
+                            inbox.reread_open_thread(cx);
+                            inbox.request_threads(ReadIntent::default(), cx);
+                        }
                         reader_body_worker::Event::Finished(result) => {
                             inbox.finish_reader_parts(result, cx);
                         }
@@ -4524,7 +4561,7 @@ impl Inbox {
             now,
             height,
             downloading,
-            &self.reader_bodies.reserved,
+            &mut self.reader_bodies,
         );
         if let Some(generation) = generation {
             self.finish_body_refresh_at(generation, true, now);
@@ -5179,6 +5216,10 @@ impl Render for Inbox {
             alphas: self.motion.body_alphas(now),
             attachment_alphas: self.motion.attachment_alphas(now),
             replacing_text: self.motion.replacing_body_text(),
+            body_probes: self.reader_bodies.body_probes.clone(),
+            fallback_text: self.reader_bodies.fallback_since.keys().cloned().collect(),
+            attachment_sizes: self.reader_bodies.sizes.clone(),
+            now: Some(now),
             heights: self.motion.body_heights(now),
             outgoing_placeholders: self.motion.body_placeholders(),
             preview_padding,
@@ -5186,8 +5227,7 @@ impl Render for Inbox {
             anchor: returning.map(|(anchor, _)| anchor).or(anchor),
             frames: self.frames.clone(),
             attachment_download: self.attachment_download.clone(),
-            attachment_marks: self.attachment_marks.clone(),
-            cached_files: self.cached_files.clone(),
+            failed_attachments: self.failed_attachments.clone(),
             reveal_attachment,
             preview_current,
             quiet_preview: self.quiet_search_preview(),
@@ -5235,6 +5275,11 @@ impl Render for Inbox {
             | conv.missing_fade.is_some()
             | conv.match_line.animating
             | self.row_widths.running(now)
+            | self
+                .reader_bodies
+                .sizes
+                .values()
+                .any(|size| size.from.is_some_and(|(_, fade)| fade.running(now)))
             | agents_animating
             | activity_animating
             | self.search_view.animating(now)
@@ -5495,12 +5540,6 @@ struct ListContent {
     cached_results: Option<(u64, gpui::AnyView)>,
 }
 
-#[derive(Clone, Copy)]
-enum AttachmentMark {
-    Ready,
-    Failed,
-}
-
 /// What the conversation's bodies show this frame beyond the session.
 #[derive(Default)]
 struct ConvFrame {
@@ -5517,6 +5556,10 @@ struct ConvFrame {
     alphas: HashMap<String, f32>,
     attachment_alphas: HashMap<String, f32>,
     replacing_text: HashSet<String>,
+    body_probes: HashMap<String, Rc<Cell<f32>>>,
+    fallback_text: HashSet<String>,
+    attachment_sizes: HashMap<(String, String), AttachmentSize>,
+    now: Option<Instant>,
     card_alphas: HashMap<String, f32>,
     heights: HashMap<String, (f32, f32)>,
     outgoing_placeholders: HashMap<String, bool>,
@@ -5526,8 +5569,7 @@ struct ConvFrame {
     anchor: Option<ScrollAnchor>,
     frames: Option<SharedFrameLog>,
     attachment_download: Option<(String, String, Download)>,
-    attachment_marks: HashMap<(String, String), AttachmentMark>,
-    cached_files: HashSet<(String, String)>,
+    failed_attachments: HashSet<(String, String)>,
     reveal_attachment: bool,
     preview_current: bool,
     quiet_preview: bool,
@@ -6561,6 +6603,12 @@ fn thread_list(
                             previous_labels,
                             label_scope: inbox.list_label.clone(),
                             unread_note: inbox.session.agent_notes.unread.contains(&row.id),
+                            attachment_alpha: inbox.row_widths.attachment_alpha(
+                                &row.id,
+                                row.has_attachment,
+                                now,
+                                drawn,
+                            ),
                         };
                         let element =
                             thread_row(&theme_for_rows, &row, index, &look, text_width, window, cx);
@@ -6607,6 +6655,12 @@ fn thread_list(
                                             .agent_notes
                                             .unread
                                             .contains(&row.id),
+                                        attachment_alpha: inbox.row_widths.attachment_alpha(
+                                            &row.id,
+                                            row.has_attachment,
+                                            now,
+                                            false,
+                                        ),
                                     };
                                     Some(slot_layer(dy, 1.0).child(thread_row(
                                         &theme_for_rows,
@@ -6807,6 +6861,7 @@ fn ghost_row(
         previous_labels: None,
         label_scope,
         unread_note: false,
+        attachment_alpha: 1.0,
     };
     slot_layer(motion::snap(top, window.scale_factor()), opacity)
         .child(thread_row(
@@ -6849,6 +6904,7 @@ struct RowLook {
     previous_labels: Option<(Vec<String>, f32)>,
     label_scope: Option<String>,
     unread_note: bool,
+    attachment_alpha: f32,
 }
 
 /// The list's left border, which the unread bars sit just inside.
@@ -7055,6 +7111,7 @@ fn thread_line_one(
                         div()
                             .flex_none()
                             .text_color(rgb(dim))
+                            .opacity(look.attachment_alpha)
                             .child(THREAD_ATTACHMENT_MARK),
                     )
                 })
@@ -7994,13 +8051,11 @@ struct ConversationRead {
     view: Vec<ConvMessage>,
     reads: mail_body::BodyReads,
     matches: Option<(u64, Vec<fell_core::SearchMatch>)>,
-    cached_files: HashSet<(String, String)>,
 }
 
 struct ReaderRequest {
     ids: Vec<MessageId>,
     generation: u64,
-    started: Instant,
     _job: reader_body_worker::Job,
 }
 
@@ -8010,8 +8065,10 @@ struct ReaderBodies {
     generation: u64,
     failed: HashMap<String, reader_body_worker::Failure>,
     completed: HashSet<String>,
-    reserved: HashSet<String>,
-    announced: HashSet<String>,
+    started: HashMap<String, Instant>,
+    fallback_since: HashMap<String, Instant>,
+    body_probes: HashMap<String, Rc<Cell<f32>>>,
+    sizes: HashMap<(String, String), AttachmentSize>,
 }
 
 #[derive(Clone, Copy)]
@@ -8044,89 +8101,129 @@ impl ReaderBodies {
 
     fn labels(&mut self, session: &Session, now: Instant) -> HashMap<String, ReaderLabel> {
         use fell_core::ReaderParts::*;
-        if let Some(active) = &self.active
-            && now.saturating_duration_since(active.started) >= reader_body_worker::SHOW_AFTER
-        {
-            self.announced
-                .extend(active.ids.iter().map(|id| id.0.clone()));
-        }
         session
             .messages
             .iter()
-            .filter(|message| message.expanded && self.reserved.contains(&message.id))
-            .map(|message| {
+            .filter(|message| message.expanded)
+            .filter_map(|message| {
                 let parts = message.reader_parts;
-                let html = matches!(parts, Listed { html: true });
-                let label = if message.needs_reader_parts()
-                    && let Some(failure) = self.failed.get(&message.id)
-                {
-                    ReaderLabel::Failed {
-                        offline: matches!(failure, reader_body_worker::Failure::Offline),
+                let started = self.started.get(&message.id);
+                let managed = started.is_some() || parts != Ready;
+                if !managed {
+                    return None;
+                }
+                let html_ready = matches!(message.rich, Rich::Html(_) | Rich::PlainPart(_));
+                if !html_ready && message.rich != Rich::Pending && !message.body.blocks.is_empty() {
+                    self.fallback_since.entry(message.id.clone()).or_insert(now);
+                }
+                let text = self.fallback_since.contains_key(&message.id);
+                self.body_probes.entry(message.id.clone()).or_default();
+                let label = match parts {
+                    Unavailable { html } => ReaderLabel::Failed {
+                        offline: false,
                         html,
-                        unknown: parts == Unknown,
+                        unknown: false,
+                    },
+                    _ if started.is_none_or(|started| {
+                        now.saturating_duration_since(*started) < reader_body_worker::SHOW_AFTER
+                    }) =>
+                    {
+                        ReaderLabel::Hidden
                     }
-                } else if !self.announced.contains(&message.id) {
-                    ReaderLabel::Hidden
-                } else {
-                    match parts {
-                        Unknown => ReaderLabel::Checking,
-                        Listed { .. } if !message.needs_reader_parts() => ReaderLabel::Hidden,
-                        Listed { html: true } => ReaderLabel::Formatted,
-                        Listed { html: false } => ReaderLabel::Loading,
-                        Ready if message.rich == Rich::Pending => ReaderLabel::Formatted,
-                        Ready => ReaderLabel::Hidden,
+                    _ if message.needs_reader_parts()
+                        && let Some(failure) = self.failed.get(&message.id) =>
+                    {
+                        ReaderLabel::Failed {
+                            offline: matches!(failure, reader_body_worker::Failure::Offline),
+                            html: matches!(parts, Listed { html: true }),
+                            unknown: parts == Unknown,
+                        }
                     }
+                    Unknown if text => ReaderLabel::Checking,
+                    Unknown => ReaderLabel::Loading,
+                    Listed { .. } if !message.needs_reader_parts() => ReaderLabel::Hidden,
+                    Listed { html: true } if text => ReaderLabel::Formatted,
+                    Listed { .. } => ReaderLabel::Loading,
+                    Ready if message.rich == Rich::Pending && text => ReaderLabel::Formatted,
+                    Ready if message.rich == Rich::Pending => ReaderLabel::Loading,
+                    Ready => ReaderLabel::Hidden,
                 };
-                (message.id.clone(), label)
+                Some((message.id.clone(), label))
             })
             .collect()
     }
+
+    fn fallback_was_visible(&self, id: &str) -> bool {
+        self.fallback_since
+            .get(id)
+            .is_some_and(|at| at.elapsed() >= reader_body_worker::SHOW_AFTER)
+    }
+
+    fn reconcile_sizes(
+        &mut self,
+        old: &ConvMessage,
+        new: &ConvMessage,
+        motion: Motion,
+        now: Instant,
+    ) {
+        use fell_core::ReaderParts::{Listed, Ready};
+        if !matches!(old.reader_parts, Listed { .. }) || new.reader_parts != Ready {
+            return;
+        }
+        for part in &new.attachments {
+            if let Some(previous) = old.attachments.iter().find(|old| {
+                old.section == part.section
+                    && old.filename == part.filename
+                    && old.mime_type == part.mime_type
+            }) {
+                let close = part.size.abs_diff(previous.size) <= part.size / 10;
+                let size = if close { previous.size } else { part.size };
+                let transition = (!close).then(|| motion.start(motion::FADE, now)).flatten();
+                self.sizes.insert(
+                    (new.id.clone(), part.section.clone()),
+                    AttachmentSize {
+                        size,
+                        from: transition.map(|fade| (previous.size, fade)),
+                    },
+                );
+            }
+        }
+    }
 }
 
-fn reader_label(
-    theme: &Theme,
-    columns: ReaderColumns,
-    session: &Session,
-    label: ReaderLabel,
-) -> gpui::AnyElement {
-    let (line, color) = match label {
-        ReaderLabel::Hidden => (String::new(), theme.dimmed),
-        ReaderLabel::Checking => ("Checking message parts…".into(), theme.dimmed),
-        ReaderLabel::Formatted => ("Loading formatted version…".into(), theme.dimmed),
-        ReaderLabel::Loading => ("Loading message…".into(), theme.dimmed),
-        ReaderLabel::Failed {
-            offline,
-            html,
-            unknown,
-        } => {
-            let retry = keymap::binding_text(&session.keymap, Action::SyncNow);
-            let missing = if unknown {
-                "Parts"
-            } else if html {
-                "Formatted version"
-            } else {
-                "Body"
-            };
-            let reason = if offline {
-                "unavailable offline"
-            } else {
-                "couldn’t load"
-            };
-            (format!("{missing} {reason} · {retry} retry"), theme.error)
-        }
-    };
-    columns.flow(
-        |columns| columns.prose,
-        |_, _| {
-            div()
-                .h(px(theme.ui_px * 1.45))
-                .text_size(px(theme.ui_px - 1.0))
-                .text_color(rgb(color))
-                .truncate()
-                .child(line.clone())
-                .into_any_element()
-        },
-    )
+#[derive(Clone, Copy)]
+struct AttachmentSize {
+    size: u64,
+    from: Option<(u64, Transition)>,
+}
+
+impl ReaderLabel {
+    fn text(self, session: &Session) -> Option<(String, bool)> {
+        let retry = || keymap::binding_text(&session.keymap, Action::SyncNow);
+        Some(match self {
+            Self::Hidden => return None,
+            Self::Checking => ("Checking for attachments…".into(), false),
+            Self::Formatted => ("Loading formatted version…".into(), false),
+            Self::Loading => ("Loading message…".into(), false),
+            Self::Failed { offline: true, .. } => (
+                format!(
+                    "Offline · attachments and formatting not loaded · {} retry",
+                    retry()
+                ),
+                true,
+            ),
+            Self::Failed { html, unknown, .. } => {
+                let missing = if unknown {
+                    "Attachments and formatting"
+                } else if html {
+                    "Formatted version"
+                } else {
+                    "Message"
+                };
+                (format!("{missing} couldn’t load · {} retry", retry()), true)
+            }
+        })
+    }
 }
 
 #[derive(Default)]
@@ -8177,7 +8274,7 @@ impl BodyRefresh {
         now: Instant,
         height: impl Fn(usize) -> Option<f32>,
         downloading: bool,
-        fetched: &HashSet<String>,
+        reader: &mut ReaderBodies,
     ) {
         let mut rich = self.rich;
         if let Some((mut messages, _)) = self.messages {
@@ -8189,28 +8286,34 @@ impl BodyRefresh {
             let changed = present::bodies_filled(&session.messages, &messages)
                 .expect("a queued reread keeps the same message order");
             for index in changed {
-                let old_height = session.messages[index]
-                    .expanded
-                    .then(|| height(index))
-                    .flatten();
-                let placeholder = (session.messages[index].body_state
-                    == fell_core::BodyState::Pending
-                    && messages[index].body_state != fell_core::BodyState::Pending)
-                    .then_some(downloading);
-                let id = &messages[index].id;
-                motion.body_arrived(id, old_height, placeholder, now);
-                if session.messages[index].attachments.is_empty()
-                    && !messages[index].attachments.is_empty()
-                {
-                    motion.attachments_arrived(id);
+                let old = &session.messages[index];
+                let new = &messages[index];
+                let id = &new.id;
+                reader.reconcile_sizes(old, new, motion.motion, now);
+                if !old.expanded {
+                    continue;
                 }
-                if matches!(messages[index].rich, Rich::Html(_) | Rich::PlainPart(_))
-                    && matches!(
-                        session.messages[index].reader_parts,
-                        fell_core::ReaderParts::Listed { html: true }
-                    )
-                {
-                    motion.body_text_replaced(id);
+                if old.attachments.is_empty() && !new.attachments.is_empty() {
+                    motion.attachments_arrived(id, now);
+                }
+                let managed = reader.body_probes.contains_key(id);
+                let prepared =
+                    matches!(new.rich, Rich::Html(_) | Rich::PlainPart(_)) && new.rich != old.rich;
+                if managed {
+                    // Metadata and a staged HTML read leave the displayed text
+                    // and the existing chips unchanged.
+                    if prepared || (new.rich != Rich::Pending && old.body != new.body) {
+                        let height = reader.body_probes.get(id).map(|slot| slot.get());
+                        motion.body_arrived(id, height, None, now);
+                        if prepared && reader.fallback_was_visible(id) {
+                            motion.body_text_replaced(id);
+                        }
+                    }
+                } else {
+                    let placeholder = (old.body_state == fell_core::BodyState::Pending
+                        && new.body_state != fell_core::BodyState::Pending)
+                        .then_some(downloading);
+                    motion.body_arrived(id, height(index), placeholder, now);
                 }
             }
             session.refresh_same_messages(messages);
@@ -8220,9 +8323,14 @@ impl BodyRefresh {
                     && ready != message.rich
                 {
                     if message.expanded {
-                        motion.body_arrived(&message.id, height(index), None, now);
-                        if fetched.contains(&message.id)
-                            && message.rich == Rich::Pending
+                        let measured = reader.body_probes.get(&message.id).map(|slot| slot.get());
+                        motion.body_arrived(
+                            &message.id,
+                            measured.or_else(|| height(index)),
+                            None,
+                            now,
+                        );
+                        if reader.fallback_was_visible(&message.id)
                             && matches!(ready, Rich::Html(_) | Rich::PlainPart(_))
                         {
                             motion.body_text_replaced(&message.id);
@@ -8233,30 +8341,6 @@ impl BodyRefresh {
             }
         }
     }
-}
-
-fn cached_attachment_keys(
-    store: &fell_core::Store,
-    account: &AccountId,
-    messages: &[ConvMessage],
-) -> HashSet<(String, String)> {
-    messages
-        .iter()
-        .filter(|message| !message.attachments.is_empty())
-        .flat_map(|message| {
-            message.attachments.iter().filter_map(|part| {
-                let request = fell_core::PartRequest {
-                    account_id: account.clone(),
-                    message_id: MessageId(message.id.clone()),
-                    part: part.clone(),
-                    copies: Vec::new(),
-                    decoded_size_known: message.reader_parts == fell_core::ReaderParts::Ready,
-                };
-                fell_core::PartCache::is_cached(store, &request)
-                    .then(|| (message.id.clone(), part.section.clone()))
-            })
-        })
-        .collect()
 }
 
 /// One thread's messages as the conversation shows them, with whether
@@ -8296,7 +8380,10 @@ pub fn read_conversation(
             message.snippet = present::markdown_snippet(&body, &stored.headers.subject);
         }
         if stored.has_attachment
-            || matches!(message.reader_parts, fell_core::ReaderParts::Listed { .. })
+            || matches!(
+                message.reader_parts,
+                fell_core::ReaderParts::Listed { .. } | fell_core::ReaderParts::Unavailable { .. }
+            )
         {
             let parts = store.message_attachments(account, &stored.headers.message_id)?;
             message.attachments = attachments::visible_parts(parts.unwrap_or_default());
@@ -8403,14 +8490,20 @@ fn conversation(
                 block
             };
             let block = match frame.heights.get(&message.id) {
-                Some(&(from, progress)) if progress < 1.0 && message.expanded => GrowingMessage {
-                    inner: block,
-                    width: px(columns.pane_right + 2. * MESSAGE_PAD_PX),
-                    from,
-                    progress,
-                    gap: px(MESSAGE_GAP_PX),
+                Some(&(from, progress))
+                    if progress < 1.0
+                        && message.expanded
+                        && !frame.body_probes.contains_key(&message.id) =>
+                {
+                    GrowingMessage {
+                        inner: block,
+                        width: px(columns.pane_right + 2. * MESSAGE_PAD_PX),
+                        from,
+                        progress,
+                        gap: px(MESSAGE_GAP_PX),
+                    }
+                    .into_any_element()
                 }
-                .into_any_element(),
                 _ => block,
             };
             let block = if let Some(padding) = padding.filter(|_| index + 1 == shown.len()) {
@@ -8651,7 +8744,9 @@ fn collapsed_message(
     let mut date = present::relative_date(now, message.date_unix);
     let dimmed = motion::mix(theme.dimmed, theme.on_selection, cursor);
     let (body, outgoing) = frame.body_labels(message);
-    let missing = present::missing_body_line(message.body_state, frame.syncing);
+    let missing = (message.body_state == fell_core::BodyState::TooLarge)
+        .then(|| present::missing_body_line(message.body_state, frame.syncing))
+        .flatten();
     let snippet = missing.as_deref().unwrap_or(&message.snippet);
     let measure =
         |text: &str| line_px_with_style(window, &rows.style, text, FontWeight::NORMAL).ceil();
@@ -8832,16 +8927,34 @@ fn expanded_header_flow(
     )
 }
 
+fn reader_status_text(theme: &Theme, text: &str, failed: bool, width: f32) -> gpui::Div {
+    div()
+        .w(px(width))
+        .flex_none()
+        .text_right()
+        .text_size(px(13.))
+        .text_color(rgb(if failed { theme.error } else { theme.dimmed }))
+        .truncate()
+        .child(text.to_owned())
+}
+
 fn expanded_message_header(
     theme: &Theme,
     message: &ConvMessage,
     columns: ReaderColumns,
+    status: Option<&(String, bool)>,
     window: &Window,
 ) -> gpui::Div {
     let style = conversation_line_style(window, theme, px(theme.ui_px - 1.));
     let sender_style = conversation_line_style(window, theme, px(theme.ui_px));
     let date = present::relative_date(now_unix(), message.date_unix);
     let date_width = line_px_with_style(window, &sender_style, &date, FontWeight::NORMAL).ceil();
+    let status_style = conversation_line_style(window, theme, px(13.));
+    let status_width = status.map_or(0.0, |(text, _)| {
+        line_px_with_style(window, &status_style, text, FontWeight::NORMAL)
+            .ceil()
+            .min((columns.card.width - date_width - 96.).max(0.))
+    });
     let sender = present::display_safe(&message.sender);
     let email = present::display_safe(&message.email);
     let folders = message
@@ -8863,7 +8976,12 @@ fn expanded_message_header(
         ),
         measure(&style, &email, FontWeight::NORMAL, theme.dimmed),
         measure(&style, &joined, FontWeight::NORMAL, theme.dimmed),
-        date_width,
+        date_width
+            + if status.is_some() {
+                status_width + MESSAGE_HEADER_GAP_PX
+            } else {
+                0.
+            },
     ];
     let fit = |style: &TextStyle, text: &str, width: f32, weight, color| {
         clip_shaped(window, style, text, width.floor(), weight, Some(color))
@@ -8958,7 +9076,13 @@ fn expanded_message_header(
                 .max_w(px(columns.card.width))
                 .flex()
                 .justify_end()
+                .gap(px(MESSAGE_HEADER_GAP_PX))
                 .overflow_hidden()
+                .children(
+                    status.map(|(text, failed)| {
+                        reader_status_text(theme, text, *failed, status_width)
+                    }),
+                )
                 .child(shaped_text(line, window))
         }),
     )
@@ -8978,6 +9102,10 @@ fn expanded_message(
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
+    let status = frame
+        .part_status
+        .get(&message.id)
+        .and_then(|label| label.text(session));
     let dim = theme.dimmed;
     div()
         .id(gpui::ElementId::named_usize("message", index))
@@ -9009,7 +9137,13 @@ fn expanded_message(
                 }),
             )
         })
-        .child(expanded_message_header(theme, message, columns, window))
+        .child(expanded_message_header(
+            theme,
+            message,
+            columns,
+            status.as_ref().filter(|_| message.recipients.is_none()),
+            window,
+        ))
         .children(message.recipients.as_ref().map(|line| {
             div()
                 .id(gpui::ElementId::named_usize("recipients", index))
@@ -9029,6 +9163,7 @@ fn expanded_message(
                             frame.disclosures().recipients.get(&message.id).copied(),
                             index,
                             width,
+                            status.as_ref(),
                             Live(live.0 && active),
                             window,
                             cx,
@@ -9054,38 +9189,37 @@ fn expanded_message(
                     })),
             ),
         )
-        .children(
-            frame
-                .part_status
-                .get(&message.id)
-                .map(|label| reader_label(theme, columns, session, *label)),
-        )
         // `q` opens every collapsed block in the message at once, so only
         // the first fold of the reader's message names the key.
-        .child(message_body(
-            theme,
+        .child(measured_message_body(
             message,
-            FoldView {
-                open: frame.leaving.as_ref().map_or_else(
-                    || session.is_open(&message.id),
-                    |(reader, _)| reader.quotes.contains(&message.id),
-                ),
-                columns,
-                name_key: index
-                    == frame
-                        .leaving
-                        .as_ref()
-                        .map_or(session.message_cursor, |(reader, _)| {
-                            reader.layout.message_cursor
-                        }),
-                focused: cursor,
-                fill,
-                index,
-                live: live.0,
-            },
+            columns,
             frame,
-            window,
-            cx,
+            message_body(
+                theme,
+                message,
+                FoldView {
+                    open: frame.leaving.as_ref().map_or_else(
+                        || session.is_open(&message.id),
+                        |(reader, _)| reader.quotes.contains(&message.id),
+                    ),
+                    columns,
+                    name_key: index
+                        == frame
+                            .leaving
+                            .as_ref()
+                            .map_or(session.message_cursor, |(reader, _)| {
+                                reader.layout.message_cursor
+                            }),
+                    focused: cursor,
+                    fill,
+                    index,
+                    live: live.0,
+                },
+                frame,
+                window,
+                cx,
+            ),
         ))
         .when(!message.attachments.is_empty(), |card| {
             card.child(
@@ -9114,6 +9248,40 @@ fn expanded_message(
                     )),
             )
         })
+        .into_any_element()
+}
+
+fn measured_message_body(
+    message: &ConvMessage,
+    columns: ReaderColumns,
+    frame: &ConvFrame,
+    body: gpui::AnyElement,
+) -> gpui::AnyElement {
+    let Some(probe) = frame.body_probes.get(&message.id).cloned() else {
+        return body;
+    };
+    let body = match frame.heights.get(&message.id) {
+        Some(&(from, progress)) if progress < 1.0 => GrowingMessage {
+            inner: body,
+            width: px(columns.pane_right),
+            from,
+            progress,
+            gap: px(0.),
+        }
+        .into_any_element(),
+        _ => body,
+    };
+    div()
+        .relative()
+        .child(body)
+        .child(
+            gpui::canvas(
+                move |bounds, _, _| probe.set(f32::from(bounds.size.height)),
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .inset_0(),
+        )
         .into_any_element()
 }
 
@@ -9148,20 +9316,23 @@ fn message_body(
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
-    let (alpha, outgoing) = frame.body_labels(message);
-    let status = frame.part_status.get(&message.id);
-    let hide = message.reader_parts == fell_core::ReaderParts::Unknown
-        && matches!(status, Some(ReaderLabel::Hidden | ReaderLabel::Checking));
-    let body = match present::missing_body_line(message.body_state, frame.syncing) {
-        _ if hide => stored_message_body(theme, message, folds, frame, 0.0, cx),
-        Some(_) if message.body_state == fell_core::BodyState::Pending && status.is_some() => {
-            missing_message_body(theme, folds.columns, "", 0.0)
-        }
-        Some(line) => missing_message_body(theme, folds.columns, &line, alpha),
-        None => {
-            let style = conversation_line_style(window, theme, px(theme.ui_px));
-            let markers = crate::render::ListMarkerFont::new(window, style);
-            stored_message_body(theme, message, folds, frame, alpha, &markers, cx)
+    let managed = frame.part_status.contains_key(&message.id);
+    let (alpha, outgoing) = if managed {
+        (frame.body_alpha(&message.id), None)
+    } else {
+        frame.body_labels(message)
+    };
+    let style = conversation_line_style(window, theme, px(theme.ui_px));
+    let markers = crate::render::ListMarkerFont::new(window, style);
+    let body = if managed
+        && (message.body_state == fell_core::BodyState::Pending
+            || (message.rich == Rich::Pending && !frame.fallback_text.contains(&message.id)))
+    {
+        div().into_any_element()
+    } else {
+        match present::missing_body_line(message.body_state, frame.syncing) {
+            Some(line) => missing_message_body(theme, folds.columns, &line, alpha),
+            None => stored_message_body(theme, message, folds, frame, alpha, &markers, cx),
         }
     };
     let old = if let Some(line) = outgoing {
@@ -9178,6 +9349,7 @@ fn message_body(
             },
             frame,
             1.0 - alpha,
+            &markers,
             cx,
         )
     } else {
@@ -9698,6 +9870,7 @@ fn recipient_lines(
     reveal: Option<f32>,
     index: usize,
     width: f32,
+    status: Option<&(String, bool)>,
     live: Live,
     window: &Window,
     cx: &mut Context<Inbox>,
@@ -9715,6 +9888,19 @@ fn recipient_lines(
     let size = px(theme.ui_px - 1.0);
     let style = conversation_line_style(window, theme, size);
     let space = line_px_with_style(window, &style, " ", FontWeight::NORMAL);
+    let status_style = conversation_line_style(window, theme, px(13.));
+    let status_width = status.map_or(0.0, |(text, _)| {
+        line_px_with_style(window, &status_style, text, FontWeight::NORMAL)
+            .ceil()
+            .min((width - 54.).max(0.))
+    });
+    let status =
+        status.map(|(text, failed)| reader_status_text(theme, text, *failed, status_width));
+    let recipient_width = if status_width > 0.0 {
+        width - status_width - 8.
+    } else {
+        width
+    };
     let details = || {
         div()
             .flex()
@@ -9782,13 +9968,14 @@ fn recipient_lines(
         // Only a single name too long for the pane is cut, with an ellipsis.
         // The text takes the box's colour, so hover reaches it.
         let measure = |text: &str| line_px_with_style(window, &style, text, FontWeight::NORMAL);
-        let (names, tail, _) =
-            present::fit_recipients(line, |names, tail| measure(names) + measure(tail) <= width);
+        let (names, tail, _) = present::fit_recipients(line, |names, tail| {
+            measure(names) + measure(tail) <= recipient_width
+        });
         let names = clip_line(
             window,
             &style,
             &names,
-            (width - measure(&tail)).max(40.0),
+            (recipient_width - measure(&tail)).max(24.0),
             FontWeight::NORMAL,
         );
         div()
@@ -9808,11 +9995,13 @@ fn recipient_lines(
         .text_size(size)
         .child(
             div()
+                .relative()
                 .when(live.0, |body| {
                     body.cursor_pointer()
                         .on_mouse_down(MouseButton::Left, toggle)
                 })
-                .child(disclosure(width, open, reveal, summary, details)),
+                .child(disclosure(recipient_width, open, reveal, summary, details))
+                .children(status.map(|status| status.absolute().right_0().top_0())),
         )
         .into_any_element()
 }
@@ -11820,7 +12009,6 @@ mod tests {
             let id = inbox.open_thread.clone().unwrap();
             inbox.read_in_flight = true;
             let reply = super::ConversationRead {
-                cached_files: Default::default(),
                 notes: None,
                 latest_note: None,
                 note_generation: 0,
@@ -11838,7 +12026,6 @@ mod tests {
             );
             let id = inbox.open_thread.clone().unwrap();
             let reply = super::ConversationRead {
-                cached_files: Default::default(),
                 notes: None,
                 latest_note: None,
                 note_generation: 0,
@@ -11931,7 +12118,6 @@ mod tests {
                 row.id,
                 before + 1,
                 Ok(Some(super::ConversationRead {
-                    cached_files: Default::default(),
                     notes: None,
                     latest_note: None,
                     note_generation: 0,
@@ -12065,7 +12251,6 @@ mod tests {
                     row.id.clone(),
                     read,
                     Ok(Some(super::ConversationRead {
-                        cached_files: Default::default(),
                         notes: None,
                         latest_note: None,
                         note_generation: 0,
@@ -12149,7 +12334,7 @@ mod tests {
             now,
             |_| Some(100.),
             pending.downloading(&SyncKind::LocalOffline),
-            &Default::default(),
+            &mut Default::default(),
         );
         pending.applied(
             8,

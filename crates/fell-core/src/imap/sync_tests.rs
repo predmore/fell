@@ -4706,8 +4706,10 @@ fn reader_stores_metadata_and_bodies_before_the_sync_pass_finishes() {
         r#"("TEXT" "PLAIN" NIL NIL NIL "7BIT" 5 1 NIL ("ATTACHMENT" ("FILENAME" "route.txt"))) "MIXED")"#,
     );
     let server = TestServer::spawn_parallel(
-        inbox_state((1..=5).map(|uid| (uid, sample(uid))).collect()),
-        (1..=5).map(|uid| (uid, structure.into())).collect(),
+        inbox_state((1..=6).map(|uid| (uid, sample(uid))).collect()),
+        (1..=6)
+            .map(|uid| (uid, if uid == 4 { "(TEXT)" } else { structure }.into()))
+            .collect(),
     );
     let config = crate::AccountConfig::parse(&format!(
         concat!(
@@ -4724,7 +4726,7 @@ fn reader_stores_metadata_and_bodies_before_the_sync_pass_finishes() {
     let store = crate::ReaderBodyFetcher::open_store(&path).unwrap();
     store.upsert_account(&account).unwrap();
     let ids = |uid| crate::MessageId::new(format!("reader-{uid}@example.test"));
-    let messages = (1..=4)
+    let messages = (1..=5)
         .map(|uid| {
             let mut message =
                 crate::imap::to_message(&account.id, "INBOX", "INBOX", 20, uid, &[], &sample(uid));
@@ -4806,7 +4808,14 @@ fn reader_stores_metadata_and_bodies_before_the_sync_pass_finishes() {
     last = Instant::now();
     assert!(
         reader
-            .fetch(&config, &store, &[ids(3)], &cancel, || {})
+            .fetch(&config, &store, &[ids(3), ids(4)], &cancel, || {
+                assert_eq!(
+                    store.reader_parts(&account.id, ids(3).as_str()).unwrap()
+                        == crate::ReaderParts::Ready,
+                    store.reader_parts(&account.id, ids(4).as_str()).unwrap()
+                        == crate::ReaderParts::Ready
+                );
+            })
             .unwrap()
             .is_empty()
     );
@@ -4824,12 +4833,16 @@ fn reader_stores_metadata_and_bodies_before_the_sync_pass_finishes() {
     assert_eq!(count("LOGIN"), 1, "{foreground:?}");
     assert_eq!(count(" EXAMINE "), 1, "{foreground:?}");
     assert_eq!(count("UID FETCH 1,2 "), 2, "{foreground:?}");
-    assert_eq!(count("UID FETCH 3 "), 2, "{foreground:?}");
+    assert_eq!(count("UID FETCH 3,4 "), 2, "{foreground:?}");
+    assert_eq!(
+        store.reader_parts(&account.id, ids(4).as_str()).unwrap(),
+        crate::ReaderParts::Ready
+    );
     let cancelled = crate::CancelBodyFetch::default();
     cancelled.cancel();
     assert!(
         reader
-            .fetch(&config, &store, &[ids(4)], &cancelled, || panic!(
+            .fetch(&config, &store, &[ids(5)], &cancelled, || panic!(
                 "cancelled write"
             ))
             .is_err()

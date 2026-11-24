@@ -534,6 +534,17 @@ impl Store {
         Ok(())
     }
 
+    /// Read related mailbox rows from one WAL snapshot.
+    pub fn read_snapshot<T>(&self, read: impl FnOnce() -> Result<T>) -> Result<T> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Deferred,
+        )?;
+        let result = read()?;
+        tx.commit()?;
+        Ok(result)
+    }
+
     pub fn db_path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
@@ -9675,6 +9686,50 @@ mod tests {
                 bulk_headers: vec![("List-Id".into(), "<list.example>".into())],
             }
         );
+    }
+
+    #[test]
+    fn absorbing_a_copy_preserves_its_provisional_attachment_source() {
+        let store = Store::open_in_memory().unwrap();
+        let account = account();
+        store.upsert_account(&account).unwrap();
+        let mut source = msg("sent-source@x", None, None, "Route", "unchanged body");
+        source.remote_id = RemoteId("imap:7:1:Sent".into());
+        source.folders = vec!["Sent".into()];
+        let mut kept = msg(
+            "list-source@x",
+            None,
+            None,
+            "[test] Route",
+            "unchanged body",
+        );
+        kept.remote_id = RemoteId("imap:9:2:INBOX".into());
+        kept.folders = vec!["INBOX".into()];
+        store.upsert_message(&source).unwrap();
+        store.upsert_message(&kept).unwrap();
+        let fixture = crate::imap::mime_fixtures::mixed_two_attachments("sent-source@x");
+        let parts = crate::imap::parts_from_raw(&fixture.raw).mime_parts;
+        let section = parts[0].section.clone();
+        store
+            .store_structures(
+                &account.id,
+                &[(
+                    source.headers.message_id.clone(),
+                    source.remote_id.clone(),
+                    crate::imap::BodyStructure { html: true, parts },
+                )],
+            )
+            .unwrap();
+
+        kept.list_id = Some("test.example".into());
+        store.upsert_message(&kept).unwrap();
+        assert_eq!(listed(&store).len(), 1);
+        let request = store
+            .part_request(&account.id, &kept.headers.message_id, &section)
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.copies, [source.remote_id]);
+        assert!(!request.decoded_size_known);
     }
 
     #[test]
