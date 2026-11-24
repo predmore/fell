@@ -9996,6 +9996,7 @@ mod tests {
                     source.remote_id.clone(),
                     crate::imap::BodyStructure { html: true, parts },
                 )],
+                true,
             )
             .unwrap();
 

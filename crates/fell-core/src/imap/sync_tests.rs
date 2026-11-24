@@ -4870,9 +4870,7 @@ fn header_and_structure_backfill_set_the_paperclip_before_downloading_bodies() {
         "",
     );
     let mut state = inbox_state(vec![(1, fixture.raw), (2, malformed)]);
-    state.mailboxes[0].messages[0]
-        .flags
-        .push("\\Flagged".into());
+    state.mailboxes[0].messages[0].flags.push("\\Seen".into());
     let server = TestServer::spawn_parallel(
         state,
         [(1, structure.to_owned()), (2, "(TEXT)".to_owned())]
@@ -4907,7 +4905,7 @@ fn header_and_structure_backfill_set_the_paperclip_before_downloading_bodies() {
             .unwrap();
         assert!(row.has_attachment);
         assert!(
-            row.starred,
+            !row.unread,
             "FLAGS arrive with structure in a separate response"
         );
         let files = store
