@@ -496,6 +496,7 @@ pub struct Session {
     pub error_fault: Option<QueryFault>,
     /// Details for the last attachment failure, until another attempt starts.
     pub attachment_error: Option<String>,
+    pub attachment_retry_notice: Option<Toast>,
     pub recent: Vec<Action>,
     pub search: Option<search::Search>,
     pub search_generation: u64,
@@ -588,6 +589,7 @@ impl Session {
             error: None,
             error_fault: None,
             attachment_error: None,
+            attachment_retry_notice: None,
             recent: Vec::new(),
             search: None,
             search_generation: 0,
@@ -644,6 +646,7 @@ impl Session {
     pub fn status_notice(&self) -> Option<&Toast> {
         self.toast
             .as_ref()
+            .or(self.attachment_retry_notice.as_ref())
             .or_else(|| self.search.as_ref()?.error.as_ref())
             .or(self.startup_crash_notice.as_ref())
     }
@@ -804,20 +807,27 @@ impl Session {
         }
     }
 
-    pub fn detail_text(&self) -> Option<String> {
+    fn status_details(&self) -> [Option<&str>; 3] {
         let sync = match &self.sync {
             SyncKind::Failed(failure) => Some(failure.detail.as_str()),
             _ => None,
         };
-        let lines: Vec<&str> = [
-            self.startup_error.as_deref(),
-            self.error.as_deref(),
-            sync,
-            self.attachment_error.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
+        [self.startup_error.as_deref(), self.error.as_deref(), sync]
+    }
+
+    pub fn has_status_details(&self) -> bool {
+        self.status_details()
+            .into_iter()
+            .any(|detail| detail.is_some())
+    }
+
+    pub fn detail_text(&self) -> Option<String> {
+        let lines: Vec<&str> = self
+            .status_details()
+            .into_iter()
+            .chain([self.attachment_error.as_deref()])
+            .flatten()
+            .collect();
         if lines.is_empty() {
             None
         } else {
@@ -5251,6 +5261,7 @@ mod tests {
         let mut session = session();
         let cause = "Couldn't open attachment\nIMAP server refused part 2";
         session.attachment_error = Some(cause.into());
+        assert!(!session.has_status_details());
         session.show_toast("Couldn't open attachment · space a R retry", true);
 
         session.on_key(KeyId::Char('?'), 10);

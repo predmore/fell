@@ -1002,7 +1002,9 @@ impl Store {
     ) -> Result<Vec<crate::BodyState>> {
         messages
             .iter()
-            .map(|id| bodies::state(&self.conn, account_id, id.as_str()))
+            .map(|id| {
+                bodies::reader_states(&self.conn, account_id, id.as_str()).map(|states| states.0)
+            })
             .collect()
     }
 
@@ -1354,7 +1356,17 @@ impl Store {
     /// Whether the conversation needs to check or download a message's parts.
     /// `message_id` is canonical, as returned by [`Self::thread_messages`].
     pub fn reader_parts(&self, account: &AccountId, message_id: &str) -> Result<ReaderParts> {
-        bodies::reader_parts(&self.conn, account, message_id)
+        bodies::reader_states(&self.conn, account, message_id).map(|states| states.1)
+    }
+
+    /// Body and MIME-list states by canonical message id. Reads the whole
+    /// thread together without loading the compressed body parts.
+    pub fn thread_reader_states(
+        &self,
+        account: &AccountId,
+        thread: &ThreadId,
+    ) -> Result<HashMap<String, (crate::BodyState, ReaderParts)>> {
+        bodies::thread_reader_states(&self.conn, account, thread)
     }
 
     pub(crate) fn store_structures(

@@ -16,6 +16,12 @@ use crate::model::Toast;
 use crate::present::display_safe;
 use crate::store_actor::StoreClient;
 
+#[derive(Clone, Copy)]
+pub(super) enum FailedAction {
+    Open,
+    Save,
+}
+
 impl Inbox {
     pub(super) fn attachment_source(&self) -> AttachmentSource {
         AttachmentSource {
@@ -86,17 +92,57 @@ impl Inbox {
     }
 
     fn attachment_failed(&mut self, line: String, detail: String, retry: Request) {
-        let targets = match &retry {
-            Request::Open(target) => std::slice::from_ref(target),
-            Request::Save(targets) => targets.as_slice(),
+        let (action, targets) = match &retry {
+            Request::Open(target) => (FailedAction::Open, std::slice::from_ref(target)),
+            Request::Save(targets) => (FailedAction::Save, targets.as_slice()),
         };
-        self.failed_attachments.extend(targets.iter().map(part_key));
+        let focused = self.session.focused_attachment().is_some_and(|focused| {
+            targets.iter().any(|target| {
+                target.message == focused.message && target.part.section == focused.part.section
+            })
+        });
+        self.failed_attachments
+            .extend(targets.iter().map(|target| (part_key(target), action)));
         self.attachment_retry = Some(retry);
         self.session.attachment_error = Some(format!("{line}\n{}", display_safe(&detail)));
+        if focused {
+            self.session.clear_toast();
+        } else {
+            self.session.set_toast(self.attachment_retry_notice(line));
+        }
+    }
+
+    fn focused_attachment_failure(&self) -> Option<(&Target, FailedAction)> {
+        let target = self.session.focused_attachment()?;
+        let action = self.failed_attachments.get(&part_key(target))?;
+        Some((target, *action))
+    }
+
+    pub(super) fn attachment_to_retry(&self) -> Option<Request> {
+        match self.focused_attachment_failure() {
+            Some((target, FailedAction::Open)) => Some(Request::Open(target.clone())),
+            Some((target, FailedAction::Save)) => Some(Request::Save(vec![target.clone()])),
+            None => self.attachment_retry.clone(),
+        }
+    }
+
+    pub(super) fn focused_attachment_retry_notice(&self) -> Option<Toast> {
+        if self.attachment_busy {
+            return None;
+        }
+        let (target, action) = self.focused_attachment_failure()?;
+        let action = match action {
+            FailedAction::Open => "open",
+            FailedAction::Save => "save",
+        };
+        Some(self.attachment_retry_notice(format!("Couldn't {action} “{}”", target.name())))
+    }
+
+    fn attachment_retry_notice(&self, line: String) -> Toast {
         let key = keymap::binding_text(&self.session.keymap, Action::RetryAttachment);
         let mut toast = Toast::with_hint(line, key, " to retry");
         toast.alert = true;
-        self.session.set_toast(toast);
+        toast
     }
 
     // Some xdg-open implementations wait for the viewer to exit. Reap the

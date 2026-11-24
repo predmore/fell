@@ -1,6 +1,6 @@
 //! The wrapping file chips beneath an expanded message.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Instant;
 
 use fell_core::MimePart;
@@ -9,6 +9,7 @@ use gpui::{
     PathBuilder, Styled, Window, div, point, prelude::*, px, rgb,
 };
 
+use super::attachment_actions::FailedAction;
 use super::{ConvFrame, Inbox, LayoutProbe, LayoutSlot, Live, conversation_line_style};
 use crate::attachments::{self, Download, Request, Target};
 use crate::model::Session;
@@ -46,13 +47,13 @@ impl MetadataMotion {
     pub(super) fn frame(
         &mut self,
         download: Option<&(String, String, Download)>,
-        failed: &HashSet<Key>,
+        failed: &HashMap<Key, FailedAction>,
         motion: Motion,
         now: Instant,
     ) -> HashMap<Key, MetadataFrame> {
         let download =
             download.map(|(id, section, progress)| ((id.clone(), section.clone()), *progress));
-        for key in failed.iter().chain(download.iter().map(|(key, _)| key)) {
+        for key in failed.keys().chain(download.iter().map(|(key, _)| key)) {
             self.0.entry(key.clone()).or_default();
         }
         let mut frames = HashMap::new();
@@ -61,7 +62,7 @@ impl MetadataMotion {
                 Some((downloading, progress)) if key == downloading => {
                     Metadata::Download(*progress)
                 }
-                _ if failed.contains(key) => Metadata::Failed,
+                _ if failed.contains_key(key) => Metadata::Failed,
                 _ => Metadata::Size,
             };
             if std::mem::discriminant(&state.current) != std::mem::discriminant(&current) {

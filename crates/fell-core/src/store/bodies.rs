@@ -23,14 +23,16 @@
 //! parts that need their source to be reclassified. New mail never joins
 //! the queue, so a mailbox that is caught up pays nothing per pass.
 
-use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::HashMap;
+
+use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::account::AccountId;
 use crate::imap::{SNIPPET_BYTES, cap_snippet, html_snippet_text};
 use crate::message::{
     Disposition, MessageId, MessageParts, MimePart, PartRole, RemoteId, TransferEncoding,
 };
-use crate::{Error, Result};
+use crate::{BodyState, Error, Result, ThreadId};
 
 pub(super) mod cid_upgrade;
 
@@ -454,37 +456,69 @@ pub enum ReaderParts {
     },
 }
 
-pub(super) fn reader_parts(
+// A complete list comes from a full source. Only other states need to
+// check whether there is still a server copy to read from.
+const READER_STATES_SQL: &str = "
+    SELECT m.message_id, m.body_text IS NULL AND m.snippet = '',
+           b.parts_listed, b.html IS NOT NULL, b.plain IS NOT NULL,
+           b.withheld IS 1,
+           CASE WHEN b.parts_listed = 1 THEN 0 ELSE EXISTS (
+               SELECT 1 FROM message_copies c
+               WHERE c.account_id = m.account_id AND c.message_id = m.message_id
+           ) END
+    FROM messages m LEFT JOIN message_bodies b USING (account_id, message_id)
+    WHERE m.account_id = ?1";
+
+fn reader_states_from_row(row: &Row<'_>) -> rusqlite::Result<(BodyState, ReaderParts)> {
+    let no_preview: bool = row.get(1)?;
+    let code: Option<i64> = row.get(2)?;
+    let html: bool = row.get(3)?;
+    let plain: bool = row.get(4)?;
+    let withheld: bool = row.get(5)?;
+    let has_copy: bool = row.get(6)?;
+    let provisional = matches!(code, Some(2 | 3));
+    let has_body = code.is_some() && (!provisional || html || plain);
+    let state = if no_preview && withheld {
+        BodyState::TooLarge
+    } else if no_preview && !has_body && has_copy {
+        BodyState::Pending
+    } else {
+        BodyState::Stored
+    };
+    let needs_html = code == Some(3) && !html;
+    let parts = match (code.unwrap_or(0), has_copy) {
+        (0, true) => ReaderParts::Unknown,
+        (2 | 3, true) => ReaderParts::Listed { html: needs_html },
+        (2 | 3, false) => ReaderParts::Unavailable { html: needs_html },
+        _ => ReaderParts::Ready,
+    };
+    Ok((state, parts))
+}
+
+pub(super) fn reader_states(
     conn: &Connection,
     account: &AccountId,
     id: &str,
-) -> Result<ReaderParts> {
-    let row = conn
-        .prepare_cached(
-            "SELECT COALESCE(b.parts_listed, 0), b.html IS NOT NULL,
-                EXISTS (SELECT 1 FROM message_copies c
-                        WHERE c.account_id = m.account_id AND c.message_id = m.message_id)
-         FROM messages m LEFT JOIN message_bodies b USING (account_id, message_id)
-         WHERE m.account_id = ?1 AND m.message_id = ?2",
-        )?
-        .query_row(params![account.as_str(), id], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, bool>(1)?,
-                row.get::<_, bool>(2)?,
-            ))
-        })
+) -> Result<(BodyState, ReaderParts)> {
+    let states = conn
+        .prepare_cached(&format!("{READER_STATES_SQL} AND m.message_id = ?2"))?
+        .query_row(params![account.as_str(), id], reader_states_from_row)
         .optional()?;
-    Ok(match row {
-        Some((0, _, true)) => ReaderParts::Unknown,
-        Some((code @ (2 | 3), html, false)) => ReaderParts::Unavailable {
-            html: code == 3 && !html,
-        },
-        Some((code @ (2 | 3), html, true)) => ReaderParts::Listed {
-            html: code == 3 && !html,
-        },
-        _ => ReaderParts::Ready,
-    })
+    Ok(states.unwrap_or((BodyState::Stored, ReaderParts::Ready)))
+}
+
+pub(super) fn thread_reader_states(
+    conn: &Connection,
+    account: &AccountId,
+    thread: &ThreadId,
+) -> Result<HashMap<String, (BodyState, ReaderParts)>> {
+    let mut stmt = conn.prepare_cached(&format!("{READER_STATES_SQL} AND m.thread_id = ?2"))?;
+    let states = stmt
+        .query_map(params![account.as_str(), thread.as_str()], |row| {
+            Ok((row.get(0)?, reader_states_from_row(row)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(states)
 }
 
 fn list_code(conn: &Connection, account_id: &AccountId, message_id: &str) -> Result<i64> {
@@ -706,45 +740,6 @@ pub(super) fn mark_withheld(
         params![account_id.as_str(), message_id],
     )?;
     Ok(())
-}
-
-/// Whether a stored message has its body: see [`crate::BodyState`]. A row
-/// with no body text, no snippet and no `message_bodies` row is one a
-/// first sync listed from its headers; mail with no server copy (a local
-/// write) is never pending.
-pub(super) fn state(
-    conn: &Connection,
-    account_id: &AccountId,
-    message_id: &str,
-) -> Result<crate::BodyState> {
-    let row = conn
-        .prepare_cached(
-            "SELECT m.body_text IS NULL AND m.snippet = '',
-                    IFNULL(b.parts_listed NOT IN (2, 3) OR b.html IS NOT NULL OR b.plain IS NOT NULL, 0),
-                    IFNULL(b.withheld, 0),
-                    EXISTS (
-                        SELECT 1 FROM message_copies c
-                        WHERE c.account_id = m.account_id AND c.message_id = m.message_id
-                    )
-             FROM messages m
-             LEFT JOIN message_bodies b
-               ON b.account_id = m.account_id AND b.message_id = m.message_id
-             WHERE m.account_id = ?1 AND m.message_id = ?2",
-        )?
-        .query_row(params![account_id.as_str(), message_id], |row| {
-            Ok((
-                row.get::<_, bool>(0)?,
-                row.get::<_, bool>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, bool>(3)?,
-            ))
-        })
-        .optional()?;
-    Ok(match row {
-        Some((true, _, 1, _)) => crate::BodyState::TooLarge,
-        Some((true, false, _, true)) => crate::BodyState::Pending,
-        _ => crate::BodyState::Stored,
-    })
 }
 
 /// A merge is about to delete row `from` in favour of `to`: give `to` the
@@ -1229,6 +1224,54 @@ mod tests {
     }
 
     #[test]
+    fn thread_reader_states_preserve_pending_and_provisional_states() {
+        let root = newsletter("stored@x", "INBOX", 1, "<p>Sale</p>");
+        let thread = root.thread_id.clone();
+        let parent = root.headers.message_id.clone();
+        let mut messages = vec![root];
+        for (uid, id) in (2..).zip(["unknown@x", "listed@x", "gone@x", "withheld@x"]) {
+            let mut reply = newsletter(id, "INBOX", uid, "<p>Sale</p>");
+            reply.headers.in_reply_to = Some(parent.clone());
+            reply.headers.references = vec![parent.clone()];
+            messages.push(reply);
+        }
+        messages.push(newsletter("other@x", "INBOX", 6, "<p>Sale</p>"));
+        let store = store_with(messages);
+        store
+            .conn
+            .execute_batch(
+                "UPDATE messages SET body_text = NULL, snippet = ''
+                 WHERE message_id NOT IN ('stored@x', 'other@x');
+                 DELETE FROM message_bodies WHERE message_id = 'unknown@x';
+                 UPDATE message_bodies SET parts_listed = 3, html = NULL, plain = NULL
+                 WHERE message_id IN ('listed@x', 'gone@x');
+                 UPDATE message_bodies SET parts_listed = 0, html = NULL, plain = NULL, withheld = 1
+                 WHERE message_id = 'withheld@x';
+                 DELETE FROM message_copies WHERE message_id = 'gone@x';",
+            )
+            .unwrap();
+        let states = store.thread_reader_states(&account().id, &thread).unwrap();
+        assert_eq!(states.len(), 5);
+        assert_eq!(states["stored@x"], (BodyState::Stored, ReaderParts::Ready));
+        assert_eq!(
+            states["unknown@x"],
+            (BodyState::Pending, ReaderParts::Unknown)
+        );
+        assert_eq!(
+            states["listed@x"],
+            (BodyState::Pending, ReaderParts::Listed { html: true })
+        );
+        assert_eq!(
+            states["gone@x"],
+            (BodyState::Stored, ReaderParts::Unavailable { html: true })
+        );
+        assert_eq!(
+            states["withheld@x"],
+            (BodyState::TooLarge, ReaderParts::Unknown)
+        );
+    }
+
+    #[test]
     fn parts_round_trip_compressed_and_lists_carry_no_body() {
         let html = format!(
             "<table>{}</table>",
@@ -1601,7 +1644,7 @@ mod tests {
         full.snippet.clear();
         let store = store_with(vec![headers("old@x", 1), headers("kept@x", 2), full]);
         let account = account().id;
-        let state = |id| state(&store.conn, &account, id).unwrap();
+        let state = |id| reader_states(&store.conn, &account, id).unwrap().0;
         assert_eq!(state("kept@x"), crate::BodyState::Pending);
         mark_withheld(&store.conn, &account, "old@x").unwrap();
 

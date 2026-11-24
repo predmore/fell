@@ -664,7 +664,7 @@ struct Inbox {
     attachment_retry: Option<AttachmentRequest>,
     attachment_download: Option<(String, String, Download)>,
     attachment_metadata: attachment_chips::MetadataMotion,
-    failed_attachments: HashSet<(String, String)>,
+    failed_attachments: HashMap<(String, String), attachment_actions::FailedAction>,
     reveal_attachment: bool,
     forwarding_attachments: bool,
     note_view: agent_notes::NoteView,
@@ -899,7 +899,7 @@ impl Inbox {
             attachment_retry: None,
             attachment_download: None,
             attachment_metadata: attachment_chips::MetadataMotion::default(),
-            failed_attachments: HashSet::new(),
+            failed_attachments: HashMap::new(),
             reveal_attachment: false,
             forwarding_attachments: false,
             note_view: agent_notes::NoteView::default(),
@@ -1735,6 +1735,7 @@ impl Inbox {
                     arrival: self.motion.arrival(self.frame_now),
                     alphas: self.motion.body_alphas(self.frame_now),
                     disclosures,
+                    feedback: self.reader_bodies.painted.clone(),
                 }));
             }
             self.session.pane = Pane::List;
@@ -4252,7 +4253,7 @@ impl Inbox {
             self.toggle_pinned_note();
         }
         if step.retry_attachment {
-            if let Some(request) = self.attachment_retry.clone() {
+            if let Some(request) = self.attachment_to_retry() {
                 self.start_attachment_action(request, false, cx);
             } else {
                 self.session
@@ -4978,10 +4979,15 @@ impl Render for Inbox {
             || std::mem::take(&mut self.instant_conversation_scroll);
         self.advance_glides(now, window.scale_factor());
         let refreshing_body = !self.body_refresh.is_empty();
-        let anchor = self
-            .sent_arrival_anchor
-            .take()
-            .or_else(|| self.apply_body_refresh(now));
+        let reader_current =
+            self.open_thread.is_some() && self.open_thread == self.session.cursor_id;
+        let anchor = self.sent_arrival_anchor.take().or_else(|| {
+            if reader_current {
+                self.apply_body_refresh(now)
+            } else {
+                None
+            }
+        });
         let reveal_attachment = std::mem::take(&mut self.reveal_attachment);
         self.want_bodies(panes.1, cx);
         self.motion.narrow_status = width < present::NARROW_WIDTH;
@@ -5011,6 +5017,7 @@ impl Render for Inbox {
                 });
             });
         }
+        self.session.attachment_retry_notice = self.focused_attachment_retry_notice();
         self.motion.observe(&self.session, panes, now);
         let reflow = self.motion.reading_reflow(now);
         let list_width = list_width(width, self.split);
@@ -5224,12 +5231,17 @@ impl Render for Inbox {
             }
         }
         let preview_current = self.search_preview_current();
+        let feedback = self.reader_bodies.feedback(
+            &self.session,
+            reader_current && panes.1 && preview_current,
+            real,
+            now,
+            &mut self.motion,
+        );
         let conv = ConvFrame {
             syncing: self.pending_bodies.downloading(&self.session.sync),
             missing_fade: self.pending_bodies.fade(now),
-            part_status: self
-                .reader_bodies
-                .labels(&self.session, real, now, &mut self.motion),
+            feedback,
             agent_note,
             pin,
             note_details_only,
@@ -5238,7 +5250,6 @@ impl Render for Inbox {
             return_glide: returning.map(|(_, glide)| glide),
             card_alphas: self.motion.card_alphas(now),
             alphas: self.motion.body_alphas(now),
-            attachment_alphas: self.motion.attachment_alphas(now),
             replacing_text: self.motion.replacing_body_text(),
             body_probes: self.reader_bodies.body_probes.clone(),
             fallback_text: self.reader_bodies.fallback_since.keys().cloned().collect(),
@@ -5302,7 +5313,7 @@ impl Render for Inbox {
             | status_labels.count_fade.is_some()
             | self.body_landing.is_some()
             | conv.missing_fade.is_some()
-            | conv.part_status.values().any(|status| status.running)
+            | (reader_current && panes.1 && preview_current && conv.feedback.running())
             | conv
                 .attachment_metadata
                 .values()
@@ -5548,6 +5559,7 @@ struct LeavingReader {
     arrival: f32,
     alphas: HashMap<String, f32>,
     disclosures: Disclosures,
+    feedback: Arc<ReaderFeedback>,
 }
 
 #[derive(Clone, Copy)]
@@ -5585,10 +5597,9 @@ struct ConvFrame {
     return_glide: Option<LandingGlide>,
     syncing: bool,
     missing_fade: Option<f32>,
-    part_status: HashMap<String, ReaderStatusFrame>,
+    feedback: Arc<ReaderFeedback>,
     /// Bodies fading in, by message id: their opacity.
     alphas: HashMap<String, f32>,
-    attachment_alphas: HashMap<String, f32>,
     replacing_text: HashMap<String, RenderedBody>,
     body_probes: HashMap<String, Rc<Cell<f32>>>,
     fallback_text: HashSet<String>,
@@ -5612,6 +5623,12 @@ struct ConvFrame {
 }
 
 impl ConvFrame {
+    fn reader_feedback(&self) -> &ReaderFeedback {
+        self.leaving
+            .as_ref()
+            .map_or(&self.feedback, |(reader, _)| &reader.feedback)
+    }
+
     fn body_alpha(&self, id: &str) -> f32 {
         self.leaving
             .as_ref()
@@ -5624,13 +5641,14 @@ impl ConvFrame {
     fn show_attachment_row(&self, message: &ConvMessage) -> bool {
         !message.attachments.is_empty()
             && self
+                .reader_feedback()
                 .part_status
                 .get(&message.id)
                 .is_none_or(|status| status.show_chips)
     }
 
     fn attachment_alpha(&self, id: &str) -> f32 {
-        self.attachment_alphas.get(id).copied().unwrap_or(1.0)
+        self.reader_feedback().attachment_alpha(id)
     }
 
     fn disclosures(&self) -> &Disclosures {
@@ -8103,6 +8121,7 @@ struct ReaderRequest {
 
 const READER_CHIPS_AFTER: Duration = Duration::from_millis(400);
 const READER_LABEL_MINIMUM: Duration = Duration::from_millis(300);
+const READER_LABEL_AFTER_LOAD: Duration = Duration::from_millis(150);
 
 #[derive(Default)]
 struct ReaderBodies {
@@ -8117,6 +8136,9 @@ struct ReaderBodies {
     sizes: HashMap<(String, String), AttachmentSize>,
     statuses: HashMap<String, ReaderStatus>,
     shown_chips: HashSet<String>,
+    painted: Arc<ReaderFeedback>,
+    selected_message: Option<String>,
+    paused_messages: HashSet<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -8134,14 +8156,33 @@ enum ReaderLabel {
 struct ReaderStatus {
     label: Option<ReaderLabel>,
     visible_since: Option<Instant>,
+    resolved_since: Option<Instant>,
     arrival: Option<Transition>,
     leaving: Option<(ReaderLabel, f32, Transition)>,
 }
 
+#[derive(Clone, Copy)]
 struct ReaderStatusFrame {
     layers: [Option<(ReaderLabel, f32)>; 2],
     show_chips: bool,
     running: bool,
+    pending: bool,
+}
+
+#[derive(Default)]
+struct ReaderFeedback {
+    part_status: HashMap<String, ReaderStatusFrame>,
+    attachment_alphas: HashMap<String, f32>,
+}
+
+impl ReaderFeedback {
+    fn running(&self) -> bool {
+        self.part_status.values().any(|status| status.running)
+    }
+
+    fn attachment_alpha(&self, id: &str) -> f32 {
+        self.attachment_alphas.get(id).copied().unwrap_or(1.0)
+    }
 }
 
 impl ReaderStatus {
@@ -8153,10 +8194,14 @@ impl ReaderStatus {
     ) -> ReaderStatusFrame {
         // Count from the first painted label, even if its wording changes.
         // A label still at zero opacity can disappear without flashing.
-        let holding = wanted.is_none()
-            && self
-                .visible_since
-                .is_some_and(|since| now.saturating_duration_since(since) < READER_LABEL_MINIMUM);
+        let holding = if let (None, Some(visible)) = (wanted, self.visible_since) {
+            let resolved = *self.resolved_since.get_or_insert(now);
+            now.saturating_duration_since(visible) < READER_LABEL_MINIMUM
+                && now.saturating_duration_since(resolved) < READER_LABEL_AFTER_LOAD
+        } else {
+            self.resolved_since = None;
+            false
+        };
         if !holding && wanted != self.label {
             self.leaving = self
                 .label
@@ -8186,6 +8231,7 @@ impl ReaderStatus {
             running: holding
                 || self.leaving.is_some()
                 || self.arrival.is_some_and(|fade| fade.running(now)),
+            pending: false,
         }
     }
 }
@@ -8203,6 +8249,47 @@ impl ReaderBodies {
         self.active
             .as_ref()
             .is_some_and(|active| active.generation == generation)
+    }
+
+    fn feedback(
+        &mut self,
+        session: &Session,
+        current: bool,
+        real: Instant,
+        now: Instant,
+        motion: &mut InboxMotion,
+    ) -> Arc<ReaderFeedback> {
+        // The old conversation can stay on screen while the store reads
+        // the newly selected thread. Keep exactly what the last frame drew.
+        if current {
+            let selected = session.messages.get(session.message_cursor);
+            let selected = selected.map(|message| message.id.as_str());
+            if self.selected_message.as_deref() != selected {
+                if let Some(old) = self.selected_message.take()
+                    && self
+                        .painted
+                        .part_status
+                        .get(&old)
+                        .is_some_and(|frame| frame.pending)
+                {
+                    self.paused_messages.insert(old);
+                }
+                if let Some(id) = selected {
+                    self.paused_messages.remove(id);
+                }
+                self.selected_message = selected.map(str::to_owned);
+            }
+            let part_status = self.labels(session, real, now, motion);
+            let mut attachment_alphas = motion.attachment_alphas(now);
+            for id in &self.paused_messages {
+                attachment_alphas.insert(id.clone(), self.painted.attachment_alpha(id));
+            }
+            self.painted = Arc::new(ReaderFeedback {
+                part_status,
+                attachment_alphas,
+            });
+        }
+        self.painted.clone()
     }
 
     fn labels(
@@ -8225,6 +8312,24 @@ impl ReaderBodies {
                     || parts != Ready;
                 if !managed {
                     return None;
+                }
+                let settled = parts == Ready && message.rich != Rich::Pending;
+                let terminal = matches!(parts, Unavailable { .. })
+                    || message.body_state == fell_core::BodyState::TooLarge
+                    || self.failed.contains_key(&message.id);
+                let pending = !settled && !terminal;
+                if self.paused_messages.contains(&message.id) {
+                    if pending && let Some(frame) = self.painted.part_status.get(&message.id) {
+                        let frame = ReaderStatusFrame {
+                            running: false,
+                            ..*frame
+                        };
+                        return Some((message.id.clone(), frame));
+                    }
+                    // A card left open elsewhere in the thread still gets
+                    // its settled body and files when they are available.
+                    self.paused_messages.remove(&message.id);
+                    self.statuses.remove(&message.id);
                 }
                 let html_ready = matches!(message.rich, Rich::Html(_) | Rich::PlainPart(_));
                 let text = !html_ready
@@ -8285,10 +8390,7 @@ impl ReaderBodies {
                     real,
                     motion.motion,
                 );
-                let settled = parts == Ready && message.rich != Rich::Pending;
-                let terminal = matches!(parts, Unavailable { .. })
-                    || message.body_state == fell_core::BodyState::TooLarge
-                    || self.failed.contains_key(&message.id);
+                frame.pending = pending;
                 frame.show_chips = !message.attachments.is_empty()
                     && (self.shown_chips.contains(&message.id)
                         || settled
@@ -8520,15 +8622,15 @@ pub fn read_conversation(
 ) -> Result<Vec<ConvMessage>, fell_core::Error> {
     let (me, roles, names, viewing) = shown;
     let messages = store.thread_messages(account, thread)?;
-    let ids: Vec<_> = messages
-        .iter()
-        .map(|message| message.headers.message_id.clone())
-        .collect();
-    let states = store.body_states(account, &ids)?;
+    let states = store.thread_reader_states(account, thread)?;
     let mut view = present::conversation(&messages, me, roles, names, viewing);
-    for ((message, state), stored) in view.iter_mut().zip(states).zip(&messages) {
+    for (message, stored) in view.iter_mut().zip(&messages) {
+        let (state, parts) = states
+            .get(&message.id)
+            .copied()
+            .unwrap_or((fell_core::BodyState::Stored, fell_core::ReaderParts::Ready));
         message.body_state = state;
-        message.reader_parts = store.reader_parts(account, &message.id)?;
+        message.reader_parts = parts;
         if state == fell_core::BodyState::Stored
             && roles.is(FolderRole::Drafts, viewing)
             && stored
@@ -9284,7 +9386,7 @@ fn expanded_message(
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
-    let status = frame.part_status.get(&message.id);
+    let status = frame.reader_feedback().part_status.get(&message.id);
     let retry = status.map(|_| keymap::binding_text(&session.keymap, Action::SyncNow));
     let status = status.zip(retry.as_deref());
     let dim = theme.dimmed;
@@ -9489,7 +9591,10 @@ fn message_body(
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
-    let managed = frame.part_status.contains_key(&message.id);
+    let managed = frame
+        .reader_feedback()
+        .part_status
+        .contains_key(&message.id);
     let (alpha, outgoing) = if managed {
         (frame.body_alpha(&message.id), None)
     } else {
@@ -10456,7 +10561,7 @@ fn status_bar(
     let mode_width = bar_px(window, session.mode_label(), size, mono);
     let dot_width = bar_px(window, "·", size, ui);
     let outage = session.worker_outage();
-    let details = outage.is_none() && session.detail_text().is_some();
+    let details = outage.is_none() && session.has_status_details();
     let details_width = if details {
         gap + bar_px(window, "· ? details", size, ui)
     } else {
@@ -12491,6 +12596,17 @@ mod tests {
 
         let mut status = ReaderStatus::default();
         layer(&mut status, loading, 0);
+        layer(&mut status, loading, 16);
+        layer(&mut status, None, 55);
+        assert!(layer(&mut status, None, 204)[1].is_some());
+        assert_eq!(
+            layer(&mut status, None, 205),
+            [Some((ReaderLabel::Loading, 1.)), None]
+        );
+        assert_eq!(layer(&mut status, None, 325), [None, None]);
+
+        let mut status = ReaderStatus::default();
+        layer(&mut status, loading, 0);
         assert_eq!(layer(&mut status, None, 20), [None, None]);
 
         let mut status = ReaderStatus::default();
@@ -12575,13 +12691,33 @@ mod tests {
 
         session.messages[0].reader_parts = ReaderParts::Ready;
         session.messages[0].body_state = BodyState::Stored;
-        let waiting = reader.labels(&session, at(399), at(399), &mut motion);
+        let waiting = reader.feedback(&session, true, at(399), at(399), &mut motion);
         assert_eq!(
-            waiting[&id].layers,
+            waiting.part_status[&id].layers,
             [None, Some((ReaderLabel::Loading, 1.))]
         );
-        assert!(!waiting[&id].show_chips);
-        assert!(reader.labels(&session, at(400), at(400), &mut motion)[&id].show_chips);
+        assert!(!waiting.part_status[&id].show_chips);
+        let leaving = reader.feedback(&session, false, at(400), at(400), &mut motion);
+        assert!(std::sync::Arc::ptr_eq(&waiting, &leaving));
+        assert!(!leaving.part_status[&id].show_chips);
+        let mut other = session.messages[0].clone();
+        other.id = "other@demo.test".into();
+        other.expanded = false;
+        session.messages.push(other);
+        session.message_cursor = 1;
+        let unfocused = reader.feedback(&session, true, at(400), at(400), &mut motion);
+        assert_eq!(
+            unfocused.part_status[&id].layers,
+            waiting.part_status[&id].layers
+        );
+        assert!(!unfocused.part_status[&id].show_chips);
+        session.message_cursor = 0;
+        assert!(
+            reader
+                .feedback(&session, true, at(400), at(400), &mut motion)
+                .part_status[&id]
+                .show_chips
+        );
 
         let mut reader = ReaderBodies::default();
         let mut motion = InboxMotion::new(motion::Motion::new(true));
