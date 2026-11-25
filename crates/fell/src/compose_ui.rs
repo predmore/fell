@@ -666,6 +666,14 @@ impl ComposeView {
         self.look = Some(theme);
     }
 
+    pub(crate) fn set_motion(&mut self, next: Motion) -> bool {
+        if self.motion.enabled() == next.enabled() {
+            return false;
+        }
+        self.motion = next;
+        true
+    }
+
     /// Whether this window still follows the Omarchy theme.
     pub(crate) fn follows_look(&self) -> bool {
         self.look.is_some()

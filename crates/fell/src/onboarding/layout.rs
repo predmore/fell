@@ -1168,12 +1168,12 @@ mod tests {
             assert!(tick_feedback(setup));
 
             let mut theme = setup.theme.clone();
-            assert!(!setup.apply_theme(theme.clone()));
+            assert!(!setup.apply_theme(theme.clone(), setup.motion));
             assert!(setup.transition.is_some());
             assert!(tick_feedback(setup));
 
             theme.accent ^= 1;
-            assert!(setup.apply_theme(theme));
+            assert!(setup.apply_theme(theme, setup.motion));
             assert!(setup.transition.is_none());
             assert!(!tick_feedback(setup));
         });

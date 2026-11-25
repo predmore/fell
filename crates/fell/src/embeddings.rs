@@ -22,7 +22,8 @@ fell embeddings status           which embedder indexes mail, and where its file
 fell embeddings install [--yes]  download the pinned all-MiniLM-L6-v2 files, after asking
 fell embeddings remove           delete those files; indexing goes back to local-hash-v1
 
-Fell does not download a model unless you run `install`. Until then it
+Fell downloads a model only after you choose Install in Settings or run this
+command with `install`. Until then it
 indexes with local-hash-v1, a lexical hash, and search is keyword search.
 With the model installed and loaded, search is hybrid: it also finds mail
 close in meaning. If the model does not load, search stays keyword search.
@@ -101,7 +102,7 @@ fn say(console: &mut Console<'_>, text: &str) -> Result<(), String> {
     writeln!(console.out, "{text}").map_err(|err| err.to_string())
 }
 
-fn megabytes(bytes: u64) -> String {
+pub(crate) fn megabytes(bytes: u64) -> String {
     format!("{:.1} MB", bytes as f64 / 1_000_000.0)
 }
 
@@ -136,7 +137,7 @@ fn status(model: &LocalModel, root: &Path, console: &mut Console<'_>) -> Result<
 }
 
 /// What `install` will do, shown before it asks.
-fn plan(model: &LocalModel, root: &Path) -> String {
+pub(crate) fn plan(model: &LocalModel, root: &Path) -> String {
     let mut text = format!(
         "Fell will download {}\nfrom Hugging Face, {} in total:\n",
         model.title,
@@ -160,6 +161,16 @@ fn plan(model: &LocalModel, root: &Path) -> String {
         model_dir(model, root).display()
     ));
     text
+}
+
+pub(crate) fn install_from_settings(root: &Path) -> Result<(), String> {
+    let mut fetch = HttpsFetch::default();
+    download(&MINILM_L6_V2_INT8, root, &mut |url| fetch.get(url))?;
+    Ok(())
+}
+
+fn download(model: &LocalModel, root: &Path, fetch: &mut Fetch<'_>) -> Result<PathBuf, String> {
+    install_model(model, root, fetch).map_err(|err| format!("{err}. Nothing was installed."))
 }
 
 fn install(
@@ -207,8 +218,7 @@ fn install(
         let _ = writeln!(console.out, "Downloading {url}");
         fetch(url)
     };
-    let dir = install_model(model, root, &mut announce)
-        .map_err(|err| format!("{err}. Nothing was installed."))?;
+    let dir = download(model, root, &mut announce)?;
     say(
         console,
         &format!(

@@ -69,26 +69,37 @@ pub(crate) struct Onboarding {
     bridge: Bridge,
     check_started: Instant,
     checked: Option<FinishedCheck>,
+    return_to_inbox: Option<gpui::AnyWindowHandle>,
 }
 
 impl Onboarding {
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let view = Self::init(window, cx);
         view.watch_bridge(cx);
-        theme::follow(cx, |view, next, cx| {
-            if view.apply_theme(next) {
+        theme::follow(cx, |view, next, motion, cx| {
+            if view.apply_theme(next, motion) {
                 cx.notify();
             }
         });
         view
     }
 
-    fn apply_theme(&mut self, next: Theme) -> bool {
-        if self.theme == next {
+    pub(crate) fn from_inbox(
+        inbox: gpui::AnyWindowHandle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut view = Self::new(window, cx);
+        view.return_to_inbox = Some(inbox);
+        view
+    }
+
+    fn apply_theme(&mut self, next: Theme, motion: Motion) -> bool {
+        if self.theme == next && self.motion.enabled() == motion.enabled() {
             return false;
         }
         self.theme = next;
-        self.motion = Motion::from_env();
+        self.motion = motion;
         self.transition = None;
         self.feedback.settle();
         true
@@ -111,6 +122,7 @@ impl Onboarding {
             bridge: Bridge::Checking,
             check_started: Instant::now(),
             checked: None,
+            return_to_inbox: None,
         }
     }
 
@@ -408,8 +420,12 @@ impl Onboarding {
             let _ = this.update_in(cx, |view, window, cx| match result {
                 Ok(_) => {
                     let setup = cx.entity();
+                    let previous = view.return_to_inbox.take();
                     window.defer(cx, move |window, cx| {
-                        crate::view::finish_onboarding(setup, window, cx)
+                        crate::view::finish_onboarding(setup, window, cx);
+                        if let Some(previous) = previous {
+                            let _ = previous.update(cx, |_, window, _| window.remove_window());
+                        }
                     });
                 }
                 Err(error) => {
@@ -449,6 +465,9 @@ impl Onboarding {
                     );
                 self.select(controls[index]);
                 cx.notify();
+            }
+            "escape" if self.form.step == Step::Provider && self.return_to_inbox.is_some() => {
+                window.remove_window();
             }
             "escape" => self.back(cx),
             "enter" if !event.is_held => self.activate(self.control, window, cx),

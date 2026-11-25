@@ -124,6 +124,7 @@ pub struct Layer {
     agents: Option<crate::model::agents::Agents>,
     activity: Option<crate::model::activity::Activity>,
     palette_origin: Overlay,
+    settings: Option<crate::model::settings::Nav>,
     pub label_target: Option<String>,
     pub picker_choices: Vec<PickerChoice>,
     pub label_marks: f32,
@@ -151,6 +152,9 @@ impl Layer {
                 || session.palette_origin == Overlay::AgentActivity)
                 .then(|| session.activity.clone()),
             palette_origin: session.palette_origin.clone(),
+            settings: (session.overlay == Overlay::Settings
+                || session.palette_origin == Overlay::Settings)
+                .then(|| session.settings_nav.clone()),
             label_target: session.label_target(),
             picker_choices,
             label_marks,
@@ -172,6 +176,9 @@ impl Layer {
         }
         if let Some(activity) = &mut self.activity {
             std::mem::swap(activity, &mut session.activity);
+        }
+        if let Some(settings) = &mut self.settings {
+            std::mem::swap(settings, &mut session.settings_nav);
         }
         std::mem::swap(&mut self.palette_origin, &mut session.palette_origin);
     }

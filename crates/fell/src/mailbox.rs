@@ -16,7 +16,7 @@ use crate::model::SyncKind;
 pub struct Startup {
     pub keymap: Keymap,
     pub split: f32,
-    /// `read_dwell_ms` in ui.toml: how long a thread stays open before it
+    /// Legacy `read_dwell_ms` from ui.toml: how long a thread stays open before it
     /// is marked read. 0, the default, marks it as it opens.
     pub read_dwell_ms: u64,
     pub error: Option<String>,
@@ -154,36 +154,6 @@ fn read_account_config_text(
         )
     })?;
     Ok(Some((config, text)))
-}
-
-pub(crate) fn save_notification_mode(
-    account: &AccountId,
-    mode: fell_core::NotificationMode,
-) -> Result<(), String> {
-    let path = account_config_path().ok_or_else(|| "No account is set up".to_string())?;
-    let lock = lock_account_dir(&path).map_err(|err| err.to_string())?;
-    let (config, text) = read_account_config_text(&path)
-        .map_err(|err| err.to_string())?
-        .ok_or_else(|| "No account is set up".to_string())?;
-    if config.id != account.as_str() {
-        return Err("The configured account has changed; restart Fell".into());
-    }
-
-    let mut updated = String::with_capacity(text.len() + 30);
-    for line in text.lines() {
-        let key = line.split_once('=').map(|(key, _)| key.trim());
-        if matches!(key, Some("notifications" | "notification_content")) {
-            continue;
-        }
-        updated.push_str(line);
-        updated.push('\n');
-    }
-    use std::fmt::Write as _;
-    let _ = writeln!(updated, "notifications = \"{}\"", mode.as_str());
-    stage_account_text_at(path, &updated, false, lock)
-        .and_then(StagedAccountConfig::publish)
-        .map_err(|err| err.to_string())?;
-    Ok(())
 }
 
 /// The account file a send from `account` takes its login and SMTP settings

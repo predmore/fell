@@ -449,13 +449,22 @@ fn follow_theme(cx: &mut App, window: Rc<RefCell<Option<WindowHandle<ComposeView
             let Some(handle) = *window.borrow() else {
                 continue;
             };
-            let next = cx
+            let (next, motion) = cx
                 .background_executor()
-                .spawn(async { crate::theme::load() })
+                .spawn(async {
+                    let values = crate::settings::appearance();
+                    (
+                        crate::theme::load_with(values),
+                        crate::motion::Motion::for_preference(values.reduce_motion),
+                    )
+                })
                 .await;
             let _ = handle.update(cx, |view, _, cx| {
+                let changed = view.set_motion(motion);
                 if view.follows_look() {
                     view.set_look(next);
+                    cx.notify();
+                } else if changed {
                     cx.notify();
                 }
             });

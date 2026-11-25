@@ -124,7 +124,7 @@ impl Inbox {
     }
 }
 
-fn open_in_editor(path: &Path) -> io::Result<()> {
+pub(super) fn open_in_editor(path: &Path) -> io::Result<()> {
     if let Some(editor) = env::var_os("EDITOR")
         && let Some(args) = shlex::bytes::split(editor.as_bytes())
         && let Some((program, args)) = args.split_first()

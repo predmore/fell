@@ -303,7 +303,7 @@ impl<T> NumberFade<T> {
     }
 }
 
-/// Whether motion is on, read once at startup.
+/// Whether animations are enabled for the current preferences.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Motion {
     enabled: bool,
@@ -318,16 +318,19 @@ impl Motion {
         self.enabled
     }
 
-    /// `FELL_REDUCE_MOTION=1` turns motion off and `=0` forces it on.
-    /// Otherwise the desktop decides: `gtk-enable-animations=false` in the
-    /// GTK settings file is the reduced-motion switch GNOME, GTK apps and
-    /// Omarchy's GTK config share.
     pub fn from_env() -> Self {
-        let reduce = match env::var("FELL_REDUCE_MOTION") {
-            Ok(value) => is_true(&value),
-            Err(_) => desktop_reduces_motion(gtk_settings_paths()),
-        };
-        Self::new(!reduce)
+        Self::for_preference(crate::settings::appearance().reduce_motion)
+    }
+
+    /// The old override is still the default when settings.toml has no value.
+    pub fn environment_preference() -> Option<bool> {
+        env::var("FELL_REDUCE_MOTION")
+            .ok()
+            .map(|value| is_true(&value))
+    }
+
+    pub fn for_preference(reduce: Option<bool>) -> Self {
+        Self::new(!reduce.unwrap_or_else(|| desktop_reduces_motion(gtk_settings_paths())))
     }
 
     /// A transition starting now, or `None` when motion is reduced.
