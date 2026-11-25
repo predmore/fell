@@ -5481,7 +5481,7 @@ impl Render for Inbox {
                 StatusLabel::new(&self.theme, &self.session, reply_check, width)
             };
         let status_labels = self.status_labels.update(status, self.motion.motion, now);
-        self.focus_pending_link(window, cx);
+        self.update_link_focus(refreshing_body && self.body_refresh.is_empty(), window, cx);
         let (link_preview, link_fading) = self.reader_links.frame(
             &self.focus,
             panes.1 && preview_current && self.session.overlay == Overlay::None,
@@ -11195,22 +11195,11 @@ fn status_bar(
             .when(hint_opacity < 1.0, |hints| hints.opacity(hint_opacity))
             .child(format!("{count}{hint}"))
     });
-    let link_layers = link_preview
-        .into_iter()
-        .filter_map(|(preview, alpha)| {
-            preview
-                .filter(|_| {
-                    !noticed && hints.is_none() && (!narrow || !status_has_details) && alpha > 0.0
-                })
-                .map(|preview| (preview, alpha))
-        })
-        .collect::<Vec<_>>();
-    let link_opacity = link_layers
-        .iter()
-        .map(|(_, alpha)| alpha)
-        .sum::<f32>()
-        .min(1.0);
-    let link_room = width - shared_width - if narrow { 0. } else { sync_width + gap } - 2.;
+    let link_preview = link_preview.filter(|_| hints.is_none() && (!narrow || !status_has_details));
+    let link_opacity = link_preview.as_ref().map_or(0.0, |(_, alpha)| *alpha);
+    let link_layer = link_preview
+        .map(|(preview, alpha)| (preview, alpha * (1.0 - notice_opacity)))
+        .filter(|(_, alpha)| *alpha > 0.0);
     let text = status
         .leaving
         .filter(|(_, opacity)| *opacity > 0.0)
@@ -11284,7 +11273,11 @@ fn status_bar(
                 .when_some(text, |cell, (toast, opacity, dy)| {
                     cell.child(notice_text(&toast, opacity, dy))
                 })
-                .children(link_layers.into_iter().map(|(preview, alpha)| {
+                .children(link_layer.map(|(preview, alpha)| {
+                    // Keep the right slot clear of the link action notices
+                    // throughout the fade, including the first and last frame.
+                    let notice_room = bar_px(window, reader_links::OPEN_FAILED, size, ui).ceil();
+                    let link_room = width - used - notice_room - gap - 2.;
                     let title_width = bar_px(window, &preview.destination, size, ui)
                         + dot_width
                         + 8.

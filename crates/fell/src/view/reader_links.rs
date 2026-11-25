@@ -2,13 +2,16 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     rc::{Rc, Weak},
-    time::Instant,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
 use gpui::{App, Context, ElementId, FocusHandle, SharedString, Window};
 
 use super::{Inbox, Overlay, Pane, Rich};
 use crate::motion::{self, Motion, Transition};
+
+pub(crate) const OPEN_FAILED: &str = "Couldn't open link";
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct LinkPreview {
@@ -20,6 +23,7 @@ pub(crate) struct LinkPreview {
 pub(crate) struct Placement {
     pub line: Cell<(f32, f32)>,
     pub visible: Cell<bool>,
+    pub target: Arc<str>,
     pub preview: Option<LinkPreview>,
 }
 
@@ -29,11 +33,11 @@ pub(super) struct ReaderLinks {
     hovered: Option<FocusHandle>,
     pub(super) pending: Option<(String, bool)>,
     current: Option<LinkPreview>,
-    outgoing: Option<LinkPreview>,
-    fade: Option<Transition>,
+    outgoing: Option<(LinkPreview, f32, Transition)>,
+    incoming: Option<Transition>,
 }
 
-pub(super) type PreviewFrame = [(Option<LinkPreview>, f32); 2];
+pub(super) type PreviewFrame = Option<(LinkPreview, f32)>;
 
 impl ReaderLinks {
     fn placement(&self, handle: &FocusHandle) -> Option<Rc<Placement>> {
@@ -42,6 +46,56 @@ impl ReaderLinks {
 
     pub(super) fn clear_hover(&mut self) {
         self.hovered = None;
+    }
+
+    fn preview_at(&self, now: Instant) -> PreviewFrame {
+        if let Some((preview, opacity, fade)) = &self.outgoing
+            && fade.running(now)
+        {
+            return Some((preview.clone(), opacity * fade.remaining(now)));
+        }
+        self.current
+            .clone()
+            .map(|preview| (preview, motion::progress(self.incoming.as_ref(), now)))
+    }
+
+    fn animate_preview(
+        &mut self,
+        next: Option<LinkPreview>,
+        motion: Motion,
+        now: Instant,
+    ) -> (PreviewFrame, bool) {
+        const SWAP_OUT: Duration = Duration::from_millis(60);
+        const SWAP_IN: Duration = Duration::from_millis(100);
+        if next != self.current {
+            let visible = self.preview_at(now).filter(|(_, alpha)| *alpha > 0.0);
+            let replacing = next.is_some() && visible.is_some();
+            let outgoing = if replacing { SWAP_OUT } else { motion::FADE };
+            self.outgoing = visible
+                .and_then(|(preview, alpha)| Some((preview, alpha, motion.start(outgoing, now)?)));
+            self.incoming = next.as_ref().and_then(|_| {
+                if replacing {
+                    motion.start(SWAP_IN, now + SWAP_OUT)
+                } else {
+                    motion.start(motion::FADE, now)
+                }
+            });
+            self.current = next;
+        }
+        if self
+            .outgoing
+            .as_ref()
+            .is_some_and(|(_, _, fade)| !fade.running(now))
+        {
+            self.outgoing = None;
+        }
+        if self.incoming.is_some_and(|fade| !fade.running(now)) {
+            self.incoming = None;
+        }
+        (
+            self.preview_at(now),
+            self.outgoing.is_some() || self.incoming.is_some(),
+        )
     }
 
     pub(super) fn frame(
@@ -68,22 +122,7 @@ impl ReaderLinks {
         } else {
             None
         };
-        if next != self.current {
-            self.outgoing = std::mem::replace(&mut self.current, next);
-            self.fade = motion.start(motion::FADE, now);
-        }
-        if self.fade.is_some_and(|fade| !fade.running(now)) {
-            self.fade = None;
-            self.outgoing = None;
-        }
-        let progress = motion::progress(self.fade.as_ref(), now);
-        (
-            [
-                (self.current.clone(), progress),
-                (self.outgoing.clone(), 1.0 - progress),
-            ],
-            self.fade.is_some(),
-        )
+        self.animate_preview(next, motion, now)
     }
 }
 
@@ -142,6 +181,7 @@ impl Inbox {
         &mut self,
         backward: bool,
         visible_first: bool,
+        preferred: Option<&str>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -157,29 +197,28 @@ impl Inbox {
         let Some(mut place) = self.reader_links.placement(&focus) else {
             return false;
         };
-        if visible_first && !place.visible.get() {
+        if preferred.is_some() || (visible_first && !place.visible.get()) {
             let first = focus.clone();
-            let first_place = place.clone();
+            let mut next_focus = focus.clone();
+            let mut next_place = place.clone();
             loop {
-                window.focus_next();
-                let Some(next) = window.focused(cx) else {
-                    break;
-                };
-                let Some(next_place) = self.reader_links.placement(&next) else {
-                    break;
-                };
-                if next == first {
-                    break;
-                }
-                if next_place.visible.get() {
-                    focus = next;
+                let exact = preferred == Some(next_place.target.as_ref());
+                if exact || (visible_first && !place.visible.get() && next_place.visible.get()) {
+                    focus = next_focus;
                     place = next_place;
-                    break;
+                    if exact || preferred.is_none() {
+                        break;
+                    }
                 }
-            }
-            if !place.visible.get() {
-                focus = first;
-                place = first_place;
+                window.focus_next();
+                let Some(next) = window.focused(cx).filter(|next| *next != first) else {
+                    break;
+                };
+                let Some(next_position) = self.reader_links.placement(&next) else {
+                    break;
+                };
+                next_focus = next;
+                next_place = next_position;
             }
             window.focus(&focus);
         }
@@ -206,13 +245,16 @@ impl Inbox {
         true
     }
 
-    fn link_view_ready(&self) -> bool {
+    fn link_view_current(&self) -> bool {
         self.session.pane == Pane::Conversation
             && self.session.overlay == Overlay::None
             && self.open_thread.is_some()
             && self.open_thread == self.session.cursor_id
             && self.search_conversation_live()
-            && self.body_refresh.is_empty()
+    }
+
+    fn link_bodies_settled(&self) -> bool {
+        self.body_refresh.is_empty()
             && self
                 .session
                 .messages
@@ -232,7 +274,7 @@ impl Inbox {
 
     fn pending_link_direction(&self) -> Option<bool> {
         let (thread, backward) = self.reader_links.pending.as_ref()?;
-        (Some(thread) == self.session.cursor_id.as_ref() && self.link_view_ready())
+        (Some(thread) == self.session.cursor_id.as_ref() && self.link_view_current())
             .then_some(*backward)
     }
 
@@ -242,25 +284,44 @@ impl Inbox {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.focus.is_focused(window) && !self.link_view_ready() {
+        if !self.link_view_current() {
             self.queue_link_focus(backward);
             cx.notify();
             return;
         }
         self.reader_links.pending = None;
-        self.focus_or_notice(backward, window, cx);
-    }
-
-    fn focus_or_notice(&mut self, backward: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let first = self.focus.is_focused(window) && !backward;
-        if !self.focus_link(backward, first, window, cx) {
-            self.session.show_toast("No links", false);
-            self.expire_action_notice(cx);
+        if !self.focus_or_notice(backward, None, window, cx) {
+            self.queue_link_focus(backward);
             cx.notify();
         }
     }
 
-    pub(super) fn focus_pending_link(&mut self, window: &Window, cx: &mut Context<Self>) {
+    fn focus_or_notice(
+        &mut self,
+        backward: bool,
+        preferred: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let first = self.focus.is_focused(window) && !backward;
+        if self.focus_link(backward, first, preferred, window, cx) {
+            return true;
+        }
+        if !self.link_bodies_settled() {
+            return false;
+        }
+        self.session.show_toast("No links", false);
+        self.expire_action_notice(cx);
+        cx.notify();
+        true
+    }
+
+    pub(super) fn update_link_focus(
+        &mut self,
+        body_replaced: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
         if self
             .reader_links
             .pending
@@ -269,35 +330,53 @@ impl Inbox {
         {
             self.reader_links.pending = None;
         }
-        if self.pending_link_direction().is_none() {
+        // Retain the old handle until the new dispatch tree is available.
+        let previous = if body_replaced && self.link_view_current() {
+            window.focused(cx).and_then(|handle| {
+                let target = self.reader_links.placement(&handle)?.target.clone();
+                Some((handle, target))
+            })
+        } else {
+            None
+        };
+        if previous.is_none() && self.pending_link_direction().is_none() {
             return;
         }
-        // The incoming body registers its stops when this frame is drawn.
-        window.request_animation_frame();
         let inbox = cx.weak_entity();
-        window.on_next_frame(move |window, cx| {
+        let thread = self.session.cursor_id.clone();
+        // The draw registers the new stops. Finish before the next input can
+        // be dispatched to a link whose body just left the tree.
+        window.defer(cx, move |window, cx| {
             let _ = inbox.update(cx, |inbox, cx| {
-                inbox.apply_pending_link_focus(window, cx);
+                if inbox.session.cursor_id != thread || !inbox.link_view_current() {
+                    return;
+                }
+                if let Some((handle, target)) = previous
+                    // The inbox focus-lost listener can already have reset
+                    // focus to the reader root during this draw.
+                    && (handle.is_focused(window) || inbox.focus.is_focused(window))
+                    && !inbox.focus.contains(&handle, window)
+                {
+                    window.focus(&inbox.focus);
+                    if !inbox.focus_or_notice(false, Some(&target), window, cx) {
+                        inbox.queue_link_focus(false);
+                    }
+                } else if let Some(backward) = inbox.pending_link_direction()
+                    && inbox.focus_or_notice(backward, None, window, cx)
+                {
+                    inbox.reader_links.pending = None;
+                }
             });
         });
-    }
-
-    fn apply_pending_link_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(backward) = self.pending_link_direction() {
-            self.reader_links.pending = None;
-            self.focus_or_notice(backward, window, cx);
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
 
     #[test]
-    fn list_tab_waits_for_formatted_links_and_activates_the_settled_target() {
+    fn list_tab_focuses_the_stored_link_and_hands_off_to_the_matching_formatted_link() {
         let (mut app, inbox) = super::super::tests::pending_inbox();
         let window_handle: gpui::AnyWindowHandle = inbox.into();
         let draw = |app: &mut gpui::TestAppContext| {
@@ -307,6 +386,10 @@ mod tests {
         };
         inbox
             .update(&mut app, |inbox, window, cx| {
+                cx.on_focus_lost(window, |inbox, window, _| {
+                    window.focus(&inbox.focus);
+                })
+                .detach();
                 let message = inbox.session.messages.last_mut().unwrap();
                 message.expanded = true;
                 message.body_state = fell_core::BodyState::Stored;
@@ -331,14 +414,24 @@ mod tests {
         draw(&mut app);
         inbox
             .update(&mut app, |inbox, window, cx| {
-                inbox.apply_pending_link_focus(window, cx);
-                assert!(inbox.focus.is_focused(window));
-                assert!(inbox.reader_links.pending.is_some());
+                assert!(!inbox.focus.is_focused(window));
+                assert!(inbox.reader_links.pending.is_none());
+                let focused = window.focused(cx).unwrap();
+                assert_eq!(
+                    inbox
+                        .reader_links
+                        .placement(&focused)
+                        .unwrap()
+                        .target
+                        .as_ref(),
+                    "https://example.test/stored"
+                );
                 let message = inbox.session.messages.last().unwrap();
                 inbox.body_refresh.rich.insert(
                     message.id.clone(),
                     Rich::Html(Arc::new(crate::mail_body::prepare_html(
-                        r#"<p><a href="https://example.test/formatted">Formatted release notes</a></p>"#,
+                        r#"<p><a href="https://example.test/other">Another link</a></p>
+                        <p><a href="https://example.test/stored">Formatted release notes</a></p>"#,
                         &message.mail_headers,
                     ))),
                 );
@@ -346,20 +439,38 @@ mod tests {
             })
             .unwrap();
         draw(&mut app);
-        inbox
-            .update(&mut app, |inbox, window, cx| {
-                inbox.apply_pending_link_focus(window, cx);
-                assert!(!inbox.focus.is_focused(window));
-                assert!(inbox.reader_links.pending.is_none());
-            })
-            .unwrap();
-        draw(&mut app);
+        // Dispatch against the newly drawn tree without waiting for another frame.
         app.simulate_keystrokes(window_handle, "y");
         assert_eq!(
             app.read_from_clipboard()
                 .and_then(|clipboard| clipboard.text())
                 .as_deref(),
-            Some("https://example.test/formatted"),
+            Some("https://example.test/stored"),
         );
+    }
+
+    #[test]
+    fn link_previews_take_turns_in_the_status_slot() {
+        let preview = |domain: &str| LinkPreview {
+            destination: domain.to_owned().into(),
+            target: format!("https://{domain}").into(),
+            mismatch: false,
+        };
+        let mut state = ReaderLinks::default();
+        let old = preview("hover.example.test");
+        let new = preview("focus.example.test");
+        let motion = Motion::new(true);
+        let start = Instant::now();
+        state.animate_preview(Some(old.clone()), motion, start);
+        let swap = start + motion::FADE;
+        assert!(state.animate_preview(Some(new.clone()), motion, swap).1);
+        let frame =
+            |state: &ReaderLinks, ms| state.preview_at(swap + Duration::from_millis(ms)).unwrap();
+        assert!(frame(&state, 0) == (old.clone(), 1.0));
+        assert!(frame(&state, 30) == (old, 0.25));
+        assert!(frame(&state, 60) == (new.clone(), 0.0));
+        let (entering, alpha) = frame(&state, 90);
+        assert!(entering == new && (0.0..1.0).contains(&alpha));
+        assert!(frame(&state, 160) == (new, 1.0));
     }
 }

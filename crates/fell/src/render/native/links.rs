@@ -76,6 +76,12 @@ pub(super) struct LinkFocus {
     handles: Vec<Option<LinkState>>,
 }
 
+#[derive(Default)]
+pub(super) struct LinkControls {
+    pub elements: Vec<AnyElement>,
+    pub focused: Option<Range<usize>>,
+}
+
 struct LinkState {
     target: Arc<str>,
     handle: FocusHandle,
@@ -94,7 +100,7 @@ pub(super) fn link_controls(
     focus: &mut LinkFocus,
     window: &mut Window,
     cx: &mut App,
-) -> Vec<AnyElement> {
+) -> LinkControls {
     if focus.text != mail.text {
         focus.text = mail.text.clone();
         focus.handles.clear();
@@ -102,7 +108,7 @@ pub(super) fn link_controls(
     focus.handles.resize_with(mail.links.len(), || None);
     let mut fragments: Vec<Vec<LinkFragment>> = (0..mail.links.len()).map(|_| Vec::new()).collect();
     let clip = window.content_mask().bounds.intersect(&bounds);
-    mail.for_visible_line(bounds, window, |line, shaped, origin, _| {
+    mail.for_visible_line(bounds, window, None, |line, shaped, origin, _| {
         let layout = &shaped.unwrapped_layout;
         let glyphs = layout.runs.iter().flat_map(|run| &run.glyphs);
         let mut glyphs = glyphs.peekable();
@@ -161,7 +167,7 @@ pub(super) fn link_controls(
         }
     });
 
-    let mut controls = Vec::new();
+    let mut controls = LinkControls::default();
     for (index, (link, rects)) in mail.links.iter().zip(fragments).enumerate() {
         let slot = &mut focus.handles[index];
         if slot
@@ -187,6 +193,7 @@ pub(super) fn link_controls(
             let place = Rc::new(Placement {
                 line: Cell::default(),
                 visible: Cell::default(),
+                target: link.target.clone(),
                 preview,
             });
             reader_links::register(window, cx, &handle, &place);
@@ -209,6 +216,9 @@ pub(super) fn link_controls(
         state.place.visible.set(!rects.is_empty());
         let handle = &state.handle;
         let focused = handle.is_focused(window);
+        if focused {
+            controls.focused = Some(link.range.clone());
+        }
         let target = link.target.clone();
         let mut control = div()
             .relative()
@@ -251,7 +261,6 @@ pub(super) fn link_controls(
                                 .left(px(-2.))
                                 .right(px(-2.))
                                 .border_t(px(1.))
-                                .border_b(px(1.))
                                 .border_color(paint(mail.palette.accent))
                                 .when(fragment.starts_line, |outline| {
                                     outline
@@ -261,6 +270,7 @@ pub(super) fn link_controls(
                                 })
                                 .when(fragment.ends_line, |outline| {
                                     outline
+                                        .border_b(px(1.))
                                         .border_r(px(1.))
                                         .rounded_tr(px(2.))
                                         .rounded_br(px(2.))
@@ -285,7 +295,7 @@ pub(super) fn link_controls(
             cx,
         );
         control.prepaint_at(bounds.origin, window, cx);
-        controls.push(control);
+        controls.elements.push(control);
     }
     controls
 }
@@ -305,7 +315,7 @@ fn open(target: Arc<str>, window: &Window, cx: &mut App) {
             if !task.await {
                 fell_core::diagnostic!(WARN, "Could not open link");
                 let _ = cx.update(|window, cx| {
-                    reader_links::notice(window, cx, "Couldn't open link", true)
+                    reader_links::notice(window, cx, reader_links::OPEN_FAILED, true)
                 });
             }
         })

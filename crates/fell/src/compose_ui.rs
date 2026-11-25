@@ -6329,7 +6329,7 @@ fn link_host(href: &str) -> String {
     match place_of_href(href) {
         Some(Place::Host(host)) => without_www(&host).to_owned(),
         Some(Place::Mail { address, .. }) => address,
-        None => ascii_target(href),
+        Some(Place::UserInfo) | None => ascii_target(href),
     }
 }
 
@@ -6406,13 +6406,15 @@ enum Place {
         address: String,
         domain: String,
     },
+    /// A URL label with credentials can give the impression of another host.
+    UserInfo,
 }
 
 impl Place {
-    fn domain(&self) -> &str {
+    fn domain(&self) -> Option<&str> {
         match self {
-            Place::Host(host) => host,
-            Place::Mail { domain, .. } => domain,
+            Place::Host(host) | Place::Mail { domain: host, .. } => Some(host),
+            Place::UserInfo => None,
         }
     }
 }
@@ -6463,6 +6465,9 @@ fn place_of_word(word: &str, links: Links) -> Option<Place> {
     let lower = lower.strip_prefix("mailto:").unwrap_or(&lower);
     if lower.contains("://") {
         let url = url::Url::parse(lower).ok()?;
+        if !url.username().is_empty() || url.password().is_some_and(|value| !value.is_empty()) {
+            return Some(Place::UserInfo);
+        }
         return url.host_str().and_then(ascii_domain).map(Place::Host);
     }
     if let Some((local, domain)) = lower.rsplit_once('@')
@@ -6550,6 +6555,7 @@ pub(crate) fn reader_link_destination(text: &str, href: &str) -> Option<(String,
     let destination = match target {
         Place::Host(host) => host,
         Place::Mail { address, .. } => address,
+        Place::UserInfo => return None,
     };
     Some((destination, mismatch))
 }
@@ -6567,9 +6573,9 @@ fn place_mismatch(
     domain: impl Fn(&str) -> &str,
 ) -> bool {
     places.any(|place| match (target, &place) {
-        (None, _) => true,
+        (None, _) | (_, Place::UserInfo) => true,
         (Some(Place::Mail { address, .. }), Place::Mail { address: word, .. }) => address != word,
-        (Some(target), place) => domain(target.domain()) != domain(place.domain()),
+        (Some(target), place) => target.domain().map(&domain) != place.domain().map(&domain),
     })
 }
 
@@ -7712,6 +7718,16 @@ mod tests {
             ("github.test", "https://email.github.test", false),
             ("updates.example.test", "https://mirror.example.test", false),
             ("https://paypal.test", "https://paypal.test.evil.test", true),
+            (
+                "https://paypal.com@evil.test",
+                "https://evil.test/login",
+                true,
+            ),
+            (
+                "https://:paypal.com@evil.test",
+                "https://evil.test/login",
+                true,
+            ),
             ("paypal.test", "https://paypal.test.evil.test", true),
             ("paypal.co.uk", "https://evil.co.uk", true),
             ("www.github.io", "https://other.github.io", true),

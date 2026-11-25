@@ -18,7 +18,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use super::theme::{Palette, ink, paint};
 
 mod links;
-use links::{LinkSpan, checked_target, link_controls, link_spans};
+use links::{LinkControls, LinkSpan, checked_target, link_controls, link_spans};
 
 /// Decoded inline images for one message.
 ///
@@ -2103,9 +2103,24 @@ fn shape_mail_line(
     runs: &[gpui::TextRun],
     range: &Range<usize>,
     hyphen: bool,
+    focused: Option<&Range<usize>>,
 ) -> gpui::WrappedLine {
     let visible = visible_mail_line(text, range, hyphen);
     let mut runs = slice_runs(runs, range);
+    if let Some(focused) = focused
+        && focused.start < range.end
+        && range.start < focused.end
+    {
+        // Link spans follow run boundaries. Keep the glyphs and their wrap
+        // while the focus outline takes over from the underline.
+        let mut at = range.start;
+        for run in &mut runs {
+            if focused.contains(&at) {
+                run.underline = None;
+            }
+            at += run.len;
+        }
+    }
     if matches!(visible, std::borrow::Cow::Owned(_)) {
         let mut remaining = &text[range.clone()];
         let count = runs.len();
@@ -2242,7 +2257,7 @@ impl IntoElement for MailText {
 
 impl Element for MailText {
     type RequestLayoutState = ();
-    type PrepaintState = Vec<AnyElement>;
+    type PrepaintState = LinkControls;
 
     fn id(&self) -> Option<ElementId> {
         self.id.clone()
@@ -2332,7 +2347,7 @@ impl Element for MailText {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        id.map_or_else(Vec::new, |id| {
+        id.map_or_else(LinkControls::default, |id| {
             window.with_element_state(id, |state, window| {
                 let mut state = state.unwrap_or_default();
                 let controls = link_controls(self, bounds, &mut state, window, cx);
@@ -2351,14 +2366,19 @@ impl Element for MailText {
         window: &mut Window,
         cx: &mut App,
     ) {
-        for control in controls {
+        for control in &mut controls.elements {
             control.paint(window, cx);
         }
-        self.for_visible_line(bounds, window, |_, shaped, origin, window| {
-            let align = TextAlign::Left;
-            let _ = shaped.paint_background(origin, self.line_height, align, None, window, cx);
-            let _ = shaped.paint(origin, self.line_height, align, None, window, cx);
-        });
+        self.for_visible_line(
+            bounds,
+            window,
+            controls.focused.as_ref(),
+            |_, shaped, origin, window| {
+                let align = TextAlign::Left;
+                let _ = shaped.paint_background(origin, self.line_height, align, None, window, cx);
+                let _ = shaped.paint(origin, self.line_height, align, None, window, cx);
+            },
+        );
     }
 }
 
@@ -2367,6 +2387,7 @@ impl MailText {
         &self,
         bounds: Bounds<Pixels>,
         window: &mut Window,
+        focused: Option<&Range<usize>>,
         mut visit: impl FnMut(&MailLine, gpui::WrappedLine, gpui::Point<Pixels>, &mut Window),
     ) {
         let mask = window.content_mask().bounds;
@@ -2391,6 +2412,7 @@ impl MailText {
                 &self.text_runs,
                 &line.range,
                 line.hyphen,
+                focused,
             );
             let x = if self.rtl {
                 bounds.right() - shaped.unwrapped_layout.width
@@ -2410,7 +2432,7 @@ fn wrap_shaped_mail(
     window: &Window,
 ) -> WrappedMail {
     let shape = |range: &Range<usize>, hyphen| {
-        shape_mail_line(window, &key.text, key.size, runs, range, hyphen)
+        shape_mail_line(window, &key.text, key.size, runs, range, hyphen, None)
     };
     let mut run_ends = None;
     let mut advances = HashMap::new();
