@@ -4230,9 +4230,7 @@ impl Inbox {
         {
             match stroke.key.as_str() {
                 "tab" => {
-                    let first = self.focus.is_focused(window) && !stroke.modifiers.shift;
-                    self.reader_links.pending = None;
-                    self.focus_link(stroke.modifiers.shift, first, window, cx);
+                    self.focus_message_links(stroke.modifiers.shift, window, cx);
                     cx.stop_propagation();
                     return;
                 }
@@ -4356,7 +4354,7 @@ impl Inbox {
             && self.session.pane == Pane::Conversation
             && self.session.overlay == Overlay::None
         {
-            self.reader_links.pending = self.session.cursor_id.clone();
+            self.queue_link_focus(false);
         }
         if overlay != Overlay::Help && self.session.overlay == Overlay::Help {
             self.help_scroll = help::HelpScroll::default();
@@ -11212,6 +11210,7 @@ fn status_bar(
         .map(|(_, alpha)| alpha)
         .sum::<f32>()
         .min(1.0);
+    let link_room = width - shared_width - if narrow { 0. } else { sync_width + gap } - 2.;
     let text = status
         .leaving
         .filter(|(_, opacity)| *opacity > 0.0)
@@ -11286,11 +11285,21 @@ fn status_bar(
                     cell.child(notice_text(&toast, opacity, dy))
                 })
                 .children(link_layers.into_iter().map(|(preview, alpha)| {
-                    let line = if preview.mismatch {
-                        format!("Link text differs · {}", preview.target).into()
-                    } else {
-                        preview.target
-                    };
+                    let title_width = bar_px(window, &preview.destination, size, ui)
+                        + dot_width
+                        + 8.
+                        + if preview.mismatch {
+                            bar_px(window, "Opens", size, ui) + 4.
+                        } else {
+                            0.
+                        };
+                    let url = clip_line(
+                        window,
+                        &conversation_line_style(window, theme, px(size)),
+                        &preview.target,
+                        (link_room - title_width).max(0.).floor(),
+                        FontWeight::NORMAL,
+                    );
                     div()
                         .absolute()
                         .inset_0()
@@ -11301,13 +11310,26 @@ fn status_bar(
                         .child(
                             div()
                                 .min_w_0()
-                                .truncate()
-                                .text_color(rgb(if preview.mismatch {
-                                    theme.error
-                                } else {
-                                    theme.foreground
-                                }))
-                                .child(line),
+                                .flex()
+                                .items_center()
+                                .gap(px(4.))
+                                .text_color(rgb(theme.dimmed))
+                                .when(preview.mismatch, |line| {
+                                    line.child(div().flex_none().child("Opens"))
+                                })
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .whitespace_nowrap()
+                                        .text_color(rgb(if preview.mismatch {
+                                            theme.error
+                                        } else {
+                                            theme.foreground
+                                        }))
+                                        .child(preview.destination),
+                                )
+                                .child(div().flex_none().child("·"))
+                                .child(div().whitespace_nowrap().child(url)),
                         )
                 })),
         )

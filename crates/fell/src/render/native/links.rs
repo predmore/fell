@@ -82,6 +82,12 @@ struct LinkState {
     place: Rc<Placement>,
 }
 
+struct LinkFragment {
+    bounds: Bounds<Pixels>,
+    starts_line: bool,
+    ends_line: bool,
+}
+
 pub(super) fn link_controls(
     mail: &MailText,
     bounds: Bounds<Pixels>,
@@ -94,7 +100,7 @@ pub(super) fn link_controls(
         focus.handles.clear();
     }
     focus.handles.resize_with(mail.links.len(), || None);
-    let mut fragments = vec![Vec::<Bounds<Pixels>>::new(); mail.links.len()];
+    let mut fragments: Vec<Vec<LinkFragment>> = (0..mail.links.len()).map(|_| Vec::new()).collect();
     let clip = window.content_mask().bounds.intersect(&bounds);
     mail.for_visible_line(bounds, window, |line, shaped, origin, _| {
         let layout = &shaped.unwrapped_layout;
@@ -121,12 +127,12 @@ pub(super) fn link_controls(
             let byte = line.range.start + glyph.index + skipped;
             let links = &mail.links[first..last];
             let relative = links.partition_point(|link| link.range.end <= byte);
-            if links
+            let Some(link) = links
                 .get(relative)
-                .is_none_or(|link| !link.range.contains(&byte))
-            {
+                .filter(|link| link.range.contains(&byte))
+            else {
                 continue;
-            }
+            };
             let right = glyphs.peek().map_or(layout.width, |next| next.position.x);
             if right <= glyph.position.x {
                 continue;
@@ -141,12 +147,16 @@ pub(super) fn link_controls(
             }
             let rectangles = &mut fragments[first + relative];
             if let Some(previous) = rectangles.last_mut()
-                && previous.origin.y == rect.origin.y
-                && previous.right() == rect.left()
+                && previous.bounds.origin.y == rect.origin.y
+                && previous.bounds.right() == rect.left()
             {
-                previous.size.width = rect.right() - previous.left();
+                previous.bounds.size.width = rect.right() - previous.bounds.left();
             } else {
-                rectangles.push(rect);
+                rectangles.push(LinkFragment {
+                    bounds: rect,
+                    starts_line: link.range.start >= line.range.start,
+                    ends_line: link.range.end <= line.range.end,
+                });
             }
         }
     });
@@ -162,10 +172,17 @@ pub(super) fn link_controls(
         }
         let state = slot.get_or_insert_with(|| {
             let label = mail.text[link.range.clone()].trim();
-            let preview = (label != link.target.as_ref()).then(|| LinkPreview {
-                target: link.target.to_string().into(),
-                mismatch: crate::compose_ui::link_label_mismatch(label, &link.target),
-            });
+            let preview = if label == link.target.as_ref() {
+                None
+            } else {
+                crate::compose_ui::reader_link_destination(label, &link.target).map(
+                    |(destination, mismatch)| LinkPreview {
+                        destination: destination.into(),
+                        target: link.target.to_string().into(),
+                        mismatch,
+                    },
+                )
+            };
             let handle = cx.focus_handle().tab_stop(true);
             let place = Rc::new(Placement {
                 line: Cell::default(),
@@ -212,10 +229,11 @@ pub(super) fn link_controls(
                 }
                 cx.stop_propagation();
             })
-            .children(rects.into_iter().enumerate().map(|(at, rect)| {
+            .children(rects.into_iter().enumerate().map(|(at, fragment)| {
                 let target = link.target.clone();
                 let handle = handle.clone();
                 let hover = handle.clone();
+                let rect = fragment.bounds;
                 div()
                     .absolute()
                     .left(rect.left() - bounds.left())
@@ -224,11 +242,30 @@ pub(super) fn link_controls(
                     .h(rect.size.height)
                     .id(ElementId::named_usize("link-fragment", at))
                     .cursor(CursorStyle::PointingHand)
-                    .when(focused, |fragment| {
-                        fragment
-                            .rounded(px(2.))
-                            .border_1()
-                            .border_color(paint(mail.palette.accent))
+                    .when(focused, |hit| {
+                        hit.child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .bottom_0()
+                                .left(px(-2.))
+                                .right(px(-2.))
+                                .border_t(px(1.))
+                                .border_b(px(1.))
+                                .border_color(paint(mail.palette.accent))
+                                .when(fragment.starts_line, |outline| {
+                                    outline
+                                        .border_l(px(1.))
+                                        .rounded_tl(px(2.))
+                                        .rounded_bl(px(2.))
+                                })
+                                .when(fragment.ends_line, |outline| {
+                                    outline
+                                        .border_r(px(1.))
+                                        .rounded_tr(px(2.))
+                                        .rounded_br(px(2.))
+                                }),
+                        )
                     })
                     .on_hover(move |hovered, window, cx| {
                         reader_links::hover(window, cx, &hover, *hovered)

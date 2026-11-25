@@ -440,6 +440,10 @@ impl BodyLoads {
         self.wanted.clear();
     }
 
+    pub fn awaiting(&self, id: &str) -> bool {
+        self.wanted.contains_key(id)
+    }
+
     pub fn begin(&mut self, id: &str) -> Option<BodyLoad> {
         let stamp = *self.wanted.get(id)?;
         if self.active.contains_key(id) {
