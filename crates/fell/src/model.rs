@@ -198,6 +198,7 @@ pub struct Toast {
     pub text: String,
     pub alert: bool,
     pub hint: Option<(String, &'static str)>,
+    pub details: bool,
     pub label: Option<present::LabelNotice>,
 }
 
@@ -207,6 +208,7 @@ impl Toast {
             text: text.into(),
             alert: false,
             hint: Some((key, suffix)),
+            details: false,
             label: None,
         }
     }
@@ -625,6 +627,7 @@ impl Session {
             text: text.into(),
             alert,
             hint: None,
+            details: false,
             label: None,
         });
     }
@@ -634,6 +637,7 @@ impl Session {
             text: notice.fit(f32::INFINITY, |_| 0.0),
             alert: false,
             hint: None,
+            details: false,
             label: Some(notice),
         });
     }
