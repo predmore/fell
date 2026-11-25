@@ -41,7 +41,7 @@ use crate::attachments::{self, Download, Fetcher, Request as AttachmentRequest};
 use crate::compose_ui::ComposeView;
 use crate::draft_host::DraftHome;
 use crate::frame_log::{FrameLog, SharedFrameLog};
-use crate::inbox_motion::{Disclosures, InboxMotion, PaneEntry, StatusMotion};
+use crate::inbox_motion::{Disclosures, InboxMotion, PaneEntry, StatusMotion, ThreadGhost};
 use crate::keymap::{self, Action, KeyId};
 use crate::mail_body::{self, BodyCache, BodyJob, BodyLoad, BodyLoads, HtmlBody, PreparedBody};
 use crate::mailbox;
@@ -2159,6 +2159,7 @@ impl Inbox {
         let last = ((-offset + view) / ROW_PX).ceil() as usize + 2;
         let overscan = self.motion.list.as_ref().map_or(0, |s| s.overscan(ROW_PX));
         let rows = &self.session.threads;
+        let highlighted = self.session.highlighted();
         (first.saturating_sub(overscan)..(last + overscan).min(rows.len()))
             .filter_map(|index| {
                 let row = &rows[index];
@@ -2168,6 +2169,7 @@ impl Inbox {
                     Drawn {
                         top,
                         slot,
+                        selected: highlighted.contains(&row.id),
                         row: row.clone(),
                     }
                 })
@@ -2191,13 +2193,13 @@ impl Inbox {
             .enumerate()
             .map(|(index, row)| (row.id.as_str(), index))
             .collect();
-        let reach = self.list_viewport().unwrap_or(640.0);
+        let viewport = self.list_viewport().unwrap_or(640.0);
         // Keep the current shift if all drawn rows stayed in place and no
         // row arrived below them in the viewport (undo at the end of a list).
         let end = self.session.threads.len() as f32 * ROW_PX;
         let same_visible_end = drawn.last().is_some_and(|last| {
             let old_end = last.slot + ROW_PX;
-            old_end >= reach || end + offset <= old_end + 0.5
+            old_end >= viewport || end + offset <= old_end + 0.5
         });
         let kept = !replace
             && same_visible_end
@@ -2210,25 +2212,73 @@ impl Inbox {
             return;
         }
         let ids = slots;
-        let before = drawn
+        let mut before: Vec<_> = drawn
             .iter()
             .map(|old| (old.row.id.clone(), old.top))
             .collect();
-        let left = drawn
+        let left: Vec<_> = drawn
             .iter()
             .filter(|old| !ids.contains_key(old.row.id.as_str()))
-            .map(|old| (old.row.clone(), old.top - offset))
+            .map(|old| {
+                let ghost = ThreadGhost {
+                    row: old.row.clone(),
+                    selected: old.selected,
+                };
+                (ghost, old.top - offset)
+            })
             .collect();
+        let mut reach = viewport;
+        let batch = left.len() > 1
+            || self
+                .motion
+                .list
+                .as_ref()
+                .is_some_and(ListShift::has_batch_ghosts);
+        if !replace && batch {
+            let threads = &self.session.threads;
+            let visible_start = (-offset / ROW_PX).floor() as usize;
+            let visible_end = (((viewport - offset) / ROW_PX).ceil() as usize).min(threads.len());
+            let slot = |index: usize| index as f32 * ROW_PX + offset;
+            let tracked = |old: &Drawn| ids.get(old.row.id.as_str()).map(|&index| (index, old.top));
+            let arrivals = |slots: std::ops::Range<usize>, dy| {
+                slots.map(move |index| (threads[index].id.clone(), slot(index) + dy))
+            };
+            if let Some((index, top)) = drawn
+                .iter()
+                .filter_map(tracked)
+                .min_by_key(|&(index, _)| index)
+            {
+                let dy = InboxMotion::batch_top_arrival_offset(top, slot(index));
+                before.extend(arrivals(visible_start..index.min(visible_end), dy));
+                reach = reach.max(-dy);
+            }
+            let (after, previous_bottom) = drawn
+                .iter()
+                .filter_map(tracked)
+                .max_by_key(|&(index, _)| index)
+                .map_or((0, viewport), |(index, top)| (index + 1, top + ROW_PX));
+            let first = after.max(visible_start);
+            let first_slot = slot(first);
+            let dy =
+                InboxMotion::batch_bottom_arrival_offset(viewport, previous_bottom, first_slot);
+            before.extend(arrivals(first..visible_end, dy));
+            // The last tracked row can itself start past the viewport.
+            reach = reach.max(dy);
+        }
         // A row that is back (a quick undo) stops fading where it was.
         let mut carried = self.motion.carried_ghosts();
-        carried.retain(|ghost| !ids.contains_key(ghost.row.id.as_str()));
+        carried.retain(|ghost| !ids.contains_key(ghost.row.row.id.as_str()));
         // Rows of a list this one replaced that sat below its last row:
         // nothing arrives over them, so they fade out where they were.
         let below = drawn
             .into_iter()
             .map(|old| {
                 let top = old.top - offset;
-                (old.row, top)
+                let ghost = ThreadGhost {
+                    row: old.row,
+                    selected: !replace && old.selected,
+                };
+                (ghost, top)
             })
             .filter(|(_, top)| end == 0.0 || *top >= end)
             .collect();
@@ -3231,7 +3281,11 @@ impl Inbox {
     fn take_out_of_list(&mut self, ids: &[String], cx: &mut Context<Self>) {
         self.pending_removals.extend(ids.iter().cloned());
         let now = self.motion.clock.now();
-        let drawn = self.drawn_rows(now);
+        let mut drawn = self.drawn_rows(now);
+        // The action may have cleared visual mode or the marks already.
+        for row in &mut drawn {
+            row.selected |= self.pending_removals.contains(&row.row.id);
+        }
         for id in ids {
             self.session.remove_thread(id);
         }
@@ -5525,6 +5579,7 @@ impl Render for Inbox {
 /// A row as the last frame drew it.
 struct Drawn {
     row: ThreadRow,
+    selected: bool,
     /// Its top in the viewport, as painted (in flight or not).
     top: f32,
     /// The top of its slot then.
@@ -6678,7 +6733,7 @@ fn thread_list(
                         let element =
                             thread_row(&theme_for_rows, &row, index, &look, text_width, window, cx);
                         let top = index as f32 * ROW_PX + offset;
-                        let (moving, ghosts, overflow) = if let Some(shift) =
+                        let (moving, ghosts, overflow, batch) = if let Some(shift) =
                             inbox.motion.list.as_mut()
                         {
                             let below = inbox.session.threads[index + 1..]
@@ -6689,7 +6744,12 @@ fn thread_list(
                             moving.dy = motion::snap(moving.dy, window.scale_factor());
                             let reach = if index == last { f32::INFINITY } else { ROW_PX };
                             // Ghosts are kept in content pixels, so they scroll.
-                            let ghosts = shift.ghosts_in(index as f32 * ROW_PX, reach, now);
+                            let ghosts = shift.ghosts_for_slot(
+                                index as f32 * ROW_PX,
+                                reach,
+                                index == visible.start,
+                                now,
+                            );
                             // GPUI only asks for in-view slots. Paint rows still
                             // moving across an edge from the nearest drawn slot.
                             let extra = shift.overscan(ROW_PX);
@@ -6738,9 +6798,9 @@ fn thread_list(
                                     )))
                                 })
                                 .collect::<Vec<_>>();
-                            (moving, ghosts, overflow)
+                            (moving, ghosts, overflow, shift.has_batch_ghosts())
                         } else {
-                            (RowMotion::STILL, Vec::new(), Vec::new())
+                            (RowMotion::STILL, Vec::new(), Vec::new(), false)
                         };
                         if capture {
                             painted.push(LeavingRow {
@@ -6760,9 +6820,9 @@ fn thread_list(
                                 ghost_row(
                                     &theme_for_rows,
                                     ghost,
-                                    index,
                                     text_width,
                                     (bar_dx, inbox.list_label.clone()),
+                                    batch,
                                     window,
                                     cx,
                                 )
@@ -6772,6 +6832,7 @@ fn thread_list(
                             0.0,
                             moving,
                             selected.then_some(theme_for_rows.selection),
+                            batch.then_some(theme_for_rows.background),
                             element,
                             window,
                         );
@@ -6839,6 +6900,7 @@ fn leaving_label_rows(
                             frame.top,
                             frame.motion,
                             look.selected.then_some(theme.selection),
+                            None,
                             element,
                             window,
                         )
@@ -6891,11 +6953,12 @@ fn moving_row_layer(
     top: f32,
     motion: RowMotion,
     selection: Option<u32>,
+    cover: Option<u32>,
     element: gpui::AnyElement,
     window: &Window,
 ) -> gpui::Div {
     if motion.reveal.is_none() {
-        return slot_layer(top + motion.dy, motion.opacity).child(element);
+        return fading_row_layer(top + motion.dy, motion.opacity, cover, element);
     }
     // The selected slot is highlighted as soon as it opens. Its content
     // fades in on top while the rows below slide down.
@@ -6903,22 +6966,39 @@ fn moving_row_layer(
     slot_layer(top + motion.dy, 1.0)
         .h(px(shown))
         .overflow_hidden()
-        .when_some(selection, |layer, fill| layer.bg(rgb(fill)))
+        .when_some(selection.or(cover), |layer, fill| layer.bg(rgb(fill)))
         .child(slot_layer(0.0, motion.opacity).child(element))
+}
+
+/// A fading row can cover older ink with the list background while only
+/// its own content fades. An opaque thread row already paints its background.
+fn fading_row_layer(
+    top: f32,
+    opacity: f32,
+    cover: Option<u32>,
+    element: gpui::AnyElement,
+) -> gpui::Div {
+    if let Some(fill) = cover.filter(|_| opacity < 1.0) {
+        slot_layer(top, 1.0)
+            .bg(rgb(fill))
+            .child(slot_layer(0.0, opacity).child(element))
+    } else {
+        slot_layer(top, opacity).child(element)
+    }
 }
 
 /// Paint a row that left, at its last position and with no input handlers.
 fn ghost_row(
     theme: &Theme,
-    (row, top, opacity): (ThreadRow, f32, f32),
-    index: usize,
+    (ThreadGhost { row, selected }, top, opacity): (ThreadGhost, f32, f32),
     text_width: f32,
     (bar_dx, label_scope): (f32, Option<String>),
+    batch: bool,
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
     let look = RowLook {
-        selected: false,
+        selected,
         fading: None,
         ghost: true,
         bar_dx,
@@ -6928,11 +7008,13 @@ fn ghost_row(
         unread_note: false,
         attachment_alpha: 1.0,
     };
-    slot_layer(motion::snap(top, window.scale_factor()), opacity)
-        .child(thread_row(
-            theme, &row, index, &look, text_width, window, cx,
-        ))
-        .into_any_element()
+    fading_row_layer(
+        motion::snap(top, window.scale_factor()),
+        opacity,
+        batch.then_some(theme.background),
+        thread_row(theme, &row, 0, &look, text_width, window, cx),
+    )
+    .into_any_element()
 }
 
 /// A row drawn as it is, with nothing moving: a row that left the list,
