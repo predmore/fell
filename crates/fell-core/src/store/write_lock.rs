@@ -797,6 +797,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&other_dir);
     }
 
+    /// UI writes land while sync streams batches back to back. They used to
+    /// fail with "database is locked". This checks that they succeed and
+    /// that sync carries on; whether sync stands aside for them is checked
+    /// by `sync_begins_a_batch_only_once_no_write_is_waiting`, and latency
+    /// by `measure_action_latency_during_a_large_sync`.
     #[test]
     fn archive_undo_and_a_new_draft_land_while_sync_writes_back_to_back() {
         let dir = scratch("ui");
@@ -808,22 +813,17 @@ mod tests {
         ui.apply_delta(&account_id, &delta(1, 1)).unwrap();
 
         let sync = Sync::start(&path, 1_000);
-        // Generous for a loaded machine, and well under the 5 s lock wait
-        // after which a write used to give up.
-        let quick = Duration::from_secs(2);
 
-        let (archived, took) = timed("archive", || {
+        let (archived, _) = timed("archive", || {
             ui.archive_thread(&account_id, &target.thread_id, "INBOX")
         });
         archived.expect("archive failed while sync was writing");
-        assert!(took < quick, "archive waited {took:?} for sync");
 
-        let (undone, took) = timed("undo", || ui.undo(&account_id));
+        let (undone, _) = timed("undo", || ui.undo(&account_id));
         undone.expect("undo failed while sync was writing");
-        assert!(took < quick, "undo waited {took:?} for sync");
 
         let root = dir.join("drafts");
-        let (started, took) = timed("new draft", || {
+        let (started, _) = timed("new draft", || {
             DraftSession::start_reply_in(
                 &root,
                 "c1",
@@ -838,7 +838,6 @@ mod tests {
             )
         });
         started.expect("starting a draft failed while sync was writing");
-        assert!(took < quick, "starting a draft waited {took:?} for sync");
 
         // Sync kept going once the reader had its turn.
         let before = sync.batches();
@@ -849,6 +848,60 @@ mod tests {
         }
         sync.finish();
         drop(ui);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sync stands aside for a write that is waiting on the lock. Checked
+    /// through the handshake rather than by timing writes: a write racing
+    /// sync's batches without a turn still lands within seconds, so a time
+    /// bound cannot tell a missing turn from a slow machine.
+    ///
+    /// The lock is held by a third connection, so the UI write keeps
+    /// waiting. Sync's next batch may then begin only once no write is
+    /// waiting (the waiter went quiet) or after `MOST_YIELD`. Without the
+    /// turn it begins at once, while the write is still waiting.
+    #[test]
+    fn sync_begins_a_batch_only_once_no_write_is_waiting() {
+        let dir = scratch("turn");
+        let path = dir.join("mail.db");
+        let ui = Store::open(&path).unwrap();
+        ui.upsert_account(&account()).unwrap();
+        let account_id = AccountId("a1".into());
+        let target = inbox_message(1);
+        ui.apply_delta(&account_id, &delta(1, 1)).unwrap();
+        let sync = Store::open(&path).unwrap();
+        let other = Store::open(&path).unwrap();
+
+        let holder = crate::store::begin_immediate(other.connection()).unwrap();
+        let writer = std::thread::spawn(move || {
+            ui.archive_thread(&account_id, &target.thread_id, "INBOX")
+                .map(|_| ())
+        });
+        // Only a hang guard: the write reaches SQLite's busy handler at once.
+        let guard = Instant::now();
+        while !sync.write_is_waiting() {
+            assert!(
+                guard.elapsed() < super::LOCK_WAIT,
+                "the UI write never waited"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let asked = Instant::now();
+        let (still_waiting, after) = sync
+            .lock_wait
+            .behind_waiting_writes(|| (sync.write_is_waiting(), asked.elapsed()));
+        assert!(
+            !still_waiting || after >= super::MOST_YIELD,
+            "sync began a batch after {after:?} while a write was still waiting"
+        );
+
+        drop(holder);
+        writer
+            .join()
+            .unwrap()
+            .expect("the waiting write failed once the lock was free");
+        drop((sync, other));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
