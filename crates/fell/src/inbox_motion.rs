@@ -1781,7 +1781,9 @@ mod tests {
         let mut session = session();
         let now = Instant::now();
         motion.observe(&session, (true, true), now);
-        let notice = Toast::with_hint("Couldn't save attachments", "?".into(), " details");
+        let mut notice =
+            Toast::with_hint("Couldn't save attachments", "space a R".into(), " to retry");
+        notice.details = true;
         session.set_toast(notice.clone());
         motion.observe(&session, (true, true), now);
         assert_eq!(notice_opacity(&motion, &session, now), Some(0.0));

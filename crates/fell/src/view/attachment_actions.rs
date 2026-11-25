@@ -157,13 +157,9 @@ impl Inbox {
 
     fn attachment_retry_notice(&self, line: String, details: bool) -> Toast {
         let key = keymap::binding_text(&self.session.keymap, Action::RetryAttachment);
-        let suffix = if details {
-            " to retry · ? details"
-        } else {
-            " to retry"
-        };
-        let mut toast = Toast::with_hint(line, key, suffix);
+        let mut toast = Toast::with_hint(line, key, " to retry");
         toast.alert = true;
+        toast.details = details;
         toast
     }
 
@@ -502,7 +498,7 @@ mod tests {
                     if !focus_first {
                         let notice = inbox.session.status_notice().unwrap();
                         assert_eq!(notice.text, "Saved 1, 2 failed");
-                        assert_eq!(notice.hint.as_ref().unwrap().1, " to retry · ? details");
+                        assert!(notice.details);
                         assert_eq!(inbox.attachment_to_retry(), Some(retry));
                         inbox.session.focus_attachment(index, first.part.clone());
                     }
@@ -511,8 +507,9 @@ mod tests {
                     assert_eq!(notice.text, "Couldn't save “route.txt”");
                     assert_eq!(
                         notice.hint.as_ref().unwrap(),
-                        &("space a R".into(), " to retry · ? details")
+                        &("space a R".into(), " to retry")
                     );
+                    assert!(notice.details);
                     assert_eq!(
                         inbox.attachment_to_retry(),
                         Some(Request::Save(vec![first]))
@@ -520,7 +517,7 @@ mod tests {
                     inbox.session.focus_attachment(index, second.part.clone());
                     let notice = inbox.focused_attachment_retry_notice().unwrap();
                     assert_eq!(notice.text, "Couldn't save “notes.txt”");
-                    assert_eq!(notice.hint.unwrap().1, " to retry");
+                    assert!(!notice.details);
                 })
                 .unwrap();
 

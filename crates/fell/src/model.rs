@@ -198,6 +198,7 @@ pub struct Toast {
     pub text: String,
     pub alert: bool,
     pub hint: Option<(String, &'static str)>,
+    pub details: bool,
     pub label: Option<present::LabelNotice>,
 }
 
@@ -207,6 +208,7 @@ impl Toast {
             text: text.into(),
             alert: false,
             hint: Some((key, suffix)),
+            details: false,
             label: None,
         }
     }
@@ -625,6 +627,7 @@ impl Session {
             text: text.into(),
             alert,
             hint: None,
+            details: false,
             label: None,
         });
     }
@@ -634,6 +637,7 @@ impl Session {
             text: notice.fit(f32::INFINITY, |_| 0.0),
             alert: false,
             hint: None,
+            details: false,
             label: Some(notice),
         });
     }
@@ -807,20 +811,27 @@ impl Session {
         }
     }
 
-    pub fn detail_text(&self) -> Option<String> {
+    fn status_details(&self) -> [Option<&str>; 3] {
         let sync = match &self.sync {
             SyncKind::Failed(failure) => Some(failure.detail.as_str()),
             _ => None,
         };
-        let lines: Vec<&str> = [
-            self.startup_error.as_deref(),
-            self.error.as_deref(),
-            sync,
-            self.attachment_error.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
+        [self.startup_error.as_deref(), self.error.as_deref(), sync]
+    }
+
+    pub fn has_status_details(&self) -> bool {
+        self.status_details()
+            .into_iter()
+            .any(|detail| detail.is_some())
+    }
+
+    pub fn detail_text(&self) -> Option<String> {
+        let lines: Vec<&str> = self
+            .status_details()
+            .into_iter()
+            .chain([self.attachment_error.as_deref()])
+            .flatten()
+            .collect();
         if lines.is_empty() {
             None
         } else {
@@ -5254,6 +5265,7 @@ mod tests {
         let mut session = session();
         let cause = "Couldn't open attachment\nIMAP server refused part 2";
         session.attachment_error = Some(cause.into());
+        assert!(!session.has_status_details());
         session.show_toast("Couldn't open attachment · space a R retry", true);
 
         session.on_key(KeyId::Char('?'), 10);

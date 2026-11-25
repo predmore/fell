@@ -701,6 +701,7 @@ impl Session {
                 text: one_line(&error),
                 alert: true,
                 hint: None,
+                details: false,
                 label: None,
             });
             return true;

@@ -3723,7 +3723,7 @@ impl Inbox {
         }
         let Some(home) = self.draft_home.clone() else {
             self.session.show_toast(
-                "The mailbox did not open, so a draft has nowhere to go · ? details",
+                "The mailbox did not open, so a draft has nowhere to go",
                 true,
             );
             return;
@@ -3897,7 +3897,7 @@ impl Inbox {
         };
         let Some(home) = self.draft_home.clone() else {
             self.session.show_toast(
-                "The mailbox did not open, so a draft has nowhere to go · ? details",
+                "The mailbox did not open, so a draft has nowhere to go",
                 true,
             );
             return;
@@ -5299,7 +5299,7 @@ impl Render for Inbox {
             if self.opening_draft.as_ref().is_some_and(|open| {
                 real.saturating_duration_since(open.started) >= DRAFT_OPEN_FEEDBACK
             }) {
-                StatusLabel::opening_draft(&self.theme)
+                StatusLabel::opening_draft(&self.theme, &self.session)
             } else {
                 StatusLabel::new(&self.theme, &self.session, reply_check, width)
             };
@@ -10309,7 +10309,16 @@ enum StatusPhase {
     Download,
     Reply(ReplyCheck),
     QueryError(QueryFault),
-    StartupError,
+}
+
+const DETAILS_SUFFIX: &str = " · ? details";
+
+fn status_details_suffix(theme: &Theme) -> gpui::Div {
+    div()
+        .flex_none()
+        .whitespace_nowrap()
+        .text_color(rgb(theme.error))
+        .child(DETAILS_SUFFIX)
 }
 
 #[derive(Clone)]
@@ -10318,16 +10327,18 @@ struct StatusLabel {
     text: String,
     download: Option<DownloadStatus>,
     color: u32,
+    details: bool,
     steady_sync: bool,
 }
 
 impl StatusLabel {
-    fn opening_draft(theme: &Theme) -> Self {
+    fn opening_draft(theme: &Theme, session: &Session) -> Self {
         Self {
             phase: StatusPhase::OpeningDraft,
             text: "Opening…".into(),
             download: None,
             color: theme.dimmed,
+            details: session.has_status_details(),
             steady_sync: false,
         }
     }
@@ -10344,30 +10355,23 @@ impl StatusLabel {
         } else {
             StatusPhase::Sync(std::mem::discriminant(&session.sync))
         };
-        if matches!(phase, StatusPhase::Sync(_)) && !session.sync.is_error() {
-            let error = match session.error_fault {
-                Some(QueryFault::Folder) => Some((
-                    StatusPhase::QueryError(QueryFault::Folder),
-                    "Couldn't read folder",
-                )),
-                Some(QueryFault::Message) => Some((
-                    StatusPhase::QueryError(QueryFault::Message),
-                    "Couldn't read conversation",
-                )),
-                None => session
-                    .startup_error
-                    .as_ref()
-                    .map(|_| (StatusPhase::StartupError, "Startup error")),
+        let details = session.has_status_details();
+        if matches!(phase, StatusPhase::Sync(_))
+            && !session.sync.is_error()
+            && let Some(fault) = session.error_fault
+        {
+            let text = match fault {
+                QueryFault::Folder => "Couldn't read folder",
+                QueryFault::Message => "Couldn't read conversation",
             };
-            if let Some((phase, text)) = error {
-                return Self {
-                    phase,
-                    text: format!("{text} · ? details"),
-                    download: None,
-                    color: theme.error,
-                    steady_sync: false,
-                };
-            }
+            return Self {
+                phase: StatusPhase::QueryError(fault),
+                text: text.into(),
+                download: None,
+                color: theme.error,
+                details,
+                steady_sync: false,
+            };
         }
         let (text, color) = match reply_check {
             Some(ReplyCheck::Waiting) => ("Reply-To unverified".into(), theme.dimmed),
@@ -10391,8 +10395,6 @@ impl StatusLabel {
             None => (
                 if download.is_some() {
                     String::new()
-                } else if session.sync.is_error() {
-                    format!("{} · ? details", session.sync.status())
                 } else {
                     session.sync.status()
                 },
@@ -10408,6 +10410,7 @@ impl StatusLabel {
             text,
             download,
             color,
+            details,
             steady_sync: reply_check.is_none()
                 && matches!(
                     session.sync,
@@ -10427,8 +10430,15 @@ impl StatusLabel {
         fading_count: Option<(&str, f32)>,
     ) -> (gpui::Div, f32) {
         let ui = theme.ui_family.as_ref();
+        let details_width = if self.details {
+            bar_px(window, DETAILS_SUFFIX, size, ui)
+        } else {
+            0.
+        };
         let label = div()
             .flex_none()
+            .flex()
+            .items_baseline()
             .whitespace_nowrap()
             .text_size(px(size))
             .text_color(rgb(self.color));
@@ -10439,8 +10449,11 @@ impl StatusLabel {
             suffix,
         }) = &self.download
         else {
-            let width = bar_px(window, &self.text, size, ui).ceil();
-            return (label.child(self.text.clone()), width);
+            let width = (bar_px(window, &self.text, size, ui) + details_width).ceil();
+            let label = label.child(self.text.clone()).when(self.details, |label| {
+                label.child(status_details_suffix(theme))
+            });
+            return (label, width);
         };
         let figures = tabular_style(window, theme, size);
         let figure_width =
@@ -10449,7 +10462,7 @@ impl StatusLabel {
             .max(figure_width(done))
             .max(fading_count.map_or(0., |(old, _)| figure_width(old)));
         let suffix_width = bar_px(window, suffix, size, ui).ceil();
-        let prefix_room = room - count_room - suffix_width;
+        let prefix_room = room - count_room - suffix_width - details_width;
         let short;
         let prefix = if bar_px(window, prefix, size, ui).ceil() > prefix_room {
             short = format!("Downloading {total} · ");
@@ -10457,11 +10470,10 @@ impl StatusLabel {
         } else {
             prefix
         };
-        let width = bar_px(window, prefix, size, ui).ceil() + count_room + suffix_width;
+        let width =
+            bar_px(window, prefix, size, ui).ceil() + count_room + suffix_width + details_width;
         let shown = fading_count.map_or(1.0, |(_, progress)| progress);
         let label = label
-            .flex()
-            .items_baseline()
             .child(div().flex_none().child(prefix.clone()))
             .child(
                 div()
@@ -10479,7 +10491,10 @@ impl StatusLabel {
                             .child(old.to_owned())
                     })),
             )
-            .child(div().flex_none().child(suffix.clone()));
+            .child(div().flex_none().child(suffix.clone()))
+            .when(self.details, |label| {
+                label.child(status_details_suffix(theme))
+            });
         (label, width)
     }
 }
@@ -10508,10 +10523,13 @@ impl StatusLabels {
             self.outgoing = None;
         }
         if let Some(old) = old {
-            if old.phase == StatusPhase::OpeningDraft && old.phase != next.phase {
+            if old.phase == StatusPhase::OpeningDraft
+                && old.phase != next.phase
+                && old.details == next.details
+            {
                 self.outgoing = None;
                 self.count_fade = motion::NumberFade::default();
-            } else if old.phase != next.phase {
+            } else if old.phase != next.phase || old.details != next.details {
                 self.outgoing = motion.start(motion::FADE, now).map(|fade| (old, fade));
                 self.count_fade = motion::NumberFade::default();
             } else if let (Some(old_download), Some(next_download)) =
@@ -10538,6 +10556,18 @@ impl StatusLabels {
 }
 
 impl StatusLabelsFrame {
+    fn details_opacity(&self) -> f32 {
+        match &self.outgoing {
+            Some((old, elapsed)) if old.details && !self.current.details => {
+                motion::fade_out(*elapsed)
+            }
+            Some((old, elapsed)) if !old.details && self.current.details => {
+                motion::ease_out(*elapsed)
+            }
+            _ => f32::from(self.current.details),
+        }
+    }
+
     fn fading_count(&self) -> Option<(&str, f32)> {
         self.count_fade
             .as_ref()
@@ -10610,6 +10640,7 @@ fn status_bar(
     let mode_width = bar_px(window, session.mode_label(), size, mono);
     let dot_width = bar_px(window, "·", size, ui);
     let outage = session.worker_outage();
+    let details_opacity = labels.details_opacity();
     // Keep the sync label's room stable as a notice enters or leaves.
     let trailing = (gap + dot_width).max(16.)
         + if noticed || hint.is_empty() && count.is_empty() {
@@ -10625,8 +10656,16 @@ fn status_bar(
         if let Some(worker) = outage {
             let key = keymap::binding_text(&session.keymap, Action::OpenDiagnosticLog);
             let text = worker.outage_notice();
-            let width = bar_px(window, &format!("{text} · {key} for log"), size, ui);
+            let details_width = if details_opacity > 0.0 {
+                bar_px(window, DETAILS_SUFFIX, size, ui)
+            } else {
+                0.
+            };
+            let width =
+                bar_px(window, &format!("{text} · {key} for log"), size, ui) + details_width;
             let label = div()
+                .flex()
+                .items_baseline()
                 .text_size(px(size))
                 .whitespace_nowrap()
                 .text_color(rgb(theme.error))
@@ -10634,7 +10673,10 @@ fn status_bar(
                     text.to_owned(),
                     Some((&key, " for log")),
                     theme,
-                ));
+                ))
+                .when(details_opacity > 0.0, |label| {
+                    label.child(status_details_suffix(theme).opacity(details_opacity))
+                });
             (label, width)
         } else if !noticed
             && !narrow
@@ -10646,7 +10688,8 @@ fn status_bar(
         {
             // Keep the routine sync slot fixed even while its text fades.
             let width = bar_px(window, "synced just now · 0000 new", size, ui).ceil();
-            let (label, _) = labels.draw(theme, size, sync_room, window);
+            let (label, label_width) = labels.draw(theme, size, sync_room, window);
+            let width = width.max(label_width);
             (label.w(px(width)).truncate(), width)
         } else {
             labels.draw(theme, size, sync_room, window)
@@ -10675,9 +10718,26 @@ fn status_bar(
             .as_ref()
             .map(|(key, suffix)| (key.as_str(), *suffix));
         let tail = hint.map(|(key, suffix)| format!(" · {key}{suffix}"));
+        // Reserve room even while the status error is clearing, so the
+        // notice under it keeps the same fit through that fade.
+        let reserve_details = narrow || toast.details;
+        let shown_details = if toast.details {
+            1.0
+        } else if narrow {
+            details_opacity
+        } else {
+            0.0
+        };
         let tail_width = |size| {
-            tail.as_deref()
-                .map_or(0.0, |tail| bar_px(window, tail, size, ui))
+            let hint_width = tail
+                .as_deref()
+                .map_or(0.0, |tail| bar_px(window, tail, size, ui));
+            hint_width
+                + if reserve_details {
+                    bar_px(window, DETAILS_SUFFIX, size, ui)
+                } else {
+                    0.
+                }
         };
         let room = (width - used).max(0.0);
         let notice_size = if narrow
@@ -10701,6 +10761,8 @@ fn status_bar(
             |label| label.fit(room, measure),
         );
         div()
+            .flex()
+            .items_baseline()
             .overflow_hidden()
             .whitespace_nowrap()
             .text_ellipsis()
@@ -10715,6 +10777,9 @@ fn status_bar(
                 text.relative().top(px(motion::snap(dy, scale)))
             })
             .child(status_text(text, hint, theme))
+            .when(shown_details > 0.0, |text| {
+                text.child(status_details_suffix(theme).opacity(shown_details))
+            })
     };
     let label = label.opacity(status.sync_opacity);
     let (wide_sync, narrow_sync) = if narrow {
@@ -11955,8 +12020,8 @@ mod tests {
 
     #[test]
     fn a_status_error_keeps_its_details_hint_through_recovery() {
-        use super::{Motion, QueryFault, StatusLabel, StatusLabels};
-        use crate::model::Session;
+        use super::{Motion, QueryFault, ReplyCheck, StatusLabel, StatusLabels};
+        use crate::model::{Session, SyncFailure};
 
         let theme = crate::theme::load();
         let mut session = Session::new(
@@ -11971,23 +12036,57 @@ mod tests {
 
         session.fail_query(QueryFault::Folder, "database is locked".into());
         let failed = StatusLabel::new(&theme, &session, None, 1200.);
-        assert_eq!(failed.text, "Couldn't read folder · ? details");
+        assert_eq!(failed.text, "Couldn't read folder");
+        assert!(failed.details);
         labels.update(failed, motion, now);
 
         session.clear_query_fault(QueryFault::Folder);
         let recovered = StatusLabel::new(&theme, &session, None, 1200.);
         let frame = labels.update(recovered.clone(), motion, now);
         assert_eq!(frame.current.text, "local · offline");
-        assert_eq!(
-            frame.outgoing.unwrap().0.text,
-            "Couldn't read folder · ? details"
-        );
-        assert!(
-            labels
-                .update(recovered, motion, now + motion::FADE)
-                .outgoing
-                .is_none()
-        );
+        assert!(!frame.current.details);
+        assert_eq!(frame.details_opacity(), 1.0);
+        assert!(frame.outgoing.unwrap().0.details);
+        let settled = labels.update(recovered, motion, now + motion::FADE);
+        assert!(settled.outgoing.is_none());
+        assert_eq!(settled.details_opacity(), 0.0);
+
+        session.sync = SyncKind::Failed(SyncFailure {
+            kind: fell_core::SyncFailureKind::Unreachable,
+            bridge: false,
+            detail: "Connection refused".into(),
+            recovery: None,
+        });
+        let reply = StatusLabel::new(&theme, &session, Some(ReplyCheck::Verified), 1200.);
+        assert_eq!(reply.text, "Reply-To verified · r to reply");
+        assert!(reply.details);
+
+        session.sync = SyncKind::Syncing {
+            new_messages: None,
+            progress: Some(fell_core::SyncProgress {
+                folder: "Inbox".into(),
+                total: 85,
+                done: 12,
+            }),
+        };
+        session.fail_query(QueryFault::Folder, "database is locked".into());
+        let download = StatusLabel::new(&theme, &session, None, 440.);
+        assert_eq!(download.download.unwrap().done, "12");
+        assert!(download.details);
+
+        session.clear_query_fault(QueryFault::Folder);
+        session.sync = SyncKind::Synced {
+            at: i64::MAX,
+            changed: false,
+            new_messages: None,
+        };
+        session.record_startup_error("invalid keymap".into());
+        let synced = StatusLabel::new(&theme, &session, None, 1200.);
+        assert_eq!(synced.text, "synced just now");
+        assert!(synced.steady_sync && synced.details);
+        let opening = StatusLabel::opening_draft(&theme, &session);
+        assert_eq!(opening.text, "Opening…");
+        assert!(opening.details);
     }
 
     #[test]
@@ -12009,6 +12108,7 @@ mod tests {
             }
             .download_status(),
             color: 0,
+            details: false,
             steady_sync: false,
         };
         for count in 0..=60 {
