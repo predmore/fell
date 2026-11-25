@@ -218,6 +218,7 @@ pub(crate) fn parse_draft(
         body,
         files,
         identities: vec![account.email.clone()],
+        managed_signature: None,
         owner: String::new(),
         reply: ReplyParts {
             references,

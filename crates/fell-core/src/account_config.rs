@@ -1,8 +1,9 @@
 //! One configured mail account, read from a small `key = value` file.
 //!
 //! The app keeps this at `~/.config/fell/account.toml`, mode `0600`. Only
-//! flat keys are understood. An unknown key is an error so a typo does not
-//! silently fall back to a default.
+//! flat account keys and `[[identities]]` tables are understood. Unknown
+//! keys are errors. The top-level email remains the default sender. Give
+//! it an identity table to set its signature.
 //!
 //! ```toml
 //! backend = "bridge"            # "bridge" or "imap"
@@ -21,6 +22,11 @@
 //! # save_sent = "auto"        # "append" or "server" overrides the backend default
 //! # write_back = true           # send local changes to the server (off by default)
 //! # notifications = "on"       # "on", "private", or "off"
+//!
+//! [[identities]]
+//! address = "alias@pm.me"
+//! name = "Me"
+//! signature = "**Me**\nExample Studio"
 //! ```
 //!
 //! Sync learns which folder is Sent, Drafts, Trash and so on from the
@@ -95,10 +101,35 @@ impl SaveSent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    pub address: String,
+    pub name: String,
+    pub signature: Option<String>,
+}
+
+impl Identity {
+    pub fn from_header(&self) -> String {
+        crate::compose::configured_from(&self.name, &self.address)
+    }
+
+    pub(crate) fn valid_address(address: &str) -> bool {
+        let Some((local, domain)) = address.split_once('@') else {
+            return false;
+        };
+        !local.is_empty()
+            && !domain.is_empty()
+            && !address.contains(['"', ',', ';', ':', '<', '>', '[', ']', '(', ')'])
+            && !domain.contains('@')
+            && crate::compose::email_of(address).as_deref() == Some(&address.to_ascii_lowercase())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountConfig {
     pub id: String,
     pub name: String,
     pub email: String,
+    pub identities: Vec<Identity>,
     pub backend: BackendKind,
     pub host: String,
     pub port: u16,
@@ -167,6 +198,7 @@ impl AccountConfig {
             id: "mail".into(),
             name: String::new(),
             email,
+            identities: Vec::new(),
             backend: BackendKind::Bridge,
             host: "127.0.0.1".into(),
             port: 1143,
@@ -184,13 +216,21 @@ impl AccountConfig {
     }
 
     pub fn parse(text: &str) -> Result<Self> {
-        let mut fields: Vec<(String, Value)> = Vec::new();
+        let mut fields = Vec::new();
+        let mut tables: Vec<Vec<(String, Value)>> = Vec::new();
         for (index, raw) in text.lines().enumerate() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
             let lineno = index + 1;
+            if line.starts_with('[')
+                && line.split('#').next().unwrap_or("").trim_end() == "[[identities]]"
+            {
+                tables.push(Vec::new());
+                continue;
+            }
+            let fields = tables.last_mut().unwrap_or(&mut fields);
             let Some((key, value)) = line.split_once('=') else {
                 return Err(invalid(format!("line {lineno}: expected key = value")));
             };
@@ -202,10 +242,11 @@ impl AccountConfig {
             }
             fields.push((key.to_string(), value));
         }
-        let mut get = |key: &str| -> Option<Value> {
-            let index = fields.iter().position(|(seen, _)| seen == key)?;
-            Some(fields.remove(index).1)
-        };
+        let identities = tables
+            .into_iter()
+            .map(parse_identity)
+            .collect::<Result<_>>()?;
+        let mut get = |key: &str| take_field(&mut fields, key);
 
         let backend = match get("backend") {
             None => BackendKind::Bridge,
@@ -322,6 +363,7 @@ impl AccountConfig {
             id,
             name,
             email,
+            identities,
             backend,
             host,
             port,
@@ -350,6 +392,24 @@ impl AccountConfig {
         }
         if self.email.is_empty() {
             return Err(invalid("email is empty"));
+        }
+        let mut addresses = std::collections::HashSet::new();
+        for identity in &self.identities {
+            if !Identity::valid_address(&identity.address) {
+                return Err(invalid("identity address must be a bare email address"));
+            }
+            if !addresses.insert(identity.address.to_ascii_lowercase()) {
+                return Err(invalid("identity address is set twice"));
+            }
+            if identity.name.chars().any(char::is_control) || identity.name.contains(['<', '>']) {
+                return Err(invalid("identity name must be plain display text"));
+            }
+            if identity.signature.as_ref().is_some_and(|text| {
+                text.chars()
+                    .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\t'))
+            }) {
+                return Err(invalid("identity signature contains a control character"));
+            }
         }
         if self.username.is_empty() {
             return Err(invalid("username is empty"));
@@ -433,7 +493,48 @@ impl AccountConfig {
         if self.notifications != NotificationMode::On {
             push(&mut out, "notifications", self.notifications.as_str());
         }
+        Self::render_identities(&mut out, &self.identities);
         out
+    }
+
+    /// Append identity tables without rewriting unrelated account settings.
+    pub fn render_identities(out: &mut String, identities: &[Identity]) {
+        for identity in identities {
+            out.push_str("\n[[identities]]\n");
+            push(out, "address", &identity.address);
+            if !identity.name.is_empty() {
+                push(out, "name", &identity.name);
+            }
+            if let Some(signature) = &identity.signature {
+                push(out, "signature", signature);
+            }
+        }
+    }
+
+    /// The legacy account address is always first and remains the default.
+    /// Listing it explicitly lets it have its own signature.
+    pub fn compose_identities(&self) -> Vec<Identity> {
+        let mut default = self
+            .identities
+            .iter()
+            .find(|identity| identity.address.eq_ignore_ascii_case(&self.email))
+            .cloned()
+            .unwrap_or_else(|| Identity {
+                address: self.email.clone(),
+                name: String::new(),
+                signature: None,
+            });
+        if default.name.is_empty() {
+            default.name.clone_from(&self.name);
+        }
+        std::iter::once(default)
+            .chain(
+                self.identities
+                    .iter()
+                    .filter(|identity| !identity.address.eq_ignore_ascii_case(&self.email))
+                    .cloned(),
+            )
+            .collect()
     }
 
     pub fn account(&self) -> Account {
@@ -477,9 +578,20 @@ impl AccountConfig {
             // certificate check.
             accept_invalid_certs: self.backend == BackendKind::Bridge && literal_loopback(&host),
             append_sent: self.append_sent(),
+            senders: Vec::new(),
             host,
             port,
             security,
+        }
+    }
+
+    fn smtp_submission_config(&self) -> SmtpConfig {
+        SmtpConfig {
+            senders: std::iter::once(&self.email)
+                .chain(self.identities.iter().map(|identity| &identity.address))
+                .filter_map(|address| crate::compose::email_of(address))
+                .collect(),
+            ..self.smtp_config()
         }
     }
 
@@ -489,7 +601,7 @@ impl AccountConfig {
             BackendKind::Imap => Box::new(ImapBackend {
                 account_id: AccountId(self.id.clone()),
                 config: self.imap_config()?,
-                smtp: self.smtp_config(),
+                smtp: self.smtp_submission_config(),
             }),
             _ => Box::new(self.bridge_backend()?),
         })
@@ -499,7 +611,7 @@ impl AccountConfig {
         Ok(BridgeBackend {
             account_id: AccountId(self.id.clone()),
             imap: self.imap_config()?,
-            smtp: self.smtp_config(),
+            smtp: self.smtp_submission_config(),
         })
     }
 
@@ -780,6 +892,65 @@ impl Value {
     }
 }
 
+/// An agent can write draft.md but cannot grant itself permission to use
+/// another From address. Recheck the account file on address changes,
+/// including edits made while the editor is closed.
+pub(crate) fn configured_sender(account: &crate::AccountId, header: &str) -> Option<Identity> {
+    use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    let email = crate::compose::email_of(header)?;
+    let directory = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(directory.join("fell/account.toml"))
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
+        return None;
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text).ok()?;
+    let config = AccountConfig::parse(&text).ok()?;
+    if config.id != account.as_str() {
+        return None;
+    }
+    config
+        .compose_identities()
+        .into_iter()
+        .find(|identity| identity.address.eq_ignore_ascii_case(&email))
+}
+
+fn take_field(fields: &mut Vec<(String, Value)>, key: &str) -> Option<Value> {
+    let index = fields.iter().position(|(seen, _)| seen == key)?;
+    Some(fields.remove(index).1)
+}
+
+fn parse_identity(mut fields: Vec<(String, Value)>) -> Result<Identity> {
+    let address = required(take_field(&mut fields, "address"), "identity address")?;
+    let name = take_field(&mut fields, "name")
+        .map(|value| value.text("identity name"))
+        .transpose()?
+        .unwrap_or_default();
+    let signature = take_field(&mut fields, "signature")
+        .map(|value| value.text("identity signature"))
+        .transpose()?;
+    if let Some((key, _)) = fields.first() {
+        return Err(invalid(format!("unknown identity key {key}")));
+    }
+    Ok(Identity {
+        address,
+        name,
+        signature,
+    })
+}
+
 fn parse_value(raw: &str) -> std::result::Result<Value, String> {
     if let Some(rest) = raw.strip_prefix('"') {
         let mut out = String::new();
@@ -866,6 +1037,64 @@ fn invalid(message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_tables_round_trip_and_can_sign_the_primary_address() {
+        let text = r#"
+email = "primary@example.com"
+name = "Primary Name"
+password = "test"
+[[identities]] # aliases
+address = "alias@example.com"
+name = 'Studio, Research'
+signature = "**Studio**\nResearch \tcontact"
+[[identities]]
+address = "PRIMARY@example.com"
+signature = "Primary signature"
+"#;
+        let config = AccountConfig::parse(text).unwrap();
+        assert_eq!(AccountConfig::parse(&config.render()).unwrap(), config);
+        let identities = config.compose_identities();
+        assert_eq!(identities.len(), 2);
+        assert_eq!(
+            identities[0].from_header(),
+            "Primary Name <PRIMARY@example.com>"
+        );
+        assert_eq!(
+            identities[0].signature.as_deref(),
+            Some("Primary signature")
+        );
+        assert_eq!(
+            identities[1].signature.as_deref(),
+            Some("**Studio**\nResearch \tcontact")
+        );
+        assert!(crate::compose::email_of(&identities[1].from_header()).is_some());
+    }
+
+    #[test]
+    fn identity_tables_reject_unknown_keys_invalid_addresses_and_duplicates() {
+        let base = "email = \"primary@example.com\"\npassword = \"test\"\n";
+        for invalid in [
+            "[[identities]]\nname = \"Missing address\"",
+            "[[identities]]\naddress = true",
+            "[[identities]]\naddress = \"Name <alias@example.com>\"",
+            "[[identities]]\naddress = \"alias@example.com\"\nunknown = true",
+            "[[identities]]\naddress = \"alias@example.com\"\naddress = \"other@example.com\"",
+            "[[identities]]\naddress = \"alias@example.com\"\n[[identities]]\naddress = \"Alias@example.com\"",
+            "[[identities]]\naddress = \"alias@example.com\"\nname = \"Line\\nbreak\"",
+        ] {
+            assert!(
+                AccountConfig::parse(&format!("{base}{invalid}")).is_err(),
+                "{invalid}"
+            );
+        }
+        let legacy = AccountConfig::parse(base).unwrap();
+        assert!(legacy.identities.is_empty());
+        assert_eq!(
+            legacy.compose_identities()[0].from_header(),
+            "primary@example.com"
+        );
+    }
 
     #[test]
     fn folder_overrides_parse_and_render() {

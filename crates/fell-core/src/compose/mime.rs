@@ -131,6 +131,7 @@ fn build_message(
     Outgoing {
         draft: Draft {
             account_id,
+            from: fields.from.clone(),
             to: fields.to.clone(),
             cc: fields.cc.clone(),
             bcc: fields.bcc.clone(),

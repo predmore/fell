@@ -33,6 +33,8 @@ pub struct SmtpConfig {
     pub accept_invalid_certs: bool,
     /// Queue a server Sent copy after successful submission.
     pub append_sent: bool,
+    /// Canonical addresses from the account file. Empty for fixture backends.
+    pub senders: Vec<String>,
 }
 
 impl SmtpConfig {
@@ -44,6 +46,7 @@ impl SmtpConfig {
             security: ImapSecurity::StartTls,
             accept_invalid_certs: true,
             append_sent: false,
+            senders: Vec::new(),
         }
     }
 }
@@ -77,9 +80,17 @@ pub(crate) fn confirm_send(
     confirmation: UserSendConfirmation,
 ) -> Result<SentMessage> {
     require_confirmation(&pending, &confirmation)?;
+    let from = sender(&pending.mime)?;
+    if crate::compose::email_of(&pending.draft.from).as_ref() != Some(&from) {
+        return Err(smtp_err("smtp: draft and message From addresses differ"));
+    }
+    if !config.senders.is_empty() && !config.senders.contains(&from) {
+        return Err(smtp_err("smtp: From is not configured in account.toml"));
+    }
     let remote = deliver(
         &Endpoint::new(config, &login.username, &login.password),
         &pending,
+        &from,
     )?;
     Ok(SentMessage {
         pending_id: pending.id,
@@ -87,11 +98,7 @@ pub(crate) fn confirm_send(
     })
 }
 
-fn deliver(endpoint: &Endpoint, pending: &PendingSend) -> Result<String> {
-    if pending.mime.is_empty() {
-        return Err(smtp_err("smtp: message is empty"));
-    }
-    let from = sender(&pending.mime)?;
+fn deliver(endpoint: &Endpoint, pending: &PendingSend, from: &str) -> Result<String> {
     let recipients = envelope(&pending.draft)?;
     let (mut pipe, hello) = login(endpoint)?;
     let mail_from = if offers(&hello, "8BITMIME") {
@@ -632,6 +639,7 @@ Bcc: this is body text\r\n"
             "bridge",
             Draft {
                 account_id: AccountId("mailbox".into()),
+                from: "jon@example.com".into(),
                 to: vec!["Ada <ada@example.com>".into()],
                 cc: vec!["be@example.com".into()],
                 bcc: vec!["Hidden <hidden@example.com>".into()],
@@ -660,6 +668,7 @@ Bcc: this is body text\r\n"
         let mut pending = sample_pending();
         pending.draft.account_id = account.clone();
         pending.mime = mime.to_vec();
+        pending.draft.from = sender(mime)?;
         let confirmation = confirm(&pending);
         let sent = confirm_send(
             &backend(port, ImapSecurity::Plain).smtp,
@@ -693,6 +702,7 @@ Bcc: this is body text\r\n"
                 security,
                 accept_invalid_certs: true,
                 append_sent: false,
+                senders: Vec::new(),
             },
         }
     }
@@ -705,18 +715,10 @@ Bcc: this is body text\r\n"
         ] {
             let mime = format!("From: jon@example.com\r\n{header}Subject: x\r\n\r\nHi\r\n");
             let pending = sample_pending().with_message(mime.into_bytes(), Vec::new());
-            let err = deliver(
-                &Endpoint {
-                    host: "127.0.0.1".into(),
-                    port: 1,
-                    username: "bridge-user".into(),
-                    password: "bridge-secret".into(),
-                    security: ImapSecurity::StartTls,
-                    accept_invalid_certs: false,
-                },
-                &pending,
-            )
-            .unwrap_err();
+            let backend = backend(1, ImapSecurity::StartTls);
+            let err = backend
+                .confirm_send(pending.clone(), confirm(&pending))
+                .unwrap_err();
             let text = err.to_string();
             assert!(text.contains("Bcc"), "{text}");
             assert!(!text.contains("connect"), "{text}");
@@ -734,6 +736,27 @@ Bcc: this is body text\r\n"
         let text = err.to_string();
         assert!(text.contains("SMTP"), "{text}");
         assert!(!text.contains("connect"), "{text}");
+    }
+
+    #[test]
+    fn a_configured_alias_is_the_envelope_and_message_sender() {
+        let (port, captured, join) = serve(Wire::Clear, AfterData::Accept);
+        let mut backend = backend(port, ImapSecurity::Plain);
+        backend.smtp.senders = vec!["jon@example.com".into(), "alias@example.com".into()];
+        let mut pending = sample_pending();
+        pending.draft.from = "Studio <alias@example.com>".into();
+        pending.mime = String::from_utf8(pending.mime)
+            .unwrap()
+            .replace("jon@example.com", "alias@example.com")
+            .into_bytes();
+        backend
+            .confirm_send(pending.clone(), confirm(&pending))
+            .unwrap();
+        let captured = captured.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(captured.from, "alias@example.com");
+        assert_eq!(sender(&captured.data).unwrap(), "alias@example.com");
+        assert_eq!(captured.data, pending.mime);
+        join.join().unwrap();
     }
 
     #[test]
@@ -823,6 +846,7 @@ Bcc: this is body text\r\n"
                     accept_invalid_certs,
                 },
                 &sample_pending(),
+                "jon@example.com",
             )
             .unwrap_err();
             let text = err.to_string();

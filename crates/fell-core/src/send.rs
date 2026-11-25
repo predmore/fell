@@ -15,6 +15,7 @@ static NEXT_PENDING: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Draft {
     pub account_id: AccountId,
+    pub from: String,
     pub to: Vec<String>,
     pub cc: Vec<String>,
     pub bcc: Vec<String>,
@@ -68,7 +69,7 @@ impl PendingSend {
 
 /// Proof that the user confirmed send in the Fell UI.
 ///
-/// Bound to a specific pending id plus the account, recipients, subject,
+/// Bound to a specific pending id plus the account, From, recipients, subject,
 /// body, reply parent, attachments, and a SHA-256 of the exact message bytes
 /// that were shown. Constructed only via
 /// [`UserSendConfirmation::from_interactive_ui`].
@@ -79,6 +80,7 @@ impl PendingSend {
 ///     "x",
 ///     Draft {
 ///         account_id: AccountId("a".into()),
+///         from: "jon@example.com".into(),
 ///         to: vec![],
 ///         cc: vec![],
 ///         bcc: vec![],
@@ -94,6 +96,7 @@ impl PendingSend {
 pub struct UserSendConfirmation {
     pending_id: PendingSendId,
     account_id: AccountId,
+    from: String,
     to: Vec<String>,
     cc: Vec<String>,
     bcc: Vec<String>,
@@ -114,7 +117,7 @@ pub fn message_digest(mime: &[u8]) -> [u8; 32] {
 impl UserSendConfirmation {
     /// Call from the GPUI app after an explicit user Send action.
     ///
-    /// Snapshots the pending id, account, recipients, subject, body, reply
+    /// Snapshots the pending id, account, From, recipients, subject, body, reply
     /// parent, attachments, and a hash of the message bytes.
     /// `fell-mcp` cannot name [`fell_confirm::InteractiveUi`] without adding a
     /// Cargo dependency on `fell-confirm`, and builds `fell-core` without the
@@ -125,6 +128,7 @@ impl UserSendConfirmation {
         Self {
             pending_id: pending.id.clone(),
             account_id: pending.draft.account_id.clone(),
+            from: pending.draft.from.clone(),
             to: pending.draft.to.clone(),
             cc: pending.draft.cc.clone(),
             bcc: pending.draft.bcc.clone(),
@@ -148,7 +152,7 @@ pub struct SentMessage {
 }
 
 /// Refuse a send unless the confirmation token names this pending send
-/// and still matches its account, recipients, subject, body, reply parent,
+/// and still matches its account, From, recipients, subject, body, reply parent,
 /// attachments, and message bytes.
 pub fn require_confirmation(
     pending: &PendingSend,
@@ -156,6 +160,7 @@ pub fn require_confirmation(
 ) -> crate::Result<()> {
     if confirmation.pending_id == pending.id
         && confirmation.account_id == pending.draft.account_id
+        && confirmation.from == pending.draft.from
         && confirmation.to == pending.draft.to
         && confirmation.cc == pending.draft.cc
         && confirmation.bcc == pending.draft.bcc
@@ -180,6 +185,7 @@ mod tests {
     fn draft(body: &str) -> Draft {
         Draft {
             account_id: AccountId("a1".into()),
+            from: "jon@example.com".into(),
             to: vec!["b@x".into()],
             cc: vec![],
             bcc: vec![],
@@ -236,6 +242,18 @@ mod tests {
     }
 
     #[test]
+    fn confirmation_does_not_cover_a_changed_identity() {
+        let backend = FixtureBackend::default();
+        let mut pending = backend.submit_draft(draft("shown")).unwrap();
+        let confirmation = mint(&pending);
+        pending.draft.from = "alias@example.com".into();
+        assert!(matches!(
+            backend.confirm_send(pending, confirmation),
+            Err(crate::Error::SendUnconfirmed)
+        ));
+    }
+
+    #[test]
     fn confirmation_does_not_cover_mutated_subject() {
         let backend = FixtureBackend::default();
         let pending = backend.submit_draft(draft("shown")).unwrap();
@@ -252,6 +270,7 @@ mod tests {
         let pending = backend
             .submit_draft(Draft {
                 account_id: AccountId("a1".into()),
+                from: "jon@example.com".into(),
                 to: vec!["b@x".into()],
                 cc: vec!["c@x".into()],
                 bcc: vec!["d@x".into()],

@@ -4202,6 +4202,17 @@ impl Inbox {
                 Ok::<_, fell_core::Error>((parent, parts))
             }
         });
+        let configured = cx.background_executor().spawn({
+            let account = account.clone();
+            async move {
+                crate::mailbox::send_account_config(&account)
+                    .ok()
+                    .flatten()
+                    .filter(|config| !config.identities.is_empty())
+                    .map(|config| config.compose_identities())
+                    .unwrap_or_default()
+            }
+        });
         cx.spawn(async move |this, cx| {
             let reply_note = suggestion.clone();
             let result = match read.await {
@@ -4218,10 +4229,15 @@ impl Inbox {
                         parent.has_attachment = !omitted.is_empty();
                         parent.attachment_names = omitted;
                     }
-                    let own = fell_core::compose::own_addresses(&parent, &email, &roles);
+                    let identities = configured.await;
+                    let mut own = fell_core::compose::own_addresses(&parent, &email, &roles);
+                    own.extend(identities.iter().map(|identity| identity.address.clone()));
+                    let from = fell_core::compose::reply_identity(&parent, &identities)
+                        .map(fell_core::Identity::from_header)
+                        .unwrap_or(email);
                     let offset = crate::present::local_offset(parent.headers.date_unix);
                     let start = fell_core::compose::start_reply_in_zone(
-                        kind, &parent, &email, &own, offset, &roles,
+                        kind, &parent, &from, &own, offset, &roles,
                     );
                     if start.parts.reply_to_unverified {
                         let id = parent.headers.message_id;
@@ -4698,7 +4714,11 @@ impl Inbox {
             if settings_page != Some(page) {
                 self.settings_view.reset_scroll();
             }
-            if matches!(page, crate::model::settings::Page::Section(_)) {
+            if matches!(
+                page,
+                crate::model::settings::Page::Section(_)
+                    | crate::model::settings::Page::IdentityImport
+            ) {
                 self.settings_view
                     .scroll_to(self.session.settings_nav.selected);
             }

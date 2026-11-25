@@ -724,7 +724,13 @@ mod tests {
         let bridge = file.bridge_backend().unwrap();
         assert_eq!(bridge.imap.username, "a@b");
         assert_eq!(bridge.imap.password, "from-command");
-        assert_eq!(bridge.smtp, SmtpConfig::bridge_local());
+        assert_eq!(
+            bridge.smtp,
+            SmtpConfig {
+                senders: vec!["a@b".into()],
+                ..SmtpConfig::bridge_local()
+            }
+        );
     }
 
     #[test]
@@ -733,6 +739,7 @@ mod tests {
         let pending = backend
             .submit_draft(Draft {
                 account_id: AccountId("a".into()),
+                from: "jon@example.com".into(),
                 to: vec!["b@x".into()],
                 cc: vec![],
                 bcc: vec![],

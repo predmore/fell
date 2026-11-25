@@ -324,7 +324,13 @@ impl ComposeView {
         cx: &mut Context<Self>,
         theme: &crate::theme::Theme,
     ) -> Option<(Field, Div, bool)> {
-        if self.preview || self.palette.is_some() {
+        if self.preview
+            || self.palette.is_some()
+            || self
+                .from_picker
+                .as_ref()
+                .is_some_and(super::identity::Picker::active)
+        {
             return None;
         }
         let completion = &self.recipients;

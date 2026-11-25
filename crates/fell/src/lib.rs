@@ -90,6 +90,7 @@ mod tests {
         let pending = backend
             .submit_draft(Draft {
                 account_id: AccountId("a".into()),
+                from: "jon@example.com".into(),
                 to: vec!["b@x".into()],
                 cc: vec![],
                 bcc: vec![],

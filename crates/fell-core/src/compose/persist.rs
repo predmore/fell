@@ -28,6 +28,9 @@ pub struct StoredCompose {
     pub body: String,
     pub files: Vec<ResolvedFile>,
     pub identities: Vec<String>,
+    /// The generated delimiter and signature text, empty for a managed draft
+    /// with no signature, or absent after an edit to the signature.
+    pub managed_signature: Option<String>,
     pub owner: String,
     /// A reply's References and a reply or forward's quoted original.
     pub reply: ReplyParts,
@@ -260,8 +263,8 @@ pub(crate) fn confirm_synced_sends(
 const UPSERT_COMPOSE: &str = "INSERT INTO compose_drafts (
         id, account_id, from_addr, to_addrs, cc_addrs, bcc_addrs,
         subject, body, in_reply_to, identities, owner, updated_unix,
-        references_header, quote_text, quote_html, reply_to_unverified
-     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+        references_header, quote_text, quote_html, reply_to_unverified, managed_signature
+     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
      ON CONFLICT(id) DO UPDATE SET
         from_addr = excluded.from_addr,
         to_addrs = excluded.to_addrs,
@@ -279,7 +282,8 @@ const UPSERT_COMPOSE: &str = "INSERT INTO compose_drafts (
             THEN compose_drafts.quote_text ELSE excluded.quote_text END,
         quote_html = CASE WHEN excluded.quote_html = ''
             THEN compose_drafts.quote_html ELSE excluded.quote_html END,
-        reply_to_unverified = compose_drafts.reply_to_unverified OR excluded.reply_to_unverified
+        reply_to_unverified = compose_drafts.reply_to_unverified OR excluded.reply_to_unverified,
+        managed_signature = excluded.managed_signature
      WHERE compose_drafts.discarded_action_id IS NULL";
 
 fn save_compose_in(
@@ -307,6 +311,7 @@ fn save_compose_in(
             draft.reply.quote_text,
             draft.reply.quote_html,
             draft.reply.reply_to_unverified,
+            draft.managed_signature,
         ],
     )?;
     if written == 0 {
@@ -714,7 +719,7 @@ impl Store {
             .query_row(
                 "SELECT account_id, from_addr, to_addrs, cc_addrs, bcc_addrs,
                         subject, body, in_reply_to, identities, owner,
-                        references_header, quote_text, quote_html, reply_to_unverified
+                        references_header, quote_text, quote_html, reply_to_unverified, managed_signature
                  FROM compose_drafts WHERE id = ?1 AND discarded_action_id IS NULL",
                 params![id],
                 |row| {
@@ -735,12 +740,25 @@ impl Store {
                             quote_html: row.get(12)?,
                             reply_to_unverified: row.get(13)?,
                         },
+                        row.get::<_, Option<String>>(14)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((account, from, to, cc, bcc, subject, body, reply, identities, owner, parts)) =
-            row
+        let Some((
+            account,
+            from,
+            to,
+            cc,
+            bcc,
+            subject,
+            body,
+            reply,
+            identities,
+            owner,
+            parts,
+            managed_signature,
+        )) = row
         else {
             return Ok(None);
         };
@@ -779,6 +797,7 @@ impl Store {
             body,
             files,
             identities: split_list(&identities),
+            managed_signature,
             owner,
             reply: parts,
         }))
@@ -1350,6 +1369,7 @@ mod tests {
                     body: "sounds good\n".into(),
                     files: Vec::new(),
                     identities: vec!["me@x".into()],
+                    managed_signature: None,
                     owner: String::new(),
                     reply: super::super::ReplyParts {
                         quote_text: quote_text.into(),
@@ -1416,6 +1436,7 @@ mod tests {
                     body: "hello\n".into(),
                     files: Vec::new(),
                     identities: vec!["me@x".into()],
+                    managed_signature: None,
                     owner: owner.into(),
                     reply: Default::default(),
                 })
@@ -1488,6 +1509,7 @@ mod tests {
                     inline: true,
                 }],
                 identities: vec!["jon@example.com".into()],
+                managed_signature: None,
                 owner: String::new(),
                 reply: Default::default(),
             })
@@ -1525,6 +1547,7 @@ mod tests {
                 body: "![chart](chart.png) ![logo](logo.png)\n".into(),
                 files: vec![file("chart.png", b"old"), file("logo.png", b"logo")],
                 identities: vec!["jon@example.com".into()],
+                managed_signature: None,
                 owner: String::new(),
                 reply: Default::default(),
             })
@@ -1651,6 +1674,7 @@ mod tests {
                 body: "body\n".into(),
                 files: Vec::new(),
                 identities: vec!["jon@example.com".into()],
+                managed_signature: None,
                 owner: "agent:ada".into(),
                 reply: Default::default(),
             })
@@ -1719,6 +1743,7 @@ mod tests {
                     inline: false,
                 }],
                 identities: vec!["jon@example.com".into()],
+                managed_signature: None,
                 owner: "agent:ada".into(),
                 reply: Default::default(),
             })

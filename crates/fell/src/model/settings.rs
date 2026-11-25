@@ -51,7 +51,7 @@ impl Section {
         use Preference::*;
         use Row::*;
         match self {
-            Self::Accounts => &[AccountSetup],
+            Self::Accounts => &[AccountSetup, EditAccount, ImportIdentities],
             Self::Appearance => &[Value(Theme), Value(FontSize), Value(ReduceMotion)],
             Self::Reading => &[Value(ReadDwell)],
             Self::Keymap => &[Value(WhichKey), EffectiveBindings, EditKeymap],
@@ -66,6 +66,8 @@ impl Section {
 pub enum Row {
     Value(Preference),
     AccountSetup,
+    EditAccount,
+    ImportIdentities,
     EffectiveBindings,
     EditKeymap,
     InstallModel,
@@ -78,6 +80,8 @@ impl Row {
         match self {
             Self::Value(preference) => preference.command(),
             Self::AccountSetup => "Settings: Open account setup",
+            Self::EditAccount => "Settings: Edit account.toml",
+            Self::ImportIdentities => "Settings: Import sender addresses",
             Self::EffectiveBindings => "Settings: Show effective bindings",
             Self::EditKeymap => "Settings: Edit keymap.toml",
             Self::InstallModel => "Settings: Install local search model",
@@ -91,6 +95,10 @@ impl Row {
 pub enum Request {
     Save(Edit),
     AccountSetup,
+    EditAccount,
+    ReadIdentityCandidates,
+    ToggleIdentityCandidate(usize),
+    ImportIdentities,
     EditKeymap,
     CheckModel,
     Scroll(i32),
@@ -103,6 +111,7 @@ pub enum Page {
     Index,
     Section(Section),
     Bindings,
+    IdentityImport,
     ConfirmModel {
         install: bool,
     },
@@ -111,6 +120,8 @@ pub enum Page {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Availability {
     pub account_setup: bool,
+    pub edit_account: bool,
+    pub identity_count: usize,
     pub install_model: bool,
     pub remove_model: bool,
 }
@@ -119,6 +130,8 @@ impl Default for Availability {
     fn default() -> Self {
         Self {
             account_setup: true,
+            edit_account: false,
+            identity_count: 0,
             install_model: true,
             remove_model: false,
         }
@@ -129,6 +142,8 @@ impl Availability {
     pub fn shows(self, row: Row) -> bool {
         match row {
             Row::AccountSetup => self.account_setup,
+            Row::EditAccount => self.edit_account,
+            Row::ImportIdentities => self.identity_count > 0,
             Row::InstallModel => self.install_model,
             Row::RemoveModel => self.remove_model,
             _ => true,
@@ -140,6 +155,7 @@ impl Availability {
 pub struct Nav {
     pub page: Page,
     pub selected: usize,
+    pub identity_candidates: usize,
     pub availability: Availability,
 }
 
@@ -189,6 +205,7 @@ impl Nav {
                     .unwrap();
             }
             Page::Bindings => self.select_row(Row::EffectiveBindings),
+            Page::IdentityImport => self.select_row(Row::ImportIdentities),
             Page::ConfirmModel { install } => {
                 self.page = Page::Section(Section::Search);
                 self.selected = 0;
@@ -212,6 +229,7 @@ impl Nav {
         let len = match self.page {
             Page::Index => Section::ALL.len(),
             Page::Section(section) => self.rows(section).count(),
+            Page::IdentityImport => self.identity_candidates + 1,
             Page::Bindings | Page::ConfirmModel { .. } => return,
         };
         if len != 0 {

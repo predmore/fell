@@ -1,6 +1,7 @@
 //! Compose window. The buffer is plain markdown. Styling is a view of that
 //! text, through the same document model the conversation renderer uses.
 
+mod identity;
 mod recipient_rows;
 mod recipients;
 pub(crate) use recipients::RecipientStore;
@@ -339,6 +340,7 @@ pub struct ComposeView {
     leader_at: Option<std::time::Instant>,
     which_visible: bool,
     palette: Option<String>,
+    from_picker: Option<identity::Picker>,
     status: SharedString,
     sent: bool,
     /// The draft whose send is talking to the server. Another send of it
@@ -470,6 +472,7 @@ impl ComposeView {
             leader_at: None,
             which_visible: false,
             palette: None,
+            from_picker: None,
             status: "".into(),
             sent: false,
             sending: None,
@@ -520,13 +523,29 @@ impl ComposeView {
                     break;
                 };
                 let account = account.clone();
-                let unavailable = cx
+                let result = cx
                     .background_executor()
-                    .spawn(async move { crate::mailbox::send_account_config(&account).err() })
+                    .spawn(async move { crate::mailbox::send_account_config(&account) })
                     .await;
                 if this
                     .update(cx, |this, cx| {
-                        if this.send_feedback.update_readiness(generation, unavailable) {
+                        let identities = result
+                            .as_ref()
+                            .ok()
+                            .and_then(|config| config.as_ref())
+                            .map(fell_core::AccountConfig::compose_identities)
+                            .unwrap_or_default();
+                        let changed = this
+                            .hub
+                            .with_session(this.draft_id.as_ref(), |session| {
+                                session.set_identities(identities)
+                            })
+                            .unwrap_or(false);
+                        if this
+                            .send_feedback
+                            .update_readiness(generation, result.err())
+                            || changed
+                        {
                             cx.notify();
                         }
                     })
@@ -851,6 +870,14 @@ impl ComposeView {
         self.close_on_send = true;
     }
 
+    fn signature_only(&self) -> bool {
+        self.hub
+            .with_session(self.draft_id.as_ref(), |session| {
+                session.has_only_signature()
+            })
+            .unwrap_or(false)
+    }
+
     /// A draft with nobody to send it to yet starts on the To line, ready
     /// to type, as a new draft from `c` does.
     fn start_on_recipients_if_empty(&mut self, snap: &Snapshot) {
@@ -859,7 +886,9 @@ impl ComposeView {
             self.field = Field::To;
             self.status = "".into();
             // Tab from Subject carries the typing on after what is written.
-            self.editor.cursor_to_end_of_text();
+            if !self.signature_only() {
+                self.editor.cursor_to_end_of_text();
+            }
         }
     }
 
@@ -877,16 +906,22 @@ impl ComposeView {
             return;
         }
         self.start_on_recipients_if_empty(&snap);
+        let signature_only = self.signature_only();
         if snap.send_requested_by.is_none()
             && self.field == Field::Body
             && snap.in_reply_to.is_some()
-            && snap.body.trim().is_empty()
+            && (snap.body.trim().is_empty() || signature_only)
         {
             // A new reply: the next thing is always typing, as after `c`.
             self.editor.row = 0;
             self.editor.col = 0;
             self.editor.mode = Mode::Insert;
             self.status = "insert".into();
+            return;
+        }
+        if signature_only {
+            self.editor.row = 0;
+            self.editor.col = 0;
             return;
         }
         if snap.send_requested_by.is_none() {
@@ -984,6 +1019,7 @@ impl ComposeView {
         self.send_check = None;
         self.send_panel = SendPanel::Summary;
         self.palette = None;
+        self.from_picker = None;
         self.leader = false;
         self.which_visible = false;
         self.quote_open = false;
@@ -1473,6 +1509,19 @@ impl ComposeView {
             event.keystroke.key_char.as_deref().filter(|_| {
                 !event.keystroke.modifiers.control && !event.keystroke.modifiers.platform
             });
+        if self
+            .from_picker
+            .as_ref()
+            .is_some_and(identity::Picker::active)
+        {
+            let key = match (key, event.keystroke.modifiers.control) {
+                ("p", true) => "up",
+                ("n", true) => "down",
+                _ => key,
+            };
+            self.identity_key(key, typed, cx);
+            return;
+        }
         if let Some(Some(lock)) = self.hub.with_session(&id, |session| session.send_lock())
             && key != "escape"
         {
@@ -1532,7 +1581,9 @@ impl ComposeView {
             return;
         }
         if self.field != Field::Body {
-            if palette_shortcut {
+            if key == "f" && event.keystroke.modifiers.control {
+                self.open_identity_picker();
+            } else if palette_shortcut {
                 self.palette = Some(String::new());
             } else if !self.recipient_key(key, &event.keystroke.modifiers) {
                 self.field_key(key, typed);
@@ -1588,12 +1639,13 @@ impl ComposeView {
             .with_session(self.draft_id.as_ref(), |session| session.send_lock())
             .flatten();
         if let Some(lock) = locked
-            && matches!(action, "quote" | "keep" | "reject" | "undo")
+            && matches!(action, "quote" | "keep" | "reject" | "undo" | "from")
         {
             self.status = lock.reason().into();
             return;
         }
         match action {
+            "from" => self.open_identity_picker(),
             "unlock" if locked == Some(SendLock::MaybeSent) => {
                 self.status = "".into();
                 self.send_panel = SendPanel::ConfirmUnlock;
@@ -1723,6 +1775,10 @@ impl ComposeView {
 
     fn leader_key(&mut self, key: &str, cx: &mut Context<Self>) {
         match key {
+            "c" => {
+                self.status = "compose: f From".into();
+                return;
+            }
             "m" => {
                 self.status =
                     "mail: d discard · s send · p preview · r raw · q quote · t theme".into();
@@ -1736,7 +1792,7 @@ impl ComposeView {
                 self.status = "help: l diagnostic log".into();
                 return;
             }
-            "d" | "s" | "p" | "r" | "q" | "t" | "k" | "x" | "l" => {}
+            "d" | "s" | "p" | "r" | "q" | "t" | "k" | "x" | "l" | "f" => {}
             "escape" => {
                 self.leader = false;
                 self.which_visible = false;
@@ -1759,6 +1815,8 @@ impl ComposeView {
                 "t" => "theme",
                 _ => "",
             }
+        } else if status.starts_with("compose:") && key == "f" {
+            "from"
         } else if status.starts_with("agent") {
             match key {
                 "k" => "keep",
@@ -1772,6 +1830,9 @@ impl ComposeView {
         };
         self.leader = false;
         self.which_visible = false;
+        if status.starts_with("compose:") {
+            self.status = "".into();
+        }
         if !action.is_empty() {
             self.run_action(action, cx);
         }
@@ -2287,6 +2348,14 @@ impl Render for ComposeView {
             .look
             .as_ref()
             .and_then(|theme| theme.mono_family.clone());
+        let can_pick_from = lock.is_none()
+            && self
+                .hub
+                .with_session(self.draft_id.as_ref(), |session| {
+                    identity::can_pick(session, &snap.from)
+                })
+                .unwrap_or(false);
+        let from_picker = self.identity_picker_view(recipient_theme, window, cx);
         let feedback = feedback.map(|feedback| {
             send_feedback_view(feedback, self.send_panel, &self.send_detail_scroll, colors)
         });
@@ -2326,7 +2395,7 @@ impl Render for ComposeView {
                     .size_0(),
                 )
             })
-            .child(header(&snap, colors).flex_shrink_0())
+            .child(header(&snap, colors, can_pick_from, cx).flex_shrink_0())
             // Everything between the header and the Attachments divider:
             // the HTML preview panel covers exactly this, so it never ends
             // partway into a row below.
@@ -2394,6 +2463,7 @@ impl Render for ComposeView {
                     query,
                     palette_help,
                     matches!(lock, None | Some(SendLock::MaybeSent)),
+                    can_pick_from,
                     colors,
                 )
                 .when(self.recipients.has_matches(), |panel| {
@@ -2401,6 +2471,7 @@ impl Render for ComposeView {
                 })
             }))
             .children(self.preview.then(|| preview_scrim(colors)))
+            .children(from_picker)
             .when_some(self.frames.clone(), |root, frames| {
                 frames.borrow_mut().built(std::time::Instant::now());
                 let prepaint = frames.clone();
@@ -3192,8 +3263,14 @@ impl PreparedSend {
     }
 }
 
-fn header(snap: &Snapshot, colors: Palette) -> gpui::Div {
+fn header(
+    snap: &Snapshot,
+    colors: Palette,
+    can_pick_from: bool,
+    cx: &mut Context<ComposeView>,
+) -> gpui::Div {
     let title = div()
+        .flex_1()
         .flex()
         .flex_wrap()
         .gap_x_2()
@@ -3222,9 +3299,30 @@ fn header(snap: &Snapshot, colors: Palette) -> gpui::Div {
         .child(title)
         .child(
             div()
-                .flex_shrink_0()
+                .id("compose-from")
+                .w(gpui::relative(0.70))
+                .justify_end()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap_2()
                 .text_color(rgb(colors.dim))
-                .child(format!("from {}", snap.from)),
+                .when(can_pick_from, |from| {
+                    from.cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.open_identity_picker();
+                            cx.notify();
+                        }))
+                })
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .child(format!("From {}", crate::present::display_safe(&snap.from))),
+                )
+                .when(can_pick_from, |from| {
+                    from.child(div().flex_none().child("⌄"))
+                }),
         )
 }
 
@@ -6158,6 +6256,8 @@ fn which_key(colors: Palette) -> gpui::Div {
                 .text_color(rgb(colors.dim))
                 .child("d discard   s send   p preview   r raw   q quote   t theme"),
         )
+        .child("space c  compose")
+        .child(div().text_color(rgb(colors.dim)).child("f  Choose From"))
         .child("space a  agent edit")
         .child(div().text_color(rgb(colors.dim)).child("k keep   x reject"))
         .child("space ?  help")
@@ -6170,9 +6270,11 @@ fn palette_view(
     query: &str,
     commands: &'static str,
     can_discard: bool,
+    can_pick_from: bool,
     colors: Palette,
 ) -> gpui::Div {
     let discard_selected = palette_action(query) == Some("discard");
+    let from_selected = palette_action(query) == Some("from");
     div()
         .absolute()
         .top(px(80.))
@@ -6201,6 +6303,29 @@ fn palette_view(
                         .when(discard_selected, |row| row.bg(rgb(colors.selection)))
                         .child(DISCARD_DRAFT_LABEL)
                         .child(div().text_color(rgb(colors.dim)).child("Space m d")),
+                )
+            },
+        )
+        .when(
+            can_pick_from && (query.trim().is_empty() || from_selected),
+            |panel| {
+                panel.child(
+                    div()
+                        .mt_2()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .text_sm()
+                        .when(from_selected, |row| row.bg(rgb(colors.selection)))
+                        .child("Choose From")
+                        .child(
+                            div()
+                                .text_color(rgb(colors.dim))
+                                .child("Ctrl-f · Space c f"),
+                        ),
                 )
             },
         )
@@ -6699,13 +6824,14 @@ fn palette_action(query: &str) -> Option<&'static str> {
     match query.as_str() {
         "complete recipient" | "complete" => return Some("complete recipient"),
         "details" => return Some("details"),
+        "choose from" => return Some("from"),
         "dismiss" => return Some("dismiss"),
         "diagnostic log" | "open diagnostic log" => return Some("diagnostic log"),
         _ => {}
     }
     let mut found = None;
     for name in [
-        "send", "preview", "raw", "quote", "theme", "keep", "reject", "undo", "close",
+        "send", "preview", "raw", "quote", "theme", "keep", "reject", "undo", "close", "from",
     ] {
         if name.starts_with(&query) {
             if found.is_some() {

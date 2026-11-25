@@ -3371,6 +3371,32 @@ fn sent_copy_survives_a_write_lock_past_both_old_save_attempts() {
 }
 
 #[test]
+fn the_alias_sent_over_smtp_is_the_local_and_appended_from() {
+    let fixture = sent_fixture();
+    let account = &fixture.account.id;
+    let mime = String::from_utf8(REPLY_MIME.to_vec())
+        .unwrap()
+        .replace("Robin <c@x>", "Studio <studio@example.com>")
+        .into_bytes();
+    let id = crate::MessageId::new("reply@compose.fell");
+    fixture
+        .store
+        .claim_compose_send(account, "alias-reply", Some(id.as_str()))
+        .unwrap();
+    crate::smtp::tests::confirm_fixture_delivery(&fixture.backend.config, account, &mime).unwrap();
+    let (_, local) = fixture
+        .store
+        .record_sent_message(account, "alias-reply", &id, &[], &mime, true)
+        .unwrap();
+    assert_eq!(local.headers.from.email, "studio@example.com");
+    assert_eq!(fixture.replay().sent, 1);
+    assert_eq!(
+        fixture.server.state.lock().unwrap().mailboxes[1].messages[0].raw,
+        mime
+    );
+}
+
+#[test]
 fn sent_copy_is_appended_after_smtp_even_if_sqlite_refuses_the_local_insert() {
     let fixture = sent_fixture();
     let account = &fixture.account.id;

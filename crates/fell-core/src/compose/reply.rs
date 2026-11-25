@@ -148,6 +148,31 @@ fn prefixed(marker: &str, subject: &str) -> String {
     }
 }
 
+/// Prefer recorded deliveries to matching recipient headers. The first
+/// configured identity is the fallback when the message names none.
+pub fn reply_identity<'a>(
+    parent: &Message,
+    identities: &'a [crate::Identity],
+) -> Option<&'a crate::Identity> {
+    parent
+        .arrived_via
+        .iter()
+        .map(String::as_str)
+        .chain(
+            parent
+                .to
+                .iter()
+                .chain(&parent.cc)
+                .map(|address| address.email.as_str()),
+        )
+        .find_map(|address| {
+            identities
+                .iter()
+                .find(|identity| identity.address.eq_ignore_ascii_case(address.trim()))
+        })
+        .or_else(|| identities.first())
+}
+
 /// The person's own addresses for a reply to `parent`: the account's, the
 /// aliases this copy arrived through (Delivered-To and the like), and the
 /// sender of a copy in Sent, which the person sent from some address of
@@ -656,6 +681,59 @@ mod tests {
 
     fn me() -> Vec<String> {
         vec!["jon@example.com".into()]
+    }
+
+    #[test]
+    fn reply_and_forward_choose_delivery_then_to_then_cc_then_default() {
+        let mut account = crate::AccountConfig::bridge(
+            "me@example.com",
+            "fixture",
+            crate::PasswordSource::Inline("fixture".into()),
+        );
+        account.identities = ["delivery@example.com", "to@example.com", "cc@example.com"]
+            .into_iter()
+            .map(|address| crate::Identity {
+                address: address.into(),
+                name: "Studio".into(),
+                signature: None,
+            })
+            .collect();
+        let identities = account.compose_identities();
+        let mut parent = parent();
+        parent.arrived_via = vec!["other@example.com".into(), "Delivery@Example.com".into()];
+        parent.to = vec![address(None, "to@example.com")];
+        parent.cc = vec![address(None, "cc@example.com")];
+        let own = identities
+            .iter()
+            .map(|identity| identity.address.clone())
+            .collect::<Vec<_>>();
+        for kind in [ReplyKind::Reply, ReplyKind::ReplyAll, ReplyKind::Forward] {
+            let identity = reply_identity(&parent, &identities).unwrap();
+            let start = start_reply(
+                kind,
+                &parent,
+                &identity.from_header(),
+                &own,
+                &FolderRoles::default(),
+            );
+            assert_eq!(start.fields.from, "Studio <delivery@example.com>");
+            assert!(start.fields.cc.is_empty());
+        }
+        parent.arrived_via.clear();
+        assert_eq!(
+            reply_identity(&parent, &identities).unwrap().address,
+            "to@example.com"
+        );
+        parent.to.clear();
+        assert_eq!(
+            reply_identity(&parent, &identities).unwrap().address,
+            "cc@example.com"
+        );
+        parent.cc.clear();
+        assert_eq!(
+            reply_identity(&parent, &identities).unwrap().address,
+            "me@example.com"
+        );
     }
 
     #[test]

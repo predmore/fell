@@ -44,8 +44,8 @@ pub(crate) use persist::{
 pub(crate) use reply::format_address;
 pub use reply::{
     ForwardSummary, MAX_REFERENCES, ReplyKind, ReplyParts, ReplyStart, build_references,
-    configured_from, forward_subject, own_addresses, reply_recipients, reply_subject, start_reply,
-    start_reply_in_zone,
+    configured_from, forward_subject, own_addresses, reply_identity, reply_recipients,
+    reply_subject, start_reply, start_reply_in_zone,
 };
 pub(crate) use server::server_draft_payload;
 pub use server::{
@@ -53,7 +53,8 @@ pub use server::{
     server_draft_open_notice,
 };
 pub use session::{
-    AddressView, AttachmentView, DraftSession, HunkView, ReplyContext, SendLock, SentCopy, Snapshot,
+    AddressView, AttachmentView, DraftSession, HunkView, ReplyContext, SendLock, SentCopy,
+    Snapshot, signature_block,
 };
 pub(crate) use workspace::inline_image_paths;
 pub use workspace::{
