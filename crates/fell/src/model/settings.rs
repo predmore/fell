@@ -108,7 +108,7 @@ pub enum Page {
     },
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Availability {
     pub account_setup: bool,
     pub install_model: bool,

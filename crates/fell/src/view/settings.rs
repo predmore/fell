@@ -4,11 +4,11 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use fell_core::BackendKind;
 use fell_core::embed::{
     LocalEmbedder, MINILM_L6_V2_INT8, ModelError, default_models_dir, load_local_embedder,
     model_dir, remove_model,
 };
+use fell_core::{AccountConfig, BackendKind};
 use futures::channel::mpsc;
 use futures::{FutureExt, StreamExt};
 use gpui::{
@@ -19,7 +19,7 @@ use gpui::{
 use super::{FontOpt, Inbox};
 use crate::model::Overlay;
 use crate::model::settings::{self as nav, Availability, Page, Request, Row, Section};
-use crate::motion::{self, Glide, Motion, NumberFade, Transition};
+use crate::motion::{self, Glide, LayerSwap, Motion, SwapFrame, Transition};
 use crate::settings::{self, Edit, Snapshot, Values};
 use crate::{embeddings, mailbox, theme};
 
@@ -57,10 +57,7 @@ impl ModelStatus {
     fn status(self) -> (&'static str, &'static str) {
         match self {
             Self::Checking => ("Checking model files…", "Search can always match keywords."),
-            Self::Missing => (
-                "Keyword search",
-                "Install a local model to find mail by meaning too.",
-            ),
+            Self::Missing => ("Keyword search", "Finds mail by the words it contains."),
             Self::Installed => (
                 "Model installed",
                 "Ready for meaning-based search when Fell opens the mailbox.",
@@ -90,13 +87,14 @@ pub(super) struct View {
     edits: Option<mpsc::UnboundedSender<Edit>>,
     scroll: ScrollHandle,
     scroll_glide: Option<Glide>,
-    fade: NumberFade<(Values, Vec<settings::Preference>)>,
+    fade: Option<(Snapshot, LayerSwap)>,
+    notice_generation: Option<u64>,
+    reveal_index_selection: bool,
     selection: Option<(Page, usize)>,
     chevrons: Option<Transition>,
     page: Option<Page>,
     page_fade: Option<Transition>,
-    account: Option<BackendKind>,
-    account_file_exists: bool,
+    server: Option<String>,
     setup: Option<gpui::AnyWindowHandle>,
     model_root: Option<PathBuf>,
     model: ModelStatus,
@@ -105,11 +103,7 @@ pub(super) struct View {
 }
 
 impl View {
-    pub fn new(
-        snapshot: Snapshot,
-        account: Option<BackendKind>,
-        account_file_exists: bool,
-    ) -> Self {
+    pub fn new(snapshot: Snapshot, account: Option<&AccountConfig>) -> Self {
         let model_root = default_models_dir();
         let model = model_root
             .as_deref()
@@ -125,13 +119,26 @@ impl View {
             edits: None,
             scroll: ScrollHandle::new(),
             scroll_glide: None,
-            fade: NumberFade::default(),
+            fade: None,
+            notice_generation: None,
+            reveal_index_selection: false,
             selection: None,
             chevrons: None,
             page: None,
             page_fade: None,
-            account,
-            account_file_exists,
+            server: account.map(|config| {
+                let host = crate::present::display_safe(&config.host);
+                let host = if host.contains(':') && !host.starts_with('[') {
+                    format!("[{host}]")
+                } else {
+                    host
+                };
+                match config.backend {
+                    BackendKind::Bridge => format!("Proton Mail Bridge on {host}:{}", config.port),
+                    BackendKind::Imap => format!("IMAP · {host}:{}", config.port),
+                    BackendKind::ProtonApi => "Proton Mail".into(),
+                }
+            }),
             setup: None,
             model_root,
             model,
@@ -142,7 +149,7 @@ impl View {
 
     pub fn availability(&self) -> Availability {
         Availability {
-            account_setup: !self.account_file_exists,
+            account_setup: !account_file_exists(mailbox::account_config_path().as_deref()),
             install_model: matches!(
                 self.model,
                 ModelStatus::Checking | ModelStatus::Missing | ModelStatus::NeedsRepair
@@ -158,13 +165,30 @@ impl View {
         self.scroll.scroll_to_item(row);
     }
 
+    pub fn reveal_index_row(&mut self, row: usize, height: f32, final_height: f32) {
+        if !self.reveal_index_selection {
+            return;
+        }
+        // The old card can still be growing. Keep the index at its reset
+        // position until the final viewport can show the selected row.
+        let viewport = final_height - HEADER_HEIGHT - BODY_PADDING - INDEX_FOOTER_HEIGHT - 2.;
+        let top = -f32::from(self.scroll.offset().y);
+        let row_top = row as f32 * INDEX_ROW_HEIGHT;
+        if row_top >= top && row_top + INDEX_ROW_HEIGHT <= top + viewport {
+            self.reveal_index_selection = false;
+        } else if height >= final_height - 1. {
+            self.scroll.scroll_to_item(row);
+            self.reveal_index_selection = false;
+        }
+    }
+
     pub fn reset_scroll(&mut self) {
         self.scroll_glide = None;
         self.scroll.set_offset(gpui::point(px(0.), px(0.)));
     }
 
     pub fn settle(&mut self) {
-        self.fade = NumberFade::default();
+        self.fade = None;
         self.page_fade = None;
     }
 
@@ -177,6 +201,15 @@ impl View {
         if self.scroll_glide.is_none() {
             self.scroll.set_offset(gpui::point(px(0.), px(target)));
         }
+    }
+
+    fn value_fade(&self, now: Instant) -> Option<(&Snapshot, f32, f32)> {
+        let (old, fade) = self.fade.as_ref()?;
+        let (outgoing, incoming) = match fade.frame(now)? {
+            SwapFrame::Leaving(opacity) => (opacity, 0.),
+            SwapFrame::Arriving(opacity) => (0., opacity),
+        };
+        Some((old, outgoing, incoming))
     }
 
     pub fn observe(
@@ -199,6 +232,7 @@ impl View {
         }
         let selection = page.map(|page| (page, selected));
         if self.selection != selection {
+            self.reveal_index_selection = page == Some(Page::Index);
             self.selection = selection;
             self.chevrons = selection.and_then(|_| motion.start(motion::FADE, now));
         }
@@ -211,7 +245,7 @@ impl View {
             self.page = page;
         }
         self.scroll_glide.is_some()
-            || self.fade.frame(now).is_some()
+            || self.value_fade(now).is_some()
             || self.page_fade.is_some_and(|fade| fade.running(now))
             || self.chevrons.is_some_and(|fade| fade.running(now))
     }
@@ -219,9 +253,7 @@ impl View {
 
 impl Inbox {
     pub(super) fn watch_settings(&mut self, legacy: Values, cx: &mut Context<Self>) {
-        if let Some(notice) = self.settings_view.snapshot.notice.clone() {
-            self.settings_notice(notice, true, cx);
-        }
+        self.update_settings_notice(true, cx);
         report_unknown(&self.settings_view.snapshot);
         let (edits, mut requests) = mpsc::unbounded();
         self.settings_view.edits = Some(edits);
@@ -261,14 +293,12 @@ impl Inbox {
                     .spawn(async move {
                         let path = read_path.as_deref();
                         let (snapshot, save_error) = match (edit, path) {
-                            (Some(edit), Some(path)) => {
-                                match settings::save(path, legacy, &previous, edit) {
-                                    Ok(snapshot) => (snapshot, None),
-                                    Err(err) => {
-                                        (previous.reload(Some(path), legacy), Some(err.to_string()))
-                                    }
+                            (Some(edit), Some(path)) => match settings::save(path, legacy, edit) {
+                                Ok(snapshot) => (snapshot, None),
+                                Err(err) => {
+                                    (previous.reload(Some(path), legacy), Some(err.to_string()))
                                 }
-                            }
+                            },
                             (Some(_), None) => (
                                 Snapshot::read(None, legacy),
                                 Some("No config directory".into()),
@@ -308,19 +338,21 @@ impl Inbox {
         next_motion: Motion,
         cx: &mut Context<Self>,
     ) {
+        let availability_changed = self.refresh_settings_availability();
         let prior = &self.settings_view.snapshot;
         if *prior == snapshot && self.theme == theme && self.motion.motion == next_motion {
+            if availability_changed {
+                cx.notify();
+            }
             return;
         }
         let before = prior.values;
-        let old_invalid = prior.invalid.clone();
         let next = snapshot.values;
         if prior.unknown != snapshot.unknown {
             report_unknown(&snapshot);
         }
-        let notice = (prior.notice != snapshot.notice)
-            .then(|| snapshot.notice.clone())
-            .flatten();
+        let notice_changed = prior.notice() != snapshot.notice();
+        let old = (before != next || prior.invalid != snapshot.invalid).then(|| prior.clone());
         if self.motion.motion != next_motion {
             self.settle_motion();
             if next_motion.enabled() {
@@ -331,13 +363,12 @@ impl Inbox {
             self.row_widths = crate::row_widths::RowWidths::new(next_motion);
         }
         if self.session.overlay == Overlay::Settings
-            && (before != next || old_invalid != snapshot.invalid)
+            && let Some(old) = old
         {
-            self.settings_view.fade.change(
-                (before, old_invalid),
-                next_motion,
-                self.motion.clock.now(),
-            );
+            let half = motion::FADE / 2;
+            self.settings_view.fade =
+                LayerSwap::start(next_motion, self.motion.clock.now(), half, half)
+                    .map(|fade| (old, fade));
         }
         if before.notifications != next.notifications {
             self.session.notification_mode = Some(next.notifications);
@@ -358,9 +389,7 @@ impl Inbox {
             self.row_widths.clear();
         }
         self.settings_view.snapshot = snapshot;
-        if let Some(notice) = notice {
-            self.settings_notice(notice, true, cx);
-        }
+        self.update_settings_notice(notice_changed, cx);
         cx.notify();
     }
 
@@ -391,10 +420,24 @@ impl Inbox {
         cx.notify();
     }
 
+    pub(super) fn update_settings_notice(&mut self, changed: bool, cx: &mut Context<Self>) {
+        let snapshot = &self.settings_view.snapshot;
+        let inline = snapshot.read_error.is_none()
+            && self.session.overlay == Overlay::Settings
+            && shows_invalid_value(self.session.settings_nav.page, snapshot);
+        let notice = if inline { None } else { snapshot.notice() };
+        if let Some(notice) = notice {
+            if changed {
+                self.settings_notice(notice, true, cx);
+                self.settings_view.notice_generation = Some(self.session.toast_generation());
+            }
+        } else if let Some(generation) = self.settings_view.notice_generation.take() {
+            self.session.clear_toast_if(generation);
+        }
+    }
+
     fn open_account_setup(&mut self, cx: &mut Context<Self>) {
-        if self.settings_view.account_file_exists
-            || mailbox::account_config_path().is_some_and(|path| path.exists())
-        {
+        if account_file_exists(mailbox::account_config_path().as_deref()) {
             self.settings_notice("An account file already exists", true, cx);
             return;
         }
@@ -456,15 +499,22 @@ impl Inbox {
 
     fn apply_model_status(&mut self, status: ModelStatus) {
         self.settings_view.model = status;
-        self.session
-            .settings_nav
-            .set_availability(self.settings_view.availability());
+        self.refresh_settings_availability();
+    }
+
+    pub(super) fn refresh_settings_availability(&mut self) -> bool {
+        let availability = self.settings_view.availability();
+        if self.session.settings_nav.availability == availability {
+            return false;
+        }
+        self.session.settings_nav.set_availability(availability);
         if self.session.overlay == Overlay::Palette {
             self.session.palette_index = self
                 .session
                 .palette_index
                 .min(self.session.palette().len().saturating_sub(1));
         }
+        true
     }
 
     fn read_model_status(&mut self, cx: &mut Context<Self>) {
@@ -575,8 +625,24 @@ impl Inbox {
     }
 }
 
+fn account_file_exists(path: Option<&Path>) -> bool {
+    path.is_some_and(|path| {
+        !matches!(fs::symlink_metadata(path), Err(error) if error.kind() == io::ErrorKind::NotFound)
+    })
+}
+
+fn shows_invalid_value(page: Page, snapshot: &Snapshot) -> bool {
+    let Page::Section(section) = page else {
+        return false;
+    };
+    snapshot
+        .invalid
+        .iter()
+        .any(|(key, _)| section.rows().contains(&Row::Value(*key)))
+}
+
 fn ensure_keymap(dir: &Path) -> io::Result<PathBuf> {
-    mailbox::create_mailbox_dirs(dir)?;
+    mailbox::private_config_dir(dir)?;
     let path = dir.join("keymap.toml");
     match OpenOptions::new()
         .write(true)
@@ -588,7 +654,20 @@ fn ensure_keymap(dir: &Path) -> io::Result<PathBuf> {
             file.set_permissions(fs::Permissions::from_mode(0o600))?;
             file.write_all(b"# Change the leader key, then reopen Fell.\nleader = \"space\"\n")?;
         }
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            match OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&path)
+            {
+                Ok(file) if file.metadata()?.is_file() => {
+                    mailbox::restrict_permissions(&file, 0o600)?;
+                }
+                Err(err) if err.raw_os_error() == Some(libc::ELOOP) => {}
+                Err(err) => return Err(err),
+                Ok(_) => return Err(io::Error::other("keymap.toml must be a regular file")),
+            }
+        }
         Err(err) => return Err(err),
     }
     Ok(path)
@@ -604,10 +683,21 @@ const HEADER_HEIGHT: f32 = 64.;
 const SECTION_ROW_HEIGHT: f32 = 64.;
 const INDEX_ROW_HEIGHT: f32 = 49.;
 const ACCOUNT_SUMMARY_HEIGHT: f32 = 64.;
+const ACCOUNT_SERVER_HEIGHT: f32 = 80.;
+const BODY_PADDING: f32 = 16.;
+const BINDING_ROW_HEIGHT: f32 = 39.;
+const MAX_BINDING_ROWS: f32 = 9.;
 const INDEX_FOOTER_HEIGHT: f32 = 21.;
 const SEARCH_SUMMARY_HEIGHT: f32 = 70.;
 
 pub(super) fn card_height(nav: &nav::Nav, room: f32, narrow: bool) -> f32 {
+    if nav.page == Page::Bindings {
+        let chrome = HEADER_HEIGHT + BODY_PADDING + 2.;
+        let rows = ((room - chrome) / BINDING_ROW_HEIGHT)
+            .floor()
+            .clamp(1., MAX_BINDING_ROWS);
+        return chrome + rows * BINDING_ROW_HEIGHT;
+    }
     let rows = match nav.page {
         Page::Index => Section::ALL.len() as f32 * INDEX_ROW_HEIGHT + INDEX_FOOTER_HEIGHT,
         Page::Section(section) => {
@@ -622,13 +712,15 @@ pub(super) fn card_height(nav: &nav::Nav, room: f32, narrow: bool) -> f32 {
                 })
                 .sum::<f32>()
                 + match section {
-                    Section::Accounts => ACCOUNT_SUMMARY_HEIGHT,
+                    Section::Accounts if nav.availability.account_setup => ACCOUNT_SUMMARY_HEIGHT,
+                    Section::Accounts => ACCOUNT_SERVER_HEIGHT - 10.,
                     Section::Search => SEARCH_SUMMARY_HEIGHT,
                     _ => 0.,
                 }
         }
         Page::ConfirmModel { install: true } if narrow => 445.,
-        Page::Bindings | Page::ConfirmModel { .. } => 370.,
+        Page::ConfirmModel { .. } => 370.,
+        Page::Bindings => unreachable!(),
     };
     (HEADER_HEIGHT + rows + 18.).min(room.max(120.))
 }
@@ -638,7 +730,7 @@ pub(super) fn card(
     session: &crate::model::Session,
     view: &View,
     live: bool,
-    height: f32,
+    (height, width): (f32, f32),
     now: Instant,
     cx: &mut Context<Inbox>,
 ) -> gpui::Div {
@@ -688,6 +780,7 @@ pub(super) fn card(
                                     cx.stop_propagation();
                                     inbox.session.settings_nav.back();
                                     inbox.settings_view.reset_scroll();
+                                    inbox.update_settings_notice(false, cx);
                                     cx.notify();
                                 }
                             }),
@@ -714,6 +807,7 @@ pub(super) fn card(
     let selected = session.settings_nav.selected;
     let mut details = None;
     let mut footer = None;
+    let mut binding_fade = false;
     match page {
         Page::Index => {
             for (index, section) in Section::ALL.into_iter().enumerate() {
@@ -754,28 +848,23 @@ pub(super) fn card(
                     row(theme, index, selected, live, SECTION_ROW_HEIGHT, cx).py(px(10.));
                 if let Row::Value(preference) = setting {
                     let state = preference.display(view.snapshot.values);
-                    let invalid = view.snapshot.invalid.contains(&preference);
-                    let previous = view.fade.frame(now);
-                    let changed = previous.and_then(|((values, _), progress)| {
-                        let old = preference.display(*values);
-                        (old != state).then_some((old, progress))
+                    let note = preference_note(&view.snapshot, preference, &state, width);
+                    let previous = view.value_fade(now);
+                    let changed = previous.and_then(|(snapshot, outgoing, incoming)| {
+                        let old = preference.display(snapshot.values);
+                        (old != state).then_some((old, outgoing, incoming))
                     });
-                    let old_warning = previous.and_then(|((values, bad), progress)| {
-                        let was_invalid = bad.contains(&preference);
-                        let old = preference.display(*values);
-                        (was_invalid != invalid || (invalid && old != state)).then_some((
-                            was_invalid,
-                            old,
-                            progress,
-                        ))
+                    let old_note = previous.and_then(|(snapshot, outgoing, incoming)| {
+                        let old = preference.display(snapshot.values);
+                        let old = preference_note(snapshot, preference, &old, width);
+                        (old != note).then_some((old, outgoing, incoming))
                     });
                     let opacity = if selected {
                         motion::progress(view.chevrons.as_ref(), now)
                     } else {
                         0.
                     };
-                    let (old, progress) =
-                        changed.map_or((None, 1.), |(old, progress)| (Some(old), progress));
+                    let incoming = changed.as_ref().map_or(1., |(_, _, incoming)| *incoming);
                     let value = div()
                         .relative()
                         .flex_1()
@@ -783,8 +872,8 @@ pub(super) fn card(
                         .flex()
                         .flex_col()
                         .text_center()
-                        .child(value_text(theme, state.clone(), selected).opacity(progress))
-                        .when_some(old, |value, old| {
+                        .child(value_text(theme, state, selected).opacity(incoming))
+                        .when_some(changed, |value, (old, outgoing, _)| {
                             // Keep the outgoing value's width until its fade ends.
                             value
                                 .child(
@@ -798,34 +887,37 @@ pub(super) fn card(
                                         .top_0()
                                         .left_0()
                                         .right_0()
-                                        .opacity(1. - progress),
+                                        .opacity(outgoing),
                                 )
                         });
                     control = control
                         .child(row_label(theme, preference.label(), None, selected).child({
-                            let progress = old_warning
-                                .as_ref()
-                                .map_or(1., |(_, _, progress)| *progress);
+                            let incoming =
+                                old_note.as_ref().map_or(1., |(_, _, incoming)| *incoming);
+                            let render = |(text, alert): (String, bool)| {
+                                div()
+                                    .text_size(px(12.))
+                                    .line_height(px(15.))
+                                    .text_color(rgb(if alert {
+                                        theme.error
+                                    } else if selected {
+                                        theme.on_selection_dim
+                                    } else {
+                                        theme.dimmed
+                                    }))
+                                    .child(text)
+                            };
                             div()
                                 .relative()
-                                .child(
-                                    preference_note(theme, preference, invalid, &state, selected)
-                                        .opacity(progress),
-                                )
-                                .when_some(old_warning, |note, (was_invalid, old, progress)| {
+                                .child(render(note).opacity(incoming))
+                                .when_some(old_note, |note, (old, outgoing, _)| {
                                     note.child(
-                                        preference_note(
-                                            theme,
-                                            preference,
-                                            was_invalid,
-                                            &old,
-                                            selected,
-                                        )
-                                        .absolute()
-                                        .top_0()
-                                        .left_0()
-                                        .right_0()
-                                        .opacity(1. - progress),
+                                        render(old)
+                                            .absolute()
+                                            .top_0()
+                                            .left_0()
+                                            .right_0()
+                                            .opacity(outgoing),
                                     )
                                 })
                         }))
@@ -889,7 +981,11 @@ pub(super) fn card(
                         div()
                             .flex_none()
                             .text_size(px(13.))
-                            .text_color(rgb(theme.dimmed))
+                            .text_color(rgb(if selected {
+                                theme.on_selection_dim
+                            } else {
+                                theme.dimmed
+                            }))
                             .child(embeddings::megabytes(MODEL.download_bytes()))
                     } else {
                         trailing(theme, suffix, selected)
@@ -903,23 +999,48 @@ pub(super) fn card(
 
             details = match section {
                 Section::Accounts => {
-                    let title = if view.account.is_some() {
-                        crate::present::display_safe(&session.account_email)
-                    } else if view.account_file_exists {
-                        "Account unavailable".to_owned()
+                    let (title, description) = if session.settings_nav.availability.account_setup {
+                        (
+                            "No account configured".to_owned(),
+                            "Set up an account to sync your mailbox.",
+                        )
+                    } else if let Some(server) = &view.server {
+                        (
+                            crate::present::display_safe(&session.account_email),
+                            server.as_str(),
+                        )
                     } else {
-                        "No account configured".to_owned()
+                        (
+                            "Account unavailable".to_owned(),
+                            "Check account.toml or reopen Fell to connect.",
+                        )
                     };
-                    let description = match view.account {
-                        Some(BackendKind::Bridge) => "Proton Mail Bridge",
-                        Some(BackendKind::Imap) => "IMAP",
-                        Some(BackendKind::ProtonApi) => "Proton Mail",
-                        None if view.account_file_exists => {
-                            "Check account.toml for configuration errors."
-                        }
-                        None => "Set up an account to sync your mailbox.",
-                    };
-                    Some(detail(theme, title, description, false).h(px(ACCOUNT_SUMMARY_HEIGHT)))
+                    let setup = session.settings_nav.availability.account_setup;
+                    let sync = view.server.as_ref().filter(|_| !setup).map(|_| {
+                        session.last_sync_at.map_or_else(
+                            || "Waiting for first sync".into(),
+                            |at| {
+                                format!(
+                                    "Last sync · {}",
+                                    crate::present::activity_time(super::now_unix(), at)
+                                )
+                            },
+                        )
+                    });
+                    Some(
+                        detail(theme, title, description, false, setup)
+                            .h(px(if setup {
+                                ACCOUNT_SUMMARY_HEIGHT
+                            } else {
+                                ACCOUNT_SERVER_HEIGHT
+                            }))
+                            .children(sync.map(|label| {
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(theme.dimmed))
+                                    .child(label)
+                            })),
+                    )
                 }
                 Section::Search => {
                     let (status, description) = view.model.status();
@@ -929,16 +1050,25 @@ pub(super) fn card(
                         .map_or((description, false), |(message, alert)| {
                             (message.as_str(), *alert)
                         });
-                    Some(detail(theme, status, message, alert))
+                    Some(detail(
+                        theme,
+                        status,
+                        message,
+                        alert,
+                        session.settings_nav.rows(section).next().is_some(),
+                    ))
                 }
                 _ => None,
             };
         }
         Page::Bindings => {
+            let mut rows = 0;
             for (action, keys) in nav::bindings(&session.keymap) {
+                rows += 1;
                 body = body.child(
                     div()
-                        .min_h(px(39.))
+                        .h(px(BINDING_ROW_HEIGHT))
+                        .flex_none()
                         .px(px(10.))
                         .py(px(5.))
                         .flex()
@@ -968,6 +1098,14 @@ pub(super) fn card(
                         ),
                 );
             }
+            let scrollable =
+                rows as f32 * BINDING_ROW_HEIGHT + HEADER_HEIGHT + BODY_PADDING + 2. - height;
+            let offset = if live {
+                f32::from(view.scroll.offset().y)
+            } else {
+                0.
+            };
+            binding_fade = scrollable + offset > 1.;
         }
         Page::ConfirmModel { install } => {
             body = body.child(if install {
@@ -1001,6 +1139,7 @@ pub(super) fn card(
         }
     }
     div()
+        .relative()
         .w(px(530.))
         .max_w(gpui::relative(0.94))
         .h(px(height))
@@ -1023,6 +1162,9 @@ pub(super) fn card(
         .children(details.map(|details| details.opacity(content_opacity)))
         .child(body.opacity(content_opacity))
         .children(footer)
+        .when(binding_fade, |card| {
+            card.child(super::help::edge(theme, false, 24.))
+        })
 }
 
 fn install_plan(theme: &theme::Theme, root: Option<&Path>) -> gpui::Div {
@@ -1087,13 +1229,15 @@ fn detail(
     title: impl Into<gpui::SharedString>,
     explanation: &str,
     alert: bool,
+    rows_follow: bool,
 ) -> gpui::Div {
     div()
         .flex_none()
         .px(px(20.))
         .py(px(13.))
-        .border_b_1()
-        .border_color(rgb(theme.border))
+        .when(rows_follow, |summary| {
+            summary.border_b_1().border_color(rgb(theme.border))
+        })
         .child(
             div()
                 .font_weight(FontWeight::SEMIBOLD)
@@ -1103,6 +1247,7 @@ fn detail(
         .child(
             div()
                 .text_size(px(12.))
+                .line_height(px(17.))
                 .text_color(rgb(if alert { theme.error } else { theme.dimmed }))
                 .child(explanation.to_owned()),
         )
@@ -1174,32 +1319,17 @@ fn row_label(
 }
 
 fn preference_note(
-    theme: &theme::Theme,
+    snapshot: &Snapshot,
     preference: settings::Preference,
-    invalid: bool,
     state: &str,
-    selected: bool,
-) -> gpui::Div {
-    let (text, color) = if invalid {
-        (
-            format!("Invalid in settings.toml · using {state}"),
-            theme.error,
-        )
-    } else {
-        (
-            preference.description().to_owned(),
-            if selected {
-                theme.on_selection_dim
-            } else {
-                theme.dimmed
-            },
-        )
-    };
-    div()
-        .text_size(px(12.))
-        .line_height(px(15.))
-        .text_color(rgb(color))
-        .child(text)
+    width: f32,
+) -> (String, bool) {
+    let invalid = snapshot.invalid.iter().find(|(key, _)| *key == preference);
+    match invalid {
+        Some(_) if width < 320. => (format!("Invalid · using {state}"), true),
+        Some((_, value)) => (format!("{value} isn't valid · using {state}"), true),
+        None => (preference.description().to_owned(), false),
+    }
 }
 
 fn chevron(
@@ -1317,7 +1447,7 @@ mod tests {
     use fell_core::NotificationMode;
 
     #[test]
-    fn edit_keymap_creates_a_private_file_and_keeps_an_existing_one() {
+    fn edit_keymap_creates_and_repairs_private_permissions() {
         use std::os::unix::fs::MetadataExt;
 
         let temp = tempfile::tempdir().unwrap();
@@ -1326,8 +1456,78 @@ mod tests {
         assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
         fs::write(&path, "leader = ','").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         assert_eq!(ensure_keymap(&dir).unwrap(), path);
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
         assert_eq!(fs::read_to_string(path).unwrap(), "leader = ','");
+    }
+
+    #[test]
+    fn keymap_permissions_leave_symlink_targets_alone() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("fell");
+        fs::create_dir(&dir).unwrap();
+        let owned = temp.path().join("preferences.toml");
+        fs::write(&owned, "leader = ','").unwrap();
+        fs::set_permissions(&owned, fs::Permissions::from_mode(0o644)).unwrap();
+        let path = dir.join("keymap.toml");
+        symlink(&owned, &path).unwrap();
+        assert_eq!(ensure_keymap(&dir).unwrap(), path);
+        assert!(path.is_symlink());
+        assert_eq!(fs::metadata(&owned).unwrap().mode() & 0o777, 0o644);
+    }
+
+    #[test]
+    fn account_setup_guard_rechecks_the_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("account.toml");
+        assert!(!account_file_exists(Some(&path)));
+        fs::write(&path, "").unwrap();
+        assert!(account_file_exists(Some(&path)));
+        fs::rename(&path, temp.path().join("account.bak")).unwrap();
+        assert!(!account_file_exists(Some(&path)));
+    }
+
+    #[test]
+    fn invalid_value_toast_clears_when_fixed_and_stays_inline_in_its_section() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.toml");
+        let defaults = Values::default();
+        let apply = |inbox: &mut Inbox, text, cx: &mut Context<Inbox>| {
+            fs::write(&path, text).unwrap();
+            let snapshot = Snapshot::read(Some(&path), defaults);
+            inbox.apply_settings(snapshot, inbox.theme.clone(), Motion::new(false), cx);
+        };
+        let (mut app, handle) = crate::view::tests::pending_inbox();
+        handle
+            .update(&mut app, |inbox, _, cx| {
+                inbox.session.clear_toast();
+                apply(inbox, "read_dwell_ms = 'soon'", cx);
+                assert!(inbox.settings_view.notice_generation.is_some());
+                assert!(inbox.session.toast.is_some());
+                apply(inbox, "read_dwell_ms = 500", cx);
+                assert!(inbox.session.toast.is_none());
+
+                apply(inbox, "read_dwell_ms = 'soon'", cx);
+                inbox.session.show_toast("Another action", false);
+                let newer = inbox.session.toast_generation();
+                apply(inbox, "read_dwell_ms = 500", cx);
+                assert_eq!(inbox.session.toast_generation(), newer);
+                assert!(inbox.session.toast.is_some());
+
+                inbox.session.clear_toast();
+                inbox.session.overlay = Overlay::Settings;
+                inbox.session.settings_nav.page = Page::Section(Section::Reading);
+                apply(inbox, "read_dwell_ms = 'soon'", cx);
+                assert!(inbox.session.toast.is_none());
+                assert_eq!(
+                    inbox.settings_view.snapshot.invalid,
+                    [(settings::Preference::ReadDwell, r#""soon""#.to_owned())]
+                );
+            })
+            .unwrap();
     }
 
     #[test]

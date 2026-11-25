@@ -2,7 +2,7 @@
 //! still have their own files.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -263,10 +263,9 @@ impl Default for Values {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
     pub values: Values,
-    pub notice: Option<String>,
+    pub read_error: Option<String>,
     pub unknown: Vec<String>,
-    pub invalid: Vec<Preference>,
-    source: Option<Source>,
+    pub invalid: Vec<(Preference, String)>,
 }
 
 impl Snapshot {
@@ -276,7 +275,7 @@ impl Snapshot {
             if let Some(item) = document.get(preference.key())
                 && preference.apply(item, &mut values).is_none()
             {
-                invalid.push(preference);
+                invalid.push((preference, invalid_label(item)));
             }
         }
         let unknown = document
@@ -288,23 +287,27 @@ impl Snapshot {
             })
             .map(|(key, _)| key.to_owned())
             .collect();
-        let notice = (!invalid.is_empty()).then(|| {
-            format!(
-                "settings.toml contains invalid values · {}",
-                invalid
-                    .iter()
-                    .map(|key| key.key())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        });
         Self {
             values,
-            notice,
+            read_error: None,
             unknown,
             invalid,
-            source: None,
         }
+    }
+
+    pub fn notice(&self) -> Option<String> {
+        self.read_error.clone().or_else(|| {
+            (!self.invalid.is_empty()).then(|| {
+                format!(
+                    "settings.toml contains invalid values · {}",
+                    self.invalid
+                        .iter()
+                        .map(|(key, _)| key.key())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+        })
     }
 
     pub fn read(path: Option<&Path>, defaults: Values) -> Self {
@@ -316,18 +319,31 @@ impl Snapshot {
         let Some(path) = path else {
             return Self::parse(&DocumentMut::new(), defaults);
         };
-        match read_complete(path, self.source.as_ref()) {
-            Ok((document, source)) => Self {
-                source,
-                ..Self::parse(&document, defaults)
-            },
-            Err(_) => Self {
-                notice: Some(
-                    "Could not read settings.toml · Finish the edit or save a replacement".into(),
-                ),
+        match read_complete(path) {
+            Ok((document, _)) => Self::parse(&document, defaults),
+            Err(error) => Self {
+                read_error: Some(format!("Could not read settings.toml · {error}")),
                 ..self.clone()
             },
         }
+    }
+}
+
+fn invalid_label(item: &Item) -> String {
+    let bounded = |text: &str| {
+        let mut chars = text.chars();
+        let mut label: String = chars.by_ref().take(18).collect();
+        if chars.next().is_some() {
+            label.push('…');
+        }
+        crate::present::display_safe(&label)
+    };
+    if let Some(text) = item.as_str() {
+        format!("{:?}", bounded(text))
+    } else if let Some(value) = item.as_value() {
+        bounded(&value.to_string())
+    } else {
+        "Table".into()
     }
 }
 
@@ -339,6 +355,7 @@ pub fn path() -> Option<PathBuf> {
 struct Source {
     device: u64,
     inode: u64,
+    modified: (i64, i64),
     text: String,
 }
 
@@ -384,19 +401,30 @@ fn read_source(path: &Path, account: &Path) -> io::Result<Option<Source>> {
             "settings.toml must be a regular file owned by you and separate from account.toml",
         ));
     }
-    let mut text = String::new();
-    file.read_to_string(&mut text)?;
+    let mut bytes = Vec::new();
+    let mut second = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let between = file.metadata()?;
+    file.rewind()?;
+    file.read_to_end(&mut second)?;
     let after = file.metadata()?;
-    if text.is_empty()
-        || after.len() != text.len() as u64
-        || before.mtime() != after.mtime()
-        || before.mtime_nsec() != after.mtime_nsec()
+    let observed = fs::symlink_metadata(path).map_err(|_| changed_while_saving())?;
+    let stamp = |meta: &fs::Metadata| (meta.mtime(), meta.mtime_nsec());
+    if bytes != second
+        || [&between, &after, &observed]
+            .into_iter()
+            .any(|meta| meta.len() != bytes.len() as u64 || stamp(meta) != stamp(&before))
+        || before.len() != bytes.len() as u64
+        || !same_file(&before, &observed)
     {
         return Err(changed_while_saving());
     }
+    let text = String::from_utf8(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Expected UTF-8 text"))?;
     Ok(Some(Source {
         device: before.dev(),
         inode: before.ino(),
+        modified: stamp(&before),
         text,
     }))
 }
@@ -405,31 +433,26 @@ fn changed_while_saving() -> io::Error {
     io::Error::other("settings.toml changed while saving. Try again")
 }
 
-fn read_complete(
-    path: &Path,
-    previous: Option<&Source>,
-) -> io::Result<(DocumentMut, Option<Source>)> {
+fn read_complete(path: &Path) -> io::Result<(DocumentMut, Option<Source>)> {
     let target = resolve(path)?;
     let source = read_source(&target, &path.with_file_name("account.toml"))?;
-    let Some(current) = &source else {
-        return Ok((DocumentMut::new(), None));
-    };
-    let document: DocumentMut = current.text.parse().map_err(|_| changed_while_saving())?;
-    // Losing keys while the same inode is shrinking can be a parseable
-    // prefix from a truncate-and-write editor. An atomic replacement can
-    // intentionally remove keys, as can deleting the settings file.
-    if let Some(previous) = previous
-        && previous.device == current.device
-        && previous.inode == current.inode
-        && current.text.len() < previous.text.len()
-        && (previous.text.starts_with(&current.text)
-            || previous
+    let document = if let Some(source) = &source {
+        source.text.parse().map_err(|error: toml_edit::TomlError| {
+            let offset = error.span().map_or(0, |span| span.start);
+            let line = 1 + source
                 .text
-                .parse::<DocumentMut>()
-                .is_ok_and(|old| old.iter().any(|(key, _)| document.get(key).is_none())))
-    {
-        return Err(changed_while_saving());
-    }
+                .bytes()
+                .take(offset)
+                .filter(|b| *b == b'\n')
+                .count();
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("TOML syntax error on line {line} · {}", error.message()),
+            )
+        })?
+    } else {
+        DocumentMut::new()
+    };
     Ok((document, source))
 }
 
@@ -439,19 +462,18 @@ pub enum Edit {
     Notifications(NotificationMode),
 }
 
-pub fn save(
-    path: &Path,
-    defaults: Values,
-    previous: &Snapshot,
-    edit: Edit,
-) -> io::Result<Snapshot> {
+pub fn save(path: &Path, defaults: Values, edit: Edit) -> io::Result<Snapshot> {
     let config = path.parent().expect("settings file has a parent");
-    mailbox::create_mailbox_dirs(config)?;
+    let config_dir = mailbox::private_config_dir(config)?;
     let target = resolve(path)?;
     let dir = target.parent().expect("target file has a parent");
-    let lock = File::open(dir)?;
+    let lock = if dir == config {
+        config_dir
+    } else {
+        File::open(dir)?
+    };
     lock.try_lock()?;
-    let (mut document, before) = read_complete(path, previous.source.as_ref())?;
+    let (mut document, before) = read_complete(path)?;
     let (preference, mut value) = match edit {
         Edit::Cycle(preference, backwards) => (
             preference,
@@ -476,19 +498,15 @@ pub fn save(
     let text = document.to_string();
     file.write_all(text.as_bytes())?;
     file.as_file().sync_all()?;
-    if resolve(path)? != target || read_complete(path, previous.source.as_ref())?.1 != before {
+    if resolve(path)? != target
+        || read_source(&target, &path.with_file_name("account.toml"))
+            .map_err(|_| changed_while_saving())?
+            != before
+    {
         return Err(changed_while_saving());
     }
-    let published = file.persist(&target)?;
-    let meta = published.metadata()?;
-    Ok(Snapshot {
-        source: Some(Source {
-            device: meta.dev(),
-            inode: meta.ino(),
-            text,
-        }),
-        ..Snapshot::parse(&document, defaults)
-    })
+    file.persist(&target)?;
+    Ok(Snapshot::parse(&document, defaults))
 }
 
 /// Watch the directory as well as the file's ancestors, since the first
@@ -525,14 +543,7 @@ mod tests {
         let dir = temp.path().join("fell");
         let path = dir.join("settings.toml");
         let defaults = Values::default();
-        let previous = Snapshot::read(Some(&path), defaults);
-        save(
-            &path,
-            defaults,
-            &previous,
-            Edit::Cycle(Preference::FontSize, false),
-        )
-        .unwrap();
+        save(&path, defaults, Edit::Cycle(Preference::FontSize, false)).unwrap();
         assert_eq!(fs::metadata(dir).unwrap().mode() & 0o777, 0o700);
         assert_eq!(fs::metadata(path).unwrap().mode() & 0o777, 0o600);
     }
@@ -548,16 +559,7 @@ mod tests {
         fs::write(&account, "# Existing account\n").unwrap();
         let defaults = Values::default();
         symlink(&account, &config).unwrap();
-        let previous = Snapshot::read(Some(&config), defaults);
-        assert!(
-            save(
-                &config,
-                defaults,
-                &previous,
-                Edit::Cycle(Preference::FontSize, false)
-            )
-            .is_err()
-        );
+        assert!(save(&config, defaults, Edit::Cycle(Preference::FontSize, false)).is_err());
         assert_eq!(
             fs::read_to_string(&account).unwrap(),
             "# Existing account\n"
@@ -567,13 +569,7 @@ mod tests {
         mailbox::create_mailbox_dirs(path.parent().unwrap()).unwrap();
         fs::write(&owned, "# Existing preferences\n").unwrap();
         symlink(&owned, &path).unwrap();
-        save(
-            &path,
-            defaults,
-            &previous,
-            Edit::Cycle(Preference::FontSize, false),
-        )
-        .unwrap();
+        save(&path, defaults, Edit::Cycle(Preference::FontSize, false)).unwrap();
         assert!(path.is_symlink());
         let updated = fs::read_to_string(owned).unwrap();
         assert!(updated.contains("# Existing preferences"));
@@ -581,37 +577,66 @@ mod tests {
     }
 
     #[test]
-    fn reload_and_save_refuse_partial_in_place_edits() {
+    fn completed_in_place_edits_can_shrink_or_empty_the_file() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("settings.toml");
-        let original = "read_dwell_ms = 500\n# Keep these settings\nnotifications = 'private'\n";
-        fs::write(&path, original).unwrap();
         let defaults = Values::default();
-        let mut previous = Snapshot::read(Some(&path), defaults);
-        for partial in ["", "read_dwell_ms = [", "read_dwell_ms = 1500\n"] {
-            fs::write(&path, partial).unwrap();
+        let original = "# Reading preferences\nread_dwell_ms = 500\nnotifications = 'private'\n";
+        for (edited, dwell, notifications) in [
+            (
+                "read_dwell_ms = 500\nnotifications = 'private'\n",
+                500,
+                NotificationMode::Private,
+            ),
+            (original.trim_end(), 500, NotificationMode::Private),
+            (
+                "# Reading preferences\nread_dwell_ms = 500\n",
+                500,
+                defaults.notifications,
+            ),
+            ("", defaults.read_dwell_ms, defaults.notifications),
+        ] {
+            fs::write(&path, original).unwrap();
+            let previous = Snapshot::read(Some(&path), defaults);
+            fs::write(&path, edited).unwrap();
             let next = previous.reload(Some(&path), defaults);
-            assert_eq!(next.values, previous.values);
-            assert!(next.notice.is_some());
-            let error = save(
-                &path,
-                defaults,
-                &next,
-                Edit::Cycle(Preference::FontSize, false),
-            )
-            .unwrap_err();
-            assert_eq!(
-                error.to_string(),
-                "settings.toml changed while saving. Try again"
-            );
-            assert_eq!(fs::read_to_string(&path).unwrap(), partial);
-            previous = next;
+            assert_eq!(next.values.read_dwell_ms, dwell);
+            assert_eq!(next.values.notifications, notifications);
+            assert!(next.notice().is_none());
+
+            let saved = save(&path, defaults, Edit::Cycle(Preference::FontSize, false)).unwrap();
+            assert_eq!(saved.values.read_dwell_ms, dwell);
+            assert_eq!(saved.values.notifications, notifications);
+            assert_eq!(saved.values.font_size, Some(12));
         }
-        fs::write(&path, original.replace("500", "1500")).unwrap();
-        let recovered = previous.reload(Some(&path), defaults);
-        assert_eq!(recovered.values.read_dwell_ms, 1500);
-        assert_eq!(recovered.values.notifications, NotificationMode::Private);
-        assert!(recovered.notice.is_none());
+    }
+
+    #[test]
+    fn a_syntax_error_keeps_previous_values_and_a_valid_edit_recovers() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.toml");
+        let defaults = Values::default();
+        fs::write(&path, "read_dwell_ms = 500\n").unwrap();
+        let previous = Snapshot::read(Some(&path), defaults);
+        let broken = "# Reading preferences\nread_dwell_ms = [";
+        fs::write(&path, broken).unwrap();
+
+        let next = previous.reload(Some(&path), defaults);
+        assert_eq!(next.values, previous.values);
+        assert!(
+            next.notice()
+                .unwrap()
+                .contains("TOML syntax error on line 2")
+        );
+        let error = save(&path, defaults, Edit::Cycle(Preference::FontSize, false)).unwrap_err();
+        assert!(error.to_string().contains("TOML syntax error on line 2"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), broken);
+
+        fs::write(&path, "read_dwell_ms=250").unwrap();
+        let recovered = next.reload(Some(&path), defaults);
+        assert_eq!(recovered.values.read_dwell_ms, 250);
+        assert!(recovered.notice().is_none());
+        assert!(save(&path, defaults, Edit::Cycle(Preference::FontSize, false)).is_ok());
     }
 
     #[test]
@@ -624,7 +649,6 @@ mod tests {
         let snapshot = save(
             &path,
             Values::default(),
-            &Snapshot::read(Some(&path), Values::default()),
             Edit::Cycle(Preference::WhichKey, false),
         )
         .unwrap();
@@ -639,42 +663,23 @@ mod tests {
     }
 
     #[test]
-    fn a_running_watcher_reloads_the_first_save_and_an_external_replacement() {
-        use std::time::{Duration, Instant};
-
+    fn reload_applies_first_save_and_atomic_replacement() {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().join("fell");
         let path = dir.join("settings.toml");
         let defaults = Values::default();
-        let (changed, mut updates) = futures::channel::mpsc::unbounded();
-        assert!(crate::theme::watch_dirs(watched_dirs(&path), changed));
+        let previous = Snapshot::read(Some(&path), defaults);
 
-        let await_change = |updates: &mut futures::channel::mpsc::UnboundedReceiver<()>| {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while updates.try_recv().is_err() {
-                assert!(
-                    Instant::now() < deadline,
-                    "settings watch did not report a change"
-                );
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Snapshot::read(Some(&path), defaults).values
-        };
+        save(&path, defaults, Edit::Cycle(Preference::ReadDwell, false)).unwrap();
+        let previous = previous.reload(Some(&path), defaults);
+        assert_eq!(previous.values.read_dwell_ms, 250);
 
-        save(
-            &path,
-            defaults,
-            &Snapshot::read(Some(&path), defaults),
-            Edit::Cycle(Preference::ReadDwell, false),
-        )
-        .unwrap();
-        assert_eq!(await_change(&mut updates).read_dwell_ms, 250);
         let mut edit = tempfile::NamedTempFile::new_in(&dir).unwrap();
         write!(edit, "read_dwell_ms = 1500\nnotifications = 'off'\n").unwrap();
         edit.persist(&path).unwrap();
-        let reloaded = await_change(&mut updates);
-        assert_eq!(reloaded.read_dwell_ms, 1500);
-        assert_eq!(reloaded.notifications, NotificationMode::Off);
+        let reloaded = previous.reload(Some(&path), defaults);
+        assert_eq!(reloaded.values.read_dwell_ms, 1500);
+        assert_eq!(reloaded.values.notifications, NotificationMode::Off);
     }
 
     #[test]
@@ -699,23 +704,15 @@ mod tests {
             }
         );
         assert_eq!(
-            bad.notice.unwrap(),
+            bad.notice().unwrap(),
             "settings.toml contains invalid values · read_dwell_ms, which_key_ms, notifications"
         );
 
         fs::write(&path, "theme = 'dark'\nwhich_key_ms = [").unwrap();
         let broken = Snapshot::read(Some(&path), legacy);
         assert_eq!(broken.values, legacy);
-        assert!(broken.notice.is_some());
-        assert!(
-            save(
-                &path,
-                legacy,
-                &broken,
-                Edit::Cycle(Preference::Theme, false)
-            )
-            .is_err()
-        );
+        assert!(broken.notice().is_some());
+        assert!(save(&path, legacy, Edit::Cycle(Preference::Theme, false)).is_err());
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             "theme = 'dark'\nwhich_key_ms = ["

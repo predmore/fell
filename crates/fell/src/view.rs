@@ -948,11 +948,7 @@ impl Inbox {
             activity_scroll: ScrollHandle::new(),
             activity_motion: activity::ActivityMotion::default(),
             help_scroll: help::HelpScroll::default(),
-            settings_view: settings::View::new(
-                settings,
-                config.as_ref().map(|config| config.backend),
-                !startup.account_missing,
-            ),
+            settings_view: settings::View::new(settings, config.as_ref()),
             search_view: search::SearchView::default(),
             search_preview: cx.new(|_| search::CachedPreview::new(reader.clone())),
             search_rows: cx.new(|_| search::CachedRows(reader)),
@@ -1010,10 +1006,7 @@ impl Inbox {
         .detach();
         inbox.show_crash_notice(cx);
         inbox.watch_store_restarts(store_restarts, cx);
-        inbox
-            .session
-            .settings_nav
-            .set_availability(inbox.settings_view.availability());
+        inbox.refresh_settings_availability();
         inbox.watch_settings(legacy, cx);
         inbox.watch_reviews(cx);
         inbox.watch_notes(cx);
@@ -4251,6 +4244,7 @@ impl Inbox {
         // When the note has scrolled away, the ordinary mail shortcuts
         // belong to the message the reader can see.
         self.session.agent_notes.shortcuts_hidden = !self.note_in_view();
+        self.refresh_settings_availability();
         let step = self.session.on_key(key, page);
         self.session
             .dismiss_key_notice(previous_notice, step.undo || self.undos_in_flight > 0);
@@ -4445,13 +4439,11 @@ impl Inbox {
             if settings_page != Some(page) {
                 self.settings_view.reset_scroll();
             }
-            if matches!(
-                page,
-                crate::model::settings::Page::Index | crate::model::settings::Page::Section(_)
-            ) {
+            if matches!(page, crate::model::settings::Page::Section(_)) {
                 self.settings_view
                     .scroll_to(self.session.settings_nav.selected);
             }
+            self.update_settings_notice(false, cx);
         }
         // Reads go to the store thread. The list moves on this frame; the
         // conversation follows when its read lands.
@@ -5464,6 +5456,18 @@ impl Render for Inbox {
             layer.swap(&mut self.session);
         }
         let viewport_height = f32::from(window.viewport_size().height);
+        let settings_room = viewport_height - CARD_TOP_PX - 16.;
+        if self.session.overlay == Overlay::Settings
+            && self.session.settings_nav.page == crate::model::settings::Page::Index
+        {
+            let final_height =
+                settings::card_height(&self.session.settings_nav, settings_room, width < 500.);
+            self.settings_view.reveal_index_row(
+                self.session.settings_nav.selected,
+                card.unwrap_or(final_height),
+                final_height,
+            );
+        }
         let mut overlay_card =
             |session: &Session, motion, live, picker: (&[PickerChoice], Option<String>, f32)| {
                 let help = self
@@ -5513,13 +5517,16 @@ impl Render for Inbox {
                             session,
                             &self.settings_view,
                             live,
-                            card.unwrap_or_else(|| {
-                                settings::card_height(
-                                    &session.settings_nav,
-                                    viewport_height - CARD_TOP_PX - 16.,
-                                    width < 500.,
-                                )
-                            }),
+                            (
+                                card.unwrap_or_else(|| {
+                                    settings::card_height(
+                                        &session.settings_nav,
+                                        settings_room,
+                                        width < 500.,
+                                    )
+                                }),
+                                width,
+                            ),
                             now,
                             cx,
                         )),

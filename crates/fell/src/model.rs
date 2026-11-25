@@ -494,6 +494,7 @@ pub struct Session {
     pub count: String,
     pub keymap: Keymap,
     pub sync: SyncKind,
+    pub last_sync_at: Option<i64>,
     pub worker_outages: HashSet<Worker>,
     /// Mailbox or keymap failure from startup. Folder and message reads do not clear it.
     pub startup_error: Option<String>,
@@ -591,6 +592,11 @@ impl Session {
             which_visible: false,
             count: String::new(),
             keymap,
+            last_sync_at: if let SyncKind::Synced { at, .. } = sync {
+                Some(at)
+            } else {
+                None
+            },
             sync,
             startup_error: None,
             error: None,
@@ -683,6 +689,9 @@ impl Session {
     pub fn apply_sync_status(&mut self, status: SyncKind) {
         if let Some(notice) = self.sync_notice.take() {
             self.clear_toast_if(notice);
+        }
+        if let SyncKind::Synced { at, .. } = status {
+            self.last_sync_at = Some(at);
         }
         self.sync = status;
     }

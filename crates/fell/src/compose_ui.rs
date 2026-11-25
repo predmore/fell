@@ -2190,8 +2190,12 @@ impl Render for ComposeView {
                     )
                     .child(body)
                     .children(
-                        self.quote_view(&snap, colors)
-                            .map(|quote| quote.flex_shrink_0()),
+                        self.quote_view(
+                            &snap,
+                            colors,
+                            (!wide).then(|| window.viewport_size().height * 0.3),
+                        )
+                        .map(|quote| quote.flex_shrink_0()),
                     )
                     .children(
                         self.preview
@@ -2502,7 +2506,12 @@ impl ComposeView {
     }
 
     /// The quoted part stored on the draft. Absent when nothing is quoted.
-    fn quote_view(&self, snap: &Snapshot, colors: Palette) -> Option<gpui::Div> {
+    fn quote_view(
+        &self,
+        snap: &Snapshot,
+        colors: Palette,
+        narrow_height: Option<gpui::Pixels>,
+    ) -> Option<gpui::Div> {
         let html = stored_quote(snap)?;
         let what = if snap.forwarded.is_some() {
             "Forwarded message"
@@ -2522,7 +2531,7 @@ impl ComposeView {
             .border_color(rgb(colors.rule))
             .child(label);
         if self.quote_open {
-            block = block.child(render_doc(
+            let quote = render_doc(
                 &html_to_doc(html),
                 &self.folder,
                 Paint {
@@ -2530,7 +2539,15 @@ impl ComposeView {
                     text_px: self.ui_px,
                 },
                 colors,
-            ));
+            );
+            block = block.child(
+                div()
+                    .id("compose-quote")
+                    .when_some(narrow_height, |quote, height| {
+                        quote.max_h(height).overflow_y_scroll()
+                    })
+                    .child(quote),
+            );
         }
         Some(block)
     }

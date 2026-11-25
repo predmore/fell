@@ -2,9 +2,9 @@
 
 use std::env;
 use std::ffi::OsStr;
-use std::fs;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::{fs, io};
 
 use fell_core::{Account, AccountConfig, AccountId, Store};
 
@@ -294,10 +294,9 @@ pub(crate) fn stage_account_config_at(
 
 fn lock_account_dir(path: &Path) -> Result<fs::File, AccountFileError> {
     let dir = path.parent().expect("account file has a parent directory");
-    create_mailbox_dirs(dir).map_err(|err| err.to_string())?;
     // Serialize setup through publication, since a concurrent attempt could
     // otherwise replace the credential while this config is being written.
-    let lock = fs::File::open(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
+    let lock = private_config_dir(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
     lock.try_lock()
         .map_err(|err| format!("Couldn't lock the account directory: {err}"))?;
     Ok(lock)
@@ -425,10 +424,39 @@ pub(crate) fn create_mailbox_dirs(dir: &Path) -> std::io::Result<()> {
     }
     for path in missing.iter().rev() {
         match fs::DirBuilder::new().mode(0o700).create(path) {
-            Ok(()) => fs::set_permissions(path, fs::Permissions::from_mode(0o700))?,
+            Ok(()) => restrict_permissions(&open_directory(path)?, 0o700)?,
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(err) => return Err(err),
         }
+    }
+    Ok(())
+}
+
+fn open_directory(dir: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dir)
+}
+
+pub(crate) fn private_config_dir(dir: &Path) -> io::Result<fs::File> {
+    create_mailbox_dirs(dir)?;
+    let file = open_directory(dir)?;
+    restrict_permissions(&file, 0o700)?;
+    Ok(file)
+}
+
+pub(crate) fn restrict_permissions(file: &fs::File, mode: u32) -> io::Result<()> {
+    let metadata = file.metadata()?;
+    // SAFETY: geteuid has no arguments and returns the current effective user.
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Fell configuration must be owned by you",
+        ));
+    }
+    if metadata.mode() & 0o7777 != mode {
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
     }
     Ok(())
 }
@@ -511,10 +539,9 @@ pub fn save_split(split: f32) {
     let Some(dir) = config_dir() else {
         return;
     };
-    if fs::create_dir_all(&dir).is_err() {
+    if private_config_dir(&dir).is_err() {
         return;
     }
-    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
     let path = dir.join("ui.toml");
     // Keep the other settings in the file.
     let kept: String = fs::read_to_string(&path)
@@ -535,6 +562,29 @@ pub fn save_split(split: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_permissions_are_repaired_without_chmodding_parents_or_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("config");
+        let dir = parent.join("fell");
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+
+        for mode in [0o755, 0o777] {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(mode)).unwrap();
+            private_config_dir(&dir).unwrap();
+            assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
+        }
+        assert_eq!(fs::metadata(&parent).unwrap().mode() & 0o777, 0o755);
+
+        let link = temp.path().join("fell");
+        symlink(&parent, &link).unwrap();
+        assert!(private_config_dir(&link).is_err());
+        assert_eq!(fs::metadata(&parent).unwrap().mode() & 0o777, 0o755);
+    }
 
     #[test]
     fn ui_settings_read_by_name() {

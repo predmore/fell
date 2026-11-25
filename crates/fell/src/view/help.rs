@@ -312,8 +312,8 @@ fn card(
                                         .map(|action| action_row(theme, session, action, &layout)),
                                 ),
                         )
-                        .children((moving && offset > 0.).then(|| edge(theme, true)))
-                        .children((moving && offset < last).then(|| edge(theme, false))),
+                        .children((moving && offset > 0.).then(|| edge(theme, true, 14.)))
+                        .children((moving && offset < last).then(|| edge(theme, false, 14.))),
                 )
                 .when(last > 0., |viewport| {
                     // This gutter is reserved at every scroll position.
@@ -358,14 +358,14 @@ fn action_row(theme: &Theme, session: &Session, action: Action, layout: &Layout)
 }
 
 /// While a row crosses the viewport boundary, its text fades into the card.
-fn edge(theme: &Theme, top: bool) -> Div {
+pub(super) fn edge(theme: &Theme, top: bool, height: f32) -> Div {
     let solid = Hsla::from(rgb(theme.surface));
     let clear = Hsla { a: 0., ..solid };
     div()
         .absolute()
         .left_0()
         .right_0()
-        .h(px(14.))
+        .h(px(height))
         .when(top, |fade| fade.top_0())
         .when(!top, |fade| fade.bottom_0())
         .bg(gpui::linear_gradient(
