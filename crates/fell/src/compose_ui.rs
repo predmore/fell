@@ -6543,6 +6543,20 @@ fn dotted_name(name: &str) -> Option<&str> {
 
 /// Whether a word of the label reads as an address that is not where the
 /// link goes: "Sign in at paypal.com" to another host.
+pub(crate) fn link_label_mismatch(text: &str, href: &str) -> bool {
+    if let Ok(label) = url::Url::parse(text.trim())
+        && matches!(label.scheme(), "http" | "https" | "mailto")
+        && let Ok(target) = url::Url::parse(href)
+    {
+        return label != target;
+    }
+    label_misleads(
+        text.split_whitespace()
+            .filter_map(|word| place_of_word(word, Links::Label)),
+        href,
+    )
+}
+
 fn label_misleads(mut places: impl Iterator<Item = Place>, href: &str) -> bool {
     let target = place_of_href(href);
     places.any(|place| match (&target, &place) {
@@ -7673,6 +7687,19 @@ mod tests {
             shown_target("write to ada", "mailto:ada@example.com", Links::Host).as_deref(),
             Some("(ada@example.com)")
         );
+    }
+
+    #[test]
+    fn reader_flags_a_link_label_that_names_a_different_destination() {
+        let target = "https://example.test/release";
+        assert!(!super::link_label_mismatch("Release notes", target));
+        assert!(!super::link_label_mismatch("example.test", target));
+        assert!(super::link_label_mismatch("updates.example.test", target));
+        assert!(super::link_label_mismatch(
+            "https://example.test/build",
+            target
+        ));
+        assert!(!super::link_label_mismatch(target, target));
     }
 
     #[test]

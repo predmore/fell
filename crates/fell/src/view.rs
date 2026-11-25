@@ -9,6 +9,7 @@ mod diagnostics;
 pub(crate) mod disclosure;
 mod help;
 mod notification_actions;
+pub(crate) mod reader_links;
 mod search;
 mod settings;
 mod snooze;
@@ -687,6 +688,7 @@ struct Inbox {
     waiting_for_first_rows: bool,
     waiting_for_inbox_total: bool,
     status_labels: StatusLabels,
+    reader_links: reader_links::ReaderLinks,
     list_scroll: UniformListScrollHandle,
     conv_scroll: ScrollHandle,
     // Keep the extra scroll range on the first preview thread after input,
@@ -811,7 +813,7 @@ impl Inbox {
         let inbox = Self::with_startup(startup, demo, Some(window), cx);
         window.focus(&inbox.focus);
         cx.on_focus_lost(window, |inbox, window, _| {
-            // A focused link can scroll out of the reader's paint area.
+            // A focused link can disappear when its message closes.
             window.focus(&inbox.focus);
         })
         .detach();
@@ -933,6 +935,7 @@ impl Inbox {
             waiting_for_first_rows: false,
             waiting_for_inbox_total: false,
             status_labels: StatusLabels::default(),
+            reader_links: reader_links::ReaderLinks::default(),
             store,
             startup_crash: None,
             worker_restart_notice: None,
@@ -4227,16 +4230,17 @@ impl Inbox {
         {
             match stroke.key.as_str() {
                 "tab" => {
-                    if stroke.modifiers.shift {
-                        window.focus_prev();
-                    } else {
-                        window.focus_next();
-                    }
+                    let first = self.focus.is_focused(window) && !stroke.modifiers.shift;
+                    self.reader_links.pending = None;
+                    self.focus_link(stroke.modifiers.shift, first, window, cx);
                     cx.stop_propagation();
                     return;
                 }
                 "escape" if !self.focus.is_focused(window) => {
+                    self.reader_links.pending = None;
+                    self.reader_links.clear_hover();
                     window.focus(&self.focus);
+                    cx.notify();
                     cx.stop_propagation();
                     return;
                 }
@@ -4246,6 +4250,8 @@ impl Inbox {
         let Some(key) = key_from(&event.keystroke) else {
             return;
         };
+        self.reader_links.pending = None;
+        self.reader_links.clear_hover();
         // A held key that started before a prompt appeared cannot confirm it.
         if key == KeyId::Char('y') && event.is_held {
             return;
@@ -4349,12 +4355,8 @@ impl Inbox {
         if step.action == Some(Action::FocusLinks)
             && self.session.pane == Pane::Conversation
             && self.session.overlay == Overlay::None
-            && self.search_conversation_live()
-            && let Some(inbox) = cx.try_global::<InboxWindow>().copied()
         {
-            cx.defer(move |cx| {
-                let _ = inbox.0.update(cx, |_, window, _| window.focus_next());
-            });
+            self.reader_links.pending = self.session.cursor_id.clone();
         }
         if overlay != Overlay::Help && self.session.overlay == Overlay::Help {
             self.help_scroll = help::HelpScroll::default();
@@ -5481,7 +5483,17 @@ impl Render for Inbox {
                 StatusLabel::new(&self.theme, &self.session, reply_check, width)
             };
         let status_labels = self.status_labels.update(status, self.motion.motion, now);
+        self.focus_pending_link(window, cx);
+        let (link_preview, link_fading) = self.reader_links.frame(
+            &self.focus,
+            panes.1 && preview_current && self.session.overlay == Overlay::None,
+            self.motion.motion,
+            now,
+            window,
+            cx,
+        );
         let animating = self.motion.tick(now)
+            | link_fading
             | waiting_for_resize
             | self.note_view.running()
             | self.note_pin.running()
@@ -5703,6 +5715,7 @@ impl Render for Inbox {
                     cached_results: cached_search_rows,
                 },
                 status_labels,
+                link_preview,
                 recipient_popup,
             },
             width,
@@ -5786,6 +5799,7 @@ struct Shown {
     cached_preview: Option<(u64, gpui::AnyView)>,
     list: ListContent,
     status_labels: StatusLabelsFrame,
+    link_preview: reader_links::PreviewFrame,
     recipient_popup: Option<gpui::Deferred>,
 }
 
@@ -5940,6 +5954,7 @@ fn observe_wheel(scroll: ScrollHandle, showing: bool, cx: &mut Context<Inbox>) -
                             if !moved {
                                 return;
                             }
+                            inbox.reader_links.clear_hover();
                             inbox.reader_took_over(false);
                         } else {
                             inbox.reveal.cancel_pending();
@@ -5987,6 +6002,7 @@ fn shell(
         cached_preview,
         list,
         status_labels,
+        link_preview,
         recipient_popup,
     } = shown;
     let frames = conv.frames.clone();
@@ -6264,6 +6280,7 @@ fn shell(
             session,
             status,
             status_labels,
+            link_preview,
             width,
             window,
         ))
@@ -10072,7 +10089,11 @@ fn stored_message_body(
             // A draft's markdown is painted as its compose window shows it.
             let palette = mail_body::palette(theme);
             let quiet = mail_body::history_palette(theme);
-            let mut runs: Vec<(usize, Option<fell_render::Fold>, Vec<&str>)> = Vec::new();
+            let mut runs: Vec<(
+                usize,
+                Option<fell_render::Fold>,
+                Vec<&crate::text_render::PlainText>,
+            )> = Vec::new();
             let body = match &message.rich {
                 Rich::PlainPart(plain) => plain,
                 _ => &message.body,
@@ -10088,15 +10109,13 @@ fn stored_message_body(
             );
             for (at, block) in body.blocks.iter().enumerate() {
                 let (kind, text) = match block {
-                    BodyBlock::Text(text) => (None, text.as_str()),
+                    BodyBlock::Text(text) => (None, text),
                     BodyBlock::List(_) | BodyBlock::Markdown { .. } => {
                         runs.push((at, None, Vec::new()));
                         continue;
                     }
-                    BodyBlock::Quote(text) => (Some(fell_render::Fold::Quote), text.as_str()),
-                    BodyBlock::Signature(text) => {
-                        (Some(fell_render::Fold::Signature), text.as_str())
-                    }
+                    BodyBlock::Quote(text) => (Some(fell_render::Fold::Quote), text),
+                    BodyBlock::Signature(text) => (Some(fell_render::Fold::Signature), text),
                 };
                 match (runs.last_mut(), kind) {
                     (Some((_, Some(above), texts)), Some(next)) => {
@@ -10129,32 +10148,39 @@ fn stored_message_body(
                             .line_height(px(theme.ui_px * 1.45)),
                         )
                         .into_any_element(),
-                    None => {
-                        let text = texts.concat();
-                        folds.columns.flow(
-                            |columns| columns.prose,
-                            |_, live| {
-                                div()
-                                    .pb(px(8.))
-                                    .line_height(px(theme.ui_px * 1.45))
-                                    .map(|block| match &body.blocks[at] {
-                                        BodyBlock::Markdown { doc, agent } => block.child(
-                                            crate::compose_ui::render_draft_doc(doc, *agent, theme),
-                                        ),
-                                        _ => block.child(crate::render::plain_text(
-                                            text.clone(),
+                    None => folds.columns.flow(
+                        |columns| columns.prose,
+                        |_, live| {
+                            div()
+                                .pb(px(8.))
+                                .line_height(px(theme.ui_px * 1.45))
+                                .map(|block| match &body.blocks[at] {
+                                    BodyBlock::Markdown { doc, agent } => block.child(
+                                        crate::compose_ui::render_draft_doc(doc, *agent, theme),
+                                    ),
+                                    BodyBlock::Text(text) => {
+                                        block.child(crate::render::plain_text(
+                                            text,
                                             palette,
                                             at,
                                             folds.live && live,
-                                        )),
-                                    })
-                                    .into_any_element()
-                            },
-                        )
-                    }
+                                        ))
+                                    }
+                                    _ => block,
+                                })
+                                .into_any_element()
+                        },
+                    ),
                     Some(kind) => {
-                        let text = texts.join("\n\n");
-                        let lines = text.lines().filter(|line| !line.trim().is_empty()).count();
+                        let lines = texts
+                            .iter()
+                            .flat_map(|text| text.lines())
+                            .filter(|line| !line.trim().is_empty())
+                            .count();
+                        let rtl = texts
+                            .iter()
+                            .find(|text| text.chars().any(char::is_alphabetic))
+                            .is_some_and(|text| crate::render::is_right_to_left(text));
                         let line_height = px(theme.ui_px * 1.4);
                         fold_section(
                             theme,
@@ -10162,7 +10188,7 @@ fn stored_message_body(
                                 kind,
                                 lines,
                                 show_key: Some(run) == first_hidden,
-                                rtl: crate::render::is_right_to_left(&text),
+                                rtl,
                             },
                             folds,
                             (folds.columns.moving_prose(), folds.columns.pane_right),
@@ -10171,20 +10197,23 @@ fn stored_message_body(
                                 folds.columns.flow(
                                     |columns| columns.prose,
                                     |_, live| {
-                                        history_rule(
-                                            div(),
-                                            crate::render::is_right_to_left(&text),
-                                            crate::theme::strong_border(theme),
-                                        )
-                                        .text_color(rgb(theme.dimmed))
-                                        .line_height(line_height)
-                                        .child(crate::render::plain_text(
-                                            text.clone(),
-                                            quiet,
-                                            at,
-                                            folds.live && folds.open && live,
-                                        ))
-                                        .into_any_element()
+                                        history_rule(div(), rtl, crate::theme::strong_border(theme))
+                                            .text_color(rgb(theme.dimmed))
+                                            .line_height(line_height)
+                                            .flex()
+                                            .flex_col()
+                                            .gap(line_height)
+                                            .children(texts.iter().enumerate().map(
+                                                |(index, text)| {
+                                                    crate::render::plain_text(
+                                                        text,
+                                                        quiet,
+                                                        at + index,
+                                                        folds.live && folds.open && live,
+                                                    )
+                                                },
+                                            ))
+                                            .into_any_element()
                                     },
                                 )
                             },
@@ -10965,6 +10994,7 @@ fn status_bar(
     session: &Session,
     status: StatusMotion,
     labels: StatusLabelsFrame,
+    link_preview: reader_links::PreviewFrame,
     width: f32,
     window: &Window,
 ) -> gpui::Div {
@@ -11167,6 +11197,21 @@ fn status_bar(
             .when(hint_opacity < 1.0, |hints| hints.opacity(hint_opacity))
             .child(format!("{count}{hint}"))
     });
+    let link_layers = link_preview
+        .into_iter()
+        .filter_map(|(preview, alpha)| {
+            preview
+                .filter(|_| {
+                    !noticed && hints.is_none() && (!narrow || !status_has_details) && alpha > 0.0
+                })
+                .map(|preview| (preview, alpha))
+        })
+        .collect::<Vec<_>>();
+    let link_opacity = link_layers
+        .iter()
+        .map(|(_, alpha)| alpha)
+        .sum::<f32>()
+        .min(1.0);
     let text = status
         .leaving
         .filter(|(_, opacity)| *opacity > 0.0)
@@ -11233,13 +11278,38 @@ fn status_bar(
                             .inset_0()
                             .flex()
                             .items_center()
-                            .opacity(status.sync)
+                            .opacity(status.sync * (1.0 - link_opacity))
                             .child(narrow_sync.unwrap().min_w_0().truncate()),
                     )
                 })
                 .when_some(text, |cell, (toast, opacity, dy)| {
                     cell.child(notice_text(&toast, opacity, dy))
-                }),
+                })
+                .children(link_layers.into_iter().map(|(preview, alpha)| {
+                    let line = if preview.mismatch {
+                        format!("Link text differs · {}", preview.target).into()
+                    } else {
+                        preview.target
+                    };
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_end()
+                        .opacity(alpha)
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(rgb(if preview.mismatch {
+                                    theme.error
+                                } else {
+                                    theme.foreground
+                                }))
+                                .child(line),
+                        )
+                })),
         )
         .map(|bar| match hints {
             Some(hints) if !noticed => bar.child(hints),
@@ -12536,7 +12606,17 @@ mod tests {
         cx.draw(
             point(px(0.), px(0.)),
             size(px(width), px(30.)),
-            |window, _| super::status_bar(theme, session, status, labels, width, window),
+            |window, _| {
+                super::status_bar(
+                    theme,
+                    session,
+                    status,
+                    labels,
+                    Default::default(),
+                    width,
+                    window,
+                )
+            },
         );
         (
             STATUS_NOTICE_TEXT.take().unwrap(),

@@ -67,13 +67,16 @@ pub fn plain_link_ranges(text: &str) -> Vec<Range<usize>> {
         };
         if text[..start].chars().next_back().is_some_and(|ch| {
             !ch.is_whitespace()
-                && !matches!(ch, '(' | '[' | '{' | '<' | '>' | '"' | '\'' | '“' | '‘')
+                && !matches!(
+                    ch,
+                    '(' | '[' | '{' | '<' | '>' | '"' | '\'' | '`' | '“' | '‘'
+                )
         }) {
             continue;
         }
         let end = text[colon + 1..]
             .find(|ch: char| {
-                ch.is_whitespace() || matches!(ch, '<' | '>' | '"' | '“' | '”' | '‘' | '’')
+                ch.is_whitespace() || matches!(ch, '<' | '>' | '"' | '`' | '“' | '”' | '‘' | '’')
             })
             .map_or(text.len(), |end| colon + 1 + end);
         scanned = end;
@@ -119,7 +122,7 @@ fn trim_url_end(candidate: &str) -> &str {
             if matches!(ch, '(' | '[' | '{') {
                 openings[bracket] += 1;
             } else if openings[bracket] == 0 {
-                continue;
+                break;
             } else {
                 openings[bracket] -= 1;
             }
@@ -212,6 +215,20 @@ mod tests {
         check(
             "ftp://www.example.test foohttps://example.test http://",
             &[],
+        );
+    }
+
+    #[test]
+    fn unmatched_closers_and_backticks_end_links() {
+        check(
+            "https://example.test/notes).Next https://example.test/a)b https://example.test/x]y https://example.test/u}v `https://example.test/a`",
+            &[
+                "https://example.test/notes",
+                "https://example.test/a",
+                "https://example.test/x",
+                "https://example.test/u",
+                "https://example.test/a",
+            ],
         );
     }
 

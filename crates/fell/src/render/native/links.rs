@@ -1,18 +1,48 @@
 use std::{
+    cell::{Cell, RefCell},
+    collections::HashMap,
     ops::Range,
     process::{Command, Stdio},
+    rc::Rc,
     sync::Arc,
 };
 
 use gpui::{
-    AnyElement, App, AvailableSpace, Bounds, CursorStyle, ElementId, FocusHandle, MouseButton,
-    Pixels, Render, SharedString, Window, div, point, prelude::*, px, size,
+    AnyElement, App, AvailableSpace, Bounds, ClipboardItem, CursorStyle, ElementId, FocusHandle,
+    MouseButton, Pixels, SharedString, Window, div, point, prelude::*, px, size,
 };
 
-use super::{MailText, Mark, Palette, SOFT_HYPHEN, ink, paint};
+use super::{MailText, Mark, SOFT_HYPHEN, paint};
+use crate::view::reader_links::{self, LinkPreview, Placement};
+
+pub(super) fn checked_target(href: &str) -> Option<Arc<str>> {
+    type Targets = HashMap<String, Option<Arc<str>>>;
+    thread_local! { static TARGETS: RefCell<Targets> = RefCell::default(); }
+    if href.len() > 4096 {
+        return fell_render::reader_link_target(href).map(Arc::from);
+    }
+    TARGETS.with_borrow_mut(|cache| {
+        if let Some(target) = cache.get(href) {
+            return target.clone();
+        }
+        if cache.len() >= 2048 {
+            cache.clear();
+        }
+        let target = fell_render::reader_link_target(href).map(Arc::from);
+        cache.insert(href.into(), target.clone());
+        target
+    })
+}
 
 pub(super) struct LinkSpan {
     pub range: Range<usize>,
+    pub target: Arc<str>,
+    source: usize,
+}
+
+#[derive(Clone)]
+pub(super) struct LinkMark {
+    pub source: usize,
     pub target: Arc<str>,
 }
 
@@ -21,16 +51,17 @@ pub(super) fn link_spans(runs: &[(usize, Mark)]) -> Vec<LinkSpan> {
     let mut at = 0;
     for (len, mark) in runs {
         let end = at + len;
-        if let Some(target) = &mark.link {
+        if let Some(link) = &mark.link {
             if let Some(last) = links.last_mut()
                 && last.range.end == at
-                && Arc::ptr_eq(&last.target, target)
+                && last.source == link.source
             {
                 last.range.end = end;
             } else {
                 links.push(LinkSpan {
                     range: at..end,
-                    target: target.clone(),
+                    target: link.target.clone(),
+                    source: link.source,
                 });
             }
         }
@@ -42,7 +73,13 @@ pub(super) fn link_spans(runs: &[(usize, Mark)]) -> Vec<LinkSpan> {
 #[derive(Default)]
 pub(super) struct LinkFocus {
     text: SharedString,
-    handles: Vec<Option<(Arc<str>, FocusHandle)>>,
+    handles: Vec<Option<LinkState>>,
+}
+
+struct LinkState {
+    target: Arc<str>,
+    handle: FocusHandle,
+    place: Rc<Placement>,
 }
 
 pub(super) fn link_controls(
@@ -116,63 +153,69 @@ pub(super) fn link_controls(
 
     let mut controls = Vec::new();
     for (index, (link, rects)) in mail.links.iter().zip(fragments).enumerate() {
-        let Some(first) = rects.first() else {
-            continue;
-        };
         let slot = &mut focus.handles[index];
         if slot
             .as_ref()
-            .is_some_and(|(target, _)| target != &link.target)
+            .is_some_and(|state| state.target != link.target)
         {
             *slot = None;
         }
-        let (_, handle) =
-            slot.get_or_insert_with(|| (link.target.clone(), cx.focus_handle().tab_stop(true)));
+        let state = slot.get_or_insert_with(|| {
+            let label = mail.text[link.range.clone()].trim();
+            let preview = (label != link.target.as_ref()).then(|| LinkPreview {
+                target: link.target.to_string().into(),
+                mismatch: crate::compose_ui::link_label_mismatch(label, &link.target),
+            });
+            let handle = cx.focus_handle().tab_stop(true);
+            let place = Rc::new(Placement {
+                line: Cell::default(),
+                visible: Cell::default(),
+                preview,
+            });
+            reader_links::register(window, cx, &handle, &place);
+            LinkState {
+                target: link.target.clone(),
+                handle,
+                place,
+            }
+        });
+        let first_line = mail
+            .wrapped
+            .borrow()
+            .lines
+            .partition_point(|line| line.range.end <= link.range.start);
+        let top = bounds.top() + mail.line_height * first_line as f32;
+        state
+            .place
+            .line
+            .set((top.into(), (top + mail.line_height).into()));
+        state.place.visible.set(!rects.is_empty());
+        let handle = &state.handle;
         let focused = handle.is_focused(window);
-        let preview = TargetPreview {
-            target: SharedString::from(link.target.to_string()),
-            palette: mail.palette,
-            max_width: (window.viewport_size().width - px(16.)).min(px(520.)),
-        };
-        if focused {
-            let mut label = preview.label().into_any_element();
-            let measured = label.layout_as_root(
-                size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
-                window,
-                cx,
-            );
-            let viewport = window.viewport_size();
-            let x = first
-                .left()
-                .min(viewport.width - measured.width - px(8.))
-                .max(px(8.));
-            let below = rects.last().unwrap_or(first).bottom() + px(4.);
-            let y = if below + measured.height <= viewport.height {
-                below
-            } else {
-                (first.top() - measured.height - px(4.)).max(px(0.))
-            };
-            window.defer_draw(label, point(x, y), 0);
-        }
         let target = link.target.clone();
         let mut control = div()
             .relative()
             .size_0()
             .id(ElementId::named_usize("mail-link", index))
             .track_focus(handle)
-            .on_key_down(move |event, _, cx| {
-                if !event.is_held
-                    && event.keystroke.modifiers == gpui::Modifiers::default()
-                    && matches!(event.keystroke.key.as_str(), "enter" | "return")
-                {
-                    open(target.clone());
-                    cx.stop_propagation();
+            .on_key_down(move |event, window, cx| {
+                if event.is_held || event.keystroke.modifiers != gpui::Modifiers::default() {
+                    return;
                 }
+                match event.keystroke.key.as_str() {
+                    "enter" | "return" | "o" => open(target.clone(), window, cx),
+                    "y" => {
+                        cx.write_to_clipboard(ClipboardItem::new_string(target.to_string()));
+                        reader_links::notice(window, cx, "Copied link", false);
+                    }
+                    _ => return,
+                }
+                cx.stop_propagation();
             })
             .children(rects.into_iter().enumerate().map(|(at, rect)| {
                 let target = link.target.clone();
                 let handle = handle.clone();
-                let preview = preview.clone();
+                let hover = handle.clone();
                 div()
                     .absolute()
                     .left(rect.left() - bounds.left())
@@ -184,15 +227,17 @@ pub(super) fn link_controls(
                     .when(focused, |fragment| {
                         fragment
                             .rounded(px(2.))
-                            .bg(ink(mail.palette.accent).opacity(0.18))
+                            .border_1()
+                            .border_color(paint(mail.palette.accent))
                     })
-                    .when(!focused, |fragment| {
-                        fragment.tooltip(move |_, cx| cx.new(|_| preview.clone()).into())
+                    .on_hover(move |hovered, window, cx| {
+                        reader_links::hover(window, cx, &hover, *hovered)
                     })
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(move |_, window, cx| {
+                        reader_links::clicked(window, cx);
                         window.focus(&handle);
-                        open(target.clone());
+                        open(target.clone(), window, cx);
                         cx.stop_propagation();
                     })
             }))
@@ -208,48 +253,24 @@ pub(super) fn link_controls(
     controls
 }
 
-#[derive(Clone)]
-struct TargetPreview {
-    target: SharedString,
-    palette: Palette,
-    max_width: Pixels,
-}
-
-impl TargetPreview {
-    fn label(&self) -> gpui::Div {
-        div()
-            .max_w(self.max_width)
-            .overflow_hidden()
-            .text_ellipsis()
-            .text_size(px(12.))
-            .line_height(px(18.))
-            .px(px(8.))
-            .py(px(4.))
-            .rounded(px(4.))
-            .border_1()
-            .border_color(paint(self.palette.accent))
-            .bg(paint(self.palette.background))
-            .text_color(paint(self.palette.foreground))
-            .child(self.target.clone())
-    }
-}
-
-impl Render for TargetPreview {
-    fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
-        self.label()
-    }
-}
-
-fn open(target: Arc<str>) {
-    std::thread::spawn(move || {
-        let result = Command::new("xdg-open")
+fn open(target: Arc<str>, window: &Window, cx: &mut App) {
+    let task = cx.background_executor().spawn(async move {
+        Command::new("xdg-open")
             .arg(target.as_ref())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
-        if !result.is_ok_and(|status| status.success()) {
-            fell_core::diagnostic!(WARN, "Could not open link");
-        }
+            .status()
+            .is_ok_and(|status| status.success())
     });
+    window
+        .spawn(cx, async move |cx| {
+            if !task.await {
+                fell_core::diagnostic!(WARN, "Could not open link");
+                let _ = cx.update(|window, cx| {
+                    reader_links::notice(window, cx, "Couldn't open link", true)
+                });
+            }
+        })
+        .detach();
 }

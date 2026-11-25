@@ -3,7 +3,10 @@
 //! The conversation view paints [`RenderedBody`] for stored plain text and
 //! for the plain alternative when native HTML has no visible content.
 
-use std::sync::Arc;
+use std::{
+    ops::{Deref, Range},
+    sync::Arc,
+};
 
 use fell_render::{Block, is_forward_subject, plain_list_runs};
 use gpui::SharedString;
@@ -19,12 +22,12 @@ pub struct RenderedBody {
 /// One piece of stored plain text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BodyBlock {
-    Text(SharedString),
+    Text(PlainText),
     List(Arc<[Block]>),
     /// Quoted history. Collapsed until the reader expands it.
-    Quote(SharedString),
+    Quote(PlainText),
     /// A signature block. Collapsed until the reader expands it.
-    Signature(SharedString),
+    Signature(PlainText),
     /// A compose draft's markdown, painted with the compose window's
     /// renderer, so the draft reads as the recipient will see it. `agent`:
     /// an agent wrote it, so each link shows where it goes.
@@ -34,8 +37,55 @@ pub enum BodyBlock {
     },
 }
 
-fn shared(text: &str) -> SharedString {
-    SharedString::from(text.to_string())
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlainText {
+    pub(crate) text: SharedString,
+    pub(crate) links: Arc<[PlainLink]>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PlainLink {
+    pub range: Range<usize>,
+    pub target: Arc<str>,
+}
+
+impl From<&str> for PlainText {
+    fn from(text: &str) -> Self {
+        Self {
+            text: text.to_owned().into(),
+            links: fell_render::plain_link_ranges(text)
+                .into_iter()
+                .map(|range| PlainLink {
+                    target: Arc::from(&text[range.clone()]),
+                    range,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl PlainText {
+    pub(crate) fn as_str(&self) -> &str {
+        self.text.as_str()
+    }
+}
+
+impl Deref for PlainText {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for PlainText {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+fn shared(text: &str) -> PlainText {
+    text.into()
 }
 
 /// Turn stored plain text into blocks. Markup is not interpreted.
@@ -47,14 +97,12 @@ pub fn render_stored_body(body_text: Option<&str>, snippet: &str, subject: &str)
         };
     }
     let (head, history) = split_outlook_history(&raw, subject);
-    let mut blocks = if head.is_empty() {
-        Vec::new()
+    let mut blocks = Vec::new();
+    if let ("", Some(forward)) = (head, history) {
+        push_text(forward, &mut blocks);
     } else {
-        split_blocks(head)
-    };
-    match history {
-        Some(BodyBlock::Text(forward)) => push_text(&forward, &mut blocks),
-        other => blocks.extend(other),
+        blocks = split_blocks(head);
+        blocks.extend(history.map(|quote| BodyBlock::Quote(shared(quote))));
     }
     RenderedBody { blocks }
 }
@@ -65,8 +113,8 @@ pub fn render_stored_body(body_text: Option<&str>, snippet: &str, subject: &str)
 /// name an address, as a reply header's does, so a sender's own template
 /// lines stay. A forward stays open. Nothing is split off
 /// when no reply text would be left above it, or no quoted text under it.
-fn split_outlook_history<'a>(raw: &'a str, subject: &str) -> (&'a str, Option<BodyBlock>) {
-    let open_forward = || ("", Some(BodyBlock::Text(shared(raw))));
+fn split_outlook_history<'a>(raw: &'a str, subject: &str) -> (&'a str, Option<&'a str>) {
+    let open_forward = || ("", Some(raw));
     if is_forward_subject(subject) {
         return open_forward();
     }
@@ -111,7 +159,7 @@ fn split_outlook_history<'a>(raw: &'a str, subject: &str) -> (&'a str, Option<Bo
         if head.trim().is_empty() || !quoted {
             return (raw, None);
         }
-        return (head, Some(BodyBlock::Quote(shared(raw[*start..].trim()))));
+        return (head, Some(raw[*start..].trim()));
     }
     (raw, None)
 }
@@ -282,7 +330,7 @@ mod tests {
             rendered.blocks
         );
         assert!(
-            matches!(&rendered.blocks[..], [_, BodyBlock::Text(text)] if text == "Caleb\nFell")
+            matches!(&rendered.blocks[..], [_, BodyBlock::Text(text)] if text.as_str() == "Caleb\nFell")
         );
     }
 

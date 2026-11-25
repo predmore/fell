@@ -3079,7 +3079,18 @@ impl Session {
                     ..Step::default()
                 };
             }
-            Action::FocusLinks => self.count.clear(),
+            Action::FocusLinks => {
+                self.count.clear();
+                self.leave_attachments();
+                if self.pane == Pane::List
+                    && !self.in_drafts()
+                    && self.cursor_id.is_some()
+                    && self.cursor_draft().is_none()
+                {
+                    self.pane = Pane::Conversation;
+                    self.opened(&mut step);
+                }
+            }
             Action::FocusAttachments => {
                 self.count.clear();
                 let index = if self.pane == Pane::List {

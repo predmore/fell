@@ -18,7 +18,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use super::theme::{Palette, ink, paint};
 
 mod links;
-use links::{LinkSpan, link_controls, link_spans};
+use links::{LinkSpan, checked_target, link_controls, link_spans};
 
 /// Decoded inline images for one message.
 ///
@@ -510,12 +510,13 @@ impl BlockColumns {
                     let width = reading
                         .reader
                         .map_or(reading.width, |reader| reader.pane_right);
+                    let reading_live = frame.alpha[1] > frame.alpha[0];
                     crate::view::disclosure::reflow(
                         width,
                         frame,
                         [
-                            render(split.with_links(false)),
-                            render(reading.with_links(false)),
+                            render(split.with_links(split.links && !reading_live)),
+                            render(reading.with_links(reading.links && reading_live)),
                         ],
                     )
                 }
@@ -1554,7 +1555,7 @@ struct Mark {
     code: bool,
     /// In the monospace face: the code itself.
     mono: bool,
-    link: Option<Arc<str>>,
+    link: Option<links::LinkMark>,
 }
 
 /// Fine print's size: a step under the body, as the sender meant it.
@@ -1699,7 +1700,10 @@ fn walk_inlines(
             }
             Inline::Link { href, children } => {
                 let mut next = mark.clone();
-                next.link = fell_render::reader_link_target(href).map(Arc::from);
+                next.link = checked_target(href).map(|target| links::LinkMark {
+                    source: inline as *const Inline as usize,
+                    target,
+                });
                 walk_inlines(
                     children,
                     &next,
@@ -1760,14 +1764,15 @@ fn flush_text(
 }
 
 pub(crate) fn plain_text(
-    text: String,
+    text: &crate::text_render::PlainText,
     palette: Palette,
     block: usize,
     live: bool,
 ) -> impl IntoElement {
     let mut runs = Vec::new();
     let mut at = 0;
-    for range in fell_render::plain_link_ranges(&text) {
+    for link in text.links.iter() {
+        let range = &link.range;
         if at < range.start {
             runs.push((range.start - at, Mark::default()));
         }
@@ -1775,7 +1780,10 @@ pub(crate) fn plain_text(
         runs.push((
             range.len(),
             Mark {
-                link: Some(Arc::from(&text[range])),
+                link: Some(links::LinkMark {
+                    source: range.start,
+                    target: link.target.clone(),
+                }),
                 ..Mark::default()
             },
         ));
@@ -1783,7 +1791,7 @@ pub(crate) fn plain_text(
     if at < text.len() {
         runs.push((text.len() - at, Mark::default()));
     }
-    let mut element = MailText::new(text.into(), runs, palette);
+    let mut element = MailText::new(text.text.clone(), runs, palette);
     if live && !element.links.is_empty() {
         element.id = Some(ElementId::named_usize("plain-mail-text", block));
     }
