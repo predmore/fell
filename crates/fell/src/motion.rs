@@ -699,14 +699,30 @@ impl<R: Clone> ListShift<R> {
         (painted < viewport && painted + row_height > 0.0).then_some(painted)
     }
 
-    /// Ghosts whose old top falls in the slot `[top, top + height)` (list
-    /// content pixels), with their top relative to that slot. The view
-    /// draws each beneath the row in that slot, so the row slides over it
-    /// as it fades.
-    pub fn ghosts_in(&self, top: f32, height: f32, now: Instant) -> Vec<(R, f32, f32)> {
+    pub fn has_batch_ghosts(&self) -> bool {
+        !self.replaced && self.ghosts.len() > 1
+    }
+
+    /// Ghost tops relative to this slot, in list content pixels. A single
+    /// ghost keeps its usual slot. For a batch, the first painted slot owns
+    /// every ghost so they paint before any live row, including rows that
+    /// are sliding across slot boundaries.
+    pub fn ghosts_for_slot(
+        &self,
+        top: f32,
+        height: f32,
+        first: bool,
+        now: Instant,
+    ) -> Vec<(R, f32, f32)> {
+        let batch = self.has_batch_ghosts();
+        if batch && !first {
+            return Vec::new();
+        }
         self.ghosts
             .iter()
-            .filter(|ghost| ghost.running(now) && ghost.top >= top && ghost.top < top + height)
+            .filter(|ghost| {
+                ghost.running(now) && (batch || (ghost.top >= top && ghost.top < top + height))
+            })
             .map(|ghost| (ghost.row.clone(), ghost.top - top, ghost.opacity(now)))
             .collect()
     }
@@ -900,7 +916,7 @@ mod tests {
             },
             "c starts where it was"
         );
-        let ghosts = shift.ghosts_in(68.0, 68.0, start);
+        let ghosts = shift.ghosts_for_slot(68.0, 68.0, false, start);
         assert_eq!(ghosts.len(), 1);
         assert_eq!(ghosts[0].0, "b");
         assert_eq!(ghosts[0].1, 0.0);
@@ -911,8 +927,42 @@ mod tests {
             shift.row("c", 68.0, 68.0, None, at(start, 120)),
             RowMotion::STILL
         );
-        assert!(shift.ghosts_in(68.0, 68.0, at(start, 120)).is_empty());
+        assert!(
+            shift
+                .ghosts_for_slot(68.0, 68.0, false, at(start, 120))
+                .is_empty()
+        );
         assert!(!shift.running(at(start, 120)));
+    }
+
+    #[test]
+    fn batch_ghosts_paint_before_every_live_slot_even_when_scrolled() {
+        let start = Instant::now();
+        let shift = shift(
+            &[
+                ("a", -18.0),
+                ("b", 50.0),
+                ("c", 118.0),
+                ("d", 186.0),
+                ("e", 254.0),
+            ],
+            &[("a", 50.0), ("b", 118.0), ("d", 254.0)],
+            vec![],
+            false,
+            start,
+        );
+        // The first live slot starts at content y=68. Ghost a still
+        // intersects the viewport above that slot, and d is two slots below.
+        assert_eq!(
+            shift.ghosts_for_slot(68.0, 68.0, true, start),
+            vec![("a", -18.0, 1.0), ("b", 50.0, 1.0), ("d", 186.0, 1.0)]
+        );
+        assert!(shift.ghosts_for_slot(136.0, 68.0, false, start).is_empty());
+        assert!(
+            shift
+                .ghosts_for_slot(204.0, f32::INFINITY, false, start)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1019,7 +1069,7 @@ mod tests {
     fn a_replaced_list_fades_in_without_ghosts() {
         let start = Instant::now();
         let mut replaced = shift(&[("a", 0.0)], &[("a", 0.0)], vec![], false, start);
-        assert!(replaced.ghosts_in(0.0, 68.0, start).is_empty());
+        assert!(replaced.ghosts_for_slot(0.0, 68.0, false, start).is_empty());
         assert_eq!(
             replaced.row("x", 0.0, 68.0, None, start).opacity,
             ARRIVE_FROM
@@ -1197,7 +1247,11 @@ mod tests {
             true,
             at(start, 20),
         );
-        assert!(switched.ghosts_in(0.0, 1000.0, at(start, 20)).is_empty());
+        assert!(
+            switched
+                .ghosts_for_slot(0.0, 1000.0, false, at(start, 20))
+                .is_empty()
+        );
         let b = switched.row("b", 0.0, 68.0, None, at(start, 20));
         assert_eq!(b.dy, 0.0, "a shared row fades in with the rest");
         assert!(b.opacity < 1.0);
@@ -1216,12 +1270,12 @@ mod tests {
         )
         .fading_below(vec![("c", 136.0), ("d", 204.0)]);
         // Sent's rows arrive in place; the inbox's last two fade below them.
-        let fading = switched.ghosts_in(68.0, f32::INFINITY, start);
+        let fading = switched.ghosts_for_slot(68.0, f32::INFINITY, false, start);
         assert_eq!(fading.len(), 2);
         assert!(fading.iter().all(|(_, _, opacity)| *opacity == 1.0));
         let row = switched.row("s1", 0.0, 68.0, None, start);
         assert!(row.opacity < 1.0, "Sent's rows arrive");
-        let mid = switched.ghosts_in(68.0, f32::INFINITY, at(start, 60));
+        let mid = switched.ghosts_for_slot(68.0, f32::INFINITY, false, at(start, 60));
         assert!(
             mid.iter()
                 .all(|(_, _, opacity)| *opacity > 0.0 && *opacity < 1.0)
@@ -1229,12 +1283,15 @@ mod tests {
         assert!(switched.running(at(start, 100)));
         assert!(
             switched
-                .ghosts_in(68.0, f32::INFINITY, at(start, 120))
+                .ghosts_for_slot(68.0, f32::INFINITY, false, at(start, 120))
                 .is_empty()
         );
         // Not a replacement: nothing is added (rows that left are ghosts already).
         let kept = shift(&[("a", 0.0)], &[], vec![], false, start).fading_below(vec![("z", 68.0)]);
-        assert!(kept.ghosts_in(0.0, f32::INFINITY, start).is_empty());
+        assert!(
+            kept.ghosts_for_slot(0.0, f32::INFINITY, false, start)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1263,7 +1320,11 @@ mod tests {
         assert!(offset > 0.0 && offset < 68.0);
         let carried = first.take_ghosts();
         let second = shift(&[("c", offset)], &[], carried, false, mid);
-        assert_eq!(second.ghosts_in(0.0, 68.0, mid).len(), 1, "b keeps fading");
+        assert_eq!(
+            second.ghosts_for_slot(0.0, 68.0, false, mid).len(),
+            1,
+            "b keeps fading"
+        );
     }
 
     #[test]
@@ -1310,10 +1371,10 @@ mod tests {
             start,
         );
         // Scrolling never moves it: slots are asked for in content pixels.
-        assert_eq!(shift.ghosts_in(136.0, 68.0, start).len(), 1);
+        assert_eq!(shift.ghosts_for_slot(136.0, 68.0, false, start).len(), 1);
         // Two rows arrived above: it is now in row 4's slot.
         shift.move_ghosts(136.0);
-        assert!(shift.ghosts_in(136.0, 68.0, start).is_empty());
-        assert_eq!(shift.ghosts_in(272.0, 68.0, start).len(), 1);
+        assert!(shift.ghosts_for_slot(136.0, 68.0, false, start).is_empty());
+        assert_eq!(shift.ghosts_for_slot(272.0, 68.0, false, start).len(), 1);
     }
 }

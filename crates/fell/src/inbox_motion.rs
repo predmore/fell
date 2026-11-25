@@ -25,6 +25,12 @@ pub const SELECTION_FROM: f32 = 0.6;
 
 const STATUS_SWAP_OUT: Duration = Duration::from_millis(60);
 
+#[derive(Clone, Debug)]
+pub struct ThreadGhost {
+    pub row: ThreadRow,
+    pub selected: bool,
+}
+
 /// The folder label and count leaving the header as a pair.
 pub struct FolderHeaderFade {
     pub folder: String,
@@ -204,7 +210,7 @@ pub struct InboxMotion {
     /// The time every transition here runs on.
     pub clock: motion::Clock,
     /// Rows moving after an archive, undo, sync or folder switch.
-    pub list: Option<ListShift<ThreadRow>>,
+    pub list: Option<ListShift<ThreadGhost>>,
     /// The list viewport gliding to the selection (`Ctrl-d`, `gg`, `G`).
     pub list_glide: Option<Glide>,
     /// The conversation gliding to a page or a message.
@@ -774,7 +780,7 @@ impl InboxMotion {
     }
 
     /// Hand the ghosts of a shift still running to the next one.
-    pub fn carried_ghosts(&mut self) -> Vec<Ghost<ThreadRow>> {
+    pub fn carried_ghosts(&mut self) -> Vec<Ghost<ThreadGhost>> {
         self.list
             .as_mut()
             .map(ListShift::take_ghosts)
@@ -794,6 +800,23 @@ impl InboxMotion {
         self.list
             .as_ref()
             .map_or(0.0, |shift| shift.offset_of(id, top, now))
+    }
+
+    /// Keep the tail of a shrinking list sliding even beyond the old
+    /// snapshot. The first unseen row starts below the clip and below the
+    /// last tracked row. Giving the tail one offset keeps its rows spaced.
+    pub fn batch_bottom_arrival_offset(
+        viewport: f32,
+        previous_bottom: f32,
+        first_slot: f32,
+    ) -> f32 {
+        (viewport.max(previous_bottom) - first_slot).max(0.0)
+    }
+
+    /// The prefix ends at or above the clip and before the first tracked
+    /// row. Every row in the prefix shares this upward starting offset.
+    pub fn batch_top_arrival_offset(tracked_top: f32, tracked_slot: f32) -> f32 {
+        (tracked_top.min(0.0) - tracked_slot).min(0.0)
     }
 
     /// Observe the folder whose page actually supplied the count.
@@ -2130,6 +2153,90 @@ mod tests {
         motion.tick(later(switched, 120));
         assert!(motion.closing_overlay(later(switched, 120)).is_none());
         assert_eq!(motion.card_height(later(switched, 120)), Some(510.));
+    }
+
+    #[test]
+    fn unseen_batch_arrivals_start_at_or_below_the_bottom_edge() {
+        let viewport = 200.0;
+        let first_slot = 68.0;
+        for (previous_bottom, start_top) in [(0.0, 200.0), (150.0, 200.0), (220.0, 220.0)] {
+            let dy =
+                InboxMotion::batch_bottom_arrival_offset(viewport, previous_bottom, first_slot);
+            assert_eq!(first_slot + dy, start_top);
+
+            let now = Instant::now();
+            let mut shift = ListShift::start(
+                &Motion::new(true),
+                vec![
+                    ("a".into(), 0.0),
+                    ("b".into(), 68.0),
+                    ("c".into(), start_top),
+                    ("d".into(), start_top + 68.0),
+                ],
+                vec![("a", 0.0), ("b", 68.0)],
+                vec![],
+                viewport,
+                false,
+                now,
+            )
+            .unwrap();
+            for elapsed in [0, 16, 60, 120] {
+                let at = later(now, elapsed);
+                let c = shift.row("c", first_slot, 68.0, None, at);
+                let d = shift.row("d", first_slot + 68.0, 68.0, None, at);
+                assert_eq!(c, d);
+                assert_eq!(c.opacity, 1.0);
+                if elapsed == 0 {
+                    assert_eq!(c.dy, dy);
+                } else if elapsed == 120 {
+                    assert_eq!(c.dy, 0.0);
+                } else {
+                    assert!((0.0..dy).contains(&c.dy));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unseen_batch_arrivals_slide_down_from_above_the_top_edge() {
+        let tracked_slot = 136.0;
+        for tracked_top in [-68.0, 0.0, 12.0] {
+            let now = Instant::now();
+            let dy = InboxMotion::batch_top_arrival_offset(tracked_top, tracked_slot);
+            let mut shift = ListShift::start(
+                &Motion::new(true),
+                vec![
+                    ("a".into(), dy),
+                    ("b".into(), 68.0 + dy),
+                    ("c".into(), tracked_top),
+                    ("d".into(), 68.0),
+                    ("e".into(), 136.0),
+                ],
+                vec![("d", 68.0), ("e", 136.0)],
+                vec![],
+                600.0,
+                false,
+                now,
+            )
+            .unwrap();
+            assert!(68.0 + dy + 68.0 <= tracked_top.min(0.0));
+            for elapsed in [0, 16, 60, 120] {
+                let at = later(now, elapsed);
+                let a = shift.row("a", 0.0, 68.0, None, at);
+                let b = shift.row("b", 68.0, 68.0, None, at);
+                let c = shift.row("c", tracked_slot, 68.0, None, at);
+                assert_eq!(a, b);
+                assert_eq!(a.opacity, 1.0);
+                assert!(b.dy <= c.dy, "the incoming rows stay above the tracked row");
+                if elapsed == 0 {
+                    assert_eq!(a.dy, dy);
+                } else if elapsed == 120 {
+                    assert_eq!(a.dy, 0.0);
+                } else {
+                    assert!((dy..0.0).contains(&a.dy));
+                }
+            }
+        }
     }
 
     #[test]
