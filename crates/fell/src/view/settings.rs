@@ -13,7 +13,8 @@ use futures::channel::mpsc;
 use futures::{FutureExt, StreamExt};
 use gpui::{
     Bounds, Context, FontWeight, InteractiveElement, MouseButton, ParentElement, ScrollHandle,
-    StatefulInteractiveElement, Styled, TitlebarOptions, WindowOptions, div, prelude::*, px, rgb,
+    StatefulInteractiveElement, Styled, TitlebarOptions, Window, WindowOptions, div, prelude::*,
+    px, rgb,
 };
 
 use super::{FontOpt, Inbox};
@@ -682,13 +683,14 @@ fn report_unknown(snapshot: &Snapshot) {
 const HEADER_HEIGHT: f32 = 64.;
 const SECTION_ROW_HEIGHT: f32 = 64.;
 const INDEX_ROW_HEIGHT: f32 = 49.;
-const ACCOUNT_SUMMARY_HEIGHT: f32 = 64.;
-const ACCOUNT_SERVER_HEIGHT: f32 = 80.;
+const ACCOUNT_SUMMARY_HEIGHT: f32 = 80.;
 const BODY_PADDING: f32 = 16.;
 const BINDING_ROW_HEIGHT: f32 = 39.;
 const MAX_BINDING_ROWS: f32 = 9.;
 const INDEX_FOOTER_HEIGHT: f32 = 21.;
 const SEARCH_SUMMARY_HEIGHT: f32 = 70.;
+const VALUE_TEXT_SIZE: f32 = 13.;
+const CHEVRON_WIDTH: f32 = 11.;
 
 pub(super) fn card_height(nav: &nav::Nav, room: f32, narrow: bool) -> f32 {
     if nav.page == Page::Bindings {
@@ -713,7 +715,7 @@ pub(super) fn card_height(nav: &nav::Nav, room: f32, narrow: bool) -> f32 {
                 .sum::<f32>()
                 + match section {
                     Section::Accounts if nav.availability.account_setup => ACCOUNT_SUMMARY_HEIGHT,
-                    Section::Accounts => ACCOUNT_SERVER_HEIGHT - 10.,
+                    Section::Accounts => ACCOUNT_SUMMARY_HEIGHT - 10.,
                     Section::Search => SEARCH_SUMMARY_HEIGHT,
                     _ => 0.,
                 }
@@ -730,11 +732,12 @@ pub(super) fn card(
     session: &crate::model::Session,
     view: &View,
     live: bool,
-    (height, width): (f32, f32),
+    (height, window): (f32, &Window),
     now: Instant,
     cx: &mut Context<Inbox>,
 ) -> gpui::Div {
     let page = session.settings_nav.page;
+    let width = f32::from(window.viewport_size().width);
     let content_opacity = if live {
         motion::lerp(
             motion::ARRIVE_FROM,
@@ -766,11 +769,13 @@ pub(super) fn card(
         .px(px(20.))
         .border_b_1()
         .border_color(rgb(theme.border))
-        .when_some(back, |header, back| {
-            header.child(
+        .child(div().h(px(16.)).when_some(back, |crumb, back| {
+            crumb.child(
                 div()
                     .id("settings-back")
                     .text_size(px(12.))
+                    .line_height(px(16.))
+                    .opacity(content_opacity)
                     .text_color(rgb(theme.dimmed))
                     .when(live, |label| {
                         label.cursor_pointer().on_mouse_down(
@@ -788,7 +793,7 @@ pub(super) fn card(
                     })
                     .child(format!("‹  {back}")),
             )
-        })
+        }))
         .child(
             div()
                 .text_size(px(20.))
@@ -807,7 +812,7 @@ pub(super) fn card(
     let selected = session.settings_nav.selected;
     let mut details = None;
     let mut footer = None;
-    let mut binding_fade = false;
+    let mut binding_edges = (false, false);
     match page {
         Page::Index => {
             for (index, section) in Section::ALL.into_iter().enumerate() {
@@ -874,21 +879,14 @@ pub(super) fn card(
                         .text_center()
                         .child(value_text(theme, state, selected).opacity(incoming))
                         .when_some(changed, |value, (old, outgoing, _)| {
-                            // Keep the outgoing value's width until its fade ends.
-                            value
-                                .child(
-                                    value_text(theme, old.clone(), selected)
-                                        .h(px(0.))
-                                        .opacity(0.),
-                                )
-                                .child(
-                                    value_text(theme, old, selected)
-                                        .absolute()
-                                        .top_0()
-                                        .left_0()
-                                        .right_0()
-                                        .opacity(outgoing),
-                                )
+                            value.child(
+                                value_text(theme, old, selected)
+                                    .absolute()
+                                    .top_0()
+                                    .left_0()
+                                    .right_0()
+                                    .opacity(outgoing),
+                            )
                         });
                     control = control
                         .child(row_label(theme, preference.label(), None, selected).child({
@@ -923,9 +921,7 @@ pub(super) fn card(
                         }))
                         .child(
                             div()
-                                .w_auto()
-                                .min_w(px(56.))
-                                .max_w(px(142.))
+                                .w(value_column_width(preference, theme, window))
                                 .flex_none()
                                 .flex()
                                 .items_center()
@@ -999,7 +995,13 @@ pub(super) fn card(
 
             details = match section {
                 Section::Accounts => {
-                    let (title, description) = if session.settings_nav.availability.account_setup {
+                    let setup = session.settings_nav.availability.account_setup;
+                    let (title, description) = if setup && view.server.is_some() {
+                        (
+                            "Account file not found".to_owned(),
+                            "This mailbox stays open until you reopen Fell.",
+                        )
+                    } else if setup {
                         (
                             "No account configured".to_owned(),
                             "Set up an account to sync your mailbox.",
@@ -1015,7 +1017,6 @@ pub(super) fn card(
                             "Check account.toml or reopen Fell to connect.",
                         )
                     };
-                    let setup = session.settings_nav.availability.account_setup;
                     let sync = view.server.as_ref().filter(|_| !setup).map(|_| {
                         session.last_sync_at.map_or_else(
                             || "Waiting for first sync".into(),
@@ -1029,11 +1030,7 @@ pub(super) fn card(
                     });
                     Some(
                         detail(theme, title, description, false, setup)
-                            .h(px(if setup {
-                                ACCOUNT_SUMMARY_HEIGHT
-                            } else {
-                                ACCOUNT_SERVER_HEIGHT
-                            }))
+                            .h(px(ACCOUNT_SUMMARY_HEIGHT))
                             .children(sync.map(|label| {
                                 div()
                                     .text_size(px(12.))
@@ -1105,7 +1102,7 @@ pub(super) fn card(
             } else {
                 0.
             };
-            binding_fade = scrollable + offset > 1.;
+            binding_edges = (offset < -1., scrollable + offset > 1.);
         }
         Page::ConfirmModel { install } => {
             body = body.child(if install {
@@ -1162,8 +1159,11 @@ pub(super) fn card(
         .children(details.map(|details| details.opacity(content_opacity)))
         .child(body.opacity(content_opacity))
         .children(footer)
-        .when(binding_fade, |card| {
-            card.child(super::help::edge(theme, false, 24.))
+        .when(binding_edges.0, |card| {
+            card.child(super::help::edge(theme, true, 24.).top(px(HEADER_HEIGHT)))
+        })
+        .when(binding_edges.1, |card| {
+            card.child(super::help::edge(theme, false, 44.))
         })
 }
 
@@ -1332,6 +1332,30 @@ fn preference_note(
     }
 }
 
+// Measure with the inbox font. Each label keeps the same column through
+// the fade, including values that came from a manual edit of settings.toml.
+fn value_column_width(
+    preference: settings::Preference,
+    theme: &theme::Theme,
+    window: &Window,
+) -> gpui::Pixels {
+    use settings::Preference::*;
+
+    let samples: &[&str] = match preference {
+        Theme => &["Follow desktop", "Dark", "Light"],
+        FontSize => &["System", "18 px"],
+        ReduceMotion => &["Follow desktop", "On", "Off"],
+        ReadDwell => &["Immediately", "10000 ms"],
+        WhichKey => &["Immediately", "5000 ms"],
+        Notifications => &["Sender + subject", "Private", "Off"],
+    };
+    let text_width = samples
+        .iter()
+        .map(|sample| super::bar_px(window, sample, VALUE_TEXT_SIZE, theme.ui_family.as_ref()))
+        .fold(0., f32::max);
+    px((text_width.ceil() + 2. * CHEVRON_WIDTH + 2.).clamp(56., 142.))
+}
+
 fn chevron(
     theme: &theme::Theme,
     index: usize,
@@ -1348,7 +1372,7 @@ fn chevron(
         } else {
             "next-value"
         })
-        .w(px(11.))
+        .w(px(CHEVRON_WIDTH))
         .flex_none()
         .text_center()
         .text_size(px(12.))
@@ -1386,7 +1410,7 @@ fn value_text(
     selected: bool,
 ) -> gpui::Div {
     div()
-        .text_size(px(13.))
+        .text_size(px(VALUE_TEXT_SIZE))
         .text_color(rgb(if selected {
             theme.on_selection_accent
         } else {

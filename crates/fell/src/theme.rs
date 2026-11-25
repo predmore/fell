@@ -342,6 +342,16 @@ pub(crate) fn note_text(color: u32, background: u32) -> u32 {
     ensure(color, background, NOTE_TEXT_CONTRAST)
 }
 
+pub(crate) fn scroll_fade(color: u32, top: bool) -> gpui::Background {
+    let solid = gpui::Hsla::from(gpui::rgb(color));
+    let clear = gpui::Hsla { a: 0., ..solid };
+    gpui::linear_gradient(
+        if top { 0. } else { 180. },
+        gpui::linear_color_stop(clear, 0.),
+        gpui::linear_color_stop(solid, 1.),
+    )
+}
+
 pub fn contrast_ok(theme: &Theme) -> bool {
     let surfaces = [theme.background, theme.surface];
     for bg in surfaces {

@@ -2,7 +2,7 @@
 use std::time::Instant;
 
 use gpui::prelude::*;
-use gpui::{Context, Div, FontWeight, Hsla, MouseButton, Pixels, Size, Window, div, px, rgb};
+use gpui::{Context, Div, FontWeight, MouseButton, Pixels, Size, Window, div, px, rgb};
 
 use super::{CARD_TOP_PX, FontOpt, Inbox, conversation_line_style};
 use crate::keymap::{Action, KeyId, binding_text};
@@ -359,8 +359,6 @@ fn action_row(theme: &Theme, session: &Session, action: Action, layout: &Layout)
 
 /// While a row crosses the viewport boundary, its text fades into the card.
 pub(super) fn edge(theme: &Theme, top: bool, height: f32) -> Div {
-    let solid = Hsla::from(rgb(theme.surface));
-    let clear = Hsla { a: 0., ..solid };
     div()
         .absolute()
         .left_0()
@@ -368,11 +366,7 @@ pub(super) fn edge(theme: &Theme, top: bool, height: f32) -> Div {
         .h(px(height))
         .when(top, |fade| fade.top_0())
         .when(!top, |fade| fade.bottom_0())
-        .bg(gpui::linear_gradient(
-            if top { 0. } else { 180. },
-            gpui::linear_color_stop(clear, 0.),
-            gpui::linear_color_stop(solid, 1.),
-        ))
+        .bg(crate::theme::scroll_fade(theme.surface, top))
 }
 
 #[cfg(test)]

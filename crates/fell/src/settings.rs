@@ -299,10 +299,10 @@ impl Snapshot {
         self.read_error.clone().or_else(|| {
             (!self.invalid.is_empty()).then(|| {
                 format!(
-                    "settings.toml contains invalid values · {}",
+                    "Invalid in settings.toml · {}",
                     self.invalid
                         .iter()
-                        .map(|(key, _)| key.key())
+                        .map(|(key, value)| format!("{} = {value}", key.key()))
                         .collect::<Vec<_>>()
                         .join(", ")
                 )
@@ -341,6 +341,8 @@ fn invalid_label(item: &Item) -> String {
     if let Some(text) = item.as_str() {
         format!("{:?}", bounded(text))
     } else if let Some(value) = item.as_value() {
+        let mut value = value.clone();
+        value.decor_mut().clear();
         bounded(&value.to_string())
     } else {
         "Table".into()
@@ -705,7 +707,7 @@ mod tests {
         );
         assert_eq!(
             bad.notice().unwrap(),
-            "settings.toml contains invalid values · read_dwell_ms, which_key_ms, notifications"
+            r#"Invalid in settings.toml · read_dwell_ms = "now", which_key_ms = -1, notifications = 0"#
         );
 
         fs::write(&path, "theme = 'dark'\nwhich_key_ms = [").unwrap();

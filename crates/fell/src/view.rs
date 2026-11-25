@@ -5525,7 +5525,7 @@ impl Render for Inbox {
                                         width < 500.,
                                     )
                                 }),
-                                width,
+                                window,
                             ),
                             now,
                             cx,

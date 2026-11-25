@@ -294,6 +294,7 @@ pub struct ComposeView {
     raw: bool,
     preview: bool,
     quote_open: bool,
+    quote_scroll: gpui::ScrollHandle,
     focus: FocusHandle,
     leader: bool,
     leader_at: Option<std::time::Instant>,
@@ -421,6 +422,7 @@ impl ComposeView {
             raw: false,
             preview: false,
             quote_open: false,
+            quote_scroll: gpui::ScrollHandle::new(),
             focus: cx.focus_handle(),
             leader: false,
             leader_at: None,
@@ -2540,14 +2542,39 @@ impl ComposeView {
                 },
                 colors,
             );
-            block = block.child(
+            block = block.child(if let Some(height) = narrow_height {
+                let scroll = self.quote_scroll.clone();
                 div()
-                    .id("compose-quote")
-                    .when_some(narrow_height, |quote, height| {
-                        quote.max_h(height).overflow_y_scroll()
-                    })
-                    .child(quote),
-            );
+                    .relative()
+                    .child(
+                        div()
+                            .id("compose-quote")
+                            .max_h(height)
+                            .overflow_y_scroll()
+                            .track_scroll(&self.quote_scroll)
+                            .child(quote),
+                    )
+                    .child(
+                        gpui::canvas(
+                            |_, _, _| (),
+                            move |bounds, _, window, _| {
+                                if scroll.max_offset().height + scroll.offset().y > px(1.) {
+                                    window.paint_quad(gpui::fill(
+                                        bounds,
+                                        crate::theme::scroll_fade(colors.bg, false),
+                                    ));
+                                }
+                            },
+                        )
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .h(px(24.)),
+                    )
+            } else {
+                quote
+            });
         }
         Some(block)
     }
@@ -2560,6 +2587,9 @@ impl ComposeView {
             .unwrap_or(false);
         if quoted {
             self.quote_open = !self.quote_open;
+            if self.quote_open {
+                self.quote_scroll.set_offset(gpui::point(px(0.), px(0.)));
+            }
             self.status = if self.quote_open {
                 "quote shown"
             } else {
