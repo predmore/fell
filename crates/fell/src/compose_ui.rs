@@ -6463,9 +6463,12 @@ fn place_of_word(word: &str, links: Links) -> Option<Place> {
     let word = word.trim_matches(|ch| !word_char(ch));
     let lower = word.to_lowercase();
     let lower = lower.strip_prefix("mailto:").unwrap_or(&lower);
-    if lower.contains("://") {
+    if let Some((_, rest)) = lower.split_once("://") {
         let url = url::Url::parse(lower).ok()?;
-        if !url.username().is_empty() || url.password().is_some_and(|value| !value.is_empty()) {
+        // The parser can discard an empty userinfo marker, but it is still
+        // present in the label the reader sees.
+        let authority = rest.split(['/', '\\', '?', '#']).next().unwrap_or_default();
+        if authority.contains('@') || !url.username().is_empty() || url.password().is_some() {
             return Some(Place::UserInfo);
         }
         return url.host_str().and_then(ascii_domain).map(Place::Host);
@@ -7728,6 +7731,8 @@ mod tests {
                 "https://evil.test/login",
                 true,
             ),
+            ("https://@evil.test", "https://evil.test/login", true),
+            ("https://evil.test/@paypal.com", "https://evil.test/", false),
             ("paypal.test", "https://paypal.test.evil.test", true),
             ("paypal.co.uk", "https://evil.co.uk", true),
             ("www.github.io", "https://other.github.io", true),
