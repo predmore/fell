@@ -16,6 +16,9 @@ const FENCE: &str = "<|im_start|>";
 
 #[test]
 fn hostile_corpus_stays_inside_the_envelope() {
+    if crate::isolated_draft_paths().is_none() {
+        return;
+    }
     let (mut session, thread) = mailbox();
     init(&mut session);
 
@@ -314,21 +317,14 @@ fn tool_names(session: &mut Session) -> Vec<String> {
         .collect()
 }
 
-/// Set in the child process that runs [`agent_draft_from_hostile_mail_marks_new_recipients`].
-const ISOLATED_ROOT: &str = "FELL_CORPUS_ISOLATED_ROOT";
-
 /// An agent reads hostile mail and copies its injected recipients into a
 /// draft, through the MCP tools and the inbox's draft socket. The review
 /// window marks each one first time, Bcc included, and nothing goes out.
 #[test]
 fn agent_draft_from_hostile_mail_marks_new_recipients() {
-    // The draft tools use the default mailbox, draft folder and socket
-    // paths, so the test runs in a child whose paths are all temp dirs.
-    let Some(root) = std::env::var_os(ISOLATED_ROOT) else {
-        in_isolated_process("agent_draft_from_hostile_mail_marks_new_recipients");
+    let Some(root) = crate::isolated_draft_paths() else {
         return;
     };
-    let root = std::path::PathBuf::from(root);
     let (mut session, thread) = hostile_reply_mailbox(&root.join("mail.db"));
     init(&mut session);
 
@@ -545,41 +541,6 @@ fn agent_draft_from_hostile_mail_marks_new_recipients() {
         );
         assert!(sent.unwrap_err().contains("is not an email address"));
     }
-}
-
-/// Run `test` alone in a fresh copy of this test binary, with every path
-/// Fell reads pointed into a new temp dir.
-fn in_isolated_process(test: &str) {
-    let root = std::env::temp_dir().join(format!(
-        "fell-corpus-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&root).unwrap();
-    let output = crate::spawn_alone(
-        std::process::Command::new(std::env::current_exe().unwrap())
-            .args([&format!("corpus::{test}"), "--exact", "--test-threads=1"])
-            .env(ISOLATED_ROOT, &root)
-            .env("XDG_RUNTIME_DIR", root.join("run"))
-            .env("XDG_DATA_HOME", root.join("data"))
-            .env("FELL_STORE", root.join("mail.db"))
-            .env("FELL_DRAFT_ROOT", root.join("drafts"))
-            .env("FELL_DRAFT_SOCK", root.join("run/live.sock"))
-            .env("FELL_COMPOSE_INDEX", root.join("data/compose-stores"))
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped()),
-    )
-    .wait_with_output()
-    .unwrap();
-    let _ = std::fs::remove_dir_all(&root);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "{stdout}\n{stderr}");
-    assert!(stdout.contains("1 passed"), "{stdout}");
 }
 
 /// A mailbox on disk where the account has mailed ada@x and bob@x, and

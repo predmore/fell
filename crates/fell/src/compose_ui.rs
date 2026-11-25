@@ -6974,7 +6974,8 @@ mod tests {
         let folder =
             fell_core::compose::materialize_in(&temp_root(tag), tag, &fields, body, &account)
                 .unwrap();
-        fell_core::compose::DraftSession::create(folder, tag, account, fields, body).unwrap()
+        fell_core::compose::DraftSession::testing_create_local(folder, tag, account, fields, body)
+            .unwrap()
     }
 
     #[test]
@@ -7828,6 +7829,9 @@ mod tests {
 
     #[test]
     fn the_quoted_original_is_the_stored_quote() {
+        let Some(root) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
         let mut session = plain_session("quote", "body\n");
         assert_eq!(super::stored_quote(&session.snapshot()), None);
         session.set_quote(Some("  \n".into()));
@@ -7839,7 +7843,7 @@ mod tests {
         );
 
         let (hub, id, _) =
-            super::open_demo(temp_root("demo-quote"), super::ThemeKind::Dark).expect("demo draft");
+            super::open_demo(root.join("demo"), super::ThemeKind::Dark).expect("demo draft");
         let demo = hub.with_session(&id, |session| session.snapshot()).unwrap();
         assert_eq!(super::stored_quote(&demo), Some(super::demo_quote()));
     }

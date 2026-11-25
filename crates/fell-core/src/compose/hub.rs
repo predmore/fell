@@ -1313,7 +1313,7 @@ mod tests {
             })
             .unwrap();
         let open = || {
-            let mut session = DraftSession::create(
+            let mut session = DraftSession::testing_create_local(
                 folder.clone(),
                 "d1",
                 AccountId("a".into()),
@@ -1362,8 +1362,14 @@ mod tests {
         let folder =
             workspace::materialize_in(&root, "d1", &fields, "alpha\n", &AccountId("a".into()))
                 .unwrap();
-        let session =
-            DraftSession::create(folder, "d1", AccountId("a".into()), fields, "alpha\n").unwrap();
+        let session = DraftSession::testing_create_local(
+            folder,
+            "d1",
+            AccountId("a".into()),
+            fields,
+            "alpha\n",
+        )
+        .unwrap();
         let hub = DraftHub::new();
         hub.insert(session);
         let rx = hub.subscribe();
@@ -1420,8 +1426,14 @@ mod tests {
         let folder =
             workspace::materialize_in(&root, "d1", &fields, "alpha\n", &AccountId("a".into()))
                 .unwrap();
-        let mut session =
-            DraftSession::create(folder, "d1", AccountId("a".into()), fields, "alpha\n").unwrap();
+        let mut session = DraftSession::testing_create_local(
+            folder,
+            "d1",
+            AccountId("a".into()),
+            fields,
+            "alpha\n",
+        )
+        .unwrap();
         session.set_owner("agent:bot");
         let hub = Arc::new(DraftHub::new());
         hub.insert(session);
@@ -1535,25 +1547,17 @@ mod tests {
 
     #[test]
     fn offline_draft_writes_recheck_scope_after_mcp_authorizes() {
-        let id = format!(
-            "fallback-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let root = std::env::temp_dir().join(&id);
-        fs::create_dir_all(&root).unwrap();
+        let Some(root) = crate::test_support::in_isolated_process() else {
+            return;
+        };
+        let id = "fallback";
         let account = AccountId("offline".into());
         let fields = DraftFields {
             subject: "Demo draft".into(),
             ..DraftFields::default()
         };
-        let folder = workspace::draft_folder(&id).unwrap();
-        workspace::materialize_in(folder.parent().unwrap(), &id, &fields, "alpha\n", &account)
-            .unwrap();
-        let db = root.join("mail.db");
+        let folder = workspace::materialize_workspace(id, &fields, "alpha\n", &account).unwrap();
+        let db = root.join("drafts.db");
         let store = crate::Store::open(&db).unwrap();
         store
             .upsert_account(&crate::Account {
@@ -1565,7 +1569,7 @@ mod tests {
             .unwrap();
         store
             .save_compose(&super::super::persist::StoredCompose {
-                id: id.clone(),
+                id: id.to_string(),
                 account_id: account.clone(),
                 fields,
                 body: "alpha\n".into(),
@@ -1575,7 +1579,7 @@ mod tests {
                 reply: Default::default(),
             })
             .unwrap();
-        super::super::persist::remember_compose_store(&id, &db).unwrap();
+        super::super::persist::remember_compose_store(id, &db).unwrap();
         let before = workspace::read_draft_file(&folder).unwrap();
         let enabled = crate::AgentGrant::enabled(true, false, true);
         let settings = crate::Store::open(&db).unwrap();
@@ -1590,16 +1594,16 @@ mod tests {
             assert_eq!(store.agent_grant(&account, "bot").unwrap(), enabled);
             settings.set_agent_grant(&account, "bot", revoked).unwrap();
             let edit =
-                file_fallback_edit(&store, &id, "agent:bot", account.as_str(), "alpha", "beta");
+                file_fallback_edit(&store, id, "agent:bot", account.as_str(), "alpha", "beta");
             let replace =
-                file_fallback_replace_body(&store, &id, "agent:bot", account.as_str(), "beta");
+                file_fallback_replace_body(&store, id, "agent:bot", account.as_str(), "beta");
             for result in [edit, replace] {
                 let error = result.unwrap_err();
                 assert!(error.contains(expected), "{error}");
             }
         }
         assert_eq!(workspace::read_draft_file(&folder).unwrap(), before);
-        assert_eq!(store.load_compose(&id).unwrap().unwrap().body, "alpha\n");
+        assert_eq!(store.load_compose(id).unwrap().unwrap().body, "alpha\n");
     }
 
     fn request_send_d1(hub: &DraftHub) -> Value {
@@ -1792,7 +1796,7 @@ mod tests {
         let folder = hub
             .with_session("d1", |session| session.folder().to_path_buf())
             .unwrap();
-        let again = DraftSession::create(
+        let again = DraftSession::testing_create_local(
             folder,
             "d1",
             AccountId("a".into()),
@@ -1971,7 +1975,7 @@ mod tests {
             &AccountId("a".into()),
         )
         .unwrap();
-        let mut session = DraftSession::create(
+        let mut session = DraftSession::testing_create_local(
             folder.clone(),
             "d1",
             AccountId("a".into()),
@@ -2010,22 +2014,11 @@ mod tests {
 
     #[test]
     fn the_socket_loads_the_stored_account_not_local() {
-        let id = format!(
-            "acct{}{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let id = id.chars().take(32).collect::<String>();
-        let folder = workspace::draft_folder(&id).unwrap();
-        let control = workspace::control_dir(&folder);
-        let index = super::super::persist::compose_index_file(&id);
-        let db = std::env::temp_dir().join(format!("{id}.db"));
-        let _ = fs::remove_dir_all(&folder);
-        let _ = fs::remove_dir_all(&control);
-        let _ = fs::remove_file(&db);
+        let Some(root) = crate::test_support::in_isolated_process() else {
+            return;
+        };
+        let id = "stored-account";
+        let db = root.join("drafts.db");
         let fields = DraftFields {
             from: "jon@example.com".into(),
             to: vec!["ada@example.com".into()],
@@ -2033,10 +2026,8 @@ mod tests {
             subject: "Hi".into(),
             ..DraftFields::default()
         };
-        let root = folder.parent().unwrap().to_path_buf();
-        workspace::materialize_in(
-            &root,
-            &id,
+        let folder = workspace::materialize_workspace(
+            id,
             &fields,
             "hidden body\n",
             &AccountId("acct-real".into()),
@@ -2054,7 +2045,7 @@ mod tests {
             .unwrap();
         store
             .save_compose(&super::super::persist::StoredCompose {
-                id: id.clone(),
+                id: id.to_string(),
                 account_id: AccountId("acct-real".into()),
                 fields: fields.clone(),
                 body: "hidden body\n".into(),
@@ -2064,7 +2055,7 @@ mod tests {
                 reply: Default::default(),
             })
             .unwrap();
-        super::super::persist::remember_compose_store(&id, &db).unwrap();
+        super::super::persist::remember_compose_store(id, &db).unwrap();
         let hub = DraftHub::new();
         let denied = hub.handle_line(
             &json!({
@@ -2088,7 +2079,7 @@ mod tests {
             .to_string(),
         );
         assert!(opened.contains("hidden body"), "{opened}");
-        let account = hub.with_session(&id, |session| session.account_id().as_str().to_string());
+        let account = hub.with_session(id, |session| session.account_id().as_str().to_string());
         assert_eq!(account.as_deref(), Some("acct-real"));
         let missing = DraftHub::new().handle_line(
             &json!({
@@ -2101,11 +2092,5 @@ mod tests {
         );
         assert!(missing.contains("mailbox"), "{missing}");
         assert!(!missing.contains("another agent"), "{missing}");
-        let _ = fs::remove_dir_all(&folder);
-        let _ = fs::remove_dir_all(&control);
-        let _ = fs::remove_file(&db);
-        if let Some(index) = index {
-            let _ = fs::remove_file(index);
-        }
     }
 }

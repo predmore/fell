@@ -44,6 +44,11 @@ pub(crate) fn spawn_alone(command: &mut std::process::Command) -> std::process::
 }
 
 #[cfg(test)]
+fn isolated_draft_paths() -> Option<std::path::PathBuf> {
+    fell_core::test_support::in_isolated_process_with(spawn_alone)
+}
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn mcp_sources_do_not_mint_send_tokens() {

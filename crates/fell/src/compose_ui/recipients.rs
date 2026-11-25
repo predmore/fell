@@ -396,8 +396,10 @@ mod tests {
 
     #[test]
     fn accepting_a_recipient_saves_it_and_typing_starts_after_it() {
-        let root = tempfile::tempdir().unwrap();
-        let (hub, id, folder) = open_demo(root.path().to_owned(), ThemeKind::Dark).unwrap();
+        let Some(root) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let (hub, id, folder) = open_demo(root.join("demo"), ThemeKind::Dark).unwrap();
         let mut app = gpui::TestAppContext::single();
         let (view, cx) =
             app.add_window_view(|_, cx| ComposeView::new(hub.clone(), id.clone(), folder, cx));
@@ -429,8 +431,10 @@ mod tests {
 
     #[test]
     fn completion_excludes_addresses_across_the_three_recipient_lines() {
-        let root = tempfile::tempdir().unwrap();
-        let (hub, id, folder) = open_demo(root.path().to_owned(), ThemeKind::Dark).unwrap();
+        let Some(root) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let (hub, id, folder) = open_demo(root.join("demo"), ThemeKind::Dark).unwrap();
         let mut app = gpui::TestAppContext::single();
         let (view, cx) = app.add_window_view(|_, cx| ComposeView::new(hub, id, folder, cx));
         view.update(cx, |compose, _| {
@@ -454,8 +458,10 @@ mod tests {
 
     #[test]
     fn a_five_thousand_address_line_has_a_bounded_exclusion_set() {
-        let root = tempfile::tempdir().unwrap();
-        let (hub, id, folder) = open_demo(root.path().to_owned(), ThemeKind::Dark).unwrap();
+        let Some(root) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let (hub, id, folder) = open_demo(root.join("demo"), ThemeKind::Dark).unwrap();
         let mut app = gpui::TestAppContext::single();
         let (view, cx) = app.add_window_view(|_, cx| ComposeView::new(hub, id, folder, cx));
         view.update(cx, |compose, _| {
@@ -478,8 +484,10 @@ mod tests {
 
     #[test]
     fn palette_undo_restores_focused_to_before_sending() {
-        let root = tempfile::tempdir().unwrap();
-        let (hub, id, folder) = open_demo(root.path().to_owned(), ThemeKind::Dark).unwrap();
+        let Some(root) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let (hub, id, folder) = open_demo(root.join("demo"), ThemeKind::Dark).unwrap();
         hub.with_session(&id, |session| {
             session.set_body_from_user("See you Thursday.\n".into());
             session.end_user_change();
@@ -527,7 +535,7 @@ mod tests {
             );
         });
         cx.run_until_parked();
-        let store = fell_core::Store::open(root.path().join("mail.db")).unwrap();
+        let store = fell_core::Store::open(root.join("demo/mail.db")).unwrap();
         while store.maintain_correspondents().unwrap() {}
         let account = fell_core::AccountId("local".into());
         let sent_to = store.correspondent_suggestions(&account, "ada").unwrap();

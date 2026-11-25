@@ -99,16 +99,10 @@ mod tests {
 
     #[test]
     fn only_the_editor_send_action_transmits() {
-        let root = std::env::temp_dir().join(format!(
-            "fell-editor-send-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let (hub, id, _) = open_demo(root, ThemeKind::Dark).unwrap();
+        let Some(root) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let (hub, id, _) = open_demo(root.join("demo"), ThemeKind::Dark).unwrap();
         hub.with_session(&id, |session| {
             assert!(!session.request_send());
             let backend = fell_core::backend_for(session.account_id(), None).unwrap();
@@ -156,7 +150,7 @@ mod tests {
             &AccountId("mailbox".into()),
         )
         .unwrap();
-        let mut session = fell_core::compose::DraftSession::create(
+        let mut session = fell_core::compose::DraftSession::testing_create_local(
             folder,
             name,
             AccountId("mailbox".into()),
@@ -681,7 +675,7 @@ mod tests {
             &AccountId("mailbox".into()),
         )
         .unwrap();
-        let mut session = fell_core::compose::DraftSession::create(
+        let mut session = fell_core::compose::DraftSession::testing_create_local(
             folder,
             name,
             AccountId("mailbox".into()),
