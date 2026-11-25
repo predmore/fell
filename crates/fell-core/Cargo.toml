@@ -14,9 +14,9 @@ rust-version.workspace = true
 ui-confirm = ["dep:fell-confirm"]
 # `Store::testing_index_embeddings`, `Store::testing_search_embedder` and
 # `Store::testing_search_warm_asked`, for other crates' tests: the first two
-# rewrite the vector index and swap the search ranker. Enable it only from a `[dev-dependencies]` entry, so no release
-# build has it.
-test-utils = []
+# rewrite the vector index and swap the search ranker. Also requires explicit
+# draft paths when testing from other crates. Enable only for tests and benches.
+test-utils = ["dep:tempfile"]
 
 [dependencies]
 backtrace = "0.3"
@@ -36,6 +36,7 @@ rustls = { version = "0.23.46", default-features = false, features = ["ring", "s
 rustls-native-certs = "0.8.5"
 saphyr = { version = "0.3.4", default-features = false }
 similar = { version = "3.2.1", default-features = false, features = ["std", "text"] }
+tempfile = { version = "3", optional = true }
 thiserror.workspace = true
 time = { version = "0.3", features = ["formatting", "local-offset"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }

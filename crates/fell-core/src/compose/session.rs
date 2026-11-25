@@ -298,6 +298,23 @@ impl DraftSession {
         Ok(session)
     }
 
+    /// Create a folder-only fixture under a test's private root. Its mailbox
+    /// path stays absent unless the test binds a fixture store later.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn testing_create_local(
+        folder: PathBuf,
+        id: impl Into<String>,
+        account_id: AccountId,
+        fields: DraftFields,
+        body: impl Into<String>,
+    ) -> Result<Self, String> {
+        let unused_store = folder.with_file_name("unused-mailbox.db");
+        let mut session = Self::unsaved(folder, id.into(), account_id, fields, body.into());
+        session.bind_store(unused_store);
+        session.flush()?;
+        Ok(session)
+    }
+
     /// Start draft `id` under `root`: its row in the mailbox at `store`
     /// first, then its folder. A crash in between leaves a row, which the
     /// drafts list shows and opening writes a folder for, never a folder no
@@ -1812,8 +1829,14 @@ mod tests {
         let folder =
             workspace::materialize_in(&root, "d1", &fields, body, &AccountId("local".into()))
                 .unwrap();
-        let session =
-            DraftSession::create(folder, "d1", AccountId("local".into()), fields, body).unwrap();
+        let session = DraftSession::testing_create_local(
+            folder,
+            "d1",
+            AccountId("local".into()),
+            fields,
+            body,
+        )
+        .unwrap();
         (root, session)
     }
 
@@ -1998,9 +2021,14 @@ mod tests {
         };
         let folder =
             workspace::materialize_in(&root, "d1", &fields, "body\n", &account.id).unwrap();
-        let mut session =
-            DraftSession::create(folder.clone(), "d1", account.id.clone(), fields, "body\n")
-                .unwrap();
+        let mut session = DraftSession::testing_create_local(
+            folder.clone(),
+            "d1",
+            account.id.clone(),
+            fields,
+            "body\n",
+        )
+        .unwrap();
         session.bind_store(&db);
         session.flush().unwrap();
         let session = DraftSession::open_with_store(&folder, account.id, &store).unwrap();
@@ -2334,6 +2362,9 @@ mod tests {
 
     #[test]
     fn open_refuses_a_folder_with_no_mailbox_record() {
+        if crate::test_support::in_isolated_process().is_none() {
+            return;
+        }
         let (root, session) = temp_session("body\n");
         let folder = session.folder().to_path_buf();
         drop(session);
@@ -2366,7 +2397,7 @@ mod tests {
                 backend_kind: crate::BackendKind::Bridge,
             })
             .unwrap();
-        let mut live = DraftSession::create(
+        let mut live = DraftSession::testing_create_local(
             folder.clone(),
             "d1",
             AccountId("local".into()),
@@ -3123,7 +3154,11 @@ mod tests {
 
     #[test]
     fn a_draft_with_no_mailbox_is_not_claimed() {
+        if crate::test_support::in_isolated_process().is_none() {
+            return;
+        }
         let (root, mut session) = temp_session("body\n");
+        session.store_path = None;
         let err = session
             .begin_send(&crate::MessageId::new("test@compose.fell"))
             .unwrap_err();

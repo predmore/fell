@@ -1485,11 +1485,12 @@ mod tests {
             }
         }
 
-        let dir = tempfile::tempdir().unwrap();
+        let Some(root) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
         let mut app = TestAppContext::single();
-        let (reader, cx) = app.add_window_view(|_, cx| {
-            Reader(cx.new(|cx| test_inbox(dir.path().join("test.db"), cx)))
-        });
+        let (reader, cx) =
+            app.add_window_view(|_, cx| Reader(cx.new(|cx| test_inbox(root.join("test.db"), cx))));
         cx.run_until_parked();
         let inbox = reader.read_with(cx, |reader, _| reader.0.clone());
         let store = fell_core::Store::open_in_memory().unwrap();
@@ -1536,9 +1537,11 @@ mod tests {
 
     #[test]
     fn a_refresh_started_before_a_note_decision_cannot_restore_old_chips() {
-        let dir = tempfile::tempdir().unwrap();
+        let Some(root) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
         let mut app = TestAppContext::single();
-        let inbox = app.new(|cx| test_inbox(dir.path().join("test.db"), cx));
+        let inbox = app.new(|cx| test_inbox(root.join("test.db"), cx));
         inbox.update(&mut app, |inbox, _| {
             let thread = "survey";
             let mut before = note(1, true);

@@ -851,6 +851,9 @@ mod tests {
 
     #[test]
     fn triage_and_drafts_round_trip_without_sending() {
+        if crate::isolated_draft_paths().is_none() {
+            return;
+        }
         let (mut session, thread) = session_with(AgentGrant::enabled(true, true, true), "bot");
         init(&mut session);
         let names = tool_names(&mut session);
@@ -978,6 +981,9 @@ mod tests {
 
     #[test]
     fn draft_scope_cannot_triage_and_undo_needs_the_action_scope() {
+        if crate::isolated_draft_paths().is_none() {
+            return;
+        }
         let (mut session, thread) = session_with(AgentGrant::enabled(false, false, true), "bot");
         init(&mut session);
         let response = call(&mut session, "search", json!({ "query": "invoice" }));
@@ -1223,6 +1229,9 @@ mod tests {
 
     #[test]
     fn read_thread_truncates_bodies_and_draft_lists_hide_other_bcc() {
+        if crate::isolated_draft_paths().is_none() {
+            return;
+        }
         let (mut session, thread) = session_with(AgentGrant::enabled(true, false, true), "bot");
         let long = "y".repeat(50);
         let mut replacement = message("a1", "root@x", "Invoice March", &long, "billing");
@@ -1289,12 +1298,7 @@ mod tests {
 
     #[test]
     fn request_send_and_draft_edits_never_transmit() {
-        // The draft tools fall back to the default mailbox path, so on a
-        // machine with real mail this test would open it.
-        if fell_core::test_support::skip_unless_available(
-            "request_send_and_draft_edits_never_transmit",
-            fell_core::test_support::real_mailbox_present("r1"),
-        ) {
+        if crate::isolated_draft_paths().is_none() {
             return;
         }
         let (mut session, _) = session_with(AgentGrant::enabled(true, true, true), "bot");

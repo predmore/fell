@@ -1149,6 +1149,10 @@ pub fn mailbox_db_path() -> Option<PathBuf> {
 pub(crate) fn compose_index_file(id: &str) -> Option<PathBuf> {
     let root = if let Some(dir) = std::env::var_os("FELL_COMPOSE_INDEX") {
         PathBuf::from(dir)
+    } else if cfg!(any(test, feature = "test-utils")) {
+        panic!(
+            "draft tests must use an explicit store or set FELL_COMPOSE_INDEX in an isolated child"
+        );
     } else if let Some(data) = std::env::var_os("XDG_DATA_HOME") {
         PathBuf::from(data).join("fell/compose-stores")
     } else {
@@ -1576,7 +1580,7 @@ mod tests {
         };
         let folder =
             workspace::materialize_in(&drafts, "keep", &fields, "original\n", &account.id).unwrap();
-        let mut session = super::super::session::DraftSession::create(
+        let mut session = super::super::session::DraftSession::testing_create_local(
             folder.clone(),
             "keep",
             account.id.clone(),

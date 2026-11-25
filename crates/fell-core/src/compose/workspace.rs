@@ -126,16 +126,24 @@ fn runtime_home() -> PathBuf {
 
 pub fn draft_root() -> PathBuf {
     if let Some(root) = std::env::var_os("FELL_DRAFT_ROOT") {
-        return PathBuf::from(root);
+        PathBuf::from(root)
+    } else if cfg!(any(test, feature = "test-utils")) {
+        panic!("draft tests must use an explicit root or set FELL_DRAFT_ROOT in an isolated child");
+    } else {
+        runtime_home().join("drafts")
     }
-    runtime_home().join("drafts")
 }
 
 pub fn draft_socket_path() -> PathBuf {
     if let Some(path) = std::env::var_os("FELL_DRAFT_SOCK") {
-        return PathBuf::from(path);
+        PathBuf::from(path)
+    } else if cfg!(any(test, feature = "test-utils")) {
+        panic!(
+            "draft tests must use an explicit socket or set FELL_DRAFT_SOCK in an isolated child"
+        );
+    } else {
+        runtime_home().join("live.sock")
     }
-    runtime_home().join("live.sock")
 }
 
 pub fn draft_folder(id: &str) -> Result<PathBuf, String> {

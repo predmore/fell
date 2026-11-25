@@ -23,6 +23,7 @@ impl Server {
             .env("HOME", root)
             .env("FELL_DRAFT_SOCK", root.join("draft.sock"))
             .env("FELL_DRAFT_ROOT", root.join("drafts"))
+            .env("FELL_COMPOSE_INDEX", root.join("data/compose-stores"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped());
         for (name, dir) in [
