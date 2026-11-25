@@ -40,11 +40,11 @@ impl Inbox {
         let ids = edit.ids;
         let targets = ids.iter().cloned().map(ThreadId).collect::<Vec<_>>();
         let removed = self.session.search.is_none()
-            && self.list_label.is_none()
+            && self.session.list_label.is_none()
             && match edit.kind {
                 TriageKind::Snooze(_) => self.in_inbox_list(),
-                TriageKind::Unsnooze => self.list_folder == SNOOZED,
-                TriageKind::Mute => self.in_inbox_list() || self.list_folder == MUTED,
+                TriageKind::Unsnooze => self.session.list_folder == SNOOZED,
+                TriageKind::Mute => self.in_inbox_list() || self.session.list_folder == MUTED,
             };
         self.session.picked.clear();
         self.session.visual = false;
@@ -114,7 +114,7 @@ impl Inbox {
     fn in_inbox_list(&self) -> bool {
         self.session
             .roles
-            .is(fell_core::FolderRole::Inbox, &self.list_folder)
+            .is(fell_core::FolderRole::Inbox, &self.session.list_folder)
     }
 
     pub(super) fn snoozes_changed(&mut self, cx: &mut Context<Self>) {

@@ -28,9 +28,12 @@ impl Inbox {
         let viewing = window.is_window_active()
             && self.session.search.is_none()
             && self.session.label_scope.is_none()
-            && self.list_label.is_none()
-            && self.session.roles.is(FolderRole::Inbox, &self.list_folder)
-            && self.session.folder == self.list_folder;
+            && self.session.list_label.is_none()
+            && self
+                .session
+                .roles
+                .is(FolderRole::Inbox, &self.session.list_folder)
+            && self.session.folder == self.session.list_folder;
         queue.set_viewing(viewing);
     }
 

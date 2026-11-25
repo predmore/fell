@@ -1228,7 +1228,7 @@ impl Inbox {
     pub(super) fn save_note_decision(&mut self, note: NoteRequest, cx: &mut Context<Self>) {
         let scoped = self.session.search.is_some();
         let folder = if note.decision == NoteDecision::Dismiss {
-            self.list_folder.clone()
+            self.session.list_folder.clone()
         } else {
             let Some(folder) = self.action_folder(&note.thread) else {
                 return;
