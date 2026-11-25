@@ -201,7 +201,7 @@ pub fn email_of(raw: &str) -> Option<String> {
 /// of `<other@domain>` is not a name either.
 pub fn mailbox_parts(raw: &str) -> Option<(Option<String>, String)> {
     let text = raw.trim();
-    if text.is_empty() || text.chars().any(|ch| ch.is_control()) {
+    if text.is_empty() || !text.chars().all(recipient_display_char) {
         return None;
     }
     let open = text.matches('<').count();
@@ -287,7 +287,7 @@ pub fn parse_address_line(line: &str) -> Result<Vec<String>, String> {
                 let item = current.trim().to_string();
                 if !item.is_empty() {
                     if !valid_address(&item) {
-                        return Err(format!("invalid address `{item}`"));
+                        return Err(invalid_address_message(&item));
                     }
                     out.push(item);
                 }
@@ -302,11 +302,25 @@ pub fn parse_address_line(line: &str) -> Result<Vec<String>, String> {
     let item = current.trim().to_string();
     if !item.is_empty() {
         if !valid_address(&item) {
-            return Err(format!("invalid address `{item}`"));
+            return Err(invalid_address_message(&item));
         }
         out.push(item);
     }
     Ok(out)
+}
+
+fn invalid_address_message(raw: &str) -> String {
+    let visible: String = raw
+        .chars()
+        .map(|ch| {
+            if recipient_display_char(ch) {
+                ch
+            } else {
+                '�'
+            }
+        })
+        .collect();
+    format!("invalid address `{visible}`")
 }
 
 pub fn format_address_line(addresses: &[String]) -> String {
@@ -482,9 +496,21 @@ fn check_addresses(
     }
 }
 
+/// Characters that can be shown verbatim as part of a recipient address.
+pub fn recipient_display_char(ch: char) -> bool {
+    !ch.is_control()
+        && !matches!(
+            ch,
+            '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{2069}'
+                | '\u{FEFF}'
+        )
+}
+
 fn address_problem(raw: &str) -> Option<&'static str> {
     let text = raw.trim();
-    if text.is_empty() || text.chars().any(|ch| ch.is_control()) {
+    if text.is_empty() || !text.chars().all(recipient_display_char) {
         return Some("invalid address");
     }
     let mut quoted = false;
@@ -616,6 +642,17 @@ mod tests {
             email_of("\"Predmore, Ada\" <ada@example.com>").as_deref(),
             Some("ada@example.com")
         );
+    }
+
+    #[test]
+    fn an_address_with_hidden_formatting_is_rejected() {
+        let raw = "ann@ex\u{202e}ample.test";
+        assert_eq!(
+            parse_address_line(raw),
+            Err("invalid address `ann@ex�ample.test`".into())
+        );
+        assert!(mailbox_parts(raw).is_none());
+        assert!(!valid_address(raw));
     }
 
     #[test]

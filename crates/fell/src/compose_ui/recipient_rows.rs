@@ -1,16 +1,19 @@
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::rc::Rc;
 use std::time::Instant;
 
-use fell_core::compose::{AddressView, parse_address_line};
+use fell_core::compose::{AddressView, parse_address_line, recipient_display_char};
 use gpui::{
-    Bounds, FontStyle, Pixels, ScrollHandle, StatefulInteractiveElement, TextAlign, TextRun,
-    UnderlineStyle, Window, canvas, div, fill, point, prelude::*, px, rgb, size,
+    App, Bounds, FontStyle, MouseButton, Pixels, Point, ScrollHandle, StatefulInteractiveElement,
+    TextAlign, TextRun, UnderlineStyle, Window, WrappedLineLayout, canvas, div, fill, point,
+    prelude::*, px, rgb, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use super::{LABEL_PX, Palette, display_safe};
-use crate::motion::{self, Glide, Motion};
+use super::{LABEL_PX, Palette};
+use crate::motion::{self, Glide, Motion, Transition};
 
 pub(super) const FIELDS_PADDING: f32 = 16.;
 pub(super) const FIELD_GAP: f32 = 12.;
@@ -21,7 +24,7 @@ pub(super) fn label_width(window: &Window) -> Pixels {
     px(LABEL_PX).min(window.viewport_size().width / 4.)
 }
 
-const LINE: Pixels = px(22.);
+pub(super) const LINE: Pixels = px(26.);
 const CARET: Pixels = px(3.);
 
 pub(super) fn matches_saved(line: &str, addresses: &[AddressView]) -> bool {
@@ -113,6 +116,9 @@ struct DisplayLine {
     spans: Vec<Span>,
     caret: Option<usize>,
     invalid: Option<usize>,
+    selected: Option<usize>,
+    source_offsets: Vec<(usize, usize)>,
+    keep_together: Vec<Range<usize>>,
 }
 
 struct Span {
@@ -122,8 +128,8 @@ struct Span {
 
 enum SpanKind {
     Invalid,
-    Selected,
-    Note(u32),
+    SelectedInvalid,
+    Note { color: u32, recipient: String },
     Placeholder(u32),
 }
 
@@ -150,6 +156,9 @@ fn display_line(line: RecipientLine<'_>, colors: Palette, wide: bool) -> Display
         spans: Vec::new(),
         caret: None,
         invalid: None,
+        selected: None,
+        source_offsets: Vec::new(),
+        keep_together: Vec::new(),
     };
     let saved: HashMap<_, _> = saved
         .iter()
@@ -157,35 +166,51 @@ fn display_line(line: RecipientLine<'_>, colors: Palette, wide: bool) -> Display
         .collect();
     for (at, raw) in tokens(value) {
         let trimmed = raw.trim();
+        let separator = shown.text.len();
         if at > 0 {
-            if wide || trimmed.is_empty() {
-                shown.text.push(' ');
-            } else {
-                shown.text.push('\n');
-            }
+            shown.text.push(if wide { ' ' } else { '\n' });
         }
         let skip = raw.len() - raw.trim_start().len();
+        let source_start = at + skip;
         let visible = raw.trim_start();
         let start = shown.text.len();
-        shown.text.push_str(&display_safe(visible));
+        for (offset, ch) in visible.char_indices() {
+            shown
+                .source_offsets
+                .push((shown.text.len(), source_start + offset));
+            shown.text.push(if recipient_display_char(ch) {
+                ch
+            } else {
+                '�'
+            });
+        }
         let end = shown.text.len();
+        shown.source_offsets.push((end, at + raw.len()));
+
         let invalid = show_errors && parse_address_line(raw).is_err();
         let mut selected = false;
         if let Some(range) = &selection
             && (at..=at + raw.len()).contains(&range.start)
         {
-            let display_at = |source: usize| {
-                start + display_safe(&visible[..source.saturating_sub(at + skip)]).len()
+            let offset_for_source = |source: usize| {
+                shown
+                    .source_offsets
+                    .iter()
+                    .rev()
+                    .find(|(_, byte)| *byte <= source.max(source_start))
+                    .map_or(start, |(display, _)| *display)
             };
-            let left = display_at(range.start);
-            let right = display_at(range.end);
-            shown.caret = Some(left);
+            let left = offset_for_source(range.start);
+            let right = offset_for_source(range.end);
             if left < right {
                 selected = true;
+                shown.selected = Some(left);
                 shown.spans.push(Span {
                     bytes: left..right,
-                    kind: SpanKind::Selected,
+                    kind: SpanKind::SelectedInvalid,
                 });
+            } else {
+                shown.caret = Some(left);
             }
         }
         if invalid {
@@ -196,6 +221,9 @@ fn display_line(line: RecipientLine<'_>, colors: Palette, wide: bool) -> Display
                     kind: SpanKind::Invalid,
                 });
             }
+        }
+        if wide && at > 0 && start < end {
+            shown.keep_together.push(separator..end);
         }
         if let Some(address) = saved.get(trimmed) {
             let note = match (
@@ -213,12 +241,21 @@ fn display_line(line: RecipientLine<'_>, colors: Palette, wide: bool) -> Display
                 shown.text.push_str(&note.replace(' ', "\u{a0}"));
                 shown.spans.push(Span {
                     bytes: start..shown.text.len(),
-                    kind: SpanKind::Note(color),
+                    kind: SpanKind::Note {
+                        color,
+                        recipient: address.raw.clone(),
+                    },
                 });
+                shown.keep_together.push(start..shown.text.len());
             }
         }
-        if at + raw.len() < value.len() && (wide || value[at + raw.len() + 1..].trim().is_empty()) {
+        if wide && at + raw.len() < value.len() {
             shown.text.push(',');
+            if let Some(group) = shown.keep_together.last_mut()
+                && group.end + 1 == shown.text.len()
+            {
+                group.end += 1;
+            }
         }
     }
     if shown.text.is_empty() {
@@ -244,6 +281,8 @@ pub(super) struct RowHeight {
     target: Option<f32>,
     glide: Option<Glide>,
     scroll: ScrollHandle,
+    invalid_anchor: Option<Pixels>,
+    notes: HashMap<String, Option<Transition>>,
 }
 
 impl RowHeight {
@@ -259,11 +298,35 @@ impl RowHeight {
     }
 }
 
-/// Keep a whole line visible even while the row is growing or when a long
-/// list needs to scroll in a small window.
-fn reveal_offset(full: Pixels, height: Pixels, current: Pixels, anchor: Option<Pixels>) -> Pixels {
-    let top = anchor.map_or(current, |y| current.clamp(y + LINE - height, y));
+/// Leave the text pinned while the row opens below it. At its height cap,
+/// scroll a full caret line into view. A caret above view reveals immediately.
+fn reveal_offset(
+    full: Pixels,
+    height: Pixels,
+    current: Pixels,
+    anchor: Option<Pixels>,
+    growing: bool,
+) -> Pixels {
+    let top = match anchor {
+        Some(y) if y < current => y,
+        Some(y) if !growing => current.max(y + LINE - height),
+        _ => current,
+    };
     top.clamp(px(0.), (full - height).max(px(0.)))
+}
+
+fn cursor_position(line: &WrappedLineLayout, at: usize, width: Pixels) -> Option<Point<Pixels>> {
+    let mut position = line.position_for_index(at, LINE)?;
+    if line
+        .wrap_boundaries()
+        .iter()
+        .any(|boundary| line.runs()[boundary.run_ix].glyphs[boundary.glyph_ix].index == at)
+    {
+        position.x = px(0.);
+        position.y += LINE;
+    }
+    position.x = position.x.clamp(px(0.), width);
+    Some(position)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -277,6 +340,7 @@ pub(super) fn value_view(
     motion: Motion,
     now: Instant,
     window: &mut Window,
+    on_cursor: impl Fn(usize, &mut App) + 'static,
 ) -> gpui::Div {
     let mut shown = display_line(line, colors, wide);
     let mut style = window.text_style();
@@ -284,7 +348,8 @@ pub(super) fn value_view(
     style.font_weight = gpui::FontWeight(400.);
     style.color = rgb(colors.fg).into();
     let mut runs = Vec::<TextRun>::new();
-    let mut notes = Vec::new();
+    let mut notes = HashMap::new();
+    let mut notes_animating = false;
     let mut at = 0;
     for span in shown.spans {
         if at < span.bytes.start {
@@ -292,26 +357,36 @@ pub(super) fn value_view(
         }
         let mut run = style.clone();
         match span.kind {
-            SpanKind::Invalid => {
-                run.color = rgb(colors.error).into();
+            SpanKind::Invalid | SpanKind::SelectedInvalid => {
+                let selected = matches!(span.kind, SpanKind::SelectedInvalid);
+                let error = if selected {
+                    let bg = motion::mix(colors.panel, colors.error, 0.20);
+                    run.background_color = Some(rgb(bg).into());
+                    crate::theme::ensure_all(colors.error, &[bg], crate::theme::TEXT_CONTRAST)
+                } else {
+                    colors.error
+                };
+                run.color = rgb(error).into();
                 run.underline = Some(UnderlineStyle {
-                    thickness: px(1.),
+                    thickness: px(1.5),
                     color: None,
-                    wavy: true,
+                    wavy: false,
                 });
             }
-            SpanKind::Selected => {
-                run.background_color = Some(rgb(colors.selection).into());
-                let fg = crate::theme::ensure_all(
-                    colors.fg,
-                    &[colors.selection],
-                    crate::theme::TEXT_CONTRAST,
-                );
-                run.color = rgb(fg).into();
-            }
-            SpanKind::Note(color) => {
-                notes.push(span.bytes.clone());
-                run.color = rgb(color).into();
+            SpanKind::Note { color, recipient } => {
+                let fade = *notes.entry(recipient.clone()).or_insert_with(|| {
+                    row.notes
+                        .get(&recipient)
+                        .copied()
+                        .unwrap_or_else(|| row.target.and_then(|_| motion.start(motion::FADE, now)))
+                });
+                notes_animating |= fade.is_some_and(|fade| fade.running(now));
+                run.color = rgb(motion::mix(
+                    colors.panel,
+                    color,
+                    motion::progress(fade.as_ref(), now),
+                ))
+                .into();
                 run.font_style = FontStyle::Italic;
             }
             SpanKind::Placeholder(color) => run.color = rgb(color).into(),
@@ -322,54 +397,54 @@ pub(super) fn value_view(
     if at < shown.text.len() {
         runs.push(style.to_run(shown.text.len() - at));
     }
+    row.notes = notes;
     let viewport = window.viewport_size();
     // Match the fields' padding and the row's accent rule, label and gap.
     let chrome = 2. * FIELDS_PADDING + FIELD_RULE + FIELD_INDENT + FIELD_GAP + 4.;
     let width = (viewport.width - px(chrome) - label_width(window) - CARET).max(px(1.));
-    let shape = |text: String| {
+    let shape = |text: String, wrap| {
         window
             .text_system()
-            .shape_text(text.into(), px(16.), &runs, Some(width), None)
+            .shape_text(text.into(), px(16.), &runs, wrap, None)
             .unwrap_or_default()
     };
-    let mut lines = shape(shown.text.clone());
-    // GPUI can break at punctuation inside a note. If that happened, wrap
-    // before the note instead, keeping its address and the note legible.
-    let mut start = 0;
-    let mut moved_note = false;
-    for line in &lines {
-        for boundary in line.wrap_boundaries() {
-            let glyph = &line.runs()[boundary.run_ix].glyphs[boundary.glyph_ix];
-            let at = start + glyph.index;
-            let note = notes.partition_point(|note| note.end <= at);
-            if let Some(note) = notes.get(note)
-                && note.start < at
-                && shown.text.as_bytes()[note.start] == b' '
-            {
-                shown.text.replace_range(note.start..note.start + 1, "\n");
-                moved_note = true;
+    // Place hard breaks at measured group boundaries. GPUI still wraps a
+    // single address that cannot fit on an otherwise empty line.
+    if !shown.keep_together.is_empty() {
+        let mut start = 0;
+        let mut groups = shown.keep_together.iter().peekable();
+        for line in shape(shown.text.clone(), None) {
+            let mut left = px(0.);
+            let end = start + line.len();
+            while let Some(group) = groups.next_if(|group| group.start < end) {
+                if group.start >= start
+                    && line.unwrapped_layout.x_for_index(group.end - start) - left > width
+                {
+                    shown.text.replace_range(group.start..group.start + 1, "\n");
+                    left = line.unwrapped_layout.x_for_index(group.start + 1 - start);
+                }
             }
+            start = end + 1;
         }
-        start += line.len() + 1;
     }
-    if moved_note {
-        lines = shape(shown.text);
-    }
+    let lines = Rc::new(shape(shown.text, Some(width)));
     let mut full_height = px(0.);
     let mut start = 0;
     let mut caret = None;
     let mut invalid = None;
-    for line in &lines {
+    let mut selected = None;
+    for line in lines.iter() {
         let end = start + line.len();
-        let position = |at| {
-            line.position_for_index(at - start, LINE)
-                .map(|p| point(p.x.min(width), p.y + full_height))
-        };
+        let position =
+            |at| cursor_position(line, at - start, width).map(|p| point(p.x, p.y + full_height));
         if let Some(at) = shown.caret.filter(|at| (start..=end).contains(at)) {
             caret = position(at);
         }
         if let Some(at) = shown.invalid.filter(|at| (start..=end).contains(at)) {
             invalid = position(at);
+        }
+        if let Some(at) = shown.selected.filter(|at| (start..=end).contains(at)) {
+            selected = position(at);
         }
         full_height += line.size(LINE).height;
         start = end + 1;
@@ -382,23 +457,37 @@ pub(super) fn value_view(
             .floor()
             .max(1.);
     let height = px(row.height(f32::from(full_height.min(max_height)), motion, now));
-    if row.glide.is_some() {
+    if notes_animating || row.glide.is_some() {
         window.request_animation_frame();
     }
 
+    let invalid = invalid.map(|p| p.y);
+    let new_invalid = row.invalid_anchor != invalid;
+    row.invalid_anchor = invalid;
+    let growing = row.glide.is_some_and(|glide| glide.from < glide.to);
     let offset = reveal_offset(
         full_height,
         height,
         -row.scroll.offset().y,
-        caret.or(invalid).map(|p| p.y),
+        caret.or(selected).map(|p| p.y).or_else(|| {
+            if new_invalid || row.glide.is_some() {
+                invalid
+            } else {
+                None
+            }
+        }),
+        growing,
     );
     row.scroll.set_offset(point(px(0.), -offset));
 
+    let origin = Rc::new(Cell::new(Point::default()));
+    let prepaint_origin = Rc::clone(&origin);
+    let paint_lines = Rc::clone(&lines);
     let painted = canvas(
-        |_, _, _| (),
+        move |bounds, _, _| prepaint_origin.set(bounds.origin),
         move |bounds, (), window, cx| {
             let mut origin = bounds.origin;
-            for line in &lines {
+            for line in paint_lines.iter() {
                 let _ = line.paint_background(origin, LINE, TextAlign::Left, None, window, cx);
                 let _ = line.paint(origin, LINE, TextAlign::Left, None, window, cx);
                 origin.y += line.size(LINE).height;
@@ -416,14 +505,66 @@ pub(super) fn value_view(
     )
     .w_full()
     .h(full_height);
-    div().child(
-        div()
-            .id(label)
+    let offsets = shown.source_offsets;
+    let scroll = row.scroll.clone();
+    div()
+        .relative()
+        .child(
+            div()
+                .id(label)
+                .h(height)
+                .overflow_y_scroll()
+                .track_scroll(&row.scroll)
+                .cursor_text()
+                .on_mouse_down(MouseButton::Left, move |event, _, cx| {
+                    let mut position = event.position - origin.get();
+                    let mut start = 0;
+                    for line in lines.iter() {
+                        let line_height = line.size(LINE).height;
+                        if position.y < line_height {
+                            let index = line
+                                .closest_index_for_position(position, LINE)
+                                .unwrap_or_else(|bound| bound);
+                            let at = start + index;
+                            let source = offsets.partition_point(|(display, _)| *display <= at);
+                            on_cursor(
+                                offsets
+                                    .get(source.saturating_sub(1))
+                                    .map_or(0, |(_, byte)| *byte),
+                                cx,
+                            );
+                            return;
+                        }
+                        position.y -= line_height;
+                        start += line.len() + 1;
+                    }
+                })
+                .child(painted),
+        )
+        .children((full_height > max_height && full_height > height).then(|| {
+            canvas(
+                |_, _, _| (),
+                move |bounds, (), window, _| {
+                    let ratio = height / full_height;
+                    let thumb = (height * ratio).max(px(8.));
+                    let travel = height - thumb;
+                    let scroll_fraction =
+                        (-scroll.offset().y / (full_height - height)).clamp(0., 1.);
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            bounds.origin + point(px(0.), travel * scroll_fraction),
+                            size(px(2.), thumb),
+                        ),
+                        rgb(colors.marker),
+                    ));
+                },
+            )
+            .absolute()
+            .right_0()
+            .top_0()
+            .w(px(2.))
             .h(height)
-            .overflow_y_scroll()
-            .track_scroll(&row.scroll)
-            .child(painted),
-    )
+        }))
 }
 
 #[cfg(test)]
@@ -469,45 +610,108 @@ mod tests {
                 matches!(span.kind, SpanKind::Invalid) && &inactive.text[span.bytes.clone()] == "r"
             }));
             assert!(focused.spans.iter().any(|span| {
-                matches!(span.kind, SpanKind::Selected) && &focused.text[span.bytes.clone()] == "r"
+                matches!(span.kind, SpanKind::SelectedInvalid)
+                    && &focused.text[span.bytes.clone()] == "r"
             }));
-            assert_eq!(focused.caret, inactive.invalid);
+            assert_eq!(focused.selected, inactive.invalid);
+            assert!(focused.caret.is_none());
         }
     }
 
     #[test]
-    fn the_caret_line_stays_visible_during_growth_and_after_resize() {
+    fn growth_keeps_previous_text_pinned_and_tall_lists_scroll() {
         let motion = Motion::new(true);
         let start = Instant::now();
         let mut row = RowHeight::default();
-        assert_eq!(row.height(22., motion, start), 22.);
-        assert_eq!(row.height(44., motion, start), 22.);
+        assert_eq!(row.height(26., motion, start), 26.);
+        assert_eq!(row.height(52., motion, start), 26.);
         let full = LINE * 2;
         for elapsed in [0, 16, 60, 120] {
             let now = start + std::time::Duration::from_millis(elapsed);
-            let height = px(row.height(44., motion, now));
-            let skip = reveal_offset(full, height, px(0.), Some(LINE));
+            let height = px(row.height(52., motion, now));
+            let skip = reveal_offset(full, height, px(0.), Some(LINE), elapsed < 120);
             assert!(height >= LINE && height <= full);
-            assert!(LINE >= skip && full <= skip + height);
+            assert_eq!(skip, px(0.));
             if elapsed == 60 {
                 assert!(
-                    height > px(33.) && height < full,
+                    height > px(39.) && height < full,
                     "ease-out is past the midpoint"
                 );
             }
         }
         assert_eq!(
-            reveal_offset(LINE * 10, LINE * 3, px(0.), Some(LINE * 8)),
+            reveal_offset(LINE * 10, LINE * 3, px(0.), Some(LINE * 8), false),
             LINE * 6
         );
         assert_eq!(
-            reveal_offset(LINE * 10, LINE * 3, LINE * 6, Some(LINE)),
+            reveal_offset(LINE * 10, LINE * 3, LINE * 6, Some(LINE), true),
             LINE
         );
         assert_eq!(
-            row.height(22., Motion::new(false), start + motion::SLIDE),
-            22.
+            row.height(26., Motion::new(false), start + motion::SLIDE),
+            26.
         );
+    }
+
+    #[test]
+    fn a_soft_wrap_boundary_places_the_caret_and_hit_target_on_the_continuation() {
+        struct Empty;
+        impl Render for Empty {
+            fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+        let mut app = gpui::TestAppContext::single();
+        app.add_window_view(|window, _| {
+            let text = "ann@example.test";
+            let width = px(65.);
+            let run = window.text_style().to_run(text.len());
+            let lines = window
+                .text_system()
+                .shape_text(text.into(), px(16.), &[run], Some(width), None)
+                .unwrap();
+            let line = &lines[0];
+            let boundary = &line.wrap_boundaries()[0];
+            let at = line.runs()[boundary.run_ix].glyphs[boundary.glyph_ix].index;
+            assert!(at > 0 && at < text.len());
+            assert_eq!(line.position_for_index(at, LINE).unwrap().y, px(0.));
+            let caret = cursor_position(line, at, width).unwrap();
+            assert_eq!(caret, point(px(0.), LINE));
+            assert_eq!(line.closest_index_for_position(caret, LINE), Ok(at));
+            Empty
+        });
+    }
+
+    #[test]
+    fn a_narrow_comma_moves_the_caret_and_hidden_formatting_remains_selectable() {
+        let colors = palette(ThemeKind::Dark);
+        let redirects = HashSet::new();
+        let shown = |value, selection| {
+            display_line(
+                RecipientLine {
+                    value,
+                    saved: &[],
+                    redirects: &redirects,
+                    placeholder: ("none", colors.dim),
+                    selection,
+                    show_errors: true,
+                },
+                colors,
+                false,
+            )
+        };
+        let complete = "ann@example.test,";
+        let next = shown(complete, Some(complete.len()..complete.len()));
+        assert_eq!(next.text, "ann@example.test\n");
+        assert_eq!(next.caret, Some(next.text.len()));
+
+        let hidden = "ann@ex\u{202e}ample.test";
+        let error = first_invalid(hidden).unwrap();
+        assert_eq!(&hidden[error.clone()], hidden);
+        let invalid = shown(hidden, Some(error));
+        assert_eq!(invalid.text, "ann@ex�ample.test");
+        assert!(matches!(invalid.spans[0].kind, SpanKind::SelectedInvalid));
+        assert_eq!(invalid.spans[0].bytes, 0..invalid.text.len());
     }
 
     #[test]

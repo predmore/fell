@@ -284,6 +284,12 @@ fn leave_header(field: Field, editor: &mut Editor) -> Field {
     next
 }
 
+struct RecipientError {
+    message: SharedString,
+    /// The saved addresses against which the rejected edit was made.
+    saved: Vec<String>,
+}
+
 pub struct ComposeView {
     hub: Arc<DraftHub>,
     draft_id: SharedString,
@@ -296,7 +302,7 @@ pub struct ComposeView {
     bcc_line: String,
     subject_line: String,
     recipients: recipients::Completion,
-    recipient_errors: [Option<SharedString>; 3],
+    recipient_errors: [Option<RecipientError>; 3],
     recipient_selection: Option<Range<usize>>,
     recipient_heights: [recipient_rows::RowHeight; 3],
     styled_cache: Option<(StyledBodyKey, gpui::Entity<CachedStyledBody>)>,
@@ -1002,7 +1008,26 @@ impl ComposeView {
         .into_iter()
         .enumerate()
         {
-            if self.field != field && self.recipient_errors[index].is_none() {
+            let error = &mut self.recipient_errors[index];
+            if let Some(latched) = error {
+                if latched
+                    .saved
+                    .iter()
+                    .map(String::as_str)
+                    .eq(saved.iter().map(|address| address.raw.as_str()))
+                {
+                    continue;
+                }
+                if self.status == latched.message {
+                    self.status = "".into();
+                }
+                *error = None;
+                *line = join_addrs(saved);
+                if self.field == field {
+                    self.recipient_selection = None;
+                }
+                changed = true;
+            } else if self.field != field {
                 let canonical = join_addrs(saved);
                 if *line != canonical && !recipient_rows::matches_saved(line, saved) {
                     *line = canonical;
@@ -1106,25 +1131,41 @@ impl ComposeView {
         }
     }
 
-    fn record_field(&self, field: Field) -> Option<Result<(), String>> {
-        self.hub
-            .with_session(self.draft_id.as_ref(), |session| match field {
-                Field::To => session.set_addresses_from_user("to", &self.to_line),
-                Field::Cc => session.set_addresses_from_user("cc", &self.cc_line),
-                Field::Bcc => session.set_addresses_from_user("bcc", &self.bcc_line),
-                Field::Subject => {
-                    session.set_subject_from_user(self.subject_line.clone());
-                    Ok(())
-                }
-                Field::Body => Ok(()),
-            })
+    fn record_field(
+        &self,
+        field: Field,
+        session: &mut fell_core::compose::DraftSession,
+    ) -> Result<(), String> {
+        match field {
+            Field::To => session.set_addresses_from_user("to", &self.to_line),
+            Field::Cc => session.set_addresses_from_user("cc", &self.cc_line),
+            Field::Bcc => session.set_addresses_from_user("bcc", &self.bcc_line),
+            Field::Subject => {
+                session.set_subject_from_user(self.subject_line.clone());
+                Ok(())
+            }
+            Field::Body => Ok(()),
+        }
     }
 
     fn commit_field(&mut self, field: Field) -> bool {
         let id = self.draft_id.to_string();
-        let result = self.record_field(field);
+        let result = self.hub.with_session(&id, |session| {
+            let result = self.record_field(field, session);
+            let saved = if result.is_err() {
+                match field {
+                    Field::To => Some(session.fields().to.clone()),
+                    Field::Cc => Some(session.fields().cc.clone()),
+                    Field::Bcc => Some(session.fields().bcc.clone()),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            (result, saved)
+        });
         match result {
-            Some(Ok(())) => {
+            Some((Ok(()), _)) => {
                 if let Some(index) = field.recipient_index() {
                     self.recipient_errors[index] = None;
                 }
@@ -1137,12 +1178,15 @@ impl ComposeView {
                 self.status = "".into();
                 true
             }
-            Some(Err(err)) => {
+            Some((Err(err), saved)) => {
                 self.status = err.into();
-                if let Some(index) = field.recipient_index()
+                if let (Some(index), Some(saved)) = (field.recipient_index(), saved)
                     && recipient_rows::first_invalid(self.header_text()).is_some()
                 {
-                    self.recipient_errors[index] = Some(self.status.clone());
+                    self.recipient_errors[index] = Some(RecipientError {
+                        message: self.status.clone(),
+                        saved,
+                    });
                 }
                 false
             }
@@ -1169,6 +1213,10 @@ impl ComposeView {
         }
         self.send_feedback.invalidate_readiness();
         cx.global_mut::<SendAttempts>().clear(&id);
+        if self.recipient_errors.iter().any(Option::is_some) && self.pull_unpainted() {
+            self.status = "the draft changed; it is on screen before send".into();
+            return;
+        }
         if self.field != Field::Body && !self.commit_field(self.field) {
             return;
         }
@@ -1176,7 +1224,7 @@ impl ComposeView {
             .recipient_errors
             .iter()
             .enumerate()
-            .find_map(|(index, error)| Some((index, error.clone()?)))
+            .find_map(|(index, error)| Some((index, error.as_ref()?.message.clone())))
         {
             self.focus_header([Field::To, Field::Cc, Field::Bcc][index]);
             self.status = error;
@@ -1742,6 +1790,43 @@ impl ComposeView {
             .and_then(|_| recipient_rows::first_invalid(self.header_text()));
     }
 
+    fn place_recipient_cursor(&mut self, field: Field, at: usize, cx: &mut Context<Self>) {
+        if self.preview
+            || self.palette.is_some()
+            || self.send_panel != SendPanel::Summary
+            || self.closing
+            || self.discarding
+            || self.hub.with_session(self.draft_id.as_ref(), |session| {
+                session.send_lock().is_some()
+            }) != Some(false)
+        {
+            return;
+        }
+        if self.field != field {
+            if self.field == Field::Body {
+                self.end_insert();
+            } else if !self.commit_field(self.field) {
+                cx.notify();
+                return;
+            }
+            self.focus_header(field);
+            if self.recipient_selection.is_some() {
+                self.update_recipient_completion(cx);
+                cx.notify();
+                return;
+            }
+        }
+        let line = self.header_text();
+        let mut at = at.min(line.len());
+        while !line.is_char_boundary(at) {
+            at -= 1;
+        }
+        self.recipient_selection = Some(at..at);
+        self.touched = true;
+        self.update_recipient_completion(cx);
+        cx.notify();
+    }
+
     fn header_text(&self) -> &str {
         match self.field {
             Field::To => &self.to_line,
@@ -1785,10 +1870,15 @@ impl ComposeView {
         }
         // Recipient completion owns unfinished tokens. Only committed
         // recipients are eligible for a server save.
-        if self.field == Field::Subject && self.record_field(self.field) == Some(Ok(())) {
-            self.hub.with_session(self.draft_id.as_ref(), |session| {
-                session.arm_outbound(now_ms())
-            });
+        if self.field == Field::Subject
+            && self
+                .hub
+                .with_session(self.draft_id.as_ref(), |session| {
+                    session.set_subject_from_user(self.subject_line.clone());
+                    session.arm_outbound(now_ms());
+                })
+                .is_some()
+        {
             self.flush_pending = true;
         }
     }
@@ -2140,7 +2230,7 @@ impl Render for ComposeView {
                 .iter()
                 .flatten()
                 .next()
-                .cloned()
+                .map(|error| error.message.clone())
                 .unwrap_or_default()
         } else {
             self.status.clone()
@@ -2244,6 +2334,7 @@ impl Render for ComposeView {
                             &ui_family,
                             reply_check,
                             overlay,
+                            cx.entity().downgrade(),
                         )
                         .flex_shrink_0(),
                     )
@@ -2324,6 +2415,7 @@ impl ComposeView {
         family: &str,
         reply_check: Option<ReplyCheck>,
         overlay: Option<(Field, gpui::Deferred)>,
+        view: gpui::WeakEntity<Self>,
     ) -> gpui::Div {
         let mut overlay = overlay;
         let mut overlay_for = |field| {
@@ -2389,6 +2481,7 @@ impl ComposeView {
                     .clone()
                     .unwrap_or(value.len()..value.len())
             });
+            let view = view.clone();
             let shown = recipient_rows::value_view(
                 label,
                 recipient_rows::RecipientLine {
@@ -2406,6 +2499,11 @@ impl ComposeView {
                 motion,
                 now,
                 window,
+                move |at, cx| {
+                    let _ = view.update(cx, |compose, cx| {
+                        compose.place_recipient_cursor(field, at, cx)
+                    });
+                },
             );
             column = column.child(field_row(
                 label,
@@ -3113,6 +3211,7 @@ fn field_row(
                 .w(label_width)
                 .flex_shrink_0()
                 .text_size(px(16.))
+                .line_height(recipient_rows::LINE)
                 .text_color(rgb(colors.fg))
                 .child(label.to_string()),
         )
@@ -5751,6 +5850,22 @@ fn status_bar(
         );
     }
     if !message.is_empty() {
+        let invalid_span = message
+            .strip_prefix("invalid address `")
+            .and_then(|fragment| {
+                let start = message.len() - fragment.len();
+                let end = message.strip_suffix('`').map_or(message.len(), str::len);
+                (start < end).then_some(start..end)
+            });
+        let text = gpui::StyledText::new(message).with_highlights(invalid_span.map(|span| {
+            (
+                span,
+                gpui::HighlightStyle {
+                    color: Some(rgb(colors.error).into()),
+                    ..Default::default()
+                },
+            )
+        }));
         if !mode.is_empty() {
             left = left.child(dot().opacity(opacity));
         }
@@ -5764,7 +5879,7 @@ fn status_bar(
                     message.font_family(warning_font.to_owned())
                 })
                 .opacity(opacity)
-                .child(message),
+                .child(text),
         );
     }
     if let Some(label) = fresh_label {

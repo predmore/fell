@@ -19,7 +19,7 @@ mod writer;
 
 pub use frontmatter::{
     AttachmentRef, DraftFields, DraftIssue, ParsedDraft, email_of, format_address_line,
-    mailbox_parts, parse_address_line,
+    mailbox_parts, parse_address_line, recipient_display_char,
 };
 pub use hub::{
     ClosedDraftSave, DraftCloseNotice, DraftHub, HubEvent, LOCAL_SENT_COPY_FAILED,

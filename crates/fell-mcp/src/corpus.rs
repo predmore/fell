@@ -447,7 +447,7 @@ fn agent_draft_from_hostile_mail_marks_new_recipients() {
             new("late@evil.test"),
             new("attacker@evil.test"),
             new("\u{430}da@x"),
-            new("ada@x\u{200b}"),
+            ("".into(), false),
         ]
     );
 
@@ -458,13 +458,21 @@ fn agent_draft_from_hostile_mail_marks_new_recipients() {
     assert!(unseen.unwrap_err().contains("on screen"));
     assert_eq!(hub.with_session(&id, |draft| draft.send_lock()), Some(None));
 
-    // The editor's send action starts here. Stop before the network.
-    let outgoing = hub
+    // The hidden character has no displayable mailbox and blocks send
+    // even after the person has seen the draft. Repair it before checking
+    // the generated message, still without reaching the network.
+    assert_eq!(snap.bcc[3].raw, "ada@x\u{200b}");
+    let (outgoing, snap) = hub
         .with_session(&id, |draft| {
             draft.mark_seen();
-            draft.prepare_send()
+            let blocked = draft.prepare_send().map(|_| ()).unwrap_err();
+            assert_eq!(blocked, "bcc: invalid address");
+            draft
+                .edit(draft.revision(), "ada@x\u{200b}", "repaired@evil.test")
+                .unwrap();
+            draft.mark_seen();
+            (draft.prepare_send().unwrap(), draft.snapshot())
         })
-        .unwrap()
         .unwrap();
     let raw = |views: &[fell_core::compose::AddressView]| {
         views
@@ -501,6 +509,7 @@ fn agent_draft_from_hostile_mail_marks_new_recipients() {
     for leaked in [
         "late@evil.test",
         "attacker@evil.test",
+        "repaired@evil.test",
         "body@evil.test",
         "other@evil.test",
         "front@evil.test",

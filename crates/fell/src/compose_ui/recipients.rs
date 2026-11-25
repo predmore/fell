@@ -367,7 +367,13 @@ fn token_at(line: &str, caret: usize) -> Range<usize> {
 
 fn prefix(token: &str) -> Option<&str> {
     let token = token.trim();
-    if token.is_empty() || (token.contains('<') && email_of(token).is_some()) {
+    if token.is_empty()
+        || email_of(token).is_some_and(|email| {
+            email
+                .split_once('@')
+                .is_some_and(|(local, domain)| !local.is_empty() && !domain.is_empty())
+        })
+    {
         return None;
     }
     let typed = token.rsplit_once('<').map_or(token, |(_, email)| email);
@@ -538,6 +544,55 @@ mod tests {
                 assert!(compose.recipient_errors[field.recipient_index().unwrap()].is_none());
             }
         });
+    }
+
+    #[test]
+    fn a_rejected_edit_is_cleared_only_when_its_saved_addresses_change() {
+        let root = tempfile::tempdir().unwrap();
+        let (hub, id, folder) = open_demo(root.path().to_owned(), ThemeKind::Dark).unwrap();
+        let mut app = gpui::TestAppContext::single();
+        let (view, cx) =
+            app.add_window_view(|_, cx| ComposeView::new(hub.clone(), id.clone(), folder, cx));
+        view.update(cx, |compose, _| {
+            for undo in [true, false] {
+                compose.focus_header(Field::To);
+                if undo {
+                    compose.to_line = "ari@example.test".into();
+                    assert!(compose.commit_field(Field::To));
+                    hub.with_session(&id, |session| session.end_user_change());
+                }
+                compose.to_line.push_str(", r");
+                assert!(!compose.commit_field(Field::To));
+                compose.focus_header(Field::Body);
+                assert!(!compose.pull_unpainted());
+                assert!(compose.recipient_errors[0].is_some());
+                if undo {
+                    compose.undo();
+                    assert_eq!(compose.to_line, "Ada <ada@example.com>");
+                } else {
+                    hub.with_session(&id, |session| {
+                        session
+                            .edit(
+                                session.revision(),
+                                "Ada <ada@example.com>",
+                                "avery@example.test",
+                            )
+                            .unwrap()
+                    });
+                    assert!(compose.pull_unpainted());
+                    assert_eq!(compose.to_line, "avery@example.test");
+                }
+                assert!(compose.recipient_errors[0].is_none());
+            }
+        });
+    }
+
+    #[test]
+    fn completion_stops_once_the_token_is_an_address() {
+        for token in ["ann@example.test", "Ann Test <ann@example.test>"] {
+            assert_eq!(prefix(token), None);
+        }
+        assert_eq!(prefix("Ann Test <ann@"), Some("ann@"));
     }
 
     #[test]
