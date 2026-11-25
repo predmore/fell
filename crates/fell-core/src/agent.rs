@@ -22,7 +22,7 @@ pub use activity::{
 };
 
 const ACTION_COLS: &str = "id, account_id, actor, kind, summary, undone, created_unix";
-const SNOOZE_SUMMARY_PREFIX: &str = "snoozed thread until ";
+pub(crate) const SNOOZE_SUMMARY_PREFIX: &str = "snoozed thread until ";
 pub const SNOOZE_CHANGED_NOTICE: &str = "Snooze already changed";
 const SNOOZE_RETIRED: i64 = 2;
 
@@ -1477,7 +1477,7 @@ fn undo_messages(conn: &Connection, account_id: &AccountId, action: &RecordedAct
     Ok(())
 }
 
-/// A changed live snooze blocks undo unless the timer cleared exactly
+/// A changed live snooze blocks undo unless a wake cleared exactly
 /// that deadline for this action. Older events can share the deadline.
 fn snooze_wakes(
     conn: &Connection,

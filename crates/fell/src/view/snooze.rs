@@ -5,7 +5,7 @@ use gpui::{
 };
 
 use crate::model::snooze::{
-    PRESETS, Picker, TriageEdit, TriageKind, preset, toast_time, wake_time,
+    PRESETS, Picker, TriageEdit, TriageKind, preset, preset_prefix, toast_time, wake_time,
 };
 use crate::model::{Overlay, Toast};
 
@@ -154,6 +154,11 @@ pub(super) fn card(
     let scale = motion::lerp(0.97, 1.0, opacity);
     let now = now_unix();
     let typing = !picker.query.is_empty();
+    let selected_preset = if typing {
+        preset_prefix(&picker.query)
+    } else {
+        Some(picker.index)
+    };
     let detail = (typing && !picker.error).then(|| {
         picker
             .deadline(now)
@@ -249,7 +254,7 @@ pub(super) fn card(
                         .py(px(6.0))
                         .px(px(5.0))
                         .children(PRESETS.iter().enumerate().map(|(index, label)| {
-                            let selected = !typing && index == picker.index;
+                            let selected = selected_preset == Some(index);
                             div()
                                 .h(px(32.0))
                                 .px(px(10.0))

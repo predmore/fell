@@ -44,9 +44,9 @@ pub(crate) struct Observer<'a> {
 }
 
 impl Observer<'_> {
-    pub fn is_arrival(&self, message: &Message) -> bool {
-        message.unread
-            && !message.archived
+    pub fn is_candidate(&self, message: &Message) -> bool {
+        // A snooze wake can mark a reply unread before the commit.
+        !message.archived
             && !message
                 .headers
                 .from
@@ -126,7 +126,7 @@ impl Store {
     }
 }
 
-fn in_inbox(roles: &FolderRoles, encoded: &str) -> bool {
+pub(super) fn in_inbox(roles: &FolderRoles, encoded: &str) -> bool {
     let mut inbox = false;
     for folder in split_field(encoded) {
         match roles.role_of(&folder) {

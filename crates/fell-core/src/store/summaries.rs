@@ -1577,6 +1577,15 @@ mod tests {
         (!threads.is_empty()).then(|| ThreadId(threads[rng.below(threads.len())].clone()))
     }
 
+    fn inbox_message_at(rng: &mut Rng, index: usize, date: i64) -> Message {
+        let mut mail = message(rng, index, &[]);
+        mail.headers.date_unix = date;
+        mail.folders = vec!["INBOX".into()];
+        mail.remote_id = RemoteId(format!("imap:1:{index}:INBOX"));
+        mail.archived = false;
+        mail
+    }
+
     /// The page `span` should return, cut from the whole list by key.
     fn expected_page(full: &[FolderThread], span: &FolderSpan) -> (Vec<FolderThread>, bool, bool) {
         let keys: Vec<ListKey> = full.iter().map(ListKey::of).collect();
@@ -2017,6 +2026,42 @@ mod tests {
                                 .unwrap();
                         }
                     }
+                    11 => {
+                        let snoozed = store.folder_threads(&account, triage::SNOOZED).unwrap();
+                        if let Some(row) = snoozed.first() {
+                            let messages = store.thread_messages(&account, &row.thread_id).unwrap();
+                            let (oldest, latest): (i64, i64) = store
+                                .conn
+                                .query_row(
+                                    "SELECT min(created_unix), max(created_unix)
+                                     FROM agent_actions WHERE account_id = ?1 AND kind = 'snooze'",
+                                    [account.as_str()],
+                                    |row| Ok((row.get(0)?, row.get(1)?)),
+                                )
+                                .unwrap();
+                            let when = if rng.chance(50) {
+                                oldest - 1
+                            } else {
+                                latest + 1
+                            };
+                            let mut reply = inbox_message_at(&mut rng, index, when);
+                            reply.headers.in_reply_to =
+                                Some(messages[0].headers.message_id.clone());
+                            reply.unread = true;
+                            made.push(reply.headers.message_id.0.clone());
+                            copies.push(reply.clone());
+                            index += 1;
+                            store
+                                .apply_delta(
+                                    &account,
+                                    &MailboxDelta {
+                                        messages: vec![reply],
+                                        ..MailboxDelta::default()
+                                    },
+                                )
+                                .unwrap();
+                        }
+                    }
                     12 | 13 => {
                         if let Some(thread) = random_thread(&store, &mut rng) {
                             let until = rng.chance(60).then_some(1_800_000_000 + step);
@@ -2204,6 +2249,174 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_snoozed_inbox_reply_wakes_only_if_newer_and_unmuted() {
+        const SET_AT: i64 = 1_700_000_100;
+        for (newer, muted, unread) in [
+            (false, false, true),
+            (true, false, true),
+            (true, false, false),
+            (true, true, true),
+        ] {
+            let store = Store::open_in_memory().unwrap();
+            let account = account();
+            store.upsert_account(&account).unwrap();
+            let mut rng = Rng(27);
+            let mut root = inbox_message_at(&mut rng, 1, SET_AT - 60);
+            root.unread = false;
+            let target = store.upsert_message(&root).unwrap();
+            let mut other = inbox_message_at(&mut rng, 2, SET_AT + 30);
+            other.headers.subject = "Separate thread".into();
+            let other_thread = store.upsert_message(&other).unwrap();
+            store
+                .set_thread_snoozes(
+                    &account.id,
+                    std::slice::from_ref(&target),
+                    Some(1_900_000_000),
+                )
+                .unwrap();
+            store
+                .conn
+                .execute("UPDATE agent_actions SET created_unix = ?1", [SET_AT])
+                .unwrap();
+            if muted {
+                store
+                    .toggle_thread_mutes(&account.id, std::slice::from_ref(&target))
+                    .unwrap();
+            }
+            let when = if newer { SET_AT + 1 } else { SET_AT - 1 };
+            let mut reply = inbox_message_at(&mut rng, 3, when);
+            reply.headers.in_reply_to = Some(root.headers.message_id);
+            reply.unread = unread;
+            let reply_id = reply.headers.message_id.clone();
+            let mut alerts = Vec::new();
+            let mut observer = crate::store::inbox_arrivals::Observer {
+                account: &account,
+                checkpoint: crate::imap::MailboxCheckpoint {
+                    uidvalidity: 1,
+                    uid: 2,
+                    modseq: None,
+                    uidnext: None,
+                    pruned: None,
+                    floor: None,
+                    keyword_baseline: false,
+                    projected: false,
+                    star_baseline: false,
+                },
+                send: &mut |batch| {
+                    alerts.extend(batch.unwrap().into_iter().map(|arrival| arrival.id))
+                },
+            };
+            store
+                .apply_sync_delta_observed(
+                    &account.id,
+                    &MailboxDelta {
+                        messages: vec![reply],
+                        ..MailboxDelta::default()
+                    },
+                    Some(&mut observer),
+                )
+                .unwrap();
+
+            let wakes = newer && !muted;
+            let inbox = store.folder_threads(&account.id, "INBOX").unwrap();
+            assert_eq!(inbox.len(), if wakes { 2 } else { 1 });
+            assert_eq!(
+                &inbox[0].thread_id,
+                if wakes { &target } else { &other_thread }
+            );
+            assert_eq!(
+                store
+                    .folder_threads(&account.id, triage::SNOOZED)
+                    .unwrap()
+                    .len(),
+                usize::from(!wakes)
+            );
+            assert_eq!(
+                alerts,
+                wakes
+                    .then(|| reply_id.clone())
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                store.thread_messages(&account.id, &target).unwrap().len(),
+                2
+            );
+            if wakes {
+                assert!(inbox[0].unread);
+                let (action, notice, restored) = store.undo_with_note(&account.id).unwrap();
+                assert_eq!(action.kind, crate::ActionKind::Snooze);
+                assert_eq!(notice, None);
+                assert_eq!(restored, [target]);
+                let inbox = store.folder_threads(&account.id, "INBOX").unwrap();
+                assert_eq!(inbox[0].thread_id, other_thread);
+                assert_eq!(
+                    store
+                        .message(&account.id, &reply_id)
+                        .unwrap()
+                        .unwrap()
+                        .unread,
+                    unread
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn opening_returns_the_mailbox_when_a_due_wake_fails() {
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("mail.db");
+        let account = account();
+        let mailbox = Store::open(&path).unwrap();
+        mailbox.upsert_account(&account).unwrap();
+        let mut mail = inbox_message_at(&mut Rng(29), 1, 1_700_000_000);
+        mail.unread = false;
+        let target = mailbox.upsert_message(&mail).unwrap();
+        mailbox
+            .set_thread_snoozes(&account.id, std::slice::from_ref(&target), Some(20))
+            .unwrap();
+        mailbox
+            .conn
+            .execute_batch(
+                "INSERT INTO meta (key, value) VALUES ('test_block_wake', '1');
+             CREATE TRIGGER test_block_wake BEFORE UPDATE OF snooze_until ON messages
+             WHEN OLD.snooze_until IS NOT NULL AND NEW.snooze_until IS NULL
+               AND (SELECT value FROM meta WHERE key = 'test_block_wake') = '1'
+             BEGIN SELECT RAISE(ABORT, 'test wake failure'); END;",
+            )
+            .unwrap();
+        drop(mailbox);
+
+        let reopened = Store::open(path).unwrap();
+        assert!(reopened.db_path().is_some());
+        assert_eq!(
+            reopened
+                .folder_threads(&account.id, triage::SNOOZED)
+                .unwrap()[0]
+                .thread_id,
+            target
+        );
+        assert!(reopened.wake_snoozes(20).is_err());
+        reopened
+            .conn
+            .execute(
+                "UPDATE meta SET value = '0' WHERE key = 'test_block_wake'",
+                [],
+            )
+            .unwrap();
+        reopened.wake_snoozes(20).unwrap();
+        assert!(
+            reopened
+                .folder_threads(&account.id, triage::SNOOZED)
+                .unwrap()
+                .is_empty()
+        );
+        let inbox = reopened.folder_threads(&account.id, "INBOX").unwrap();
+        assert_eq!(inbox[0].thread_id, target);
+        assert!(inbox[0].unread);
     }
 
     #[test]

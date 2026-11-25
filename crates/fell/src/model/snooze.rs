@@ -113,16 +113,23 @@ pub(crate) fn preset(now: i64, index: usize) -> Option<i64> {
     }
 }
 
-pub(crate) fn typed(now: i64, query: &str) -> Option<i64> {
-    let query = query.trim().to_ascii_lowercase();
-    if !query.is_empty()
-        && let Some(index) = PRESETS.iter().position(|name| {
+pub(crate) fn preset_prefix(query: &str) -> Option<usize> {
+    let query = query.trim();
+    if query.is_empty() {
+        None
+    } else {
+        PRESETS.iter().position(|name| {
             name.get(..query.len())
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&query))
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(query))
         })
-    {
+    }
+}
+
+pub(crate) fn typed(now: i64, query: &str) -> Option<i64> {
+    if let Some(index) = preset_prefix(query) {
         return preset(now, index);
     }
+    let query = query.trim().to_ascii_lowercase();
     if let Some((unit, digits)) = query
         .chars()
         .next_back()
@@ -164,17 +171,21 @@ pub(crate) fn typed(now: i64, query: &str) -> Option<i64> {
         },
     };
     let (hour, minute) = parse_clock(clock)?;
-    let hours = if (1..=12).contains(&hour) && clock.bytes().all(|c| c.is_ascii_digit()) {
-        let evening = hour % 12 + 12;
-        if day == "tonight" {
-            [Some(evening), None]
-        } else {
-            [Some(hour % 12), Some(evening)]
-        }
-    } else {
-        [Some(hour), None]
-    };
+    let bare = (1..=12).contains(&hour) && clock.bytes().all(|c| c.is_ascii_digit());
     let on_day = |days| {
+        let hours = if bare {
+            let morning = hour % 12;
+            let evening = morning + 12;
+            if day == "tonight" {
+                [Some(evening), None]
+            } else if days != 0 {
+                [Some(if hour <= 6 { evening } else { morning }), None]
+            } else {
+                [Some(morning), Some(evening)]
+            }
+        } else {
+            [Some(hour), None]
+        };
         hours
             .into_iter()
             .flatten()
@@ -321,6 +332,22 @@ mod tests {
         assert_eq!(parse_clock("24:00"), None);
         assert_eq!(parse_clock("3:6pm"), None);
         assert_eq!(parse_clock("0am"), None);
+    }
+
+    #[test]
+    fn future_days_default_bare_workday_hours() {
+        let start = local_tm(1_893_456_000).unwrap();
+        let wednesday = at(start, (3 + 7 - start.tm_wday) % 7, 8, 0).unwrap();
+        let local = local_tm(wednesday).unwrap();
+        for (input, days, hour) in [
+            ("fri 3", 2, 15),
+            ("tomorrow 5", 1, 17),
+            ("tomorrow 9", 1, 9),
+            ("fri 12", 2, 0),
+            ("fri 3am", 2, 3),
+        ] {
+            assert_eq!(typed(wednesday, input), at(local, days, hour, 0), "{input}");
+        }
     }
 
     #[test]

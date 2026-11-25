@@ -169,83 +169,32 @@ impl Store {
         Ok(mute)
     }
 
-    /// Clear every due snooze, restoring the Inbox row and its unread state
-    /// atomically. `now` is wall time so this also catches up after suspend.
+    /// Clear every due snooze in bounded write transactions. Wall time
+    /// also catches up snoozes missed during suspend.
     pub fn wake_snoozes(&self, now: i64) -> Result<()> {
+        const BATCH: usize = 64;
         const DUE: &str = "SELECT account_id, thread_id FROM thread_folders
-                           WHERE folder_key = char(31) || 'snoozed' AND last_date >= ?1";
+                           WHERE folder_key = char(31) || 'snoozed' AND last_date >= ?1
+                           ORDER BY last_date DESC LIMIT ?2";
         let since = now.saturating_neg();
-        if !self.conn.prepare_cached(DUE)?.exists([since])? {
-            return Ok(());
-        }
-        let tx = super::immediate_transaction(&self.conn)?;
-        let due = tx
-            .prepare_cached(DUE)?
-            .query_map([since], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (account, thread) in due {
-            let snoozed = tx
-                .prepare_cached(
-                    "SELECT message_id, snooze_until FROM messages
-                 WHERE account_id = ?1 AND thread_id = ?2 AND snooze_until IS NOT NULL",
-                )?
-                .query_map(params![account, thread], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        while self.conn.prepare_cached(DUE)?.exists(params![since, 1])? {
+            let tx = super::immediate_transaction(&self.conn)?;
+            let due = tx
+                .prepare_cached(DUE)?
+                .query_map(params![since, BATCH as i64], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            let inbox = inbox_for_wake(&tx, &account, &thread)?;
-            tx.execute(
-                "UPDATE messages SET snooze_until = NULL
-                 WHERE account_id = ?1 AND thread_id = ?2 AND snooze_until IS NOT NULL",
-                params![account, thread],
-            )?;
-            let mut previous_return = None;
-            if let Some((id, unread)) = &inbox {
-                previous_return = tx
-                    .prepare_cached(
-                        "SELECT returned_at FROM snooze_returns WHERE account_id = ?1 AND message_id = ?2",
-                    )?
-                    .query_row(params![account, id], |row| row.get::<_, i64>(0))
-                    .optional()?;
-                tx.execute(
-                    "INSERT INTO snooze_returns VALUES (?1, ?2, ?3)
-                     ON CONFLICT(account_id, message_id) DO UPDATE SET returned_at = excluded.returned_at",
-                    params![account, id, now],
-                )?;
-                if !unread {
-                    tx.execute(
-                        "UPDATE messages SET unread = 1 WHERE account_id = ?1 AND message_id = ?2",
-                        params![account, id],
-                    )?;
-                    // Keep the returned mail unread across sync without writing a server flag.
-                    super::intents::remember(
-                        &tx,
-                        &AccountId(account.clone()),
-                        id,
-                        Some(true),
-                        None,
-                    )?;
-                }
+            for (account, thread) in &due {
+                let inbox = inbox_for_wake(&tx, account, thread)?;
+                wake_thread(&tx, account, thread, now, inbox)?;
             }
-            let mut record = tx.prepare_cached(
-                "INSERT INTO snooze_wake_events
-                 SELECT ?1, ?2, ?3, revision, ?4, ?5, ?6, ?7 FROM snooze_revision WHERE id = 1",
-            )?;
-            for (id, until) in snoozed {
-                record.execute(params![
-                    account,
-                    id,
-                    until,
-                    inbox.as_ref().map(|(id, _)| id),
-                    now,
-                    previous_return,
-                    inbox.as_ref().is_some_and(|(_, unread)| !unread)
-                ])?;
+            tx.commit()?;
+            if due.len() < BATCH {
+                break;
             }
         }
-        tx.commit()
+        Ok(())
     }
 
     /// Local notification mute state, including Message-ID aliases.
@@ -260,6 +209,162 @@ impl Store {
             .prepare_cached("SELECT revision FROM snooze_revision WHERE id = 1")?
             .query_row([], |row| row.get(0))?)
     }
+}
+
+pub(super) fn has_snoozes(conn: &Connection, account: &AccountId) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT 1 FROM thread_folders WHERE account_id = ?1 AND folder_key = ?2 LIMIT 1",
+        )?
+        .exists(params![account.as_str(), SNOOZED])?)
+}
+
+/// Wake a snoozed thread on a distinct incoming Inbox message that was
+/// sent after its active snooze. Run after rethreading and before commit
+/// so arrival notifications see the same Inbox membership as the list.
+pub(super) fn wake_arrivals(
+    conn: &Connection,
+    account: &AccountId,
+    arrivals: &[crate::MessageId],
+    roles: Option<&crate::FolderRoles>,
+) -> Result<()> {
+    if arrivals.is_empty() {
+        return Ok(());
+    }
+    let listed;
+    let roles = if let Some(roles) = roles {
+        roles
+    } else {
+        listed = super::roles::listed(conn, account)?.unwrap_or_default();
+        &listed
+    };
+    let now = crate::agent::now_unix();
+    let key = account.as_str();
+    let mut incoming = conn.prepare_cached(&format!(
+        "SELECT m.thread_id, m.date_unix, m.folders, m.unread
+         FROM messages m JOIN accounts a ON a.id = m.account_id
+         WHERE m.account_id = ?1 AND m.message_id = ?2 AND NOT m.archived
+           AND m.snooze_until IS NULL AND m.from_email <> a.email COLLATE NOCASE
+           AND (m.folders <> '' OR NOT ({}))
+           AND EXISTS (
+               SELECT 1 FROM messages s WHERE s.account_id = m.account_id
+               AND s.thread_id = m.thread_id AND s.snooze_until > 0
+           )",
+        super::views::has_view_copy("m"),
+    ))?;
+    // The activity snapshot supplies the set time for the live deadline,
+    // including when threading has since folded a copy into an alias.
+    let mut last_snooze = conn.prepare_cached(
+        "WITH snoozed AS (
+             SELECT message_id, snooze_until FROM messages
+             WHERE account_id = ?1 AND thread_id = ?2 AND snooze_until > 0
+         ), anchors AS (
+             SELECT message_id, snooze_until FROM snoozed
+             UNION ALL
+             SELECT a.message_id, s.snooze_until FROM snoozed s
+             JOIN message_aliases a ON a.account_id = ?1 AND a.canonical_message_id = s.message_id
+         )
+         SELECT max(action.created_unix) FROM anchors
+         JOIN agent_action_messages snapshot ON snapshot.message_id = anchors.message_id
+         JOIN agent_actions action ON action.id = snapshot.action_id
+         WHERE action.account_id = ?1 AND action.kind = 'snooze' AND action.undone = 0
+           AND action.summary = ?3 || anchors.snooze_until",
+    )?;
+    for arrival in arrivals {
+        let Some((thread, sent, folders, unread)) = incoming
+            .query_row(params![key, arrival.as_str()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                ))
+            })
+            .optional()?
+        else {
+            continue;
+        };
+        if (!folders.is_empty() && !super::inbox_arrivals::in_inbox(roles, &folders))
+            || muted(conn, key, &thread)?
+        {
+            continue;
+        }
+        let set_at: Option<i64> = last_snooze.query_row(
+            params![key, thread, crate::agent::SNOOZE_SUMMARY_PREFIX],
+            |row| row.get(0),
+        )?;
+        if set_at.is_some_and(|set_at| sent > set_at) {
+            wake_thread(
+                conn,
+                key,
+                &thread,
+                now,
+                Some((arrival.as_str().into(), unread)),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn wake_thread(
+    conn: &Connection,
+    account: &str,
+    thread: &str,
+    now: i64,
+    inbox: Option<(String, bool)>,
+) -> Result<()> {
+    let snoozed = conn
+        .prepare_cached(
+            "SELECT message_id, snooze_until FROM messages
+         WHERE account_id = ?1 AND thread_id = ?2 AND snooze_until IS NOT NULL",
+        )?
+        .query_map(params![account, thread], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    conn.execute(
+        "UPDATE messages SET snooze_until = NULL
+         WHERE account_id = ?1 AND thread_id = ?2 AND snooze_until IS NOT NULL",
+        params![account, thread],
+    )?;
+    let mut previous_return = None;
+    if let Some((id, unread)) = &inbox {
+        previous_return = conn
+            .prepare_cached(
+                "SELECT returned_at FROM snooze_returns WHERE account_id = ?1 AND message_id = ?2",
+            )?
+            .query_row(params![account, id], |row| row.get::<_, i64>(0))
+            .optional()?;
+        conn.execute(
+            "INSERT INTO snooze_returns VALUES (?1, ?2, ?3)
+             ON CONFLICT(account_id, message_id) DO UPDATE SET returned_at = excluded.returned_at",
+            params![account, id, now],
+        )?;
+        if !unread {
+            conn.execute(
+                "UPDATE messages SET unread = 1 WHERE account_id = ?1 AND message_id = ?2",
+                params![account, id],
+            )?;
+            // Keep the returned mail unread across sync without writing a server flag.
+            super::intents::remember(conn, &AccountId(account.to_owned()), id, Some(true), None)?;
+        }
+    }
+    let mut record = conn.prepare_cached(
+        "INSERT INTO snooze_wake_events
+         SELECT ?1, ?2, ?3, revision, ?4, ?5, ?6, ?7 FROM snooze_revision WHERE id = 1",
+    )?;
+    for (id, until) in snoozed {
+        record.execute(params![
+            account,
+            id,
+            until,
+            inbox.as_ref().map(|(id, _)| id),
+            now,
+            previous_return,
+            inbox.as_ref().is_some_and(|(_, unread)| !unread)
+        ])?;
+    }
+    Ok(())
 }
 
 fn inbox_for_wake(
@@ -326,7 +431,7 @@ pub(crate) fn undo_snooze(
     Ok((restored, notice))
 }
 
-/// Roll back the timer side effects of this wake. A later local read edit
+/// Roll back the side effects of this wake. A later local read edit
 /// takes over the unread state, while the return's ranking is still ours.
 pub(crate) fn undo_wake(conn: &Connection, account: &AccountId, event: i64) -> Result<()> {
     let key = account.as_str();

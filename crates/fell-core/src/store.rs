@@ -677,7 +677,13 @@ impl Store {
             #[cfg(unix)]
             _mailbox_lock: None,
         };
-        store.wake_snoozes(crate::agent::now_unix())?;
+        if let Err(err) = store.wake_snoozes(crate::agent::now_unix()) {
+            crate::diagnostic!(
+                WARN,
+                "Could not wake snoozed mail at startup",
+                error = &err as &dyn std::error::Error
+            );
+        }
         Ok(store)
     }
 
@@ -863,6 +869,8 @@ impl Store {
         };
         let mut new_messages = 0;
         let mut inbox_arrivals = Vec::new();
+        let check_snoozes = !delta.messages.is_empty() && triage::has_snoozes(&tx, account_id)?;
+        let mut wake_arrivals = Vec::new();
         let keyword_copies: HashSet<_> = if delta.messages.is_empty() {
             HashSet::new()
         } else {
@@ -913,8 +921,11 @@ impl Store {
             // A combined delta can carry the listing for these messages.
             if insert_message(&tx, &message, &mut merge_roles)? {
                 new_messages += 1;
+                if check_snoozes {
+                    wake_arrivals.push(message.headers.message_id.clone());
+                }
                 if let Some(watch) = &observer
-                    && watch.is_arrival(&message)
+                    && watch.is_candidate(&message)
                 {
                     inbox_arrivals.push(message.headers.message_id.clone());
                 }
@@ -962,6 +973,7 @@ impl Store {
         if split {
             if has_arrivals {
                 self.rethread_written(&tx, account_id)?;
+                triage::wake_arrivals(&tx, account_id, &wake_arrivals, delta.roles.as_ref())?;
             }
             tx.commit()?;
             #[cfg(test)]
@@ -982,6 +994,9 @@ impl Store {
         let settled = copies::settle(&tx, account_id, delta.settle)?;
         if (has_arrivals && !split) || repaired || took_over || settled {
             self.rethread_written(&tx, account_id)?;
+        }
+        if !split {
+            triage::wake_arrivals(&tx, account_id, &wake_arrivals, None)?;
         }
         if let Some(cursor) = &delta.cursor {
             set_sync_cursor_on(&tx, account_id, cursor)?;
@@ -1079,8 +1094,16 @@ impl Store {
 
     pub fn upsert_message(&self, message: &Message) -> Result<ThreadId> {
         let tx = immediate_transaction(&self.conn)?;
-        insert_message(&tx, message, &mut MergeRoles::new(None))?;
+        let inserted = insert_message(&tx, message, &mut MergeRoles::new(None))?;
         self.rethread_written(&tx, &message.account_id)?;
+        if inserted && triage::has_snoozes(&tx, &message.account_id)? {
+            triage::wake_arrivals(
+                &tx,
+                &message.account_id,
+                std::slice::from_ref(&message.headers.message_id),
+                None,
+            )?;
+        }
         let thread_id =
             thread_id_for_message_id(&tx, &message.account_id, &message.headers.message_id)?
                 .ok_or_else(|| {
