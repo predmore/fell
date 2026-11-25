@@ -13,6 +13,7 @@ pub(crate) mod reader_links;
 mod search;
 mod settings;
 mod snooze;
+mod threading;
 
 use std::cell::{Cell, OnceCell};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -50,7 +51,8 @@ use crate::mail_body::{self, BodyCache, BodyJob, BodyLoad, BodyLoads, HtmlBody, 
 use crate::mailbox;
 use crate::model::{
     Banner, DRAFT_NOT_THREAD, DownloadStatus, Fetch, FlagEdit, FolderIntent, LabelEdit, Overlay,
-    PickerChoice, QueryFault, ReadDwell, Session, Step, SyncKind, Toast, grouped, row_key,
+    PickerChoice, QueryFault, ReadDwell, Session, Step, SyncKind, ThreadEdit, Toast, grouped,
+    row_key,
 };
 use crate::motion::{self, Glide, LayerSwap, ListShift, Motion, RowMotion, SwapFrame, Transition};
 use crate::onboarding::Onboarding;
@@ -304,6 +306,8 @@ struct ReadIntent {
     /// Archive, move, or undo wrote to the store. Scroll to the selection
     /// instead of holding the viewport still.
     changed: bool,
+    /// A regrouping retains the selected row's viewport slot when possible.
+    hold_selection: bool,
     /// Undo: select this thread when it is back in the folder, loading the
     /// rows around it if they are not loaded.
     select: Option<ListKey>,
@@ -318,6 +322,7 @@ impl ReadIntent {
         self.switch |= later.switch;
         self.refresh_open |= later.refresh_open;
         self.changed |= later.changed;
+        self.hold_selection |= later.hold_selection;
         if later.select.is_some() {
             self.select = later.select;
             self.notification_pane = later.notification_pane;
@@ -726,6 +731,8 @@ struct Inbox {
     conv_layout_current: bool,
     painted_reader: Option<ReaderLayout>,
     sent_arrival_anchor: Option<ScrollAnchor>,
+    regroup_to: Option<ThreadId>,
+    regroup_motion: Option<threading::RegroupMotion>,
     /// Background sync for the account file. `None` for the demo mailbox.
     sync: Option<SyncHandle>,
     /// Visible label rows as they looked in the last list prepaint.
@@ -970,6 +977,8 @@ impl Inbox {
             conv_layout_current: false,
             painted_reader: None,
             sent_arrival_anchor: None,
+            regroup_to: None,
+            regroup_motion: None,
             sync: None,
             painted_label_rows: Vec::new(),
             leaving_rows: None,
@@ -1814,7 +1823,16 @@ impl Inbox {
             .as_ref()
             .and_then(|id| self.session.threads.iter().position(|row| &row.id == id));
         let same_thread = self.session.cursor_id == before_id;
-        match present::landing(switched, intent.holds_viewport(), same_thread) {
+        let landing = if intent.hold_selection
+            && !switched
+            && before_index.is_some()
+            && after_index.is_some()
+        {
+            present::Landing::Hold
+        } else {
+            present::landing(switched, intent.holds_viewport(), same_thread)
+        };
+        match landing {
             present::Landing::Hold => {
                 // Rows sync put above the selection, or rows loaded above
                 // the first one, push it down. Scroll by the same amount so
@@ -2632,7 +2650,20 @@ impl Inbox {
                         .reader_bodies
                         .recheck_moved_parts(&inbox.session.messages, &view);
                 }
-                let follow = if in_place {
+                let regrouping = inbox
+                    .regroup_to
+                    .take()
+                    .is_some_and(|target| target.as_str() == id)
+                    && inbox
+                        .session
+                        .messages
+                        .get(inbox.session.message_cursor)
+                        .is_some_and(|focused| view.iter().any(|message| message.id == focused.id));
+                let follow = if regrouping && !in_place {
+                    inbox.keep_shown_text(&mut view);
+                    inbox.regroup_conversation(view, generation);
+                    false
+                } else if in_place {
                     inbox.keep_shown_text(&mut view);
                     inbox.queue_conversation_refresh(view, generation);
                     false
@@ -2668,7 +2699,7 @@ impl Inbox {
                     }
                     false
                 };
-                let landing = if inbox.quiet_search_preview() {
+                let landing = if regrouping || inbox.quiet_search_preview() {
                     crate::model::search::MatchLanding::KeepReader
                 } else if same {
                     crate::model::search::MatchLanding::CurrentMatch
@@ -3462,6 +3493,14 @@ impl Inbox {
         let account = self.account_id.clone();
         let folder = self.session.folder.clone();
         let reading = folder.clone();
+        let label = self.session.label_scope.clone();
+        let reading_label = label.clone();
+        let cursor = self.session.cursor_id.clone();
+        let focused = self
+            .session
+            .messages
+            .get(self.session.message_cursor)
+            .map(|message| MessageId(message.id.clone()));
         let expected = notice.as_ref().map(|(_, action_id)| *action_id);
         self.undos_in_flight += 1;
         self.change_mailbox(
@@ -3472,14 +3511,34 @@ impl Inbox {
                         .map(|(action, restored)| (action, None, restored)),
                     None => store.undo_with_note(&account),
                 }?;
-                let select = restored_folder_key(store, &account, &reading, &restored);
-                Ok((action, note_notice, restored, select))
+                let grouping = matches!(
+                    action.kind,
+                    fell_core::ActionKind::SplitThread | fell_core::ActionKind::MergeThreads
+                );
+                let regroup_to = if grouping && let Some(focused) = focused {
+                    store
+                        .thread_for_message(&account, &focused)?
+                        .filter(|id| restored.contains(id))
+                } else {
+                    None
+                };
+                let select = if grouping {
+                    regroup_to.as_ref().and_then(|id| {
+                        store
+                            .threading_list_key(&account, id, &reading, reading_label.as_deref())
+                            .ok()
+                            .flatten()
+                    })
+                } else {
+                    restored_folder_key(store, &account, &reading, &restored)
+                };
+                Ok((action, note_notice, restored, select, grouping, regroup_to))
             },
             move |inbox, result, cx| {
                 inbox.undos_in_flight -= 1;
                 match result {
-                    Ok((action, note_notice, restored, select)) => {
-                        if note_notice.is_some() {
+                    Ok((action, note_notice, restored, select, grouping, regroup_to)) => {
+                        if note_notice.is_some() || grouping {
                             inbox.note_generation = inbox.note_generation.wrapping_add(1);
                         }
                         if action.kind == fell_core::ActionKind::DiscardDrafts {
@@ -3491,6 +3550,8 @@ impl Inbox {
                             });
                         }
                         let text = match action.kind {
+                            fell_core::ActionKind::SplitThread => "Split undone",
+                            fell_core::ActionKind::MergeThreads => "Merge undone",
                             fell_core::ActionKind::Read => "Marked unread",
                             fell_core::ActionKind::Unread => "Marked read",
                             fell_core::ActionKind::Archive if notice.is_some() => {
@@ -3537,12 +3598,30 @@ impl Inbox {
                         }
                         inbox.expire_action_notice(cx);
                         inbox.send_to_server();
-                        if inbox.session.search.is_some() && !restored.is_empty() {
+                        let still_viewing =
+                            inbox.session.folder == folder && inbox.session.label_scope == label;
+                        let follow_group =
+                            grouping && still_viewing && inbox.session.cursor_id == cursor;
+                        if follow_group
+                            && let Some(target) = regroup_to
+                            && (select.is_some() || inbox.session.search.is_some())
+                        {
+                            inbox.regroup_to = Some(target.clone());
+                            if inbox.session.search.is_some() {
+                                inbox.search_view.prefer = vec![target];
+                            }
+                        } else if !grouping
+                            && inbox.session.search.is_some()
+                            && !restored.is_empty()
+                        {
                             inbox.search_view.prefer = restored;
                         }
-                        let select = select.filter(|_| inbox.session.folder == folder);
+                        let select =
+                            select.filter(|_| still_viewing && (!grouping || follow_group));
                         Some(ReadIntent {
                             changed: true,
+                            refresh_open: grouping,
+                            hold_selection: follow_group,
                             select,
                             ..ReadIntent::default()
                         })
@@ -4262,6 +4341,7 @@ impl Inbox {
         }
         // Input never waits on an animation.
         self.settle_motion();
+        self.regroup_motion = None;
         window.focus(&self.focus);
         if self.session.overlay == Overlay::Help {
             let now = self.motion.clock.now();
@@ -4362,6 +4442,12 @@ impl Inbox {
         if (overlay == Overlay::Snooze) != (self.session.overlay == Overlay::Snooze) {
             self.snooze_clock =
                 (self.session.overlay == Overlay::Snooze).then(|| Self::watch_snooze_clock(cx));
+        }
+        if step.search_merge_targets {
+            self.search_merge_targets(cx);
+        }
+        if let Some(edit) = step.threading.clone() {
+            self.edit_threading(edit, cx);
         }
         if let Some(request) = step.agents.clone() {
             self.request_agent_access(request, cx);
@@ -4678,6 +4764,7 @@ impl Inbox {
         self.note_visit = None;
         self.instant_conversation_scroll = false;
         self.sent_arrival_anchor = None;
+        self.regroup_motion = None;
         self.preview_padding = false;
         self.preview_laid_out = false;
         if self.reveal == Reveal::Preview {
@@ -5414,6 +5501,10 @@ impl Render for Inbox {
             now,
             &mut self.motion,
         );
+        self.regroup_motion = self
+            .regroup_motion
+            .take()
+            .filter(|motion| motion.transition.running(now));
         let conv = ConvFrame {
             syncing: self.pending_bodies.downloading(&self.session.sync),
             missing_fade: self.pending_bodies.fade(now),
@@ -5425,6 +5516,7 @@ impl Render for Inbox {
             hide_message_cursor: self.note_pin.eligible() && !self.message_selected(),
             return_glide: returning.map(|(_, glide)| glide),
             card_alphas: self.motion.card_alphas(now),
+            regroup: self.regroup_motion.as_ref().map(|motion| motion.frame(now)),
             alphas: self.motion.body_alphas(now),
             replacing_text: self.motion.replacing_body_text(),
             body_probes: self.reader_bodies.body_probes.clone(),
@@ -5504,6 +5596,7 @@ impl Render for Inbox {
             | status_labels.outgoing.is_some()
             | status_labels.count_fade.is_some()
             | self.body_landing.is_some()
+            | self.regroup_motion.is_some()
             | conv.missing_fade.is_some()
             | (reader_current && panes.1 && preview_current && conv.feedback.running())
             | conv
@@ -5858,6 +5951,7 @@ struct ConvFrame {
     attachment_sizes: HashMap<(String, String), AttachmentSize>,
     now: Option<Instant>,
     card_alphas: HashMap<String, f32>,
+    regroup: Option<threading::RegroupFrame>,
     heights: HashMap<String, (f32, f32)>,
     outgoing_placeholders: HashMap<String, bool>,
     preview_padding: Option<PreviewPadding>,
@@ -8973,6 +9067,7 @@ pub fn read_conversation(
     } else {
         viewing
     };
+    let joined = store.thread_subject_joins(account, thread)?;
     let mut view = present::conversation(&messages, me, roles, names, scope);
     for (message, stored) in view.iter_mut().zip(&messages) {
         message.muted = muted;
@@ -8981,6 +9076,7 @@ pub fn read_conversation(
             .get(&message.id)
             .copied()
             .unwrap_or((fell_core::BodyState::Stored, fell_core::ReaderParts::Ready));
+        message.joined_by_subject = joined.contains(&stored.headers.message_id);
         message.body_state = state;
         message.reader_parts = parts;
         if state == fell_core::BodyState::Stored
@@ -9104,36 +9200,63 @@ fn conversation(
                     cx,
                 )
             };
+            let regroup = frame.regroup.as_ref().filter(|_| leaving.is_none());
+            let added = regroup.filter(|frame| frame.arriving.contains(&message.id));
             let block = if let Some(alpha) = frame.card_alphas.get(&message.id) {
                 div().opacity(*alpha).child(block).into_any_element()
             } else {
                 block
             };
-            let block = match frame.heights.get(&message.id) {
-                Some(&(from, progress))
-                    if progress < 1.0
-                        && message.expanded
-                        && !frame.body_probes.contains_key(&message.id) =>
-                {
-                    GrowingMessage {
-                        inner: block,
-                        width: px(columns.pane_right + 2. * MESSAGE_PAD_PX),
-                        from,
-                        progress,
-                        gap: px(MESSAGE_GAP_PX),
-                    }
-                    .into_any_element()
+            let block = if let Some(added) = added {
+                GrowingMessage {
+                    inner: div()
+                        .opacity(added.progress)
+                        .child(block)
+                        .into_any_element(),
+                    width: px(columns.pane_right + 2. * MESSAGE_PAD_PX),
+                    from: 0.,
+                    progress: added.progress,
+                    gap: px(if message.expanded {
+                        MESSAGE_GAP_PX * added.progress
+                    } else {
+                        0.
+                    }),
                 }
-                _ => block,
+                .into_any_element()
+            } else {
+                match frame.heights.get(&message.id) {
+                    Some(&(from, progress))
+                        if progress < 1.0
+                            && message.expanded
+                            && !frame.body_probes.contains_key(&message.id) =>
+                    {
+                        GrowingMessage {
+                            inner: block,
+                            width: px(columns.pane_right + 2. * MESSAGE_PAD_PX),
+                            from,
+                            progress,
+                            gap: px(MESSAGE_GAP_PX),
+                        }
+                        .into_any_element()
+                    }
+                    _ => block,
+                }
             };
             let block = if let Some(padding) = padding.filter(|_| index + 1 == shown.len()) {
                 padding.wrap_newest(block)
             } else {
                 block
             };
-            match &hold {
+            let block = match &hold {
                 Some(probes) => probes.wrap(index, block),
                 None => block,
+            };
+            if index == 0
+                && let Some(regroup) = regroup.filter(|frame| frame.gap > 0.)
+            {
+                div().pt(px(regroup.gap)).child(block).into_any_element()
+            } else {
+                block
             }
         })
         .collect();
@@ -9424,7 +9547,13 @@ fn collapsed_message(
             .as_ref()
             .map_or(0., |line| f32::from(line.width).ceil())
     };
-    let snippet_w = remaining - sender_w;
+    let marker = "joined by subject";
+    let mark_w = if message.joined_by_subject {
+        measure(marker) + rows.gap
+    } else {
+        0.
+    };
+    let snippet_w = (remaining - sender_w - mark_w).max(0.);
     let dates = columns.date_column();
     let row = div()
         .id(gpui::ElementId::named_usize("message", index))
@@ -9458,20 +9587,23 @@ fn collapsed_message(
                 }),
             )
         });
-    let leading =
-        div()
-            .flex()
-            .items_center()
-            .gap(px(rows.gap))
-            .child(
-                div()
-                    .w(px(sender_w))
-                    .flex_none()
-                    .whitespace_nowrap()
-                    .font_weight(FontWeight::MEDIUM)
-                    .children(sender.map(|line| line.text)),
-            )
-            .child(
+    let leading = div()
+        .flex()
+        .items_center()
+        .gap(px(rows.gap))
+        .child(
+            div()
+                .w(px(sender_w))
+                .flex_none()
+                .whitespace_nowrap()
+                .font_weight(FontWeight::MEDIUM)
+                .children(sender.map(|line| line.text)),
+        )
+        .when(message.joined_by_subject, |leading| {
+            leading.child(div().flex_none().text_color(rgb(dimmed)).child(marker))
+        })
+        .when(snippet_w > 0., |leading| {
+            leading.child(
                 div()
                     .w(px(snippet_w))
                     .flex_none()
@@ -9493,7 +9625,8 @@ fn collapsed_message(
                                     .child(line.text)
                             }),
                     ),
-            );
+            )
+        });
     message_date_row(
         row,
         rows.gap,
@@ -9597,8 +9730,20 @@ fn expanded_message_header(
     let line_height = sender_style.line_height_in_pixels(window.rem_size());
     let date = present::relative_date(now_unix(), message.date_unix);
     let date_width = line_px_with_style(window, &sender_style, &date, FontWeight::NORMAL).ceil();
+    let marker = "joined by subject";
+    let marker_width = if message.joined_by_subject {
+        MESSAGE_HEADER_GAP_PX
+            + line_px_with_style(window, &style, marker, FontWeight::NORMAL).ceil()
+    } else {
+        0.
+    };
     let status_width = status.map_or(0.0, |(_, retry)| {
-        reader_status_width(theme, retry, columns.card.width - date_width - 96., window)
+        reader_status_width(
+            theme,
+            retry,
+            columns.card.width - date_width - marker_width - 96.,
+            window,
+        )
     });
     let sender = present::display_safe(&message.sender);
     let email = present::display_safe(&message.email);
@@ -9639,6 +9784,7 @@ fn expanded_message_header(
         measure(&style, &email, FontWeight::NORMAL, theme.dimmed),
         measure(&style, &joined, FontWeight::NORMAL, theme.dimmed) + mute_room,
         date_width
+            + marker_width
             + if status.is_some() {
                 status_width + MESSAGE_HEADER_GAP_PX
             } else {
@@ -9745,6 +9891,15 @@ fn expanded_message_header(
                 .gap(px(MESSAGE_HEADER_GAP_PX))
                 .overflow_hidden()
                 .children(status.map(|slot| reader_status_text(theme, slot, status_width)))
+                .when(message.joined_by_subject, |header| {
+                    header.child(
+                        div()
+                            .flex_none()
+                            .text_size(px(theme.ui_px - 1.))
+                            .text_color(rgb(theme.dimmed))
+                            .child(marker),
+                    )
+                })
                 .child(paint_shaped_text(line, line_height, false))
         }),
     )
@@ -11451,7 +11606,7 @@ fn card_fit(
             let empty_label = choices.is_empty()
                 && matches!(
                     session.folder_intent,
-                    FolderIntent::Label | FolderIntent::LabelList
+                    FolderIntent::Label | FolderIntent::LabelList | FolderIntent::Merge
                 );
             Some(picker_card_height(
                 choices
@@ -11804,9 +11959,14 @@ fn folder_picker(
         session.folder_intent,
         FolderIntent::Label | FolderIntent::LabelList
     );
+    let merging = session.folder_intent == FolderIntent::Merge;
     let selected = session.folder_index;
     let match_query = session.folder_query.trim().to_ascii_lowercase();
-    let inset = if labeling { 2.0 * MARGIN } else { 0.0 };
+    let inset = if labeling || merging {
+        2.0 * MARGIN
+    } else {
+        0.0
+    };
     let width = PICKER_PX.min((f32::from(window.viewport_size().width) - inset).max(0.0));
     let label_room = (width - 2.0 - 2.0 * (PICKER_ROW_MARGIN + PICKER_ROW_PAD)).max(0.0);
     let style = conversation_line_style(window, theme, px(theme.ui_px));
@@ -11837,7 +11997,7 @@ fn folder_picker(
     div()
         .w(px(width))
         .max_w_full()
-        .when(labeling, |card| card.mx(px(MARGIN)))
+        .when(labeling || merging, |card| card.mx(px(MARGIN)))
         .min_w_0()
         .max_h(px(PICKER_MAX_PX))
         .bg(rgb(theme.surface))
@@ -11916,7 +12076,7 @@ fn folder_picker(
                 .overflow_y_scroll()
                 .track_scroll(scroll)
                 .my(px(present::CARD_ROW_INSET_PX))
-                .children((labeling && choices.is_empty()).then(|| {
+                .children(((labeling || merging) && choices.is_empty()).then(|| {
                     div()
                         .h(px(PICKER_ROW_PX))
                         .flex_none()
@@ -11924,7 +12084,13 @@ fn folder_picker(
                         .items_center()
                         .px(px(14.))
                         .text_color(rgb(theme.dimmed))
-                        .child(if session.folder_query.is_empty() {
+                        .child(if merging {
+                            if session.merge_loading {
+                                "Finding conversations…"
+                            } else {
+                                "No matching conversations"
+                            }
+                        } else if session.folder_query.is_empty() {
                             "No labels yet"
                         } else {
                             "No matching labels"
@@ -11938,10 +12104,11 @@ fn folder_picker(
                         } else {
                             0.0
                         };
+                    let room = if merging { room * 0.62 } else { room };
                     let clip = |text: &str| {
                         clip_shaped(window, &style, text, room, FontWeight::NORMAL, None)
                     };
-                    let label = if labeling {
+                    let label = if labeling || merging {
                         clip(&label)
                     } else {
                         fit_folder_path(&label, FolderFit::Picker(&match_query), clip, |line| {

@@ -151,7 +151,9 @@ impl Layout {
         Self::measure(
             theme.ui_px,
             window.viewport_size(),
-            session.detail_text(),
+            session.detail_text().or_else(|| Some(
+                "Joined by subject · Fell matched the subject and participants because reply headers were missing.".into()
+            )),
             |error, width| {
                 let style = conversation_line_style(window, theme, px(theme.ui_px));
                 window
@@ -294,7 +296,11 @@ fn card(
                                         .right_0()
                                         .top(px(-offset))
                                         .line_height(px(layout.row))
-                                        .text_color(rgb(theme.error))
+                                        .text_color(rgb(if session.detail_text().is_some() {
+                                            theme.error
+                                        } else {
+                                            theme.dimmed
+                                        }))
                                         .child(detail.clone()),
                                 )
                             },

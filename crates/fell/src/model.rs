@@ -195,6 +195,7 @@ pub enum FolderIntent {
     Move,
     Label,
     LabelList,
+    Merge,
 }
 
 /// One-line result of the last move or undo.
@@ -348,6 +349,18 @@ struct LabelSelection {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ThreadEdit {
+    Split {
+        thread: String,
+        message: String,
+    },
+    Merge {
+        sources: Vec<String>,
+        target: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FlagEdit {
     /// Thread ids, in list order.
     pub ids: Vec<String>,
@@ -400,6 +413,8 @@ pub struct Step {
     pub message_disclosure_changed: bool,
     pub move_edit: Option<MoveEdit>,
     pub read_label_targets: bool,
+    pub search_merge_targets: bool,
+    pub threading: Option<ThreadEdit>,
     pub labels: Option<LabelEdit>,
     pub triage: Option<snooze::TriageEdit>,
     /// Resolve a flag toggle against marked conversations outside the loaded page.
@@ -544,6 +559,10 @@ pub struct Session {
     pub folder_index: usize,
     pub folder_intent: FolderIntent,
     label_selection: LabelSelection,
+    pub merge_sources: Vec<String>,
+    pub merge_choices: Vec<PickerChoice>,
+    pub merge_search: u64,
+    pub merge_loading: bool,
     pub toast: Option<Toast>,
     pub startup_crash_notice: Option<Toast>,
     /// Counts notices shown; see [`Session::toast_generation`].
@@ -647,6 +666,10 @@ impl Session {
             folder_index: 0,
             folder_intent: FolderIntent::Go,
             label_selection: LabelSelection::default(),
+            merge_sources: Vec::new(),
+            merge_choices: Vec::new(),
+            merge_search: 0,
+            merge_loading: false,
             toast: None,
             startup_crash_notice: None,
             worker_outages: HashSet::new(),
@@ -760,6 +783,7 @@ impl Session {
                 }
                 "Move to"
             }
+            FolderIntent::Merge => "Merge into",
             FolderIntent::Go => "Folder",
             FolderIntent::Label => "Label",
             FolderIntent::LabelList => "Go to label",
@@ -1085,6 +1109,9 @@ impl Session {
     }
 
     pub fn picker_choices(&self) -> Vec<PickerChoice> {
+        if self.folder_intent == FolderIntent::Merge {
+            return self.merge_choices.clone();
+        }
         if matches!(
             self.folder_intent,
             FolderIntent::Label | FolderIntent::LabelList
@@ -2436,7 +2463,7 @@ impl Session {
             KeyId::Backspace => {
                 self.folder_query.pop();
                 self.folder_index = 0;
-                Step::default()
+                self.merge_query_changed()
             }
             KeyId::Up | KeyId::Ctrl('p') | KeyId::Ctrl('k') => {
                 let len = self.picker_choices().len();
@@ -2459,23 +2486,38 @@ impl Session {
             KeyId::Char(ch) => {
                 self.folder_query.push(ch);
                 self.folder_index = 0;
-                Step::default()
+                self.merge_query_changed()
             }
             KeyId::Space => {
                 self.folder_query.push(' ');
                 self.folder_index = 0;
-                Step::default()
+                self.merge_query_changed()
             }
             _ => Step::default(),
         }
     }
 
+    fn merge_query_changed(&mut self) -> Step {
+        if self.folder_intent != FolderIntent::Merge {
+            return Step::default();
+        }
+        self.merge_search = self.merge_search.wrapping_add(1);
+        self.merge_loading = true;
+        Step {
+            search_merge_targets: true,
+            ..Step::default()
+        }
+    }
+
     /// Enter or a click on the highlighted folder.
     pub fn confirm_folder(&mut self) -> Step {
+        if self.folder_intent == FolderIntent::Merge && self.merge_loading {
+            return Step::default();
+        }
         let Some(chosen) = self.picker_choices().into_iter().nth(self.folder_index) else {
             if matches!(
                 self.folder_intent,
-                FolderIntent::Label | FolderIntent::LabelList
+                FolderIntent::Label | FolderIntent::LabelList | FolderIntent::Merge
             ) {
                 return Step::default();
             }
@@ -2497,6 +2539,13 @@ impl Session {
         self.folder_query.clear();
         self.folder_intent = FolderIntent::Go;
         match intent {
+            FolderIntent::Merge => Step {
+                threading: Some(ThreadEdit::Merge {
+                    sources: std::mem::take(&mut self.merge_sources),
+                    target: name,
+                }),
+                ..Step::default()
+            },
             FolderIntent::Move => {
                 let Some(selection) = self.move_selection.take() else {
                     return Step::default();
@@ -2952,6 +3001,39 @@ impl Session {
                     folder: self.folder.clone(),
                     notice: self.toast_generation,
                 });
+            }
+            Action::SplitThread => {
+                self.count.clear();
+                if self.pane == Pane::Conversation
+                    && self.cursor_draft().is_none()
+                    && let Some(thread) = &self.cursor_id
+                    && let Some(message) = self.messages.get(self.message_cursor)
+                {
+                    step.threading = Some(ThreadEdit::Split {
+                        thread: thread.clone(),
+                        message: message.id.clone(),
+                    });
+                } else {
+                    self.show_toast("Focus a message to split its conversation", false);
+                }
+            }
+            Action::MergeThreads => {
+                self.count.clear();
+                self.merge_sources = self
+                    .action_targets()
+                    .into_iter()
+                    .filter(|id| present::draft_id_from_row(id).is_none())
+                    .collect();
+                if self.merge_sources.is_empty() {
+                    self.show_toast("Choose a conversation to merge", false);
+                } else {
+                    self.overlay = Overlay::Folders;
+                    self.folder_intent = FolderIntent::Merge;
+                    self.merge_choices.clear();
+                    self.folder_query.clear();
+                    self.folder_index = 0;
+                    return self.merge_query_changed();
+                }
             }
             Action::Undo => {
                 self.count.clear();
@@ -5310,6 +5392,40 @@ mod tests {
     }
 
     #[test]
+    fn threading_chords_take_the_focused_message_or_marked_threads() {
+        let mut session = session();
+        session.set_threads(vec![row("a"), row("b"), row("c")]);
+        let chord = |session: &mut Session, key| {
+            session.on_key(KeyId::Space, 10);
+            session.on_key(KeyId::Char('c'), 10);
+            session.on_key(KeyId::Char(key), 10)
+        };
+        session.on_key(KeyId::Char('x'), 10);
+        session.on_key(KeyId::Char('j'), 10);
+        session.on_key(KeyId::Char('x'), 10);
+        assert!(chord(&mut session, 'm').search_merge_targets);
+        assert_eq!(session.merge_sources, ["a", "b"]);
+        session.on_key(KeyId::Escape, 10);
+
+        session.on_key(KeyId::Char('V'), 10);
+        session.on_key(KeyId::Char('j'), 10);
+        assert!(chord(&mut session, 'm').search_merge_targets);
+        assert_eq!(session.merge_sources, ["b", "c"]);
+        session.on_key(KeyId::Escape, 10);
+
+        session.pane = Pane::Conversation;
+        session.set_messages(vec![empty_message(false), empty_message(true)]);
+        let wanted = session.messages[1].id.clone();
+        assert_eq!(
+            chord(&mut session, 's').threading,
+            Some(ThreadEdit::Split {
+                thread: "c".into(),
+                message: wanted
+            })
+        );
+    }
+
+    #[test]
     fn undo_selects_the_thread_that_came_back() {
         let mut session = session();
         session.cursor_id = Some("b".into());
@@ -6601,6 +6717,7 @@ mod tests {
             recipients: None,
             context: None,
             body_state: fell_core::BodyState::Stored,
+            joined_by_subject: false,
             reader_parts: Default::default(),
         }
     }

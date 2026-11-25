@@ -47,6 +47,7 @@ Decided with Jon on 2026-11-16. This is the bar the UX judges score against (eve
 - Stable height rows, no layout shift while syncing; new mail slides in without moving the selection.
 
 ## Conversation view
+- A dimmed “joined by subject” marker appears on replies whose subject and participants supplied the link. Help explains the marker. `Space c s` splits at the focused message and takes its replies along. `Space c m` opens a conversation picker for the current thread or the `x` or `V` selection. `u` undoes either edit.
 - Messages stacked oldest to newest; read messages collapsed to one line (sender, snippet, date), unread and the latest expanded.
 - Quoted history and signatures collapsed by default with a key to expand.
 - Native styled text by default; a key toggles to the web view for complex HTML; remote images blocked with a one-line, per-sender allow prompt.

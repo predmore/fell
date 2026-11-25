@@ -50,6 +50,7 @@ pub struct ThreadRow {
 pub struct ConvMessage {
     pub muted: bool,
     pub wake_at: Option<i64>,
+    pub joined_by_subject: bool,
     /// The message's Message-ID, which open state is kept by.
     pub id: String,
     pub sender: String,
@@ -878,6 +879,7 @@ pub fn conversation(
                 muted: false,
                 wake_at: None,
                 id: message.headers.message_id.as_str().to_string(),
+                joined_by_subject: false,
                 mail_headers: mail_headers(message),
                 sender: display_name(&message.headers.from.name, &email, me),
                 email,
@@ -1513,6 +1515,7 @@ mod tests {
             muted: false,
             wake_at: None,
             id: id.into(),
+            joined_by_subject: false,
             sender: "Ada".into(),
             email: "ada@x".into(),
             mail_headers: Vec::new(),

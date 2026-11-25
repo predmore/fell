@@ -21,7 +21,7 @@ use crate::search::{
     IndexedText, SearchHit, SearchOptions, SearchResults, fts5_phrase, sync_terms,
     terms_for_indexed,
 };
-use crate::threading::{ThreadId, resolve_thread_id};
+use crate::threading::ThreadId;
 
 pub(crate) mod bodies;
 pub(crate) mod copies;
@@ -37,7 +37,7 @@ pub(crate) use sent::retry_sent_write;
 pub(crate) mod sent_bcc;
 mod sent_echo_repair;
 mod summaries;
-mod threads;
+pub(crate) mod threads;
 pub(crate) mod triage;
 pub use triage::{MUTED, SNOOZED};
 pub(crate) mod views;
@@ -3127,9 +3127,7 @@ fn insert_arrival(
 
 fn insert_new(conn: &Connection, message: &Message, fingerprint: &str) -> Result<ThreadId> {
     let account_id = &message.account_id;
-    let thread_id = resolve_thread_id(&message.headers, |parent| {
-        thread_id_for_message_id(conn, account_id, parent)
-    })?;
+    let thread_id = threads::initial_thread(conn, account_id, &message.headers)?;
     let references = references_header(&message.headers);
     let mut folders = union_tokens("", &message.folders, false);
     if message.archived {
@@ -3282,9 +3280,7 @@ fn write_kept(
         .filter(|id| !id.is_empty())
         .map(MessageId::new);
     headers.references = parse_references(&references);
-    let thread_id = resolve_thread_id(&headers, |parent| {
-        thread_id_for_message_id(conn, &message.account_id, parent)
-    })?;
+    let thread_id = threads::initial_thread(conn, &message.account_id, &headers)?;
     // Duplicate copies union arrival folders and labels. Archive and snooze are
     // local triage, so a later copy must not clear them, and INBOX stays off
     // while the message is archived.
