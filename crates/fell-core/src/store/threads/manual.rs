@@ -234,6 +234,7 @@ impl Store {
             }
         }
         if branch.len() == rows.len() {
+            tx.commit()?;
             return Err(Error::Action(
                 "This message and its replies already make up the conversation".into(),
             ));
@@ -285,6 +286,9 @@ impl Store {
             .collect::<Result<BTreeSet<_>>>()?;
         sources.remove(target.as_str());
         if sources.is_empty() {
+            // The automatic pass already joined the selection. Keep its
+            // result even though there is no manual edit to record.
+            tx.commit()?;
             return Err(Error::Action("Choose another conversation".into()));
         }
         ensure_action_schema(&tx)?;
@@ -454,11 +458,10 @@ pub(crate) fn undo(
     } else {
         restore_notes(conn, account, action.id)?;
     }
-    store.rethread_written(conn, account)?;
-    if action.kind == ActionKind::MergeThreads {
-        // A reply that came in during the merge follows its restored
-        // ancestor even if Proton gave it the temporary destination's id.
-        // Move only that reply, without creating a new manual assignment.
+    let header_parents = store.rethread_written(conn, account)?;
+    if !arrivals.is_empty() {
+        // A late reply follows its restored ancestor even if Proton gave it
+        // another id. Active edits still place replies and late header parents.
         let manual = ManualThreads::load(conn, account_id)?;
         let mut anchors = ManualThreads::default();
         for id in &restored {
@@ -470,11 +473,14 @@ pub(crate) fn undo(
             "SELECT {} FROM messages WHERE account_id = ?1 AND message_id = ?2",
             super::THREADING_COLS,
         ))?;
+        let mut active = HashMap::new();
         let mut resolved = HashMap::new();
         for row in &arrivals {
             if !late_parents.contains(&row.headers.message_id)
-                && stored_parent(conn, account_id, &row.headers.message_id)?
-                    .is_some_and(|current| !manual.pinned(current.thread.as_str()))
+                && !header_parents.contains_key(&row.headers.message_id)
+                && manual
+                    .destination(conn, account_id, row, &mut read, &mut active)?
+                    .is_none()
                 && let Some(destination) =
                     anchors.destination(conn, account_id, row, &mut read, &mut resolved)?
             {

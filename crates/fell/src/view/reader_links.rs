@@ -476,6 +476,69 @@ mod tests {
     }
 
     #[test]
+    fn regrouping_keeps_focus_on_the_retained_message_and_skips_departing_links() {
+        const DEPARTING: &str = "https://example.test/departing";
+        const RETAINED: &str = "https://example.test/retained";
+        let (mut app, inbox) = super::super::tests::pending_inbox();
+        let window_handle: gpui::AnyWindowHandle = inbox.into();
+        let draw = |app: &mut gpui::TestAppContext| {
+            window_handle
+                .update(app, |_, window, cx| window.draw(cx).clear())
+                .unwrap();
+        };
+        inbox
+            .update(&mut app, |inbox, window, cx| {
+                let mut retained = inbox.session.messages.last().unwrap().clone();
+                retained.expanded = true;
+                retained.body_state = fell_core::BodyState::Stored;
+                retained.reader_parts = fell_core::ReaderParts::Ready;
+                retained.rich = Rich::Plain;
+                let mut departing = retained.clone();
+                departing.id = "departing-message@example.test".into();
+                departing.body = crate::text_render::render_stored_body(Some(DEPARTING), "", "");
+                retained.body = crate::text_render::render_stored_body(Some(RETAINED), "", "");
+                inbox.session.set_messages(vec![departing, retained]);
+                window.focus(&inbox.focus);
+                inbox.session.on_key(crate::keymap::KeyId::Tab, 10);
+                cx.notify();
+            })
+            .unwrap();
+        draw(&mut app);
+
+        let retained_focus = inbox
+            .update(&mut app, |inbox, window, cx| {
+                assert!(inbox.focus_link(false, false, Some(DEPARTING), window, cx));
+                assert!(inbox.focus_link(false, false, Some(RETAINED), window, cx));
+                let focused = window.focused(cx).unwrap();
+                let retained = inbox.session.messages[1].clone();
+                let thread = inbox.session.cursor_id.clone().unwrap();
+                inbox.regroup_conversation(vec![retained], &thread, 1);
+                let now = inbox.motion.clock.now();
+                assert!(
+                    inbox
+                        .regroup_motion
+                        .as_ref()
+                        .unwrap()
+                        .frame(now)
+                        .departing
+                        .contains_key(&0)
+                );
+                cx.notify();
+                focused
+            })
+            .unwrap();
+        draw(&mut app);
+
+        inbox
+            .update(&mut app, |inbox, window, cx| {
+                assert!(retained_focus.is_focused(window));
+                assert!(inbox.focus.contains(&retained_focus, window));
+                assert!(!inbox.focus_link(false, false, Some(DEPARTING), window, cx));
+            })
+            .unwrap();
+    }
+
+    #[test]
     fn link_previews_take_turns_in_the_status_slot() {
         let preview = |domain: &str| LinkPreview {
             destination: domain.to_owned().into(),

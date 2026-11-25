@@ -1109,13 +1109,17 @@ impl Store {
         Ok(())
     }
 
-    fn rethread_written(&self, conn: &Connection, account_id: &AccountId) -> Result<()> {
+    fn rethread_written(
+        &self,
+        conn: &Connection,
+        account_id: &AccountId,
+    ) -> Result<HashMap<MessageId, ThreadId>> {
         #[cfg(test)]
         if self.full_rethread.get() {
             threads::index_queued_subjects(conn)?;
-            threads::rethread_all(conn, account_id)?;
+            let header_parents = threads::rethread_all(conn, account_id)?;
             conn.execute_batch("DELETE FROM thread_dirty_rows; DELETE FROM thread_dirty_ids;")?;
-            return Ok(());
+            return Ok(header_parents);
         }
         threads::rethread_dirty(conn, account_id)
     }

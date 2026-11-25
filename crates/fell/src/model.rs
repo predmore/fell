@@ -2476,6 +2476,11 @@ impl Session {
                 self.folder_index = 0;
                 self.merge_query_changed()
             }
+            KeyId::Up | KeyId::Down | KeyId::Ctrl('p' | 'k' | 'n' | 'j')
+                if self.folder_intent == FolderIntent::Merge && self.merge_loading =>
+            {
+                Step::default()
+            }
             KeyId::Up | KeyId::Ctrl('p') | KeyId::Ctrl('k') => {
                 let len = self.picker_choices().len();
                 if len > 0 {
@@ -5435,6 +5440,10 @@ mod tests {
         session.merge_choices = vec![choice("b"), choice("c")];
         assert!(session.confirm_pending_merge().threading.is_none());
         session.on_key(KeyId::Char('e'), 10);
+        session.on_key(KeyId::Down, 10);
+        assert_eq!(session.folder_index, 0);
+        session.on_key(KeyId::Ctrl('p'), 10);
+        assert_eq!(session.folder_index, 0);
         assert!(session.on_key(KeyId::Enter, 10).threading.is_none());
         session.folder_index = 1;
         session.merge_loading = false;

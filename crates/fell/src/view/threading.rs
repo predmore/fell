@@ -1,18 +1,23 @@
 use super::*;
 
+const MERGE_FEEDBACK_DELAY: Duration = Duration::from_millis(120);
+const TITLE_EXIT: Duration = Duration::from_millis(60);
+
 pub(super) struct RegroupMotion {
     pub transition: Transition,
     pub anchor: Option<ScrollAnchor>,
     departing: Arc<HashMap<usize, Vec<DepartingMessage>>>,
-    old_title: String,
+    title: Option<(String, LayerSwap)>,
     arriving: HashSet<String>,
+    previous_markers: Arc<HashMap<String, Option<String>>>,
 }
 
 pub(super) struct RegroupFrame {
     pub departing: Arc<HashMap<usize, Vec<DepartingMessage>>>,
-    pub old_title: String,
+    pub title: Option<(String, motion::SwapFrame)>,
     pub progress: f32,
     pub arriving: HashSet<String>,
+    pub previous_markers: Arc<HashMap<String, Option<String>>>,
 }
 
 pub(super) struct DepartingMessage {
@@ -21,13 +26,25 @@ pub(super) struct DepartingMessage {
 }
 
 impl RegroupMotion {
+    pub fn running(&self, now: Instant) -> bool {
+        self.transition.running(now)
+            || self
+                .title
+                .as_ref()
+                .is_some_and(|(_, swap)| swap.frame(now).is_some())
+    }
+
     pub fn frame(&self, now: Instant) -> RegroupFrame {
         let progress = self.transition.progress(now);
         RegroupFrame {
             departing: self.departing.clone(),
-            old_title: self.old_title.clone(),
+            title: self
+                .title
+                .as_ref()
+                .and_then(|(title, swap)| swap.frame(now).map(|frame| (title.clone(), frame))),
             progress,
             arriving: self.arriving.clone(),
+            previous_markers: self.previous_markers.clone(),
         }
     }
 }
@@ -61,6 +78,16 @@ impl Inbox {
         let me = self.session.account_email.clone();
         let sources = self.session.merge_sources.clone();
         let query = self.session.folder_query.clone();
+        self.merge_feedback_at = Some(Instant::now() + MERGE_FEEDBACK_DELAY);
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(MERGE_FEEDBACK_DELAY).await;
+            let _ = this.update(cx, |inbox, cx| {
+                if inbox.merge_query_loading() && inbox.session.merge_search == generation {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
         let reply = self
             .store
             .call(move |store| store.merge_candidates(&account, &sources, &query, &me));
@@ -77,6 +104,7 @@ impl Inbox {
                     return;
                 }
                 session.merge_loading = false;
+                inbox.merge_feedback_at = None;
                 let before = inbox.before_step();
                 let session = &mut inbox.session;
                 match result {
@@ -117,6 +145,26 @@ impl Inbox {
             });
         })
         .detach();
+    }
+
+    fn merge_query_loading(&self) -> bool {
+        self.session.overlay == Overlay::Folders
+            && self.session.folder_intent == FolderIntent::Merge
+            && self.session.merge_loading
+    }
+
+    pub(super) fn merge_feedback(&self, now: Instant) -> (f32, bool) {
+        if self.merge_query_loading()
+            && let Some(start) = self.merge_feedback_at
+            && now >= start
+        {
+            let fade = self.motion.motion.start(motion::QUICK, start);
+            return (
+                motion::progress(fade.as_ref(), now),
+                fade.is_some_and(|fade| fade.running(now)),
+            );
+        }
+        (0., false)
     }
 
     pub(super) fn edit_threading(&mut self, edit: ThreadEdit, cx: &mut Context<Self>) {
@@ -206,7 +254,11 @@ impl Inbox {
                 Err(err) => {
                     inbox.session.show_toast(err.to_string(), true);
                     inbox.expire_action_notice(cx);
-                    matches!(err, fell_core::Error::UnknownThread).then_some(ReadIntent {
+                    matches!(
+                        err,
+                        fell_core::Error::UnknownThread | fell_core::Error::Action(_)
+                    )
+                    .then_some(ReadIntent {
                         refresh_open: true,
                         ..ReadIntent::default()
                     })
@@ -218,7 +270,12 @@ impl Inbox {
 
     /// Membership changed while the reader's selected message stayed in
     /// view. Reuse its disclosure state, focus and last drawn scroll anchor.
-    pub(super) fn regroup_conversation(&mut self, view: Vec<ConvMessage>, generation: u64) {
+    pub(super) fn regroup_conversation(
+        &mut self,
+        view: Vec<ConvMessage>,
+        target: &str,
+        generation: u64,
+    ) {
         let anchor = self
             .conv_layout_current
             .then(|| {
@@ -229,12 +286,11 @@ impl Inbox {
                 )
             })
             .flatten();
-        let transition = self
-            .motion
-            .motion
-            .start(motion::FADE, self.motion.clock.now());
+        let now = self.motion.clock.now();
+        let transition = self.motion.motion.start(motion::FADE, now);
         let mut departing = HashMap::<_, Vec<_>>::new();
         let mut arriving = HashSet::new();
+        let mut previous_markers = HashMap::new();
         if transition.is_some() {
             let indices: HashMap<_, _> = view
                 .iter()
@@ -247,6 +303,10 @@ impl Inbox {
                 if let Some(&slot) = indices.get(old.id.as_str()) {
                     next_slot = slot;
                     retained.insert(old.id.as_str());
+                    let previous = old.grouping_marker(None);
+                    if previous != view[slot].grouping_marker(None) {
+                        previous_markers.insert(old.id.clone(), previous);
+                    }
                 } else if self.conv_layout_current
                     && let Some(bounds) = self
                         .conv_scroll
@@ -278,12 +338,21 @@ impl Inbox {
             anchor.index = self.session.message_cursor;
             anchor
         });
+        let title = self
+            .session
+            .threads
+            .iter()
+            .find(|row| row.id == target)
+            .filter(|row| !self.open_subject.is_empty() && row.subject != self.open_subject)
+            .and_then(|_| LayerSwap::start(self.motion.motion, now, TITLE_EXIT, motion::QUICK))
+            .map(|swap| (self.open_subject.clone(), swap));
         self.regroup_motion = transition.map(|transition| RegroupMotion {
             transition,
             anchor,
             departing: Arc::new(departing),
-            old_title: self.open_subject.clone(),
+            title,
             arriving,
+            previous_markers: Arc::new(previous_markers),
         });
         self.sent_arrival_anchor = anchor.filter(|_| transition.is_none());
         self.reveal = Reveal::Reading {

@@ -435,7 +435,11 @@ fn index_refs(
 /// Re-resolve the rows `account_id`'s writes queued since the last pass, and
 /// the stored replies that name a queued Message-ID. Clears that account's
 /// queue. Other accounts' queued rows wait for their own pass.
-pub(super) fn rethread_dirty(conn: &Connection, account_id: &AccountId) -> Result<()> {
+/// Returns header parents placed by active manual edits.
+pub(super) fn rethread_dirty(
+    conn: &Connection,
+    account_id: &AccountId,
+) -> Result<HashMap<MessageId, ThreadId>> {
     let account = account_id.as_str();
     let dirty = {
         let mut stmt = conn.prepare_cached(
@@ -532,7 +536,7 @@ pub(super) fn rethread_dirty(conn: &Connection, account_id: &AccountId) -> Resul
         }
     }
     if affected.is_empty() {
-        return Ok(());
+        return Ok(HashMap::new());
     }
 
     let manual = ManualThreads::load(conn, account)?;
@@ -543,7 +547,7 @@ pub(super) fn rethread_dirty(conn: &Connection, account_id: &AccountId) -> Resul
         rows.extend(manual.apply(conn, account, affected_rows(conn, account, &added)?)?);
         rows.sort_unstable_by_key(|row| row.rowid);
     }
-    manual.move_header_parents(conn, account, &mut rows)?;
+    let header_parents = manual.place_header_parents(conn, account, &mut rows)?;
 
     let mut parents: HashMap<MessageId, Option<ThreadId>> = HashMap::new();
     let mut lookup = |parent: &MessageId| -> Result<Option<ThreadId>> {
@@ -577,7 +581,8 @@ pub(super) fn rethread_dirty(conn: &Connection, account_id: &AccountId) -> Resul
         account_id,
         &mut union,
         nodes.iter().map(String::as_str),
-    )
+    )?;
+    Ok(header_parents)
 }
 
 fn affected_rows(
@@ -871,6 +876,9 @@ impl ManualThreads {
         read: &mut rusqlite::Statement<'_>,
         resolved: &mut HashMap<MessageId, Option<ThreadId>>,
     ) -> Result<Option<ThreadId>> {
+        if self.overrides.is_empty() {
+            return Ok(None);
+        }
         let mut ancestors = Vec::new();
         let mut next = None;
         let destination = loop {
@@ -908,32 +916,37 @@ impl ManualThreads {
 
     /// An explicitly placed child can claim a late header parent. Move the
     /// canonical message alone, leaving its previous thread's other rows.
-    fn move_header_parents(
+    /// Include parents that already occupy their child's manual destination.
+    fn place_header_parents(
         &self,
         conn: &Connection,
         account: &str,
         rows: &mut [ThreadingRow],
-    ) -> Result<()> {
-        let mut moved = HashMap::new();
+    ) -> Result<HashMap<MessageId, ThreadId>> {
+        let mut placed = HashMap::new();
         for row in rows
             .iter()
             .filter(|row| self.overrides.contains_key(&row.headers.message_id))
         {
             if let Some(parent) = header_parent(conn, account, row)?
-                && !self.pinned(parent.thread.as_str())
+                && (parent.thread == row.thread_id || !self.pinned(parent.thread.as_str()))
             {
-                set_member_thread(conn, account, &parent.id, &row.thread_id)?;
-                moved.insert(parent.id, row.thread_id.clone());
+                if parent.thread != row.thread_id {
+                    set_member_thread(conn, account, &parent.id, &row.thread_id)?;
+                }
+                placed.insert(parent.id, row.thread_id.clone());
             }
         }
-        if !moved.is_empty() {
+        if !placed.is_empty() {
             for row in rows {
-                if let Some(thread) = moved.remove(&row.headers.message_id) {
-                    row.thread_id = thread;
+                if let Some(thread) = placed.get(&row.headers.message_id)
+                    && row.thread_id != *thread
+                {
+                    row.thread_id = thread.clone();
                 }
             }
         }
-        Ok(())
+        Ok(placed)
     }
 }
 
@@ -956,14 +969,17 @@ fn set_member_thread(
 /// stay apart. Non-proton merges keep the earliest already-assigned id.
 /// Reads every row in the account, so only upgrades call it; writes use
 /// [`rethread_dirty`].
-pub(super) fn rethread_all(conn: &Connection, account_id: &AccountId) -> Result<()> {
+pub(super) fn rethread_all(
+    conn: &Connection,
+    account_id: &AccountId,
+) -> Result<HashMap<MessageId, ThreadId>> {
     let account = account_id.as_str();
     let manual = ManualThreads::load(conn, account)?;
     let mut rows = manual.apply(conn, account, load_threading_rows(conn, account_id)?)?;
     if rows.is_empty() {
-        return Ok(());
+        return Ok(HashMap::new());
     }
-    manual.move_header_parents(conn, account, &mut rows)?;
+    let header_parents = manual.place_header_parents(conn, account, &mut rows)?;
 
     let mut by_message: HashMap<MessageId, ThreadId> = rows
         .iter()
@@ -994,7 +1010,8 @@ pub(super) fn rethread_all(conn: &Connection, account_id: &AccountId) -> Result<
         account_id,
         &mut union,
         nodes.iter().map(String::as_str),
-    )
+    )?;
+    Ok(header_parents)
 }
 
 /// Merges to apply, in row order: each row's thread onto the thread its
@@ -1769,6 +1786,42 @@ mod tests {
     }
 
     #[test]
+    fn a_merge_already_done_by_queued_rethreading_commits_the_automatic_join() {
+        let store = Store::open_in_memory().unwrap();
+        let acct = account();
+        store.upsert_account(&acct).unwrap();
+        let mail = |id, date| message(id, None, &[], None, "INBOX", "a@x", id, date, None);
+        let target = store.upsert_message(&mail("a@x", 100)).unwrap();
+        let source = store.upsert_message(&mail("b@x", 200)).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE messages SET in_reply_to = 'a@x' WHERE message_id = 'b@x'",
+                [],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.merge_threads(&acct.id, std::slice::from_ref(&source), &target),
+            Err(crate::Error::Action(message)) if message == "Choose another conversation"
+        ));
+        assert_eq!(store.thread_messages(&acct.id, &target).unwrap().len(), 2);
+        assert!(
+            store
+                .folder_key_of(&acct.id, "INBOX", &source)
+                .unwrap()
+                .is_none()
+        );
+        let dirty: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM thread_dirty_rows", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(dirty, 0);
+    }
+
+    #[test]
     fn an_unrelated_subject_chain_does_not_expand_the_manual_dirty_set() {
         let store = Store::open_in_memory().unwrap();
         let account = account();
@@ -2026,6 +2079,126 @@ mod tests {
                 .thread_messages(&account, &ThreadId::proton("three"))
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn undoing_a_merge_routes_late_replies_away_from_a_still_pinned_destination() {
+        for earlier_split in [false, true] {
+            let store = Store::open_in_memory().unwrap();
+            let acct = account();
+            store.upsert_account(&acct).unwrap();
+            let mail = |id, parent, proton: &str, date| {
+                message(
+                    id,
+                    parent,
+                    &[],
+                    Some(proton.into()),
+                    "INBOX",
+                    "a@x",
+                    id,
+                    date,
+                    None,
+                )
+            };
+            let target = store
+                .upsert_message(&mail("team@x", None, "team", 100))
+                .unwrap();
+            let first = store
+                .upsert_message(&mail(
+                    "first@x",
+                    None,
+                    if earlier_split { "team" } else { "one" },
+                    200,
+                ))
+                .unwrap();
+            let first = if earlier_split {
+                store
+                    .split_thread(&acct.id, &MessageId::new("first@x"))
+                    .unwrap()
+            } else {
+                store.merge_threads(&acct.id, &[first], &target).unwrap()
+            };
+            let second = store
+                .upsert_message(&mail("second@x", None, "two", 300))
+                .unwrap();
+            store
+                .merge_threads(&acct.id, std::slice::from_ref(&second), &target)
+                .unwrap();
+            let reply = mail("reply@x", Some("second@x"), "team", 400);
+            assert_eq!(store.upsert_message(&reply).unwrap(), target);
+            let team_reply = mail("team-reply@x", Some("team@x"), "team", 500);
+            assert_eq!(store.upsert_message(&team_reply).unwrap(), target);
+
+            assert_eq!(
+                store.undo(&acct.id).unwrap().kind,
+                crate::ActionKind::MergeThreads
+            );
+            let thread = |id| {
+                store
+                    .thread_for_message(&acct.id, &MessageId::new(id))
+                    .unwrap()
+                    .unwrap()
+            };
+            assert_eq!(thread("first@x"), first);
+            assert_eq!(thread("second@x"), second);
+            assert_eq!(thread("reply@x"), second);
+            assert_eq!(thread("team-reply@x"), target);
+            assert!(
+                stored_override(&store.conn, acct.id.as_str(), &reply.headers.message_id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn undoing_a_split_routes_late_replies_filed_under_a_new_proton_key() {
+        let store = Store::open_in_memory().unwrap();
+        let acct = account();
+        store.upsert_account(&acct).unwrap();
+        let mail = |id, parent, proton: &str, date| {
+            message(
+                id,
+                parent,
+                &[],
+                Some(proton.into()),
+                "INBOX",
+                "a@x",
+                id,
+                date,
+                None,
+            )
+        };
+        let team = store
+            .upsert_message(&mail("a@x", None, "team", 100))
+            .unwrap();
+        store
+            .upsert_message(&mail("b@x", Some("a@x"), "team", 200))
+            .unwrap();
+        let detached = store
+            .split_thread(&acct.id, &MessageId::new("b@x"))
+            .unwrap();
+        let reply = mail("reply@x", Some("b@x"), "fresh", 300);
+        assert_eq!(store.upsert_message(&reply).unwrap(), detached);
+        let later = mail("later@x", Some("reply@x"), "fresher", 400);
+        assert_eq!(store.upsert_message(&later).unwrap(), detached);
+
+        assert_eq!(
+            store.undo(&acct.id).unwrap().kind,
+            crate::ActionKind::SplitThread
+        );
+        assert_eq!(store.thread_messages(&acct.id, &team).unwrap().len(), 4);
+        assert!(
+            store
+                .thread_messages(&acct.id, &detached)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            stored_override(&store.conn, acct.id.as_str(), &reply.headers.message_id)
+                .unwrap()
+                .is_none()
         );
     }
 
