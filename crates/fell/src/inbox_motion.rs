@@ -121,6 +121,7 @@ pub struct Layer {
     folder_query: String,
     folder_index: usize,
     folder_intent: FolderIntent,
+    snooze: Option<crate::model::snooze::Picker>,
     agents: Option<crate::model::agents::Agents>,
     activity: Option<crate::model::activity::Activity>,
     palette_origin: Overlay,
@@ -145,6 +146,11 @@ impl Layer {
             folder_query: session.folder_query.clone(),
             folder_index: session.folder_index,
             folder_intent: session.folder_intent,
+            snooze: (session.overlay == Overlay::Snooze).then(|| {
+                let mut picker = session.snooze.clone();
+                picker.ids.clear();
+                picker
+            }),
             agents: (session.overlay == Overlay::Agents
                 || session.palette_origin == Overlay::Agents)
                 .then(|| session.agents.clone()),
@@ -171,6 +177,9 @@ impl Layer {
         std::mem::swap(&mut self.folder_query, &mut session.folder_query);
         std::mem::swap(&mut self.folder_index, &mut session.folder_index);
         std::mem::swap(&mut self.folder_intent, &mut session.folder_intent);
+        if let Some(picker) = &mut self.snooze {
+            std::mem::swap(picker, &mut session.snooze);
+        }
         if let Some(agents) = &mut self.agents {
             std::mem::swap(agents, &mut session.agents);
         }

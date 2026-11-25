@@ -21,7 +21,9 @@ use std::ops::RangeBounds;
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
-use super::{FolderThread, decode_participants, folder_query_names, split_field, unique_tokens};
+use super::{
+    FolderThread, decode_participants, folder_query_names, split_field, triage, unique_tokens,
+};
 use crate::Result;
 use crate::account::AccountId;
 use crate::threading::ThreadId;
@@ -92,6 +94,9 @@ CREATE INDEX IF NOT EXISTS idx_thread_folders_list
 -- Only the unread rows, so the header's count reads nothing else.
 CREATE INDEX IF NOT EXISTS idx_thread_folders_unread
     ON thread_folders(account_id, folder_key, thread_id) WHERE unread = 1;
+CREATE INDEX IF NOT EXISTS idx_thread_folders_snooze_due
+    ON thread_folders(last_date, account_id, thread_id)
+    WHERE folder_key = char(31) || 'snoozed';
 "#;
 
 const LABEL_TABLE: &str = r#"
@@ -113,12 +118,15 @@ const INSERT_LABEL: &str =
     "INSERT OR IGNORE INTO thread_labels (account_id, thread_id, label, last_date, unread)
      VALUES (?1, ?2, ?3, ?4, ?5)";
 
-/// Version 2 added `thread_folders.last_date`. Version 3 added `thread_labels`.
-const SUMMARY_VERSION: &str = "3";
+/// Version 4 projects existing snoozes into the folder index.
+const SUMMARY_VERSION: &str = "4";
+
+const QUEUE_STORED_SNOOZES: &str = "INSERT OR IGNORE INTO thread_summary_dirty
+    SELECT DISTINCT account_id, thread_id FROM messages WHERE snooze_until IS NOT NULL";
 
 /// Bump when [`SUMMARY_TRIGGERS`] changes. They are rebuilt only then, in
 /// one transaction (see [`super::ensure_triggers`]).
-const SUMMARY_TRIGGERS_VERSION: &str = "1";
+const SUMMARY_TRIGGERS_VERSION: &str = "2";
 
 // Inserts check NOT EXISTS instead of OR IGNORE: an UPSERT that fires a
 // trigger overrides the trigger's own conflict clause.
@@ -138,7 +146,7 @@ END;
 
 CREATE TRIGGER thread_summary_update AFTER UPDATE OF
     account_id, thread_id, subject, snippet, date_unix, unread, folders, archived,
-    starred, has_attachment, from_email, from_name, labels
+    starred, has_attachment, from_email, from_name, labels, snooze_until
 ON messages BEGIN
     INSERT INTO thread_summary_dirty (account_id, thread_id)
     SELECT old.account_id, old.thread_id
@@ -184,6 +192,12 @@ pub(super) fn ensure_thread_summaries(conn: &Connection) -> Result<()> {
         tx.execute_batch(FOLDER_TABLE)?;
         return tx.commit();
     }
+    if version.as_deref() == Some("3") {
+        tx.execute_batch(FOLDER_TABLE)?;
+        tx.execute(QUEUE_STORED_SNOOZES, [])?;
+        stamp_version(&tx)?;
+        return tx.commit();
+    }
     let from_v1 = version.as_deref() == Some("1") && table_exists(&tx, "thread_folders")?;
     if from_v1 {
         // Version 1 rows are right apart from the date. Add it from the
@@ -211,6 +225,7 @@ pub(super) fn ensure_thread_summaries(conn: &Connection) -> Result<()> {
         tx.execute_batch(LABEL_TABLE)?;
         tx.execute("DELETE FROM thread_labels", [])?;
         backfill_labels(&tx)?;
+        tx.execute(QUEUE_STORED_SNOOZES, [])?;
         stamp_version(&tx)?;
         return tx.commit();
     }
@@ -343,7 +358,10 @@ pub(super) fn refresh_dirty(conn: &Connection) -> Result<()> {
     for (account, thread) in &queued {
         let keys = old_keys.query_map(params![account, thread], |row| row.get::<_, String>(0))?;
         for key in keys {
-            touched.insert((account.clone(), key?));
+            let key = key?;
+            if !is_virtual(&key) {
+                touched.insert((account.clone(), physical_key(&key).to_owned()));
+            }
         }
         drop_summary.execute(params![account, thread])?;
         drop_folders.execute(params![account, thread])?;
@@ -373,7 +391,9 @@ pub(super) fn refresh_dirty(conn: &Connection) -> Result<()> {
                 ])?;
             }
             for folder in &summary.folders {
-                touched.insert((account.clone(), folder.key.clone()));
+                if !is_virtual(&folder.key) {
+                    touched.insert((account.clone(), physical_key(&folder.key).to_owned()));
+                }
                 put_folder.execute(params![
                     account,
                     folder.key,
@@ -382,7 +402,7 @@ pub(super) fn refresh_dirty(conn: &Connection) -> Result<()> {
                     folder.first_rowid,
                     folder.first_pos as i64,
                     i64::from(folder.unread),
-                    summary.last_date,
+                    folder.date.unwrap_or(summary.last_date),
                 ])?;
             }
         } else {
@@ -391,10 +411,19 @@ pub(super) fn refresh_dirty(conn: &Connection) -> Result<()> {
         unqueue.execute(params![account, thread])?;
     }
     let mut earliest = conn.prepare_cached(
-        "SELECT display, first_rowid, first_pos FROM thread_folders
-         WHERE account_id = ?1 AND folder_key = ?2 AND display IS NOT NULL
-         ORDER BY first_rowid, first_pos
-         LIMIT 1",
+        "SELECT display, first_rowid, first_pos FROM (
+             SELECT * FROM (
+                 SELECT display, first_rowid, first_pos FROM thread_folders
+                 WHERE account_id = ?1 AND folder_key = ?2 AND display IS NOT NULL
+                 ORDER BY first_rowid, first_pos LIMIT 1
+             )
+             UNION ALL
+             SELECT * FROM (
+                 SELECT display, first_rowid, first_pos FROM thread_folders
+                 WHERE account_id = ?1 AND folder_key = char(31, 31) || ?2 AND display IS NOT NULL
+                 ORDER BY first_rowid, first_pos LIMIT 1
+             )
+         ) ORDER BY first_rowid, first_pos LIMIT 1",
     )?;
     let mut put_name = conn.prepare_cached(
         "INSERT INTO account_folders (account_id, folder_key, display, first_rowid, first_pos)
@@ -440,6 +469,7 @@ struct Summary {
     /// Non-empty label fields, oldest first, joined by `\x1e`.
     labels: String,
     folders: Vec<Membership>,
+    muted: bool,
 }
 
 struct Membership {
@@ -449,6 +479,7 @@ struct Membership {
     first_rowid: i64,
     first_pos: usize,
     unread: bool,
+    date: Option<i64>,
 }
 
 /// Summary of one thread from its messages, or `None` when it has none.
@@ -456,7 +487,7 @@ fn compute(conn: &Connection, account: &str, thread: &str) -> Result<Option<Summ
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT rowid, subject, snippet, date_unix, unread, folders, archived, starred,
                 has_attachment, from_email, from_name, labels, ({}),
-                CASE WHEN folders = '' AND NOT archived THEN {} ELSE 0 END
+                CASE WHEN folders = '' AND NOT archived THEN {} ELSE 0 END, snooze_until
          FROM messages m
          WHERE account_id = ?1 AND thread_id = ?2
          ORDER BY date_unix ASC, rowid ASC",
@@ -469,6 +500,7 @@ fn compute(conn: &Connection, account: &str, thread: &str) -> Result<Option<Summ
     let mut labels: Vec<String> = Vec::new();
     let mut folders: Vec<Membership> = Vec::new();
     let mut at: HashMap<String, usize> = HashMap::new();
+    let mut snoozed = None;
     while let Some(row) = rows.next()? {
         let rowid: i64 = row.get(0)?;
         let subject: String = row.get(1)?;
@@ -484,6 +516,7 @@ fn compute(conn: &Connection, account: &str, thread: &str) -> Result<Option<Summ
         let label_field: String = row.get(11)?;
         let views: Option<String> = row.get(12)?;
         let has_view_copy: bool = row.get(13)?;
+        snoozed = snoozed.max(row.get::<_, Option<i64>>(14)?.filter(|until| *until > 0));
 
         participants.push(format!(
             "{}\u{1f}{from_email}",
@@ -529,6 +562,7 @@ fn compute(conn: &Connection, account: &str, thread: &str) -> Result<Option<Summ
                         first_rowid: rowid,
                         first_pos: pos,
                         unread,
+                        date: None,
                     });
                 }
             }
@@ -548,6 +582,7 @@ fn compute(conn: &Connection, account: &str, thread: &str) -> Result<Option<Summ
                     participants: String::new(),
                     labels: String::new(),
                     folders: Vec::new(),
+                    muted: false,
                 });
             }
             Some(summary) => {
@@ -563,20 +598,70 @@ fn compute(conn: &Connection, account: &str, thread: &str) -> Result<Option<Summ
             }
         }
     }
-    Ok(summary.map(|mut summary| {
-        summary.participants = participants.join("\u{1e}");
-        summary.labels = labels.join("\u{1e}");
-        summary.folders = folders;
-        summary
-    }))
+    let Some(mut summary) = summary else {
+        return Ok(None);
+    };
+    summary.muted = triage::muted(conn, account, thread)?;
+    let returned = triage::returned_at(conn, account, thread)?;
+    if snoozed.is_some() || summary.muted || returned.is_some() {
+        let roles = super::roles::listed(conn, &AccountId(account.to_owned()))?;
+        let inbox = |key: &str| {
+            key == triage::INBOX_KEY
+                || roles
+                    .as_ref()
+                    .is_some_and(|roles| roles.is(crate::FolderRole::Inbox, key))
+        };
+        if snoozed.is_some() || summary.muted {
+            for folder in folders.iter_mut().filter(|folder| inbox(&folder.key)) {
+                folder.key.insert_str(0, HIDDEN_INBOX_PREFIX);
+            }
+        } else if let Some(returned) = returned {
+            for folder in folders.iter_mut().filter(|folder| inbox(&folder.key)) {
+                folder.date = Some(summary.last_date.max(returned));
+            }
+        }
+        if let Some(until) = snoozed {
+            // The shared index orders larger dates first. Snoozed shows the
+            // next wake first and uses the negative timestamp as its key.
+            folders.push(Membership::virtual_list(
+                triage::SNOOZED,
+                summary.unread,
+                Some(-until),
+            ));
+        }
+        if summary.muted {
+            folders.push(Membership::virtual_list(
+                triage::MUTED,
+                summary.unread,
+                None,
+            ));
+        }
+    }
+    summary.participants = participants.join("\u{1e}");
+    summary.labels = labels.join("\u{1e}");
+    summary.folders = folders;
+    Ok(Some(summary))
 }
 
-fn folder_thread(thread: &str, summary: &Summary, unread: bool) -> FolderThread {
+impl Membership {
+    fn virtual_list(key: &str, unread: bool, date: Option<i64>) -> Self {
+        Self {
+            key: key.to_owned(),
+            unread,
+            date,
+            display: None,
+            first_rowid: 0,
+            first_pos: 0,
+        }
+    }
+}
+
+fn folder_thread(thread: &str, summary: &Summary, unread: bool, date: i64) -> FolderThread {
     FolderThread {
         thread_id: ThreadId(thread.to_string()),
         subject: summary.subject.clone(),
         snippet: summary.snippet.clone(),
-        last_date_unix: summary.last_date,
+        last_date_unix: date,
         message_count: summary.message_count,
         unread,
         participants: decode_participants(&summary.participants),
@@ -585,6 +670,7 @@ fn folder_thread(thread: &str, summary: &Summary, unread: bool) -> FolderThread 
         labels: unique_tokens(&summary.labels),
         starred: summary.starred,
         has_attachment: summary.has_attachment,
+        muted: summary.muted,
     }
 }
 
@@ -764,21 +850,21 @@ impl<'a> ListReader<'a> {
             let Some(summary) = compute(conn, account, &thread)? else {
                 continue;
             };
-            let unread = match source {
+            let membership = match source {
                 ListSource::Folder(_) => summary
                     .folders
                     .iter()
                     .filter(|membership| keys.contains(&membership.key))
-                    .map(|membership| membership.unread)
-                    .reduce(|a, b| a || b),
+                    .map(|folder| (folder.unread, folder.date.unwrap_or(summary.last_date)))
+                    .reduce(|(a, first), (b, second)| (a || b, first.max(second))),
                 ListSource::Label(label) => summary
                     .labels
                     .split('\u{1e}')
                     .any(|name| !name.is_empty() && name == label)
-                    .then_some(summary.unread),
+                    .then_some((summary.unread, summary.last_date)),
             };
-            if let Some(unread) = unread {
-                queued.push(folder_thread(&thread, &summary, unread));
+            if let Some((unread, date)) = membership {
+                queued.push(folder_thread(&thread, &summary, unread, date));
             }
         }
         queued.sort_by_key(ListKey::of);
@@ -858,45 +944,60 @@ impl<'a> ListReader<'a> {
     }
 
     fn page(&self, span: &FolderSpan) -> Result<FolderPage> {
-        let threads = match span {
-            FolderSpan::Top { rows } => self.rows(Unbounded, Unbounded, false, Some(*rows))?,
-            FolderSpan::Bottom { rows } => self.rows(Unbounded, Unbounded, true, Some(*rows))?,
-            FolderSpan::Window {
-                first,
-                last,
-                before,
-                after,
-            } => {
-                // A start below the end would list the rows between twice.
-                let first = first.as_ref().map(|first| first.min(last));
-                let mut threads = match first {
-                    Some(first) => self.rows(Unbounded, Excluded(first), true, Some(*before))?,
-                    None => Vec::new(),
-                };
-                let lower = first.map_or(Unbounded, Included);
-                threads.extend(self.rows(lower, Included(last), false, None)?);
-                threads.extend(self.rows(Excluded(last), Unbounded, false, Some(*after))?);
-                threads
+        let FolderSpan::Window {
+            first,
+            last,
+            before,
+            after,
+        } = span
+        else {
+            let (rows, from_end) = match *span {
+                FolderSpan::Top { rows } => (rows, false),
+                FolderSpan::Bottom { rows } => (rows, true),
+                FolderSpan::Window { .. } => unreachable!(),
+            };
+            // One extra row tells us whether this edge continues. Probing
+            // back past the edge could walk every row tied on its date.
+            let mut threads =
+                self.rows(Unbounded, Unbounded, from_end, Some(rows.saturating_add(1)))?;
+            let more = threads.len() > rows;
+            if more {
+                if from_end {
+                    threads.remove(0);
+                } else {
+                    threads.truncate(rows);
+                }
             }
+            return Ok(FolderPage {
+                threads,
+                more_before: from_end && more,
+                more_after: !from_end && more,
+                unread: self.unread()?,
+            });
         };
-        let (more_before, more_after) = match (threads.first(), threads.last()) {
-            (Some(top), Some(bottom)) => (
-                self.any(Unbounded, Excluded(&ListKey::of(top)))?,
-                self.any(Excluded(&ListKey::of(bottom)), Unbounded)?,
-            ),
-            // Nothing left inside the window. Say which side still has rows.
-            _ => match span {
-                FolderSpan::Window { first, last, .. } => (
-                    match first {
-                        Some(first) => self.any(Unbounded, Excluded(first))?,
-                        None => false,
-                    },
-                    self.any(Excluded(last), Unbounded)?,
-                ),
-                FolderSpan::Top { .. } => (false, self.any(Unbounded, Unbounded)?),
-                FolderSpan::Bottom { .. } => (self.any(Unbounded, Unbounded)?, false),
-            },
+        // A start below the end would list the rows between twice.
+        let requested_first = first.as_ref();
+        let first = requested_first.map(|first| first.min(last));
+        let mut threads = match first {
+            Some(first) => self.rows(Unbounded, Excluded(first), true, Some(*before))?,
+            None => Vec::new(),
         };
+        let lower = first.map_or(Unbounded, Included);
+        threads.extend(self.rows(lower, Included(last), false, None)?);
+        threads.extend(self.rows(Excluded(last), Unbounded, false, Some(*after))?);
+        let more_before = match threads
+            .first()
+            .map(ListKey::of)
+            .as_ref()
+            .or(requested_first)
+        {
+            Some(top) => self.any(Unbounded, Excluded(top))?,
+            None => false,
+        };
+        let more_after = self.any(
+            Excluded(threads.last().map(ListKey::of).as_ref().unwrap_or(last)),
+            Unbounded,
+        )?;
         Ok(FolderPage {
             threads,
             more_before,
@@ -934,6 +1035,7 @@ fn list_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FolderThread> {
         latest_name: row.get(9)?,
         participants: decode_participants(&participants),
         labels: unique_tokens(&labels),
+        muted: row.get(12)?,
     })
 }
 
@@ -959,7 +1061,11 @@ fn window_sql(
     let mut sql = format!(
         "SELECT ts.thread_id, ts.subject, ts.snippet, tf.last_date, ts.message_count,
                 tf.unread, ts.starred, ts.has_attachment, ts.latest_email,
-                ts.latest_name, ts.participants, ts.labels
+                ts.latest_name, ts.participants, ts.labels, EXISTS (
+                    SELECT 1 FROM thread_folders muted
+                    WHERE muted.account_id = tf.account_id AND muted.thread_id = tf.thread_id
+                      AND muted.folder_key = char(31) || 'muted'
+                )
          FROM {table} tf INDEXED BY idx_{table}_list
          CROSS JOIN thread_summary ts
            ON ts.account_id = tf.account_id AND ts.thread_id = tf.thread_id
@@ -1229,9 +1335,9 @@ pub(super) fn folder_key_of(
             let listed = summary
                 .folders
                 .iter()
-                .any(|membership| keys.contains(&membership.key));
-            return Ok(listed.then(|| ListKey {
-                date_unix: summary.last_date,
+                .find(|membership| keys.contains(&membership.key));
+            return Ok(listed.map(|folder| ListKey {
+                date_unix: folder.date.unwrap_or(summary.last_date),
                 thread_id: thread.clone(),
             }));
         }
@@ -1273,6 +1379,16 @@ pub(crate) fn folder_names(conn: &Connection, account_id: &AccountId) -> Result<
     in_one_snapshot(conn, || folder_names_in(conn, account_id))
 }
 
+const HIDDEN_INBOX_PREFIX: &str = "\x1f\x1f";
+
+fn physical_key(key: &str) -> &str {
+    key.strip_prefix(HIDDEN_INBOX_PREFIX).unwrap_or(key)
+}
+
+fn is_virtual(key: &str) -> bool {
+    matches!(key, triage::SNOOZED | triage::MUTED)
+}
+
 fn folder_names_in(conn: &Connection, account_id: &AccountId) -> Result<Vec<String>> {
     let account = account_id.as_str();
     let queued = queued_threads(conn, account)?;
@@ -1309,7 +1425,13 @@ fn folder_names_in(conn: &Connection, account_id: &AccountId) -> Result<Vec<Stri
         )?;
         let mut rows = stmt.query(params![account])?;
         while let Some(row) = rows.next()? {
-            add_name(row.get(2)?, row.get(0)?, row.get(1)?, row.get(3)?);
+            let key: String = row.get(2)?;
+            add_name(
+                physical_key(&key).to_owned(),
+                row.get(0)?,
+                row.get(1)?,
+                row.get(3)?,
+            );
         }
     }
     let mut messages = conn.prepare_cached(
@@ -1555,7 +1677,26 @@ mod tests {
     fn assert_lists_match(store: &Store, context: &str, pages: bool) {
         let account = account().id;
         for folder in QUERIES {
-            let full = store.folder_threads_scan(&account, folder).unwrap();
+            let mut full = store.folder_threads_scan(&account, folder).unwrap();
+            if folder.eq_ignore_ascii_case("inbox") {
+                full.retain_mut(|row| {
+                    let (due, returned): (Option<i64>, Option<i64>) = store
+                        .conn
+                        .query_row(
+                            "SELECT max(m.snooze_until), max(r.returned_at) FROM messages m
+                         LEFT JOIN snooze_returns r USING(account_id, message_id)
+                         WHERE m.account_id = ?1 AND m.thread_id = ?2",
+                            params![account.as_str(), row.thread_id.as_str()],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .unwrap();
+                    if let Some(date) = returned {
+                        row.last_date_unix = row.last_date_unix.max(date);
+                    }
+                    due.is_none()
+                });
+                full.sort_by_key(ListKey::of);
+            }
             assert_eq!(
                 store.folder_threads(&account, folder).unwrap(),
                 full,
@@ -1575,6 +1716,33 @@ mod tests {
                     assert!(unreads.iter().all(|count| *count == Some(unread)));
                 }
             }
+        }
+        let mut stmt = store
+            .conn
+            .prepare_cached(
+                "SELECT thread_id, -max(snooze_until) FROM messages WHERE account_id = ?1
+             GROUP BY thread_id HAVING max(snooze_until) IS NOT NULL
+             ORDER BY -max(snooze_until) DESC, thread_id",
+            )
+            .unwrap();
+        let snoozed = stmt
+            .query_map([account.as_str()], |row| {
+                Ok((ThreadId(row.get(0)?), row.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let actual = store.folder_threads(&account, triage::SNOOZED).unwrap();
+        assert_eq!(
+            actual
+                .iter()
+                .map(|row| (row.thread_id.clone(), row.last_date_unix))
+                .collect::<Vec<_>>(),
+            snoozed,
+            "{context}: Snoozed",
+        );
+        if pages {
+            assert_pages_match(store, triage::SNOOZED, &actual, context);
         }
         if pages {
             for label in ["tag0", "tag1", "tag2", "tag", "missing"] {
@@ -1665,7 +1833,7 @@ mod tests {
                     .labels
                     .split('\u{1e}')
                     .any(|token| token == label)
-                    .then(|| folder_thread(thread, &summary, summary.unread))
+                    .then(|| folder_thread(thread, &summary, summary.unread, summary.last_date))
             })
             .collect();
         out.sort_by_key(ListKey::of);
@@ -1720,7 +1888,7 @@ mod tests {
             let mut index = 0;
             for step in 0..60 {
                 let context = format!("seed {seed}, step {step}");
-                match rng.below(12) {
+                match rng.below(15) {
                     0..=4 => {
                         let size = 1 + rng.below(12);
                         let mut batch = Vec::new();
@@ -1849,6 +2017,15 @@ mod tests {
                                 .unwrap();
                         }
                     }
+                    12 | 13 => {
+                        if let Some(thread) = random_thread(&store, &mut rng) {
+                            let until = rng.chance(60).then_some(1_800_000_000 + step);
+                            store
+                                .set_thread_snoozes(&account, &[thread], until)
+                                .unwrap();
+                        }
+                    }
+                    14 => store.wake_snoozes(1_800_000_000 + step).unwrap(),
                     _ => {
                         if !copies.is_empty() {
                             let flags = (0..3)
@@ -1878,6 +2055,241 @@ mod tests {
                 assert_lists_match(&store, &context, step % 10 == 9);
             }
         }
+    }
+
+    #[test]
+    fn snoozing_a_selection_updates_inbox_and_notifications_and_undo_restores_it() {
+        let store = Store::open_in_memory().unwrap();
+        let account = account();
+        store.upsert_account(&account).unwrap();
+        let mut rng = Rng(17);
+        let batch = (1..=3)
+            .map(|index| {
+                let mut m = message(&mut rng, index, &[]);
+                m.folders = vec!["INBOX".into()];
+                m.remote_id = RemoteId(format!("imap:1:{index}:INBOX"));
+                m.unread = true;
+                m
+            })
+            .collect::<Vec<_>>();
+        let ids = batch
+            .iter()
+            .map(|m| m.headers.message_id.clone())
+            .collect::<Vec<_>>();
+        store
+            .apply_delta(
+                &account.id,
+                &MailboxDelta {
+                    messages: batch,
+                    ..MailboxDelta::default()
+                },
+            )
+            .unwrap();
+        let inbox = store.folder_threads(&account.id, "INBOX").unwrap();
+        assert_eq!(inbox.len(), 3);
+        let targets = inbox[..2]
+            .iter()
+            .map(|row| row.thread_id.clone())
+            .collect::<Vec<_>>();
+        let until = 1_900_000_000;
+        assert_eq!(
+            store
+                .set_thread_snoozes(&account.id, &targets, Some(until))
+                .unwrap(),
+            2
+        );
+        let top = FolderSpan::Top { rows: 10 };
+        let page = store.folder_page(&account.id, "INBOX", &top).unwrap();
+        assert_eq!(page.threads, &inbox[2..]);
+        assert_eq!(page.unread, 1);
+        assert_eq!(
+            store
+                .unread_inbox_messages(&account.id, &ids)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .folder_threads(&account.id, triage::SNOOZED)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            store.undo(&account.id).unwrap().kind,
+            crate::ActionKind::Snooze
+        );
+        assert_eq!(store.folder_threads(&account.id, "INBOX").unwrap(), inbox);
+
+        let agent = store
+            .snooze_thread(&account.id, &targets[0], until, "user")
+            .unwrap()
+            .unwrap();
+        assert_eq!(agent.kind, "snooze");
+        assert!(
+            store
+                .folder_key_of(&account.id, "INBOX", &targets[0])
+                .unwrap()
+                .is_none()
+        );
+        store
+            .set_thread_snoozes(&account.id, &targets[..1], None)
+            .unwrap();
+        assert_eq!(store.folder_threads(&account.id, "INBOX").unwrap(), inbox);
+        assert_eq!(
+            store.undo(&account.id).unwrap().kind,
+            crate::ActionKind::Unsnooze
+        );
+        assert!(
+            store
+                .folder_key_of(&account.id, "INBOX", &targets[0])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn overdue_snoozes_return_unread_at_the_top_even_when_reopening() {
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("mail.db");
+        let account = account();
+        let target = {
+            let store = Store::open(&path).unwrap();
+            store.upsert_account(&account).unwrap();
+            let mut rng = Rng(23);
+            let batch = (1..=2)
+                .map(|index| {
+                    let mut m = message(&mut rng, index, &[]);
+                    m.headers.date_unix = 1_700_000_000 + index as i64;
+                    m.folders = vec!["INBOX".into()];
+                    m.remote_id = RemoteId(format!("imap:1:{index}:INBOX"));
+                    m.unread = false;
+                    m
+                })
+                .collect();
+            store
+                .apply_delta(
+                    &account.id,
+                    &MailboxDelta {
+                        messages: batch,
+                        ..MailboxDelta::default()
+                    },
+                )
+                .unwrap();
+            let target = store.folder_threads(&account.id, "INBOX").unwrap()[1]
+                .thread_id
+                .clone();
+            store
+                .set_thread_snoozes(&account.id, std::slice::from_ref(&target), Some(20))
+                .unwrap();
+            store.wake_snoozes(19).unwrap();
+            assert!(
+                store
+                    .folder_key_of(&account.id, "INBOX", &target)
+                    .unwrap()
+                    .is_none()
+            );
+            target
+        };
+        let reopened = Store::open(&path).unwrap();
+        let top = FolderSpan::Top { rows: 1 };
+        let page = reopened.folder_page(&account.id, "INBOX", &top).unwrap();
+        assert_eq!(page.threads[0].thread_id, target);
+        assert!(page.threads[0].unread);
+        assert_eq!(page.unread, 1);
+        assert!(
+            reopened
+                .folder_threads(&account.id, triage::SNOOZED)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn muting_follows_message_ids_through_rethreading_and_keeps_server_copies() {
+        let store = Store::open_in_memory().unwrap();
+        let account = account();
+        store.upsert_account(&account).unwrap();
+        store.set_write_back(&account.id, true).unwrap();
+        let mut rng = Rng(47);
+        let mut root = message(&mut rng, 1, &[]);
+        root.folders = vec!["INBOX".into()];
+        root.remote_id = RemoteId("imap:1:1:INBOX".into());
+        let mut reply = message(&mut rng, 2, &[]);
+        reply.headers.in_reply_to = Some(root.headers.message_id.clone());
+        reply.headers.proton_conversation_id = Some("joined".into());
+        reply.folders = vec!["INBOX".into()];
+        reply.remote_id = RemoteId("imap:1:2:INBOX".into());
+        reply.unread = true;
+        let arrival = reply.headers.message_id.clone();
+        store
+            .apply_delta(
+                &account.id,
+                &MailboxDelta {
+                    messages: vec![root.clone()],
+                    ..MailboxDelta::default()
+                },
+            )
+            .unwrap();
+        let old = store.folder_threads(&account.id, "INBOX").unwrap()[0]
+            .thread_id
+            .clone();
+        assert!(
+            store
+                .toggle_thread_mutes(&account.id, std::slice::from_ref(&old))
+                .unwrap()
+        );
+        store
+            .apply_delta(
+                &account.id,
+                &MailboxDelta {
+                    messages: vec![reply],
+                    ..MailboxDelta::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            store
+                .folder_threads(&account.id, "INBOX")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .unread_inbox_messages(&account.id, std::slice::from_ref(&arrival))
+                .unwrap()
+                .is_empty()
+        );
+        let muted = store.folder_threads(&account.id, triage::MUTED).unwrap();
+        assert_eq!(muted.len(), 1);
+        assert!(muted[0].muted);
+        assert_ne!(muted[0].thread_id, old);
+        assert_eq!(muted[0].message_count, 2);
+        assert!(store.outbox(&account.id).unwrap().is_empty());
+
+        assert!(
+            !store
+                .toggle_thread_mutes(&account.id, std::slice::from_ref(&muted[0].thread_id))
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .unread_inbox_messages(&account.id, std::slice::from_ref(&arrival))
+                .unwrap(),
+            [arrival]
+        );
+        assert_eq!(
+            store.undo(&account.id).unwrap().kind,
+            crate::ActionKind::Unmute
+        );
+        assert!(
+            store
+                .folder_threads(&account.id, "INBOX")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.outbox(&account.id).unwrap().is_empty());
     }
 
     #[test]

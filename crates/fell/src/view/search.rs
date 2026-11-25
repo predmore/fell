@@ -2277,6 +2277,8 @@ mod tests {
     #[test]
     fn narrow_search_rows_fit_compact_dates_without_crowding_the_subject() {
         let mut row = present::ThreadRow {
+            muted: false,
+            wake_at: None,
             id: "field-report".into(),
             spans: vec![present::NameSpan {
                 text: "Regional Field Survey Coordinator".into(),

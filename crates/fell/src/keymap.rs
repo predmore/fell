@@ -45,6 +45,8 @@ pub enum Action {
     Inbox,
     Sent,
     Drafts,
+    Snoozed,
+    Muted,
     Compose,
     Reply,
     ReplyAll,
@@ -64,6 +66,9 @@ pub enum Action {
     PreviousHit,
     Move,
     Archive,
+    Snooze,
+    Unsnooze,
+    Mute,
     ToggleUnread,
     ToggleStar,
     Delete,
@@ -111,6 +116,8 @@ impl Action {
             Self::Inbox => "Go to Inbox",
             Self::Sent => "Go to Sent",
             Self::Drafts => "Go to Drafts",
+            Self::Snoozed => "Go to Snoozed",
+            Self::Muted => "Go to Muted",
             Self::Compose => "Compose",
             Self::Reply => "Reply",
             Self::ReplyAll => "Reply all",
@@ -130,6 +137,9 @@ impl Action {
             Self::PreviousHit => "Previous search hit",
             Self::Move => "Move",
             Self::Archive => "Archive",
+            Self::Snooze => "Snooze",
+            Self::Unsnooze => "Unsnooze",
+            Self::Mute => "Mute or unmute",
             Self::ToggleUnread => "Mark unread or read",
             Self::ToggleStar => "Star or unstar",
             Self::Delete => "Delete",
@@ -185,6 +195,8 @@ const ALL_ACTIONS: &[Action] = &[
     Action::Inbox,
     Action::Sent,
     Action::Drafts,
+    Action::Snoozed,
+    Action::Muted,
     Action::Compose,
     Action::Reply,
     Action::ReplyAll,
@@ -204,6 +216,9 @@ const ALL_ACTIONS: &[Action] = &[
     Action::PreviousHit,
     Action::Move,
     Action::Archive,
+    Action::Snooze,
+    Action::Unsnooze,
+    Action::Mute,
     Action::ToggleUnread,
     Action::ToggleStar,
     Action::Delete,
@@ -356,6 +371,19 @@ fn default_bindings() -> Vec<Binding> {
     bind(&[KeyId::Char('S')], Action::SaveAttachment, None);
     bind(&[KeyId::Char('m')], Action::Move, None);
     bind(&[KeyId::Char('e')], Action::Archive, None);
+    bind(&[KeyId::Char('b')], Action::Snooze, None);
+    bind(&[KeyId::Char('B')], Action::Unsnooze, None);
+    bind(&[KeyId::Char('M')], Action::Mute, None);
+    bind(
+        &[KeyId::Char('g'), KeyId::Char('z')],
+        Action::Snoozed,
+        Some("Go"),
+    );
+    bind(
+        &[KeyId::Char('g'), KeyId::Char('m')],
+        Action::Muted,
+        Some("Go"),
+    );
     bind(&[KeyId::Char('U')], Action::ToggleUnread, None);
     bind(&[KeyId::Char('s')], Action::ToggleStar, None);
     bind(&[KeyId::Char('#')], Action::Delete, None);
@@ -410,6 +438,18 @@ fn default_bindings() -> Vec<Binding> {
         Action::Label,
         Some("Folders"),
     );
+    for (key, action) in [
+        ('b', Action::Snooze),
+        ('B', Action::Unsnooze),
+        ('M', Action::Mute),
+        ('z', Action::Snoozed),
+    ] {
+        bind(
+            &[KeyId::Leader, KeyId::Char('f'), KeyId::Char(key)],
+            action,
+            Some("Folders"),
+        );
+    }
     bind(
         &[KeyId::Leader, KeyId::Char('f'), KeyId::Char('m')],
         Action::Move,

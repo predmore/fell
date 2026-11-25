@@ -33,6 +33,7 @@ pub enum WorkerEvent {
     Restarted(Worker),
     Stopped(Worker),
     Recovered(Worker),
+    SnoozesChanged,
 }
 
 const PANIC_WINDOW: Duration = Duration::from_secs(60);

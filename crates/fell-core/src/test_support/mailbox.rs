@@ -157,6 +157,35 @@ pub fn seed(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Add newer, one-message Inbox threads that start out snoozed. Keeping this
+/// phase separate preserves the baseline measurements on the 100k fixture.
+pub fn add_snoozed_threads(store: &Store, count: usize) -> Result<()> {
+    let account = account();
+    let mut rng = Rng(17);
+    for start in (MESSAGES..MESSAGES + count).step_by(BATCH) {
+        let end = (start + BATCH).min(MESSAGES + count);
+        let messages = (start..end)
+            .map(|index| {
+                let mut row = message(&account, &mut rng, index, index);
+                row.headers.date_unix = 2_000_000_000 + index as i64;
+                row.remote_id = RemoteId(format!("imap:1:{}:INBOX", index + 1));
+                row.folders = vec!["INBOX".into()];
+                row.unread = true;
+                row.snooze_until = Some(i64::MAX);
+                row
+            })
+            .collect();
+        store.apply_delta(
+            &account.id,
+            &MailboxDelta {
+                messages,
+                ..MailboxDelta::default()
+            },
+        )?;
+    }
+    Ok(())
+}
+
 fn message(account: &Account, rng: &mut Rng, index: usize, root: usize) -> Message {
     let id = message_id(index);
     let parent = (index > root).then(|| message_id(index - 1));

@@ -55,6 +55,7 @@ impl Inbox {
 
     pub(super) fn apply_worker_event(&mut self, event: WorkerEvent, cx: &mut Context<Self>) {
         match event {
+            WorkerEvent::SnoozesChanged => self.snoozes_changed(cx),
             WorkerEvent::Restarted(worker) => {
                 let key = keymap::binding_text(&self.session.keymap, Action::OpenDiagnosticLog);
                 self.session

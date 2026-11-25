@@ -38,6 +38,8 @@ pub(crate) mod sent_bcc;
 mod sent_echo_repair;
 mod summaries;
 mod threads;
+pub(crate) mod triage;
+pub use triage::{MUTED, SNOOZED};
 pub(crate) mod views;
 mod write_lock;
 
@@ -608,11 +610,12 @@ impl Store {
         // Summaries first: every write transaction refreshes them on commit,
         // including the one that installs the threading triggers. Then the
         // threading tables, which the version 3 upgrade below already reads.
+        conn.execute_batch(roles::ROLES_TABLE)?;
+        conn.execute_batch(triage::SCHEMA)?;
         summaries::ensure_thread_summaries(&conn)?;
         ensure_agent_grant_revision(&conn)?;
         conn.execute_batch(sent_bcc::SENT_BCC_TABLE)?;
         conn.execute_batch(sent::LOCAL_SENT_TABLE)?;
-        conn.execute_batch(roles::ROLES_TABLE)?;
         conn.execute_batch(intents::INTENT_SCHEMA)?;
         let outbox_tx =
             rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
@@ -656,7 +659,7 @@ impl Store {
         crate::actions::migrate_purge_snapshots(&conn)?;
         keywords::migrate_reserved_labels(&conn)?;
         correspondents::ensure(&conn)?;
-        Ok(Self {
+        let store = Self {
             indexer: None,
             semantic: std::cell::RefCell::new(crate::search::semantic::Semantic::new(
                 crate::embed::EmbedderSource::from_env(),
@@ -672,7 +675,9 @@ impl Store {
             fail_after_flags: std::cell::Cell::new(None),
             #[cfg(unix)]
             _mailbox_lock: None,
-        })
+        };
+        store.wake_snoozes(crate::agent::now_unix())?;
+        Ok(store)
     }
 
     /// Tests: rows, matrix bytes, and key bytes of the search vector matrix.
@@ -2307,6 +2312,7 @@ impl Store {
             let participants: String = row.get::<_, Option<String>>(10)?.unwrap_or_default();
             let labels: String = row.get::<_, Option<String>>(11)?.unwrap_or_default();
             Ok(FolderThread {
+                muted: false,
                 thread_id: ThreadId(row.get(0)?),
                 subject: row.get(1)?,
                 snippet: row.get(2)?,
@@ -2706,6 +2712,7 @@ pub struct Participant {
 /// A thread as it appears in one folder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FolderThread {
+    pub muted: bool,
     pub thread_id: ThreadId,
     pub subject: String,
     pub snippet: String,

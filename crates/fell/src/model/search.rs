@@ -103,6 +103,8 @@ impl SearchReply {
                     let mut location = locations.remove(&message_id);
                     let sender_name = location.as_mut().and_then(|hit| hit.sender_name.take());
                     rows.push(ThreadRow {
+                        muted: false,
+                        wake_at: None,
                         id: thread_id.0.clone(),
                         spans: vec![NameSpan {
                             text: one_line(&display_name(&sender_name, &sender_email, me)),

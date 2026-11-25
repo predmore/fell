@@ -59,7 +59,7 @@ pub(crate) fn record(
     outbox::flags::queue(conn, account_id, message_id, unread, starred)
 }
 
-fn remember(
+pub(super) fn remember(
     conn: &Connection,
     account_id: &AccountId,
     message_id: &str,

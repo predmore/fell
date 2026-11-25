@@ -456,17 +456,14 @@ impl crate::Store {
         thread_id: &ThreadId,
         actor: &str,
     ) -> Result<Option<RecordedAction>> {
-        let summary = "unsnoozed thread".to_string();
-        self.mutate_thread(
-            account_id,
-            thread_id,
-            actor,
-            "unsnooze",
-            summary,
-            |message| {
-                message.snooze_until = None;
-            },
-        )
+        let actor = require_token(actor, "actor")?;
+        let tx = crate::store::immediate_transaction(&self.conn)?;
+        require_account(&tx, account_id)?;
+        check_actor_grant(&tx, account_id, actor, WriteScope::Triage)?;
+        let result = unsnooze_in(&tx, account_id, thread_id, actor)?;
+        tx.commit()?;
+        self.seal_private_files()?;
+        Ok(result)
     }
 
     /// Move the thread's messages that are in `from` to `to`. Other folders
@@ -791,6 +788,25 @@ pub(crate) fn snooze_in(
         "snooze",
         &format!("{SNOOZE_SUMMARY_PREFIX}{until}"),
         |message| message.snooze_until = Some(until),
+    )
+}
+
+pub(crate) fn unsnooze_in(
+    conn: &Connection,
+    account: &AccountId,
+    thread: &ThreadId,
+    actor: &str,
+) -> Result<Option<RecordedAction>> {
+    mutate_thread_in(
+        conn,
+        account,
+        thread,
+        actor,
+        "unsnooze",
+        "unsnoozed thread",
+        |message| {
+            message.snooze_until = None;
+        },
     )
 }
 

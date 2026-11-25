@@ -5,6 +5,7 @@ pub mod agents;
 mod notes;
 pub mod search;
 pub(crate) mod settings;
+pub(crate) mod snooze;
 pub use notes::{AgentNotes, NoteRequest, SUGGESTIONS_QUERY};
 
 use std::collections::{HashMap, HashSet};
@@ -176,6 +177,7 @@ pub enum Overlay {
     None,
     Palette,
     Folders,
+    Snooze,
     Help,
     About,
     Agents,
@@ -380,6 +382,7 @@ pub struct Step {
     pub apply_move: bool,
     pub read_label_targets: bool,
     pub labels: Option<LabelEdit>,
+    pub triage: Option<snooze::TriageEdit>,
     /// Resolve a flag toggle against marked conversations outside the loaded page.
     pub off_page_flags: Option<(Vec<String>, bool)>,
     /// `u` restores the latest local action.
@@ -439,6 +442,7 @@ pub enum QueryFault {
 
 #[derive(Clone, Debug)]
 pub struct Session {
+    pub(crate) snooze: snooze::Picker,
     pub account_name: String,
     pub account_email: String,
     pub folder: String,
@@ -584,6 +588,7 @@ impl Session {
             recipients_open: HashSet::new(),
             overlay: Overlay::None,
             settings_nav: settings::Nav::default(),
+            snooze: snooze::Picker::default(),
             agents: agents::Agents::default(),
             activity: activity::Activity::default(),
             palette_origin: Overlay::None,
@@ -872,7 +877,10 @@ impl Session {
     /// `folder` as one line of text, told apart from a folder that reads
     /// the same: `Sent ([Gmail]/Sent Mail)`.
     pub fn folder_text(&self, folder: &str) -> String {
-        self.roles.label_among(folder, &self.folders)
+        virtual_folder_label(folder).map_or_else(
+            || self.roles.label_among(folder, &self.folders),
+            str::to_owned,
+        )
     }
 
     /// The folder on screen is the account's drafts folder.
@@ -2121,6 +2129,7 @@ impl Session {
         match self.overlay {
             Overlay::Palette => self.palette_key(key, page_rows),
             Overlay::Folders => self.folder_key(key),
+            Overlay::Snooze => self.snooze_key(key),
             Overlay::Agents => self.agents_key(key, page_rows),
             Overlay::Settings => self.settings_key(key, page_rows),
             Overlay::AgentActivity => self.activity_key(key, page_rows),
@@ -2536,6 +2545,8 @@ impl Session {
                     | Action::Inbox
                     | Action::Sent
                     | Action::Drafts
+                    | Action::Snoozed
+                    | Action::Muted
                     | Action::FolderPicker
                     | Action::LabelList
                     | Action::Palette
@@ -2582,7 +2593,11 @@ impl Session {
             self.count.clear();
             return step;
         }
-        if self.label_scope.is_some()
+        if (self.label_scope.is_some()
+            || matches!(
+                self.folder.as_str(),
+                fell_core::store::MUTED | fell_core::store::SNOOZED
+            ))
             && matches!(
                 action,
                 Action::Move | Action::Archive | Action::Delete | Action::Spam
@@ -2674,6 +2689,31 @@ impl Session {
             Action::Inbox => step.reload_threads = self.go_role(FolderRole::Inbox),
             Action::Sent => step.reload_threads = self.go_role(FolderRole::Sent),
             Action::Drafts => step.reload_threads = self.go_role(FolderRole::Drafts),
+            Action::Snoozed => step.reload_threads = self.go_folder(fell_core::store::SNOOZED),
+            Action::Muted => step.reload_threads = self.go_folder(fell_core::store::MUTED),
+            Action::Snooze | Action::Unsnooze | Action::Mute => {
+                self.count.clear();
+                let (ids, drafts) = self.split_removal_targets(self.action_targets());
+                if ids.is_empty() || self.in_drafts() {
+                    self.show_toast(
+                        if drafts.is_empty() && !self.in_drafts() {
+                            "No conversation"
+                        } else {
+                            DRAFT_NOT_THREAD
+                        },
+                        true,
+                    );
+                } else if action == Action::Snooze {
+                    self.show_snooze_picker(ids);
+                } else {
+                    let kind = if action == Action::Mute {
+                        snooze::TriageKind::Mute
+                    } else {
+                        snooze::TriageKind::Unsnooze
+                    };
+                    step.triage = Some(snooze::TriageEdit { ids, kind });
+                }
+            }
             Action::FolderPicker => {
                 self.count.clear();
                 self.folder_intent = FolderIntent::Go;
@@ -3397,7 +3437,7 @@ impl Session {
         let title = || {
             label
                 .map(str::to_owned)
-                .unwrap_or_else(|| self.roles.label(folder))
+                .unwrap_or_else(|| self.folder_text(folder))
         };
         let retry = keymap::binding_text(&self.keymap, Action::SyncNow);
         Some(match &self.sync {
@@ -3454,6 +3494,14 @@ impl Session {
                 hint: String::new(),
             },
         })
+    }
+}
+
+pub(crate) fn virtual_folder_label(folder: &str) -> Option<&'static str> {
+    match folder {
+        fell_core::store::SNOOZED => Some("Snoozed"),
+        fell_core::store::MUTED => Some("Muted"),
+        _ => None,
     }
 }
 
@@ -3639,6 +3687,8 @@ mod tests {
 
     fn row(id: &str) -> ThreadRow {
         ThreadRow {
+            muted: false,
+            wake_at: None,
             id: id.into(),
             spans: vec![NameSpan {
                 text: id.into(),
@@ -3973,6 +4023,49 @@ mod tests {
         assert_eq!(session.label_scope.as_deref(), Some("Client notes"));
         assert!(session.perform(Action::Inbox, 10).reload_threads);
         assert_eq!(session.label_scope, None);
+    }
+
+    #[test]
+    fn snooze_picker_and_mute_take_the_marked_or_visual_threads() {
+        let mut s = session();
+        s.set_threads(vec![row("a"), row("b"), row("c")]);
+        s.on_key(KeyId::Char('x'), 10);
+        s.on_key(KeyId::Char('j'), 10);
+        s.on_key(KeyId::Char('b'), 10);
+        assert_eq!(s.overlay, Overlay::Snooze);
+        assert_eq!(s.snooze.ids, ["a"]);
+        for ch in "mon 9am".chars() {
+            s.on_key(
+                if ch == ' ' {
+                    KeyId::Space
+                } else {
+                    KeyId::Char(ch)
+                },
+                10,
+            );
+        }
+        let edit = s.on_key(KeyId::Enter, 10).triage.unwrap();
+        assert!(matches!(edit.kind, snooze::TriageKind::Snooze(_)));
+        assert_eq!(edit.ids, ["a"]);
+        s.picked.clear();
+        s.on_key(KeyId::Char('V'), 10);
+        s.on_key(KeyId::Char('j'), 10);
+        let edit = s.on_key(KeyId::Char('M'), 10).triage.unwrap();
+        assert_eq!(
+            (edit.kind, edit.ids),
+            (snooze::TriageKind::Mute, vec!["b".into(), "c".into()])
+        );
+
+        s.on_key(KeyId::Char('g'), 10);
+        s.on_key(KeyId::Char('z'), 10);
+        assert_eq!(s.folder, fell_core::store::SNOOZED);
+        assert_eq!(s.folder_text(&s.folder), "Snoozed");
+        s.set_threads(vec![row("b")]);
+        let edit = s.on_key(KeyId::Char('B'), 10).triage.unwrap();
+        assert_eq!(
+            (edit.kind, edit.ids),
+            (snooze::TriageKind::Unsnooze, vec!["b".into()])
+        );
     }
 
     #[test]
@@ -5677,6 +5770,8 @@ mod tests {
         let drafts: Vec<ThreadRow> = [("draft-old", 1), ("draft-new", 2_000_000)]
             .into_iter()
             .map(|(id, date)| ThreadRow {
+                muted: false,
+                wake_at: None,
                 draft: Some(id.into()),
                 server_draft: None,
                 ..dated(id, date)

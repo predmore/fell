@@ -12,6 +12,11 @@ const ELIGIBLE_MESSAGE: &str =
      FROM messages m
      WHERE m.account_id = ?1 AND m.message_id = ?2 AND m.unread = 1 AND m.archived = 0
        AND NOT EXISTS (
+           SELECT 1 FROM thread_folders tf
+           WHERE tf.account_id = m.account_id AND tf.thread_id = m.thread_id
+             AND tf.folder_key IN (char(31) || 'snoozed', char(31) || 'muted')
+       )
+       AND NOT EXISTS (
            SELECT 1 FROM messages t JOIN message_copies c USING(account_id, message_id)
            WHERE t.account_id = m.account_id AND t.thread_id = m.thread_id
              AND instr(char(30) || lower(c.keywords) || char(30), char(30) || '$muted' || char(30)) > 0

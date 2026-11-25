@@ -11,11 +11,12 @@ mod help;
 mod notification_actions;
 mod search;
 mod settings;
+mod snooze;
 
 use std::cell::{Cell, OnceCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -52,7 +53,7 @@ use crate::model::{
 };
 use crate::motion::{self, Glide, LayerSwap, ListShift, Motion, RowMotion, SwapFrame, Transition};
 use crate::onboarding::Onboarding;
-use crate::present::{self, ConvMessage, Pane, Rich, ThreadRow};
+use crate::present::{self, ConvMessage, Pane, Rich, ThreadRow, now_unix};
 use crate::reader_body_worker;
 use crate::render::READING_MEASURE_PX;
 use crate::reply_check::{ReplyCheck, ReplyChecks};
@@ -1465,7 +1466,7 @@ impl Inbox {
                 .then(|| store.list_labels(&account).ok())
                 .flatten();
             let roles = store.folder_roles(&account).unwrap_or_default();
-            let mut rows = present::thread_rows(&page.threads, &me);
+            let mut rows = present::folder_thread_rows(&page.threads, &me, &reading);
             let unread = page.unread;
             let drafts = if reading_label.is_none() && roles.is(FolderRole::Drafts, &reading) {
                 // Synced drafts name who they are to, and none is unread.
@@ -1879,7 +1880,10 @@ impl Inbox {
                 (&me, &roles, &names, &reading),
             )
             .ok()?;
-            Some((present::thread_rows(&page.threads, &me), messages))
+            Some((
+                present::folder_thread_rows(&page.threads, &me, &reading),
+                messages,
+            ))
         });
         cx.spawn(async move |this, cx| {
             let Ok(Some((rows, messages))) = reply.await else {
@@ -3598,7 +3602,11 @@ impl Inbox {
             self.protect_flag(id, edit.change, generation, None);
         }
         let account = self.account_id.clone();
-        let folder = if self.list_label.is_some() {
+        let folder = if self.list_label.is_some()
+            || matches!(
+                self.list_folder.as_str(),
+                fell_core::store::MUTED | fell_core::store::SNOOZED
+            ) {
             String::new()
         } else {
             self.list_folder.clone()
@@ -4345,6 +4353,9 @@ impl Inbox {
         }
         if step.read_label_targets {
             self.read_label_targets(cx);
+        }
+        if let Some(edit) = step.triage {
+            self.apply_triage(edit, cx);
         }
         if step.undo {
             self.apply_undo(cx);
@@ -6498,7 +6509,13 @@ fn header(
         };
         let count_space = if drafts { 0. } else { COUNT_GAP + count_room };
         let name_room = (room - ACCOUNT_MIN - count_space).max(0.);
-        let title = label.map_or_else(|| session.roles.label(folder), present::display_safe);
+        let title = label.map_or_else(
+            || {
+                crate::model::virtual_folder_label(folder)
+                    .map_or_else(|| session.roles.label(folder), str::to_owned)
+            },
+            present::display_safe,
+        );
         let name = if label.is_some() {
             fit(&title, name_room, FontWeight::SEMIBOLD)
         } else {
@@ -7248,7 +7265,11 @@ fn thread_line_one(
         theme.dimmed
     };
     let count = (row.message_count > 1).then(|| row.message_count.to_string());
-    let date = present::relative_date(now_unix(), row.date_unix);
+    let now = now_unix();
+    let date = row.wake_at.map_or_else(
+        || present::relative_date(now, row.date_unix),
+        |wake_at| present::activity_time(now, wake_at),
+    );
     let size = theme.ui_px - 1.0;
     let style = conversation_line_style(window, theme, px(size));
     let date_width = line_px_with_style(window, &style, &date, FontWeight::NORMAL).ceil();
@@ -7260,12 +7281,18 @@ fn thread_line_one(
     } else {
         0.0
     };
+    let muted_width = if row.muted {
+        line_px_with_style(window, &style, "Muted", FontWeight::NORMAL).ceil() + THREAD_LINE_GAP
+    } else {
+        0.0
+    };
     // The leading group, star, and date need two gaps. Inside the group,
     // optional metadata and labels each need one gap after the previous item.
     let room = (text_width
         - date_width
         - count_width
         - attachment_width
+        - muted_width
         - STAR_SLOT
         - if look.unread_note {
             agent_notes::MARKER_SLOT
@@ -7332,6 +7359,15 @@ fn thread_line_one(
                             .text_color(rgb(dim))
                             .opacity(look.attachment_alpha)
                             .child(THREAD_ATTACHMENT_MARK),
+                    )
+                })
+                .when(row.muted, |line| {
+                    line.child(
+                        div()
+                            .flex_none()
+                            .text_color(rgb(dim))
+                            .text_size(px(size))
+                            .child("Muted"),
                     )
                 })
                 .children(labels.map(|(group, _)| group)),
@@ -11270,7 +11306,11 @@ fn overlay(
         .when(
             matches!(
                 session.overlay,
-                Overlay::About | Overlay::Agents | Overlay::AgentActivity | Overlay::Settings
+                Overlay::About
+                    | Overlay::Agents
+                    | Overlay::AgentActivity
+                    | Overlay::Settings
+                    | Overlay::Snooze
             ),
             |layer| layer.items_start(),
         )
@@ -11292,6 +11332,9 @@ fn overlay(
                 .when_some(card, |card, height| card.h(px(height)))
                 .opacity(opacity)
                 .into_any_element(),
+            Overlay::Snooze => {
+                snooze::card(theme, &session.snooze, opacity, window, cx).into_any_element()
+            }
             Overlay::Help => help
                 .map_or_else(div, |(_, content)| content)
                 .opacity(opacity)
@@ -11954,13 +11997,6 @@ fn window_size() -> (f32, f32) {
     (1180.0, 760.0)
 }
 
-fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 trait FontOpt: Styled {
     fn font_family_opt(self, family: Option<String>) -> Self;
 }
@@ -12108,6 +12144,8 @@ mod tests {
     fn row(id: &str) -> super::ThreadRow {
         use crate::present::NameSpan;
         super::ThreadRow {
+            muted: false,
+            wake_at: None,
             id: id.into(),
             spans: vec![NameSpan {
                 text: id.into(),
