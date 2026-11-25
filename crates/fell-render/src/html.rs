@@ -240,7 +240,7 @@ fn plain_paragraphs(body: &str, blocks: &mut Vec<Block>) {
             if index > 0 {
                 inlines.push(Inline::LineBreak);
             }
-            inlines.push(Inline::Text(line.to_string()));
+            inlines.extend(crate::plain_links::plain_link_inlines(line));
         }
         blocks.push(Block::Paragraph { inlines });
     }
@@ -2001,7 +2001,7 @@ fn is_signature_delimiter(raw: &str) -> bool {
 /// isolates, zero-width marks, and the joiners newsletters pad a preheader
 /// with. The same set compose's `display_safe` strips. Letters of
 /// right-to-left scripts are kept; only the invisible controls go.
-fn is_invisible(ch: char) -> bool {
+pub(crate) fn is_invisible(ch: char) -> bool {
     matches!(
         ch,
         '\u{200B}'..='\u{200F}'

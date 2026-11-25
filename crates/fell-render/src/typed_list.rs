@@ -3,7 +3,7 @@
 use std::{mem, ops::Range};
 
 use crate::document::ROMAN_DIGITS;
-use crate::{Block, Inline, ListItem, ListLabelStyle};
+use crate::{Block, ListItem, ListLabelStyle};
 
 pub(crate) struct Marker<'a> {
     pub(crate) token: &'a str,
@@ -341,7 +341,7 @@ fn word_bullet_level(token: &str) -> u32 {
 
 fn plain_paragraph(text: &str) -> Vec<Block> {
     vec![Block::Paragraph {
-        inlines: vec![Inline::Text(text.trim().to_string())],
+        inlines: crate::plain_links::plain_link_inlines(text.trim()),
     }]
 }
 

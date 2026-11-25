@@ -3079,6 +3079,7 @@ impl Session {
                     ..Step::default()
                 };
             }
+            Action::FocusLinks => self.count.clear(),
             Action::FocusAttachments => {
                 self.count.clear();
                 let index = if self.pane == Pane::List {

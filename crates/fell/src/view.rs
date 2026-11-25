@@ -810,6 +810,11 @@ impl Inbox {
     ) -> Self {
         let inbox = Self::with_startup(startup, demo, Some(window), cx);
         window.focus(&inbox.focus);
+        cx.on_focus_lost(window, |inbox, window, _| {
+            // A focused link can scroll out of the reader's paint area.
+            window.focus(&inbox.focus);
+        })
+        .detach();
         cx.set_global(InboxWindow(window.window_handle()));
         let mut viewport = (window.viewport_size(), window.scale_factor());
         cx.observe_window_bounds(window, move |_, window, cx| {
@@ -4212,6 +4217,32 @@ impl Inbox {
             window.defer(cx, |window, cx| window.draw(cx).clear());
             return;
         }
+        let stroke = &event.keystroke;
+        if self.session.pane == Pane::Conversation
+            && self.session.overlay == Overlay::None
+            && self.session.chord.is_empty()
+            && !stroke.modifiers.control
+            && !stroke.modifiers.alt
+            && !stroke.modifiers.platform
+        {
+            match stroke.key.as_str() {
+                "tab" => {
+                    if stroke.modifiers.shift {
+                        window.focus_prev();
+                    } else {
+                        window.focus_next();
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
+                "escape" if !self.focus.is_focused(window) => {
+                    window.focus(&self.focus);
+                    cx.stop_propagation();
+                    return;
+                }
+                _ => {}
+            }
+        }
         let Some(key) = key_from(&event.keystroke) else {
             return;
         };
@@ -4314,6 +4345,16 @@ impl Inbox {
         } = before;
         if pane_before != Pane::Conversation && self.session.pane == Pane::Conversation {
             self.reader_entered_conversation();
+        }
+        if step.action == Some(Action::FocusLinks)
+            && self.session.pane == Pane::Conversation
+            && self.session.overlay == Overlay::None
+            && self.search_conversation_live()
+            && let Some(inbox) = cx.try_global::<InboxWindow>().copied()
+        {
+            cx.defer(move |cx| {
+                let _ = inbox.0.update(cx, |_, window, _| window.focus_next());
+            });
         }
         if overlay != Overlay::Help && self.session.overlay == Overlay::Help {
             self.help_scroll = help::HelpScroll::default();
@@ -10081,7 +10122,7 @@ fn stored_message_body(
                                 &palette,
                                 false,
                                 &crate::render::ImageGallery::default(),
-                                folds.columns.blocks(folds.fill),
+                                folds.columns.blocks(folds.fill).with_links(folds.live),
                                 crate::render::BLOCK_GAP,
                                 &markers,
                             )
@@ -10092,7 +10133,7 @@ fn stored_message_body(
                         let text = texts.concat();
                         folds.columns.flow(
                             |columns| columns.prose,
-                            |_, _| {
+                            |_, live| {
                                 div()
                                     .pb(px(8.))
                                     .line_height(px(theme.ui_px * 1.45))
@@ -10103,6 +10144,8 @@ fn stored_message_body(
                                         _ => block.child(crate::render::plain_text(
                                             text.clone(),
                                             palette,
+                                            at,
+                                            folds.live && live,
                                         )),
                                     })
                                     .into_any_element()
@@ -10127,7 +10170,7 @@ fn stored_message_body(
                             || {
                                 folds.columns.flow(
                                     |columns| columns.prose,
-                                    |_, _| {
+                                    |_, live| {
                                         history_rule(
                                             div(),
                                             crate::render::is_right_to_left(&text),
@@ -10135,7 +10178,12 @@ fn stored_message_body(
                                         )
                                         .text_color(rgb(theme.dimmed))
                                         .line_height(line_height)
-                                        .child(crate::render::plain_text(text.clone(), quiet))
+                                        .child(crate::render::plain_text(
+                                            text.clone(),
+                                            quiet,
+                                            at,
+                                            folds.live && folds.open && live,
+                                        ))
                                         .into_any_element()
                                     },
                                 )
@@ -10178,7 +10226,9 @@ fn html_sections(
         .map(|(at, section)| {
             let rtl = body.rtl.get(at).copied().unwrap_or(false);
             let blocks = folded.blocks(section);
-            let layout = columns.blocks(folds.fill);
+            let layout = columns
+                .blocks(folds.fill)
+                .with_links(folds.live && (section.fold.is_none() || folds.open));
             match section.fold {
                 // A quote the sender answers under it: open, under the
                 // history rule, in the dimmed colour.

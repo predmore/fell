@@ -51,6 +51,7 @@ pub enum Action {
     Reply,
     ReplyAll,
     Forward,
+    FocusLinks,
     FocusAttachments,
     PreviousAttachment,
     NextAttachment,
@@ -122,6 +123,7 @@ impl Action {
             Self::Reply => "Reply",
             Self::ReplyAll => "Reply all",
             Self::Forward => "Forward",
+            Self::FocusLinks => "Focus message links",
             Self::FocusAttachments => "Focus attachments",
             Self::PreviousAttachment => "Previous attachment",
             Self::NextAttachment => "Next attachment",
@@ -201,6 +203,7 @@ const ALL_ACTIONS: &[Action] = &[
     Action::Reply,
     Action::ReplyAll,
     Action::Forward,
+    Action::FocusLinks,
     Action::FocusAttachments,
     Action::PreviousAttachment,
     Action::NextAttachment,
@@ -367,6 +370,7 @@ fn default_bindings() -> Vec<Binding> {
     bind(&[KeyId::Char('r')], Action::Reply, None);
     bind(&[KeyId::Char('R')], Action::ReplyAll, None);
     bind(&[KeyId::Char('f')], Action::Forward, None);
+    bind(&[KeyId::Tab], Action::FocusLinks, None);
     bind(&[KeyId::Char('a')], Action::FocusAttachments, None);
     bind(&[KeyId::Char('S')], Action::SaveAttachment, None);
     bind(&[KeyId::Char('m')], Action::Move, None);

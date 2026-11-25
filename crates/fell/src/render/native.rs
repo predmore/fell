@@ -17,6 +17,9 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use super::theme::{Palette, ink, paint};
 
+mod links;
+use links::{LinkSpan, link_controls, link_spans};
+
 /// Decoded inline images for one message.
 ///
 /// Built once when the message is prepared. Rendering only looks up an entry,
@@ -237,6 +240,7 @@ pub(crate) struct BlockColumn {
     reader: Option<ReaderTable>,
     quote_color: Option<u32>,
     list_depth: usize,
+    links: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -257,6 +261,7 @@ impl BlockColumn {
             reader: None,
             quote_color: None,
             list_depth: 0,
+            links: true,
         }
     }
 
@@ -280,7 +285,12 @@ impl BlockColumn {
             }),
             quote_color: None,
             list_depth: 0,
+            links: true,
         }
+    }
+
+    fn with_links(self, links: bool) -> Self {
+        Self { links, ..self }
     }
 
     fn indented(self, indent: f32, rtl: bool) -> Self {
@@ -437,6 +447,15 @@ impl From<BlockColumn> for BlockColumns {
 }
 
 impl BlockColumns {
+    pub fn with_links(self, links: bool) -> Self {
+        match self {
+            Self::Fixed(layout) => Self::Fixed(layout.with_links(links)),
+            Self::Reflow(layouts, frame) => {
+                Self::Reflow(layouts.map(|layout| layout.with_links(links)), frame)
+            }
+        }
+    }
+
     pub fn reflow(
         split: BlockColumn,
         reading: BlockColumn,
@@ -491,7 +510,14 @@ impl BlockColumns {
                     let width = reading
                         .reader
                         .map_or(reading.width, |reader| reader.pane_right);
-                    crate::view::disclosure::reflow(width, frame, [render(split), render(reading)])
+                    crate::view::disclosure::reflow(
+                        width,
+                        frame,
+                        [
+                            render(split.with_links(false)),
+                            render(reading.with_links(false)),
+                        ],
+                    )
                 }
             }
         }
@@ -1528,7 +1554,7 @@ struct Mark {
     code: bool,
     /// In the monospace face: the code itself.
     mono: bool,
-    link: bool,
+    link: Option<Arc<str>>,
 }
 
 /// Fine print's size: a step under the body, as the sender meant it.
@@ -1559,6 +1585,7 @@ fn render_inlines(
     let mut text = String::new();
     let mut ranges: Vec<(Range<usize>, Mark)> = Vec::new();
     let plain = Mark::default();
+    let source = inlines.as_ptr() as usize;
     let mut at = 0;
     while at < inlines.len() {
         // Blocked images side by side in a sentence are one line too.
@@ -1566,7 +1593,7 @@ fn render_inlines(
             && let Some((end, alts)) = image_run(inlines, at)
             && alts.len() >= 2
         {
-            flush_text(&mut text, &mut ranges, palette, layout, &mut out);
+            flush_text(&mut text, &mut ranges, palette, layout, source, &mut out);
             out.push(
                 layout
                     .prose(div().child(blocked_label(&alts, palette)))
@@ -1582,13 +1609,14 @@ fn render_inlines(
             allow_remote,
             gallery,
             layout,
+            source,
             &mut text,
             &mut ranges,
             &mut out,
         );
         at += 1;
     }
-    flush_text(&mut text, &mut ranges, palette, layout, &mut out);
+    flush_text(&mut text, &mut ranges, palette, layout, source, &mut out);
     if out.is_empty() {
         out.push(div().into_any_element());
     }
@@ -1603,6 +1631,7 @@ fn walk_inlines(
     allow_remote: bool,
     gallery: &ImageGallery,
     layout: BlockColumn,
+    source: usize,
     text: &mut String,
     ranges: &mut Vec<(Range<usize>, Mark)>,
     out: &mut Vec<AnyElement>,
@@ -1630,6 +1659,7 @@ fn walk_inlines(
                     allow_remote,
                     gallery,
                     layout,
+                    source,
                     text,
                     ranges,
                     out,
@@ -1645,6 +1675,7 @@ fn walk_inlines(
                     allow_remote,
                     gallery,
                     layout,
+                    source,
                     text,
                     ranges,
                     out,
@@ -1660,14 +1691,15 @@ fn walk_inlines(
                     allow_remote,
                     gallery,
                     layout,
+                    source,
                     text,
                     ranges,
                     out,
                 );
             }
-            Inline::Link { children, .. } => {
+            Inline::Link { href, children } => {
                 let mut next = mark.clone();
-                next.link = true;
+                next.link = fell_render::reader_link_target(href).map(Arc::from);
                 walk_inlines(
                     children,
                     &next,
@@ -1675,21 +1707,15 @@ fn walk_inlines(
                     allow_remote,
                     gallery,
                     layout,
+                    source,
                     text,
                     ranges,
                     out,
                 );
             }
-            Inline::Image { source, alt } => {
-                flush_text(text, ranges, palette, layout, out);
-                out.push(image_el(
-                    source,
-                    alt,
-                    palette,
-                    allow_remote,
-                    gallery,
-                    layout,
-                ));
+            Inline::Image { source: image, alt } => {
+                flush_text(text, ranges, palette, layout, source, out);
+                out.push(image_el(image, alt, palette, allow_remote, gallery, layout));
             }
         }
     }
@@ -1708,6 +1734,7 @@ fn flush_text(
     ranges: &mut Vec<(Range<usize>, Mark)>,
     palette: &Palette,
     layout: BlockColumn,
+    source: usize,
     out: &mut Vec<AnyElement>,
 ) {
     if text.is_empty() {
@@ -1717,7 +1744,14 @@ fn flush_text(
         .drain(..)
         .map(|(range, mark)| (range.len(), mark))
         .collect();
-    let element = MailText::new(SharedString::from(std::mem::take(text)), runs, *palette);
+    let mut element = MailText::new(SharedString::from(std::mem::take(text)), runs, *palette);
+    if layout.links && !element.links.is_empty() {
+        // The source inlines belong to the cached document. Images can
+        // split the same paragraph into several separate text elements.
+        element.id = Some(ElementId::Name(
+            format!("mail-text-{source}-{}", out.len()).into(),
+        ));
+    }
     out.push(
         layout
             .prose(div().w_full().child(element))
@@ -1725,11 +1759,35 @@ fn flush_text(
     );
 }
 
-pub(crate) fn plain_text(text: String, palette: Palette) -> impl IntoElement {
-    let runs = vec![(text.len(), Mark::default())];
-    div()
-        .w_full()
-        .child(MailText::new(text.into(), runs, palette))
+pub(crate) fn plain_text(
+    text: String,
+    palette: Palette,
+    block: usize,
+    live: bool,
+) -> impl IntoElement {
+    let mut runs = Vec::new();
+    let mut at = 0;
+    for range in fell_render::plain_link_ranges(&text) {
+        if at < range.start {
+            runs.push((range.start - at, Mark::default()));
+        }
+        at = range.end;
+        runs.push((
+            range.len(),
+            Mark {
+                link: Some(Arc::from(&text[range])),
+                ..Mark::default()
+            },
+        ));
+    }
+    if at < text.len() {
+        runs.push((text.len() - at, Mark::default()));
+    }
+    let mut element = MailText::new(text.into(), runs, palette);
+    if live && !element.links.is_empty() {
+        element.id = Some(ElementId::named_usize("plain-mail-text", block));
+    }
+    div().w_full().child(element)
 }
 
 /// One line of text shaped with its runs. `shape_text`, not `shape_line`:
@@ -1840,7 +1898,7 @@ pub(crate) fn wrap_words(
     width: Option<f32>,
     mut measure: impl FnMut(Range<usize>) -> f32,
 ) -> Vec<Range<usize>> {
-    wrap_mail(text, width, &[], |range, _| measure(range))
+    wrap_mail(text, width, &[], &[], |range, _| measure(range))
         .into_iter()
         .map(|line| line.range)
         .collect()
@@ -1860,6 +1918,7 @@ fn wrap_mail(
     text: &str,
     width: Option<f32>,
     keep: &[Range<usize>],
+    urls: &[Range<usize>],
     mut measure: impl FnMut(Range<usize>, bool) -> f32,
 ) -> Vec<MailLine> {
     let mut lines = Vec::new();
@@ -1882,6 +1941,7 @@ fn wrap_mail(
             .filter(|range| measure((*range).clone(), false) <= width)
             .collect();
         let mut breaks: Vec<_> = linebreaks(hard).collect();
+        prefer_url_breaks(hard, base, urls, &mut breaks);
         // Treat an inline code span after a space as an indivisible item.
         // Its leading punctuation (for example, "/" in a path) would
         // otherwise suppress the break before the span.
@@ -1974,6 +2034,42 @@ fn wrap_mail(
     lines
 }
 
+fn prefer_url_breaks(
+    hard: &str,
+    base: usize,
+    urls: &[Range<usize>],
+    breaks: &mut Vec<(usize, BreakOpportunity)>,
+) {
+    let end = base + hard.len();
+    let from = urls.partition_point(|url| url.end <= base);
+    let to = urls.partition_point(|url| url.start < end);
+    let Some(urls) = urls.get(from..to).filter(|urls| !urls.is_empty()) else {
+        return;
+    };
+    // URL separators take precedence over ordinary breaks inside the URL.
+    // Oversized segments can still break at grapheme boundaries.
+    breaks.retain(|&(at, opportunity)| {
+        let next = base + at;
+        let index = urls.partition_point(|url| url.end <= next);
+        opportunity == BreakOpportunity::Mandatory
+            || urls.get(index).is_none_or(|url| next <= url.start)
+    });
+    for url in urls {
+        let start = url.start.saturating_sub(base);
+        let stop = url.end.min(end) - base;
+        let label = &hard[start..stop];
+        let scheme_end = label.find("://").map_or(0, |at| at + 3);
+        breaks.extend(
+            label[scheme_end..]
+                .match_indices(['/', '?', '&'])
+                .map(|(at, _)| start + scheme_end + at + 1)
+                .filter(|&at| at < stop)
+                .map(|at| (at, BreakOpportunity::Allowed)),
+        );
+    }
+    breaks.sort_unstable_by_key(|&(at, _)| at);
+}
+
 /// Remove discretionary hyphens from the shaper's input, keeping a visible
 /// hyphen and its style only where a line actually breaks at one.
 fn visible_mail_line<'a>(
@@ -2023,6 +2119,7 @@ struct WrapKey {
     text: SharedString,
     fonts: Vec<(usize, gpui::Font)>,
     keep: Vec<Range<usize>>,
+    urls: Vec<Range<usize>>,
     size: Pixels,
     width: Option<Pixels>,
 }
@@ -2064,7 +2161,7 @@ impl WrapCache {
             key.text.len()
                 + body.lines.len() * std::mem::size_of::<MailLine>()
                 + key.fonts.len() * std::mem::size_of::<(usize, gpui::Font)>()
-                + key.keep.len() * std::mem::size_of::<Range<usize>>()
+                + (key.keep.len() + key.urls.len()) * std::mem::size_of::<Range<usize>>()
         };
         let bytes = size(&key, &wrapped);
         if bytes <= MAX_BYTES {
@@ -2093,11 +2190,13 @@ impl WrapCache {
 /// its own face, which a highlight cannot set, so the runs are built from
 /// the text style the element lays out in.
 struct MailText {
+    id: Option<ElementId>,
     text: SharedString,
     /// Byte length and marks of each run, covering the text in order.
     runs: Vec<(usize, Mark)>,
     /// Inline code, kept on one line when it fits.
     keep: Vec<Range<usize>>,
+    links: Vec<LinkSpan>,
     rtl: bool,
     palette: Palette,
     wrapped: Rc<RefCell<Rc<WrappedMail>>>,
@@ -2108,9 +2207,12 @@ struct MailText {
 
 impl MailText {
     fn new(text: SharedString, runs: Vec<(usize, Mark)>, palette: Palette) -> Self {
+        let links = link_spans(&runs);
         Self {
+            id: None,
             rtl: is_right_to_left(&text),
             keep: code_ranges(&runs),
+            links,
             text,
             runs,
             palette,
@@ -2132,10 +2234,10 @@ impl IntoElement for MailText {
 
 impl Element for MailText {
     type RequestLayoutState = ();
-    type PrepaintState = ();
+    type PrepaintState = Vec<AnyElement>;
 
     fn id(&self) -> Option<ElementId> {
-        None
+        self.id.clone()
     }
 
     fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
@@ -2177,6 +2279,12 @@ impl Element for MailText {
         let runs = self.text_runs.clone();
         let fonts: Vec<_> = runs.iter().map(|run| (run.len, run.font.clone())).collect();
         let keep = self.keep.clone();
+        let urls: Vec<_> = self
+            .links
+            .iter()
+            .filter(|link| text.get(link.range.clone()) == Some(&link.target))
+            .map(|link| link.range.clone())
+            .collect();
         let rtl = self.rtl;
         let measured = Rc::clone(&self.wrapped);
         let layout = window.request_measured_layout(
@@ -2190,6 +2298,7 @@ impl Element for MailText {
                     text: text.clone(),
                     fonts: fonts.clone(),
                     keep: keep.clone(),
+                    urls: urls.clone(),
                     size: font_size,
                     width,
                 };
@@ -2208,13 +2317,20 @@ impl Element for MailText {
 
     fn prepaint(
         &mut self,
-        _: Option<&GlobalElementId>,
+        id: Option<&GlobalElementId>,
         _: Option<&InspectorElementId>,
-        _: Bounds<Pixels>,
+        bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
-        _: &mut Window,
-        _: &mut App,
+        window: &mut Window,
+        cx: &mut App,
     ) -> Self::PrepaintState {
+        id.map_or_else(Vec::new, |id| {
+            window.with_element_state(id, |state, window| {
+                let mut state = state.unwrap_or_default();
+                let controls = link_controls(self, bounds, &mut state, window, cx);
+                (controls, state)
+            })
+        })
     }
 
     fn paint(
@@ -2223,9 +2339,27 @@ impl Element for MailText {
         _: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
-        _: &mut Self::PrepaintState,
+        controls: &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
+    ) {
+        for control in controls {
+            control.paint(window, cx);
+        }
+        self.for_visible_line(bounds, window, |_, shaped, origin, window| {
+            let align = TextAlign::Left;
+            let _ = shaped.paint_background(origin, self.line_height, align, None, window, cx);
+            let _ = shaped.paint(origin, self.line_height, align, None, window, cx);
+        });
+    }
+}
+
+impl MailText {
+    fn for_visible_line(
+        &self,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        mut visit: impl FnMut(&MailLine, gpui::WrappedLine, gpui::Point<Pixels>, &mut Window),
     ) {
         let mask = window.content_mask().bounds;
         let height = f32::from(self.line_height).max(1.0);
@@ -2256,9 +2390,7 @@ impl Element for MailText {
                 bounds.left()
             };
             let origin = gpui::point(x, bounds.origin.y + self.line_height * at as f32);
-            let align = TextAlign::Left;
-            let _ = shaped.paint_background(origin, self.line_height, align, None, window, cx);
-            let _ = shaped.paint(origin, self.line_height, align, None, window, cx);
+            visit(line, shaped, origin, window);
         }
     }
 }
@@ -2337,6 +2469,7 @@ fn wrap_measured_mail(
         &key.text,
         key.width.map(f32::from),
         &key.keep,
+        &key.urls,
         |range, hyphen| {
             let line = hard.partition_point(|(start, _)| *start <= range.start);
             match line.checked_sub(1).map(|line| &hard[line]) {
@@ -2679,15 +2812,15 @@ impl Element for PreText {
 }
 
 fn highlight(mark: &Mark, palette: &Palette) -> Option<HighlightStyle> {
-    if !mark.strong && !mark.emphasis && !mark.strike && !mark.code && !mark.link {
+    if !mark.strong && !mark.emphasis && !mark.strike && !mark.code && mark.link.is_none() {
         return None;
     }
     Some(HighlightStyle {
-        color: mark.link.then(|| ink(palette.accent)),
+        color: mark.link.as_ref().map(|_| ink(palette.accent)),
         font_weight: mark.strong.then_some(FontWeight::BOLD),
         font_style: mark.emphasis.then_some(FontStyle::Italic),
         background_color: mark.code.then(|| ink(palette.code_bg)),
-        underline: mark.link.then(|| UnderlineStyle {
+        underline: mark.link.as_ref().map(|_| UnderlineStyle {
             thickness: px(1.),
             color: Some(ink(palette.accent)),
             wavy: false,
@@ -3924,7 +4057,7 @@ mod decode_tests {
         use super::{visible_mail_line, wrap_mail};
 
         let show = |text: &str, width| {
-            wrap_mail(text, width, &[], |range, hyphen| {
+            wrap_mail(text, width, &[], &[], |range, hyphen| {
                 visible_mail_line(text, &range, hyphen).chars().count() as f32
             })
             .into_iter()
@@ -3950,6 +4083,7 @@ mod decode_tests {
                 text: text.clone().into(),
                 fonts: Vec::new(),
                 keep: Vec::new(),
+                urls: Vec::new(),
                 size: gpui::px(14.0),
                 width: Some(gpui::px(width)),
             };
@@ -3978,7 +4112,7 @@ mod decode_tests {
                 },
                 |_| 1.0,
             );
-            let reference = wrap_mail(&text, Some(width), &[], |range, hyphen| {
+            let reference = wrap_mail(&text, Some(width), &[], &[], |range, hyphen| {
                 measure(&range, hyphen)
             });
             assert_eq!(shapes.get(), 1);
@@ -3993,6 +4127,31 @@ mod decode_tests {
     }
 
     #[test]
+    fn a_url_prefers_separators_and_keeps_its_original_bytes() {
+        let text = "https://example.test/north/south/section-four?mode=view&format=text";
+        let url = 0..text.len();
+        let lines: Vec<_> = super::wrap_mail(
+            text,
+            Some(29.0),
+            &[],
+            std::slice::from_ref(&url),
+            |range, _| range.len() as f32,
+        )
+        .into_iter()
+        .map(|line| &text[line.range])
+        .collect();
+        assert_eq!(
+            lines,
+            [
+                "https://example.test/north/",
+                "south/section-four?mode=view&",
+                "format=text"
+            ]
+        );
+        assert_eq!(lines.concat(), text);
+    }
+
+    #[test]
     fn a_long_mail_is_wrapped_once_at_a_stable_width() {
         use super::{WrapCache, WrapKey, WrappedMail, wrap_mail};
         use std::rc::Rc;
@@ -4003,14 +4162,19 @@ mod decode_tests {
             fonts: vec![(text.len(), gpui::font("sans-serif"))],
             text: text.into(),
             keep: Vec::new(),
+            urls: Vec::new(),
             size: gpui::px(14.),
             width: Some(gpui::px(600.)),
         };
         let first = cache.get_or_wrap(key.clone(), |key| {
             let width = key.width.unwrap();
-            let lines = wrap_mail(&key.text, Some(width.into()), &key.keep, |range, _| {
-                range.len() as f32 * 7.0
-            });
+            let lines = wrap_mail(
+                &key.text,
+                Some(width.into()),
+                &key.keep,
+                &key.urls,
+                |range, _| range.len() as f32 * 7.0,
+            );
             WrappedMail { lines, width }
         });
         assert!(first.lines.len() > 500);
@@ -4055,18 +4219,18 @@ mod decode_tests {
         };
         // Do not take a Unicode break inside inline code.
         let text = "change it to /mnt/archive when";
-        let lines = super::wrap_mail(text, Some(16.0), &[13..25], width);
+        let lines = super::wrap_mail(text, Some(16.0), &[13..25], &[], width);
         assert_eq!(show(text, lines), ["change it to", "/mnt/archive", "when"]);
         // Code with spaces stays on one line when it fits.
         let text = "try retries = 5 on staging";
-        let lines = super::wrap_mail(text, Some(14.0), &[4..15], width);
+        let lines = super::wrap_mail(text, Some(14.0), &[4..15], &[], width);
         assert_eq!(show(text, lines), ["try", "retries = 5 on", "staging"]);
         // Wider than the line: it breaks at its spaces first.
-        let lines = super::wrap_mail(text, Some(9.0), &[4..15], width);
+        let lines = super::wrap_mail(text, Some(9.0), &[4..15], &[], width);
         assert_eq!(show(text, lines), ["try", "retries =", "5 on", "staging"]);
         // Normal text uses Unicode's break opportunity after a slash.
         let text = "see https://a.test/very/long/path ok";
-        let lines = super::wrap_mail(text, Some(12.0), &[], width);
+        let lines = super::wrap_mail(text, Some(12.0), &[], &[], width);
         assert_eq!(
             show(text, lines),
             ["see https://", "a.test/very/", "long/path ok"]
