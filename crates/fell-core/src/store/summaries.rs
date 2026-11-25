@@ -2253,12 +2253,31 @@ mod tests {
 
     #[test]
     fn a_snoozed_inbox_reply_wakes_only_if_newer_and_unmuted() {
+        use crate::backend::{CopyLink, MailboxView, MailboxViewKind};
+
+        #[derive(Clone, Copy, Debug)]
+        enum Delivery {
+            Insert,
+            Link(&'static str),
+            Update,
+            Upsert,
+        }
+
+        use Delivery::{Insert, Link, Update, Upsert};
+
         const SET_AT: i64 = 1_700_000_100;
-        for (newer, muted, unread) in [
-            (false, false, true),
-            (true, false, true),
-            (true, false, false),
-            (true, true, true),
+        for (delivery, newer, muted, unread, from_self) in [
+            (Insert, false, false, true, false),
+            (Insert, true, false, true, false),
+            (Insert, true, false, false, false),
+            (Insert, true, true, true, false),
+            (Link("All Mail"), true, false, false, false),
+            (Link("Archive"), false, false, true, false),
+            (Link("Sent"), true, false, true, true),
+            (Link("All Mail"), true, false, true, true),
+            (Link("All Mail"), true, true, true, false),
+            (Update, true, false, false, false),
+            (Upsert, true, false, false, false),
         ] {
             let store = Store::open_in_memory().unwrap();
             let account = account();
@@ -2290,6 +2309,9 @@ mod tests {
             let mut reply = inbox_message_at(&mut rng, 3, when);
             reply.headers.in_reply_to = Some(root.headers.message_id);
             reply.unread = unread;
+            if from_self {
+                reply.headers.from.email = account.email.to_ascii_uppercase();
+            }
             let reply_id = reply.headers.message_id.clone();
             let mut alerts = Vec::new();
             let mut observer = crate::store::inbox_arrivals::Observer {
@@ -2309,20 +2331,74 @@ mod tests {
                     alerts.extend(batch.unwrap().into_iter().map(|arrival| arrival.id))
                 },
             };
-            store
-                .apply_sync_delta_observed(
-                    &account.id,
-                    &MailboxDelta {
-                        messages: vec![reply],
-                        ..MailboxDelta::default()
-                    },
-                    Some(&mut observer),
-                )
-                .unwrap();
+            if !matches!(delivery, Insert) {
+                let folder = if let Link(folder) = delivery {
+                    folder
+                } else {
+                    "All Mail"
+                };
+                let mut first_copy = reply.clone();
+                first_copy.folders = vec![folder.into()];
+                first_copy.remote_id = RemoteId(format!("imap:1:3:{folder}"));
+                let views = (folder == "All Mail").then(|| {
+                    vec![MailboxView {
+                        mailbox: "All Mail".into(),
+                        folder: "All Mail".into(),
+                        kind: MailboxViewKind::All,
+                    }]
+                });
+                store
+                    .apply_sync_delta_observed(
+                        &account.id,
+                        &MailboxDelta {
+                            views,
+                            messages: vec![first_copy],
+                            ..MailboxDelta::default()
+                        },
+                        Some(&mut observer),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    store.folder_threads(&account.id, triage::SNOOZED).unwrap()[0].thread_id,
+                    target,
+                    "{delivery:?}"
+                );
+            }
+            if matches!(delivery, Upsert) {
+                assert_eq!(store.upsert_message(&reply).unwrap(), target);
+            } else {
+                let mut delta = MailboxDelta::default();
+                if matches!(delivery, Link(_)) {
+                    delta.links.push(CopyLink {
+                        message_id: reply_id.clone(),
+                        flags: FlagUpdate {
+                            remote_id: reply.remote_id,
+                            unread: Some(unread),
+                            flagged: None,
+                            keywords: None,
+                            delivery_keywords: None,
+                            modseq: None,
+                        },
+                    });
+                } else {
+                    delta.messages.push(reply);
+                }
+                let writes = store
+                    .apply_sync_delta_observed(&account.id, &delta, Some(&mut observer))
+                    .unwrap();
+                assert!(writes.changed);
+                assert_eq!(writes.new_messages, usize::from(matches!(delivery, Insert)));
+                if matches!(delivery, Link(_)) {
+                    // The same UID can be replayed if sync stopped before saving its cursor.
+                    store
+                        .apply_sync_delta_observed(&account.id, &delta, Some(&mut observer))
+                        .unwrap();
+                }
+            }
 
-            let wakes = newer && !muted;
+            let wakes = newer && !muted && !from_self;
             let inbox = store.folder_threads(&account.id, "INBOX").unwrap();
-            assert_eq!(inbox.len(), if wakes { 2 } else { 1 });
+            assert_eq!(inbox.len(), if wakes { 2 } else { 1 }, "{delivery:?}");
             assert_eq!(
                 &inbox[0].thread_id,
                 if wakes { &target } else { &other_thread }
@@ -2336,10 +2412,11 @@ mod tests {
             );
             assert_eq!(
                 alerts,
-                wakes
+                (wakes && !matches!(delivery, Upsert))
                     .then(|| reply_id.clone())
                     .into_iter()
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>(),
+                "{delivery:?}"
             );
             assert_eq!(
                 store.thread_messages(&account.id, &target).unwrap().len(),

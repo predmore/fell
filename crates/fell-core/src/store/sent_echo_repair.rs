@@ -189,7 +189,7 @@ fn repair_account(conn: &Connection, account_id: &AccountId, roles: &FolderRoles
         // Do not mark unread mail read as a side effect of upgrading. The
         // IMAP copy flags and MODSEQs move intact with the copies.
         incoming.unread |= original.unread;
-        absorb_duplicate(conn, &incoming, &echo, &keeper)?;
+        absorb_duplicate(conn, &incoming, &echo, &keeper, &mut merge_roles)?;
         changed = true;
     }
     Ok(changed)

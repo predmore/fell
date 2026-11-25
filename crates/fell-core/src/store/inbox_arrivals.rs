@@ -1,8 +1,10 @@
+use std::collections::HashSet;
+
 use rusqlite::{OptionalExtension, params};
 
 use crate::folders::{FolderRole, FolderRoles};
 use crate::imap::{MailboxCheckpoint, parse_remote_id};
-use crate::{Account, AccountId, Message, MessageId, Result, Store};
+use crate::{Account, AccountId, Message, MessageId, RemoteId, Result, Store};
 
 use super::split_field;
 
@@ -43,6 +45,12 @@ pub(crate) struct Observer<'a> {
     pub send: &'a mut dyn FnMut(Result<Vec<InboxArrival>>),
 }
 
+pub(super) enum Candidate<'a> {
+    New(&'a MessageId),
+    // A copy of a stored message only alerts when it wakes the thread.
+    OnWake(&'a MessageId),
+}
+
 impl Observer<'_> {
     pub fn is_candidate(&self, message: &Message) -> bool {
         // A snooze wake can mark a reply unread before the commit.
@@ -52,26 +60,59 @@ impl Observer<'_> {
                 .from
                 .email
                 .eq_ignore_ascii_case(&self.account.email)
-            && parse_remote_id(&message.remote_id.0).is_some_and(|copy| {
-                copy.folder
-                    .eq_ignore_ascii_case(FolderRole::Inbox.default_name())
-                    && copy.uidvalidity == self.checkpoint.uidvalidity
-                    && copy.uid > self.checkpoint.uid
-            })
+            && self.is_new_inbox_copy(&message.remote_id)
     }
 
-    pub fn committed(&mut self, store: &Store, ids: &[MessageId]) {
-        if !ids.is_empty() {
-            let arrivals = self.read_arrivals(store, ids);
+    pub(super) fn is_new_inbox_copy(&self, remote_id: &RemoteId) -> bool {
+        parse_remote_id(&remote_id.0).is_some_and(|copy| {
+            copy.folder
+                .eq_ignore_ascii_case(FolderRole::Inbox.default_name())
+                && copy.uidvalidity == self.checkpoint.uidvalidity
+                && copy.uid > self.checkpoint.uid
+        })
+    }
+
+    pub(super) fn committed(
+        &mut self,
+        store: &Store,
+        candidates: &[Candidate<'_>],
+        woken: &HashSet<String>,
+    ) {
+        if !candidates.is_empty() {
+            let arrivals = self.read_arrivals(store, candidates, woken);
             (self.send)(arrivals);
         }
     }
 
-    fn read_arrivals(&self, store: &Store, ids: &[MessageId]) -> Result<Vec<InboxArrival>> {
+    fn read_arrivals(
+        &self,
+        store: &Store,
+        candidates: &[Candidate<'_>],
+        woken: &HashSet<String>,
+    ) -> Result<Vec<InboxArrival>> {
         let roles = store.folder_roles(&self.account.id)?;
         let mut query = store.conn.prepare_cached(ELIGIBLE_MESSAGE)?;
         let mut arrivals = Vec::new();
-        for id in ids {
+        let mut seen = HashSet::new();
+        for candidate in candidates {
+            let id = match candidate {
+                Candidate::New(id) => (*id).clone(),
+                Candidate::OnWake(id) => {
+                    if woken.is_empty() {
+                        continue;
+                    }
+                    let Some(id) = store.canonical_id(&self.account.id, id)? else {
+                        continue;
+                    };
+                    if !woken.contains(&id) {
+                        continue;
+                    }
+                    MessageId(id)
+                }
+            };
+            if !seen.insert(id.clone()) {
+                continue;
+            }
             let row = query
                 .query_row(params![self.account.id.as_str(), id.as_str()], |row| {
                     Ok((
@@ -87,7 +128,7 @@ impl Observer<'_> {
                 && in_inbox(&roles, &folders)
             {
                 arrivals.push(InboxArrival {
-                    id: id.clone(),
+                    id,
                     sender,
                     subject,
                     snippet,
@@ -124,6 +165,12 @@ impl Store {
         }
         Ok(unread)
     }
+}
+
+pub(super) fn has_inbox(roles: &FolderRoles, encoded: &str) -> bool {
+    encoded
+        .split('\u{1e}')
+        .any(|folder| roles.is(FolderRole::Inbox, folder))
 }
 
 pub(super) fn in_inbox(roles: &FolderRoles, encoded: &str) -> bool {

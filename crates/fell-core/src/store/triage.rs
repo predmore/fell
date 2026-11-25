@@ -1,5 +1,7 @@
 //! Local thread visibility. Folder membership and server copies remain intact.
 
+use std::collections::HashSet;
+
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::actions::{ActionKind, FOLDER_INBOX, ensure_action_schema, insert_local_action};
@@ -219,17 +221,17 @@ pub(super) fn has_snoozes(conn: &Connection, account: &AccountId) -> Result<bool
         .exists(params![account.as_str(), SNOOZED])?)
 }
 
-/// Wake a snoozed thread on a distinct incoming Inbox message that was
-/// sent after its active snooze. Run after rethreading and before commit
-/// so arrival notifications see the same Inbox membership as the list.
+/// Wake a snoozed thread on an incoming message sent after its active snooze.
+/// Run after rethreading and before commit so alerts see the same Inbox as the list.
 pub(super) fn wake_arrivals(
     conn: &Connection,
     account: &AccountId,
-    arrivals: &[crate::MessageId],
+    arrivals: &[&crate::MessageId],
     roles: Option<&crate::FolderRoles>,
-) -> Result<()> {
+) -> Result<HashSet<String>> {
+    let mut woken = HashSet::new();
     if arrivals.is_empty() {
-        return Ok(());
+        return Ok(woken);
     }
     let listed;
     let roles = if let Some(roles) = roles {
@@ -241,15 +243,16 @@ pub(super) fn wake_arrivals(
     let now = crate::agent::now_unix();
     let key = account.as_str();
     let mut incoming = conn.prepare_cached(&format!(
-        "SELECT m.thread_id, m.date_unix, m.folders, m.unread
+        "SELECT m.message_id, m.thread_id, m.date_unix, m.folders, m.unread
          FROM messages m JOIN accounts a ON a.id = m.account_id
-         WHERE m.account_id = ?1 AND m.message_id = ?2 AND NOT m.archived
+         WHERE m.account_id = ?1 AND m.message_id = ({}) AND NOT m.archived
            AND m.snooze_until IS NULL AND m.from_email <> a.email COLLATE NOCASE
            AND (m.folders <> '' OR NOT ({}))
            AND EXISTS (
                SELECT 1 FROM messages s WHERE s.account_id = m.account_id
                AND s.thread_id = m.thread_id AND s.snooze_until > 0
            )",
+        super::CANONICAL_ID_SQL,
         super::views::has_view_copy("m"),
     ))?;
     // The activity snapshot supplies the set time for the live deadline,
@@ -271,13 +274,14 @@ pub(super) fn wake_arrivals(
            AND action.summary = ?3 || anchors.snooze_until",
     )?;
     for arrival in arrivals {
-        let Some((thread, sent, folders, unread)) = incoming
+        let Some((id, thread, sent, folders, unread)) = incoming
             .query_row(params![key, arrival.as_str()], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, bool>(3)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, bool>(4)?,
                 ))
             })
             .optional()?
@@ -294,16 +298,11 @@ pub(super) fn wake_arrivals(
             |row| row.get(0),
         )?;
         if set_at.is_some_and(|set_at| sent > set_at) {
-            wake_thread(
-                conn,
-                key,
-                &thread,
-                now,
-                Some((arrival.as_str().into(), unread)),
-            )?;
+            wake_thread(conn, key, &thread, now, Some((id.clone(), unread)))?;
+            woken.insert(id);
         }
     }
-    Ok(())
+    Ok(woken)
 }
 
 fn wake_thread(
