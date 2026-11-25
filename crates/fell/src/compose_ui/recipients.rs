@@ -334,6 +334,7 @@ impl ComposeView {
             completion.selected,
             completion.ready,
             theme,
+            self.ui_px / 15.,
             |index, row| {
                 row.id(("recipient", index))
                     .cursor_pointer()

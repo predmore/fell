@@ -701,6 +701,9 @@ impl ComposeView {
             return false;
         }
         self.ui_px = next;
+        for row in &mut self.recipient_heights {
+            row.reset_height();
+        }
         true
     }
 
@@ -2511,6 +2514,7 @@ impl ComposeView {
                 colors,
                 wide,
                 family,
+                self.ui_px,
                 &mut self.recipient_heights[index],
                 motion,
                 now,
@@ -2542,6 +2546,7 @@ impl ComposeView {
                 active,
                 colors,
                 recipient_rows::label_width(window),
+                recipient_rows::line_height(self.ui_px),
                 shown,
                 overlay,
             ));
@@ -3226,6 +3231,7 @@ fn field_row(
     active: bool,
     colors: Palette,
     label_width: gpui::Pixels,
+    line_height: gpui::Pixels,
     shown: gpui::Div,
     overlay: Option<gpui::Deferred>,
 ) -> gpui::Div {
@@ -3242,8 +3248,7 @@ fn field_row(
             div()
                 .w(label_width)
                 .flex_shrink_0()
-                .text_size(px(16.))
-                .line_height(recipient_rows::LINE)
+                .line_height(line_height)
                 .text_color(rgb(colors.fg))
                 .child(label.to_string()),
         )

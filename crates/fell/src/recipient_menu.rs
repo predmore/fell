@@ -397,6 +397,7 @@ impl Menu {
         selected: usize,
         interactive: bool,
         theme: &Theme,
+        scale: f32,
         on_row: impl Fn(usize, Div) -> gpui::AnyElement,
     ) -> Option<Div> {
         let now = Instant::now();
@@ -408,17 +409,18 @@ impl Menu {
         }
         let alpha = self.close.map_or(1., |fade| fade.remaining(now));
         let highlight = self.highlight_at(selected, now);
+        // Scale the animated positions at paint time so a font change keeps their progress.
         Some(
             div()
                 .w_full()
-                .h(px(self.height_at(now)))
+                .h(px(self.height_at(now) * scale))
                 .overflow_hidden()
-                .py_1()
+                .py(px((FRAME * scale / 2. - 1.).max(0.)))
                 .rounded_md()
                 .border_1()
                 .border_color(rgb(theme.border))
                 .bg(rgb(theme.recipient_surface))
-                .text_size(px(14.))
+                .text_size(px(14. * scale))
                 .shadow_md()
                 .opacity(self.panel_fade.map_or(1., |fade| fade.remaining(now)))
                 .child(
@@ -431,14 +433,13 @@ impl Menu {
                                 .iter()
                                 .filter(|band| band.fade.running(now))
                                 .map(|band| {
-                                    selection_band(band.value, theme).opacity(band.opacity(now))
+                                    selection_band(band.value, scale, theme)
+                                        .opacity(band.opacity(now))
                                 }),
                         )
-                        .children(
-                            self.animations.get(selected).map(|row| {
-                                selection_band(highlight, theme).opacity(row.opacity(now))
-                            }),
-                        )
+                        .children(self.animations.get(selected).map(|row| {
+                            selection_band(highlight, scale, theme).opacity(row.opacity(now))
+                        }))
                         .children(
                             self.leaving_rows
                                 .iter()
@@ -449,6 +450,7 @@ impl Menu {
                                         &leaving.person,
                                         leaving.top,
                                         leaving.highlight,
+                                        scale,
                                         theme,
                                     )
                                     .opacity(row.opacity(now))
@@ -458,16 +460,28 @@ impl Menu {
                             self.leaving_status
                                 .iter()
                                 .filter(|status| status.fade.running(now))
-                                .map(|status| status_row(status.value, status.opacity(now), theme)),
+                                .map(|status| {
+                                    status_row(status.value, status.opacity(now), scale, theme)
+                                }),
                         )
                         .children(self.status.map(|status| {
-                            status_row(status, Arrival::opacity(self.status_arrival, now), theme)
+                            status_row(
+                                status,
+                                Arrival::opacity(self.status_arrival, now),
+                                scale,
+                                theme,
+                            )
                         }))
                         .children(self.rows.iter().enumerate().map(|(index, person)| {
                             let animation = &self.animations[index];
-                            let row =
-                                recipient_row(person, animation.top(index, now), highlight, theme)
-                                    .opacity(animation.opacity(now));
+                            let row = recipient_row(
+                                person,
+                                animation.top(index, now),
+                                highlight,
+                                scale,
+                                theme,
+                            )
+                            .opacity(animation.opacity(now));
                             if self.open && interactive {
                                 on_row(index, row)
                             } else {
@@ -487,31 +501,31 @@ fn same_address(a: &Address, b: &Address) -> bool {
     a.email.eq_ignore_ascii_case(&b.email)
 }
 
-fn status_row(text: &'static str, opacity: f32, theme: &Theme) -> Div {
-    row_base(0.)
+fn status_row(text: &'static str, opacity: f32, scale: f32, theme: &Theme) -> Div {
+    row_base(0., scale)
         .opacity(opacity)
         .text_color(rgb(theme.recipient_text.1))
         .child(text)
 }
 
-fn selection_band(top: f32, theme: &Theme) -> Div {
+fn selection_band(top: f32, scale: f32, theme: &Theme) -> Div {
     div()
         .absolute()
-        .top(px(top))
+        .top(px(top * scale))
         .left(px(2.))
         .right(px(2.))
-        .h(px(ROW))
+        .h(px(ROW * scale))
         .rounded_sm()
         .bg(rgb(theme.recipient_selection))
 }
 
-fn recipient_row(person: &Address, top: f32, highlight: f32, theme: &Theme) -> Div {
+fn recipient_row(person: &Address, top: f32, highlight: f32, scale: f32, theme: &Theme) -> Div {
     let selected = (1. - (top - highlight).abs() / ROW).max(0.);
     let (foreground, dimmed) = theme.recipient_text;
     let (selected_foreground, selected_dimmed) = theme.recipient_selected_text;
     let text = motion::mix(foreground, selected_foreground, selected);
     let dim = motion::mix(dimmed, selected_dimmed, selected);
-    row_base(top)
+    row_base(top, scale)
         .text_color(rgb(text))
         .children(person.name.as_deref().map(|name| {
             div()
@@ -531,15 +545,15 @@ fn recipient_row(person: &Address, top: f32, highlight: f32, theme: &Theme) -> D
         )
 }
 
-fn row_base(top: f32) -> Div {
+fn row_base(top: f32, scale: f32) -> Div {
     div()
         .absolute()
-        .top(px(top))
+        .top(px(top * scale))
         .left_0()
         .right_0()
-        .h(px(ROW))
+        .h(px(ROW * scale))
         .pl(px(TEXT_INSET - 1.))
-        .pr(px(16.))
+        .pr(px(16. * scale))
         .gap_2()
         .flex()
         .items_center()
