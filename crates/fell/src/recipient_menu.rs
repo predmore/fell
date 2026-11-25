@@ -110,6 +110,7 @@ pub(crate) struct Menu {
     status_arrival: Option<Arrival>,
     close: Option<Transition>,
     panel_fade: Option<Transition>,
+    anchored_exit_height: Option<f32>,
     height: Option<Glide>,
     highlight: Option<Glide>,
     open: bool,
@@ -324,6 +325,7 @@ impl Menu {
         self.open = true;
         self.close = None;
         self.panel_fade = None;
+        self.anchored_exit_height = None;
         next
     }
 
@@ -334,6 +336,19 @@ impl Menu {
         self.height = Glide::start(&motion, self.height_at(now), 0., 0., motion::FADE, now);
         self.close = motion.start(motion::FADE, now);
         self.panel_fade = motion.start(PANEL_FADE, now + motion::FADE - PANEL_FADE);
+        self.open = false;
+        true
+    }
+
+    /// Keep the panel's shape as its compose row moves underneath it.
+    pub fn dismiss_anchored(&mut self, motion: Motion, now: Instant) -> bool {
+        if !self.open {
+            return false;
+        }
+        self.anchored_exit_height = Some(self.height_at(now));
+        self.height = None;
+        self.close = motion.start(motion::QUICK, now);
+        self.panel_fade = self.close;
         self.open = false;
         true
     }
@@ -350,9 +365,11 @@ impl Menu {
     }
 
     fn height_at(&self, now: Instant) -> f32 {
-        self.height
-            .as_ref()
-            .map_or(panel_height(self.rows.len()), |glide| glide.value(now))
+        self.anchored_exit_height.unwrap_or_else(|| {
+            self.height
+                .as_ref()
+                .map_or(panel_height(self.rows.len()), |glide| glide.value(now))
+        })
     }
 
     pub fn animating(&self, now: Instant) -> bool {
@@ -388,7 +405,11 @@ impl Menu {
         if self.animating(now) {
             window.request_animation_frame();
         }
-        let alpha = self.close.map_or(1., |fade| fade.remaining(now));
+        let alpha = if self.anchored_exit_height.is_some() {
+            1.
+        } else {
+            self.close.map_or(1., |fade| fade.remaining(now))
+        };
         let highlight = self.highlight_at(selected, now);
         Some(
             div()
@@ -625,6 +646,22 @@ mod tests {
         assert_eq!(menu.height_at(end), 0.);
         assert_eq!(fade.remaining(end), 0.);
         assert!(!menu.animating(end));
+    }
+
+    #[test]
+    fn compose_dismisses_at_the_current_height_and_fades_over_eighty_ms() {
+        let start = Instant::now();
+        let motion = Motion::new(true);
+        let mut menu = Menu::default();
+        menu.show(vec![person("ruben"), person("riya")], 0, motion, start);
+        let dismissed = start + motion::FADE;
+        let height = menu.height_at(dismissed);
+        assert!(menu.dismiss_anchored(motion, dismissed));
+        assert!(menu.rows().is_empty());
+        let halfway = dismissed + motion::QUICK / 2;
+        assert_eq!(menu.height_at(halfway), height);
+        assert_eq!(menu.panel_fade.unwrap().remaining(halfway), 0.25);
+        assert!(!menu.animating(dismissed + motion::QUICK));
     }
 
     fn person(name: &str) -> Address {

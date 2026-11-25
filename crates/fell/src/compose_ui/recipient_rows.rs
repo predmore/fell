@@ -4,11 +4,11 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::time::Instant;
 
-use fell_core::compose::{AddressView, parse_address_line, recipient_display_char};
+use fell_core::compose::{AddressView, email_of, parse_address_line, recipient_display_char};
 use gpui::{
     App, Bounds, FontStyle, MouseButton, Pixels, Point, ScrollHandle, StatefulInteractiveElement,
-    TextAlign, TextRun, UnderlineStyle, Window, WrappedLineLayout, canvas, div, fill, point,
-    prelude::*, px, rgb, size,
+    TextAlign, TextRun, UnderlineStyle, Window, WrappedLine, WrappedLineLayout, canvas, div, fill,
+    point, prelude::*, px, rgb, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -55,6 +55,13 @@ pub(super) fn tokens(line: &str) -> impl Iterator<Item = (usize, &str)> {
         *start += raw.len() + 1;
         Some((at, raw))
     })
+}
+
+/// An address being written is ready for the same recipient note as a saved one.
+pub(super) fn complete_mailbox(raw: &str) -> Option<String> {
+    let email = email_of(raw)?;
+    let (local, domain) = email.split_once('@')?;
+    (!local.is_empty() && !domain.is_empty()).then_some(email)
 }
 
 pub(super) fn first_invalid(line: &str) -> Option<Range<usize>> {
@@ -118,7 +125,7 @@ struct DisplayLine {
     invalid: Option<usize>,
     selected: Option<usize>,
     source_offsets: Vec<(usize, usize)>,
-    keep_together: Vec<Range<usize>>,
+    recipients: Vec<Range<usize>>,
 }
 
 struct Span {
@@ -129,7 +136,7 @@ struct Span {
 enum SpanKind {
     Invalid,
     SelectedInvalid,
-    Note { color: u32, recipient: String },
+    Note { color: u32, slot: usize },
     Placeholder(u32),
 }
 
@@ -158,16 +165,25 @@ fn display_line(line: RecipientLine<'_>, colors: Palette, wide: bool) -> Display
         invalid: None,
         selected: None,
         source_offsets: Vec::new(),
-        keep_together: Vec::new(),
+        recipients: Vec::new(),
     };
     let saved: HashMap<_, _> = saved
         .iter()
         .map(|address| (address.raw.as_str(), address))
         .collect();
-    for (at, raw) in tokens(value) {
+    let mut entries = tokens(value)
+        .filter(|(at, raw)| {
+            !raw.trim().is_empty()
+                || selection
+                    .as_ref()
+                    .is_some_and(|range| (*at..=*at + raw.len()).contains(&range.start))
+        })
+        .enumerate()
+        .peekable();
+    while let Some((slot, (at, raw))) = entries.next() {
         let trimmed = raw.trim();
         let separator = shown.text.len();
-        if at > 0 {
+        if slot > 0 {
             shown.text.push(if wide { ' ' } else { '\n' });
         }
         let skip = raw.len() - raw.trim_start().len();
@@ -222,9 +238,6 @@ fn display_line(line: RecipientLine<'_>, colors: Palette, wide: bool) -> Display
                 });
             }
         }
-        if wide && at > 0 && start < end {
-            shown.keep_together.push(separator..end);
-        }
         if let Some(address) = saved.get(trimmed) {
             let note = match (
                 !redirects.is_empty() && redirects.contains(&address.email.trim().to_lowercase()),
@@ -241,21 +254,15 @@ fn display_line(line: RecipientLine<'_>, colors: Palette, wide: bool) -> Display
                 shown.text.push_str(&note.replace(' ', "\u{a0}"));
                 shown.spans.push(Span {
                     bytes: start..shown.text.len(),
-                    kind: SpanKind::Note {
-                        color,
-                        recipient: address.raw.clone(),
-                    },
+                    kind: SpanKind::Note { color, slot },
                 });
-                shown.keep_together.push(start..shown.text.len());
             }
         }
-        if wide && at + raw.len() < value.len() {
+        if wide && entries.peek().is_some() {
             shown.text.push(',');
-            if let Some(group) = shown.keep_together.last_mut()
-                && group.end + 1 == shown.text.len()
-            {
-                group.end += 1;
-            }
+        }
+        if !trimmed.is_empty() {
+            shown.recipients.push(separator..shown.text.len());
         }
     }
     if shown.text.is_empty() {
@@ -281,8 +288,7 @@ pub(super) struct RowHeight {
     target: Option<f32>,
     glide: Option<Glide>,
     scroll: ScrollHandle,
-    invalid_anchor: Option<Pixels>,
-    notes: HashMap<String, Option<Transition>>,
+    notes: HashMap<usize, Option<Transition>>,
 }
 
 impl RowHeight {
@@ -329,6 +335,57 @@ fn cursor_position(line: &WrappedLineLayout, at: usize, width: Pixels) -> Option
     Some(position)
 }
 
+/// End positions include each recipient's note and separator. Reserve room
+/// for the hidden count on the last row, keeping the first recipient visible
+/// even when it alone wraps past the height limit.
+fn visible_recipients(
+    ends: &[Point<Pixels>],
+    height: Pixels,
+    width: Pixels,
+    indicator_width: impl Fn(usize) -> Pixels,
+) -> usize {
+    let mut visible = ends.partition_point(|end| end.y + LINE <= height);
+    if visible == ends.len() {
+        return visible;
+    }
+    while visible > 1 {
+        let last = ends[visible - 1];
+        if last.y + LINE < height
+            || last.x + px(8.) + indicator_width(ends.len() - visible) <= width
+        {
+            break;
+        }
+        visible -= 1;
+    }
+    visible.max(1)
+}
+
+fn display_position(
+    lines: &[WrappedLine],
+    index: usize,
+    width: Pixels,
+    continuation: bool,
+) -> Option<Point<Pixels>> {
+    let mut start = 0;
+    let mut top = px(0.);
+    for line in lines {
+        let end = start + line.len();
+        if (start..=end).contains(&index) {
+            let at = index - start;
+            let mut position = if continuation {
+                cursor_position(line, at, width)?
+            } else {
+                line.position_for_index(at, LINE)?
+            };
+            position.y += top;
+            return Some(position);
+        }
+        top += line.size(LINE).height;
+        start = end + 1;
+    }
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn value_view(
     label: &'static str,
@@ -342,6 +399,7 @@ pub(super) fn value_view(
     window: &mut Window,
     on_cursor: impl Fn(usize, &mut App) + 'static,
 ) -> gpui::Div {
+    let active = line.selection.is_some();
     let mut shown = display_line(line, colors, wide);
     let mut style = window.text_style();
     style.font_family = family.to_owned().into();
@@ -350,6 +408,8 @@ pub(super) fn value_view(
     let mut runs = Vec::<TextRun>::new();
     let mut notes = HashMap::new();
     let mut notes_animating = false;
+    let mut short_underlines = Vec::new();
+    let mut note_ranges = Vec::new();
     let mut at = 0;
     for span in shown.spans {
         if at < span.bytes.start {
@@ -360,23 +420,34 @@ pub(super) fn value_view(
             SpanKind::Invalid | SpanKind::SelectedInvalid => {
                 let selected = matches!(span.kind, SpanKind::SelectedInvalid);
                 let error = if selected {
-                    let bg = motion::mix(colors.panel, colors.error, 0.20);
+                    let tint = motion::mix(colors.panel, colors.error, 0.33);
+                    let bg = crate::theme::ensure_all(tint, &[colors.panel], 1.7);
                     run.background_color = Some(rgb(bg).into());
                     crate::theme::ensure_all(colors.error, &[bg], crate::theme::TEXT_CONTRAST)
                 } else {
                     colors.error
                 };
                 run.color = rgb(error).into();
-                run.underline = Some(UnderlineStyle {
-                    thickness: px(1.5),
-                    color: None,
-                    wavy: false,
-                });
+                if shown.text[span.bytes.clone()]
+                    .trim_end()
+                    .graphemes(true)
+                    .count()
+                    == 1
+                {
+                    short_underlines.push((span.bytes.clone(), error));
+                } else {
+                    run.underline = Some(UnderlineStyle {
+                        thickness: px(2.),
+                        color: None,
+                        wavy: false,
+                    });
+                }
             }
-            SpanKind::Note { color, recipient } => {
-                let fade = *notes.entry(recipient.clone()).or_insert_with(|| {
+            SpanKind::Note { color, slot } => {
+                note_ranges.push(span.bytes.clone());
+                let fade = *notes.entry(slot).or_insert_with(|| {
                     row.notes
-                        .get(&recipient)
+                        .get(&slot)
                         .copied()
                         .unwrap_or_else(|| row.target.and_then(|_| motion.start(motion::FADE, now)))
                 });
@@ -402,83 +473,139 @@ pub(super) fn value_view(
     // Match the fields' padding and the row's accent rule, label and gap.
     let chrome = 2. * FIELDS_PADDING + FIELD_RULE + FIELD_INDENT + FIELD_GAP + 4.;
     let width = (viewport.width - px(chrome) - label_width(window) - CARET).max(px(1.));
-    let shape = |text: String, wrap| {
+    let shape = |text: &str, runs: &[TextRun], wrap| {
         window
             .text_system()
-            .shape_text(text.into(), px(16.), &runs, wrap, None)
+            .shape_text(text.to_owned().into(), px(16.), runs, wrap, None)
             .unwrap_or_default()
     };
-    // Place hard breaks at measured group boundaries. GPUI still wraps a
-    // single address that cannot fit on an otherwise empty line.
-    if !shown.keep_together.is_empty() {
-        let mut start = 0;
-        let mut groups = shown.keep_together.iter().peekable();
-        for line in shape(shown.text.clone(), None) {
+    // On wide rows, break between entire addresses and their notes. GPUI
+    // still soft-wraps a single group that exceeds the whole row width.
+    if wide && shown.recipients.len() > 1 {
+        let measured = shape(&shown.text, &runs, None);
+        if let Some(line) = measured.first() {
             let mut left = px(0.);
-            let end = start + line.len();
-            while let Some(group) = groups.next_if(|group| group.start < end) {
-                if group.start >= start
-                    && line.unwrapped_layout.x_for_index(group.end - start) - left > width
-                {
+            for group in shown.recipients.iter().filter(|group| group.start > 0) {
+                if line.unwrapped_layout.x_for_index(group.end) - left > width {
                     shown.text.replace_range(group.start..group.start + 1, "\n");
-                    left = line.unwrapped_layout.x_for_index(group.start + 1 - start);
+                    left = line.unwrapped_layout.x_for_index(group.start + 1);
                 }
             }
-            start = end + 1;
         }
     }
-    let lines = Rc::new(shape(shown.text, Some(width)));
-    let mut full_height = px(0.);
-    let mut start = 0;
-    let mut caret = None;
-    let mut invalid = None;
-    let mut selected = None;
-    for line in lines.iter() {
-        let end = start + line.len();
-        let position =
-            |at| cursor_position(line, at - start, width).map(|p| point(p.x, p.y + full_height));
-        if let Some(at) = shown.caret.filter(|at| (start..=end).contains(at)) {
-            caret = position(at);
+    let mut lines = shape(&shown.text, &runs, Some(width));
+    // Oversized recipients may wrap, but keep the note itself legible.
+    let mut line_start = 0;
+    let mut moved_note = false;
+    for line in &lines {
+        for boundary in line.wrap_boundaries() {
+            let at = line_start + line.runs()[boundary.run_ix].glyphs[boundary.glyph_ix].index;
+            let note = note_ranges.partition_point(|note| note.end <= at);
+            if let Some(note) = note_ranges.get(note)
+                && note.start + 1 < at
+                && shown.text.as_bytes()[note.start] == b' '
+            {
+                shown.text.replace_range(note.start..note.start + 1, "\n");
+                moved_note = true;
+            }
         }
-        if let Some(at) = shown.invalid.filter(|at| (start..=end).contains(at)) {
-            invalid = position(at);
-        }
-        if let Some(at) = shown.selected.filter(|at| (start..=end).contains(at)) {
-            selected = position(at);
-        }
-        full_height += line.size(LINE).height;
-        start = end + 1;
+        line_start += line.len() + 1;
     }
-    let full_height = full_height.max(LINE);
-    // Preserve room for the other rows and the message when a list spans
-    // more lines than fit comfortably in the header.
+    if moved_note {
+        lines = shape(&shown.text, &runs, Some(width));
+    }
+    let full_height = lines
+        .iter()
+        .fold(px(0.), |height, line| height + line.size(LINE).height)
+        .max(LINE);
     let max_height = LINE
         * (f32::from(viewport.height / 5.) / f32::from(LINE))
             .floor()
             .max(1.);
-    let height = px(row.height(f32::from(full_height.min(max_height)), motion, now));
+    let target = full_height.min(max_height);
+    let height = px(row.height(f32::from(target), motion, now));
     if notes_animating || row.glide.is_some() {
         window.request_animation_frame();
     }
-
-    let invalid = invalid.map(|p| p.y);
-    let new_invalid = row.invalid_anchor != invalid;
-    row.invalid_anchor = invalid;
-    let growing = row.glide.is_some_and(|glide| glide.from < glide.to);
-    let offset = reveal_offset(
-        full_height,
-        height,
-        -row.scroll.offset().y,
-        caret.or(selected).map(|p| p.y).or_else(|| {
-            if new_invalid || row.glide.is_some() {
-                invalid
-            } else {
-                None
+    let mut overflow = None;
+    if !active && full_height > max_height && !shown.recipients.is_empty() {
+        // Both the count and the visible prefix use the actual wrap layout.
+        let mut ends = Vec::new();
+        let mut groups = shown.recipients.iter().peekable();
+        let mut start = 0;
+        let mut top = px(0.);
+        for line in &lines {
+            let end = start + line.len();
+            while let Some(group) = groups.next_if(|group| group.end <= end) {
+                if let Some(mut position) = line.position_for_index(group.end - start, LINE) {
+                    position.y += top;
+                    ends.push(position);
+                }
             }
-        }),
-        growing,
-    );
+            top += line.size(LINE).height;
+            start = end + 1;
+        }
+        let indicator = |hidden| {
+            let text = format!("+{hidden} more");
+            let mut dim = style.clone();
+            dim.color = rgb(colors.dim).into();
+            let run = dim.to_run(text.len());
+            window
+                .text_system()
+                .shape_line(text.into(), px(16.), &[run], None)
+        };
+        let visible =
+            visible_recipients(&ends, max_height, width, |hidden| indicator(hidden).width);
+        if let Some(hidden) = ends.len().checked_sub(visible).filter(|hidden| *hidden > 0) {
+            let last = ends[visible - 1];
+            let through = shown.recipients[visible - 1].end;
+            let text = shown.text[..through].trim_end_matches(',');
+            let mut remaining = text.len();
+            runs.retain_mut(|run| {
+                run.len = run.len.min(remaining);
+                remaining -= run.len;
+                run.len > 0
+            });
+            lines = shape(text, &runs, Some(width));
+            let marker = indicator(hidden);
+            let y = max_height - LINE;
+            let inline = if last.y == y { last.x + px(8.) } else { px(0.) };
+            let x = if last.y > y {
+                width - marker.width
+            } else {
+                inline
+            };
+            let x = x.min(width - marker.width).max(px(0.));
+            overflow = Some((marker, point(x, y)));
+        }
+    }
+    let position = |index| display_position(&lines, index, width, true);
+    let caret = shown.caret.and_then(position);
+    let selected = shown.selected.and_then(position);
+    let growing = row.glide.is_some_and(|glide| glide.from < glide.to);
+    let offset = if active {
+        reveal_offset(
+            full_height,
+            height,
+            -row.scroll.offset().y,
+            caret.or(selected).map(|position| position.y),
+            growing,
+        )
+    } else {
+        px(0.)
+    };
     row.scroll.set_offset(point(px(0.), -offset));
+
+    let underlines: Vec<_> = short_underlines
+        .into_iter()
+        .filter_map(|(span, color)| {
+            let start = position(span.start)?;
+            let end = display_position(&lines, span.end, width, false)?;
+            let x = (start.x + end.x - px(12.)) / 2.;
+            Some((point(x, start.y + LINE - px(5.)), color))
+        })
+        .collect();
+    let lines = Rc::new(lines);
 
     let origin = Rc::new(Cell::new(Point::default()));
     let prepaint_origin = Rc::clone(&origin);
@@ -491,6 +618,14 @@ pub(super) fn value_view(
                 let _ = line.paint_background(origin, LINE, TextAlign::Left, None, window, cx);
                 let _ = line.paint(origin, LINE, TextAlign::Left, None, window, cx);
                 origin.y += line.size(LINE).height;
+            }
+            if let Some((marker, offset)) = &overflow {
+                let origin = bounds.origin + *offset;
+                window.paint_quad(fill(
+                    Bounds::new(origin, size(marker.width, LINE)),
+                    rgb(colors.panel),
+                ));
+                let _ = marker.paint(origin, LINE, window, cx);
             }
             if let Some(caret) = caret {
                 window.paint_quad(fill(
@@ -505,6 +640,27 @@ pub(super) fn value_view(
     )
     .w_full()
     .h(full_height);
+    // Short marks can extend into the value's inset, beyond the text's
+    // horizontal clip. Keep them clipped to the visible rows vertically.
+    let underline_origin = Rc::clone(&origin);
+    let marks = (!underlines.is_empty()).then(|| {
+        canvas(
+            |_, _, _| (),
+            move |bounds, (), window, _| {
+                for (offset, color) in &underlines {
+                    let position = underline_origin.get() + *offset;
+                    if position.y >= bounds.top() && position.y + px(2.) <= bounds.bottom() {
+                        window.paint_quad(fill(
+                            Bounds::new(position, size(px(12.), px(2.))),
+                            rgb(*color),
+                        ));
+                    }
+                }
+            },
+        )
+        .absolute()
+        .inset_0()
+    });
     let offsets = shown.source_offsets;
     let scroll = row.scroll.clone();
     div()
@@ -513,8 +669,10 @@ pub(super) fn value_view(
             div()
                 .id(label)
                 .h(height)
-                .overflow_y_scroll()
-                .track_scroll(&row.scroll)
+                .when(active, |row_view| {
+                    row_view.overflow_y_scroll().track_scroll(&row.scroll)
+                })
+                .when(!active, |row_view| row_view.overflow_hidden())
                 .cursor_text()
                 .on_mouse_down(MouseButton::Left, move |event, _, cx| {
                     let mut position = event.position - origin.get();
@@ -541,30 +699,33 @@ pub(super) fn value_view(
                 })
                 .child(painted),
         )
-        .children((full_height > max_height && full_height > height).then(|| {
-            canvas(
-                |_, _, _| (),
-                move |bounds, (), window, _| {
-                    let ratio = height / full_height;
-                    let thumb = (height * ratio).max(px(8.));
-                    let travel = height - thumb;
-                    let scroll_fraction =
-                        (-scroll.offset().y / (full_height - height)).clamp(0., 1.);
-                    window.paint_quad(fill(
-                        Bounds::new(
-                            bounds.origin + point(px(0.), travel * scroll_fraction),
-                            size(px(2.), thumb),
-                        ),
-                        rgb(colors.marker),
-                    ));
-                },
-            )
-            .absolute()
-            .right_0()
-            .top_0()
-            .w(px(2.))
-            .h(height)
-        }))
+        .children(marks)
+        .children(
+            (active && full_height > max_height && full_height > height).then(|| {
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, (), window, _| {
+                        let ratio = height / full_height;
+                        let thumb = (height * ratio).max(px(8.));
+                        let travel = height - thumb;
+                        let scroll_fraction =
+                            (-scroll.offset().y / (full_height - height)).clamp(0., 1.);
+                        window.paint_quad(fill(
+                            Bounds::new(
+                                bounds.origin + point(px(0.), travel * scroll_fraction),
+                                size(px(2.), thumb),
+                            ),
+                            rgb(colors.marker),
+                        ));
+                    },
+                )
+                .absolute()
+                .right_0()
+                .top_0()
+                .w(px(2.))
+                .h(height)
+            }),
+        )
 }
 
 #[cfg(test)]
@@ -606,6 +767,12 @@ mod tests {
             assert_eq!(inactive.text, focused.text);
             assert_eq!(inactive.text.lines().count(), if wide { 1 } else { 3 });
             assert!(inactive.text.contains("(first\u{a0}time)"));
+            let first = &inactive.text[inactive.recipients[0].clone()];
+            assert!(first.ends_with(if wide {
+                "(first\u{a0}time),"
+            } else {
+                "(first\u{a0}time)"
+            }));
             assert!(inactive.spans.iter().any(|span| {
                 matches!(span.kind, SpanKind::Invalid) && &inactive.text[span.bytes.clone()] == "r"
             }));
@@ -615,6 +782,64 @@ mod tests {
             }));
             assert_eq!(focused.selected, inactive.invalid);
             assert!(focused.caret.is_none());
+        }
+    }
+
+    #[test]
+    fn overflow_counts_whole_recipients_and_makes_room_for_the_label() {
+        let mut ends = (0..7)
+            .map(|row| point(px(185.), LINE * row))
+            .collect::<Vec<_>>();
+        let label = |_| px(70.);
+        let height = LINE * 5;
+        assert_eq!(
+            ends.len() - visible_recipients(&ends, height, px(320.), label),
+            2
+        );
+        ends[4].x = px(300.);
+        assert_eq!(
+            ends.len() - visible_recipients(&ends, height, px(320.), label),
+            3
+        );
+        assert_eq!(visible_recipients(&ends[..5], height, px(320.), label), 5);
+        assert_eq!(visible_recipients(&ends[5..], height, px(320.), label), 1);
+        assert_eq!(visible_recipients(&[], height, px(320.), label), 0);
+    }
+
+    #[test]
+    fn a_trailing_separator_has_room_only_while_the_caret_is_there() {
+        let raw = "ari@example.test, ";
+        let colors = palette(ThemeKind::Dark);
+        let redirects = HashSet::new();
+        for wide in [false, true] {
+            let shown = |selection| {
+                display_line(
+                    RecipientLine {
+                        value: raw,
+                        saved: &[],
+                        redirects: &redirects,
+                        placeholder: ("none", colors.dim),
+                        selection,
+                        show_errors: false,
+                    },
+                    colors,
+                    wide,
+                )
+            };
+            let resting = shown(None);
+            assert_eq!(resting.text, "ari@example.test");
+            assert_eq!(resting.recipients.len(), 1);
+            let typing = shown(Some(raw.len()..raw.len()));
+            assert_eq!(
+                typing.text,
+                if wide {
+                    "ari@example.test, "
+                } else {
+                    "ari@example.test\n"
+                }
+            );
+            assert_eq!(typing.caret, Some(typing.text.len()));
+            assert_eq!(typing.recipients.len(), 1);
         }
     }
 

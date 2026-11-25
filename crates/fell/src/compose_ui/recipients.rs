@@ -8,7 +8,10 @@ use fell_core::Address;
 use fell_core::compose::email_of;
 use gpui::{Context, Deferred, MouseButton, Window, deferred, div, prelude::*, px};
 
-use super::{ComposeView, Field, recipient_rows::tokens};
+use super::{
+    ComposeView, Field,
+    recipient_rows::{complete_mailbox, tokens},
+};
 use crate::motion::Motion;
 use crate::recipient_menu::{self, Menu};
 use crate::store_actor::StoreClient;
@@ -33,6 +36,7 @@ struct Lookup {
     draft: gpui::SharedString,
     field: Field,
     prefix: String,
+    address_input: bool,
     excluded: HashSet<String>,
 }
 
@@ -84,10 +88,12 @@ impl ComposeView {
                     None => line.len(),
                 };
                 let token = token_at(line, caret);
+                let typed = &line[token.start..caret];
                 Some(Lookup {
                     draft: self.draft_id.clone(),
                     field: self.field,
-                    prefix: prefix(&line[token.start..caret])?.to_owned(),
+                    prefix: prefix(typed)?.to_owned(),
+                    address_input: typed.contains(['@', '<']),
                     excluded: self.excluded_recipients(token),
                 })
             });
@@ -101,7 +107,9 @@ impl ComposeView {
             .map(|lookup| (&lookup.draft, lookup.field))
             != next.as_ref().map(|lookup| (&lookup.draft, lookup.field))
         {
-            completion.menu.dismiss(completion.motion, Instant::now());
+            completion
+                .menu
+                .dismiss_anchored(completion.motion, Instant::now());
             completion.selected = 0;
         }
         completion.key = next.clone();
@@ -113,6 +121,7 @@ impl ComposeView {
             draft,
             field,
             prefix,
+            address_input,
             excluded,
         }) = next
         else {
@@ -185,12 +194,15 @@ impl ComposeView {
                 }
                 let completion = &mut compose.recipients;
                 let accept = std::mem::take(&mut completion.accept_pending);
-                completion.selected = completion.menu.show(
-                    rows,
-                    completion.selected,
-                    completion.motion,
-                    Instant::now(),
-                );
+                let now = Instant::now();
+                completion.selected = if rows.is_empty() && address_input {
+                    completion.menu.dismiss_anchored(completion.motion, now);
+                    0
+                } else {
+                    completion
+                        .menu
+                        .show(rows, completion.selected, completion.motion, now)
+                };
                 completion.ready = true;
                 if accept && compose.accept_recipient(compose.recipients.selected) {
                     compose.update_recipient_completion(cx);
@@ -255,7 +267,11 @@ impl ComposeView {
 
     pub(super) fn dismiss_recipient_menu(&mut self) -> bool {
         let completion = &mut self.recipients;
-        if !completion.menu.dismiss(completion.motion, Instant::now()) && completion.ready {
+        if !completion
+            .menu
+            .dismiss_anchored(completion.motion, Instant::now())
+            && completion.ready
+        {
             return false;
         }
         completion.generation.fetch_add(1, Ordering::Relaxed);
@@ -367,13 +383,7 @@ fn token_at(line: &str, caret: usize) -> Range<usize> {
 
 fn prefix(token: &str) -> Option<&str> {
     let token = token.trim();
-    if token.is_empty()
-        || email_of(token).is_some_and(|email| {
-            email
-                .split_once('@')
-                .is_some_and(|(local, domain)| !local.is_empty() && !domain.is_empty())
-        })
-    {
+    if token.is_empty() || complete_mailbox(token).is_some() {
         return None;
     }
     let typed = token.rsplit_once('<').map_or(token, |(_, email)| email);

@@ -1698,19 +1698,19 @@ impl DraftSession {
         text
     }
 
+    /// Classify the same recipient while it is being edited and after it is saved.
+    pub fn address_view(&self, raw: &str) -> AddressView {
+        let email = email_of(raw).unwrap_or_default();
+        let fresh = !email.is_empty() && !self.known.contains(&email);
+        AddressView {
+            raw: raw.to_owned(),
+            email,
+            fresh,
+        }
+    }
+
     fn address_views(&self, addresses: &[String]) -> Vec<AddressView> {
-        addresses
-            .iter()
-            .map(|raw| {
-                let email = email_of(raw).unwrap_or_default();
-                let fresh = !email.is_empty() && !self.known.contains(&email);
-                AddressView {
-                    raw: raw.clone(),
-                    email,
-                    fresh,
-                }
-            })
-            .collect()
+        addresses.iter().map(|raw| self.address_view(raw)).collect()
     }
 
     fn checkpoint(&self) -> Checkpoint {

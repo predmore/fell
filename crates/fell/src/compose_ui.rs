@@ -2481,12 +2481,25 @@ impl ComposeView {
                     .clone()
                     .unwrap_or(value.len()..value.len())
             });
+            let edited = (active || self.recipient_errors[index].is_some())
+                .then(|| {
+                    self.hub.with_session(self.draft_id.as_ref(), |session| {
+                        recipient_rows::tokens(value)
+                            .filter_map(|(_, raw)| {
+                                let raw = raw.trim();
+                                recipient_rows::complete_mailbox(raw)?;
+                                Some(session.address_view(raw))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .flatten();
             let view = view.clone();
             let shown = recipient_rows::value_view(
                 label,
                 recipient_rows::RecipientLine {
                     value,
-                    saved: addresses,
+                    saved: edited.as_deref().unwrap_or(addresses),
                     redirects,
                     placeholder,
                     selection,
@@ -5833,7 +5846,14 @@ fn status_bar(
     };
     let warning = saved.is_some_and(|(status, _)| status.warning().is_some());
     let message_measure = if warning { measure_warning } else { measure };
-    let message = fit_words(message, room, &|text| message_measure(text, size));
+    const INVALID_PREFIX: &str = "invalid address ";
+    let invalid = message
+        .strip_prefix("invalid address `")
+        .and_then(|s| s.strip_suffix('`'));
+    let plain = invalid.map(|fragment| format!("{INVALID_PREFIX}{fragment}"));
+    let message = fit_words(plain.as_deref().unwrap_or(message), room, &|text| {
+        message_measure(text, size)
+    });
     let dot = || div().text_color(rgb(colors.dim)).child("·");
     let mut left = div()
         .flex()
@@ -5850,13 +5870,8 @@ fn status_bar(
         );
     }
     if !message.is_empty() {
-        let invalid_span = message
-            .strip_prefix("invalid address `")
-            .and_then(|fragment| {
-                let start = message.len() - fragment.len();
-                let end = message.strip_suffix('`').map_or(message.len(), str::len);
-                (start < end).then_some(start..end)
-            });
+        let invalid_span = (invalid.is_some() && message.len() > INVALID_PREFIX.len())
+            .then(|| INVALID_PREFIX.len()..message.len());
         let text = gpui::StyledText::new(message).with_highlights(invalid_span.map(|span| {
             (
                 span,
