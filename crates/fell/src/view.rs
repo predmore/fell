@@ -41,7 +41,7 @@ use crate::attachments::{self, Download, Fetcher, Request as AttachmentRequest};
 use crate::compose_ui::ComposeView;
 use crate::draft_host::DraftHome;
 use crate::frame_log::{FrameLog, SharedFrameLog};
-use crate::inbox_motion::{Disclosures, InboxMotion, PaneEntry, StatusMotion};
+use crate::inbox_motion::{Disclosures, InboxMotion, PaneEntry, StatusMotion, ThreadGhost};
 use crate::keymap::{self, Action, KeyId};
 use crate::mail_body::{self, BodyCache, BodyJob, BodyLoad, BodyLoads, HtmlBody, PreparedBody};
 use crate::mailbox;
@@ -2159,6 +2159,7 @@ impl Inbox {
         let last = ((-offset + view) / ROW_PX).ceil() as usize + 2;
         let overscan = self.motion.list.as_ref().map_or(0, |s| s.overscan(ROW_PX));
         let rows = &self.session.threads;
+        let highlighted = self.session.highlighted();
         (first.saturating_sub(overscan)..(last + overscan).min(rows.len()))
             .filter_map(|index| {
                 let row = &rows[index];
@@ -2168,6 +2169,7 @@ impl Inbox {
                     Drawn {
                         top,
                         slot,
+                        selected: highlighted.contains(&row.id),
                         row: row.clone(),
                     }
                 })
@@ -2217,7 +2219,13 @@ impl Inbox {
         let left: Vec<_> = drawn
             .iter()
             .filter(|old| !ids.contains_key(old.row.id.as_str()))
-            .map(|old| (old.row.clone(), old.top - offset))
+            .map(|old| {
+                let ghost = ThreadGhost {
+                    row: old.row.clone(),
+                    selected: old.selected,
+                };
+                (ghost, old.top - offset)
+            })
             .collect();
         let mut reach = viewport;
         let batch = left.len() > 1
@@ -2227,38 +2235,50 @@ impl Inbox {
                 .as_ref()
                 .is_some_and(ListShift::has_batch_ghosts);
         if !replace && batch {
+            let threads = &self.session.threads;
+            let visible_start = (-offset / ROW_PX).floor() as usize;
+            let visible_end = (((viewport - offset) / ROW_PX).ceil() as usize).min(threads.len());
+            let slot = |index: usize| index as f32 * ROW_PX + offset;
+            let tracked = |old: &Drawn| ids.get(old.row.id.as_str()).map(|&index| (index, old.top));
+            let arrivals = |slots: std::ops::Range<usize>, dy| {
+                slots.map(move |index| (threads[index].id.clone(), slot(index) + dy))
+            };
+            if let Some((index, top)) = drawn
+                .iter()
+                .filter_map(tracked)
+                .min_by_key(|&(index, _)| index)
+            {
+                let dy = InboxMotion::batch_top_arrival_offset(top, slot(index));
+                before.extend(arrivals(visible_start..index.min(visible_end), dy));
+                reach = reach.max(-dy);
+            }
             let (after, previous_bottom) = drawn
                 .iter()
-                .rev()
-                .find_map(|old| {
-                    ids.get(old.row.id.as_str())
-                        .map(|index| (index + 1, old.top + ROW_PX))
-                })
-                .unwrap_or((0, viewport));
-            let first = after.max((-offset / ROW_PX).floor() as usize);
-            let end = ((viewport - offset) / ROW_PX).ceil() as usize;
-            let first_slot = first as f32 * ROW_PX + offset;
-            let dy = InboxMotion::batch_arrival_offset(viewport, previous_bottom, first_slot);
-            before.extend(
-                self.session.threads[..end.min(self.session.threads.len())]
-                    .iter()
-                    .enumerate()
-                    .skip(first)
-                    .map(|(index, row)| (row.id.clone(), index as f32 * ROW_PX + offset + dy)),
-            );
+                .filter_map(tracked)
+                .max_by_key(|&(index, _)| index)
+                .map_or((0, viewport), |(index, top)| (index + 1, top + ROW_PX));
+            let first = after.max(visible_start);
+            let first_slot = slot(first);
+            let dy =
+                InboxMotion::batch_bottom_arrival_offset(viewport, previous_bottom, first_slot);
+            before.extend(arrivals(first..visible_end, dy));
             // The last tracked row can itself start past the viewport.
             reach = reach.max(dy);
         }
         // A row that is back (a quick undo) stops fading where it was.
         let mut carried = self.motion.carried_ghosts();
-        carried.retain(|ghost| !ids.contains_key(ghost.row.id.as_str()));
+        carried.retain(|ghost| !ids.contains_key(ghost.row.row.id.as_str()));
         // Rows of a list this one replaced that sat below its last row:
         // nothing arrives over them, so they fade out where they were.
         let below = drawn
             .into_iter()
             .map(|old| {
                 let top = old.top - offset;
-                (old.row, top)
+                let ghost = ThreadGhost {
+                    row: old.row,
+                    selected: !replace && old.selected,
+                };
+                (ghost, top)
             })
             .filter(|(_, top)| end == 0.0 || *top >= end)
             .collect();
@@ -3261,7 +3281,11 @@ impl Inbox {
     fn take_out_of_list(&mut self, ids: &[String], cx: &mut Context<Self>) {
         self.pending_removals.extend(ids.iter().cloned());
         let now = self.motion.clock.now();
-        let drawn = self.drawn_rows(now);
+        let mut drawn = self.drawn_rows(now);
+        // The action may have cleared visual mode or the marks already.
+        for row in &mut drawn {
+            row.selected |= self.pending_removals.contains(&row.row.id);
+        }
         for id in ids {
             self.session.remove_thread(id);
         }
@@ -5555,6 +5579,7 @@ impl Render for Inbox {
 /// A row as the last frame drew it.
 struct Drawn {
     row: ThreadRow,
+    selected: bool,
     /// Its top in the viewport, as painted (in flight or not).
     top: f32,
     /// The top of its slot then.
@@ -6965,7 +6990,7 @@ fn fading_row_layer(
 /// Paint a row that left, at its last position and with no input handlers.
 fn ghost_row(
     theme: &Theme,
-    (row, top, opacity): (ThreadRow, f32, f32),
+    (ThreadGhost { row, selected }, top, opacity): (ThreadGhost, f32, f32),
     text_width: f32,
     (bar_dx, label_scope): (f32, Option<String>),
     batch: bool,
@@ -6973,7 +6998,7 @@ fn ghost_row(
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
     let look = RowLook {
-        selected: false,
+        selected,
         fading: None,
         ghost: true,
         bar_dx,
