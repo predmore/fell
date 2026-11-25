@@ -1776,12 +1776,13 @@ mod tests {
     }
 
     #[test]
-    fn a_notice_fades_in_then_out_after_a_key() {
+    fn a_notice_and_its_details_hint_fade_together_after_a_key() {
         let mut motion = InboxMotion::new(Motion::new(true));
         let mut session = session();
         let now = Instant::now();
         motion.observe(&session, (true, true), now);
-        session.show_toast("Archived · u", false);
+        let notice = Toast::with_hint("Couldn't save attachments", "?".into(), " details");
+        session.set_toast(notice.clone());
         motion.observe(&session, (true, true), now);
         assert_eq!(notice_opacity(&motion, &session, now), Some(0.0));
         assert!(motion.tick(later(now, 40)));
@@ -1795,7 +1796,9 @@ mod tests {
         assert_eq!(status.leaving.as_ref().unwrap().1, 1.0);
         assert_eq!(status.hints, 0.0);
         let mid = motion.status(&session, later(shown, 80));
-        assert!(mid.leaving.unwrap().1 < 1.0);
+        let (leaving, opacity) = mid.leaving.unwrap();
+        assert_eq!(leaving, notice);
+        assert!(opacity > 0.0 && opacity < 1.0);
         assert!(
             mid.hints > 0.0 && mid.hints < 1.0,
             "hints come back as it leaves"

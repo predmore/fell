@@ -807,27 +807,20 @@ impl Session {
         }
     }
 
-    fn status_details(&self) -> [Option<&str>; 3] {
+    pub fn detail_text(&self) -> Option<String> {
         let sync = match &self.sync {
             SyncKind::Failed(failure) => Some(failure.detail.as_str()),
             _ => None,
         };
-        [self.startup_error.as_deref(), self.error.as_deref(), sync]
-    }
-
-    pub fn has_status_details(&self) -> bool {
-        self.status_details()
-            .into_iter()
-            .any(|detail| detail.is_some())
-    }
-
-    pub fn detail_text(&self) -> Option<String> {
-        let lines: Vec<&str> = self
-            .status_details()
-            .into_iter()
-            .chain([self.attachment_error.as_deref()])
-            .flatten()
-            .collect();
+        let lines: Vec<&str> = [
+            self.startup_error.as_deref(),
+            self.error.as_deref(),
+            sync,
+            self.attachment_error.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         if lines.is_empty() {
             None
         } else {
@@ -5261,7 +5254,6 @@ mod tests {
         let mut session = session();
         let cause = "Couldn't open attachment\nIMAP server refused part 2";
         session.attachment_error = Some(cause.into());
-        assert!(!session.has_status_details());
         session.show_toast("Couldn't open attachment · space a R retry", true);
 
         session.on_key(KeyId::Char('?'), 10);

@@ -98,14 +98,15 @@ impl Inbox {
         retry: Request,
         cx: &mut Context<Self>,
     ) {
-        let (action, targets) = match &retry {
-            Request::Open(target) => (FailedAction::Open, std::slice::from_ref(target)),
-            Request::Save(targets) => (FailedAction::Save, targets.as_slice()),
+        let action = match &retry {
+            Request::Open(_) => FailedAction::Open,
+            Request::Save(_) => FailedAction::Save,
         };
+        let targets = request_targets(&retry);
         let focused = self.session.focused_attachment().is_some_and(|focused| {
-            targets.iter().any(|target| {
-                target.message == focused.message && target.part.section == focused.part.section
-            })
+            targets
+                .iter()
+                .any(|target| same_attachment(target, focused))
         });
         self.failed_attachments
             .extend(targets.iter().map(|target| (part_key(target), action)));
@@ -114,7 +115,8 @@ impl Inbox {
         if focused {
             self.session.clear_toast();
         } else {
-            self.session.set_toast(self.attachment_retry_notice(line));
+            self.session
+                .set_toast(self.attachment_retry_notice(line, true));
             self.expire_action_notice(cx);
         }
     }
@@ -142,12 +144,25 @@ impl Inbox {
             FailedAction::Open => "open",
             FailedAction::Save => "save",
         };
-        Some(self.attachment_retry_notice(format!("Couldn't {action} “{}”", target.name())))
+        // A batch reports the first failure's cause in Help.
+        let details = self
+            .attachment_retry
+            .as_ref()
+            .and_then(|request| request_targets(request).first())
+            .is_some_and(|failed| same_attachment(failed, target));
+        Some(
+            self.attachment_retry_notice(format!("Couldn't {action} “{}”", target.name()), details),
+        )
     }
 
-    fn attachment_retry_notice(&self, line: String) -> Toast {
+    fn attachment_retry_notice(&self, line: String, details: bool) -> Toast {
         let key = keymap::binding_text(&self.session.keymap, Action::RetryAttachment);
-        let mut toast = Toast::with_hint(line, key, " to retry");
+        let suffix = if details {
+            " to retry · ? details"
+        } else {
+            " to retry"
+        };
+        let mut toast = Toast::with_hint(line, key, suffix);
         toast.alert = true;
         toast
     }
@@ -177,6 +192,17 @@ impl Inbox {
         })
         .detach();
     }
+}
+
+fn request_targets(request: &Request) -> &[Target] {
+    match request {
+        Request::Open(target) => std::slice::from_ref(target),
+        Request::Save(targets) => targets,
+    }
+}
+
+fn same_attachment(left: &Target, right: &Target) -> bool {
+    left.message == right.message && left.part.section == right.part.section
 }
 
 fn part_key(target: &Target) -> (String, String) {
@@ -466,7 +492,7 @@ mod tests {
                     if focus_first {
                         inbox.session.focus_attachment(index, first.part.clone());
                     }
-                    let retry = Request::Save(vec![first.clone(), second]);
+                    let retry = Request::Save(vec![first.clone(), second.clone()]);
                     inbox.attachment_failed(
                         "Saved 1, 2 failed".into(),
                         "fixture error".into(),
@@ -474,21 +500,27 @@ mod tests {
                         cx,
                     );
                     if !focus_first {
-                        assert_eq!(
-                            inbox.session.status_notice().unwrap().text,
-                            "Saved 1, 2 failed"
-                        );
+                        let notice = inbox.session.status_notice().unwrap();
+                        assert_eq!(notice.text, "Saved 1, 2 failed");
+                        assert_eq!(notice.hint.as_ref().unwrap().1, " to retry · ? details");
                         assert_eq!(inbox.attachment_to_retry(), Some(retry));
                         inbox.session.focus_attachment(index, first.part.clone());
                     }
                     inbox.session.attachment_retry_notice = inbox.focused_attachment_retry_notice();
                     let notice = inbox.session.status_notice().unwrap();
                     assert_eq!(notice.text, "Couldn't save “route.txt”");
-                    assert_eq!(notice.hint.as_ref().unwrap().0, "space a R");
+                    assert_eq!(
+                        notice.hint.as_ref().unwrap(),
+                        &("space a R".into(), " to retry · ? details")
+                    );
                     assert_eq!(
                         inbox.attachment_to_retry(),
                         Some(Request::Save(vec![first]))
                     );
+                    inbox.session.focus_attachment(index, second.part.clone());
+                    let notice = inbox.focused_attachment_retry_notice().unwrap();
+                    assert_eq!(notice.text, "Couldn't save “notes.txt”");
+                    assert_eq!(notice.hint.unwrap().1, " to retry");
                 })
                 .unwrap();
 
@@ -500,6 +532,12 @@ mod tests {
                     inbox.session.leave_attachments();
                     inbox.session.attachment_retry_notice = inbox.focused_attachment_retry_notice();
                     assert!(inbox.session.status_notice().is_none());
+                    assert_eq!(
+                        inbox.session.detail_text().as_deref(),
+                        Some("Saved 1, 2 failed\nfixture error")
+                    );
+                    inbox.session.show_toast("Synced", false);
+                    assert!(inbox.session.status_notice().unwrap().hint.is_none());
                 })
                 .unwrap();
         }

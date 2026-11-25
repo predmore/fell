@@ -10308,6 +10308,8 @@ enum StatusPhase {
     Sync(std::mem::Discriminant<SyncKind>),
     Download,
     Reply(ReplyCheck),
+    QueryError(QueryFault),
+    StartupError,
 }
 
 #[derive(Clone)]
@@ -10342,6 +10344,31 @@ impl StatusLabel {
         } else {
             StatusPhase::Sync(std::mem::discriminant(&session.sync))
         };
+        if matches!(phase, StatusPhase::Sync(_)) && !session.sync.is_error() {
+            let error = match session.error_fault {
+                Some(QueryFault::Folder) => Some((
+                    StatusPhase::QueryError(QueryFault::Folder),
+                    "Couldn't read folder",
+                )),
+                Some(QueryFault::Message) => Some((
+                    StatusPhase::QueryError(QueryFault::Message),
+                    "Couldn't read conversation",
+                )),
+                None => session
+                    .startup_error
+                    .as_ref()
+                    .map(|_| (StatusPhase::StartupError, "Startup error")),
+            };
+            if let Some((phase, text)) = error {
+                return Self {
+                    phase,
+                    text: format!("{text} · ? details"),
+                    download: None,
+                    color: theme.error,
+                    steady_sync: false,
+                };
+            }
+        }
         let (text, color) = match reply_check {
             Some(ReplyCheck::Waiting) => ("Reply-To unverified".into(), theme.dimmed),
             Some(ReplyCheck::Checking) => ("Checking Reply-To…".into(), theme.dimmed),
@@ -10364,6 +10391,8 @@ impl StatusLabel {
             None => (
                 if download.is_some() {
                     String::new()
+                } else if session.sync.is_error() {
+                    format!("{} · ? details", session.sync.status())
                 } else {
                     session.sync.status()
                 },
@@ -10581,23 +10610,14 @@ fn status_bar(
     let mode_width = bar_px(window, session.mode_label(), size, mono);
     let dot_width = bar_px(window, "·", size, ui);
     let outage = session.worker_outage();
-    let details = outage.is_none() && session.has_status_details();
-    let details_width = if details {
-        gap + bar_px(window, "· ? details", size, ui)
-    } else {
-        0.
-    };
-    let trailing = if noticed {
-        gap + dot_width
-    } else {
-        16. + if hint.is_empty() && count.is_empty() {
+    // Keep the sync label's room stable as a notice enters or leaves.
+    let trailing = (gap + dot_width).max(16.)
+        + if noticed || hint.is_empty() && count.is_empty() {
             0.
         } else {
             gap + bar_px(window, &format!("{count}{hint}"), size, mono)
-        }
-    };
-    let sync_room =
-        width - 2. * padding - 3. * gap - mode_width - dot_width - details_width - trailing;
+        };
+    let sync_room = width - 2. * padding - 3. * gap - mode_width - dot_width - trailing;
     // What the bar spends before the notice, measured as drawn: the
     // padding, the mode in mono, sync, the dots, the gaps between the
     // children. No typed keys show beside a notice, so no air after it.
@@ -10641,7 +10661,7 @@ fn status_bar(
     } else {
         (label, sync_width)
     };
-    let shared_width = 2. * padding + 2. * gap + mode_width + dot_width + details_width;
+    let shared_width = 2. * padding + 2. * gap + mode_width + dot_width;
     let used = shared_width
         + if narrow {
             0.
@@ -10654,12 +10674,18 @@ fn status_bar(
             .hint
             .as_ref()
             .map(|(key, suffix)| (key.as_str(), *suffix));
-        let tail_width = hint.map_or(0.0, |(key, suffix)| {
-            bar_px(window, &format!(" · {key}{suffix}"), size, ui)
-        });
-        let room = (width - used - tail_width).max(0.0);
-        let notice_size = if narrow && toast.alert && toast.label.is_none() && hint.is_none() {
-            let natural = bar_px(window, &toast.text, size, ui);
+        let tail = hint.map(|(key, suffix)| format!(" · {key}{suffix}"));
+        let tail_width = |size| {
+            tail.as_deref()
+                .map_or(0.0, |tail| bar_px(window, tail, size, ui))
+        };
+        let room = (width - used).max(0.0);
+        let notice_size = if narrow
+            && toast.alert
+            && toast.label.is_none()
+            && (hint.is_none() || !toast.text.contains('“'))
+        {
+            let natural = bar_px(window, &toast.text, size, ui) + tail_width(size);
             if natural > room {
                 (size * (room - 2.).max(0.) / natural).max(11.)
             } else {
@@ -10668,6 +10694,7 @@ fn status_bar(
         } else {
             size
         };
+        let room = (room - tail_width(notice_size)).max(0.0);
         let measure = |text: &str| bar_px(window, text, notice_size, ui);
         let text = toast.label.as_ref().map_or_else(
             || present::fit_notice(&toast.text, room, measure),
@@ -10742,9 +10769,6 @@ fn status_bar(
         .when(!narrow, |bar| {
             bar.child(div().flex_none().text_color(rgb(theme.dimmed)).child("·"))
                 .child(wide_sync.unwrap().flex_none())
-        })
-        .when(details, |bar| {
-            bar.child(div().text_color(rgb(theme.error)).child("· ? details"))
         })
         // In a narrow window sync and the notice share a separator and cell.
         .when(narrow || noticed, |bar| {
@@ -11926,6 +11950,43 @@ mod tests {
                 true,
             ),
             None
+        );
+    }
+
+    #[test]
+    fn a_status_error_keeps_its_details_hint_through_recovery() {
+        use super::{Motion, QueryFault, StatusLabel, StatusLabels};
+        use crate::model::Session;
+
+        let theme = crate::theme::load();
+        let mut session = Session::new(
+            "Demo",
+            "demo@example.test",
+            SyncKind::LocalOffline,
+            Default::default(),
+        );
+        let mut labels = StatusLabels::default();
+        let now = Instant::now();
+        let motion = Motion::new(true);
+
+        session.fail_query(QueryFault::Folder, "database is locked".into());
+        let failed = StatusLabel::new(&theme, &session, None, 1200.);
+        assert_eq!(failed.text, "Couldn't read folder · ? details");
+        labels.update(failed, motion, now);
+
+        session.clear_query_fault(QueryFault::Folder);
+        let recovered = StatusLabel::new(&theme, &session, None, 1200.);
+        let frame = labels.update(recovered.clone(), motion, now);
+        assert_eq!(frame.current.text, "local · offline");
+        assert_eq!(
+            frame.outgoing.unwrap().0.text,
+            "Couldn't read folder · ? details"
+        );
+        assert!(
+            labels
+                .update(recovered, motion, now + motion::FADE)
+                .outgoing
+                .is_none()
         );
     }
 
