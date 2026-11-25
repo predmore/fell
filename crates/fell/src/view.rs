@@ -10314,11 +10314,16 @@ enum StatusPhase {
 const DETAILS_SUFFIX: &str = " · ? details";
 
 fn status_details_suffix(theme: &Theme) -> gpui::Div {
-    div()
+    let suffix = div()
         .flex_none()
         .whitespace_nowrap()
         .text_color(rgb(theme.error))
-        .child(DETAILS_SUFFIX)
+        .child(DETAILS_SUFFIX);
+    #[cfg(test)]
+    let suffix = suffix.on_children_prepainted(|_, _, _| {
+        tests::STATUS_DETAILS_COUNT.set(tests::STATUS_DETAILS_COUNT.get() + 1);
+    });
+    suffix
 }
 
 #[derive(Clone)]
@@ -10641,6 +10646,8 @@ fn status_bar(
     let dot_width = bar_px(window, "·", size, ui);
     let outage = session.worker_outage();
     let details_opacity = labels.details_opacity();
+    let status_has_details =
+        labels.current.details || labels.outgoing.as_ref().is_some_and(|(old, _)| old.details);
     // Keep the sync label's room stable as a notice enters or leaves.
     let trailing = (gap + dot_width).max(16.)
         + if noticed || hint.is_empty() && count.is_empty() {
@@ -10718,10 +10725,12 @@ fn status_bar(
             .as_ref()
             .map(|(key, suffix)| (key.as_str(), *suffix));
         let tail = hint.map(|(key, suffix)| format!(" · {key}{suffix}"));
-        // Reserve room even while the status error is clearing, so the
-        // notice under it keeps the same fit through that fade.
-        let reserve_details = narrow || toast.details;
-        let shown_details = if toast.details {
+        // The wide status label owns the hint through its transition. In
+        // the narrow shared cell, fit the notice with room for an active
+        // or fading hint.
+        let own_details = toast.details && (narrow || !status_has_details);
+        let reserve_details = own_details || (narrow && status_has_details);
+        let shown_details = if own_details {
             1.0
         } else if narrow {
             details_opacity
@@ -10760,7 +10769,9 @@ fn status_bar(
             || present::fit_notice(&toast.text, room, measure),
             |label| label.fit(room, measure),
         );
-        div()
+        #[cfg(test)]
+        let fitted = text.clone();
+        let notice = div()
             .flex()
             .items_baseline()
             .overflow_hidden()
@@ -10779,7 +10790,12 @@ fn status_bar(
             .child(status_text(text, hint, theme))
             .when(shown_details > 0.0, |text| {
                 text.child(status_details_suffix(theme).opacity(shown_details))
-            })
+            });
+        #[cfg(test)]
+        let notice = notice.on_children_prepainted(move |_, _, _| {
+            tests::STATUS_NOTICE_TEXT.replace(Some(fitted.clone()));
+        });
+        notice
     };
     let label = label.opacity(status.sync_opacity);
     let (wide_sync, narrow_sync) = if narrow {
@@ -11801,6 +11817,12 @@ mod tests {
         pub(super) static INBOX_LABEL_X: std::cell::RefCell<Vec<(gpui::Pixels, gpui::SharedString)>> = const {
             std::cell::RefCell::new(Vec::new())
         };
+        pub(super) static STATUS_DETAILS_COUNT: std::cell::Cell<usize> = const {
+            std::cell::Cell::new(0)
+        };
+        pub(super) static STATUS_NOTICE_TEXT: std::cell::RefCell<Option<String>> = const {
+            std::cell::RefCell::new(None)
+        };
     }
     use super::{
         FIRST_PREVIEW_WAIT, FirstPreview, FolderFit, LIST_BORDER_PX, MESSAGE_HEADER_GAP_PX,
@@ -12016,6 +12038,124 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn a_status_error_and_attachment_notice_draw_only_one_details_hint() {
+        use super::{StatusLabel, StatusLabels};
+        use crate::model::{Session, SyncFailure, Toast};
+
+        let theme = crate::theme::load();
+        let mut session = Session::new(
+            "Demo",
+            "demo@example.test",
+            SyncKind::LocalOffline,
+            Default::default(),
+        );
+        let mut notice =
+            Toast::with_hint("Couldn't save attachments", "space a R".into(), " to retry");
+        notice.alert = true;
+        notice.details = true;
+        session.set_toast(notice);
+
+        let now = Instant::now();
+        let motion = motion::Motion::new(false);
+        for sync in [
+            SyncKind::LocalOffline,
+            SyncKind::Failed(SyncFailure {
+                kind: fell_core::SyncFailureKind::Unreachable,
+                bridge: false,
+                detail: "Connection refused".into(),
+                recovery: None,
+            }),
+        ] {
+            session.sync = sync;
+            for width in [440., 1200.] {
+                let status = StatusLabel::new(&theme, &session, None, width);
+                let frame = StatusLabels::default().update(status, motion, now);
+                let (_, suffixes) = draw_status_notice(&theme, &session, frame, width);
+                assert_eq!(suffixes, 1, "{width} px, {:?}", session.sync);
+            }
+        }
+    }
+
+    #[test]
+    fn a_narrow_label_notice_recovers_its_text_room_after_details_fade() {
+        use super::{StatusLabel, StatusLabels};
+        use crate::model::{QueryFault, Session};
+
+        let mut theme = crate::theme::load();
+        theme.ui_px = 14.;
+        let mut session = Session::new(
+            "Demo",
+            "demo@example.test",
+            SyncKind::LocalOffline,
+            Default::default(),
+        );
+        session.show_label_toast(crate::present::LabelNotice {
+            verb: "Removed",
+            label: "travel".into(),
+            relation: "from",
+            subject: Some("Tickets to the annual meeting in the harbour".into()),
+            count: 1,
+            undo: true,
+        });
+
+        let mut labels = StatusLabels::default();
+        let now = Instant::now();
+        let motion = motion::Motion::new(true);
+        session.fail_query(QueryFault::Folder, "database is locked".into());
+        let failed = StatusLabel::new(&theme, &session, None, 440.);
+        let (with_details, suffixes) =
+            draw_status_notice(&theme, &session, labels.update(failed, motion, now), 440.);
+        assert_eq!(suffixes, 1);
+
+        session.clear_query_fault(QueryFault::Folder);
+        let recovered = StatusLabel::new(&theme, &session, None, 440.);
+        labels.update(recovered.clone(), motion, now);
+        let fading = labels.update(recovered.clone(), motion, now + motion::FADE / 2);
+        assert_eq!(
+            draw_status_notice(&theme, &session, fading, 440.),
+            (with_details.clone(), 1)
+        );
+
+        let settled = labels.update(recovered, motion, now + motion::FADE);
+        let (fitted, suffixes) = draw_status_notice(&theme, &session, settled, 440.);
+        assert_eq!(suffixes, 0);
+        assert!(
+            fitted.starts_with("Removed “travel” from “Tickets"),
+            "{fitted}"
+        );
+        assert!(fitted.ends_with("…” · u"), "{fitted}");
+        assert_ne!(fitted, with_details);
+    }
+
+    fn draw_status_notice(
+        theme: &crate::theme::Theme,
+        session: &crate::model::Session,
+        labels: super::StatusLabelsFrame,
+        width: f32,
+    ) -> (String, usize) {
+        use gpui::{TestAppContext, point, px, size};
+
+        let mut motion = super::InboxMotion::new(motion::Motion::new(false));
+        motion.narrow_status = width < crate::present::NARROW_WIDTH;
+        let now = Instant::now();
+        motion.observe(session, (true, false), now);
+        let status = motion.status(session, now);
+        let mut app = TestAppContext::single();
+        let cx = app.add_empty_window();
+        STATUS_DETAILS_COUNT.set(0);
+        STATUS_NOTICE_TEXT.take();
+        cx.draw(
+            point(px(0.), px(0.)),
+            size(px(width), px(30.)),
+            |window, _| super::status_bar(theme, session, status, labels, width, window),
+        );
+        (
+            STATUS_NOTICE_TEXT.take().unwrap(),
+            STATUS_DETAILS_COUNT.get(),
+        )
     }
 
     #[test]
