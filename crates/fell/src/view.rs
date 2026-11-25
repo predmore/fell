@@ -7767,15 +7767,15 @@ fn fit_shaped_line(
 
 /// A line [`clip_shaped`] already shaped, drawn as it is.
 fn shaped_text(line: gpui::ShapedLine, window: &Window) -> gpui::Canvas<()> {
-    paint_shaped_text(line, window, false)
+    let height = window.text_style().line_height_in_pixels(window.rem_size());
+    paint_shaped_text(line, height, false)
 }
 
 fn paint_shaped_text(
     line: gpui::ShapedLine,
-    window: &Window,
+    height: gpui::Pixels,
     background: bool,
 ) -> gpui::Canvas<()> {
-    let height = window.text_style().line_height_in_pixels(window.rem_size());
     let width = line.width;
     gpui::canvas(
         |_, _, _| {},
@@ -9258,6 +9258,9 @@ fn expanded_message_header(
 ) -> gpui::Div {
     let style = conversation_line_style(window, theme, px(theme.ui_px - 1.));
     let sender_style = conversation_line_style(window, theme, px(theme.ui_px));
+    // The live reader is built before the inbox font is active. The cached
+    // search preview is built inside it, so both need the same themed height.
+    let line_height = sender_style.line_height_in_pixels(window.rem_size());
     let date = present::relative_date(now_unix(), message.date_unix);
     let date_width = line_px_with_style(window, &sender_style, &date, FontWeight::NORMAL).ceil();
     let status_width = status.map_or(0.0, |(_, retry)| {
@@ -9357,7 +9360,7 @@ fn expanded_message_header(
                     [sender, email, folders]
                         .into_iter()
                         .flatten()
-                        .map(|line| shaped_text(line, window)),
+                        .map(|line| paint_shaped_text(line, line_height, false)),
                 )
                 .into_any_element()
         },
@@ -9387,7 +9390,7 @@ fn expanded_message_header(
                 .gap(px(MESSAGE_HEADER_GAP_PX))
                 .overflow_hidden()
                 .children(status.map(|slot| reader_status_text(theme, slot, status_width)))
-                .child(shaped_text(line, window))
+                .child(paint_shaped_text(line, line_height, false))
         }),
     )
 }
@@ -13526,6 +13529,52 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn expanded_header_height_is_stable_when_the_search_preview_is_cached() {
+        use gpui::{ParentElement, TextStyleRefinement, VisualTestContext, point, px, size};
+        use std::{cell::Cell, rc::Rc};
+
+        let (mut app, inbox) = pending_inbox();
+        let (mut theme, message) = inbox
+            .update(&mut app, |inbox, _, _| {
+                (inbox.theme.clone(), inbox.session.messages[0].clone())
+            })
+            .unwrap();
+        theme.ui_px = 15.;
+        let mut app = VisualTestContext::from_window(*inbox, &app);
+        let mut height = |text_style| {
+            let measured = Rc::new(Cell::new(None));
+            let output = measured.clone();
+            app.draw(
+                point(px(0.), px(0.)),
+                size(px(600.), px(100.)),
+                |window, _| {
+                    let header = window.with_text_style(text_style, |window| {
+                        super::expanded_message_header(
+                            &theme,
+                            &message,
+                            ReaderColumns::split(600.),
+                            None,
+                            window,
+                        )
+                    });
+                    div()
+                        .on_children_prepainted(move |bounds, _, _| {
+                            output.set(Some(bounds[0].size.height));
+                        })
+                        .child(header)
+                },
+            );
+            measured.get().unwrap()
+        };
+        let live = height(None);
+        let cached = height(Some(TextStyleRefinement {
+            font_size: Some(px(theme.ui_px).into()),
+            ..Default::default()
+        }));
+        assert_eq!(live, cached);
     }
 
     #[test]
