@@ -947,11 +947,38 @@ mod tests {
             .unwrap();
         drop(store);
         // Open must not backfill 100,000 messages: it only installs the
-        // schema and a cursor. No sightings yet and a batch left to do
-        // prove that without timing the open on a loaded machine.
+        // schema, the version and a cursor at the first message. Checking
+        // exactly that state proves it without timing the open on a loaded
+        // machine, and catches a rebuild or a full enqueue that writes no
+        // sightings.
         let store = Store::open(&path).unwrap();
         let sightings = "SELECT COUNT(*) FROM correspondent_sightings";
         assert_eq!(count(&store.conn, sightings), 0);
+        for table in [
+            "correspondents",
+            "correspondent_prefixes",
+            "correspondent_dirty",
+        ] {
+            let rows = count(&store.conn, &format!("SELECT COUNT(*) FROM {table}"));
+            assert_eq!(rows, 0, "open filled {table}");
+        }
+        let meta = |key: &str| -> Option<String> {
+            store
+                .conn
+                .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
+                    row.get::<_, rusqlite::types::Value>(0)
+                })
+                .optional()
+                .unwrap()
+                .map(|value| match value {
+                    rusqlite::types::Value::Integer(n) => n.to_string(),
+                    rusqlite::types::Value::Text(text) => text,
+                    other => format!("{other:?}"),
+                })
+        };
+        assert_eq!(meta(VERSION).as_deref(), Some("1"));
+        let first_row = count(&store.conn, "SELECT MIN(rowid) FROM messages");
+        assert_eq!(meta(BACKFILL), Some(first_row.to_string()));
         assert!(store.maintain_correspondents().unwrap());
         assert_eq!(count(&store.conn, sightings), MAINTENANCE_BATCH);
         drop(store);
