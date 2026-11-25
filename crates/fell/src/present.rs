@@ -834,16 +834,7 @@ fn to_spans(names: &[String]) -> Vec<NameSpan> {
 /// breaks or the invisible marks that reorder or hide what is drawn.
 pub fn display_safe(text: &str) -> String {
     text.chars()
-        .filter(|ch| {
-            !ch.is_control()
-                && !matches!(
-                    *ch,
-                    '\u{200B}'..='\u{200F}'
-                        | '\u{202A}'..='\u{202E}'
-                        | '\u{2060}'..='\u{2069}'
-                        | '\u{FEFF}'
-                )
-        })
+        .filter(|&ch| fell_core::compose::recipient_display_char(ch))
         .collect()
 }
 

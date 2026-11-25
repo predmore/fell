@@ -1190,6 +1190,7 @@ impl Inbox {
             selected,
             interactive,
             theme,
+            1.,
             |index, row| {
                 row.id(("search-recipient", index))
                     .cursor_pointer()
