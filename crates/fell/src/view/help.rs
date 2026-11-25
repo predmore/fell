@@ -2,7 +2,7 @@
 use std::time::Instant;
 
 use gpui::prelude::*;
-use gpui::{Context, Div, FontWeight, Hsla, MouseButton, Pixels, Size, Window, div, px, rgb};
+use gpui::{Context, Div, FontWeight, MouseButton, Pixels, Size, Window, div, px, rgb};
 
 use super::{CARD_TOP_PX, FontOpt, Inbox, conversation_line_style};
 use crate::keymap::{Action, KeyId, binding_text};
@@ -312,8 +312,8 @@ fn card(
                                         .map(|action| action_row(theme, session, action, &layout)),
                                 ),
                         )
-                        .children((moving && offset > 0.).then(|| edge(theme, true)))
-                        .children((moving && offset < last).then(|| edge(theme, false))),
+                        .children((moving && offset > 0.).then(|| edge(theme, true, 14.)))
+                        .children((moving && offset < last).then(|| edge(theme, false, 14.))),
                 )
                 .when(last > 0., |viewport| {
                     // This gutter is reserved at every scroll position.
@@ -358,21 +358,15 @@ fn action_row(theme: &Theme, session: &Session, action: Action, layout: &Layout)
 }
 
 /// While a row crosses the viewport boundary, its text fades into the card.
-fn edge(theme: &Theme, top: bool) -> Div {
-    let solid = Hsla::from(rgb(theme.surface));
-    let clear = Hsla { a: 0., ..solid };
+pub(super) fn edge(theme: &Theme, top: bool, height: f32) -> Div {
     div()
         .absolute()
         .left_0()
         .right_0()
-        .h(px(14.))
+        .h(px(height))
         .when(top, |fade| fade.top_0())
         .when(!top, |fade| fade.bottom_0())
-        .bg(gpui::linear_gradient(
-            if top { 0. } else { 180. },
-            gpui::linear_color_stop(clear, 0.),
-            gpui::linear_color_stop(solid, 1.),
-        ))
+        .bg(crate::theme::scroll_fade(theme.surface, top))
 }
 
 #[cfg(test)]

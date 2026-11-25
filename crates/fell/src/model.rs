@@ -4,6 +4,7 @@ pub mod activity;
 pub mod agents;
 mod notes;
 pub mod search;
+pub(crate) mod settings;
 pub use notes::{AgentNotes, NoteRequest, SUGGESTIONS_QUERY};
 
 use std::collections::{HashMap, HashSet};
@@ -179,6 +180,7 @@ pub enum Overlay {
     About,
     Agents,
     AgentActivity,
+    Settings,
 }
 
 /// What confirming the folder picker does.
@@ -396,6 +398,7 @@ pub struct Step {
     /// Start a sync pass now instead of waiting for the next one.
     pub sync_now: bool,
     pub notification_mode: Option<NotificationMode>,
+    pub settings: Option<settings::Request>,
     /// Bring back the agent review window that closed last.
     pub reopen_review: bool,
     pub open_diagnostic: Option<DiagnosticFile>,
@@ -481,6 +484,7 @@ pub struct Session {
     /// on the recipient line opens only this; `q` opens everything.
     pub recipients_open: HashSet<String>,
     pub overlay: Overlay,
+    pub settings_nav: settings::Nav,
     pub agents: agents::Agents,
     pub activity: activity::Activity,
     pub palette_origin: Overlay,
@@ -490,6 +494,7 @@ pub struct Session {
     pub count: String,
     pub keymap: Keymap,
     pub sync: SyncKind,
+    pub last_sync_at: Option<i64>,
     pub worker_outages: HashSet<Worker>,
     /// Mailbox or keymap failure from startup. Folder and message reads do not clear it.
     pub startup_error: Option<String>,
@@ -578,6 +583,7 @@ impl Session {
             quotes_open: HashSet::new(),
             recipients_open: HashSet::new(),
             overlay: Overlay::None,
+            settings_nav: settings::Nav::default(),
             agents: agents::Agents::default(),
             activity: activity::Activity::default(),
             palette_origin: Overlay::None,
@@ -586,6 +592,11 @@ impl Session {
             which_visible: false,
             count: String::new(),
             keymap,
+            last_sync_at: if let SyncKind::Synced { at, .. } = sync {
+                Some(at)
+            } else {
+                None
+            },
             sync,
             startup_error: None,
             error: None,
@@ -678,6 +689,9 @@ impl Session {
     pub fn apply_sync_status(&mut self, status: SyncKind) {
         if let Some(notice) = self.sync_notice.take() {
             self.clear_toast_if(notice);
+        }
+        if let SyncKind::Synced { at, .. } = status {
+            self.last_sync_at = Some(at);
         }
         self.sync = status;
     }
@@ -983,6 +997,10 @@ impl Session {
                 &self.palette_query,
                 &self.recent,
             ))
+            .filter(|item| match item.action {
+                Action::Setting(row) => self.settings_nav.availability.shows(row),
+                _ => true,
+            })
             .collect()
     }
 
@@ -2065,7 +2083,7 @@ impl Session {
             }
             return step;
         }
-        let key = if key == self.keymap.leader {
+        let key = if self.chord.is_empty() && key == self.keymap.leader {
             KeyId::Leader
         } else {
             key
@@ -2104,6 +2122,7 @@ impl Session {
             Overlay::Palette => self.palette_key(key, page_rows),
             Overlay::Folders => self.folder_key(key),
             Overlay::Agents => self.agents_key(key, page_rows),
+            Overlay::Settings => self.settings_key(key, page_rows),
             Overlay::AgentActivity => self.activity_key(key, page_rows),
             Overlay::Help => {
                 if matches!(key, KeyId::Escape | KeyId::Enter | KeyId::Char('?')) {
@@ -2118,6 +2137,104 @@ impl Session {
                 Step::default()
             }
             Overlay::None => Step::default(),
+        }
+    }
+
+    fn settings_key(&mut self, key: KeyId, page_rows: usize) -> Step {
+        use settings::{Page, Request, Row, Section};
+
+        if let Page::ConfirmModel { install } = self.settings_nav.page
+            && matches!(key, KeyId::Char('y' | 'n') | KeyId::Escape)
+        {
+            self.settings_nav.back();
+            return Step {
+                settings: (key == KeyId::Char('y')).then_some(Request::ChangeModel { install }),
+                ..Step::default()
+            };
+        }
+        if matches!(
+            self.settings_nav.page,
+            Page::Bindings | Page::ConfirmModel { .. }
+        ) {
+            let lines = match key {
+                KeyId::Char('j') | KeyId::Down => 2,
+                KeyId::Char('k') | KeyId::Up => -2,
+                KeyId::Ctrl('d') => 8,
+                KeyId::Ctrl('u') => -8,
+                _ => 0,
+            };
+            if lines != 0 {
+                return Step {
+                    settings: Some(Request::Scroll(lines)),
+                    ..Step::default()
+                };
+            }
+            if matches!(self.settings_nav.page, Page::ConfirmModel { .. }) {
+                return Step::default();
+            }
+        }
+        match key {
+            KeyId::Escape => {
+                if !self.settings_nav.back() {
+                    self.dismiss_overlay();
+                }
+            }
+            KeyId::Char(':') | KeyId::CtrlShiftP => return self.run(Action::Palette, page_rows),
+            KeyId::Enter | KeyId::Space => {
+                if self.settings_nav.page == Page::Index {
+                    return Step {
+                        settings: self
+                            .settings_nav
+                            .enter_section(Section::ALL[self.settings_nav.selected]),
+                        ..Step::default()
+                    };
+                }
+                if let Some(row) = self.settings_nav.row() {
+                    return self.activate_setting(row, page_rows);
+                }
+            }
+            KeyId::Char('h' | 'l') | KeyId::Left | KeyId::Right => {
+                if let Some(Row::Value(preference)) = self.settings_nav.row() {
+                    return Step {
+                        settings: Some(Request::Save(crate::settings::Edit::Cycle(
+                            preference,
+                            matches!(key, KeyId::Char('h') | KeyId::Left),
+                        ))),
+                        ..Step::default()
+                    };
+                }
+            }
+            _ => self.settings_nav.move_to(key),
+        }
+        Step::default()
+    }
+
+    pub fn activate_setting(&mut self, row: settings::Row, page_rows: usize) -> Step {
+        use settings::{Page, Request, Row};
+
+        self.settings_nav.select_row(row);
+        let settings = match row {
+            Row::Value(preference) => Some(Request::Save(crate::settings::Edit::Cycle(
+                preference, false,
+            ))),
+            Row::AccountSetup => Some(Request::AccountSetup),
+            Row::EditKeymap => Some(Request::EditKeymap),
+            Row::EffectiveBindings => {
+                self.settings_nav.page = Page::Bindings;
+                self.settings_nav.selected = 0;
+                None
+            }
+            Row::InstallModel | Row::RemoveModel => {
+                self.settings_nav.page = Page::ConfirmModel {
+                    install: row == Row::InstallModel,
+                };
+                None
+            }
+            Row::ManageAgents => return self.run(Action::Agents, page_rows),
+        };
+        Step {
+            settings,
+            ..Step::default()
         }
     }
 
@@ -2731,6 +2848,22 @@ impl Session {
                     sync_now: true,
                     ..Step::default()
                 };
+            }
+            Action::Settings => {
+                self.count.clear();
+                self.overlay = Overlay::Settings;
+                self.settings_nav.reset();
+            }
+            Action::Setting(row) => {
+                if !self.settings_nav.availability.shows(row) {
+                    return step;
+                }
+                self.count.clear();
+                self.overlay = Overlay::Settings;
+                self.settings_nav.select_row(row);
+                if !matches!(row, settings::Row::Value(_)) {
+                    return self.activate_setting(row, page_rows);
+                }
             }
             Action::Notifications(mode) => {
                 self.count.clear();

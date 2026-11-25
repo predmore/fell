@@ -2,8 +2,8 @@
 //!
 //! Nothing here runs on its own. [`install_model`] is the only function that
 //! fetches, and it takes the fetcher as an argument: this crate links no HTTP
-//! client. The `fell embeddings install` command passes one after the person
-//! has agreed to the download. Opening a mailbox and indexing only look for
+//! client. Fell passes one after the person confirms installation in
+//! Settings or at the CLI. Opening a mailbox and indexing only look for
 //! files that are already on disk (see [`installed_model_dir`]).
 //!
 //! Each file is pinned to a Hugging Face commit, a byte size and a SHA-256.
@@ -303,11 +303,12 @@ pub fn install_model(
     root: &Path,
     fetch: &mut Fetch<'_>,
 ) -> Result<PathBuf, ModelError> {
+    create_private_dirs(root)?;
+    let _lock = lock_models_root(root)?;
     sweep_partials(model, root);
     if let Ok(dir) = verify_installed(model, root) {
         return Ok(dir);
     }
-    create_private_dirs(root)?;
     let staging = scratch_path(model, root, "new");
     create_private_dir(&staging)?;
     let staged = (|| {
@@ -427,6 +428,11 @@ fn download_one(file: &ModelFile, staging: &Path, fetch: &mut Fetch<'_>) -> Resu
 
 /// Delete the downloaded model. `Ok(false)` when it was not there.
 pub fn remove_model(model: &LocalModel, root: &Path) -> io::Result<bool> {
+    let _lock = match lock_models_root(root) {
+        Ok(lock) => lock,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
     let dir = model_dir(model, root);
     match fs::symlink_metadata(&dir) {
         Ok(_) => {
@@ -436,6 +442,24 @@ pub fn remove_model(model: &LocalModel, root: &Path) -> io::Result<bool> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(err),
     }
+}
+
+/// Settings and the CLI share the staging area. An installer must not
+/// sweep another installer's files, and a remove must wait for publication.
+fn lock_models_root(root: &Path) -> io::Result<fs::File> {
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_DIRECTORY | O_NOFOLLOW)
+        .open(root)?;
+    lock.try_lock().map_err(|error| {
+        let error = io::Error::from(error);
+        if error.kind() == io::ErrorKind::WouldBlock {
+            io::Error::new(error.kind(), "another model operation is in progress")
+        } else {
+            error
+        }
+    })?;
+    Ok(lock)
 }
 
 fn remove_path(path: &Path) -> io::Result<()> {
@@ -690,6 +714,25 @@ mod tests {
         assert!(remove_model(model, &root).unwrap());
         assert!(!remove_model(model, &root).unwrap());
         assert!(installed_model_dir(model, &root).is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_active_install_keeps_its_staging_area() {
+        let root = temp_root("active-install");
+        fs::create_dir(&root).unwrap();
+        let model = model_for(ID, b"onnx bytes", b"vocab", 8);
+        let active = lock_models_root(&root).unwrap();
+        let partial = scratch_path(model, &root, "new");
+        fs::create_dir(&partial).unwrap();
+        let mut fetch = |_: &str| panic!("a second install must not fetch");
+        assert!(install_model(model, &root, &mut fetch).is_err());
+        assert_eq!(
+            remove_model(model, &root).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(partial.is_dir());
+        drop(active);
         let _ = fs::remove_dir_all(&root);
     }
 

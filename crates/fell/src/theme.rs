@@ -94,12 +94,27 @@ fn label_outline(background: u32, text: u32) -> u32 {
 
 /// Read the active Omarchy theme, or the built-in theme that follows the desktop.
 pub fn load() -> Theme {
-    let fonts = load_fonts();
-    let theme = theme_candidates().into_iter().find_map(|path| {
-        let text = fs::read_to_string(&path).ok()?;
-        theme_from_palette(&text, &fonts, palette_name(&path))
-    });
-    let theme = theme.unwrap_or_else(|| builtin(prefers_dark(), fonts));
+    load_with(crate::settings::appearance())
+}
+
+pub fn load_with(settings: crate::settings::Values) -> Theme {
+    use crate::settings::ColorScheme;
+
+    let mut fonts = load_fonts();
+    if let Some(size) = settings.font_size {
+        fonts.ui_px = size as f32;
+    }
+    let theme = match settings.theme {
+        ColorScheme::Dark => builtin(true, fonts),
+        ColorScheme::Light => builtin(false, fonts),
+        ColorScheme::System => {
+            let theme = theme_candidates().into_iter().find_map(|path| {
+                let text = fs::read_to_string(&path).ok()?;
+                theme_from_palette(&text, &fonts, palette_name(&path))
+            });
+            theme.unwrap_or_else(|| builtin(prefers_dark(), fonts))
+        }
+    };
     let _ = (contrast_ok(&theme), theme.is_light());
     theme
 }
@@ -327,6 +342,16 @@ pub(crate) fn note_text(color: u32, background: u32) -> u32 {
     ensure(color, background, NOTE_TEXT_CONTRAST)
 }
 
+pub(crate) fn scroll_fade(color: u32, top: bool) -> gpui::Background {
+    let solid = gpui::Hsla::from(gpui::rgb(color));
+    let clear = gpui::Hsla { a: 0., ..solid };
+    gpui::linear_gradient(
+        if top { 0. } else { 180. },
+        gpui::linear_color_stop(clear, 0.),
+        gpui::linear_color_stop(solid, 1.),
+    )
+}
+
 pub fn contrast_ok(theme: &Theme) -> bool {
     let surfaces = [theme.background, theme.surface];
     for bg in surfaces {
@@ -364,7 +389,7 @@ pub fn contrast_ok(theme: &Theme) -> bool {
         && contrast(strong_border(theme), theme.background) >= MARK_CONTRAST
 }
 
-/// A thread watching the Omarchy theme, GTK settings, and Alacritty config.
+/// A thread watching Fell settings, the Omarchy theme, GTK, and Alacritty.
 /// It sends `()` (at most every 100 ms) when one of them may have changed,
 /// and ends when the receiver is gone. `false` when inotify is unavailable,
 /// so the caller polls instead.
@@ -374,12 +399,15 @@ pub fn watch(changed: futures::channel::mpsc::UnboundedSender<()>) -> bool {
 
 pub fn follow<V: 'static>(
     cx: &mut gpui::Context<V>,
-    mut update: impl FnMut(&mut V, Theme, &mut gpui::Context<V>) + 'static,
+    mut update: impl FnMut(&mut V, Theme, crate::motion::Motion, &mut gpui::Context<V>) + 'static,
 ) {
     use futures::StreamExt as _;
 
     let (changed, mut changes) = futures::channel::mpsc::unbounded();
     let watching = watch(changed);
+    let settings_path = crate::settings::path();
+    let defaults = crate::settings::Values::default();
+    let mut previous = crate::settings::Snapshot::read(settings_path.as_deref(), defaults);
     cx.spawn(async move |this, cx| {
         loop {
             if watching {
@@ -391,8 +419,24 @@ pub fn follow<V: 'static>(
                     .timer(std::time::Duration::from_secs(1))
                     .await;
             }
-            let next = cx.background_executor().spawn(async { load() }).await;
-            if this.update(cx, |view, cx| update(view, next, cx)).is_err() {
+            let path = settings_path.clone();
+            let (snapshot, next, motion) = cx
+                .background_executor()
+                .spawn(async move {
+                    let snapshot = previous.reload(path.as_deref(), defaults);
+                    let settings = snapshot.values;
+                    (
+                        snapshot,
+                        load_with(settings),
+                        crate::motion::Motion::for_preference(settings.reduce_motion),
+                    )
+                })
+                .await;
+            previous = snapshot;
+            if this
+                .update(cx, |view, cx| update(view, next, motion, cx))
+                .is_err()
+            {
                 break;
             }
         }
@@ -403,7 +447,7 @@ pub fn follow<V: 'static>(
 /// Each folder holding a file `load` reads, and that folder's parent, so a
 /// replaced folder (Omarchy rewrites `current/theme`) is noticed and
 /// watched again.
-fn watched_dirs() -> Vec<PathBuf> {
+pub(crate) fn watched_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     for file in theme_candidates()
         .into_iter()
@@ -418,12 +462,18 @@ fn watched_dirs() -> Vec<PathBuf> {
             dirs.push(parent.to_path_buf());
         }
     }
+    if let Some(path) = crate::settings::path() {
+        dirs.extend(crate::settings::watched_dirs(&path));
+    }
     dirs.sort();
     dirs.dedup();
     dirs
 }
 
-fn watch_dirs(dirs: Vec<PathBuf>, changed: futures::channel::mpsc::UnboundedSender<()>) -> bool {
+pub(crate) fn watch_dirs(
+    dirs: Vec<PathBuf>,
+    changed: futures::channel::mpsc::UnboundedSender<()>,
+) -> bool {
     use notify::{RecursiveMode, Watcher};
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     let Ok(mut watcher) =
@@ -449,7 +499,7 @@ fn watch_dirs(dirs: Vec<PathBuf>, changed: futures::channel::mpsc::UnboundedSend
         return false;
     }
     std::thread::Builder::new()
-        .name("fell-theme-watch".into())
+        .name("fell-config-watch".into())
         .spawn(move || {
             loop {
                 match rx.recv_timeout(std::time::Duration::from_secs(1)) {
@@ -463,7 +513,7 @@ fn watch_dirs(dirs: Vec<PathBuf>, changed: futures::channel::mpsc::UnboundedSend
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
-                // A theme switch writes several files. Settle, then reload once.
+                // A config edit can write several files. Settle, then reload once.
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 while rx.try_recv().is_ok() {}
                 rewatch(&mut watcher);

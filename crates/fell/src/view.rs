@@ -10,6 +10,7 @@ pub(crate) mod disclosure;
 mod help;
 mod notification_actions;
 mod search;
+mod settings;
 
 use std::cell::{Cell, OnceCell};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -271,7 +272,9 @@ pub(crate) fn finish_onboarding(
     cx: &mut App,
 ) {
     let startup = mailbox::startup();
-    crate::draft_host::host_agent_drafts(cx);
+    if cx.try_global::<crate::draft_host::AgentDrafts>().is_none() {
+        crate::draft_host::host_agent_drafts(cx);
+    }
     window.replace_root(cx, |window, cx| {
         let mut inbox = Inbox::focused(startup, false, window, cx);
         inbox.first_preview = FirstPreview::Handoff;
@@ -697,6 +700,7 @@ struct Inbox {
     activity_scroll: ScrollHandle,
     activity_motion: activity::ActivityMotion,
     help_scroll: help::HelpScroll,
+    settings_view: settings::View,
     search_view: search::SearchView,
     search_preview: gpui::Entity<search::CachedPreview>,
     search_rows: gpui::Entity<search::CachedRows>,
@@ -835,8 +839,18 @@ impl Inbox {
         window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let theme = theme::load();
         let config = startup.config.clone();
+        let legacy = crate::settings::Values {
+            which_key_ms: startup.keymap.which_key_ms,
+            read_dwell_ms: startup.read_dwell_ms,
+            notifications: config
+                .as_ref()
+                .map_or_else(Default::default, |config| config.notifications),
+            ..Default::default()
+        };
+        let settings = crate::settings::Snapshot::read(crate::settings::path().as_deref(), legacy);
+        let values = settings.values;
+        let theme = theme::load_with(values);
         let path = startup.path.clone();
         let draft_home = startup.path.clone().ok().map(DraftHome::real);
         let (notices, store_restarts) = futures::channel::mpsc::unbounded();
@@ -860,11 +874,12 @@ impl Inbox {
         } else {
             SyncKind::LocalOffline
         };
-        let motion = Motion::from_env();
+        let motion = Motion::for_preference(values.reduce_motion);
         let mut session = Session::new(name, email, initial, startup.keymap);
         session.loading = true;
-        session.read_dwell_ms = startup.read_dwell_ms;
-        session.notification_mode = config.as_ref().map(|config| config.notifications);
+        session.read_dwell_ms = values.read_dwell_ms;
+        session.keymap.which_key_ms = values.which_key_ms;
+        session.notification_mode = Some(values.notifications);
         if let Some(error) = startup.error {
             session.record_startup_error(error);
         }
@@ -875,7 +890,7 @@ impl Inbox {
         let notifications = config.as_ref().zip(window).map(|(config, window)| {
             let (queue, invoked) = crate::notifications::start(
                 window_active,
-                config.notifications,
+                values.notifications,
                 store.clone(),
                 config.account().id,
             );
@@ -933,6 +948,7 @@ impl Inbox {
             activity_scroll: ScrollHandle::new(),
             activity_motion: activity::ActivityMotion::default(),
             help_scroll: help::HelpScroll::default(),
+            settings_view: settings::View::new(settings, config.as_ref()),
             search_view: search::SearchView::default(),
             search_preview: cx.new(|_| search::CachedPreview::new(reader.clone())),
             search_rows: cx.new(|_| search::CachedRows(reader)),
@@ -990,13 +1006,8 @@ impl Inbox {
         .detach();
         inbox.show_crash_notice(cx);
         inbox.watch_store_restarts(store_restarts, cx);
-        theme::follow(cx, |inbox, next, cx| {
-            if inbox.theme != next {
-                inbox.theme = next;
-                inbox.row_widths.clear();
-                cx.notify();
-            }
-        });
+        inbox.refresh_settings_availability();
+        inbox.watch_settings(legacy, cx);
         inbox.watch_reviews(cx);
         inbox.watch_notes(cx);
         inbox.watch_dates(cx);
@@ -2330,6 +2341,7 @@ impl Inbox {
         self.row_widths.settle();
         self.agents_motion.settle();
         self.activity_motion.settle();
+        self.settings_view.settle();
         self.settle_search_match();
         if let Some(y) = settled.list {
             self.set_list_offset(y);
@@ -4232,6 +4244,7 @@ impl Inbox {
         // When the note has scrolled away, the ordinary mail shortcuts
         // belong to the message the reader can see.
         self.session.agent_notes.shortcuts_hidden = !self.note_in_view();
+        self.refresh_settings_availability();
         let step = self.session.on_key(key, page);
         self.session
             .dismiss_key_notice(previous_notice, step.undo || self.undos_in_flight > 0);
@@ -4254,6 +4267,8 @@ impl Inbox {
             searching: self.session.search.is_some(),
             search_generation: self.session.search_generation,
             help_open: self.session.overlay == Overlay::Help,
+            settings_page: (self.session.overlay == Overlay::Settings)
+                .then_some(self.session.settings_nav.page),
         }
     }
 
@@ -4267,6 +4282,7 @@ impl Inbox {
             searching,
             search_generation,
             help_open,
+            settings_page,
         } = before;
         if pane_before != Pane::Conversation && self.session.pane == Pane::Conversation {
             self.reader_entered_conversation();
@@ -4409,7 +4425,25 @@ impl Inbox {
             }
         }
         if let Some(mode) = step.notification_mode {
-            self.set_notification_mode(mode, cx);
+            self.settings_request(
+                crate::model::settings::Request::Save(crate::settings::Edit::Notifications(mode)),
+                cx,
+            );
+        }
+        if let Some(request) = step.settings {
+            self.settings_request(request, cx);
+        }
+        if self.session.overlay == Overlay::Settings {
+            self.validate_settings_step(cx);
+            let page = self.session.settings_nav.page;
+            if settings_page != Some(page) {
+                self.settings_view.reset_scroll();
+            }
+            if matches!(page, crate::model::settings::Page::Section(_)) {
+                self.settings_view
+                    .scroll_to(self.session.settings_nav.selected);
+            }
+            self.update_settings_notice(false, cx);
         }
         // Reads go to the store thread. The list moves on this frame; the
         // conversation follows when its read lands.
@@ -5339,6 +5373,12 @@ impl Render for Inbox {
             &self.motion.motion,
             now,
         );
+        let settings_animating = self.settings_view.observe(
+            (self.session.overlay == Overlay::Settings).then_some(self.session.settings_nav.page),
+            self.session.settings_nav.selected,
+            now,
+            self.motion.motion,
+        );
         let activity_animating = self.session.overlay == Overlay::AgentActivity
             && self
                 .activity_motion
@@ -5386,6 +5426,7 @@ impl Render for Inbox {
                 .any(|size| size.from.is_some_and(|(_, fade)| fade.running(now)))
             | agents_animating
             | activity_animating
+            | settings_animating
             | self.search_view.animating(now)
             | (self.session.overlay == Overlay::Help && self.help_scroll.running(now));
         if animating {
@@ -5415,6 +5456,18 @@ impl Render for Inbox {
             layer.swap(&mut self.session);
         }
         let viewport_height = f32::from(window.viewport_size().height);
+        let settings_room = viewport_height - CARD_TOP_PX - 16.;
+        if self.session.overlay == Overlay::Settings
+            && self.session.settings_nav.page == crate::model::settings::Page::Index
+        {
+            let final_height =
+                settings::card_height(&self.session.settings_nav, settings_room, width < 500.);
+            self.settings_view.reveal_index_row(
+                self.session.settings_nav.selected,
+                card.unwrap_or(final_height),
+                final_height,
+            );
+        }
         let mut overlay_card =
             |session: &Session, motion, live, picker: (&[PickerChoice], Option<String>, f32)| {
                 let help = self
@@ -5457,6 +5510,24 @@ impl Render for Inbox {
                             ),
                             live.then_some((&self.activity_motion, now)),
                             window,
+                            cx,
+                        )),
+                        Overlay::Settings => Some(settings::card(
+                            &theme,
+                            session,
+                            &self.settings_view,
+                            live,
+                            (
+                                card.unwrap_or_else(|| {
+                                    settings::card_height(
+                                        &session.settings_nav,
+                                        settings_room,
+                                        width < 500.,
+                                    )
+                                }),
+                                window,
+                            ),
+                            now,
                             cx,
                         )),
                         _ => None,
@@ -7034,6 +7105,7 @@ struct StepBefore {
     searching: bool,
     search_generation: u64,
     help_open: bool,
+    settings_page: Option<crate::model::settings::Page>,
 }
 
 /// How a thread row is drawn.
@@ -11111,6 +11183,11 @@ fn card_fit(
         }
         Overlay::Agents => Some(agents::card_height(&session.agents, room)),
         Overlay::AgentActivity => Some(activity::card_height(room)),
+        Overlay::Settings => Some(settings::card_height(
+            &session.settings_nav,
+            room,
+            window.viewport_size().width < px(500.),
+        )),
         _ => None,
     }
 }
@@ -11176,7 +11253,7 @@ fn overlay(
     folder_scroll: &ScrollHandle,
     picker: (&[PickerChoice], Option<String>, f32),
     help: Option<(f32, gpui::Div)>,
-    agent_card: Option<gpui::Div>,
+    section_card: Option<gpui::Div>,
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::Div {
@@ -11193,7 +11270,7 @@ fn overlay(
         .when(
             matches!(
                 session.overlay,
-                Overlay::About | Overlay::Agents | Overlay::AgentActivity
+                Overlay::About | Overlay::Agents | Overlay::AgentActivity | Overlay::Settings
             ),
             |layer| layer.items_start(),
         )
@@ -11220,7 +11297,7 @@ fn overlay(
                 .opacity(opacity)
                 .into_any_element(),
             Overlay::About => about(theme, cx).opacity(opacity).into_any_element(),
-            Overlay::Agents | Overlay::AgentActivity => agent_card
+            Overlay::Agents | Overlay::AgentActivity | Overlay::Settings => section_card
                 .unwrap_or_else(div)
                 .opacity(opacity)
                 .into_any_element(),
@@ -11853,6 +11930,8 @@ fn named_key(key: &str, shift: bool) -> Option<KeyId> {
         "slash" if shift => Some(KeyId::Char('?')),
         "slash" => Some(KeyId::Char('/')),
         "semicolon" if shift => Some(KeyId::Char(':')),
+        "colon" => Some(KeyId::Char(':')),
+        "comma" if !shift => Some(KeyId::Char(',')),
         other if other.chars().count() == 1 => {
             let ch = other.chars().next().unwrap();
             Some(KeyId::Char(if shift {
@@ -13742,6 +13821,18 @@ mod tests {
         assert_eq!(unread_bar_dx(motion::PANE_SLIDE_PX), 0.0);
         // Half way, they are still held at the edge.
         assert_eq!(-10.0 + LIST_BORDER_PX + unread_bar_dx(-10.0), 0.0);
+    }
+
+    #[test]
+    fn settings_shortcuts_accept_named_punctuation_keys() {
+        assert_eq!(
+            key_from(&stroke("comma", "", false)),
+            Some(KeyId::Char(','))
+        );
+        assert_eq!(
+            key_from(&stroke("colon", "", false)),
+            Some(KeyId::Char(':'))
+        );
     }
 
     #[test]

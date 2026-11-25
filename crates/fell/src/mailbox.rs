@@ -2,9 +2,9 @@
 
 use std::env;
 use std::ffi::OsStr;
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::{fs, io};
 
 use fell_core::{Account, AccountConfig, AccountId, Store};
 
@@ -16,7 +16,7 @@ use crate::model::SyncKind;
 pub struct Startup {
     pub keymap: Keymap,
     pub split: f32,
-    /// `read_dwell_ms` in ui.toml: how long a thread stays open before it
+    /// Legacy `read_dwell_ms` from ui.toml: how long a thread stays open before it
     /// is marked read. 0, the default, marks it as it opens.
     pub read_dwell_ms: u64,
     pub error: Option<String>,
@@ -154,36 +154,6 @@ fn read_account_config_text(
         )
     })?;
     Ok(Some((config, text)))
-}
-
-pub(crate) fn save_notification_mode(
-    account: &AccountId,
-    mode: fell_core::NotificationMode,
-) -> Result<(), String> {
-    let path = account_config_path().ok_or_else(|| "No account is set up".to_string())?;
-    let lock = lock_account_dir(&path).map_err(|err| err.to_string())?;
-    let (config, text) = read_account_config_text(&path)
-        .map_err(|err| err.to_string())?
-        .ok_or_else(|| "No account is set up".to_string())?;
-    if config.id != account.as_str() {
-        return Err("The configured account has changed; restart Fell".into());
-    }
-
-    let mut updated = String::with_capacity(text.len() + 30);
-    for line in text.lines() {
-        let key = line.split_once('=').map(|(key, _)| key.trim());
-        if matches!(key, Some("notifications" | "notification_content")) {
-            continue;
-        }
-        updated.push_str(line);
-        updated.push('\n');
-    }
-    use std::fmt::Write as _;
-    let _ = writeln!(updated, "notifications = \"{}\"", mode.as_str());
-    stage_account_text_at(path, &updated, false, lock)
-        .and_then(StagedAccountConfig::publish)
-        .map_err(|err| err.to_string())?;
-    Ok(())
 }
 
 /// The account file a send from `account` takes its login and SMTP settings
@@ -324,10 +294,9 @@ pub(crate) fn stage_account_config_at(
 
 fn lock_account_dir(path: &Path) -> Result<fs::File, AccountFileError> {
     let dir = path.parent().expect("account file has a parent directory");
-    create_mailbox_dirs(dir).map_err(|err| err.to_string())?;
     // Serialize setup through publication, since a concurrent attempt could
     // otherwise replace the credential while this config is being written.
-    let lock = fs::File::open(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
+    let lock = private_config_dir(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
     lock.try_lock()
         .map_err(|err| format!("Couldn't lock the account directory: {err}"))?;
     Ok(lock)
@@ -440,7 +409,7 @@ fn open_at(path: &Path) -> fell_core::Result<Store> {
 /// Create missing directories for the mailbox and restrict only those new
 /// directories to 0700. An existing parent, including a home directory or
 /// `/tmp`, keeps the mode it already has.
-fn create_mailbox_dirs(dir: &Path) -> fell_core::Result<()> {
+pub(crate) fn create_mailbox_dirs(dir: &Path) -> std::io::Result<()> {
     let mut missing = Vec::new();
     let mut current = dir;
     loop {
@@ -454,12 +423,40 @@ fn create_mailbox_dirs(dir: &Path) -> fell_core::Result<()> {
         }
     }
     for path in missing.iter().rev() {
-        match fs::create_dir(path) {
-            Ok(()) => fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-                .map_err(|err| fell_core::Error::Backend(err.to_string()))?,
+        match fs::DirBuilder::new().mode(0o700).create(path) {
+            Ok(()) => restrict_permissions(&open_directory(path)?, 0o700)?,
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(err) => return Err(fell_core::Error::Backend(err.to_string())),
+            Err(err) => return Err(err),
         }
+    }
+    Ok(())
+}
+
+fn open_directory(dir: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dir)
+}
+
+pub(crate) fn private_config_dir(dir: &Path) -> io::Result<fs::File> {
+    create_mailbox_dirs(dir)?;
+    let file = open_directory(dir)?;
+    restrict_permissions(&file, 0o700)?;
+    Ok(file)
+}
+
+pub(crate) fn restrict_permissions(file: &fs::File, mode: u32) -> io::Result<()> {
+    let metadata = file.metadata()?;
+    // SAFETY: geteuid has no arguments and returns the current effective user.
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Fell configuration must be owned by you",
+        ));
+    }
+    if metadata.mode() & 0o7777 != mode {
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
     }
     Ok(())
 }
@@ -542,10 +539,9 @@ pub fn save_split(split: f32) {
     let Some(dir) = config_dir() else {
         return;
     };
-    if fs::create_dir_all(&dir).is_err() {
+    if private_config_dir(&dir).is_err() {
         return;
     }
-    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
     let path = dir.join("ui.toml");
     // Keep the other settings in the file.
     let kept: String = fs::read_to_string(&path)
@@ -566,6 +562,29 @@ pub fn save_split(split: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_permissions_are_repaired_without_chmodding_parents_or_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("config");
+        let dir = parent.join("fell");
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+
+        for mode in [0o755, 0o777] {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(mode)).unwrap();
+            private_config_dir(&dir).unwrap();
+            assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
+        }
+        assert_eq!(fs::metadata(&parent).unwrap().mode() & 0o777, 0o755);
+
+        let link = temp.path().join("fell");
+        symlink(&parent, &link).unwrap();
+        assert!(private_config_dir(&link).is_err());
+        assert_eq!(fs::metadata(&parent).unwrap().mode() & 0o777, 0o755);
+    }
 
     #[test]
     fn ui_settings_read_by_name() {

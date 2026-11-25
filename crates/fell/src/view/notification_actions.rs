@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use fell_core::{AccountId, FlagChange, FolderRole, MessageId, NotificationMode, Store, ThreadId};
+use fell_core::{AccountId, FlagChange, FolderRole, MessageId, Store, ThreadId};
 use futures::StreamExt;
 use futures::channel::mpsc::UnboundedReceiver;
 use gpui::{AnyWindowHandle, Context, Window};
@@ -66,39 +66,6 @@ impl Inbox {
         }
         self.notification_toast = (!self.window_active).then(|| (toast.clone(), alert));
         self.session.show_toast(toast, alert);
-    }
-
-    pub(super) fn set_notification_mode(&mut self, mode: NotificationMode, cx: &mut Context<Self>) {
-        let Some(queue) = self.notifications.clone() else {
-            self.session.show_toast("No account is set up", true);
-            return;
-        };
-        let account = self.account_id.clone();
-        let saved = self.store.call(move |_| {
-            crate::mailbox::save_notification_mode(&account, mode)?;
-            queue.set_mode(mode);
-            Ok::<_, String>(())
-        });
-        cx.spawn(async move |this, cx| {
-            let Ok(result) = saved.await else {
-                return;
-            };
-            let _ = this.update(cx, |inbox, cx| {
-                match result {
-                    Ok(()) => {
-                        inbox.session.notification_mode = Some(mode);
-                        inbox
-                            .session
-                            .show_toast(Action::Notifications(mode).label(), false);
-                    }
-                    Err(err) => inbox
-                        .session
-                        .show_toast(format!("Could not save notifications · {err}"), true),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
     }
 
     pub(super) fn watch_notifications(

@@ -22,7 +22,8 @@ fell embeddings status           which embedder indexes mail, and where its file
 fell embeddings install [--yes]  download the pinned all-MiniLM-L6-v2 files, after asking
 fell embeddings remove           delete those files; indexing goes back to local-hash-v1
 
-Fell does not download a model unless you run `install`. Until then it
+Fell downloads a model only after you choose Install in Settings or run this
+command with `install`. Until then it
 indexes with local-hash-v1, a lexical hash, and search is keyword search.
 With the model installed and loaded, search is hybrid: it also finds mail
 close in meaning. If the model does not load, search stays keyword search.
@@ -101,7 +102,7 @@ fn say(console: &mut Console<'_>, text: &str) -> Result<(), String> {
     writeln!(console.out, "{text}").map_err(|err| err.to_string())
 }
 
-fn megabytes(bytes: u64) -> String {
+pub(crate) fn megabytes(bytes: u64) -> String {
     format!("{:.1} MB", bytes as f64 / 1_000_000.0)
 }
 
@@ -135,6 +136,13 @@ fn status(model: &LocalModel, root: &Path, console: &mut Console<'_>) -> Result<
     say(console, &text)
 }
 
+pub(crate) const INSTALL_EFFECT: &str = "\
+Each file is checked against the SHA-256 above and deleted if it does not match.\n\
+Once installed, Fell re-indexes mail with this model in the background the next\n\
+time it opens the mailbox, and search becomes hybrid: it also finds mail close in\n\
+meaning, among the mail indexed so far. If the model does not load, search stays\n\
+keyword search.";
+
 /// What `install` will do, shown before it asks.
 fn plan(model: &LocalModel, root: &Path) -> String {
     let mut text = format!(
@@ -149,17 +157,22 @@ fn plan(model: &LocalModel, root: &Path) -> String {
         ));
     }
     text.push_str(&format!(
-        "\nLicense: {} (model card: {})\nSaved to: {} (owner-only)\n\n\
-         Each file is checked against the SHA-256 above and deleted if it does not match.\n\
-         Once installed, Fell re-indexes mail with this model in the background the next\n\
-         time it opens the mailbox, and search becomes hybrid: it also finds mail close in\n\
-         meaning, among the mail indexed so far. If the model does not load, search stays\n\
-         keyword search.",
+        "\nLicense: {} (model card: {})\nSaved to: {} (owner-only)\n\n{INSTALL_EFFECT}",
         model.license,
         model.card_url,
         model_dir(model, root).display()
     ));
     text
+}
+
+pub(crate) fn install_from_settings(root: &Path) -> Result<(), String> {
+    let mut fetch = HttpsFetch::default();
+    download(&MINILM_L6_V2_INT8, root, &mut |url| fetch.get(url))?;
+    Ok(())
+}
+
+fn download(model: &LocalModel, root: &Path, fetch: &mut Fetch<'_>) -> Result<PathBuf, String> {
+    install_model(model, root, fetch).map_err(|err| format!("{err}. Nothing was installed."))
 }
 
 fn install(
@@ -207,8 +220,7 @@ fn install(
         let _ = writeln!(console.out, "Downloading {url}");
         fetch(url)
     };
-    let dir = install_model(model, root, &mut announce)
-        .map_err(|err| format!("{err}. Nothing was installed."))?;
+    let dir = download(model, root, &mut announce)?;
     say(
         console,
         &format!(

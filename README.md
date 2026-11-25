@@ -89,13 +89,41 @@ Setup writes `~/.config/fell/account.toml` (mode 0600) and saves the entered pas
 
 Use `--imap --host imap.example.com` for an IMAP account other than Bridge. Setup also shows where mail is sent (`--smtp-host`, `--smtp-port`, `--smtp-security`; an IMAP account is asked on a terminal) and logs in there without sending anything. `fell account check` tests both logins again. Sync is read-only (`EXAMINE` and `BODY.PEEK`), so nothing changes on the server. `space s` syncs now. When Bridge is down or rejects the login, the status line and the empty inbox say so. `--fixture` opens one stored message so the HTML renderer can be seen. IMAP sync and confirmed SMTP delivery live in `fell-core`. Both ordinary IMAP accounts and Bridge use their configured SMTP settings for sending. The protocol tests use loopback IMAP and SMTP servers. Message bodies are indexed locally with a lexical hash. `fell embeddings install` downloads a small local sentence model (all-MiniLM-L6-v2, 23 MB, Apache-2.0) after showing what it fetches and asking. `fell embeddings status` and `fell embeddings remove` report on it and delete it. With the model installed, search also finds mail close in meaning to the query (hybrid ranking); without it, search is keyword search. The window follows the active Omarchy theme when `~/.local/state/omarchy/current/theme/colors.toml` is present, and otherwise uses the built-in dark or light theme.
 
+### Settings
+
+Open **Settings** from the command palette or press `Space ,`. Use `j` and `k`
+to move, Enter or Space to open a section or change a value, and `h` or `l`
+to cycle backward or forward. Sections include account details, appearance,
+reading, shortcuts, notifications, local search, and access to Agents.
+
+Fell reads `~/.config/fell/settings.toml` (or `$XDG_CONFIG_HOME/fell/settings.toml`)
+at startup and after edits, including edits made in another program. The view
+writes the changed key and preserves comments and unfamiliar keys.
+
+| Key | Accepted values |
+| --- | --- |
+| `theme` | `"system"`, `"dark"`, `"light"` |
+| `font_size` | `"system"` or 12–18 pixels |
+| `reduce_motion` | `"system"`, `true`, `false` |
+| `read_dwell_ms` | 0–10000 milliseconds |
+| `which_key_ms` | 0–5000 milliseconds |
+| `notifications` | `"on"`, `"private"`, `"off"` |
+
+Missing or invalid values fall back to the previous defaults. That includes
+`FELL_REDUCE_MOTION`, `read_dwell_ms` in `ui.toml`, `which_key_ms` in
+`keymap.toml`, and the notification mode in `account.toml`. An explicit
+`"system"` for motion follows GTK. Fell keeps the last readable settings if an edit introduces a syntax error.
+Delete individual keys to restore their fallbacks, or empty or remove the file
+to restore all fallbacks. Keymap leader changes, plus the search
+model after an install or removal, take effect when you reopen Fell.
+
 ### New mail notifications
 
 Fell shows desktop notifications for new unread Inbox mail. The command palette's
 **Notifications: Show sender and subject**, **Notifications: Hide sender and subject**,
 and **Notifications: Off** actions apply immediately, and a check mark shows the
-current mode. You can also set `notifications = "on"` (the default), `"private"`,
-or `"off"` in `account.toml` and restart Fell. Private mode keeps one notice with
+current mode. Choose the same modes in Settings or by editing `notifications`
+in `settings.toml`. Private mode keeps one notice with
 an unread count and an **Open Inbox** action. When you mark a conversation read or
 archive it from a notice, the confirmation offers **Undo** for five seconds.
 

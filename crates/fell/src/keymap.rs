@@ -8,6 +8,9 @@ use std::fmt::Write as _;
 
 use fell_core::NotificationMode;
 
+use crate::model::settings::Row as SettingsRow;
+use crate::settings::Preference;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum KeyId {
     Char(char),
@@ -75,6 +78,8 @@ pub enum Action {
     Palette,
     Help,
     About,
+    Settings,
+    Setting(SettingsRow),
     ReopenReview,
     Agents,
     AgentActivity,
@@ -143,6 +148,8 @@ impl Action {
             Self::Palette => "Command palette",
             Self::Help => "Help",
             Self::About => "About Fell",
+            Self::Settings => "Settings",
+            Self::Setting(row) => row.command(),
             Self::ReopenReview => "Reopen agent review",
             Self::Agents => "Agents",
             Self::AgentActivity => "Agent activity",
@@ -206,6 +213,18 @@ const ALL_ACTIONS: &[Action] = &[
     Action::Notifications(NotificationMode::On),
     Action::Notifications(NotificationMode::Private),
     Action::Notifications(NotificationMode::Off),
+    Action::Settings,
+    Action::Setting(SettingsRow::Value(Preference::Theme)),
+    Action::Setting(SettingsRow::Value(Preference::FontSize)),
+    Action::Setting(SettingsRow::Value(Preference::ReduceMotion)),
+    Action::Setting(SettingsRow::Value(Preference::ReadDwell)),
+    Action::Setting(SettingsRow::Value(Preference::WhichKey)),
+    Action::Setting(SettingsRow::Value(Preference::Notifications)),
+    Action::Setting(SettingsRow::AccountSetup),
+    Action::Setting(SettingsRow::EffectiveBindings),
+    Action::Setting(SettingsRow::EditKeymap),
+    Action::Setting(SettingsRow::InstallModel),
+    Action::Setting(SettingsRow::RemoveModel),
     Action::ToggleSelect,
     Action::Visual,
     Action::FullWidth,
@@ -349,6 +368,7 @@ fn default_bindings() -> Vec<Binding> {
     bind(&[KeyId::Char(':')], Action::Palette, None);
     bind(&[KeyId::CtrlShiftP], Action::Palette, None);
     bind(&[KeyId::Char('?')], Action::Help, None);
+    bind(&[KeyId::Leader, KeyId::Char(',')], Action::Settings, None);
     for (key, action) in [
         ('?', Action::Help),
         ('l', Action::OpenDiagnosticLog),

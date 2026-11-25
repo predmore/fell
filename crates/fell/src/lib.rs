@@ -26,6 +26,7 @@ mod recipient_menu;
 mod reply_check;
 mod row_widths;
 mod scroll_anchor;
+mod settings;
 mod setup;
 mod store_actor;
 mod sync_worker;
