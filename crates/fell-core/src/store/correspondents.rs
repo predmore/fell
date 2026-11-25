@@ -946,13 +946,10 @@ mod tests {
             )
             .unwrap();
         drop(store);
-        let started = Instant::now();
+        // Open must not backfill 100,000 messages: it only installs the
+        // schema and a cursor. No sightings yet and a batch left to do
+        // prove that without timing the open on a loaded machine.
         let store = Store::open(&path).unwrap();
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < Duration::from_millis(300),
-            "store open took {elapsed:?}"
-        );
         let sightings = "SELECT COUNT(*) FROM correspondent_sightings";
         assert_eq!(count(&store.conn, sightings), 0);
         assert!(store.maintain_correspondents().unwrap());
