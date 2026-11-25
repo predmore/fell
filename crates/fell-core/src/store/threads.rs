@@ -1541,7 +1541,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let account = account();
         store.upsert_account(&account).unwrap();
-        let mail = |id, author, subject: &str, date| {
+        let mail = |id: &str, author, subject: &str, date| {
             let mut mail = message(id, None, &[], None, "INBOX", author, id, date, None);
             mail.headers.subject = subject.into();
             store.upsert_message(&mail).unwrap()
@@ -1551,15 +1551,34 @@ mod tests {
         let person = mail("person@x", "a@x", "Drawings for the workshop", 300);
         let latest = mail("latest@x", "c@x", "Items on sale today", 400);
         let candidates = store
-            .merge_candidates(&account.id, &[source.0], "", &account.email)
+            .merge_candidates(
+                &account.id,
+                std::slice::from_ref(&source.0),
+                "",
+                &account.email,
+            )
             .unwrap();
         assert_eq!(
             candidates
                 .into_iter()
                 .map(|row| row.thread)
                 .collect::<Vec<_>>(),
-            [topic, person, latest]
+            [topic.clone(), person.clone(), latest]
         );
+        for index in 0..30 {
+            mail(
+                &format!("recent-{index}@x"),
+                "c@x",
+                "Newer mail",
+                500 + index,
+            );
+        }
+        let recent = store
+            .merge_candidates(&account.id, &[source.0], "", &account.email)
+            .unwrap();
+        assert_eq!(recent.len(), 32);
+        assert_eq!(recent[0].thread, person);
+        assert!(recent.iter().all(|row| row.thread != topic));
     }
 
     #[test]
@@ -1666,15 +1685,16 @@ mod tests {
             run(
                 &store,
                 &Op::Batch(vec![
-                    mail("p@x", None, "team", 100),
                     mail("s@x", None, "team", 110),
                     mail("r@x", None, "old", 200),
                     mail("c@x", Some("p@x"), "old", 210),
                 ]),
             );
-            let original = threads_of(&store);
             let detached = store
                 .split_thread(&acct.id, &MessageId::new("c@x"))
+                .unwrap();
+            store
+                .upsert_message(&mail("p@x", None, "team", 100))
                 .unwrap();
             let thread = |id| {
                 store
@@ -1686,7 +1706,10 @@ mod tests {
             assert_eq!(thread("s@x"), ThreadId::proton("team"));
             assert_eq!(thread("r@x"), ThreadId::proton("old"));
             store.undo(&acct.id).unwrap();
-            assert_eq!(threads_of(&store), original);
+            assert_eq!(thread("p@x"), ThreadId::proton("team"));
+            assert_eq!(thread("s@x"), ThreadId::proton("team"));
+            assert_eq!(thread("c@x"), ThreadId::proton("old"));
+            assert_eq!(thread("r@x"), ThreadId::proton("old"));
         }
     }
 

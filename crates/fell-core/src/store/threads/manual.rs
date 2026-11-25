@@ -94,14 +94,10 @@ impl Store {
             );
         }
         let candidates = if words.is_empty() {
-            "recent AS MATERIALIZED (
-                 SELECT thread_id FROM thread_summary
+            "candidates AS MATERIALIZED (
+                 SELECT thread_id, 0 AS match_rank FROM thread_summary
                  WHERE account_id = ?1 AND thread_id NOT IN (SELECT value FROM json_each(?2))
                  ORDER BY last_date DESC, thread_id LIMIT 32
-             ),
-             candidates AS (
-                 SELECT thread_id, 0 AS match_rank FROM related
-                 UNION SELECT thread_id, 0 FROM recent
              )"
         } else {
             "terms AS MATERIALIZED (
@@ -127,18 +123,15 @@ impl Store {
              )"
         };
         let mut stmt = self.conn.prepare_cached(&format!(
-            "WITH related(thread_id) AS MATERIALIZED (
-                 SELECT DISTINCT m.thread_id FROM json_each(?4) keys
-                 CROSS JOIN subject_index s ON s.account_id = ?1 AND s.subject_key = keys.value
-                 JOIN messages m ON m.rowid = s.message_rowid
-                 WHERE m.thread_id NOT IN (SELECT value FROM json_each(?2))
-             ),
-             {candidates}
+            "WITH {candidates}
              SELECT t.thread_id, t.subject, t.latest_name, t.latest_email, t.last_date
              FROM candidates c
              JOIN thread_summary t ON t.account_id = ?1 AND t.thread_id = c.thread_id
-             LEFT JOIN related r ON r.thread_id = t.thread_id
-             ORDER BY c.match_rank, r.thread_id IS NOT NULL DESC,
+             ORDER BY c.match_rank,
+               EXISTS (SELECT 1 FROM messages m
+                       CROSS JOIN subject_index s ON s.message_rowid = m.rowid
+                       WHERE m.account_id = t.account_id AND m.thread_id = t.thread_id
+                         AND s.subject_key IN (SELECT value FROM json_each(?4))) DESC,
                (SELECT COUNT(*) FROM json_each(?5) p
                 WHERE instr(char(31) || lower(t.participants) || char(30),
                             char(31) || p.value || char(30))) DESC,

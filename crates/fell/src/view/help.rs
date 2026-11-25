@@ -15,6 +15,7 @@ const MAX_HEIGHT: f32 = 460.;
 const INSET: f32 = 8.;
 const LEFT: f32 = 14.;
 const RIGHT: f32 = 24.;
+const DETAIL_GAP: f32 = 8.;
 
 #[derive(Default)]
 pub(super) struct HelpScroll {
@@ -144,6 +145,7 @@ pub(super) struct Layout {
     stacked: bool,
     details: Vec<(String, bool, usize)>,
     detail_rows: usize,
+    detail_gap: f32,
     page: usize,
     total: usize,
 }
@@ -211,8 +213,10 @@ impl Layout {
             })
             .collect();
         let detail_rows = details.iter().map(|(_, _, lines)| *lines).sum();
+        let detail_gap = if detail_rows > 0 { DETAIL_GAP } else { 0. };
         let total = actions().count() + detail_rows;
-        let page = (((height - header - 2. - 2. * INSET) / row) as usize).clamp(1, total);
+        let page =
+            (((height - header - 2. - 2. * INSET - detail_gap) / row) as usize).clamp(1, total);
         Self {
             top,
             width,
@@ -222,6 +226,7 @@ impl Layout {
             stacked,
             details,
             detail_rows,
+            detail_gap,
             page,
             total,
         }
@@ -244,11 +249,13 @@ fn card(
     live: bool,
     cx: &mut Context<Inbox>,
 ) -> Div {
-    let body = layout.page as f32 * layout.row;
+    let page_height = layout.page as f32 * layout.row;
+    let body = page_height + layout.detail_gap;
     let last = (layout.total - layout.page) as f32 * layout.row;
     let first = (offset / layout.row).floor() as usize;
-    let end = ((offset + body) / layout.row).ceil() as usize;
-    let action_start = first.max(layout.detail_rows);
+    let end = ((offset + page_height) / layout.row).ceil() as usize;
+    let action_start =
+        (((offset - layout.detail_gap) / layout.row).floor() as usize).max(layout.detail_rows);
     let thumb = (body * layout.page as f32 / layout.total as f32).clamp(0., body);
     div()
         .w(px(layout.width))
@@ -324,7 +331,9 @@ fn card(
                                 .absolute()
                                 .left_0()
                                 .right_0()
-                                .top(px(action_start as f32 * layout.row - offset))
+                                .top(px(
+                                    action_start as f32 * layout.row + layout.detail_gap - offset
+                                ))
                                 .when(
                                     action_start == layout.detail_rows && layout.detail_rows > 0,
                                     |keys| {
@@ -333,7 +342,7 @@ fn card(
                                                 .absolute()
                                                 .left_0()
                                                 .right_0()
-                                                .top(px(-1.))
+                                                .top(px(-layout.detail_gap / 2.))
                                                 .h(px(1.))
                                                 .bg(rgb(theme.border)),
                                         )

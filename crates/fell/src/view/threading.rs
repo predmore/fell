@@ -108,7 +108,10 @@ impl Inbox {
                         }
                         inbox.apply_step(step, before, cx);
                     }
-                    Err(err) => session.show_toast(err.to_string(), true),
+                    Err(err) => {
+                        session.merge_choices.clear();
+                        session.show_toast(err.to_string(), true);
+                    }
                 }
                 cx.notify();
             });
