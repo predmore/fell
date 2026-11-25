@@ -345,9 +345,13 @@ impl RowHeight {
         self.glide = self.glide.filter(|glide| glide.running(now));
         self.glide.map_or(target, |glide| glide.value(now))
     }
+    /// After a font size change: snap to the new height and drop the old
+    /// scroll offset, which sat on the old line pitch. The same frame's
+    /// reveal then scrolls to a whole line of the new pitch.
     pub(super) fn reset_height(&mut self) {
         self.target = None;
         self.glide = None;
+        self.scroll.set_offset(point(px(0.), px(0.)));
     }
 
     pub(super) fn remaining_growth(&self, now: Instant) -> Pixels {
