@@ -2,23 +2,29 @@ use super::*;
 
 pub(super) struct RegroupMotion {
     pub transition: Transition,
-    removed_prefix: f32,
+    pub anchor: Option<ScrollAnchor>,
+    departing: Arc<HashMap<usize, Vec<DepartingMessage>>>,
     old_title: String,
     arriving: HashSet<String>,
 }
 
 pub(super) struct RegroupFrame {
-    pub gap: f32,
+    pub departing: Arc<HashMap<usize, Vec<DepartingMessage>>>,
     pub old_title: String,
     pub progress: f32,
     pub arriving: HashSet<String>,
+}
+
+pub(super) struct DepartingMessage {
+    pub message: ConvMessage,
+    pub height: f32,
 }
 
 impl RegroupMotion {
     pub fn frame(&self, now: Instant) -> RegroupFrame {
         let progress = self.transition.progress(now);
         RegroupFrame {
-            gap: self.removed_prefix * (1. - progress),
+            departing: self.departing.clone(),
             old_title: self.old_title.clone(),
             progress,
             arriving: self.arriving.clone(),
@@ -71,6 +77,8 @@ impl Inbox {
                     return;
                 }
                 session.merge_loading = false;
+                let before = inbox.before_step();
+                let session = &mut inbox.session;
                 match result {
                     Ok(rows) => {
                         session.merge_choices = rows
@@ -92,6 +100,13 @@ impl Inbox {
                                 divider: false,
                             })
                             .collect();
+                        let step = session.confirm_pending_merge();
+                        if step.threading.is_some()
+                            && let Some(log) = &inbox.frames
+                        {
+                            log.borrow_mut().note("merge_confirm_after_search", 1.);
+                        }
+                        inbox.apply_step(step, before, cx);
                     }
                     Err(err) => session.show_toast(err.to_string(), true),
                 }
@@ -119,12 +134,9 @@ impl Inbox {
         self.change_mailbox(
             move |store| {
                 let (destination, follow, notice) = match edit {
-                    ThreadEdit::Split { thread, message } => {
-                        let destination = store.split_thread(
-                            &account,
-                            &ThreadId(thread),
-                            &fell_core::MessageId(message),
-                        )?;
+                    ThreadEdit::Split { message, .. } => {
+                        let destination =
+                            store.split_thread(&account, &fell_core::MessageId(message))?;
                         (
                             destination,
                             true,
@@ -141,7 +153,7 @@ impl Inbox {
                             .is_some_and(|id| sources.contains(id) || id == &target);
                         let sources: Vec<_> = sources.into_iter().map(ThreadId).collect();
                         let target = ThreadId(target);
-                        store.merge_threads(&account, &sources, &target)?;
+                        let target = store.merge_threads(&account, &sources, &target)?;
                         let subject = present::display_safe(&subject).replace(['“', '”'], "'");
                         (target, follow, format!("Merged into “{subject}” · u"))
                     }
@@ -191,7 +203,10 @@ impl Inbox {
                 Err(err) => {
                     inbox.session.show_toast(err.to_string(), true);
                     inbox.expire_action_notice(cx);
-                    None
+                    matches!(err, fell_core::Error::UnknownThread).then_some(ReadIntent {
+                        refresh_open: true,
+                        ..ReadIntent::default()
+                    })
                 }
             },
             cx,
@@ -211,42 +226,63 @@ impl Inbox {
                 )
             })
             .flatten();
-        let removed_prefix = if anchor.is_some() {
-            self.session.messages[..self.session.message_cursor]
+        let transition = self
+            .motion
+            .motion
+            .start(motion::FADE, self.motion.clock.now());
+        let mut departing = HashMap::<_, Vec<_>>::new();
+        let mut arriving = HashSet::new();
+        if transition.is_some() {
+            let indices: HashMap<_, _> = view
                 .iter()
                 .enumerate()
-                .filter(|(_, old)| view.iter().all(|message| message.id != old.id))
-                .filter_map(|(index, _)| {
-                    self.conv_scroll
+                .map(|(index, message)| (message.id.as_str(), index))
+                .collect();
+            let mut next_slot = view.len();
+            let mut retained = HashSet::new();
+            for (index, old) in self.session.messages.iter().enumerate().rev() {
+                if let Some(&slot) = indices.get(old.id.as_str()) {
+                    next_slot = slot;
+                    retained.insert(old.id.as_str());
+                } else if self.conv_layout_current
+                    && let Some(bounds) = self
+                        .conv_scroll
                         .bounds_for_item(index + usize::from(self.conv_note_slot))
-                })
-                .map(|bounds| f32::from(bounds.size.height))
-                .sum()
-        } else {
-            0.
-        };
-        let arriving: HashSet<_> = view
-            .iter()
-            .filter(|message| self.session.messages.iter().all(|old| old.id != message.id))
-            .map(|message| message.id.clone())
-            .collect();
+                {
+                    let gap = if old.expanded { MESSAGE_GAP_PX } else { 0. };
+                    departing
+                        .entry(next_slot)
+                        .or_default()
+                        .push(DepartingMessage {
+                            message: old.clone(),
+                            height: f32::from(bounds.size.height) + gap,
+                        });
+                }
+            }
+            for cards in departing.values_mut() {
+                cards.reverse();
+            }
+            arriving.extend(
+                view.iter()
+                    .filter(|message| !retained.contains(message.id.as_str()))
+                    .map(|message| message.id.clone()),
+            );
+        }
         self.invalidate_conversation_layout();
         self.motion.conv_glide = None;
-        self.regroup_motion = self
-            .motion
-            .motion
-            .start(motion::FADE, self.motion.clock.now())
-            .map(|transition| RegroupMotion {
-                transition,
-                removed_prefix,
-                old_title: self.open_subject.clone(),
-                arriving,
-            });
         self.session.refresh_messages(view, false);
-        self.sent_arrival_anchor = anchor.map(|mut anchor| {
+        let anchor = anchor.map(|mut anchor| {
             anchor.index = self.session.message_cursor;
             anchor
         });
+        self.regroup_motion = transition.map(|transition| RegroupMotion {
+            transition,
+            anchor,
+            departing: Arc::new(departing),
+            old_title: self.open_subject.clone(),
+            arriving,
+        });
+        self.sent_arrival_anchor = anchor.filter(|_| transition.is_none());
         self.reveal = Reveal::Reading {
             selected: self.session.pane == Pane::Conversation,
         };

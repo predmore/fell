@@ -465,6 +465,24 @@ fn run_suite() -> Result<(), Box<dyn Error>> {
         |index| read(&store, index % LONG_THREADS),
     );
 
+    let sources = [mailbox::long_thread(0).0];
+    assert_eq!(
+        store
+            .merge_candidates(&account.id, &sources, "", &account.email)?
+            .len(),
+        32,
+    );
+    report.latency(
+        "Merge picker first page (32 rows)",
+        SAMPLES,
+        Some(folder_budget),
+        |_| {
+            store
+                .merge_candidates(&account.id, &sources, "", &account.email)
+                .unwrap()
+        },
+    );
+
     for (shape, query, correction) in QUERIES {
         let options = SearchOptions { semantic: false };
         let warm = store.search_with(&account.id, query, options)?;

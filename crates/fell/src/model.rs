@@ -565,6 +565,7 @@ pub struct Session {
     pub merge_choices: Vec<PickerChoice>,
     pub merge_search: u64,
     pub merge_loading: bool,
+    merge_confirm_pending: bool,
     pub toast: Option<Toast>,
     pub startup_crash_notice: Option<Toast>,
     /// Counts notices shown; see [`Session::toast_generation`].
@@ -672,6 +673,7 @@ impl Session {
             merge_choices: Vec::new(),
             merge_search: 0,
             merge_loading: false,
+            merge_confirm_pending: false,
             toast: None,
             startup_crash_notice: None,
             worker_outages: HashSet::new(),
@@ -2464,6 +2466,10 @@ impl Session {
                 self.folder_intent = FolderIntent::Go;
                 Step::default()
             }
+            KeyId::Enter if self.folder_intent == FolderIntent::Merge && self.merge_loading => {
+                self.merge_confirm_pending = true;
+                Step::default()
+            }
             KeyId::Enter => self.confirm_folder(),
             KeyId::Backspace => {
                 self.folder_query.pop();
@@ -2508,10 +2514,19 @@ impl Session {
         }
         self.merge_search = self.merge_search.wrapping_add(1);
         self.merge_loading = true;
+        self.merge_confirm_pending = false;
         Step {
             search_merge_targets: true,
             ..Step::default()
         }
+    }
+
+    pub fn confirm_pending_merge(&mut self) -> Step {
+        if std::mem::take(&mut self.merge_confirm_pending) {
+            self.folder_index = 0;
+            return self.confirm_folder();
+        }
+        Step::default()
     }
 
     /// Enter or a click on the highlighted folder.
@@ -5399,6 +5414,38 @@ mod tests {
             session.on_key(KeyId::Char(ch), 4);
         }
         assert!(session.on_key(KeyId::Enter, 4).delete);
+    }
+
+    #[test]
+    fn enter_while_searching_confirms_the_top_result_of_that_query() {
+        let mut session = session();
+        session.set_threads(vec![row("a"), row("b")]);
+        session.perform(Action::MergeThreads, 10);
+        session.on_key(KeyId::Enter, 10);
+        session.on_key(KeyId::Char('b'), 10);
+        session.merge_loading = false;
+        let choice = |name: &str| PickerChoice {
+            name: name.into(),
+            title: name.into(),
+            detail: None,
+            date: None,
+            mark: None,
+            divider: false,
+        };
+        session.merge_choices = vec![choice("b"), choice("c")];
+        assert!(session.confirm_pending_merge().threading.is_none());
+        session.on_key(KeyId::Char('e'), 10);
+        assert!(session.on_key(KeyId::Enter, 10).threading.is_none());
+        session.folder_index = 1;
+        session.merge_loading = false;
+        assert_eq!(
+            session.confirm_pending_merge().threading,
+            Some(ThreadEdit::Merge {
+                sources: vec!["a".into()],
+                target: "b".into(),
+                subject: "b".into(),
+            })
+        );
     }
 
     #[test]

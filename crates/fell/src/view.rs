@@ -2303,9 +2303,10 @@ impl Inbox {
                 let ghost = ThreadGhost {
                     row: old.row.clone(),
                     selected: old.selected
-                        && !self.regroup_selection.as_ref().is_some_and(|selection| {
-                            selection.previous.id == old.row.id
-                        }),
+                        && !self
+                            .regroup_selection
+                            .as_ref()
+                            .is_some_and(|selection| selection.previous.id == old.row.id),
                 };
                 (ghost, old.top - offset)
             })
@@ -2669,10 +2670,14 @@ impl Inbox {
                         .reader_bodies
                         .recheck_moved_parts(&inbox.session.messages, &view);
                 }
-                let regrouping = inbox
+                let regroup_target = inbox
                     .regroup_to
-                    .take()
-                    .is_some_and(|target| target.as_str() == id)
+                    .as_ref()
+                    .is_some_and(|target| target.as_str() == id);
+                if regroup_target {
+                    inbox.regroup_to = None;
+                }
+                let regrouping = regroup_target
                     && inbox
                         .session
                         .messages
@@ -5255,13 +5260,21 @@ impl Render for Inbox {
         let refreshing_body = !self.body_refresh.is_empty();
         let reader_current =
             self.open_thread.is_some() && self.open_thread == self.session.cursor_id;
-        let anchor = self.sent_arrival_anchor.take().or_else(|| {
-            if reader_current {
-                self.apply_body_refresh(now)
-            } else {
-                None
-            }
-        });
+        let regroup_anchor = self
+            .regroup_motion
+            .as_ref()
+            .and_then(|regroup| regroup.anchor);
+        let anchor = self
+            .sent_arrival_anchor
+            .take()
+            .or(regroup_anchor)
+            .or_else(|| {
+                if reader_current {
+                    self.apply_body_refresh(now)
+                } else {
+                    None
+                }
+            });
         let reveal_attachment = std::mem::take(&mut self.reveal_attachment);
         self.want_bodies(panes.1, cx);
         self.motion.narrow_status = width < present::NARROW_WIDTH;
@@ -9254,21 +9267,11 @@ fn conversation(
     let padding = frame.preview_padding.as_ref().filter(|_| scroll.is_some());
     let split_key = (leaving.is_none() && session.pane == Pane::Conversation)
         .then(|| keymap::binding_text(&session.keymap, Action::SplitThread));
-    let messages: Vec<_> = shown
-        .iter()
-        .enumerate()
-        .map(|(index, message)| {
-            let cursor = if !frame.hide_message_cursor && message_cursor == index {
-                focus
-            } else {
-                0.0
-            };
-            let marker = message.grouping_marker(
-                split_key
-                    .as_deref()
-                    .filter(|_| !frame.hide_message_cursor && index == message_cursor),
-            );
-            let block = if message.expanded {
+    let regroup = frame.regroup.as_ref().filter(|_| leaving.is_none());
+    let mut draw_message =
+        |index, message: &ConvMessage, cursor, split_key: Option<&str>, live: Live| {
+            let marker = message.grouping_marker(split_key);
+            if message.expanded {
                 let fill = expanded_card_fill(theme, cursor);
                 expanded_message(
                     theme,
@@ -9279,7 +9282,7 @@ fn conversation(
                     columns,
                     live,
                     frame,
-                    chip_probe.as_ref(),
+                    chip_probe.as_ref().filter(|_| live.0),
                     window,
                     cx,
                 )
@@ -9297,8 +9300,39 @@ fn conversation(
                     window,
                     cx,
                 )
-            };
-            let regroup = frame.regroup.as_ref().filter(|_| leaving.is_none());
+            }
+        };
+    let mut messages = Vec::with_capacity(shown.len());
+    for index in 0..=shown.len() {
+        let closing = regroup.and_then(|frame| {
+            let cards = frame.departing.get(&index)?;
+            let opacity = 1. - frame.progress;
+            let height: f32 = cards.iter().map(|card| card.height).sum();
+            Some(
+                div()
+                    .id(gpui::ElementId::named_usize("regroup-departures", index))
+                    .h(px(height * opacity))
+                    .flex_none()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .opacity(opacity)
+                            .children(cards.iter().enumerate().map(|(index, card)| {
+                                draw_message(index, &card.message, 0., None, Live(false))
+                            })),
+                    ),
+            )
+        });
+        if let Some(message) = shown.get(index) {
+            let focused = !frame.hide_message_cursor && message_cursor == index;
+            let cursor = if focused { focus } else { 0. };
+            let block = draw_message(
+                index,
+                message,
+                cursor,
+                split_key.as_deref().filter(|_| focused),
+                live,
+            );
             let added = regroup.filter(|frame| frame.arriving.contains(&message.id));
             let block = if let Some(alpha) = frame.card_alphas.get(&message.id) {
                 div().opacity(*alpha).child(block).into_any_element()
@@ -9349,15 +9383,15 @@ fn conversation(
                 Some(probes) => probes.wrap(index, block),
                 None => block,
             };
-            if index == 0
-                && let Some(regroup) = regroup.filter(|frame| frame.gap > 0.)
-            {
-                div().pt(px(regroup.gap)).child(block).into_any_element()
+            messages.push(if let Some(closing) = closing {
+                div().child(closing).child(block).into_any_element()
             } else {
                 block
-            }
-        })
-        .collect();
+            });
+        } else if let Some(closing) = closing {
+            messages.push(closing.into_any_element());
+        }
+    }
     div()
         .id("conversation")
         .relative()
@@ -12283,6 +12317,7 @@ fn folder_picker(
                         .flex()
                         .items_center()
                         .rounded_md()
+                        .when(merging && session.merge_loading, |row| row.opacity(0.6))
                         .bg(rgb(if index == selected {
                             theme.selection
                         } else {
@@ -14377,6 +14412,7 @@ mod tests {
                             &theme,
                             &message,
                             ReaderColumns::split(600.),
+                            None,
                             None,
                             window,
                         )

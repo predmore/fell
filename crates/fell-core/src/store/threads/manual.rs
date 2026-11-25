@@ -4,9 +4,11 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
-use super::{direct_parent, rows_in_thread, stored_parent};
+use super::{
+    ManualThreads, direct_parent, header_parent, rows_in_thread, set_member_thread, stored_parent,
+};
 use crate::actions::{ActionKind, LocalAction, ensure_action_schema, insert_local_action};
 use crate::store::{ListKey, Store, immediate_transaction};
 use crate::threading::{subject_is_generic, thread_subject};
@@ -49,12 +51,30 @@ impl Store {
         query: &str,
         own_email: &str,
     ) -> Result<Vec<MergeCandidate>> {
-        let words: Vec<_> = query.split_whitespace().take(20).collect();
+        let words: Vec<_> = query
+            .split_whitespace()
+            .take(20)
+            .map(|word| {
+                let word = word.to_ascii_lowercase();
+                let mut pattern = String::from("*[^a-z0-9]");
+                for ch in word.chars() {
+                    if matches!(ch, '[' | '*' | '?') {
+                        pattern.push('[');
+                        pattern.push(ch);
+                        pattern.push(']');
+                    } else {
+                        pattern.push(ch);
+                    }
+                }
+                pattern.push('*');
+                [word, pattern]
+            })
+            .collect();
         let source_ids = serde_json::json!(sources).to_string();
         let mut keys = HashSet::new();
         let mut people = HashSet::new();
         let mut source = self.conn.prepare_cached(
-            "SELECT subject, participants FROM json_each(?2) s JOIN thread_summary t
+            "SELECT subject, participants FROM json_each(?2) s CROSS JOIN thread_summary t
                ON t.account_id = ?1 AND t.thread_id = s.value",
         )?;
         let source = source.query_map(params![account.as_str(), source_ids], |row| {
@@ -73,26 +93,57 @@ impl Store {
                     .filter(|email| !email.eq_ignore_ascii_case(own_email)),
             );
         }
-        let mut stmt = self.conn.prepare_cached(
+        let candidates = if words.is_empty() {
+            "recent AS MATERIALIZED (
+                 SELECT thread_id FROM thread_summary
+                 WHERE account_id = ?1 AND thread_id NOT IN (SELECT value FROM json_each(?2))
+                 ORDER BY last_date DESC, thread_id LIMIT 32
+             ),
+             candidates AS (
+                 SELECT thread_id, 0 AS match_rank FROM related
+                 UNION SELECT thread_id, 0 FROM recent
+             )"
+        } else {
+            "terms AS MATERIALIZED (
+                 SELECT value ->> 0 AS word, value ->> 1 AS pattern FROM json_each(?3)
+             ),
+             candidates AS MATERIALIZED (
+                 SELECT t.thread_id, CASE
+                    WHEN NOT EXISTS (SELECT 1 FROM terms
+                         WHERE (' ' || lower(t.subject)) NOT GLOB pattern) THEN 0
+                    WHEN NOT EXISTS (SELECT 1 FROM terms
+                         WHERE NOT instr(lower(COALESCE(t.latest_name, '')), word)) THEN 1
+                    WHEN NOT EXISTS (SELECT 1 FROM terms
+                         WHERE NOT instr(lower(t.latest_email), word)) THEN 2
+                    ELSE 3 END AS match_rank
+                 FROM thread_summary t
+                 WHERE t.account_id = ?1 AND t.thread_id NOT IN (SELECT value FROM json_each(?2))
+                   AND NOT EXISTS (
+                       SELECT 1 FROM terms WHERE NOT instr(lower(t.subject), word)
+                         AND NOT instr(lower(t.latest_email), word)
+                         AND NOT instr(lower(COALESCE(t.latest_name, '')), word)
+                   )
+                 ORDER BY match_rank, t.last_date DESC, t.thread_id LIMIT 32
+             )"
+        };
+        let mut stmt = self.conn.prepare_cached(&format!(
             "WITH related(thread_id) AS MATERIALIZED (
                  SELECT DISTINCT m.thread_id FROM json_each(?4) keys
-                 JOIN subject_index s ON s.account_id = ?1 AND s.subject_key = keys.value
+                 CROSS JOIN subject_index s ON s.account_id = ?1 AND s.subject_key = keys.value
                  JOIN messages m ON m.rowid = s.message_rowid
-             )
+                 WHERE m.thread_id NOT IN (SELECT value FROM json_each(?2))
+             ),
+             {candidates}
              SELECT t.thread_id, t.subject, t.latest_name, t.latest_email, t.last_date
-             FROM thread_summary t LEFT JOIN related r ON r.thread_id = t.thread_id
-             WHERE t.account_id = ?1 AND t.thread_id NOT IN (SELECT value FROM json_each(?2))
-               AND NOT EXISTS (
-                   SELECT 1 FROM json_each(?3)
-                   WHERE NOT instr(lower(t.subject || ' ' || t.latest_email || ' ' || COALESCE(t.latest_name, '')),
-                                   lower(value))
-               )
-             ORDER BY r.thread_id IS NOT NULL DESC,
+             FROM candidates c
+             JOIN thread_summary t ON t.account_id = ?1 AND t.thread_id = c.thread_id
+             LEFT JOIN related r ON r.thread_id = t.thread_id
+             ORDER BY c.match_rank, r.thread_id IS NOT NULL DESC,
                (SELECT COUNT(*) FROM json_each(?5) p
                 WHERE instr(char(31) || lower(t.participants) || char(30),
                             char(31) || p.value || char(30))) DESC,
-               t.last_date DESC, t.thread_id LIMIT 32",
-        )?;
+               t.last_date DESC, t.thread_id LIMIT 32"
+        ))?;
         Ok(stmt
             .query_map(
                 params![
@@ -131,6 +182,7 @@ impl Store {
              WHERE o.account_id = ?1 AND o.thread_id = ?2
                AND (SELECT a.kind FROM local_action_thread_members s JOIN local_actions a ON a.id = s.action_id
                     WHERE s.message_id = o.message_id AND s.after_thread = o.thread_id
+                      AND s.before_thread != s.after_thread
                       AND a.account_id = o.account_id AND a.undone = 0
                     ORDER BY s.action_id DESC LIMIT 1) = 'merge_threads'",
         )?;
@@ -149,7 +201,6 @@ impl Store {
         folder: &str,
         label: Option<&str>,
     ) -> Result<Option<ListKey>> {
-        use rusqlite::OptionalExtension;
         if let Some(label) = label {
             Ok(self.conn.prepare_cached(
                 "SELECT last_date FROM thread_labels WHERE account_id = ?1 AND thread_id = ?2 AND label = ?3",
@@ -162,18 +213,12 @@ impl Store {
     }
 
     /// Detach a message and its reply descendants within this conversation.
-    pub fn split_thread(
-        &self,
-        account: &AccountId,
-        thread: &ThreadId,
-        root: &MessageId,
-    ) -> Result<ThreadId> {
+    pub fn split_thread(&self, account: &AccountId, root: &MessageId) -> Result<ThreadId> {
         let tx = immediate_transaction(self.connection())?;
         self.rethread_written(&tx, account)?;
+        let root = stored_parent(&tx, account.as_str(), root)?.ok_or(Error::UnknownThread)?;
+        let thread = &root.thread;
         let rows = rows_in_thread(&tx, account, thread)?;
-        if !rows.iter().any(|row| row.headers.message_id == *root) {
-            return Err(Error::UnknownThread);
-        }
 
         let mut children: HashMap<_, Vec<_>> = HashMap::new();
         for row in &rows {
@@ -187,7 +232,7 @@ impl Store {
             }
         }
         let mut branch = HashSet::new();
-        let mut todo = vec![root];
+        let mut todo = vec![&root.id];
         while let Some(id) = todo.pop() {
             if branch.insert(id)
                 && let Some(replies) = children.get(id)
@@ -225,17 +270,30 @@ impl Store {
         account: &AccountId,
         sources: &[ThreadId],
         target: &ThreadId,
-    ) -> Result<()> {
-        let sources: BTreeSet<_> = sources
+    ) -> Result<ThreadId> {
+        let tx = immediate_transaction(self.connection())?;
+        // Remember a member of each selection before processing the queue:
+        // the pass can replace a whole conversation's list key.
+        let target = thread_anchor(&tx, account, target)?;
+        let source_anchors = sources
             .iter()
-            .filter(|id| *id != target)
-            .map(ThreadId::as_str)
-            .collect();
+            .map(|source| thread_anchor(&tx, account, source))
+            .collect::<Result<Vec<_>>>()?;
+        self.rethread_written(&tx, account)?;
+        let current_thread = |id| {
+            stored_parent(&tx, account.as_str(), id)?
+                .map(|member| member.thread)
+                .ok_or(Error::UnknownThread)
+        };
+        let target = current_thread(&target)?;
+        let mut sources = source_anchors
+            .iter()
+            .map(|id| current_thread(id).map(|thread| thread.0))
+            .collect::<Result<BTreeSet<_>>>()?;
+        sources.remove(target.as_str());
         if sources.is_empty() {
             return Err(Error::Action("Choose another conversation".into()));
         }
-        let tx = immediate_transaction(self.connection())?;
-        self.rethread_written(&tx, account)?;
         ensure_action_schema(&tx)?;
         let action = insert_local_action(
             &tx,
@@ -243,7 +301,7 @@ impl Store {
             ActionKind::MergeThreads,
             "Conversations merged",
         )?;
-        for source in std::iter::once(target.as_str()).chain(sources.iter().copied()) {
+        for source in std::iter::once(target.as_str()).chain(sources.iter().map(String::as_str)) {
             let ids = tx
                 .prepare_cached(
                     "SELECT message_id FROM messages WHERE account_id = ?1 AND thread_id = ?2",
@@ -257,21 +315,33 @@ impl Store {
             }
             let from = ThreadId(source.to_owned());
             for id in &ids {
-                assign(&tx, account, action.id, id, &from, target)?;
+                assign(&tx, account, action.id, id, &from, &target)?;
             }
         }
         for source in sources {
             tx.execute(
                 "INSERT INTO local_action_thread_notes (action_id, note_id, before_thread)
                  SELECT ?1, id, thread_id FROM thread_notes WHERE account_id = ?2 AND thread_id = ?3",
-                params![action.id, account.as_str(), source],
+                params![action.id, account.as_str(), source.as_str()],
             )?;
-            move_notes(&tx, account, source, target.as_str())?;
+            move_notes(&tx, account, source.as_str(), target.as_str())?;
         }
         self.rethread_written(&tx, account)?;
         tx.commit()?;
-        Ok(())
+        Ok(target)
     }
+}
+
+fn thread_anchor(conn: &Connection, account: &AccountId, thread: &ThreadId) -> Result<MessageId> {
+    conn.prepare_cached(
+        "SELECT message_id FROM messages WHERE account_id = ?1 AND thread_id = ?2
+         ORDER BY date_unix DESC, rowid DESC LIMIT 1",
+    )?
+    .query_row(params![account.as_str(), thread.as_str()], |row| {
+        row.get(0).map(MessageId)
+    })
+    .optional()?
+    .ok_or(Error::UnknownThread)
 }
 
 fn assign(
@@ -324,32 +394,26 @@ pub(crate) fn undo(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let message_ids: HashSet<_> = members.iter().map(|(id, ..)| id).collect();
-    let mut arrivals = HashMap::new();
+    let mut after_threads = BTreeSet::new();
     let mut snapshots = HashSet::new();
-    for (id, before, _, after) in &members {
+    for (id, _, _, after) in &members {
         if let Some(parent) = stored_parent(conn, account_id, id)? {
             snapshots.insert(parent.id);
         }
-        // Only a split creates an otherwise empty thread. After undo, rows
-        // that arrived there without a snapshot return to the old group.
-        let fallback = (action.kind == ActionKind::SplitThread).then_some(before.as_str());
-        arrivals.insert(after.as_str(), fallback);
+        after_threads.insert(after.as_str());
     }
-    for (after, fallback) in arrivals {
-        let thread = ThreadId(after.to_owned());
-        for row in rows_in_thread(conn, account, &thread)? {
-            if snapshots.contains(&row.headers.message_id) {
-                continue;
+    let mut arrivals = Vec::new();
+    let mut late_parents = HashSet::new();
+    for after in after_threads {
+        for row in rows_in_thread(conn, account, &ThreadId(after.to_owned()))? {
+            if !snapshots.contains(&row.headers.message_id) {
+                arrivals.push(row);
+            } else if let Some(parent) = header_parent(conn, account_id, &row)?
+                && parent.thread.as_str() == after
+                && !snapshots.contains(&parent.id)
+            {
+                late_parents.insert(parent.id);
             }
-            // A reply that arrived during a merge may belong to either old
-            // thread. Reset to its independent key and let the pass resolve it.
-            let destination = match fallback {
-                Some(before) => ThreadId(before.to_owned()),
-                None => {
-                    crate::threading::resolve_thread_id(&row.headers, |_| Ok::<_, Error>(None))?
-                }
-            };
-            restore_member(conn, account_id, &row.headers.message_id, &destination)?;
         }
     }
 
@@ -377,6 +441,19 @@ pub(crate) fn undo(
         }
     }
 
+    // Resolve against the restored snapshots. Another arrival still carries
+    // its temporary key here, so let the pass reconnect those reply chains.
+    let arrival_ids: HashSet<_> = arrivals.iter().map(|row| &row.headers.message_id).collect();
+    for row in &arrivals {
+        let destination = crate::threading::resolve_thread_id(&row.headers, |parent| {
+            Ok::<_, Error>(
+                stored_parent(conn, account_id, parent)?
+                    .filter(|parent| !arrival_ids.contains(&parent.id))
+                    .map(|parent| parent.thread),
+            )
+        })?;
+        restore_member(conn, account_id, &row.headers.message_id, &destination)?;
+    }
     if action.kind == ActionKind::SplitThread {
         if let Some((_, before, _, _)) = members.first() {
             move_notes(conn, account, &format!("split:{}", action.id), before)?;
@@ -385,6 +462,33 @@ pub(crate) fn undo(
         restore_notes(conn, account, action.id)?;
     }
     store.rethread_written(conn, account)?;
+    if action.kind == ActionKind::MergeThreads {
+        // A reply that came in during the merge follows its restored
+        // ancestor even if Proton gave it the temporary destination's id.
+        // Move only that reply, without creating a new manual assignment.
+        let manual = ManualThreads::load(conn, account_id)?;
+        let mut anchors = ManualThreads::default();
+        for id in &restored {
+            if let Some(member) = stored_parent(conn, account_id, id)? {
+                anchors.overrides.insert(member.id, member.thread);
+            }
+        }
+        let mut read = conn.prepare_cached(&format!(
+            "SELECT {} FROM messages WHERE account_id = ?1 AND message_id = ?2",
+            super::THREADING_COLS,
+        ))?;
+        let mut resolved = HashMap::new();
+        for row in &arrivals {
+            if !late_parents.contains(&row.headers.message_id)
+                && stored_parent(conn, account_id, &row.headers.message_id)?
+                    .is_some_and(|current| !manual.pinned(current.thread.as_str()))
+                && let Some(destination) =
+                    anchors.destination(conn, account_id, row, &mut read, &mut resolved)?
+            {
+                set_member_thread(conn, account_id, &row.headers.message_id, &destination)?;
+            }
+        }
+    }
     conn.execute(
         "DELETE FROM local_action_thread_members WHERE action_id = ?1",
         [action.id],
@@ -448,11 +552,7 @@ fn restore_member(
          SELECT rowid FROM messages WHERE account_id = ?1 AND message_id = ?2",
     )?
     .execute(params![account, id.as_str()])?;
-    conn.prepare_cached(
-        "UPDATE messages SET thread_id = ?1 WHERE account_id = ?2 AND message_id = ?3 AND thread_id != ?1",
-    )?
-    .execute(params![thread.as_str(), account, id.as_str()])?;
-    Ok(())
+    set_member_thread(conn, account, id, thread)
 }
 
 fn move_notes(conn: &Connection, account: &AccountId, from: &str, onto: &str) -> Result<()> {

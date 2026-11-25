@@ -83,15 +83,14 @@ pub struct ConvMessage {
 
 impl ConvMessage {
     pub fn grouping_marker(&self, split_key: Option<&str>) -> Option<String> {
-        let mut markers = Vec::new();
-        if self.merged_by_you {
-            markers.push("merged by you");
-        }
-        if self.joined_by_subject {
-            markers.push("joined by subject");
-            markers.extend(split_key);
-        }
-        (!markers.is_empty()).then(|| markers.join(" · "))
+        let marker = if self.merged_by_you {
+            "merged by you"
+        } else if self.joined_by_subject {
+            "joined by subject"
+        } else {
+            return None;
+        };
+        Some(split_key.map_or_else(|| marker.to_owned(), |key| format!("{marker} · {key}")))
     }
 
     pub fn needs_reader_parts(&self) -> bool {

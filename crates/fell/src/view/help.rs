@@ -154,7 +154,7 @@ impl Layout {
         let subject_join = session
             .messages
             .iter()
-            .any(|message| message.joined_by_subject)
+            .any(|message| message.joined_by_subject && !message.merged_by_you)
             && super::present::visible_panes(
                 f32::from(window.viewport_size().width),
                 session.pane,
@@ -325,6 +325,20 @@ fn card(
                                 .left_0()
                                 .right_0()
                                 .top(px(action_start as f32 * layout.row - offset))
+                                .when(
+                                    action_start == layout.detail_rows && layout.detail_rows > 0,
+                                    |keys| {
+                                        keys.child(
+                                            div()
+                                                .absolute()
+                                                .left_0()
+                                                .right_0()
+                                                .top(px(-1.))
+                                                .h(px(1.))
+                                                .bg(rgb(theme.border)),
+                                        )
+                                    },
+                                )
                                 .children(
                                     actions()
                                         .skip(action_start - layout.detail_rows)
