@@ -1019,12 +1019,18 @@ pub(crate) mod tests {
     }
 
     /// Runs `hook` before every swap until dropped.
-    struct OnSwap;
+    ///
+    /// The hook makes Fell lock the config a second time, so no test may
+    /// spawn a process meanwhile (see [`crate::SPAWN`]).
+    struct OnSwap(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
 
     impl OnSwap {
         fn new(hook: impl FnMut(&Path) + 'static) -> Self {
+            let alone = crate::SPAWN
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             BEFORE_SWAP.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
-            Self
+            Self(alone)
         }
     }
 
@@ -1080,14 +1086,16 @@ pub(crate) mod tests {
             );
             return true;
         }
-        let status = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!("umask {umask:03o} && exec \"$0\" \"$@\""))
-            .arg(std::env::current_exe().unwrap())
-            .args(["--exact", test, "--test-threads=1", "--nocapture"])
-            .env(UMASK_CHILD, format!("{umask:03o}"))
-            .status()
-            .unwrap();
+        let status = crate::spawn_alone(
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("umask {umask:03o} && exec \"$0\" \"$@\""))
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", test, "--test-threads=1", "--nocapture"])
+                .env(UMASK_CHILD, format!("{umask:03o}")),
+        )
+        .wait()
+        .unwrap();
         assert!(status.success(), "{test} failed under umask {umask:03o}");
         false
     }

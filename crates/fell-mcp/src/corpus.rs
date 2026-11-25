@@ -559,17 +559,22 @@ fn in_isolated_process(test: &str) {
             .as_nanos()
     ));
     std::fs::create_dir_all(&root).unwrap();
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([&format!("corpus::{test}"), "--exact", "--test-threads=1"])
-        .env(ISOLATED_ROOT, &root)
-        .env("XDG_RUNTIME_DIR", root.join("run"))
-        .env("XDG_DATA_HOME", root.join("data"))
-        .env("FELL_STORE", root.join("mail.db"))
-        .env("FELL_DRAFT_ROOT", root.join("drafts"))
-        .env("FELL_DRAFT_SOCK", root.join("run/live.sock"))
-        .env("FELL_COMPOSE_INDEX", root.join("data/compose-stores"))
-        .output()
-        .unwrap();
+    let output = crate::spawn_alone(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([&format!("corpus::{test}"), "--exact", "--test-threads=1"])
+            .env(ISOLATED_ROOT, &root)
+            .env("XDG_RUNTIME_DIR", root.join("run"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("FELL_STORE", root.join("mail.db"))
+            .env("FELL_DRAFT_ROOT", root.join("drafts"))
+            .env("FELL_DRAFT_SOCK", root.join("run/live.sock"))
+            .env("FELL_COMPOSE_INDEX", root.join("data/compose-stores"))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped()),
+    )
+    .wait_with_output()
+    .unwrap();
     let _ = std::fs::remove_dir_all(&root);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);

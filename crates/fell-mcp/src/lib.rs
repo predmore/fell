@@ -24,6 +24,25 @@ mod untrusted;
 pub use cli::{FELL_MCP_ARG0, cli_main};
 pub use protocol::Session;
 
+/// Tests that spawn a child process take this for writing while they spawn;
+/// tests that lock one file twice in a row hold it for reading.
+///
+/// A fork copies every open descriptor until the child execs, and a flock
+/// belongs to the open file, so a test spawning a process at the wrong
+/// moment can keep another test's config locked after Fell let go of it.
+/// The second lock then fails with "another program is writing" (#266).
+#[cfg(test)]
+pub(crate) static SPAWN: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Spawn `command` while no test holds a file lock it could inherit.
+#[cfg(test)]
+pub(crate) fn spawn_alone(command: &mut std::process::Command) -> std::process::Child {
+    let _alone = SPAWN
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    command.spawn().unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
