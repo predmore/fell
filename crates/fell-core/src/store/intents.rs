@@ -84,10 +84,36 @@ pub(super) fn remember(
     )?;
     if unread.is_some() {
         conn.execute(
+            "UPDATE snooze_wakes SET set_unread = 0
+             WHERE account_id = ?1 AND return_id = ?2 AND set_unread = 1",
+            params![account_id.as_str(), message_id],
+        )?;
+        conn.execute(
             "DELETE FROM local_flag_intent_copies WHERE account_id = ?1 AND message_id = ?2",
             params![account_id.as_str(), message_id],
         )?;
     }
+    Ok(())
+}
+
+pub(super) fn forget_wake_unread(
+    conn: &Connection,
+    account: &AccountId,
+    message: &str,
+) -> Result<()> {
+    let key = params![account.as_str(), message];
+    conn.execute(
+        "UPDATE local_flag_intents SET unread = NULL WHERE account_id = ?1 AND message_id = ?2 AND unread = 1",
+        key,
+    )?;
+    conn.execute(
+        "DELETE FROM local_flag_intents WHERE account_id = ?1 AND message_id = ?2 AND unread IS NULL AND starred IS NULL",
+        key,
+    )?;
+    conn.execute(
+        "DELETE FROM local_flag_intent_copies WHERE account_id = ?1 AND message_id = ?2",
+        key,
+    )?;
     Ok(())
 }
 

@@ -6319,6 +6319,8 @@ mod tests {
 
     fn empty_message(expanded: bool) -> ConvMessage {
         ConvMessage {
+            muted: false,
+            wake_at: None,
             mail_headers: Vec::new(),
             id: {
                 static NEXT: std::sync::atomic::AtomicUsize =

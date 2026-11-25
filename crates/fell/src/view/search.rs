@@ -1863,7 +1863,10 @@ fn row(
     } else {
         thread_label_group(theme, row, background, dim, row_room * 0.45, None, window)
     };
-    let snippet_room = row_room - labels.as_ref().map_or(0.0, |(_, width)| width + ROW_GAP);
+    let mute_width = row.muted.then(|| super::mute_chip_width(theme, window));
+    let snippet_room = row_room
+        - labels.as_ref().map_or(0.0, |(_, width)| width + ROW_GAP)
+        - mute_width.map_or(0.0, |width| width + ROW_GAP);
     let excerpt = match &hit.preview {
         Some(preview) if !preview.highlights.is_empty() => {
             let (text, highlights) = visible_excerpt(preview);
@@ -1987,6 +1990,7 @@ fn row(
                             paint_shaped_text(line, height, true)
                         })),
                 )
+                .children(mute_width.map(|width| super::mute_chip(theme, width, background, dim)))
                 .children(labels.map(|(group, _)| group)),
         )
         .into_any_element()

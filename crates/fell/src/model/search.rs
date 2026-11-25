@@ -103,7 +103,7 @@ impl SearchReply {
                     let mut location = locations.remove(&message_id);
                     let sender_name = location.as_mut().and_then(|hit| hit.sender_name.take());
                     rows.push(ThreadRow {
-                        muted: false,
+                        muted: location.as_ref().is_some_and(|hit| hit.muted),
                         wake_at: None,
                         id: thread_id.0.clone(),
                         spans: vec![NameSpan {
@@ -1007,6 +1007,7 @@ mod tests {
                 (
                     hit.message_id.clone(),
                     SearchLocation {
+                        muted: false,
                         folder: Some(folder.into()),
                         unread: false,
                         starred: false,

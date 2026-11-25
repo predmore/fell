@@ -918,17 +918,23 @@ fn undo_action(
     if let Some(blocker) = undo_conflicts::blocker(conn, action)? {
         return Err(Error::AgentActivityBlocked(blocker));
     }
-    let effect = if matches!(action.kind.as_str(), "snooze" | "unsnooze")
-        && !snooze_unchanged(conn, account_id, action)?
-    {
-        UndoEffect::SnoozeChanged
+    let wakes = if matches!(action.kind.as_str(), "snooze" | "unsnooze") {
+        snooze_wakes(conn, account_id, action)?
     } else {
+        Some(Vec::new())
+    };
+    let effect = if let Some(wakes) = wakes {
+        for wake in wakes {
+            crate::store::triage::undo_wake(conn, account_id, wake)?;
+        }
         match action.kind.as_str() {
             "draft" => undo_draft(conn, account_id, action.id)?,
             "annotate" => crate::notes::undo_annotation(conn, action.id)?,
             _ => undo_messages(conn, account_id, action)?,
         }
         UndoEffect::Restored
+    } else {
+        UndoEffect::SnoozeChanged
     };
     conn.execute(
         "UPDATE agent_actions SET undone = ?2 WHERE id = ?1",
@@ -944,16 +950,41 @@ fn undo_action(
     Ok(effect)
 }
 
+fn recorded_action(conn: &Connection, account: &AccountId, id: i64) -> Result<RecordedAction> {
+    Ok(conn.query_row(
+        &format!("SELECT {ACTION_COLS} FROM agent_actions WHERE id = ?1 AND account_id = ?2"),
+        params![id, account.as_str()],
+        map_action,
+    )?)
+}
+
+pub(crate) fn undo_batch_snooze(
+    conn: &Connection,
+    account: &AccountId,
+    id: i64,
+) -> Result<UndoEffect> {
+    let action = recorded_action(conn, account, id)?;
+    if action.undone {
+        return Ok(UndoEffect::Restored);
+    }
+    match undo_action(conn, account, &action) {
+        Err(Error::AgentActivityBlocked(_)) => {
+            conn.execute(
+                "UPDATE agent_actions SET undone = ?2 WHERE id = ?1",
+                [id, SNOOZE_RETIRED],
+            )?;
+            Ok(UndoEffect::SnoozeChanged)
+        }
+        result => result,
+    }
+}
+
 pub(crate) fn undo_recorded(
     conn: &Connection,
     account_id: &AccountId,
     id: i64,
 ) -> Result<UndoEffect> {
-    let action = conn.query_row(
-        &format!("SELECT {ACTION_COLS} FROM agent_actions WHERE id = ?1 AND account_id = ?2"),
-        params![id, account_id.as_str()],
-        map_action,
-    )?;
+    let action = recorded_action(conn, account_id, id)?;
     if action.undone {
         return Ok(UndoEffect::Restored);
     }
@@ -1445,11 +1476,13 @@ fn undo_messages(conn: &Connection, account_id: &AccountId, action: &RecordedAct
     Ok(())
 }
 
-fn snooze_unchanged(
+/// A changed live snooze blocks undo unless the timer cleared exactly
+/// that deadline. Collect the timer events before restoring snapshots.
+fn snooze_wakes(
     conn: &Connection,
     account_id: &AccountId,
     action: &RecordedAction,
-) -> Result<bool> {
+) -> Result<Option<Vec<i64>>> {
     let until = if action.kind == "unsnooze" {
         None
     } else if let Some(until) = action
@@ -1459,19 +1492,22 @@ fn snooze_unchanged(
     {
         Some(until)
     } else {
-        return Ok(false);
+        return Ok(None);
     };
-    Ok(!conn.query_row(
-        &format!(
-            "{resolved}
-             SELECT EXISTS (SELECT 1 FROM resolved s
-             JOIN messages m ON m.account_id = ?2 AND m.message_id = s.live_id
-             WHERE m.snooze_until IS NOT ?3)",
-            resolved = undo_conflicts::RESOLVED_SNAPSHOTS,
-        ),
-        params![action.id, account_id.as_str(), until],
-        |row| row.get::<_, bool>(0),
-    )?)
+    let mut query = conn.prepare_cached(&format!(
+        "{resolved}
+         SELECT DISTINCT w.event FROM resolved s
+         JOIN messages m ON m.account_id = ?2 AND m.message_id = s.live_id
+         LEFT JOIN snooze_wakes w ON w.account_id = m.account_id
+           AND w.message_id = m.message_id AND w.until_unix = ?3 AND m.snooze_until IS NULL
+         WHERE m.snooze_until IS NOT ?3",
+        resolved = undo_conflicts::RESOLVED_SNAPSHOTS,
+    ))?;
+    Ok(query
+        .query_map(params![action.id, account_id.as_str(), until], |row| {
+            row.get::<_, Option<i64>>(0)
+        })?
+        .collect::<rusqlite::Result<Option<Vec<_>>>>()?)
 }
 
 fn snooze_changed_error() -> Error {
@@ -3087,7 +3123,7 @@ mod tests {
             older.id
         );
         assert_eq!(
-            store.undo_with_note(&account).unwrap().1,
+            store.undo_with_note(&account).unwrap().1.as_deref(),
             Some("Note restored")
         );
         assert_eq!(
@@ -3095,7 +3131,7 @@ mod tests {
             latest.id
         );
         assert_eq!(
-            store.undo_with_note(&account).unwrap().1,
+            store.undo_with_note(&account).unwrap().1.as_deref(),
             Some("Note removed")
         );
         assert_eq!(
@@ -3373,7 +3409,7 @@ mod tests {
                 .is_err()
         );
         assert_eq!(
-            store.undo_with_note(&account).unwrap().1,
+            store.undo_with_note(&account).unwrap().1.as_deref(),
             Some("Reply draft kept · suggestion restored")
         );
         assert_eq!(
@@ -3455,12 +3491,12 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(
-            store.undo_with_note(&account).unwrap().1,
+            store.undo_with_note(&account).unwrap().1.as_deref(),
             Some("Note restored")
         );
         assert_eq!(notes()[0].suggestions.len(), 1);
         assert_eq!(
-            store.undo_with_note(&account).unwrap().1,
+            store.undo_with_note(&account).unwrap().1.as_deref(),
             Some("Unstarred · restored")
         );
         assert_eq!(notes()[0].suggestions.len(), 2);
@@ -3516,7 +3552,7 @@ mod tests {
 
             if mailbox_undo {
                 assert_eq!(
-                    store.undo_with_note(&account).unwrap().1,
+                    store.undo_with_note(&account).unwrap().1.as_deref(),
                     Some("Snooze undone · suggestion restored")
                 );
             } else {
@@ -3533,7 +3569,7 @@ mod tests {
             assert_eq!(snoozed_until(), Some(prior));
             assert_eq!(notes()[0].suggestions.len(), 1);
             assert_eq!(
-                store.undo_with_note(&account).unwrap().1,
+                store.undo_with_note(&account).unwrap().1.as_deref(),
                 Some("Note removed")
             );
             assert!(store.undo_with_note(&account).is_err());
@@ -3644,7 +3680,7 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].snooze_until, Some(until));
         assert_eq!(
-            store.undo_with_note(&account).unwrap().1,
+            store.undo_with_note(&account).unwrap().1.as_deref(),
             Some("Snooze undone · suggestion restored")
         );
         let messages = only_message(&store, &account, &thread);
@@ -3652,7 +3688,7 @@ mod tests {
         assert_eq!(messages[0].snooze_until, None);
         // Undo of the note publication lies between the snooze and the label.
         assert_eq!(
-            store.undo_with_note(&account).unwrap().1,
+            store.undo_with_note(&account).unwrap().1.as_deref(),
             Some("Note removed")
         );
         assert_eq!(store.undo_with_note(&account).unwrap().0.id, older.id);
@@ -3684,7 +3720,7 @@ mod tests {
         assert_eq!(messages[1].snooze_until, Some(until));
 
         assert_eq!(
-            store.undo_with_note(&account).unwrap().1,
+            store.undo_with_note(&account).unwrap().1.as_deref(),
             Some("Snooze already changed")
         );
         assert_eq!(only_message(&store, &account, &thread), messages);
@@ -3700,7 +3736,7 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(
-            store.undo_with_note(&account).unwrap().1,
+            store.undo_with_note(&account).unwrap().1.as_deref(),
             Some("Note removed")
         );
     }
@@ -3851,7 +3887,7 @@ mod tests {
             check_snooze(Some(until));
             assert_eq!(pending(), 0);
             assert_eq!(
-                store.undo_with_note(&account).unwrap().1,
+                store.undo_with_note(&account).unwrap().1.as_deref(),
                 Some("Snooze undone · suggestion restored")
             );
             check_snooze(None);

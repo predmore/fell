@@ -78,6 +78,7 @@ pub struct SearchPreview {
 /// Scope of a ranked result's normal conversation actions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchLocation {
+    pub muted: bool,
     pub folder: Option<String>,
     pub unread: bool,
     pub starred: bool,
@@ -152,7 +153,10 @@ pub(crate) fn locations(
                               AND f.has_attachment = 1),
                     ({scopes}), ({has_view_copy}),
                     (SELECT group_concat(f.labels, char(30)) FROM messages f
-                     WHERE f.account_id = m.account_id AND f.thread_id = m.thread_id)
+                     WHERE f.account_id = m.account_id AND f.thread_id = m.thread_id),
+                    EXISTS (SELECT 1 FROM thread_folders f
+                            WHERE f.account_id = m.account_id AND f.thread_id = m.thread_id
+                              AND f.folder_key = char(31) || 'muted')
              FROM messages m
              WHERE m.account_id = ? AND m.message_id IN ({marks})"
         );
@@ -206,6 +210,7 @@ pub(crate) fn locations(
             locations.insert(
                 MessageId(row.get(0)?),
                 SearchLocation {
+                    muted: row.get(13)?,
                     folder,
                     unread,
                     starred,

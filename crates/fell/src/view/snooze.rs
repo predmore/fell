@@ -1,14 +1,15 @@
 use fell_core::store::{MUTED, SNOOZED};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    Context, FontWeight, InteractiveElement, MouseButton, ParentElement, Styled, Window, div, px,
-    rgb,
+    Context, FontWeight, InteractiveElement, MouseButton, ParentElement, Styled, div, px, rgb,
 };
 
-use crate::model::Overlay;
-use crate::model::snooze::{PRESETS, Picker, TriageEdit, TriageKind, preset, typed};
+use crate::model::snooze::{
+    PRESETS, Picker, TriageEdit, TriageKind, preset, toast_time, typed, wake_time,
+};
+use crate::model::{Overlay, Toast};
 
-use super::{Inbox, ReadIntent, Theme, ThreadId, motion, now_unix, present};
+use super::{Inbox, ReadIntent, Theme, ThreadId, motion, now_unix, palette_caret};
 
 impl Inbox {
     pub(super) fn apply_triage(&mut self, edit: TriageEdit, cx: &mut Context<Self>) {
@@ -34,27 +35,28 @@ impl Inbox {
             move |store| match edit.kind {
                 TriageKind::Snooze(until) => store
                     .set_thread_snoozes(&account, &targets, Some(until))
-                    .map(|_| {
-                        format!(
-                            "Snoozed until {}",
-                            present::activity_time(now_unix(), until)
-                        )
+                    .map(|count| {
+                        let at = toast_time(now_unix(), until);
+                        match count {
+                            0 => ("Snooze unchanged".into(), false),
+                            1 => (format!("Snoozed until {at}"), true),
+                            n => (format!("Snoozed {n} until {at}"), true),
+                        }
                     }),
                 TriageKind::Unsnooze => {
                     store
                         .set_thread_snoozes(&account, &targets, None)
                         .map(|count| {
                             if count > 0 {
-                                "Unsnoozed"
+                                ("Unsnoozed".into(), true)
                             } else {
-                                "No snoozes to clear"
+                                ("No snoozes to clear".into(), false)
                             }
-                            .into()
                         })
                 }
                 TriageKind::Mute => store
                     .toggle_thread_mutes(&account, &targets)
-                    .map(|mute| if mute { "Muted" } else { "Unmuted" }.into()),
+                    .map(|mute| (if mute { "Muted" } else { "Unmuted" }.into(), true)),
             },
             move |inbox, result, cx| {
                 if removed {
@@ -63,11 +65,22 @@ impl Inbox {
                     }
                 }
                 let failed = result.is_err();
-                let text = result.unwrap_or_else(|err| err.to_string());
-                inbox.session.show_toast(text, failed);
+                match result {
+                    Ok((text, true)) => inbox.session.set_toast(Toast::with_hint(
+                        text,
+                        crate::keymap::binding_text(
+                            &inbox.session.keymap,
+                            crate::keymap::Action::Undo,
+                        ),
+                        "",
+                    )),
+                    Ok((text, false)) => inbox.session.show_toast(text, false),
+                    Err(err) => inbox.session.show_toast(err.to_string(), true),
+                }
                 inbox.expire_action_notice(cx);
                 Some(ReadIntent {
                     changed: true,
+                    refresh_open: true,
                     select: key.filter(|_| removed && failed),
                     ..ReadIntent::default()
                 })
@@ -89,42 +102,44 @@ impl Inbox {
         if self.session.search.is_some() {
             self.refresh_search(cx);
         }
-        if self.in_inbox_list() || self.list_folder == SNOOZED {
-            self.request_threads(
-                ReadIntent {
-                    refresh_open: true,
-                    ..ReadIntent::default()
-                },
-                cx,
-            );
-        }
+        self.request_threads(
+            ReadIntent {
+                refresh_open: true,
+                ..ReadIntent::default()
+            },
+            cx,
+        );
     }
+}
+
+const BASE_HEIGHT: f32 = 188.0;
+const ERROR_HEIGHT: f32 = 29.0;
+
+pub(super) fn card_height(error: bool) -> f32 {
+    BASE_HEIGHT + if error { ERROR_HEIGHT } else { 0.0 }
 }
 
 pub(super) fn card(
     theme: &Theme,
     picker: &Picker,
     opacity: f32,
-    window: &Window,
+    height: Option<f32>,
+    available: f32,
     cx: &mut Context<Inbox>,
 ) -> gpui::Div {
-    let width = (f32::from(window.viewport_size().width) - 24.0).clamp(1.0, 380.0);
-    let height = 210.0;
+    let width = (available - 24.0).clamp(1.0, 416.0);
+    let height = height.unwrap_or_else(|| card_height(picker.error));
     let scale = motion::lerp(0.97, 1.0, opacity);
     let now = picker.opened_at;
-    let query = picker.query.trim();
-    let custom = (!query.is_empty()).then(|| typed(now, query)).flatten();
-    let detail_color = if picker.error {
-        theme.error
+    let typing = !picker.query.is_empty();
+    let detail = typing.then(|| {
+        typed(now, &picker.query)
+            .map_or_else(|| "Keep typing a time".into(), |at| wake_time(now, at))
+    });
+    let title = if picker.selected_count > 1 {
+        format!("Snooze {} conversations until", picker.selected_count)
     } else {
-        theme.dimmed
-    };
-    let detail = if picker.error {
-        "Enter a time like mon 9am or 18:30".into()
-    } else if let Some(at) = custom {
-        format!("Wake {}", present::activity_time(now, at))
-    } else {
-        String::new()
+        "Snooze until".into()
     };
 
     div()
@@ -138,7 +153,7 @@ pub(super) fn card(
         .shadow_lg()
         .opacity(opacity)
         .flex()
-        .justify_center()
+        .justify_start()
         .items_center()
         .on_mouse_down(
             MouseButton::Left,
@@ -151,7 +166,6 @@ pub(super) fn card(
         .child(
             div()
                 .w(px(width - 2.0))
-                .h(px(height - 2.0))
                 .flex_none()
                 .flex()
                 .flex_col()
@@ -162,7 +176,7 @@ pub(super) fn card(
                         .flex()
                         .items_center()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child("Snooze until"),
+                        .child(title),
                 )
                 .child(
                     div()
@@ -172,23 +186,46 @@ pub(super) fn card(
                         .items_center()
                         .border_b_1()
                         .border_color(rgb(theme.border))
-                        .text_color(rgb(if query.is_empty() {
-                            theme.dimmed
-                        } else {
-                            theme.foreground
-                        }))
-                        .child(if query.is_empty() {
-                            "Type a time, e.g. mon 9am".into()
-                        } else {
-                            picker.query.clone()
-                        }),
+                        .gap(px(10.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .items_center()
+                                .gap(px(4.0))
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_color(rgb(if typing {
+                                            theme.foreground
+                                        } else {
+                                            theme.dimmed
+                                        }))
+                                        .child(if typing {
+                                            picker.query.clone()
+                                        } else {
+                                            "Type a time, e.g. mon 9am".into()
+                                        }),
+                                )
+                                .child(palette_caret(theme)),
+                        )
+                        .children(detail.map(|detail| {
+                            div()
+                                .max_w(px(width * 0.52))
+                                .truncate()
+                                .text_size(px(theme.ui_px - 1.0))
+                                .text_color(rgb(theme.dimmed))
+                                .child(detail)
+                        })),
                 )
                 .child(
                     div()
-                        .pt(px(4.0))
+                        .py(px(6.0))
                         .px(px(5.0))
                         .children(PRESETS.iter().enumerate().map(|(index, label)| {
-                            let selected = query.is_empty() && index == picker.index;
+                            let selected = !typing && index == picker.index;
                             div()
                                 .h(px(32.0))
                                 .px(px(10.0))
@@ -200,6 +237,8 @@ pub(super) fn card(
                                 .when(selected, |row| row.bg(rgb(theme.selection)))
                                 .text_color(rgb(if selected {
                                     theme.on_selection
+                                } else if typing {
+                                    theme.dimmed
                                 } else {
                                     theme.foreground
                                 }))
@@ -228,21 +267,24 @@ pub(super) fn card(
                                         } else {
                                             theme.dimmed
                                         }))
-                                        .child(preset(now, index).map_or_else(String::new, |at| {
-                                            present::activity_time(now, at)
-                                        })),
+                                        .child(
+                                            preset(now, index)
+                                                .map_or_else(String::new, |at| wake_time(now, at)),
+                                        ),
                                 )
                         })),
                 )
-                .child(
-                    div()
-                        .h(px(29.0))
-                        .px(px(16.0))
-                        .flex()
-                        .items_center()
-                        .text_size(px(theme.ui_px - 1.0))
-                        .text_color(rgb(detail_color))
-                        .child(detail),
-                ),
+                .when(picker.error, |card| {
+                    card.child(
+                        div()
+                            .h(px(ERROR_HEIGHT))
+                            .px(px(16.0))
+                            .flex()
+                            .items_center()
+                            .text_size(px(theme.ui_px - 1.0))
+                            .text_color(rgb(theme.error))
+                            .child("Enter a time like mon 9am or 30m"),
+                    )
+                }),
         )
 }

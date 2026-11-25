@@ -506,6 +506,7 @@ impl<R> Ghost<R> {
 #[derive(Clone, Debug)]
 pub struct ListShift<R> {
     transition: Transition,
+    opening_top: bool,
     /// Rows arriving in place, from [`ARRIVE_FROM`]: never from empty.
     /// Its clock starts on the first frame that draws them, so a late
     /// first frame cannot eat the fade. `None` until then.
@@ -552,6 +553,7 @@ impl<R: Clone> ListShift<R> {
         }
         Some(ListShift {
             transition,
+            opening_top: false,
             arrive: None,
             before: before.into_iter().collect(),
             resolved: HashMap::new(),
@@ -559,6 +561,12 @@ impl<R: Clone> ListShift<R> {
             replaced,
             reach,
         })
+    }
+
+    /// A leading arrival opens its slot from the first frame that paints it.
+    pub fn top_arrival(mut self) -> Self {
+        self.opening_top = true;
+        self
     }
 
     /// The restored row already owns the cursor. Give its slot room on
@@ -620,6 +628,9 @@ impl<R: Clone> ListShift<R> {
         below: impl IntoIterator<Item = (&'a str, f32)>,
         now: Instant,
     ) -> RowMotion {
+        if std::mem::take(&mut self.opening_top) {
+            self.transition = Transition::new(now, Duration::from_millis(160));
+        }
         let p = self.transition.progress(now);
         match self.resolve(id, top) {
             Some(dy) => RowMotion {
@@ -672,7 +683,11 @@ impl<R: Clone> ListShift<R> {
     /// so a row in flight keeps its place. A row not drawn yet (two changes
     /// before one frame) is where it would have been drawn.
     pub fn offset_of(&self, id: &str, top: f32, now: Instant) -> f32 {
-        let p = self.transition.progress(now);
+        let p = if self.opening_top {
+            0.0
+        } else {
+            self.transition.progress(now)
+        };
         let start = match self.resolved.get(id) {
             Some(start) => *start,
             None => self.start_for(id, top),
@@ -743,7 +758,8 @@ impl<R: Clone> ListShift<R> {
     }
 
     pub fn running(&self, now: Instant) -> bool {
-        self.transition.running(now)
+        self.opening_top
+            || self.transition.running(now)
             || self.arrive.is_some_and(|arrive| arrive.running(now))
             || self.ghosts.iter().any(|ghost| ghost.running(now))
     }
@@ -763,6 +779,38 @@ impl<R: Clone> ListShift<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_row_arrival_opens_the_gap_from_the_first_painted_frame() {
+        let now = Instant::now();
+        let first_frame = now + Duration::from_millis(250);
+        let mut shift = ListShift::<u8>::start(
+            &Motion::new(true),
+            vec![("selection".into(), 0.0)],
+            Vec::new(),
+            Vec::new(),
+            640.0,
+            false,
+            now,
+        )
+        .unwrap()
+        .top_arrival();
+        assert!(shift.running(first_frame));
+        let draw = |shift: &mut ListShift<_>, now| {
+            shift.row("arrival", 0.0, 68.0, [("selection", 68.0)], now)
+        };
+        let start = draw(&mut shift, first_frame);
+        assert_eq!(start.reveal, Some(0.0));
+        assert_eq!(start.opacity, 0.0);
+        assert_eq!(shift.offset_of("selection", 68.0, first_frame), -68.0);
+        let midpoint = first_frame + Duration::from_millis(80);
+        let row = draw(&mut shift, midpoint);
+        assert!((0.0..1.0).contains(&row.reveal.unwrap()));
+        assert!((0.0..1.0).contains(&row.opacity));
+        let end = first_frame + Duration::from_millis(160);
+        assert_eq!(draw(&mut shift, end).reveal, Some(1.0));
+        assert_eq!(shift.offset_of("selection", 68.0, end), 0.0);
+    }
 
     #[test]
     fn a_layer_swap_starts_the_arrival_after_the_exit() {

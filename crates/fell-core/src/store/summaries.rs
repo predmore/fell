@@ -2207,6 +2207,114 @@ mod tests {
     }
 
     #[test]
+    fn undo_of_a_woken_snooze_restores_order_and_read_state() {
+        let store = Store::open_in_memory().unwrap();
+        let account = account().id;
+        store.upsert_account(&self::account()).unwrap();
+        let mut rng = Rng(21);
+        let batch = (1..=2)
+            .map(|index| {
+                let mut mail = message(&mut rng, index, &[]);
+                mail.folders = vec!["INBOX".into()];
+                mail.remote_id = RemoteId(format!("imap:1:{index}:INBOX"));
+                mail.headers.date_unix = 100 + index as i64;
+                mail.unread = false;
+                mail
+            })
+            .collect();
+        store
+            .apply_delta(
+                &account,
+                &MailboxDelta {
+                    messages: batch,
+                    ..MailboxDelta::default()
+                },
+            )
+            .unwrap();
+        let before = store.folder_threads(&account, "INBOX").unwrap();
+        let last = &before[1].thread_id;
+        store
+            .set_thread_snoozes(&account, std::slice::from_ref(last), Some(300))
+            .unwrap();
+        store.wake_snoozes(300).unwrap();
+        let woken = store.folder_threads(&account, "INBOX").unwrap();
+        assert_eq!(&woken[0].thread_id, last);
+        assert!(woken[0].unread);
+        assert_eq!(store.undo_with_note(&account).unwrap().1, None);
+        assert_eq!(store.folder_threads(&account, "INBOX").unwrap(), before);
+        for table in ["snooze_returns", "snooze_wakes", "local_flag_intents"] {
+            assert_eq!(
+                store
+                    .conn
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn batch_undo_reports_an_agent_replacement_or_unsnooze() {
+        for clear in [false, true] {
+            let store = Store::open_in_memory().unwrap();
+            let account = account().id;
+            store.upsert_account(&self::account()).unwrap();
+            store
+                .set_agent_grant(
+                    &account,
+                    "rewriter",
+                    crate::AgentGrant::enabled(false, true, false),
+                )
+                .unwrap();
+            let mut rng = Rng(28);
+            let batch = (1..=2)
+                .map(|index| {
+                    let mut mail = message(&mut rng, index, &[]);
+                    mail.folders = vec!["INBOX".into()];
+                    mail.remote_id = RemoteId(format!("imap:1:{index}:INBOX"));
+                    mail
+                })
+                .collect();
+            store
+                .apply_delta(
+                    &account,
+                    &MailboxDelta {
+                        messages: batch,
+                        ..MailboxDelta::default()
+                    },
+                )
+                .unwrap();
+            let ids = store
+                .folder_threads(&account, "INBOX")
+                .unwrap()
+                .into_iter()
+                .map(|row| row.thread_id)
+                .collect::<Vec<_>>();
+            store.set_thread_snoozes(&account, &ids, Some(300)).unwrap();
+            if clear {
+                store
+                    .unsnooze_thread(&account, &ids[0], "agent:rewriter")
+                    .unwrap();
+            } else {
+                store
+                    .snooze_thread(&account, &ids[0], 400, "agent:rewriter")
+                    .unwrap();
+            }
+            let (_, notice, restored) = store.undo_with_note(&account).unwrap();
+            assert_eq!(
+                notice.as_deref(),
+                Some("Undid 1 of 2 · 1 snooze changed since")
+            );
+            assert_eq!(restored, ids[1..]);
+            assert_eq!(
+                store.thread_messages(&account, &ids[0]).unwrap()[0].snooze_until,
+                (!clear).then_some(400),
+            );
+        }
+    }
+
+    #[test]
     fn muting_follows_message_ids_through_rethreading_and_keeps_server_copies() {
         let store = Store::open_in_memory().unwrap();
         let account = account();

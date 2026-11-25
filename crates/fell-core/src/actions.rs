@@ -829,7 +829,7 @@ impl Store {
     pub fn undo_with_note(
         &self,
         account_id: &AccountId,
-    ) -> Result<(LocalAction, Option<&'static str>, Vec<ThreadId>)> {
+    ) -> Result<(LocalAction, Option<String>, Vec<ThreadId>)> {
         self.undo_latest_with_note(account_id, None)
     }
 
@@ -837,7 +837,7 @@ impl Store {
         &self,
         account_id: &AccountId,
         expected: Option<i64>,
-    ) -> Result<(LocalAction, Option<&'static str>, Vec<ThreadId>)> {
+    ) -> Result<(LocalAction, Option<String>, Vec<ThreadId>)> {
         self.require_account(account_id)?;
         let tx = crate::store::immediate_transaction(self.connection())?;
         ensure_action_schema(&tx)?;
@@ -867,11 +867,8 @@ impl Store {
         ) {
             // The note and any linked snooze are restored below.
         } else if matches!(action.kind, ActionKind::Snooze | ActionKind::Unsnooze) {
-            let (threads, changed) = crate::store::triage::undo_snooze(&tx, account_id, action.id)?;
-            restored_threads = threads;
-            if changed && restored_threads.is_empty() {
-                triage_notice = Some(crate::agent::SNOOZE_CHANGED_NOTICE);
-            }
+            (restored_threads, triage_notice) =
+                crate::store::triage::undo_snooze(&tx, account_id, action.id)?;
         } else if matches!(action.kind, ActionKind::Mute | ActionKind::Unmute) {
             restored_threads = crate::store::triage::undo_mute(
                 &tx,
@@ -945,7 +942,11 @@ impl Store {
         let note =
             crate::notes::undo_local(&tx, account_id, action.id)?.map(|note| note.notice(&action));
         tx.commit()?;
-        Ok((action, note.or(triage_notice), restored_threads))
+        Ok((
+            action,
+            note.map(str::to_owned).or(triage_notice),
+            restored_threads,
+        ))
     }
 
     /// Threads with at least one message in `folder`, newest activity first.

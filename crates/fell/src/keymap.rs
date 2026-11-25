@@ -438,16 +438,22 @@ fn default_bindings() -> Vec<Binding> {
         Action::Label,
         Some("Folders"),
     );
-    for (key, action) in [
-        ('b', Action::Snooze),
-        ('B', Action::Unsnooze),
-        ('M', Action::Mute),
-        ('z', Action::Snoozed),
-    ] {
+    for (key, action) in [('z', Action::Snoozed), ('M', Action::Muted)] {
         bind(
             &[KeyId::Leader, KeyId::Char('f'), KeyId::Char(key)],
             action,
             Some("Folders"),
+        );
+    }
+    for (key, action) in [
+        ('s', Action::Snooze),
+        ('u', Action::Unsnooze),
+        ('m', Action::Mute),
+    ] {
+        bind(
+            &[KeyId::Leader, KeyId::Char('b'), KeyId::Char(key)],
+            action,
+            Some("Triage"),
         );
     }
     bind(

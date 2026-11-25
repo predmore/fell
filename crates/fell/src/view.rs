@@ -1466,7 +1466,15 @@ impl Inbox {
                 .then(|| store.list_labels(&account).ok())
                 .flatten();
             let roles = store.folder_roles(&account).unwrap_or_default();
-            let mut rows = present::folder_thread_rows(&page.threads, &me, &reading);
+            let mut rows = present::folder_thread_rows(
+                &page.threads,
+                &me,
+                if reading_label.is_none() {
+                    &reading
+                } else {
+                    ""
+                },
+            );
             let unread = page.unread;
             let drafts = if reading_label.is_none() && roles.is(FolderRole::Drafts, &reading) {
                 // Synced drafts name who they are to, and none is unread.
@@ -1717,6 +1725,17 @@ impl Inbox {
                 self.session.cursor_id = None;
             }
         }
+        let at_top = !switched
+            && !self.session.more_before
+            && !more_before
+            && self.list_offset().abs() < 0.5
+            && self.motion.list_glide.is_none();
+        let top_arrival = at_top
+            && intent.is_refresh()
+            && !self.session.threads.is_empty()
+            && rows
+                .first()
+                .is_some_and(|first| !self.session.threads.iter().any(|row| row.id == first.id));
         let row_height = self.list_row_height();
         let now = self.motion.clock.now();
         let drawn = self.drawn_rows(now);
@@ -1795,8 +1814,9 @@ impl Inbox {
                 // Rows sync put above the selection, or rows loaded above
                 // the first one, push it down. Scroll by the same amount so
                 // the selected row stays where the reader left it.
-                if let (Some(before), Some(after), Some(row)) =
-                    (before_index, after_index, row_height)
+                if !at_top
+                    && let (Some(before), Some(after), Some(row)) =
+                        (before_index, after_index, row_height)
                 {
                     self.shift_list(after as i64 - before as i64, row);
                 }
@@ -1814,7 +1834,7 @@ impl Inbox {
             present::Landing::Jump => self.scroll_list_to_cursor(),
         }
         if !emptied && (switched || had_rows || !self.session.threads.is_empty()) {
-            self.start_list_shift(drawn, switched, intent.select.is_some());
+            self.start_list_shift(drawn, switched, intent.select.is_some(), top_arrival);
         }
         if self.list_label.is_some() {
             self.warm = None;
@@ -2196,7 +2216,13 @@ impl Inbox {
     /// Rows among them that left the list fade out where they were, and
     /// scroll with the list from there. `replace`: the list is another
     /// folder's; it fades in and nothing of the old one lingers.
-    fn start_list_shift(&mut self, drawn: Vec<Drawn>, replace: bool, reveal_selection: bool) {
+    fn start_list_shift(
+        &mut self,
+        drawn: Vec<Drawn>,
+        replace: bool,
+        reveal_selection: bool,
+        top_arrival: bool,
+    ) {
         let now = self.motion.clock.now();
         // Ghosts keep their place in the list's content, as of the offset
         // the next frame draws at.
@@ -2308,7 +2334,9 @@ impl Inbox {
         )
         .map(|shift| {
             let shift = shift.fading_below(below);
-            if reveal_selection && !replace {
+            if top_arrival {
+                shift.top_arrival()
+            } else if reveal_selection && !replace {
                 shift.show_restored_selection()
             } else {
                 shift
@@ -3306,7 +3334,7 @@ impl Inbox {
             self.session.remove_thread(id);
         }
         self.scroll_list_to_cursor();
-        self.start_list_shift(drawn, false, false);
+        self.start_list_shift(drawn, false, false, false);
         self.request_messages(true, cx);
         // The removed row was the last one loaded: load the row after it.
         self.issue_fetch(cx);
@@ -5479,6 +5507,30 @@ impl Render for Inbox {
                 final_height,
             );
         }
+        let snooze_anchor = if panes == (true, true) {
+            (list_width + SPLITTER_PX, CARD_TOP_PX)
+        } else if panes.0 && self.session.search.is_none() {
+            let row = self
+                .session
+                .cursor_id
+                .as_ref()
+                .and_then(|id| self.session.threads.iter().position(|row| &row.id == id));
+            let top = row.map_or(CARD_TOP_PX, |index| {
+                let row_top = 44.0 + self.list_offset() + index as f32 * ROW_PX;
+                let below = row_top + ROW_PX + 8.0;
+                let height = snooze::card_height(true);
+                if below + height <= viewport_height {
+                    below.max(CARD_TOP_PX)
+                } else if row_top - height - 8.0 >= 0.0 {
+                    row_top - height - 8.0
+                } else {
+                    CARD_TOP_PX
+                }
+            });
+            (0.0, top)
+        } else {
+            (0.0, CARD_TOP_PX)
+        };
         let mut overlay_card =
             |session: &Session, motion, live, picker: (&[PickerChoice], Option<String>, f32)| {
                 let help = self
@@ -5490,6 +5542,7 @@ impl Render for Inbox {
                     motion,
                     card,
                     live,
+                    snooze_anchor,
                     &self.palette_scroll,
                     &self.folder_scroll,
                     picker,
@@ -7268,7 +7321,7 @@ fn thread_line_one(
     let now = now_unix();
     let date = row.wake_at.map_or_else(
         || present::relative_date(now, row.date_unix),
-        |wake_at| present::activity_time(now, wake_at),
+        |wake_at| crate::model::snooze::wake_time(now, wake_at),
     );
     let size = theme.ui_px - 1.0;
     let style = conversation_line_style(window, theme, px(size));
@@ -7282,7 +7335,7 @@ fn thread_line_one(
         0.0
     };
     let muted_width = if row.muted {
-        line_px_with_style(window, &style, "Muted", FontWeight::NORMAL).ceil() + THREAD_LINE_GAP
+        mute_chip_width(theme, window)
     } else {
         0.0
     };
@@ -7292,7 +7345,11 @@ fn thread_line_one(
         - date_width
         - count_width
         - attachment_width
-        - muted_width
+        - if row.muted {
+            muted_width + THREAD_LINE_GAP
+        } else {
+            0.0
+        }
         - STAR_SLOT
         - if look.unread_note {
             agent_notes::MARKER_SLOT
@@ -7362,13 +7419,7 @@ fn thread_line_one(
                     )
                 })
                 .when(row.muted, |line| {
-                    line.child(
-                        div()
-                            .flex_none()
-                            .text_color(rgb(dim))
-                            .text_size(px(size))
-                            .child("Muted"),
-                    )
+                    line.child(mute_chip(theme, muted_width, background, dim))
                 })
                 .children(labels.map(|(group, _)| group)),
         )
@@ -7549,6 +7600,22 @@ fn label_chip(
         .line_height(px(size + 2.0))
         .text_color(rgb(if warn { theme.error } else { dim }))
         .child(label)
+}
+
+fn mute_chip_width(theme: &Theme, window: &Window) -> f32 {
+    let style = conversation_line_style(window, theme, px((theme.ui_px - 2.0).max(11.0)));
+    line_px_with_style(window, &style, "Muted", FontWeight::NORMAL).ceil() + LABEL_CHIP_CHROME
+}
+
+fn mute_chip(theme: &Theme, width: f32, background: u32, color: u32) -> gpui::Div {
+    label_chip(
+        theme,
+        "Muted".into(),
+        width,
+        false,
+        theme.label_outline(background),
+        color,
+    )
 }
 
 /// A row chip's height, border included: under the 22 px line it sits on.
@@ -8833,8 +8900,20 @@ pub fn read_conversation(
     let (me, roles, names, viewing) = shown;
     let messages = store.thread_messages(account, thread)?;
     let states = store.thread_reader_states(account, thread)?;
-    let mut view = present::conversation(&messages, me, roles, names, viewing);
+    let muted = store.thread_muted(account, thread)?;
+    let wake_at = messages
+        .iter()
+        .filter_map(|message| message.snooze_until)
+        .max();
+    let scope = if muted || wake_at.is_some() {
+        ""
+    } else {
+        viewing
+    };
+    let mut view = present::conversation(&messages, me, roles, names, scope);
     for (message, stored) in view.iter_mut().zip(&messages) {
+        message.muted = muted;
+        message.wake_at = wake_at;
         let (state, parts) = states
             .get(&message.id)
             .copied()
@@ -9376,13 +9455,14 @@ fn expanded_header_gaps([sender, email, ..]: [f32; 4]) -> f32 {
     (1 + usize::from(sender > 0.0) + usize::from(email > 0.0)) as f32 * MESSAGE_HEADER_GAP_PX
 }
 
-fn expanded_header_widths(width: f32, fields: [f32; 4]) -> [f32; 4] {
+fn expanded_header_widths(width: f32, fields: [f32; 4], folder_status: f32) -> [f32; 4] {
     let [sender, email, folders, date] = fields;
     let date = date.min(width);
     let room = (width - date - expanded_header_gaps(fields)).max(0.0);
-    // When the identity needs to truncate, give it at least two thirds of
-    // the room. A short or absent folder list leaves more for the sender.
-    let identity = (room - folders.min(room / 3.0)).min(sender + email);
+    // Give the sender up to two thirds of the room, reserving extra space
+    // for triage status so the wake time survives a long sender address.
+    let folder_room = (room / 3.0).max(folder_status.min(room * 0.6));
+    let identity = (room - folders.min(folder_room)).min(sender + email);
     let email = email.min(identity - sender.min(identity / 2.0));
     let sender = sender.min(identity - email);
     let folders = folders.min((room - sender - email).max(0.0));
@@ -9392,6 +9472,7 @@ fn expanded_header_widths(width: f32, fields: [f32; 4]) -> [f32; 4] {
 fn expanded_header_flow(
     columns: ReaderColumns,
     fields: [f32; 4],
+    folder_status: f32,
     mut layer: impl FnMut([f32; 4]) -> gpui::AnyElement,
 ) -> gpui::AnyElement {
     // A header that fits both modes keeps one layer, just like a short subject.
@@ -9401,7 +9482,7 @@ fn expanded_header_flow(
             width: columns.header.width.min(full_width),
             ..columns.header
         },
-        |width, _| layer(expanded_header_widths(width, fields)),
+        |width, _| layer(expanded_header_widths(width, fields, folder_status)),
     )
 }
 
@@ -9458,16 +9539,33 @@ fn expanded_message_header(
     });
     let sender = present::display_safe(&message.sender);
     let email = present::display_safe(&message.email);
-    let folders = message
-        .folders
+    let wake = message.wake_at.map(|at| {
+        format!(
+            "Snoozed until {}",
+            crate::model::snooze::wake_time(now_unix(), at)
+        )
+    });
+    let folders = wake
         .iter()
-        .map(|folder| present::display_safe(folder))
+        .cloned()
+        .chain(
+            message
+                .folders
+                .iter()
+                .map(|folder| present::display_safe(folder)),
+        )
         .collect::<Vec<_>>();
     let joined = folders.join(" · ");
+    let mute_width = message.muted.then(|| mute_chip_width(theme, window));
+    let mute_room = mute_width.map_or(0.0, |width| width + MESSAGE_HEADER_GAP_PX);
     let measure = |style: &TextStyle, text: &str, weight, color| {
         shape_ui_line(window, style, text, weight, Some(color))
             .map_or(0.0, |line| f32::from(line.width).ceil())
     };
+    let folder_status = mute_room
+        + wake.as_ref().map_or(0.0, |text| {
+            measure(&style, text, FontWeight::NORMAL, theme.dimmed)
+        });
     let widths = [
         measure(
             &sender_style,
@@ -9476,7 +9574,7 @@ fn expanded_message_header(
             theme.foreground,
         ),
         measure(&style, &email, FontWeight::NORMAL, theme.dimmed),
-        measure(&style, &joined, FontWeight::NORMAL, theme.dimmed),
+        measure(&style, &joined, FontWeight::NORMAL, theme.dimmed) + mute_room,
         date_width
             + if status.is_some() {
                 status_width + MESSAGE_HEADER_GAP_PX
@@ -9491,6 +9589,7 @@ fn expanded_message_header(
     let leading = expanded_header_flow(
         columns,
         widths,
+        folder_status,
         |[sender_width, email_width, folder_width, _]| {
             let sender = fit(
                 &sender_style,
@@ -9510,9 +9609,10 @@ fn expanded_message_header(
                 line.as_ref()
                     .map_or(0., |line| f32::from(line.width).ceil())
             };
-            let folder_width = folder_width
+            let folder_width = (folder_width - mute_room
                 + (sender_width - line_width(&sender))
-                + (email_width - line_width(&email));
+                + (email_width - line_width(&email)))
+            .max(0.0);
             let fit_folders =
                 |text: &str| fit(&style, text, folder_width, FontWeight::NORMAL, theme.dimmed);
             let fit_whole = |text: &str| fit_folders(text).filter(|line| line.text == text);
@@ -9531,6 +9631,7 @@ fn expanded_message_header(
                         .join(" · ");
                     fit_whole(&shortened)
                 })
+                .or_else(|| wake.as_deref().and_then(fit_whole))
                 .or_else(|| {
                     let leaves = folders
                         .iter()
@@ -9551,6 +9652,9 @@ fn expanded_message_header(
                         .into_iter()
                         .flatten()
                         .map(|line| paint_shaped_text(line, line_height, false)),
+                )
+                .children(
+                    mute_width.map(|width| mute_chip(theme, width, theme.background, theme.dimmed)),
                 )
                 .into_any_element()
         },
@@ -11217,6 +11321,7 @@ fn card_fit(
                 room,
             ))
         }
+        Overlay::Snooze => Some(snooze::card_height(session.snooze.error)),
         Overlay::Agents => Some(agents::card_height(&session.agents, room)),
         Overlay::AgentActivity => Some(activity::card_height(room)),
         Overlay::Settings => Some(settings::card_height(
@@ -11285,6 +11390,7 @@ fn overlay(
     (opacity, drop): (f32, f32),
     card: Option<f32>,
     live: bool,
+    snooze_anchor: (f32, f32),
     palette_scroll: &ScrollHandle,
     folder_scroll: &ScrollHandle,
     picker: (&[PickerChoice], Option<String>, f32),
@@ -11293,7 +11399,12 @@ fn overlay(
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::Div {
-    let top = help.as_ref().map_or(CARD_TOP_PX, |(top, _)| *top);
+    let snoozing = session.overlay == Overlay::Snooze;
+    let top = if snoozing {
+        snooze_anchor.1
+    } else {
+        help.as_ref().map_or(CARD_TOP_PX, |(top, _)| *top)
+    };
     div()
         .absolute()
         .top(px(0.))
@@ -11303,6 +11414,7 @@ fn overlay(
         .flex()
         .justify_center()
         .pt(px((top - drop).max(0.)))
+        .when(snoozing, |layer| layer.pl(px(snooze_anchor.0)))
         .when(
             matches!(
                 session.overlay,
@@ -11332,9 +11444,15 @@ fn overlay(
                 .when_some(card, |card, height| card.h(px(height)))
                 .opacity(opacity)
                 .into_any_element(),
-            Overlay::Snooze => {
-                snooze::card(theme, &session.snooze, opacity, window, cx).into_any_element()
-            }
+            Overlay::Snooze => snooze::card(
+                theme,
+                &session.snooze,
+                opacity,
+                card,
+                f32::from(window.viewport_size().width) - snooze_anchor.0,
+                cx,
+            )
+            .into_any_element(),
             Overlay::Help => help
                 .map_or_else(div, |(_, content)| content)
                 .opacity(opacity)
@@ -11346,6 +11464,10 @@ fn overlay(
                 .into_any_element(),
             Overlay::None => div().into_any_element(),
         })
+}
+
+fn palette_caret(theme: &Theme) -> gpui::Div {
+    div().flex_none().w(px(2.)).h(px(16.)).bg(rgb(theme.accent))
 }
 
 fn palette(
@@ -11389,7 +11511,7 @@ fn palette(
                 .border_color(rgb(theme.border))
                 .child(div().text_color(rgb(theme.accent)).child(":"))
                 .child(div().child(session.palette_query.clone()))
-                .child(div().w(px(2.)).h(px(16.)).bg(rgb(theme.accent))),
+                .child(palette_caret(theme)),
         )
         .child(
             div()
@@ -13670,15 +13792,15 @@ mod tests {
     #[test]
     fn expanded_sender_truncates_without_losing_the_address_or_date() {
         let fields = [900.0, 135.0, 35.0, 30.0];
-        assert_eq!(expanded_header_widths(1_200.0, fields), fields);
+        assert_eq!(expanded_header_widths(1_200.0, fields, 0.0), fields);
         assert_eq!(
-            expanded_header_widths(502.0, fields),
+            expanded_header_widths(502.0, fields, 0.0),
             [272.0, 135.0, 35.0, 30.0]
         );
 
         let width = 150.0;
         let [sender, email, folders, date] =
-            expanded_header_widths(width, [300.0, 225.0, 200.0, 55.0]);
+            expanded_header_widths(width, [300.0, 225.0, 200.0, 55.0], 0.0);
         assert_eq!(date, 55.0);
         assert!(sender > 0.0 && email > 0.0 && folders > 0.0);
         assert!(sender + email + folders + date + MESSAGE_HEADER_GAP_PX * 3.0 <= width);
@@ -13686,8 +13808,15 @@ mod tests {
         let [sender, email, folders, date] = expanded_header_widths(
             super::message_content_width(360.0),
             [300.0, 225.0, 0.0, 55.0],
+            0.0,
         );
         assert_eq!([sender, email, folders, date], [108.5, 108.5, 0.0, 55.0]);
+
+        let fields = [180.0, 205.0, 250.0, 40.0];
+        let [sender, email, folders, date] = expanded_header_widths(540.0, fields, 223.0);
+        assert_eq!(folders, 223.0);
+        assert!(sender > 0.0 && email > 0.0);
+        assert_eq!(date, 40.0);
     }
 
     #[test]
@@ -13699,7 +13828,7 @@ mod tests {
                 |reading, progress| ReaderColumns::new(width, split, reading, progress, 2.0);
             let measure = |columns, fields| {
                 let mut layers = Vec::new();
-                expanded_header_flow(columns, fields, |widths| {
+                expanded_header_flow(columns, fields, 0.0, |widths| {
                     layers.push(widths);
                     div().into_any_element()
                 });

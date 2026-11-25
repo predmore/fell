@@ -48,6 +48,8 @@ pub struct ThreadRow {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConvMessage {
+    pub muted: bool,
+    pub wake_at: Option<i64>,
     /// The message's Message-ID, which open state is kept by.
     pub id: String,
     pub sender: String,
@@ -511,9 +513,11 @@ pub(crate) fn folder_thread_rows(
     folder: &str,
 ) -> Vec<ThreadRow> {
     let mut rows = thread_rows(threads, me);
-    if folder == fell_core::store::SNOOZED {
-        for row in &mut rows {
-            row.wake_at = Some(-row.date_unix);
+    for row in &mut rows {
+        match folder {
+            fell_core::store::SNOOZED => row.wake_at = Some(-row.date_unix),
+            fell_core::store::MUTED => row.muted = false,
+            _ => {}
         }
     }
     rows
@@ -880,6 +884,8 @@ pub fn conversation(
         .map(|(index, message)| {
             let email = message.headers.from.email.clone();
             ConvMessage {
+                muted: false,
+                wake_at: None,
                 id: message.headers.message_id.as_str().to_string(),
                 mail_headers: mail_headers(message),
                 sender: display_name(&message.headers.from.name, &email, me),
@@ -1124,14 +1130,14 @@ fn days_in_month(year: i32, month: u8) -> u8 {
     }
 }
 
-fn weekday(wday: u8) -> &'static str {
+pub(crate) fn weekday(wday: u8) -> &'static str {
     ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
         .get(wday as usize)
         .copied()
         .unwrap_or("Day")
 }
 
-fn month_name(month: u8) -> &'static str {
+pub(crate) fn month_name(month: u8) -> &'static str {
     [
         "", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ]
@@ -1513,6 +1519,8 @@ mod tests {
 
     fn shown_message(id: &str, state: fell_core::BodyState, body: &str) -> ConvMessage {
         ConvMessage {
+            muted: false,
+            wake_at: None,
             id: id.into(),
             sender: "Ada".into(),
             email: "ada@x".into(),
