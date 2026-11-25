@@ -2406,7 +2406,10 @@ fn tab_before_the_store_is_ready_accepts_the_first_correspondent_reply() {
         assert!(inbox.search_view.accept_pending);
         inbox
     });
-    let deadline = Instant::now() + Duration::from_secs(3);
+    // The store opens on a real background thread, so this waits on wall
+    // time. The deadline only guards against a hang: a loaded machine can
+    // take seconds to open the store.
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         app.run_until_parked();
         app.executor().advance_clock(recipient_menu::QUERY_DELAY);

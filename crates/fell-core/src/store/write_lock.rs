@@ -808,9 +808,11 @@ mod tests {
         ui.apply_delta(&account_id, &delta(1, 1)).unwrap();
 
         let sync = Sync::start(&path, 1_000);
-        // Generous for a loaded machine, and well under the 5 s lock wait
-        // after which a write used to give up.
-        let quick = Duration::from_secs(2);
+        // This checks that a UI write gets its turn, not how fast: a write
+        // starved by sync waits the whole LOCK_WAIT and then fails, while a
+        // loaded CI runner can take seconds for a write that got its turn.
+        // `measure_action_latency_during_a_large_sync` measures latency.
+        let quick = super::LOCK_WAIT / 3;
 
         let (archived, took) = timed("archive", || {
             ui.archive_thread(&account_id, &target.thread_id, "INBOX")
