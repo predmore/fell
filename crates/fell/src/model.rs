@@ -335,6 +335,7 @@ pub struct PickerChoice {
     pub name: String,
     pub title: String,
     pub detail: Option<String>,
+    pub date: Option<String>,
     pub mark: Option<&'static str>,
     pub divider: bool,
 }
@@ -357,6 +358,7 @@ pub enum ThreadEdit {
     Merge {
         sources: Vec<String>,
         target: String,
+        subject: String,
     },
 }
 
@@ -1132,6 +1134,7 @@ impl Session {
                 PickerChoice {
                     title: self.roles.label(&name),
                     detail: self.folder_detail(&name),
+                    date: None,
                     mark: None,
                     name,
                     divider,
@@ -1165,6 +1168,7 @@ impl Session {
                     name: name.clone(),
                     title: name.clone(),
                     detail: None,
+                    date: None,
                     mark: match count {
                         0 => None,
                         n if n == self.label_selection.ids.len() => Some("✓"),
@@ -1185,6 +1189,7 @@ impl Session {
                 name: query.to_string(),
                 title: format!("Create label “{query}”"),
                 detail: None,
+                date: None,
                 mark: Some("+"),
                 divider: !choices.is_empty(),
             });
@@ -2542,6 +2547,11 @@ impl Session {
             FolderIntent::Merge => Step {
                 threading: Some(ThreadEdit::Merge {
                     sources: std::mem::take(&mut self.merge_sources),
+                    subject: self
+                        .merge_choices
+                        .iter()
+                        .find(|choice| choice.name == name)
+                        .map_or_else(String::new, |choice| choice.title.clone()),
                     target: name,
                 }),
                 ..Step::default()
@@ -6718,6 +6728,7 @@ mod tests {
             context: None,
             body_state: fell_core::BodyState::Stored,
             joined_by_subject: false,
+            merged_by_you: false,
             reader_parts: Default::default(),
         }
     }

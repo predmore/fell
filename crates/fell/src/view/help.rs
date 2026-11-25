@@ -133,6 +133,8 @@ impl HelpScroll {
     }
 }
 
+const SUBJECT_JOIN_HELP: &str = "Joined by subject · Fell matched the subject and participants because reply headers were missing. Space c s splits it off.";
+
 pub(super) struct Layout {
     top: f32,
     width: f32,
@@ -140,7 +142,7 @@ pub(super) struct Layout {
     row: f32,
     line: f32,
     stacked: bool,
-    detail: Option<String>,
+    details: Vec<(String, bool, usize)>,
     detail_rows: usize,
     page: usize,
     total: usize,
@@ -148,12 +150,23 @@ pub(super) struct Layout {
 
 impl Layout {
     pub(super) fn for_window(theme: &Theme, session: &Session, window: &Window) -> Self {
+        let error = session.detail_text().map(|text| (text, true));
+        let subject_join = session
+            .messages
+            .iter()
+            .any(|message| message.joined_by_subject)
+            && super::present::visible_panes(
+                f32::from(window.viewport_size().width),
+                session.pane,
+                session.full_width,
+            )
+            .1;
         Self::measure(
             theme.ui_px,
             window.viewport_size(),
-            session.detail_text().or_else(|| Some(
-                "Joined by subject · Fell matched the subject and participants because reply headers were missing.".into()
-            )),
+            error
+                .into_iter()
+                .chain(subject_join.then(|| (SUBJECT_JOIN_HELP.into(), false))),
             |error, width| {
                 let style = conversation_line_style(window, theme, px(theme.ui_px));
                 window
@@ -178,8 +191,8 @@ impl Layout {
     fn measure(
         ui_px: f32,
         viewport: Size<Pixels>,
-        detail: Option<String>,
-        count_detail_rows: impl FnOnce(&str, f32) -> usize,
+        details: impl IntoIterator<Item = (String, bool)>,
+        count_detail_rows: impl Fn(&str, f32) -> usize,
     ) -> Self {
         let viewport_height = f32::from(viewport.height);
         let top = CARD_TOP_PX.min((viewport_height - 150.).max(0.));
@@ -190,9 +203,14 @@ impl Layout {
         let row = if stacked { 2. * line } else { line + 4. };
         let header = (ui_px + 26.).ceil();
         let height = (viewport_height - top - 16.).min(MAX_HEIGHT);
-        let detail_rows = detail
-            .as_deref()
-            .map_or(0, |error| count_detail_rows(error, text_width));
+        let details: Vec<_> = details
+            .into_iter()
+            .map(|(text, error)| {
+                let lines = count_detail_rows(&text, text_width);
+                (text, error, lines)
+            })
+            .collect();
+        let detail_rows = details.iter().map(|(_, _, lines)| *lines).sum();
         let total = actions().count() + detail_rows;
         let page = (((height - header - 2. - 2. * INSET) / row) as usize).clamp(1, total);
         Self {
@@ -202,7 +220,7 @@ impl Layout {
             row,
             line,
             stacked,
-            detail,
+            details,
             detail_rows,
             page,
             total,
@@ -283,28 +301,24 @@ fn card(
                         .right(px(RIGHT))
                         .h(px(body))
                         .overflow_hidden()
-                        .when_some(
-                            layout
-                                .detail
-                                .as_ref()
-                                .filter(|_| first < layout.detail_rows),
-                            |rows, detail| {
-                                rows.child(
+                        .children((first < layout.detail_rows).then(|| {
+                            div()
+                                .absolute()
+                                .left_0()
+                                .right_0()
+                                .top(px(-offset))
+                                .line_height(px(layout.row))
+                                .children(layout.details.iter().map(|(text, error, lines)| {
                                     div()
-                                        .absolute()
-                                        .left_0()
-                                        .right_0()
-                                        .top(px(-offset))
-                                        .line_height(px(layout.row))
-                                        .text_color(rgb(if session.detail_text().is_some() {
+                                        .h(px(layout.row * *lines as f32))
+                                        .text_color(rgb(if *error {
                                             theme.error
                                         } else {
                                             theme.dimmed
                                         }))
-                                        .child(detail.clone()),
-                                )
-                            },
-                        )
+                                        .child(text.clone())
+                                }))
+                        }))
                         .child(
                             div()
                                 .absolute()

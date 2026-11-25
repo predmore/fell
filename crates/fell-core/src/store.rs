@@ -48,6 +48,7 @@ pub use intents::PendingFlags;
 pub(crate) use summaries::folder_names as message_folder_names;
 pub(crate) use summaries::label_names;
 pub use summaries::{FolderPage, FolderSpan, ListFilter, ListKey, ListSource, ThreadList};
+pub use threads::MergeCandidate;
 
 #[derive(Clone, Debug, Default)]
 pub struct ThreadLabels {
@@ -4009,6 +4010,7 @@ fn take_local_state(
             into.canonical_id
         ],
     )?;
+    threads::retarget_override(conn, account_id, &from.canonical_id, &into.canonical_id)?;
     sync_terms(conn, account_id.as_str(), &old_terms, &new_terms)?;
     Ok(())
 }

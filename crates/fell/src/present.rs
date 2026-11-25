@@ -51,6 +51,7 @@ pub struct ConvMessage {
     pub muted: bool,
     pub wake_at: Option<i64>,
     pub joined_by_subject: bool,
+    pub merged_by_you: bool,
     /// The message's Message-ID, which open state is kept by.
     pub id: String,
     pub sender: String,
@@ -81,6 +82,18 @@ pub struct ConvMessage {
 }
 
 impl ConvMessage {
+    pub fn grouping_marker(&self, split_key: Option<&str>) -> Option<String> {
+        let mut markers = Vec::new();
+        if self.merged_by_you {
+            markers.push("merged by you");
+        }
+        if self.joined_by_subject {
+            markers.push("joined by subject");
+            markers.extend(split_key);
+        }
+        (!markers.is_empty()).then(|| markers.join(" · "))
+    }
+
     pub fn needs_reader_parts(&self) -> bool {
         match self.reader_parts {
             fell_core::ReaderParts::Unknown => true,
@@ -880,6 +893,7 @@ pub fn conversation(
                 wake_at: None,
                 id: message.headers.message_id.as_str().to_string(),
                 joined_by_subject: false,
+                merged_by_you: false,
                 mail_headers: mail_headers(message),
                 sender: display_name(&message.headers.from.name, &email, me),
                 email,
@@ -1516,6 +1530,7 @@ mod tests {
             wake_at: None,
             id: id.into(),
             joined_by_subject: false,
+            merged_by_you: false,
             sender: "Ada".into(),
             email: "ada@x".into(),
             mail_headers: Vec::new(),

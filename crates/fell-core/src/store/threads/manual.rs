@@ -9,6 +9,7 @@ use rusqlite::{Connection, params};
 use super::{direct_parent, rows_in_thread, stored_parent};
 use crate::actions::{ActionKind, LocalAction, ensure_action_schema, insert_local_action};
 use crate::store::{ListKey, Store, immediate_transaction};
+use crate::threading::{subject_is_generic, thread_subject};
 use crate::{AccountId, Error, MessageId, Result, ThreadId};
 
 pub(crate) const ACTION_SCHEMA: &str = "
@@ -20,6 +21,8 @@ CREATE TABLE IF NOT EXISTS local_action_thread_members (
     after_thread TEXT NOT NULL,
     PRIMARY KEY (action_id, message_id)
 ) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_local_action_thread_members_message
+    ON local_action_thread_members(message_id, action_id DESC);
 CREATE TABLE IF NOT EXISTS local_action_thread_notes (
     action_id INTEGER NOT NULL REFERENCES local_actions(id),
     note_id INTEGER NOT NULL,
@@ -28,35 +31,113 @@ CREATE TABLE IF NOT EXISTS local_action_thread_notes (
 ) WITHOUT ROWID;
 ";
 
+#[derive(Debug)]
+pub struct MergeCandidate {
+    pub thread: ThreadId,
+    pub subject: String,
+    pub sender_name: Option<String>,
+    pub sender_email: String,
+    pub date_unix: i64,
+}
+
 impl Store {
-    /// Recent account-wide merge destinations, filtered by subject or sender.
+    /// Rank account-wide merge destinations by topic, people, and recency.
     pub fn merge_candidates(
         &self,
         account: &AccountId,
         sources: &[String],
         query: &str,
-    ) -> Result<Vec<(ThreadId, String, String, i64)>> {
+        own_email: &str,
+    ) -> Result<Vec<MergeCandidate>> {
         let words: Vec<_> = query.split_whitespace().take(20).collect();
+        let source_ids = serde_json::json!(sources).to_string();
+        let mut keys = HashSet::new();
+        let mut people = HashSet::new();
+        let mut source = self.conn.prepare_cached(
+            "SELECT subject, participants FROM json_each(?2) s JOIN thread_summary t
+               ON t.account_id = ?1 AND t.thread_id = s.value",
+        )?;
+        let source = source.query_map(params![account.as_str(), source_ids], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in source {
+            let (subject, participants) = row?;
+            let (key, _) = thread_subject(&subject);
+            if !subject_is_generic(&key) {
+                keys.insert(key);
+            }
+            people.extend(
+                super::super::decode_participants(&participants)
+                    .into_iter()
+                    .map(|person| person.email.to_ascii_lowercase())
+                    .filter(|email| !email.eq_ignore_ascii_case(own_email)),
+            );
+        }
         let mut stmt = self.conn.prepare_cached(
-            "SELECT thread_id, subject, COALESCE(NULLIF(latest_name, ''), latest_email), last_date
-             FROM thread_summary WHERE account_id = ?1
-               AND thread_id NOT IN (SELECT value FROM json_each(?2))
+            "WITH related(thread_id) AS MATERIALIZED (
+                 SELECT DISTINCT m.thread_id FROM json_each(?4) keys
+                 JOIN subject_index s ON s.account_id = ?1 AND s.subject_key = keys.value
+                 JOIN messages m ON m.rowid = s.message_rowid
+             )
+             SELECT t.thread_id, t.subject, t.latest_name, t.latest_email, t.last_date
+             FROM thread_summary t LEFT JOIN related r ON r.thread_id = t.thread_id
+             WHERE t.account_id = ?1 AND t.thread_id NOT IN (SELECT value FROM json_each(?2))
                AND NOT EXISTS (
                    SELECT 1 FROM json_each(?3)
-                   WHERE NOT instr(lower(subject || ' ' || latest_email || ' ' || COALESCE(latest_name, '')),
+                   WHERE NOT instr(lower(t.subject || ' ' || t.latest_email || ' ' || COALESCE(t.latest_name, '')),
                                    lower(value))
                )
-             ORDER BY last_date DESC, thread_id LIMIT 32",
+             ORDER BY r.thread_id IS NOT NULL DESC,
+               (SELECT COUNT(*) FROM json_each(?5) p
+                WHERE instr(char(31) || lower(t.participants) || char(30),
+                            char(31) || p.value || char(30))) DESC,
+               t.last_date DESC, t.thread_id LIMIT 32",
         )?;
         Ok(stmt
             .query_map(
                 params![
                     account.as_str(),
-                    serde_json::json!(sources).to_string(),
-                    serde_json::json!(words).to_string()
+                    source_ids,
+                    serde_json::json!(words).to_string(),
+                    serde_json::json!(keys).to_string(),
+                    serde_json::json!(people).to_string()
                 ],
-                |row| Ok((ThreadId(row.get(0)?), row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok(MergeCandidate {
+                        thread: ThreadId(row.get(0)?),
+                        subject: row.get(1)?,
+                        sender_name: row.get(2)?,
+                        sender_email: row.get(3)?,
+                        date_unix: row.get(4)?,
+                    })
+                },
             )?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Messages whose current explicit assignment comes from a merge.
+    pub fn thread_manual_merges(
+        &self,
+        account: &AccountId,
+        thread: &ThreadId,
+    ) -> Result<HashSet<MessageId>> {
+        if !self.conn.prepare_cached(
+            "SELECT EXISTS (SELECT 1 FROM thread_overrides WHERE account_id = ?1 AND thread_id = ?2)",
+        )?.query_row(params![account.as_str(), thread.as_str()], |row| row.get::<_, bool>(0))? {
+            return Ok(HashSet::new());
+        }
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT o.message_id FROM thread_overrides o
+             WHERE o.account_id = ?1 AND o.thread_id = ?2
+               AND (SELECT a.kind FROM local_action_thread_members s JOIN local_actions a ON a.id = s.action_id
+                    WHERE s.message_id = o.message_id AND s.after_thread = o.thread_id
+                      AND a.account_id = o.account_id AND a.undone = 0
+                    ORDER BY s.action_id DESC LIMIT 1) = 'merge_threads'",
+        )?;
+        Ok(stmt
+            .query_map(params![account.as_str(), thread.as_str()], |row| {
+                row.get(0).map(MessageId)
+            })?
             .collect::<rusqlite::Result<_>>()?)
     }
 
@@ -322,6 +403,36 @@ pub(crate) fn undo(
         }
     }
     Ok(threads)
+}
+
+/// A UIDVALIDITY repair proved these two synthetic IDs name the same mail.
+pub(in crate::store) fn retarget_override(
+    conn: &Connection,
+    account: &AccountId,
+    from: &str,
+    into: &str,
+) -> Result<()> {
+    let account = account.as_str();
+    let Some(thread) = super::stored_override(conn, account, &MessageId(from.into()))? else {
+        return Ok(());
+    };
+    conn.prepare_cached(
+        "INSERT OR IGNORE INTO thread_overrides (account_id, message_id, thread_id)
+         VALUES (?1, ?2, ?3)",
+    )?
+    .execute(params![account, into, thread.as_str()])?;
+    conn.prepare_cached("DELETE FROM thread_overrides WHERE account_id = ?1 AND message_id = ?2")?
+        .execute(params![account, from])?;
+    conn.prepare_cached(
+        "UPDATE OR IGNORE local_action_thread_members SET message_id = ?3 WHERE message_id = ?2
+         AND action_id IN (SELECT id FROM local_actions WHERE account_id = ?1 AND undone = 0)",
+    )?
+    .execute(params![account, from, into])?;
+    let id = MessageId(into.into());
+    if let Some(onto) = super::stored_override(conn, account, &id)? {
+        restore_member(conn, account, &id, &onto)?;
+    }
+    Ok(())
 }
 
 fn restore_member(

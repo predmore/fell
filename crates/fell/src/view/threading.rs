@@ -3,11 +3,13 @@ use super::*;
 pub(super) struct RegroupMotion {
     pub transition: Transition,
     removed_prefix: f32,
+    old_title: String,
     arriving: HashSet<String>,
 }
 
 pub(super) struct RegroupFrame {
     pub gap: f32,
+    pub old_title: String,
     pub progress: f32,
     pub arriving: HashSet<String>,
 }
@@ -17,21 +19,45 @@ impl RegroupMotion {
         let progress = self.transition.progress(now);
         RegroupFrame {
             gap: self.removed_prefix * (1. - progress),
+            old_title: self.old_title.clone(),
             progress,
             arriving: self.arriving.clone(),
         }
     }
 }
 
+pub(super) struct RegroupSelection {
+    pub selected: String,
+    pub previous: ThreadRow,
+    pub fade: Transition,
+}
+
 impl Inbox {
+    pub(super) fn fade_regroup_selection(&mut self, previous: Option<ThreadRow>, now: Instant) {
+        self.regroup_selection = previous
+            .zip(self.session.cursor_thread())
+            .filter(|(previous, current)| previous != *current)
+            .and_then(|(previous, current)| {
+                self.motion
+                    .motion
+                    .start(motion::FADE, now)
+                    .map(|fade| RegroupSelection {
+                        selected: current.id.clone(),
+                        previous,
+                        fade,
+                    })
+            });
+    }
+
     pub(super) fn search_merge_targets(&mut self, cx: &mut Context<Self>) {
         let account = self.account_id.clone();
         let generation = self.session.merge_search;
+        let me = self.session.account_email.clone();
         let sources = self.session.merge_sources.clone();
         let query = self.session.folder_query.clone();
         let reply = self
             .store
-            .call(move |store| store.merge_candidates(&account, &sources, &query));
+            .call(move |store| store.merge_candidates(&account, &sources, &query, &me));
         cx.spawn(async move |this, cx| {
             let result = reply
                 .await
@@ -49,18 +75,19 @@ impl Inbox {
                     Ok(rows) => {
                         session.merge_choices = rows
                             .into_iter()
-                            .map(|(id, subject, sender, date)| PickerChoice {
-                                name: id.0,
-                                title: if subject.trim().is_empty() {
+                            .map(|row| PickerChoice {
+                                name: row.thread.0,
+                                title: if row.subject.trim().is_empty() {
                                     "(no subject)".into()
                                 } else {
-                                    subject
+                                    row.subject
                                 },
-                                detail: Some(format!(
-                                    "{} · {}",
-                                    present::display_safe(&sender),
-                                    present::relative_date(now_unix(), date)
+                                detail: Some(present::display_name(
+                                    &row.sender_name,
+                                    &row.sender_email,
+                                    &session.account_email,
                                 )),
+                                date: Some(present::relative_date(now_unix(), row.date_unix)),
                                 mark: None,
                                 divider: false,
                             })
@@ -98,16 +125,25 @@ impl Inbox {
                             &ThreadId(thread),
                             &fell_core::MessageId(message),
                         )?;
-                        (destination, true, "Conversation split")
+                        (
+                            destination,
+                            true,
+                            "Split into its own conversation · u".to_owned(),
+                        )
                     }
-                    ThreadEdit::Merge { sources, target } => {
+                    ThreadEdit::Merge {
+                        sources,
+                        target,
+                        subject,
+                    } => {
                         let follow = select
                             .as_ref()
                             .is_some_and(|id| sources.contains(id) || id == &target);
                         let sources: Vec<_> = sources.into_iter().map(ThreadId).collect();
                         let target = ThreadId(target);
                         store.merge_threads(&account, &sources, &target)?;
-                        (target, follow, "Conversations merged")
+                        let subject = present::display_safe(&subject).replace(['“', '”'], "'");
+                        (target, follow, format!("Merged into “{subject}” · u"))
                     }
                 };
                 let key = follow
@@ -203,6 +239,7 @@ impl Inbox {
             .map(|transition| RegroupMotion {
                 transition,
                 removed_prefix,
+                old_title: self.open_subject.clone(),
                 arriving,
             });
         self.session.refresh_messages(view, false);

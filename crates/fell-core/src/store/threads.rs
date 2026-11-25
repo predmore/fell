@@ -32,6 +32,8 @@ use crate::threading::{
 };
 
 mod manual;
+pub use manual::MergeCandidate;
+pub(super) use manual::retarget_override;
 pub(crate) use manual::{ACTION_SCHEMA, undo};
 
 /// Tables behind [`rethread_dirty`]. Safe to run on every open.
@@ -534,26 +536,14 @@ pub(super) fn rethread_dirty(conn: &Connection, account_id: &AccountId) -> Resul
     }
 
     let manual = ManualThreads::load(conn, account)?;
-    if !manual.overrides.is_empty() {
-        include_descendants(conn, account, &mut affected)?;
+    let mut rows = manual.apply(conn, account, affected_rows(conn, account, &affected)?)?;
+    let descendants = manual_descendants(conn, account, &manual, &rows)?;
+    if !descendants.is_empty() {
+        let added: BTreeSet<_> = descendants.difference(&affected).copied().collect();
+        rows.extend(manual.apply(conn, account, affected_rows(conn, account, &added)?)?);
+        rows.sort_unstable_by_key(|row| row.rowid);
     }
-    let rows = {
-        let mut stmt = conn.prepare_cached(&format!(
-            "SELECT {THREADING_COLS} FROM messages WHERE rowid = ?1 AND account_id = ?2"
-        ))?;
-        let mut out = Vec::with_capacity(affected.len());
-        for rowid in &affected {
-            if let Some(row) = stmt
-                .query_row(params![rowid, account], threading_row)
-                .optional()?
-            {
-                out.push(row);
-            }
-        }
-        out
-    };
 
-    let rows = manual.apply(conn, account, rows)?;
     let mut parents: HashMap<MessageId, Option<ThreadId>> = HashMap::new();
     let mut lookup = |parent: &MessageId| -> Result<Option<ThreadId>> {
         if let Some(found) = parents.get(parent) {
@@ -578,7 +568,11 @@ pub(super) fn rethread_dirty(conn: &Connection, account_id: &AccountId) -> Resul
         }
     }
     for (member, preferred) in &edges {
-        union.union_prefer(member, preferred, &manual);
+        if manual.pinned(preferred) {
+            union.absorb_parent(member, preferred, &manual);
+        } else {
+            union.union_prefer(member, preferred, &manual);
+        }
     }
     let nodes: Vec<String> = edge_nodes(&edges).map(str::to_string).collect();
     relabel(
@@ -589,43 +583,77 @@ pub(super) fn rethread_dirty(conn: &Connection, account_id: &AccountId) -> Resul
     )
 }
 
-/// A manual parent can carry a reply chain across the boundary one message
-/// at a time. Read the transitive dependents of changed mail before applying
-/// those routes. Indexes bound this to the affected references and subjects.
-fn include_descendants(
+fn affected_rows(
     conn: &Connection,
     account: &str,
-    affected: &mut BTreeSet<i64>,
-) -> Result<()> {
-    let mut stmt = conn.prepare_cached(
-        "WITH identity(id) AS (
-             SELECT message_id FROM messages WHERE rowid = ?2
-             UNION ALL
-             SELECT a.message_id FROM message_aliases a
-             JOIN messages m ON m.account_id = a.account_id AND m.message_id = a.canonical_message_id
-             WHERE m.rowid = ?2
-         )
-         SELECT r.child_rowid FROM identity i JOIN message_refs r
-           ON r.account_id = ?1 AND r.ref_id = i.id
-         UNION ALL
-         SELECT later.message_rowid FROM subject_index s JOIN subject_index later
-           ON later.account_id = s.account_id AND later.subject_key = s.subject_key
-          AND later.date_unix BETWEEN s.date_unix AND s.date_unix + ?3
-         WHERE s.message_rowid = ?2",
-    )?;
-    let mut todo: Vec<_> = affected.iter().copied().collect();
-    while let Some(rowid) = todo.pop() {
-        let rows = stmt.query_map(params![account, rowid, SUBJECT_WINDOW_SECS], |row| {
-            row.get(0)
-        })?;
-        for child in rows {
-            let child = child?;
-            if affected.insert(child) {
-                todo.push(child);
-            }
+    affected: &BTreeSet<i64>,
+) -> Result<Vec<ThreadingRow>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {THREADING_COLS} FROM messages WHERE rowid = ?1 AND account_id = ?2"
+    ))?;
+    let mut rows = Vec::with_capacity(affected.len());
+    for rowid in affected {
+        if let Some(row) = stmt
+            .query_row(params![rowid, account], threading_row)
+            .optional()?
+        {
+            rows.push(row);
         }
     }
-    Ok(())
+    Ok(rows)
+}
+
+/// Only manually routed rows can carry replies beyond the ordinary dirty
+/// set. Walk their indexed references and subject windows in one query.
+/// UNION visits each row at most once even for cyclical headers.
+fn manual_descendants(
+    conn: &Connection,
+    account: &str,
+    manual: &ManualThreads,
+    rows: &[ThreadingRow],
+) -> Result<BTreeSet<i64>> {
+    let mut seeds = rows
+        .iter()
+        .filter(|row| manual.pinned(row.thread_id.as_str()))
+        .peekable();
+    if seeds.peek().is_none() {
+        return Ok(BTreeSet::new());
+    }
+    let seeds: Vec<_> = seeds.map(|row| row.rowid).collect();
+    let mut stmt = conn.prepare_cached(
+        "WITH RECURSIVE reachable(rowid) AS (
+             SELECT value FROM json_each(?2)
+             UNION
+             SELECT r.child_rowid FROM reachable d
+             JOIN messages m ON m.rowid = d.rowid
+             JOIN message_refs r ON r.account_id = ?1 AND r.ref_id = m.message_id
+             UNION
+             SELECT r.child_rowid FROM reachable d
+             JOIN messages m ON m.rowid = d.rowid
+             JOIN message_aliases a ON a.account_id = ?1 AND a.canonical_message_id = m.message_id
+             JOIN message_refs r ON r.account_id = ?1 AND r.ref_id = a.message_id
+             UNION
+             SELECT later.message_rowid FROM reachable d
+             JOIN subject_index s ON s.message_rowid = d.rowid
+             JOIN subject_index later ON later.account_id = s.account_id
+               AND later.subject_key = s.subject_key
+               AND later.date_unix BETWEEN s.date_unix AND s.date_unix + ?3
+             JOIN messages m ON m.rowid = later.message_rowid
+             WHERE (m.in_reply_to IS NULL OR m.in_reply_to = '') AND m.references_header = ''
+               AND (m.proton_conversation_id IS NULL OR trim(m.proton_conversation_id) = '')
+         )
+         SELECT rowid FROM reachable",
+    )?;
+    Ok(stmt
+        .query_map(
+            params![
+                account,
+                serde_json::json!(seeds).to_string(),
+                SUBJECT_WINDOW_SECS
+            ],
+            |row| row.get(0),
+        )?
+        .collect::<rusqlite::Result<_>>()?)
 }
 
 /// Index the subjects of queued rows without resolving anything. The test
@@ -910,7 +938,11 @@ pub(super) fn rethread_all(conn: &Connection, account_id: &AccountId) -> Result<
         &mut |row| Ok(subject_parent(conn, account, row)?.map(|parent| parent.thread)),
     )?;
     for (member, preferred) in &edges {
-        union.union_prefer(member, preferred, &manual);
+        if manual.pinned(preferred) {
+            union.absorb_parent(member, preferred, &manual);
+        } else {
+            union.union_prefer(member, preferred, &manual);
+        }
     }
     let nodes: Vec<String> = rows.iter().map(|row| row.thread_id.0.clone()).collect();
     relabel(
@@ -934,16 +966,28 @@ fn thread_edges(
 ) -> Result<Vec<(String, String)>> {
     let mut edges = Vec::with_capacity(rows.len() * 2);
     for row in rows {
+        let header = header_parent_thread_id(&row.headers, &mut *lookup)?;
         if manual.pinned(row.thread_id.as_str()) {
+            // A parent can arrive after its child was moved by hand. The
+            // parent follows the child, without reintroducing the child's
+            // former Proton id as an edge.
+            if manual.overrides.contains_key(&row.headers.message_id)
+                && let Some(parent) = header.filter(|parent| !manual.pinned(parent.as_str()))
+            {
+                edges.push((parent.0, row.thread_id.0.clone()));
+            }
             continue;
         }
-        let header = header_parent_thread_id(&row.headers, &mut *lookup)?;
         let onto = resolve_thread_id(&row.headers, &mut *lookup)?;
+        if manual.pinned(onto.as_str()) {
+            continue;
+        }
         edges.push((row.thread_id.0.clone(), onto.0.clone()));
-        if let Some(header) = header {
+        if let Some(header) = header.filter(|parent| !manual.pinned(parent.as_str())) {
             edges.push((header.0, onto.0));
         } else if subject_eligible(&row.headers)
-            && let Some(original) = by_subject(row)?
+            && let Some(original) =
+                by_subject(row)?.filter(|parent| !manual.pinned(parent.as_str()))
         {
             edges.push((row.thread_id.0.clone(), original.0));
         }
@@ -1085,6 +1129,13 @@ impl ThreadUnion {
         self.earliest.get(root).copied().unwrap_or(i64::MAX)
     }
 
+    fn absorb_parent(&mut self, member: &str, pinned: &str, manual: &ManualThreads) {
+        let member = self.find(member);
+        if !manual.pinned(&member) {
+            self.parent.insert(member, pinned.to_owned());
+        }
+    }
+
     /// Merge `member` with `preferred`.
     ///
     /// Two different `proton:` roots stay apart. A proton root absorbs a
@@ -1096,8 +1147,6 @@ impl ThreadUnion {
         if member_root == preferred_root {
             return;
         }
-        // A pin accepts individual replies by ancestry, never an unrelated
-        // thread through the old union's reverse links.
         if manual.pinned(&member_root) || manual.pinned(&preferred_root) {
             return;
         }
@@ -1459,6 +1508,140 @@ mod tests {
             rethread_all(&incremental.conn, &account().id).unwrap();
             assert_eq!(threads_of(&incremental), settled, "seed {seed} fixed point");
         }
+    }
+
+    #[test]
+    fn merge_candidates_choose_topic_and_people_before_newer_mail() {
+        let store = Store::open_in_memory().unwrap();
+        let account = account();
+        store.upsert_account(&account).unwrap();
+        let mail = |id, author, subject: &str, date| {
+            let mut mail = message(id, None, &[], None, "INBOX", author, id, date, None);
+            mail.headers.subject = subject.into();
+            store.upsert_message(&mail).unwrap()
+        };
+        let source = mail("source@x", "a@x", "Re: Warehouse access checklist", 100);
+        let topic = mail("topic@x", "b@x", "Warehouse access checklist", 200);
+        let person = mail("person@x", "a@x", "Drawings for the workshop", 300);
+        let latest = mail("latest@x", "c@x", "Items on sale today", 400);
+        let candidates = store
+            .merge_candidates(&account.id, &[source.0], "", &account.email)
+            .unwrap();
+        assert_eq!(
+            candidates
+                .into_iter()
+                .map(|row| row.thread)
+                .collect::<Vec<_>>(),
+            [topic, person, latest]
+        );
+    }
+
+    #[test]
+    fn late_header_parents_follow_both_sides_of_a_split() {
+        for whole_account in [false, true] {
+            let store = Store::open_in_memory().unwrap();
+            store.full_rethread.set(whole_account);
+            let account = account();
+            store.upsert_account(&account).unwrap();
+            let mail = |id, parent, proton, date| {
+                message(id, parent, &[], proton, "INBOX", "a@x", id, date, None)
+            };
+            let retained = store
+                .upsert_message(&mail(
+                    "retained@x",
+                    Some("parent-a@x"),
+                    Some("old".into()),
+                    200,
+                ))
+                .unwrap();
+            store
+                .upsert_message(&mail(
+                    "detached@x",
+                    Some("parent-b@x"),
+                    Some("old".into()),
+                    300,
+                ))
+                .unwrap();
+            let detached = store
+                .split_thread(&account.id, &retained, &MessageId::new("detached@x"))
+                .unwrap();
+            let parents = Op::Batch(vec![
+                mail("parent-a@x", None, None, 100),
+                mail("parent-b@x", None, Some("lookup".into()), 110),
+            ]);
+            run(&store, &parents);
+            assert_eq!(
+                store
+                    .thread_for_message(&account.id, &MessageId::new("parent-a@x"))
+                    .unwrap(),
+                Some(retained)
+            );
+            assert_eq!(
+                store
+                    .thread_for_message(&account.id, &MessageId::new("parent-b@x"))
+                    .unwrap(),
+                Some(detached)
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrelated_subject_chain_does_not_expand_the_manual_dirty_set() {
+        let store = Store::open_in_memory().unwrap();
+        let account = account();
+        store.upsert_account(&account).unwrap();
+        let mail = |id: &str, date| {
+            let mut mail = message(id, None, &[], None, "INBOX", "a@x", id, date, None);
+            mail.headers.subject = "Re: Repeated billing alerts".into();
+            mail
+        };
+        let rows: Vec<_> = (0..40)
+            .map(|index| mail(&format!("alert-{index}@x"), index * 20 * 86_400))
+            .collect();
+        run(&store, &Op::Batch(rows));
+        let source = store
+            .upsert_message(&message(
+                "source@x",
+                None,
+                &[],
+                None,
+                "INBOX",
+                "b@x",
+                "one",
+                100,
+                None,
+            ))
+            .unwrap();
+        let target = store
+            .upsert_message(&message(
+                "target@x",
+                None,
+                &[],
+                None,
+                "INBOX",
+                "b@x",
+                "two",
+                200,
+                None,
+            ))
+            .unwrap();
+        store
+            .merge_threads(&account.id, &[source], &target)
+            .unwrap();
+
+        let manual = ManualThreads::load(&store.conn, account.id.as_str()).unwrap();
+        let first = rows_in_thread(
+            &store.conn,
+            &account.id,
+            &ThreadId::from_message_id(&MessageId::new("alert-0@x")),
+        )
+        .unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(
+            manual_descendants(&store.conn, account.id.as_str(), &manual, &first)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
