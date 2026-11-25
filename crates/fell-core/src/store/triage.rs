@@ -24,28 +24,25 @@ CREATE TABLE IF NOT EXISTS snooze_returns (
     PRIMARY KEY (account_id, message_id)
 ) WITHOUT ROWID;
 
--- Per-message proof that a NULL snooze came from the timer. One event
--- can clear several messages, with at most one Inbox return.
-CREATE TABLE IF NOT EXISTS snooze_wakes (
+-- One wake event can clear several messages and return one to Inbox.
+-- Undo can reveal an earlier event for the same message.
+CREATE TABLE IF NOT EXISTS snooze_wake_events (
     account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     message_id TEXT NOT NULL,
     until_unix INTEGER NOT NULL,
     event INTEGER NOT NULL,
     return_id TEXT,
     returned_at INTEGER NOT NULL,
+    previous_returned_at INTEGER,
     set_unread INTEGER NOT NULL,
-    PRIMARY KEY (account_id, message_id)
+    PRIMARY KEY (account_id, message_id, event)
 ) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS idx_snooze_wakes_return ON snooze_wakes(account_id, return_id, event);
+CREATE INDEX IF NOT EXISTS idx_snooze_events_return ON snooze_wake_events(account_id, return_id, event);
+CREATE INDEX IF NOT EXISTS idx_snooze_events_revision ON snooze_wake_events(account_id, event);
 
-CREATE TRIGGER IF NOT EXISTS snooze_wake_changed AFTER UPDATE OF snooze_until ON messages
-WHEN old.snooze_until IS NOT new.snooze_until BEGIN
-    DELETE FROM snooze_wakes WHERE account_id = old.account_id AND message_id = old.message_id;
-END;
-
-CREATE TRIGGER IF NOT EXISTS snooze_wake_read_changed AFTER UPDATE OF unread ON messages
+CREATE TRIGGER IF NOT EXISTS snooze_event_read_changed AFTER UPDATE OF unread ON messages
 WHEN old.unread IS NOT new.unread BEGIN
-    UPDATE snooze_wakes SET set_unread = 0
+    UPDATE snooze_wake_events SET set_unread = 0
     WHERE account_id = old.account_id AND return_id = old.message_id AND set_unread = 1;
 END;
 
@@ -204,7 +201,14 @@ impl Store {
                  WHERE account_id = ?1 AND thread_id = ?2 AND snooze_until IS NOT NULL",
                 params![account, thread],
             )?;
+            let mut previous_return = None;
             if let Some((id, unread)) = &inbox {
+                previous_return = tx
+                    .prepare_cached(
+                        "SELECT returned_at FROM snooze_returns WHERE account_id = ?1 AND message_id = ?2",
+                    )?
+                    .query_row(params![account, id], |row| row.get::<_, i64>(0))
+                    .optional()?;
                 tx.execute(
                     "INSERT INTO snooze_returns VALUES (?1, ?2, ?3)
                      ON CONFLICT(account_id, message_id) DO UPDATE SET returned_at = excluded.returned_at",
@@ -226,8 +230,8 @@ impl Store {
                 }
             }
             let mut record = tx.prepare_cached(
-                "INSERT INTO snooze_wakes
-                 SELECT ?1, ?2, ?3, revision, ?4, ?5, ?6 FROM snooze_revision WHERE id = 1",
+                "INSERT INTO snooze_wake_events
+                 SELECT ?1, ?2, ?3, revision, ?4, ?5, ?6, ?7 FROM snooze_revision WHERE id = 1",
             )?;
             for (id, until) in snoozed {
                 record.execute(params![
@@ -236,6 +240,7 @@ impl Store {
                     until,
                     inbox.as_ref().map(|(id, _)| id),
                     now,
+                    previous_return,
                     inbox.as_ref().is_some_and(|(_, unread)| !unread)
                 ])?;
             }
@@ -325,25 +330,33 @@ pub(crate) fn undo_snooze(
 /// takes over the unread state, while the return's ranking is still ours.
 pub(crate) fn undo_wake(conn: &Connection, account: &AccountId, event: i64) -> Result<()> {
     let key = account.as_str();
-    let returned: Option<(String, i64, bool)> = conn
+    let returned: Option<(String, i64, Option<i64>, bool)> = conn
         .prepare_cached(
-            "SELECT return_id, returned_at, set_unread FROM snooze_wakes w
+            "SELECT return_id, returned_at, previous_returned_at, set_unread FROM snooze_wake_events w
          WHERE account_id = ?1 AND event = ?2 AND return_id IS NOT NULL
            AND NOT EXISTS (
-              SELECT 1 FROM snooze_wakes later
+              SELECT 1 FROM snooze_wake_events later
               WHERE later.account_id = w.account_id AND later.return_id = w.return_id
                 AND later.event > w.event
            ) LIMIT 1",
         )?
         .query_row(params![key, event], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })
         .optional()?;
-    if let Some((id, at, set_unread)) = returned {
-        let changed = conn.execute(
-            "DELETE FROM snooze_returns WHERE account_id = ?1 AND message_id = ?2 AND returned_at = ?3",
-            params![key, id, at],
-        )?;
+    if let Some((id, at, previous, set_unread)) = returned {
+        let changed = if let Some(previous) = previous {
+            conn.execute(
+                "UPDATE snooze_returns SET returned_at = ?4
+                 WHERE account_id = ?1 AND message_id = ?2 AND returned_at = ?3",
+                params![key, id, at, previous],
+            )?
+        } else {
+            conn.execute(
+                "DELETE FROM snooze_returns WHERE account_id = ?1 AND message_id = ?2 AND returned_at = ?3",
+                params![key, id, at],
+            )?
+        };
         if changed != 0 {
             let live = crate::store::canonical_id_on(conn, account, &crate::MessageId(id))?;
             if let Some(live) = live {
@@ -359,7 +372,7 @@ pub(crate) fn undo_wake(conn: &Connection, account: &AccountId, event: i64) -> R
         }
     }
     conn.execute(
-        "DELETE FROM snooze_wakes WHERE account_id = ?1 AND event = ?2",
+        "DELETE FROM snooze_wake_events WHERE account_id = ?1 AND event = ?2",
         params![key, event],
     )?;
     Ok(())

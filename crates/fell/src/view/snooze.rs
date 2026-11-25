@@ -5,13 +5,35 @@ use gpui::{
 };
 
 use crate::model::snooze::{
-    PRESETS, Picker, TriageEdit, TriageKind, preset, toast_time, typed, wake_time,
+    PRESETS, Picker, TriageEdit, TriageKind, preset, toast_time, wake_time,
 };
 use crate::model::{Overlay, Toast};
 
 use super::{Inbox, ReadIntent, Theme, ThreadId, motion, now_unix, palette_caret};
 
 impl Inbox {
+    pub(super) fn watch_snooze_clock(cx: &mut Context<Self>) -> gpui::Task<()> {
+        cx.spawn(async move |this, cx| {
+            loop {
+                let seconds = 60 - now_unix().rem_euclid(60) as u64;
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(seconds))
+                    .await;
+                let open = this.update(cx, |inbox, cx| {
+                    if inbox.session.overlay == Overlay::Snooze {
+                        cx.notify();
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if !open.unwrap_or(false) {
+                    break;
+                }
+            }
+        })
+    }
+
     pub(super) fn apply_triage(&mut self, edit: TriageEdit, cx: &mut Context<Self>) {
         let key = self.selected_key();
         let account = self.account_id.clone();
@@ -130,10 +152,11 @@ pub(super) fn card(
     let width = (available - 24.0).clamp(1.0, 416.0);
     let height = height.unwrap_or_else(|| card_height(picker.error));
     let scale = motion::lerp(0.97, 1.0, opacity);
-    let now = picker.opened_at;
+    let now = now_unix();
     let typing = !picker.query.is_empty();
-    let detail = typing.then(|| {
-        typed(now, &picker.query)
+    let detail = (typing && !picker.error).then(|| {
+        picker
+            .deadline(now)
             .map_or_else(|| "Keep typing a time".into(), |at| wake_time(now, at))
     });
     let title = if picker.selected_count > 1 {
@@ -194,6 +217,7 @@ pub(super) fn card(
                                 .flex()
                                 .items_center()
                                 .gap(px(4.0))
+                                .when(!typing, |input| input.child(palette_caret(theme)))
                                 .child(
                                     div()
                                         .min_w_0()
@@ -209,7 +233,7 @@ pub(super) fn card(
                                             "Type a time, e.g. mon 9am".into()
                                         }),
                                 )
-                                .child(palette_caret(theme)),
+                                .when(typing, |input| input.child(palette_caret(theme))),
                         )
                         .children(detail.map(|detail| {
                             div()

@@ -1330,11 +1330,12 @@ pub(crate) fn insert_action(
     conn.execute(
         "INSERT INTO agent_actions (
             account_id, actor, kind, summary, undone, created_unix, target_subject, conversation_count,
-            local_action_floor, outbox_floor
+            local_action_floor, outbox_floor, snooze_floor
          ) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, 1,
                    COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'local_actions'), 0),
                    CASE WHEN ?3 IN ('archive', 'move') THEN
-                       COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'server_outbox'), 0) END)",
+                       COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'server_outbox'), 0) END,
+                   CASE WHEN ?3 = 'snooze' THEN (SELECT revision FROM snooze_revision) END)",
         params![account_id.as_str(), actor, kind, summary, created_unix, subject],
     )?;
     Ok(RecordedAction {
@@ -1477,7 +1478,7 @@ fn undo_messages(conn: &Connection, account_id: &AccountId, action: &RecordedAct
 }
 
 /// A changed live snooze blocks undo unless the timer cleared exactly
-/// that deadline. Collect the timer events before restoring snapshots.
+/// that deadline for this action. Older events can share the deadline.
 fn snooze_wakes(
     conn: &Connection,
     account_id: &AccountId,
@@ -1498,9 +1499,13 @@ fn snooze_wakes(
         "{resolved}
          SELECT DISTINCT w.event FROM resolved s
          JOIN messages m ON m.account_id = ?2 AND m.message_id = s.live_id
-         LEFT JOIN snooze_wakes w ON w.account_id = m.account_id
+         LEFT JOIN snooze_wake_events w ON w.account_id = m.account_id
            AND w.message_id = m.message_id AND w.until_unix = ?3 AND m.snooze_until IS NULL
-         WHERE m.snooze_until IS NOT ?3",
+           AND w.event = (SELECT max(event) FROM snooze_wake_events
+                          WHERE account_id = m.account_id AND message_id = m.message_id)
+           AND w.event > COALESCE((SELECT snooze_floor FROM agent_actions WHERE id = ?1), 0)
+         WHERE m.snooze_until IS NOT ?3
+         ORDER BY w.event DESC",
         resolved = undo_conflicts::RESOLVED_SNAPSHOTS,
     ))?;
     Ok(query

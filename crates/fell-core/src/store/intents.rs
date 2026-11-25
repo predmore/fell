@@ -84,7 +84,7 @@ pub(super) fn remember(
     )?;
     if unread.is_some() {
         conn.execute(
-            "UPDATE snooze_wakes SET set_unread = 0
+            "UPDATE snooze_wake_events SET set_unread = 0
              WHERE account_id = ?1 AND return_id = ?2 AND set_unread = 1",
             params![account_id.as_str(), message_id],
         )?;

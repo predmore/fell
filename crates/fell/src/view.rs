@@ -702,6 +702,7 @@ struct Inbox {
     activity_motion: activity::ActivityMotion,
     help_scroll: help::HelpScroll,
     settings_view: settings::View,
+    snooze_clock: Option<gpui::Task<()>>,
     search_view: search::SearchView,
     search_preview: gpui::Entity<search::CachedPreview>,
     search_rows: gpui::Entity<search::CachedRows>,
@@ -950,6 +951,7 @@ impl Inbox {
             activity_motion: activity::ActivityMotion::default(),
             help_scroll: help::HelpScroll::default(),
             settings_view: settings::View::new(settings, config.as_ref()),
+            snooze_clock: None,
             search_view: search::SearchView::default(),
             search_preview: cx.new(|_| search::CachedPreview::new(reader.clone())),
             search_rows: cx.new(|_| search::CachedRows(reader)),
@@ -4302,7 +4304,7 @@ impl Inbox {
             pane: self.session.pane,
             searching: self.session.search.is_some(),
             search_generation: self.session.search_generation,
-            help_open: self.session.overlay == Overlay::Help,
+            overlay: self.session.overlay.clone(),
             settings_page: (self.session.overlay == Overlay::Settings)
                 .then_some(self.session.settings_nav.page),
         }
@@ -4317,14 +4319,18 @@ impl Inbox {
             pane: pane_before,
             searching,
             search_generation,
-            help_open,
+            overlay,
             settings_page,
         } = before;
         if pane_before != Pane::Conversation && self.session.pane == Pane::Conversation {
             self.reader_entered_conversation();
         }
-        if !help_open && self.session.overlay == Overlay::Help {
+        if overlay != Overlay::Help && self.session.overlay == Overlay::Help {
             self.help_scroll = help::HelpScroll::default();
+        }
+        if (overlay == Overlay::Snooze) != (self.session.overlay == Overlay::Snooze) {
+            self.snooze_clock =
+                (self.session.overlay == Overlay::Snooze).then(|| Self::watch_snooze_clock(cx));
         }
         if let Some(request) = step.agents.clone() {
             self.request_agent_access(request, cx);
@@ -7174,7 +7180,7 @@ struct StepBefore {
     pane: Pane,
     searching: bool,
     search_generation: u64,
-    help_open: bool,
+    overlay: Overlay,
     settings_page: Option<crate::model::settings::Page>,
 }
 
@@ -7419,7 +7425,7 @@ fn thread_line_one(
                     )
                 })
                 .when(row.muted, |line| {
-                    line.child(mute_chip(theme, muted_width, background, dim))
+                    line.child(mute_chip(theme, muted_width, dim))
                 })
                 .children(labels.map(|(group, _)| group)),
         )
@@ -7604,18 +7610,21 @@ fn label_chip(
 
 fn mute_chip_width(theme: &Theme, window: &Window) -> f32 {
     let style = conversation_line_style(window, theme, px((theme.ui_px - 2.0).max(11.0)));
-    line_px_with_style(window, &style, "Muted", FontWeight::NORMAL).ceil() + LABEL_CHIP_CHROME
+    line_px_with_style(window, &style, "Muted", FontWeight::NORMAL).ceil()
 }
 
-fn mute_chip(theme: &Theme, width: f32, background: u32, color: u32) -> gpui::Div {
-    label_chip(
-        theme,
-        "Muted".into(),
-        width,
-        false,
-        theme.label_outline(background),
-        color,
-    )
+fn mute_chip(theme: &Theme, width: f32, color: u32) -> gpui::Div {
+    let size = (theme.ui_px - 2.0).max(11.0);
+    div()
+        .flex_none()
+        .w(px(width))
+        .h(px(LABEL_CHIP_PX))
+        .flex()
+        .items_center()
+        .text_size(px(size))
+        .line_height(px(size + 2.0))
+        .text_color(rgb(color))
+        .child("Muted")
 }
 
 /// A row chip's height, border included: under the 22 px line it sits on.
@@ -9653,9 +9662,7 @@ fn expanded_message_header(
                         .flatten()
                         .map(|line| paint_shaped_text(line, line_height, false)),
                 )
-                .children(
-                    mute_width.map(|width| mute_chip(theme, width, theme.background, theme.dimmed)),
-                )
+                .children(mute_width.map(|width| mute_chip(theme, width, theme.dimmed)))
                 .into_any_element()
         },
     );

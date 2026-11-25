@@ -2240,9 +2240,37 @@ mod tests {
         let woken = store.folder_threads(&account, "INBOX").unwrap();
         assert_eq!(&woken[0].thread_id, last);
         assert!(woken[0].unread);
+
+        store
+            .set_thread_snoozes(&account, std::slice::from_ref(last), Some(500))
+            .unwrap();
+        store.wake_snoozes(500).unwrap();
+        let second_wake = store.folder_threads(&account, "INBOX").unwrap();
+        assert_eq!(second_wake[0].last_date_unix, 500);
+        assert!(second_wake[0].unread);
+        assert_eq!(store.undo_with_note(&account).unwrap().1, None);
+        assert_eq!(store.folder_threads(&account, "INBOX").unwrap(), woken);
+
+        // An old wake for the same deadline cannot stand in for a new one.
+        store
+            .set_thread_snoozes(&account, std::slice::from_ref(last), Some(300))
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE messages SET snooze_until = NULL WHERE thread_id = ?1",
+                [last.as_str()],
+            )
+            .unwrap();
+        assert_eq!(
+            store.undo_with_note(&account).unwrap().1.as_deref(),
+            Some("Snooze already changed")
+        );
+        assert_eq!(store.folder_threads(&account, "INBOX").unwrap(), woken);
+
         assert_eq!(store.undo_with_note(&account).unwrap().1, None);
         assert_eq!(store.folder_threads(&account, "INBOX").unwrap(), before);
-        for table in ["snooze_returns", "snooze_wakes", "local_flag_intents"] {
+        for table in ["snooze_returns", "snooze_wake_events", "local_flag_intents"] {
             assert_eq!(
                 store
                     .conn

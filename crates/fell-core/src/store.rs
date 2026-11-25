@@ -164,7 +164,8 @@ CREATE TABLE IF NOT EXISTS agent_actions (
     target_subject TEXT,
     conversation_count INTEGER,
     local_action_floor INTEGER,
-    outbox_floor INTEGER
+    outbox_floor INTEGER,
+    snooze_floor INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_agent_actions_account ON agent_actions(account_id, id);
@@ -4600,6 +4601,7 @@ fn ensure_agent_action_columns(conn: &Connection) -> Result<()> {
         ("conversation_count", "INTEGER"),
         ("local_action_floor", "INTEGER"),
         ("outbox_floor", "INTEGER"),
+        ("snooze_floor", "INTEGER"),
     ] {
         if !actions.iter().any(|column| column == name)
             && let Err(err) = conn.execute(
