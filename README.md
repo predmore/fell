@@ -112,7 +112,9 @@ writes the changed key and preserves comments and unfamiliar keys.
 Missing or invalid values fall back to the previous defaults. That includes
 `FELL_REDUCE_MOTION`, `read_dwell_ms` in `ui.toml`, `which_key_ms` in
 `keymap.toml`, and the notification mode in `account.toml`. An explicit
-`"system"` for motion follows GTK. Keymap leader changes, plus the search
+`"system"` for motion follows GTK. During an incomplete file edit, Fell keeps its
+last settings. To remove keys deliberately, save an atomic replacement or
+remove the file to restore all fallbacks. Keymap leader changes, plus the search
 model after an install or removal, take effect when you reopen Fell.
 
 ### New mail notifications

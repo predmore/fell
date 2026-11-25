@@ -77,12 +77,12 @@ impl Row {
     pub fn command(self) -> &'static str {
         match self {
             Self::Value(preference) => preference.command(),
-            Self::AccountSetup => "Open account setup",
-            Self::EffectiveBindings => "Show effective bindings",
-            Self::EditKeymap => "Edit keymap.toml",
-            Self::InstallModel => "Install local search model",
-            Self::RemoveModel => "Remove local search model",
-            Self::ManageAgents => "Open Agents",
+            Self::AccountSetup => "Settings: Open account setup",
+            Self::EffectiveBindings => "Settings: Show effective bindings",
+            Self::EditKeymap => "Settings: Edit keymap.toml",
+            Self::InstallModel => "Settings: Install local search model",
+            Self::RemoveModel => "Settings: Remove local search model",
+            Self::ManageAgents => "Settings: Open Agents",
         }
     }
 }
@@ -93,7 +93,7 @@ pub enum Request {
     AccountSetup,
     EditKeymap,
     CheckModel,
-    ScrollConsent(i32),
+    Scroll(i32),
     ChangeModel { install: bool },
 }
 
@@ -108,16 +108,69 @@ pub enum Page {
     },
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct Availability {
+    pub account_setup: bool,
+    pub install_model: bool,
+    pub remove_model: bool,
+}
+
+impl Default for Availability {
+    fn default() -> Self {
+        Self {
+            account_setup: true,
+            install_model: true,
+            remove_model: false,
+        }
+    }
+}
+
+impl Availability {
+    pub fn shows(self, row: Row) -> bool {
+        match row {
+            Row::AccountSetup => self.account_setup,
+            Row::InstallModel => self.install_model,
+            Row::RemoveModel => self.remove_model,
+            _ => true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Nav {
     pub page: Page,
     pub selected: usize,
+    pub availability: Availability,
 }
 
 impl Nav {
+    pub fn reset(&mut self) {
+        self.page = Page::Index;
+        self.selected = 0;
+    }
+
+    pub fn rows(&self, section: Section) -> impl Iterator<Item = Row> {
+        section
+            .rows()
+            .iter()
+            .copied()
+            .filter(|row| self.availability.shows(*row))
+    }
+
+    pub fn set_availability(&mut self, next: Availability) {
+        let selected_row = self.row();
+        self.availability = next;
+        if let Page::Section(section) = self.page {
+            self.selected = selected_row
+                .and_then(|row| self.rows(section).position(|item| item == row))
+                .unwrap_or(0);
+        }
+    }
+
     pub fn select_row(&mut self, row: Row) {
         for section in Section::ALL {
-            if let Some(index) = section.rows().iter().position(|item| *item == row) {
+            let index = self.rows(section).position(|item| item == row);
+            if let Some(index) = index {
                 self.page = Page::Section(section);
                 self.selected = index;
                 break;
@@ -136,11 +189,15 @@ impl Nav {
                     .unwrap();
             }
             Page::Bindings => self.select_row(Row::EffectiveBindings),
-            Page::ConfirmModel { install } => self.select_row(if install {
-                Row::InstallModel
-            } else {
-                Row::RemoveModel
-            }),
+            Page::ConfirmModel { install } => {
+                self.page = Page::Section(Section::Search);
+                self.selected = 0;
+                self.select_row(if install {
+                    Row::InstallModel
+                } else {
+                    Row::RemoveModel
+                });
+            }
         }
         true
     }
@@ -151,12 +208,11 @@ impl Nav {
         (section == Section::Search).then_some(Request::CheckModel)
     }
 
-    pub fn move_to(&mut self, key: KeyId, keymap: &Keymap) {
+    pub fn move_to(&mut self, key: KeyId) {
         let len = match self.page {
             Page::Index => Section::ALL.len(),
-            Page::Section(section) => section.rows().len(),
-            Page::Bindings => bindings(keymap).count(),
-            Page::ConfirmModel { .. } => return,
+            Page::Section(section) => self.rows(section).count(),
+            Page::Bindings | Page::ConfirmModel { .. } => return,
         };
         if len != 0 {
             self.selected = match key {
@@ -171,7 +227,7 @@ impl Nav {
         let Page::Section(section) = self.page else {
             return None;
         };
-        section.rows().get(self.selected).copied()
+        self.rows(section).nth(self.selected)
     }
 }
 
@@ -229,6 +285,34 @@ mod tests {
         session.on_key(KeyId::Char(','), 10);
         session.on_key(KeyId::Char(','), 10);
         assert_eq!(session.overlay, Overlay::Settings);
+    }
+
+    #[test]
+    fn unavailable_actions_are_absent_in_both_settings_and_palette() {
+        let mut session = Session::new("", "", SyncKind::LocalOffline, Keymap::default());
+        session.settings_nav.set_availability(Availability {
+            account_setup: false,
+            ..Availability::default()
+        });
+        assert_eq!(session.settings_nav.rows(Section::Accounts).count(), 0);
+        assert_eq!(
+            session
+                .settings_nav
+                .rows(Section::Search)
+                .collect::<Vec<_>>(),
+            [Row::InstallModel]
+        );
+        session.palette_query = "settings".into();
+        let items = session.palette();
+        assert!(!items.iter().any(|item| matches!(
+            item.action,
+            Action::Setting(Row::AccountSetup | Row::RemoveModel)
+        )));
+        assert!(
+            items
+                .iter()
+                .any(|item| item.action == Action::Setting(Row::EditKeymap))
+        );
     }
 
     #[test]

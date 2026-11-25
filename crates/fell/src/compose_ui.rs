@@ -290,6 +290,7 @@ pub struct ComposeView {
     /// The Omarchy theme this window follows, live. `None` uses the
     /// built-in palette for `theme`.
     look: Option<crate::theme::Theme>,
+    ui_px: f32,
     raw: bool,
     preview: bool,
     quote_open: bool,
@@ -337,13 +338,14 @@ pub struct ComposeView {
     send_detail_scroll: gpui::ScrollHandle,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq)]
 struct StyledBodyKey {
     draft_id: SharedString,
     revision: u64,
     hunk: Option<u64>,
     colors: Palette,
     family: String,
+    text_px: f32,
 }
 
 struct CachedStyledBody {
@@ -415,6 +417,7 @@ impl ComposeView {
             frames: crate::frame_log::FrameLog::from_env(),
             theme: ThemeKind::Dark,
             look: None,
+            ui_px: 16.,
             raw: false,
             preview: false,
             quote_open: false,
@@ -663,7 +666,16 @@ impl ComposeView {
         } else {
             ThemeKind::Dark
         };
+        self.set_font_size(theme.ui_px);
         self.look = Some(theme);
+    }
+
+    pub(crate) fn set_font_size(&mut self, next: f32) -> bool {
+        if self.ui_px == next {
+            return false;
+        }
+        self.ui_px = next;
+        true
     }
 
     pub(crate) fn set_motion(&mut self, next: Motion) -> bool {
@@ -2139,7 +2151,7 @@ impl Render for ComposeView {
             .overflow_hidden()
             .bg(rgb(colors.bg))
             .text_color(rgb(colors.fg))
-            .text_size(px(16.))
+            .text_size(px(self.ui_px))
             .font_weight(FontWeight(400.))
             .font_family(ui_family.clone())
             .when_some(self.frames.clone(), |root, frames| {
@@ -2181,7 +2193,10 @@ impl Render for ComposeView {
                         self.quote_view(&snap, colors)
                             .map(|quote| quote.flex_shrink_0()),
                     )
-                    .children(self.preview.then(|| preview_panel(&snap, colors))),
+                    .children(
+                        self.preview
+                            .then(|| preview_panel(&snap, colors, self.ui_px)),
+                    ),
             )
             .child(attachment_row(&snap, colors, wide).flex_shrink_0())
             .children(feedback)
@@ -2262,9 +2277,12 @@ impl ComposeView {
         // margin, since the shaped width runs a little under the painted.
         let row_px = f32::from(window.viewport_size().width) - 32.0 - 10.0 - LABEL_PX - 12.0 - 24.0;
         let fit = |who: &str, what: &str, when: &str| {
-            let room =
-                row_px - text_px(window, who, 16.0, family) - text_px(window, when, 16.0, family);
-            fit_px(what, room, &|text| text_px(window, text, 16.0, family))
+            let room = row_px
+                - text_px(window, who, self.ui_px, family)
+                - text_px(window, when, self.ui_px, family);
+            fit_px(what, room, &|text| {
+                text_px(window, text, self.ui_px, family)
+            })
         };
         let none = HashSet::new();
         // An empty To says what it needs, in the error colour while it
@@ -2352,7 +2370,7 @@ impl ComposeView {
                 // and rule, and a margin for the shaped width running
                 // under the painted.
                 let room = f32::from(window.viewport_size().width) - 32.0 - 8.0 - 2.0 - 6.0;
-                let measure = |text: &str| text_px(window, text, 16.0, family);
+                let measure = |text: &str| text_px(window, text, self.ui_px, family);
                 Some(hunk_banner(snap, self.focused_hunk, colors, room, &measure))
             } else if snap.send_requested_by.is_some() {
                 // The row stays, so an edit arriving later does not push the
@@ -2363,7 +2381,6 @@ impl ComposeView {
                         .py_1()
                         .border_l(px(2.))
                         .border_color(rgb(colors.panel))
-                        .text_size(px(16.))
                         .text_color(rgb(colors.dim))
                         .child("no agent edits to review"),
                 )
@@ -2387,6 +2404,7 @@ impl ComposeView {
                 hunk: self.focused_hunk,
                 colors,
                 family: family.to_owned(),
+                text_px: self.ui_px,
             };
             if self
                 .styled_cache
@@ -2449,11 +2467,12 @@ impl ComposeView {
         // Room for an agent edit's "was" text: the body, less its padding,
         // the "was" label and its gap, and a margin for the shaped width
         // running under the painted.
-        let measure = |text: &str| text_px(window, text, 16.0, family);
+        let measure = |text: &str| text_px(window, text, self.ui_px, family);
         let was_room = f32::from(window.viewport_size().width) - 40.0 - measure("was") - 8.0 - 8.0;
         let was_lines = |text: &str| break_lines(text, was_room, &measure);
         let paint = SourcePaint {
             colors,
+            text_px: self.ui_px,
             font: gpui::font(if self.raw { "monospace" } else { family }.to_owned()),
             view: cx.weak_entity(),
             row: self.editor.row,
@@ -2461,6 +2480,7 @@ impl ComposeView {
         };
         div()
             .id("compose-body")
+            .text_size(px(self.ui_px))
             .flex_1()
             .min_h(px(0.))
             .overflow_y_scroll()
@@ -2497,7 +2517,6 @@ impl ComposeView {
         let mut block = div()
             .px_5()
             .py_2()
-            .text_size(px(16.))
             .text_color(rgb(colors.fg))
             .border_t_1()
             .border_color(rgb(colors.rule))
@@ -2506,7 +2525,10 @@ impl ComposeView {
             block = block.child(render_doc(
                 &html_to_doc(html),
                 &self.folder,
-                Paint::compose(Links::Target),
+                Paint {
+                    links: Links::Target,
+                    text_px: self.ui_px,
+                },
                 colors,
             ));
         }
@@ -2923,7 +2945,6 @@ fn header(snap: &Snapshot, colors: Palette) -> gpui::Div {
         .child(
             div()
                 .flex_shrink_0()
-                .text_size(px(16.))
                 .text_color(rgb(colors.dim))
                 .child(format!("from {}", snap.from)),
         )
@@ -3043,7 +3064,6 @@ fn field_row(
                 div()
                     .w(px(LABEL_PX))
                     .flex_shrink_0()
-                    .text_size(px(16.))
                     .text_color(rgb(colors.fg))
                     .child(label.to_string()),
             )
@@ -3070,7 +3090,6 @@ fn subject_row(subject: &str, active: bool, colors: Palette) -> gpui::Div {
             div()
                 .w(px(LABEL_PX))
                 .flex_shrink_0()
-                .text_size(px(16.))
                 .text_color(rgb(colors.fg))
                 .child("Subject"),
         )
@@ -3275,7 +3294,6 @@ fn context_lines(
         .py_1()
         .border_l(px(2.))
         .border_color(rgb(colors.panel))
-        .text_size(px(16.))
         .text_color(rgb(colors.fg))
         .child(
             div()
@@ -3316,7 +3334,6 @@ fn hunk_banner(
         .border_l(px(2.))
         .border_color(rgb(colors.rule))
         .bg(rgb(colors.hunk))
-        .text_size(px(16.))
         .text_color(rgb(colors.fg));
     for (index, part) in parts.into_iter().enumerate() {
         if index > 0 {
@@ -3685,7 +3702,15 @@ fn styled_body(
                         block, &text, editor, &edits, focused, links, paint, was_lines,
                     )
                 } else {
-                    render_block(block, folder, Paint::compose(links), paint.colors)
+                    render_block(
+                        block,
+                        folder,
+                        Paint {
+                            links,
+                            text_px: paint.text_px,
+                        },
+                        paint.colors,
+                    )
                 };
                 // A block in source form spaces like text, not like an image.
                 ((!raw && edits.is_empty()).then_some(&block.body), painted)
@@ -3805,7 +3830,15 @@ fn raw_source_block(
 ) -> gpui::Div {
     let colors = paint.colors;
     let Some((start, end)) = block.source else {
-        return render_block(block, Path::new(""), Paint::compose(links), colors);
+        return render_block(
+            block,
+            Path::new(""),
+            Paint {
+                links,
+                text_px: paint.text_px,
+            },
+            colors,
+        );
     };
     let slice = &text[start.min(text.len())..end.min(text.len())];
     let mut column = div().flex().flex_col();
@@ -3968,6 +4001,7 @@ fn span_href(span: &str) -> Option<&str> {
 struct SourcePaint<'a> {
     colors: Palette,
     font: gpui::Font,
+    text_px: f32,
     view: gpui::WeakEntity<ComposeView>,
     row: usize,
     window: &'a Window,
@@ -4251,7 +4285,7 @@ fn focused_link_line(
     let breaks = paint
         .window
         .text_system()
-        .shape_text(text.clone().into(), px(16.), &runs, None, None)
+        .shape_text(text.clone().into(), px(paint.text_px), &runs, None, None)
         .ok()
         .and_then(|lines| focused_link_breaks(&text, lines.first()?, width));
     let flat_wrap = breaks.is_some();
@@ -4408,7 +4442,6 @@ fn source_pieces(
         {
             pieces.drawn(
                 div()
-                    .text_size(px(16.))
                     .font_weight(FontWeight(400.))
                     .text_color(rgb(colors.marker))
                     .pr(px(6.))
@@ -4902,16 +4935,6 @@ struct Paint {
     text_px: f32,
 }
 
-impl Paint {
-    /// The compose window, whose body text is 16 px.
-    fn compose(links: Links) -> Self {
-        Self {
-            links,
-            text_px: 16.,
-        }
-    }
-}
-
 fn render_block(
     block: &fell_core::compose::Block,
     folder: &Path,
@@ -4920,7 +4943,7 @@ fn render_block(
 ) -> gpui::Div {
     let links = paint.links;
     match &block.body {
-        // 28 and 22 px over the compose window's 16.
+        // Scale heading levels from the current body text.
         BlockBody::Heading { level, inlines } => div()
             .font_weight(FontWeight(680.))
             .text_size(px(paint.text_px * if *level <= 1 { 1.75 } else { 1.375 }))
@@ -5057,12 +5080,7 @@ fn image_block(alt: &str, src: &str, folder: &Path, colors: Palette) -> gpui::Di
 }
 
 fn missing_image(block: gpui::Div, alt: &str, colors: Palette) -> gpui::Div {
-    block.child(
-        div()
-            .text_size(px(16.))
-            .text_color(rgb(colors.dim))
-            .child(alt.to_string()),
-    )
+    block.child(div().text_color(rgb(colors.dim)).child(alt.to_string()))
 }
 
 struct Preview {
@@ -5304,7 +5322,6 @@ fn attachment_row(snap: &Snapshot, colors: Palette, wide: bool) -> gpui::Div {
         .min_w(px(0.))
         .px_5()
         .py_2()
-        .text_size(px(16.))
         .bg(rgb(colors.panel))
         .text_color(rgb(colors.fg))
         .border_t_1()
@@ -5964,7 +5981,7 @@ fn preview_scrim(colors: Palette) -> gpui::Div {
 /// under the header to the Attachments divider, 12px in from the sides and
 /// the bottom, so no cut-off words or half rows show around it. Deferred,
 /// so it paints over the scrim that dims the rest of the window.
-fn preview_panel(snap: &Snapshot, colors: Palette) -> impl IntoElement {
+fn preview_panel(snap: &Snapshot, colors: Palette, text_px: f32) -> impl IntoElement {
     let doc = markdown_to_doc(&snap.body);
     deferred(
         div()
@@ -5990,7 +6007,10 @@ fn preview_panel(snap: &Snapshot, colors: Palette) -> impl IntoElement {
             .child(render_doc(
                 &doc,
                 Path::new(""),
-                Paint::compose(Links::Target),
+                Paint {
+                    links: Links::Target,
+                    text_px,
+                },
                 colors,
             )),
     )

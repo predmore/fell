@@ -988,6 +988,10 @@ impl Session {
                 &self.palette_query,
                 &self.recent,
             ))
+            .filter(|item| match item.action {
+                Action::Setting(row) => self.settings_nav.availability.shows(row),
+                _ => true,
+            })
             .collect()
     }
 
@@ -2130,14 +2134,19 @@ impl Session {
     fn settings_key(&mut self, key: KeyId, page_rows: usize) -> Step {
         use settings::{Page, Request, Row, Section};
 
-        if let Page::ConfirmModel { install } = self.settings_nav.page {
-            if matches!(key, KeyId::Char('y' | 'n') | KeyId::Escape) {
-                self.settings_nav.back();
-                return Step {
-                    settings: (key == KeyId::Char('y')).then_some(Request::ChangeModel { install }),
-                    ..Step::default()
-                };
-            }
+        if let Page::ConfirmModel { install } = self.settings_nav.page
+            && matches!(key, KeyId::Char('y' | 'n') | KeyId::Escape)
+        {
+            self.settings_nav.back();
+            return Step {
+                settings: (key == KeyId::Char('y')).then_some(Request::ChangeModel { install }),
+                ..Step::default()
+            };
+        }
+        if matches!(
+            self.settings_nav.page,
+            Page::Bindings | Page::ConfirmModel { .. }
+        ) {
             let lines = match key {
                 KeyId::Char('j') | KeyId::Down => 2,
                 KeyId::Char('k') | KeyId::Up => -2,
@@ -2145,10 +2154,15 @@ impl Session {
                 KeyId::Ctrl('u') => -8,
                 _ => 0,
             };
-            return Step {
-                settings: (lines != 0).then_some(Request::ScrollConsent(lines)),
-                ..Step::default()
-            };
+            if lines != 0 {
+                return Step {
+                    settings: Some(Request::Scroll(lines)),
+                    ..Step::default()
+                };
+            }
+            if matches!(self.settings_nav.page, Page::ConfirmModel { .. }) {
+                return Step::default();
+            }
         }
         match key {
             KeyId::Escape => {
@@ -2181,7 +2195,7 @@ impl Session {
                     };
                 }
             }
-            _ => self.settings_nav.move_to(key, &self.keymap),
+            _ => self.settings_nav.move_to(key),
         }
         Step::default()
     }
@@ -2829,9 +2843,12 @@ impl Session {
             Action::Settings => {
                 self.count.clear();
                 self.overlay = Overlay::Settings;
-                self.settings_nav = settings::Nav::default();
+                self.settings_nav.reset();
             }
             Action::Setting(row) => {
+                if !self.settings_nav.availability.shows(row) {
+                    return step;
+                }
                 self.count.clear();
                 self.overlay = Overlay::Settings;
                 self.settings_nav.select_row(row);

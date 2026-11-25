@@ -395,6 +395,9 @@ pub fn follow<V: 'static>(
 
     let (changed, mut changes) = futures::channel::mpsc::unbounded();
     let watching = watch(changed);
+    let settings_path = crate::settings::path();
+    let defaults = crate::settings::Values::default();
+    let mut previous = crate::settings::Snapshot::read(settings_path.as_deref(), defaults);
     cx.spawn(async move |this, cx| {
         loop {
             if watching {
@@ -406,16 +409,20 @@ pub fn follow<V: 'static>(
                     .timer(std::time::Duration::from_secs(1))
                     .await;
             }
-            let (next, motion) = cx
+            let path = settings_path.clone();
+            let (snapshot, next, motion) = cx
                 .background_executor()
-                .spawn(async {
-                    let settings = crate::settings::appearance();
+                .spawn(async move {
+                    let snapshot = previous.reload(path.as_deref(), defaults);
+                    let settings = snapshot.values;
                     (
+                        snapshot,
                         load_with(settings),
                         crate::motion::Motion::for_preference(settings.reduce_motion),
                     )
                 })
                 .await;
+            previous = snapshot;
             if this
                 .update(cx, |view, cx| update(view, next, motion, cx))
                 .is_err()

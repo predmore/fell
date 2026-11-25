@@ -1010,6 +1010,10 @@ impl Inbox {
         .detach();
         inbox.show_crash_notice(cx);
         inbox.watch_store_restarts(store_restarts, cx);
+        inbox
+            .session
+            .settings_nav
+            .set_availability(inbox.settings_view.availability());
         inbox.watch_settings(legacy, cx);
         inbox.watch_reviews(cx);
         inbox.watch_notes(cx);
@@ -4441,7 +4445,10 @@ impl Inbox {
             if settings_page != Some(page) {
                 self.settings_view.reset_scroll();
             }
-            if !matches!(page, crate::model::settings::Page::ConfirmModel { .. }) {
+            if matches!(
+                page,
+                crate::model::settings::Page::Index | crate::model::settings::Page::Section(_)
+            ) {
                 self.settings_view
                     .scroll_to(self.session.settings_nav.selected);
             }
@@ -5376,6 +5383,7 @@ impl Render for Inbox {
         );
         let settings_animating = self.settings_view.observe(
             (self.session.overlay == Overlay::Settings).then_some(self.session.settings_nav.page),
+            self.session.settings_nav.selected,
             now,
             self.motion.motion,
         );
@@ -5507,8 +5515,9 @@ impl Render for Inbox {
                             live,
                             card.unwrap_or_else(|| {
                                 settings::card_height(
-                                    session.settings_nav.page,
+                                    &session.settings_nav,
                                     viewport_height - CARD_TOP_PX - 16.,
+                                    width < 500.,
                                 )
                             }),
                             now,
@@ -11167,7 +11176,11 @@ fn card_fit(
         }
         Overlay::Agents => Some(agents::card_height(&session.agents, room)),
         Overlay::AgentActivity => Some(activity::card_height(room)),
-        Overlay::Settings => Some(settings::card_height(session.settings_nav.page, room)),
+        Overlay::Settings => Some(settings::card_height(
+            &session.settings_nav,
+            room,
+            window.viewport_size().width < px(500.),
+        )),
         _ => None,
     }
 }

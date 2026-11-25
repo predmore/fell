@@ -1,5 +1,6 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -15,9 +16,9 @@ use gpui::{
     StatefulInteractiveElement, Styled, TitlebarOptions, WindowOptions, div, prelude::*, px, rgb,
 };
 
-use super::Inbox;
+use super::{FontOpt, Inbox};
 use crate::model::Overlay;
-use crate::model::settings::{self as nav, Page, Request, Row, Section};
+use crate::model::settings::{self as nav, Availability, Page, Request, Row, Section};
 use crate::motion::{self, Glide, Motion, NumberFade, Transition};
 use crate::settings::{self, Edit, Snapshot, Values};
 use crate::{embeddings, mailbox, theme};
@@ -88,8 +89,10 @@ pub(super) struct View {
     snapshot: Snapshot,
     edits: Option<mpsc::UnboundedSender<Edit>>,
     scroll: ScrollHandle,
-    consent_scroll: Option<Glide>,
-    fade: NumberFade<Values>,
+    scroll_glide: Option<Glide>,
+    fade: NumberFade<(Values, Vec<settings::Preference>)>,
+    selection: Option<(Page, usize)>,
+    chevrons: Option<Transition>,
     page: Option<Page>,
     page_fade: Option<Transition>,
     account: Option<BackendKind>,
@@ -107,21 +110,47 @@ impl View {
         account: Option<BackendKind>,
         account_file_exists: bool,
     ) -> Self {
+        let model_root = default_models_dir();
+        let model = model_root
+            .as_deref()
+            .map_or(ModelStatus::Unavailable, |root| {
+                if model_dir(&MODEL, root).symlink_metadata().is_ok() {
+                    ModelStatus::Checking
+                } else {
+                    ModelStatus::Missing
+                }
+            });
         Self {
             snapshot,
             edits: None,
             scroll: ScrollHandle::new(),
-            consent_scroll: None,
+            scroll_glide: None,
             fade: NumberFade::default(),
+            selection: None,
+            chevrons: None,
             page: None,
             page_fade: None,
             account,
             account_file_exists,
             setup: None,
-            model_root: default_models_dir(),
-            model: ModelStatus::Checking,
+            model_root,
+            model,
             model_generation: 0,
             model_notice: None,
+        }
+    }
+
+    pub fn availability(&self) -> Availability {
+        Availability {
+            account_setup: !self.account_file_exists,
+            install_model: matches!(
+                self.model,
+                ModelStatus::Checking | ModelStatus::Missing | ModelStatus::NeedsRepair
+            ),
+            remove_model: matches!(
+                self.model,
+                ModelStatus::Checking | ModelStatus::Installed | ModelStatus::NeedsRepair
+            ),
         }
     }
 
@@ -130,7 +159,7 @@ impl View {
     }
 
     pub fn reset_scroll(&mut self) {
-        self.consent_scroll = None;
+        self.scroll_glide = None;
         self.scroll.set_offset(gpui::point(px(0.), px(0.)));
     }
 
@@ -139,28 +168,39 @@ impl View {
         self.page_fade = None;
     }
 
-    fn scroll_consent(&mut self, lines: i32, motion: Motion, now: Instant) {
+    fn scroll_lines(&mut self, lines: i32, motion: Motion, now: Instant) {
         let measured = f32::from(self.scroll.offset().y);
-        let end = self.consent_scroll.map_or(measured, |glide| glide.to);
+        let end = self.scroll_glide.map_or(measured, |glide| glide.to);
         let max = f32::from(self.scroll.max_offset().height);
         let target = (end - lines as f32 * 19.).clamp(-max, 0.);
-        self.consent_scroll = Glide::start(&motion, measured, target, max, motion::SLIDE, now);
-        if self.consent_scroll.is_none() {
+        self.scroll_glide = Glide::start(&motion, measured, target, max, motion::SLIDE, now);
+        if self.scroll_glide.is_none() {
             self.scroll.set_offset(gpui::point(px(0.), px(target)));
         }
     }
 
-    pub fn observe(&mut self, page: Option<Page>, now: Instant, motion: Motion) -> bool {
+    pub fn observe(
+        &mut self,
+        page: Option<Page>,
+        selected: usize,
+        now: Instant,
+        motion: Motion,
+    ) -> bool {
         if page.is_none() || !motion.enabled() {
-            if let Some(glide) = self.consent_scroll.take() {
+            if let Some(glide) = self.scroll_glide.take() {
                 self.scroll.set_offset(gpui::point(px(0.), px(glide.to)));
             }
-        } else if let Some(glide) = self.consent_scroll {
+        } else if let Some(glide) = self.scroll_glide {
             self.scroll
                 .set_offset(gpui::point(px(0.), px(glide.value(now))));
             if !glide.running(now) {
-                self.consent_scroll = None;
+                self.scroll_glide = None;
             }
+        }
+        let selection = page.map(|page| (page, selected));
+        if self.selection != selection {
+            self.selection = selection;
+            self.chevrons = selection.and_then(|_| motion.start(motion::FADE, now));
         }
         if self.page != page {
             self.page_fade = if self.page.is_some() && page.is_some() {
@@ -170,9 +210,10 @@ impl View {
             };
             self.page = page;
         }
-        self.consent_scroll.is_some()
+        self.scroll_glide.is_some()
             || self.fade.frame(now).is_some()
             || self.page_fade.is_some_and(|fade| fade.running(now))
+            || self.chevrons.is_some_and(|fade| fade.running(now))
     }
 }
 
@@ -187,6 +228,7 @@ impl Inbox {
         let path = settings::path();
         let (changed, mut changes) = mpsc::unbounded();
         let watching = theme::watch(changed);
+        let mut previous = self.settings_view.snapshot.clone();
         cx.spawn(async move |this, cx| {
             let mut startup = true;
             loop {
@@ -219,23 +261,26 @@ impl Inbox {
                     .spawn(async move {
                         let path = read_path.as_deref();
                         let (snapshot, save_error) = match (edit, path) {
-                            (Some(edit), Some(path)) => match settings::save(path, legacy, edit) {
-                                Ok(snapshot) => (snapshot, None),
-                                Err(err) => {
-                                    (Snapshot::read(Some(path), legacy), Some(err.to_string()))
+                            (Some(edit), Some(path)) => {
+                                match settings::save(path, legacy, &previous, edit) {
+                                    Ok(snapshot) => (snapshot, None),
+                                    Err(err) => {
+                                        (previous.reload(Some(path), legacy), Some(err.to_string()))
+                                    }
                                 }
-                            },
+                            }
                             (Some(_), None) => (
                                 Snapshot::read(None, legacy),
                                 Some("No config directory".into()),
                             ),
-                            (None, _) => (Snapshot::read(path, legacy), None),
+                            (None, _) => (previous.reload(path, legacy), None),
                         };
                         let theme = theme::load_with(snapshot.values);
                         let motion = Motion::for_preference(snapshot.values.reduce_motion);
                         (snapshot, theme, motion, save_error)
                     })
                     .await;
+                previous = snapshot.clone();
                 if this
                     .update(cx, |inbox, cx| {
                         inbox.apply_settings(snapshot, theme, motion, cx);
@@ -243,12 +288,6 @@ impl Inbox {
                             inbox.settings_notice(
                                 format!("Could not save settings · {error}"),
                                 true,
-                                cx,
-                            );
-                        } else if let Some(Edit::Notifications(mode)) = edit {
-                            inbox.settings_notice(
-                                crate::keymap::Action::Notifications(mode).label(),
-                                false,
                                 cx,
                             );
                         }
@@ -274,6 +313,7 @@ impl Inbox {
             return;
         }
         let before = prior.values;
+        let old_invalid = prior.invalid.clone();
         let next = snapshot.values;
         if prior.unknown != snapshot.unknown {
             report_unknown(&snapshot);
@@ -290,10 +330,14 @@ impl Inbox {
             }
             self.row_widths = crate::row_widths::RowWidths::new(next_motion);
         }
-        if self.session.overlay == Overlay::Settings && before != next {
-            self.settings_view
-                .fade
-                .change(before, next_motion, self.motion.clock.now());
+        if self.session.overlay == Overlay::Settings
+            && (before != next || old_invalid != snapshot.invalid)
+        {
+            self.settings_view.fade.change(
+                (before, old_invalid),
+                next_motion,
+                self.motion.clock.now(),
+            );
         }
         if before.notifications != next.notifications {
             self.session.notification_mode = Some(next.notifications);
@@ -333,11 +377,10 @@ impl Inbox {
             Request::AccountSetup => self.open_account_setup(cx),
             Request::EditKeymap => self.open_keymap(cx),
             Request::CheckModel => self.read_model_status(cx),
-            Request::ScrollConsent(lines) => self.settings_view.scroll_consent(
-                lines,
-                self.motion.motion,
-                self.motion.clock.now(),
-            ),
+            Request::Scroll(lines) => {
+                self.settings_view
+                    .scroll_lines(lines, self.motion.motion, self.motion.clock.now())
+            }
             Request::ChangeModel { install } => self.change_model(install, cx),
         }
     }
@@ -394,15 +437,7 @@ impl Inbox {
                 .spawn(async {
                     let dir = mailbox::config_dir()
                         .ok_or_else(|| io::Error::other("No config directory"))?;
-                    fs::create_dir_all(&dir)?;
-                    let path = dir.join("keymap.toml");
-                    match OpenOptions::new().write(true).create_new(true).open(&path) {
-                        Ok(mut file) => file.write_all(
-                            b"# Change the leader key, then reopen Fell.\nleader = \"space\"\n",
-                        )?,
-                        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
-                        Err(err) => return Err(err),
-                    }
+                    let path = ensure_keymap(&dir)?;
                     super::diagnostics::open_in_editor(&path)
                 })
                 .await;
@@ -417,6 +452,19 @@ impl Inbox {
             }
         })
         .detach();
+    }
+
+    fn apply_model_status(&mut self, status: ModelStatus) {
+        self.settings_view.model = status;
+        self.session
+            .settings_nav
+            .set_availability(self.settings_view.availability());
+        if self.session.overlay == Overlay::Palette {
+            self.session.palette_index = self
+                .session
+                .palette_index
+                .min(self.session.palette().len().saturating_sub(1));
+        }
     }
 
     fn read_model_status(&mut self, cx: &mut Context<Self>) {
@@ -436,7 +484,7 @@ impl Inbox {
                 .await;
             let _ = this.update(cx, |inbox, cx| {
                 if inbox.settings_view.model_generation == generation {
-                    inbox.settings_view.model = status;
+                    inbox.apply_model_status(status);
                     cx.notify();
                 }
             });
@@ -453,11 +501,11 @@ impl Inbox {
         }
         self.settings_view.model_generation += 1;
         self.settings_view.model_notice = None;
-        self.settings_view.model = if install {
+        self.apply_model_status(if install {
             ModelStatus::Installing
         } else {
             ModelStatus::Removing
-        };
+        });
         cx.spawn(async move |this, cx| {
             let (result, status) =
                 cx.background_executor()
@@ -478,7 +526,7 @@ impl Inbox {
                     })
                     .await;
             let _ = this.update(cx, |inbox, cx| {
-                inbox.settings_view.model = status;
+                inbox.apply_model_status(status);
                 let notice = match result {
                     Ok(message) => (message.to_owned(), false),
                     Err(error) => (format!("Model change failed · {error}"), true),
@@ -493,16 +541,14 @@ impl Inbox {
         .detach();
     }
 
-    pub(super) fn settings_click(&mut self, index: usize, cx: &mut Context<Self>) {
+    fn settings_click(&mut self, index: usize, key: crate::keymap::KeyId, cx: &mut Context<Self>) {
         if self.session.overlay != Overlay::Settings {
             return;
         }
         self.settle_motion();
         self.session.settings_nav.selected = index;
         let before = self.before_step();
-        let step = self
-            .session
-            .on_key(crate::keymap::KeyId::Enter, self.page_rows());
+        let step = self.session.on_key(key, self.page_rows());
         self.apply_step(step, before, cx);
     }
 
@@ -529,6 +575,25 @@ impl Inbox {
     }
 }
 
+fn ensure_keymap(dir: &Path) -> io::Result<PathBuf> {
+    mailbox::create_mailbox_dirs(dir)?;
+    let path = dir.join("keymap.toml");
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            file.write_all(b"# Change the leader key, then reopen Fell.\nleader = \"space\"\n")?;
+        }
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(err) => return Err(err),
+    }
+    Ok(path)
+}
+
 fn report_unknown(snapshot: &Snapshot) {
     if !snapshot.unknown.is_empty() {
         fell_core::diagnostic!(INFO, "Ignored unknown settings.toml keys");
@@ -540,19 +605,29 @@ const SECTION_ROW_HEIGHT: f32 = 64.;
 const INDEX_ROW_HEIGHT: f32 = 49.;
 const ACCOUNT_SUMMARY_HEIGHT: f32 = 64.;
 const INDEX_FOOTER_HEIGHT: f32 = 21.;
-const SEARCH_SUMMARY_HEIGHT: f32 = 108.;
+const SEARCH_SUMMARY_HEIGHT: f32 = 70.;
 
-pub(super) fn card_height(page: Page, room: f32) -> f32 {
-    let rows = match page {
+pub(super) fn card_height(nav: &nav::Nav, room: f32, narrow: bool) -> f32 {
+    let rows = match nav.page {
         Page::Index => Section::ALL.len() as f32 * INDEX_ROW_HEIGHT + INDEX_FOOTER_HEIGHT,
         Page::Section(section) => {
-            section.rows().len() as f32 * SECTION_ROW_HEIGHT
+            nav.rows(section)
+                .map(|row| {
+                    SECTION_ROW_HEIGHT
+                        + if narrow && matches!(row, Row::Value(_)) {
+                            8.
+                        } else {
+                            0.
+                        }
+                })
+                .sum::<f32>()
                 + match section {
                     Section::Accounts => ACCOUNT_SUMMARY_HEIGHT,
                     Section::Search => SEARCH_SUMMARY_HEIGHT,
                     _ => 0.,
                 }
         }
+        Page::ConfirmModel { install: true } if narrow => 445.,
         Page::Bindings | Page::ConfirmModel { .. } => 370.,
     };
     (HEADER_HEIGHT + rows + 18.).min(room.max(120.))
@@ -673,111 +748,157 @@ pub(super) fn card(
         }
         Page::Section(section) => {
             // Keep scroll indices aligned with the selectable rows.
-            for (index, setting) in section.rows().iter().copied().enumerate() {
+            for (index, setting) in session.settings_nav.rows(section).enumerate() {
                 let selected = selected == index;
-                let (label, description, state, enabled) = match setting {
-                    Row::Value(preference) => (
-                        preference.label(),
-                        Some(preference.description()),
-                        preference.display(view.snapshot.values),
-                        true,
-                    ),
-                    Row::AccountSetup => (
-                        "Open account setup",
-                        Some("Connect through Proton Bridge or IMAP."),
-                        if view.account_file_exists {
-                            "Configured"
-                        } else {
-                            "›"
-                        }
-                        .to_owned(),
-                        !view.account_file_exists,
-                    ),
-                    Row::EffectiveBindings => (
-                        "Effective bindings",
-                        Some("Shortcuts for this session."),
-                        "›".to_owned(),
-                        true,
-                    ),
-                    Row::EditKeymap => (
-                        "Edit keymap.toml",
-                        Some("Reopen Fell to apply leader key changes."),
-                        "↗".to_owned(),
-                        true,
-                    ),
-                    Row::InstallModel => (
-                        if view.model == ModelStatus::NeedsRepair {
-                            "Reinstall local model"
-                        } else {
-                            "Install local model"
-                        },
-                        Some("Download the pinned model from Hugging Face."),
-                        embeddings::megabytes(MODEL.download_bytes()),
-                        !view.model.busy()
-                            && !matches!(
-                                view.model,
-                                ModelStatus::Installed | ModelStatus::Unavailable
-                            ),
-                    ),
-                    Row::RemoveModel => (
-                        "Remove local model",
-                        Some("Return to keyword search."),
-                        "›".to_owned(),
-                        !view.model.busy()
-                            && !matches!(
-                                view.model,
-                                ModelStatus::Missing | ModelStatus::Unavailable
-                            ),
-                    ),
-                    Row::ManageAgents => (
-                        "Open Agents",
-                        Some("Review connected agents, access and activity."),
-                        "›".to_owned(),
-                        true,
-                    ),
-                };
-                let fade = if let Row::Value(preference) = setting {
-                    view.fade.frame(now).and_then(|(old, progress)| {
-                        let old = preference.display(*old);
+                let mut control =
+                    row(theme, index, selected, live, SECTION_ROW_HEIGHT, cx).py(px(10.));
+                if let Row::Value(preference) = setting {
+                    let state = preference.display(view.snapshot.values);
+                    let invalid = view.snapshot.invalid.contains(&preference);
+                    let previous = view.fade.frame(now);
+                    let changed = previous.and_then(|((values, _), progress)| {
+                        let old = preference.display(*values);
                         (old != state).then_some((old, progress))
-                    })
-                } else {
-                    None
-                };
-                let value = if matches!(setting, Row::Value(_)) {
+                    });
+                    let old_warning = previous.and_then(|((values, bad), progress)| {
+                        let was_invalid = bad.contains(&preference);
+                        let old = preference.display(*values);
+                        (was_invalid != invalid || (invalid && old != state)).then_some((
+                            was_invalid,
+                            old,
+                            progress,
+                        ))
+                    });
+                    let opacity = if selected {
+                        motion::progress(view.chevrons.as_ref(), now)
+                    } else {
+                        0.
+                    };
                     let (old, progress) =
-                        fade.map_or((None, 1.), |(old, progress)| (Some(old), progress));
-                    div()
+                        changed.map_or((None, 1.), |(old, progress)| (Some(old), progress));
+                    let value = div()
                         .relative()
-                        .w(px(142.))
-                        .flex_none()
-                        .text_right()
-                        .child(value_text(theme, state, selected).opacity(progress))
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .text_center()
+                        .child(value_text(theme, state.clone(), selected).opacity(progress))
                         .when_some(old, |value, old| {
-                            value.child(
-                                value_text(theme, old, selected)
-                                    .absolute()
-                                    .top_0()
-                                    .left_0()
-                                    .right_0()
-                                    .opacity(1. - progress),
-                            )
-                        })
+                            // Keep the outgoing value's width until its fade ends.
+                            value
+                                .child(
+                                    value_text(theme, old.clone(), selected)
+                                        .h(px(0.))
+                                        .opacity(0.),
+                                )
+                                .child(
+                                    value_text(theme, old, selected)
+                                        .absolute()
+                                        .top_0()
+                                        .left_0()
+                                        .right_0()
+                                        .opacity(1. - progress),
+                                )
+                        });
+                    control = control
+                        .child(row_label(theme, preference.label(), None, selected).child({
+                            let progress = old_warning
+                                .as_ref()
+                                .map_or(1., |(_, _, progress)| *progress);
+                            div()
+                                .relative()
+                                .child(
+                                    preference_note(theme, preference, invalid, &state, selected)
+                                        .opacity(progress),
+                                )
+                                .when_some(old_warning, |note, (was_invalid, old, progress)| {
+                                    note.child(
+                                        preference_note(
+                                            theme,
+                                            preference,
+                                            was_invalid,
+                                            &old,
+                                            selected,
+                                        )
+                                        .absolute()
+                                        .top_0()
+                                        .left_0()
+                                        .right_0()
+                                        .opacity(1. - progress),
+                                    )
+                                })
+                        }))
+                        .child(
+                            div()
+                                .w_auto()
+                                .min_w(px(56.))
+                                .max_w(px(142.))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .child(chevron(theme, index, true, live && selected, opacity, cx))
+                                .child(value)
+                                .child(chevron(theme, index, false, live && selected, opacity, cx)),
+                        );
                 } else {
-                    trailing(theme, state, selected)
-                };
-                body = body.child(
-                    row(
-                        theme,
-                        index,
-                        selected,
-                        live && enabled,
-                        SECTION_ROW_HEIGHT,
-                        cx,
-                    )
-                    .child(row_label(theme, label, description, selected))
-                    .child(value.opacity(if enabled { 1. } else { 0.75 })),
-                );
+                    let (label, description, suffix, info) = match setting {
+                        Row::AccountSetup => (
+                            "Open account setup",
+                            "Connect via Bridge or IMAP.",
+                            "›",
+                            false,
+                        ),
+                        Row::EffectiveBindings => (
+                            "Effective bindings",
+                            "Shortcuts for this session.",
+                            "›",
+                            false,
+                        ),
+                        Row::EditKeymap => (
+                            "Edit keymap.toml",
+                            "Reopen Fell to apply leader changes.",
+                            "↗",
+                            false,
+                        ),
+                        Row::InstallModel => (
+                            if view.model == ModelStatus::NeedsRepair {
+                                "Reinstall local model"
+                            } else {
+                                "Install local model"
+                            },
+                            "Download from Hugging Face.",
+                            "",
+                            true,
+                        ),
+                        Row::RemoveModel => (
+                            "Remove local model",
+                            "Return to keyword search.",
+                            "›",
+                            false,
+                        ),
+                        Row::ManageAgents => (
+                            "Open Agents",
+                            "Review connected agents and access.",
+                            "›",
+                            false,
+                        ),
+                        Row::Value(_) => unreachable!(),
+                    };
+                    let suffix = if info {
+                        div()
+                            .flex_none()
+                            .text_size(px(13.))
+                            .text_color(rgb(theme.dimmed))
+                            .child(embeddings::megabytes(MODEL.download_bytes()))
+                    } else {
+                        trailing(theme, suffix, selected)
+                    };
+                    control = control
+                        .child(row_label(theme, label, Some(description), selected))
+                        .child(suffix);
+                }
+                body = body.child(control);
             }
 
             details = match section {
@@ -798,63 +919,63 @@ pub(super) fn card(
                         }
                         None => "Set up an account to sync your mailbox.",
                     };
-                    Some(detail(theme, title, description).h(px(ACCOUNT_SUMMARY_HEIGHT)))
+                    Some(detail(theme, title, description, false).h(px(ACCOUNT_SUMMARY_HEIGHT)))
                 }
                 Section::Search => {
                     let (status, description) = view.model.status();
-                    Some(
-                        detail(theme, status, description)
-                            .h(px(SEARCH_SUMMARY_HEIGHT))
-                            .overflow_hidden()
-                            .when_some(view.model_notice.as_ref(), |line, (message, alert)| {
-                                line.child(
-                                    div()
-                                        .mt(px(6.))
-                                        .text_color(rgb(if *alert {
-                                            theme.error
-                                        } else {
-                                            theme.dimmed
-                                        }))
-                                        .child(message.clone()),
-                                )
-                            }),
-                    )
+                    let (message, alert) = view
+                        .model_notice
+                        .as_ref()
+                        .map_or((description, false), |(message, alert)| {
+                            (message.as_str(), *alert)
+                        });
+                    Some(detail(theme, status, message, alert))
                 }
                 _ => None,
             };
         }
         Page::Bindings => {
-            for (index, (action, keys)) in nav::bindings(&session.keymap).enumerate() {
+            for (action, keys) in nav::bindings(&session.keymap) {
                 body = body.child(
-                    row(theme, index, selected == index, false, 39., cx)
-                        .child(row_label(theme, action.label(), None, selected == index))
-                        .child(trailing(theme, keys, selected == index)),
+                    div()
+                        .min_h(px(39.))
+                        .px(px(10.))
+                        .py(px(5.))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(row_label(theme, action.label(), None, false))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .justify_end()
+                                .gap(px(4.))
+                                .max_w(gpui::relative(0.57))
+                                .children(keys.split(" · ").map(|keys| {
+                                    div()
+                                        .px(px(5.))
+                                        .py(px(2.))
+                                        .rounded_sm()
+                                        .border_1()
+                                        .border_color(rgb(theme.border))
+                                        .font_family_opt(theme.mono_family.clone())
+                                        .text_color(rgb(theme.dimmed))
+                                        .text_size(px(12.))
+                                        .whitespace_nowrap()
+                                        .child(keys.to_owned())
+                                })),
+                        ),
                 );
             }
         }
         Page::ConfirmModel { install } => {
-            let text = if install {
-                view.model_root
-                    .as_deref()
-                    .map(|root| embeddings::plan(&MODEL, root))
-                    .unwrap_or_default()
+            body = body.child(if install {
+                install_plan(theme, view.model_root.as_deref())
             } else {
-                "Fell will remove the local model files. Your mail stays on this device. Reopen Fell to return to keyword search.".to_owned()
-            };
-            body = body.child(
-                div()
-                    .px(px(10.))
-                    .py(px(6.))
-                    .text_size(px(13.))
-                    .line_height(px(19.))
-                    .text_color(rgb(theme.foreground))
-                    .children(text.split('\n').map(|line| {
-                        div()
-                            .min_h(px(10.))
-                            .whitespace_normal()
-                            .child(line.to_owned())
-                    })),
-            );
+                div().px(px(10.)).py(px(6.)).text_size(px(13.)).line_height(px(19.))
+                    .child("Fell will remove the local model files. Your mail stays on this device. Reopen Fell to return to keyword search.")
+            });
             footer = Some(
                 div()
                     .flex_none()
@@ -904,10 +1025,68 @@ pub(super) fn card(
         .children(footer)
 }
 
+fn install_plan(theme: &theme::Theme, root: Option<&Path>) -> gpui::Div {
+    div()
+        .px(px(10.))
+        .py(px(8.))
+        .flex()
+        .flex_col()
+        .gap(px(10.))
+        .text_size(px(13.))
+        .line_height(px(19.))
+        .child(
+            div()
+                .child(div().font_weight(FontWeight::SEMIBOLD).child(format!(
+                    "Hugging Face · {}",
+                    embeddings::megabytes(MODEL.download_bytes())
+                )))
+                .child(div().text_color(rgb(theme.dimmed)).child(MODEL.title)),
+        )
+        .child(
+            div()
+                .p(px(8.))
+                .rounded_sm()
+                .border_1()
+                .border_color(rgb(theme.border))
+                .font_family_opt(theme.mono_family.clone())
+                .text_size(px(12.))
+                .children(MODEL.files().into_iter().map(|file| {
+                    let (start, end) = file.sha256.split_at(8);
+                    let end = &end[end.len() - 8..];
+                    div()
+                        .py(px(3.))
+                        .child(div().child(format!(
+                            "{} · {}",
+                            file.name,
+                            embeddings::megabytes(file.bytes)
+                        )))
+                        .child(
+                            div()
+                                .whitespace_nowrap()
+                                .text_color(rgb(theme.dimmed))
+                                .child(format!("SHA-256 {start}…{end}")),
+                        )
+                })),
+        )
+        .child(
+            div()
+                .text_color(rgb(theme.dimmed))
+                .child(format!("License · {}", MODEL.license))
+                .children(root.map(|root| {
+                    div().child(format!(
+                        "Saved to {} (owner-only)",
+                        model_dir(&MODEL, root).display()
+                    ))
+                })),
+        )
+        .child(div().child(embeddings::INSTALL_EFFECT.replace('\n', " ")))
+}
+
 fn detail(
     theme: &theme::Theme,
     title: impl Into<gpui::SharedString>,
-    explanation: &'static str,
+    explanation: &str,
+    alert: bool,
 ) -> gpui::Div {
     div()
         .flex_none()
@@ -924,8 +1103,8 @@ fn detail(
         .child(
             div()
                 .text_size(px(12.))
-                .text_color(rgb(theme.dimmed))
-                .child(explanation),
+                .text_color(rgb(if alert { theme.error } else { theme.dimmed }))
+                .child(explanation.to_owned()),
         )
 }
 
@@ -939,7 +1118,7 @@ fn row(
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(gpui::ElementId::named_usize("settings-row", index))
-        .h(px(height))
+        .min_h(px(height))
         .flex_none()
         .flex()
         .items_center()
@@ -955,7 +1134,7 @@ fn row(
                 MouseButton::Left,
                 cx.listener(move |inbox, _, _, cx| {
                     cx.stop_propagation();
-                    inbox.settings_click(index, cx);
+                    inbox.settings_click(index, crate::keymap::KeyId::Enter, cx);
                 }),
             )
         })
@@ -992,6 +1171,73 @@ fn row_label(
                     .child(description),
             )
         })
+}
+
+fn preference_note(
+    theme: &theme::Theme,
+    preference: settings::Preference,
+    invalid: bool,
+    state: &str,
+    selected: bool,
+) -> gpui::Div {
+    let (text, color) = if invalid {
+        (
+            format!("Invalid in settings.toml · using {state}"),
+            theme.error,
+        )
+    } else {
+        (
+            preference.description().to_owned(),
+            if selected {
+                theme.on_selection_dim
+            } else {
+                theme.dimmed
+            },
+        )
+    };
+    div()
+        .text_size(px(12.))
+        .line_height(px(15.))
+        .text_color(rgb(color))
+        .child(text)
+}
+
+fn chevron(
+    theme: &theme::Theme,
+    index: usize,
+    previous: bool,
+    live: bool,
+    opacity: f32,
+    cx: &mut Context<Inbox>,
+) -> gpui::Stateful<gpui::Div> {
+    use crate::keymap::KeyId;
+
+    div()
+        .id(if previous {
+            "previous-value"
+        } else {
+            "next-value"
+        })
+        .w(px(11.))
+        .flex_none()
+        .text_center()
+        .text_size(px(12.))
+        .text_color(rgb(theme.dimmed))
+        .opacity(opacity)
+        .when(live, |control| {
+            control.on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |inbox, _, _, cx| {
+                    cx.stop_propagation();
+                    inbox.settings_click(
+                        index,
+                        if previous { KeyId::Left } else { KeyId::Right },
+                        cx,
+                    );
+                }),
+            )
+        })
+        .child(if previous { "‹" } else { "›" })
 }
 
 fn trailing(
@@ -1069,6 +1315,20 @@ fn confirm_button(
 mod tests {
     use super::*;
     use fell_core::NotificationMode;
+
+    #[test]
+    fn edit_keymap_creates_a_private_file_and_keeps_an_existing_one() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("fell");
+        let path = ensure_keymap(&dir).unwrap();
+        assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        fs::write(&path, "leader = ','").unwrap();
+        assert_eq!(ensure_keymap(&dir).unwrap(), path);
+        assert_eq!(fs::read_to_string(path).unwrap(), "leader = ','");
+    }
 
     #[test]
     fn a_reloaded_snapshot_changes_the_running_inbox() {

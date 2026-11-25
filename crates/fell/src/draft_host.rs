@@ -437,6 +437,9 @@ fn reveal(
 fn follow_theme(cx: &mut App, window: Rc<RefCell<Option<WindowHandle<ComposeView>>>>) {
     let (changed, mut changes) = futures::channel::mpsc::unbounded();
     let watching = crate::theme::watch(changed);
+    let settings_path = crate::settings::path();
+    let defaults = crate::settings::Values::default();
+    let mut previous = crate::settings::Snapshot::read(settings_path.as_deref(), defaults);
     cx.spawn(async move |cx| {
         loop {
             if watching {
@@ -446,25 +449,30 @@ fn follow_theme(cx: &mut App, window: Rc<RefCell<Option<WindowHandle<ComposeView
             } else {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
             }
-            let Some(handle) = *window.borrow() else {
-                continue;
-            };
-            let (next, motion) = cx
+            let path = settings_path.clone();
+            let (snapshot, next, motion) = cx
                 .background_executor()
-                .spawn(async {
-                    let values = crate::settings::appearance();
+                .spawn(async move {
+                    let snapshot = previous.reload(path.as_deref(), defaults);
+                    let values = snapshot.values;
                     (
+                        snapshot,
                         crate::theme::load_with(values),
                         crate::motion::Motion::for_preference(values.reduce_motion),
                     )
                 })
                 .await;
+            previous = snapshot;
+            let Some(handle) = *window.borrow() else {
+                continue;
+            };
             let _ = handle.update(cx, |view, _, cx| {
-                let changed = view.set_motion(motion);
+                let motion_changed = view.set_motion(motion);
+                let font_changed = view.set_font_size(next.ui_px);
                 if view.follows_look() {
                     view.set_look(next);
                     cx.notify();
-                } else if changed {
+                } else if font_changed || motion_changed {
                     cx.notify();
                 }
             });

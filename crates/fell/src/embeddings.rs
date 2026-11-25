@@ -136,8 +136,15 @@ fn status(model: &LocalModel, root: &Path, console: &mut Console<'_>) -> Result<
     say(console, &text)
 }
 
+pub(crate) const INSTALL_EFFECT: &str = "\
+Each file is checked against the SHA-256 above and deleted if it does not match.\n\
+Once installed, Fell re-indexes mail with this model in the background the next\n\
+time it opens the mailbox, and search becomes hybrid: it also finds mail close in\n\
+meaning, among the mail indexed so far. If the model does not load, search stays\n\
+keyword search.";
+
 /// What `install` will do, shown before it asks.
-pub(crate) fn plan(model: &LocalModel, root: &Path) -> String {
+fn plan(model: &LocalModel, root: &Path) -> String {
     let mut text = format!(
         "Fell will download {}\nfrom Hugging Face, {} in total:\n",
         model.title,
@@ -150,12 +157,7 @@ pub(crate) fn plan(model: &LocalModel, root: &Path) -> String {
         ));
     }
     text.push_str(&format!(
-        "\nLicense: {} (model card: {})\nSaved to: {} (owner-only)\n\n\
-         Each file is checked against the SHA-256 above and deleted if it does not match.\n\
-         Once installed, Fell re-indexes mail with this model in the background the next\n\
-         time it opens the mailbox, and search becomes hybrid: it also finds mail close in\n\
-         meaning, among the mail indexed so far. If the model does not load, search stays\n\
-         keyword search.",
+        "\nLicense: {} (model card: {})\nSaved to: {} (owner-only)\n\n{INSTALL_EFFECT}",
         model.license,
         model.card_url,
         model_dir(model, root).display()

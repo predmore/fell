@@ -529,6 +529,9 @@ mod tests {
                     inbox.session.leave_attachments();
                     inbox.session.attachment_retry_notice = inbox.focused_attachment_retry_notice();
                     assert!(inbox.session.status_notice().is_none());
+                    // The fixture's fallback store can finish opening on either
+                    // side of this assertion. Its startup error is independent.
+                    inbox.session.startup_error = None;
                     assert_eq!(
                         inbox.session.detail_text().as_deref(),
                         Some("Saved 1, 2 failed\nfixture error")

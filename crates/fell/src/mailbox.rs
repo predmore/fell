@@ -3,7 +3,7 @@
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use fell_core::{Account, AccountConfig, AccountId, Store};
@@ -410,7 +410,7 @@ fn open_at(path: &Path) -> fell_core::Result<Store> {
 /// Create missing directories for the mailbox and restrict only those new
 /// directories to 0700. An existing parent, including a home directory or
 /// `/tmp`, keeps the mode it already has.
-fn create_mailbox_dirs(dir: &Path) -> fell_core::Result<()> {
+pub(crate) fn create_mailbox_dirs(dir: &Path) -> std::io::Result<()> {
     let mut missing = Vec::new();
     let mut current = dir;
     loop {
@@ -424,11 +424,10 @@ fn create_mailbox_dirs(dir: &Path) -> fell_core::Result<()> {
         }
     }
     for path in missing.iter().rev() {
-        match fs::create_dir(path) {
-            Ok(()) => fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-                .map_err(|err| fell_core::Error::Backend(err.to_string()))?,
+        match fs::DirBuilder::new().mode(0o700).create(path) {
+            Ok(()) => fs::set_permissions(path, fs::Permissions::from_mode(0o700))?,
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(err) => return Err(fell_core::Error::Backend(err.to_string())),
+            Err(err) => return Err(err),
         }
     }
     Ok(())
