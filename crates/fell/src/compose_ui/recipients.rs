@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -7,7 +8,7 @@ use fell_core::Address;
 use fell_core::compose::email_of;
 use gpui::{Context, Deferred, MouseButton, Window, deferred, div, prelude::*, px};
 
-use super::{ComposeView, Field};
+use super::{ComposeView, Field, recipient_rows::tokens};
 use crate::motion::Motion;
 use crate::recipient_menu::{self, Menu};
 use crate::store_actor::StoreClient;
@@ -77,12 +78,17 @@ impl ComposeView {
             .recipient_line()
             .filter(|_| !self.closing && !self.discarding && !self.preview)
             .and_then(|line| {
-                let start = token_start(line);
+                let caret = match &self.recipient_selection {
+                    Some(selection) if !selection.is_empty() => return None,
+                    Some(caret) => caret.start,
+                    None => line.len(),
+                };
+                let token = token_at(line, caret);
                 Some(Lookup {
                     draft: self.draft_id.clone(),
                     field: self.field,
-                    prefix: prefix(&line[start..])?.to_owned(),
-                    excluded: self.excluded_recipients(start),
+                    prefix: prefix(&line[token.start..caret])?.to_owned(),
+                    excluded: self.excluded_recipients(token),
                 })
             });
         let completion = &mut self.recipients;
@@ -195,7 +201,7 @@ impl ComposeView {
         .detach();
     }
 
-    fn excluded_recipients(&self, active_token_start: usize) -> HashSet<String> {
+    fn excluded_recipients(&self, active_token: Range<usize>) -> HashSet<String> {
         [
             (Field::To, self.to_line.as_str()),
             (Field::Cc, self.cc_line.as_str()),
@@ -203,12 +209,10 @@ impl ComposeView {
         ]
         .into_iter()
         .flat_map(|(field, line)| {
-            let completed = if field == self.field {
-                &line[..active_token_start]
-            } else {
-                line
-            };
-            recipient_tokens(completed).take(recipient_menu::EXCLUSION_LIMIT)
+            tokens(line)
+                .filter(move |(start, _)| field != self.field || *start != active_token.start)
+                .take(recipient_menu::EXCLUSION_LIMIT)
+                .map(|(_, raw)| raw)
         })
         .filter_map(email_of)
         .map(|email| email.to_lowercase())
@@ -273,18 +277,27 @@ impl ComposeView {
             Field::Bcc => &mut self.bcc_line,
             _ => return false,
         };
-        let start = token_start(line);
-        if prefix(&line[start..]).is_none() {
+        let caret = match &self.recipient_selection {
+            Some(selection) if !selection.is_empty() => return false,
+            Some(caret) => caret.start,
+            None => line.len(),
+        };
+        let token = token_at(line, caret);
+        if prefix(&line[token.start..caret]).is_none() {
             return false;
         }
-        line.truncate(start);
-        if start > 0 {
-            line.push(' ');
+        let mut replacement = mailbox(person);
+        if token.start > 0 {
+            replacement.insert(0, ' ');
         }
-        line.push_str(&mailbox(person));
-        line.push_str(", ");
-        // The header edits at the end of the line. Keep the accepted
-        // recipient in the draft even if the next token is unfinished.
+        if token.end == line.len() {
+            replacement.push_str(", ");
+        }
+        let caret = token.start + replacement.len();
+        line.replace_range(token, &replacement);
+        self.recipient_selection = (caret < line.len()).then_some(caret..caret);
+        // Keep an accepted recipient in the draft even if the next token is
+        // still unfinished.
         self.commit_field(self.field);
         true
     }
@@ -337,29 +350,19 @@ impl ComposeView {
     }
 }
 
-/// The last top-level comma. A comma in a quoted name belongs to that name.
-fn token_start(line: &str) -> usize {
+/// A caret just before a comma belongs to the recipient before it.
+fn token_at(line: &str, caret: usize) -> Range<usize> {
     if !line.contains('"') {
-        return line.rfind(',').map_or(0, |index| index + 1);
+        let start = line[..caret].rfind(',').map_or(0, |index| index + 1);
+        let end = line[caret..]
+            .find(',')
+            .map_or(line.len(), |index| caret + index);
+        return start..end;
     }
-    line.len() - recipient_tokens(line).last().unwrap_or_default().len()
-}
-
-fn recipient_tokens(line: &str) -> impl Iterator<Item = &str> {
-    let mut quoted = false;
-    let mut escaped = false;
-    line.split(move |ch| {
-        if std::mem::take(&mut escaped) {
-            return false;
-        }
-        match ch {
-            '\\' if quoted => escaped = true,
-            '"' => quoted = !quoted,
-            ',' if !quoted => return true,
-            _ => {}
-        }
-        false
-    })
+    tokens(line)
+        .map(|(start, token)| start..start + token.len())
+        .find(|range| (range.start..=range.end).contains(&caret))
+        .unwrap_or(caret..caret)
 }
 
 fn prefix(token: &str) -> Option<&str> {
@@ -443,7 +446,7 @@ mod tests {
             compose.cc_line = "Rhea <rhea@EXAMPLE.test>".into();
             compose.bcc_line = "ravi@example.test".into();
             assert_eq!(
-                compose.excluded_recipients(token_start(&compose.to_line)),
+                compose.excluded_recipients(token_at(&compose.to_line, compose.to_line.len())),
                 [
                     "ruben@example.test",
                     "rhea@example.test",
@@ -472,13 +475,68 @@ mod tests {
             compose.to_line.push_str("alex");
             compose.cc_line = "rhea@example.test".into();
             compose.bcc_line.clear();
-            let start = token_start(&compose.to_line);
-            assert_eq!(prefix(&compose.to_line[start..]), Some("alex"));
-            let excluded = compose.excluded_recipients(start);
+            let token = token_at(&compose.to_line, compose.to_line.len());
+            assert_eq!(prefix(&compose.to_line[token.clone()]), Some("alex"));
+            let excluded = compose.excluded_recipients(token);
             assert_eq!(excluded.len(), recipient_menu::EXCLUSION_LIMIT + 1);
             assert!(excluded.contains("alex199@example.test"));
             assert!(!excluded.contains("alex200@example.test"));
             assert!(excluded.contains("rhea@example.test"));
+        });
+    }
+
+    #[test]
+    fn escape_retains_invalid_text_and_send_focuses_it_for_repair() {
+        let root = tempfile::tempdir().unwrap();
+        let (hub, id, folder) = open_demo(root.path().to_owned(), ThemeKind::Dark).unwrap();
+        let mut app = gpui::TestAppContext::single();
+        let (view, cx) =
+            app.add_window_view(|_, cx| ComposeView::new(hub.clone(), id.clone(), folder, cx));
+        view.update(cx, |compose, cx| {
+            for field in [Field::To, Field::Cc, Field::Bcc] {
+                compose.focus_header(field);
+                let before = compose.header_text().to_owned();
+                let line = "ari@example.test, r, avery@example.test";
+                for _ in 0..before.len() {
+                    compose.field_key("backspace", None);
+                }
+                compose.field_key("a", Some(line));
+                compose.on_key(
+                    &gpui::KeyDownEvent {
+                        keystroke: gpui::Keystroke::parse("escape").unwrap(),
+                        is_held: false,
+                    },
+                    cx,
+                );
+                compose.sync_from_hub();
+                assert!(compose.field == Field::Body);
+                assert_eq!(compose.status.as_ref(), "invalid address `r`");
+                assert!(compose.recipient_errors[field.recipient_index().unwrap()].is_some());
+
+                let saved = hub.with_session(&id, |session| session.snapshot()).unwrap();
+                let addresses = match field {
+                    Field::To => saved.to,
+                    Field::Cc => saved.cc,
+                    _ => saved.bcc,
+                };
+                assert_eq!(super::super::join_addrs(&addresses), before);
+
+                compose.send(cx);
+                assert!(compose.sending.is_none());
+                assert!(compose.field == field);
+                assert_eq!(compose.header_text(), line);
+                assert_eq!(
+                    &compose.header_text()[compose.recipient_selection.clone().unwrap()],
+                    "r"
+                );
+                compose.field_key("r", Some("ruben@example.test"));
+                assert!(compose.commit_field(field));
+                assert_eq!(
+                    compose.header_text(),
+                    "ari@example.test, ruben@example.test, avery@example.test"
+                );
+                assert!(compose.recipient_errors[field.recipient_index().unwrap()].is_none());
+            }
         });
     }
 

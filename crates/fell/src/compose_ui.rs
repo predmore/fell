@@ -1,6 +1,7 @@
 //! Compose window. The buffer is plain markdown. Styling is a view of that
 //! text, through the same document model the conversation renderer uses.
 
+mod recipient_rows;
 mod recipients;
 pub(crate) use recipients::RecipientStore;
 
@@ -149,6 +150,17 @@ enum Field {
     Body,
 }
 
+impl Field {
+    fn recipient_index(self) -> Option<usize> {
+        match self {
+            Self::To => Some(0),
+            Self::Cc => Some(1),
+            Self::Bcc => Some(2),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SendPanel {
     Summary,
@@ -284,6 +296,9 @@ pub struct ComposeView {
     bcc_line: String,
     subject_line: String,
     recipients: recipients::Completion,
+    recipient_errors: [Option<SharedString>; 3],
+    recipient_selection: Option<Range<usize>>,
+    recipient_heights: [recipient_rows::RowHeight; 3],
     styled_cache: Option<(StyledBodyKey, gpui::Entity<CachedStyledBody>)>,
     frames: Option<crate::frame_log::SharedFrameLog>,
     theme: ThemeKind,
@@ -414,6 +429,9 @@ impl ComposeView {
             bcc_line: join_addrs(&snap.bcc),
             subject_line: snap.subject,
             recipients: recipients::Completion::default(),
+            recipient_errors: Default::default(),
+            recipient_selection: None,
+            recipient_heights: Default::default(),
             styled_cache: None,
             frames: crate::frame_log::FrameLog::from_env(),
             theme: ThemeKind::Dark,
@@ -935,6 +953,9 @@ impl ComposeView {
         self.editor = Editor::from_body(&snap.body);
         self.applied_revision = snap.revision;
         self.field = Field::Body;
+        self.recipient_errors = Default::default();
+        self.recipient_selection = None;
+        self.recipient_heights = Default::default();
         self.to_line = join_addrs(&snap.to);
         self.cc_line = join_addrs(&snap.cc);
         self.bcc_line = join_addrs(&snap.bcc);
@@ -973,25 +994,20 @@ impl ComposeView {
             self.end_insert();
             changed = true;
         }
-        if self.field != Field::To {
-            let line = join_addrs(&snap.to);
-            if self.to_line != line {
-                self.to_line = line;
-                changed = true;
-            }
-        }
-        if self.field != Field::Cc {
-            let line = join_addrs(&snap.cc);
-            if self.cc_line != line {
-                self.cc_line = line;
-                changed = true;
-            }
-        }
-        if self.field != Field::Bcc {
-            let line = join_addrs(&snap.bcc);
-            if self.bcc_line != line {
-                self.bcc_line = line;
-                changed = true;
+        for (index, (field, line, saved)) in [
+            (Field::To, &mut self.to_line, &snap.to),
+            (Field::Cc, &mut self.cc_line, &snap.cc),
+            (Field::Bcc, &mut self.bcc_line, &snap.bcc),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if self.field != field && self.recipient_errors[index].is_none() {
+                let canonical = join_addrs(saved);
+                if *line != canonical && !recipient_rows::matches_saved(line, saved) {
+                    *line = canonical;
+                    changed = true;
+                }
             }
         }
         if self.field != Field::Subject && self.subject_line != snap.subject {
@@ -1075,6 +1091,12 @@ impl ComposeView {
     }
 
     fn set_header_row(&mut self, field: Field, snap: &Snapshot) {
+        if let Some(index) = field.recipient_index() {
+            self.recipient_errors[index] = None;
+            if self.field == field {
+                self.recipient_selection = None;
+            }
+        }
         match field {
             Field::To => self.to_line = join_addrs(&snap.to),
             Field::Cc => self.cc_line = join_addrs(&snap.cc),
@@ -1103,6 +1125,9 @@ impl ComposeView {
         let result = self.record_field(field);
         match result {
             Some(Ok(())) => {
+                if let Some(index) = field.recipient_index() {
+                    self.recipient_errors[index] = None;
+                }
                 let _ = self.hub.with_session(&id, |session| session.flush());
                 if self.pull_unpainted() {
                     self.status = "the draft changed; it is on screen before send".into();
@@ -1114,6 +1139,11 @@ impl ComposeView {
             }
             Some(Err(err)) => {
                 self.status = err.into();
+                if let Some(index) = field.recipient_index()
+                    && recipient_rows::first_invalid(self.header_text()).is_some()
+                {
+                    self.recipient_errors[index] = Some(self.status.clone());
+                }
                 false
             }
             None => false,
@@ -1140,6 +1170,16 @@ impl ComposeView {
         self.send_feedback.invalidate_readiness();
         cx.global_mut::<SendAttempts>().clear(&id);
         if self.field != Field::Body && !self.commit_field(self.field) {
+            return;
+        }
+        if let Some((index, error)) = self
+            .recipient_errors
+            .iter()
+            .enumerate()
+            .find_map(|(index, error)| Some((index, error.clone()?)))
+        {
+            self.focus_header([Field::To, Field::Cc, Field::Bcc][index]);
+            self.status = error;
             return;
         }
         if self.pull_unpainted() {
@@ -1408,12 +1448,17 @@ impl ComposeView {
                 }
                 let field = self.field;
                 let committed = self.commit_field(field);
-                if !committed {
+                if !committed
+                    && field
+                        .recipient_index()
+                        .is_none_or(|i| self.recipient_errors[i].is_none())
+                {
                     self.restore_header_row(field);
                 }
                 self.editor.mode = Mode::Normal;
                 self.editor.anchor = None;
                 self.field = Field::Body;
+                self.recipient_selection = None;
                 if committed {
                     self.status = "normal".into();
                 }
@@ -1687,11 +1732,14 @@ impl ComposeView {
             Field::Cc => &snap.cc,
             Field::Bcc => &snap.bcc,
         };
-        fell_core::compose::parse_address_line(self.header_text()).is_ok_and(|line| {
-            line.iter()
-                .map(String::as_str)
-                .eq(addresses.iter().map(|address| address.raw.as_str()))
-        })
+        recipient_rows::matches_saved(self.header_text(), addresses)
+    }
+
+    fn focus_header(&mut self, field: Field) {
+        self.field = field;
+        self.recipient_selection = field
+            .recipient_index()
+            .and_then(|_| recipient_rows::first_invalid(self.header_text()));
     }
 
     fn header_text(&self) -> &str {
@@ -1716,12 +1764,16 @@ impl ComposeView {
             "tab" | "enter" => {
                 let field = self.field;
                 if self.commit_field(field) {
-                    self.field = leave_header(field, &mut self.editor);
-                    if self.field == Field::Body {
+                    let next = leave_header(field, &mut self.editor);
+                    self.focus_header(next);
+                    if next == Field::Body {
                         self.status = "insert".into();
                     }
                 }
                 return;
+            }
+            _ if self.field.recipient_index().is_some() => {
+                recipient_rows::edit(line, &mut self.recipient_selection, key, typed);
             }
             "backspace" => {
                 line.pop();
@@ -1870,7 +1922,7 @@ impl ComposeView {
                 self.editor.mode = Mode::Visual;
             }
             "tab" => {
-                self.field = Field::To;
+                self.focus_header(Field::To);
                 self.status = "".into();
             }
             _ => {
@@ -2084,7 +2136,12 @@ impl Render for ComposeView {
         };
         // The mode word says it all; how to change mode is not news.
         let hint: SharedString = if idle_status(&self.status) {
-            "".into()
+            self.recipient_errors
+                .iter()
+                .flatten()
+                .next()
+                .cloned()
+                .unwrap_or_default()
         } else {
             self.status.clone()
         };
@@ -2212,6 +2269,7 @@ impl Render for ComposeView {
                         mode,
                         note: &hint,
                         draft_save,
+                        invalid_recipients: self.recipient_errors.iter().any(Option::is_some),
                     },
                     &snap,
                     self.send_tried,
@@ -2258,11 +2316,11 @@ impl Render for ComposeView {
 impl ComposeView {
     #[allow(clippy::too_many_arguments)]
     fn fields_view(
-        &self,
+        &mut self,
         snap: &Snapshot,
         colors: Palette,
         wide: bool,
-        window: &Window,
+        window: &mut Window,
         family: &str,
         reply_check: Option<ReplyCheck>,
         overlay: Option<(Field, gpui::Deferred)>,
@@ -2275,13 +2333,89 @@ impl ComposeView {
                 None
             }
         };
-        let mut column = div().flex().flex_col().bg(rgb(colors.panel)).px_4().py_1();
+        let mut column = div()
+            .flex()
+            .flex_col()
+            .bg(rgb(colors.panel))
+            .px(px(recipient_rows::FIELDS_PADDING))
+            .py_1();
         let redirects = redirects(snap);
         // A context row's subject gives way, with an ellipsis, so who and
         // when stay on one line at any width.
         // The padding, border, label and gap around the value, and a
         // margin, since the shaped width runs a little under the painted.
         let row_px = f32::from(window.viewport_size().width) - 32.0 - 10.0 - LABEL_PX - 12.0 - 24.0;
+        let none = HashSet::new();
+        let to_color =
+            if shown_send_block(snap, self.send_tried).map(String::as_str) == Some(NO_RECIPIENT) {
+                colors.error
+            } else {
+                colors.dim
+            };
+        let motion = self.motion;
+        let now = Instant::now();
+        for (index, (field, label, value, addresses, redirects, placeholder)) in [
+            (
+                Field::To,
+                "To",
+                &self.to_line,
+                &snap.to,
+                &redirects,
+                ("add a recipient", to_color),
+            ),
+            (
+                Field::Cc,
+                "Cc",
+                &self.cc_line,
+                &snap.cc,
+                &none,
+                ("none", colors.dim),
+            ),
+            (
+                Field::Bcc,
+                "Bcc",
+                &self.bcc_line,
+                &snap.bcc,
+                &none,
+                ("none", colors.dim),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let active = self.field == field;
+            let selection = active.then(|| {
+                self.recipient_selection
+                    .clone()
+                    .unwrap_or(value.len()..value.len())
+            });
+            let shown = recipient_rows::value_view(
+                label,
+                recipient_rows::RecipientLine {
+                    value,
+                    saved: addresses,
+                    redirects,
+                    placeholder,
+                    selection,
+                    show_errors: self.recipient_errors[index].is_some() || !snap.issues.is_empty(),
+                },
+                colors,
+                wide,
+                family,
+                &mut self.recipient_heights[index],
+                motion,
+                now,
+                window,
+            );
+            column = column.child(field_row(
+                label,
+                active,
+                colors,
+                recipient_rows::label_width(window),
+                shown,
+                overlay_for(field),
+            ));
+        }
         let fit = |who: &str, what: &str, when: &str| {
             let room = row_px
                 - text_px(window, who, self.ui_px, family)
@@ -2290,53 +2424,6 @@ impl ComposeView {
                 text_px(window, text, self.ui_px, family)
             })
         };
-        let none = HashSet::new();
-        // An empty To says what it needs, in the error colour while it
-        // blocks send.
-        let to_hint =
-            if shown_send_block(snap, self.send_tried).map(String::as_str) == Some(NO_RECIPIENT) {
-                ("add a recipient", colors.error)
-            } else {
-                ("add a recipient", colors.dim)
-            };
-        column = field_row(
-            column,
-            "To",
-            &self.to_line,
-            self.field == Field::To,
-            &snap.to,
-            colors,
-            wide,
-            &redirects,
-            Some(to_hint),
-            overlay_for(Field::To),
-        );
-        // Cc and Bcc always keep a row each, so tabbing into them never
-        // moves the body.
-        column = field_row(
-            column,
-            "Cc",
-            &self.cc_line,
-            self.field == Field::Cc,
-            &snap.cc,
-            colors,
-            wide,
-            &none,
-            Some(("none", colors.dim)),
-            overlay_for(Field::Cc),
-        );
-        column = field_row(
-            column,
-            "Bcc",
-            &self.bcc_line,
-            self.field == Field::Bcc,
-            &snap.bcc,
-            colors,
-            wide,
-            &none,
-            Some(("none", colors.dim)),
-            overlay_for(Field::Bcc),
-        );
         column
             .child(subject_row(
                 &self.subject_line,
@@ -3004,125 +3091,39 @@ fn agent_label(agent: &str) -> String {
     display_safe(agent.strip_prefix("agent:").unwrap_or(agent))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn field_row(
-    parent: gpui::Div,
     label: &str,
-    value: &str,
     active: bool,
-    addresses: &[fell_core::compose::AddressView],
     colors: Palette,
-    wide: bool,
-    redirects: &HashSet<String>,
-    placeholder: Option<(&str, u32)>,
+    label_width: gpui::Pixels,
+    shown: gpui::Div,
     overlay: Option<gpui::Deferred>,
 ) -> gpui::Div {
-    // While a field is being edited it shows the raw line. Otherwise each
-    // address stands alone, with its note beside it: "(first time)" for one
-    // the account never mailed, "(Reply-To)" for one the original asked
-    // replies to go to instead of its sender.
-    let note = |address: &fell_core::compose::AddressView| {
-        let redirect = redirects.contains(&address.email.trim().to_lowercase());
-        match (redirect, address.fresh) {
-            (true, true) => Some(("(Reply-To · first time)", colors.error)),
-            (true, false) => Some(("(Reply-To)", colors.dim)),
-            (false, true) => Some(("(first time)", colors.dim)),
-            (false, false) => None,
-        }
-    };
-    // The address, then its note as one unbreakable piece: a narrow window
-    // wraps the note whole onto the next line, never inside it.
-    let marked = |address: &fell_core::compose::AddressView, comma: bool| {
-        let comma = if comma { "," } else { "" };
-        let mut piece = div().flex().flex_wrap().gap_x(px(5.));
-        match note(address) {
-            Some((words, color)) => {
-                // The address may wrap inside itself when it alone is wider
-                // than the row; the note then takes the next line.
-                piece = piece
-                    .child(div().min_w(px(0.)).child(address.raw.clone()))
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .whitespace_nowrap()
-                            .italic()
-                            .text_color(rgb(color))
-                            .child(format!("{words}{comma}")),
-                    );
-            }
-            None => piece = piece.child(format!("{}{comma}", address.raw)),
-        }
-        piece
-    };
-    let shown = if active {
-        // The field being typed in shows the raw line and a caret at its end;
-        // empty, it says what it wants, dimmed.
-        div()
-            .flex()
-            .items_center()
-            .child(SharedString::from(value.to_string()))
-            .child(caret(colors, Mode::Insert))
-            .when(value.is_empty() && label == "To", |line| {
-                line.children(placeholder.map(|(words, _)| {
-                    div()
-                        .pl(px(6.))
-                        .text_color(rgb(colors.dim))
-                        .child(words.to_string())
-                }))
-            })
-    } else if addresses.is_empty() {
-        match (value.is_empty(), placeholder) {
-            (true, Some((words, color))) => div().text_color(rgb(color)).child(words.to_string()),
-            (true, None) => div().child(SharedString::from(" ")),
-            (false, _) => div().child(SharedString::from(value.to_string())),
-        }
-    } else if !wide {
-        // Narrow: one address per line, its note always beside it.
-        div().flex().flex_col().children(
-            addresses
-                .iter()
-                .map(|address| div().child(marked(address, false))),
+    div()
+        .flex()
+        .gap(px(
+            recipient_rows::FIELD_GAP - crate::recipient_menu::TEXT_INSET
+        ))
+        .pl(px(recipient_rows::FIELD_INDENT))
+        .py_1()
+        .border_l(px(recipient_rows::FIELD_RULE))
+        .border_color(rgb(if active { colors.accent } else { colors.panel }))
+        .child(
+            div()
+                .w(label_width)
+                .flex_shrink_0()
+                .text_size(px(16.))
+                .text_color(rgb(colors.fg))
+                .child(label.to_string()),
         )
-    } else {
-        // A wrapping row with each address whole, so a long list breaks
-        // between addresses, never inside one.
-        let last = addresses.len().saturating_sub(1);
-        div()
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .gap_x_2()
-            .children(addresses.iter().enumerate().map(|(index, address)| {
-                div()
-                    .whitespace_nowrap()
-                    .child(marked(address, index < last))
-            }))
-    };
-    let inset = crate::recipient_menu::TEXT_INSET;
-    parent.child(
-        div()
-            .flex()
-            .gap(px(12. - inset))
-            .pl_1()
-            .py_1()
-            .border_l(px(2.))
-            .border_color(rgb(if active { colors.accent } else { colors.panel }))
-            .child(
-                div()
-                    .w(px(LABEL_PX))
-                    .flex_shrink_0()
-                    .text_color(rgb(colors.fg))
-                    .child(label.to_string()),
-            )
-            .child(
-                div()
-                    .relative()
-                    .flex_1()
-                    .min_w_0()
-                    .child(shown.pl(px(inset)).pr_1())
-                    .children(overlay),
-            ),
-    )
+        .child(
+            div()
+                .relative()
+                .flex_1()
+                .min_w_0()
+                .child(shown.pl(px(crate::recipient_menu::TEXT_INSET)))
+                .children(overlay),
+        )
 }
 
 fn subject_row(subject: &str, active: bool, colors: Palette) -> gpui::Div {
@@ -5654,6 +5655,7 @@ struct ComposeStatus<'a> {
     mode: &'a str,
     note: &'a str,
     draft_save: Option<(DraftSaveStatus, f32)>,
+    invalid_recipients: bool,
 }
 
 /// One line, in the inbox's style: mode and hints on the left, send on
@@ -5684,6 +5686,7 @@ fn status_bar(
         mode,
         note,
         draft_save,
+        invalid_recipients,
     } = status;
     let idle = idle_status(note);
     let saved = draft_save.filter(|_| idle);
@@ -5699,7 +5702,9 @@ fn status_bar(
         1 => Some("1 first-time recipient".to_string()),
         count => Some(format!("{count} first-time recipients")),
     };
-    let right = if saved.is_some_and(|(status, _)| status.warning().is_some()) && !wide {
+    let right = if invalid_recipients
+        || (saved.is_some_and(|(status, _)| status.warning().is_some()) && !wide)
+    {
         Vec::new()
     } else {
         status_right(snap, note, send_tried, wide)
