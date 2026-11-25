@@ -191,34 +191,39 @@ impl Inbox {
         } else {
             window.focus_next();
         }
-        let Some(mut focus) = window.focused(cx) else {
-            return false;
+        let focused_link = |window: &Window| {
+            let focus = window.focused(cx)?;
+            let place = self.reader_links.placement(&focus)?;
+            Some((focus, place))
         };
-        let Some(mut place) = self.reader_links.placement(&focus) else {
+        let Some((mut focus, mut place)) = focused_link(window) else {
+            if preferred.is_some() {
+                window.focus(&self.focus);
+            }
             return false;
         };
         if preferred.is_some() || (visible_first && !place.visible.get()) {
             let first = focus.clone();
-            let mut next_focus = focus.clone();
-            let mut next_place = place.clone();
+            let mut next = (focus.clone(), place.clone());
             loop {
-                let exact = preferred == Some(next_place.target.as_ref());
-                if exact || (visible_first && !place.visible.get() && next_place.visible.get()) {
-                    focus = next_focus;
-                    place = next_place;
-                    if exact || preferred.is_none() {
-                        break;
-                    }
+                let matches = preferred.map_or_else(
+                    || next.1.visible.get(),
+                    |target| next.1.target.as_ref() == target,
+                );
+                if matches {
+                    (focus, place) = next;
+                    break;
                 }
                 window.focus_next();
-                let Some(next) = window.focused(cx).filter(|next| *next != first) else {
+                let Some(candidate) = focused_link(window).filter(|(next, _)| *next != first)
+                else {
+                    if preferred.is_some() {
+                        window.focus(&self.focus);
+                        return false;
+                    }
                     break;
                 };
-                let Some(next_position) = self.reader_links.placement(&next) else {
-                    break;
-                };
-                next_focus = next;
-                next_place = next_position;
+                next = candidate;
             }
             window.focus(&focus);
         }
@@ -290,7 +295,7 @@ impl Inbox {
             return;
         }
         self.reader_links.pending = None;
-        if !self.focus_or_notice(backward, None, window, cx) {
+        if !self.focus_or_notice(backward, window, cx) {
             self.queue_link_focus(backward);
             cx.notify();
         }
@@ -299,12 +304,11 @@ impl Inbox {
     fn focus_or_notice(
         &mut self,
         backward: bool,
-        preferred: Option<&str>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
         let first = self.focus.is_focused(window) && !backward;
-        if self.focus_link(backward, first, preferred, window, cx) {
+        if self.focus_link(backward, first, None, window, cx) {
             return true;
         }
         if !self.link_bodies_settled() {
@@ -357,12 +361,11 @@ impl Inbox {
                     && (handle.is_focused(window) || inbox.focus.is_focused(window))
                     && !inbox.focus.contains(&handle, window)
                 {
+                    inbox.reader_links.pending = None;
                     window.focus(&inbox.focus);
-                    if !inbox.focus_or_notice(false, Some(&target), window, cx) {
-                        inbox.queue_link_focus(false);
-                    }
+                    inbox.focus_link(false, false, Some(&target), window, cx);
                 } else if let Some(backward) = inbox.pending_link_direction()
-                    && inbox.focus_or_notice(backward, None, window, cx)
+                    && inbox.focus_or_notice(backward, window, cx)
                 {
                     inbox.reader_links.pending = None;
                 }
@@ -375,8 +378,7 @@ impl Inbox {
 mod tests {
     use super::*;
 
-    #[test]
-    fn list_tab_focuses_the_stored_link_and_hands_off_to_the_matching_formatted_link() {
+    fn handoff_to_formatted_body(html: &str) -> (gpui::TestAppContext, gpui::WindowHandle<Inbox>) {
         let (mut app, inbox) = super::super::tests::pending_inbox();
         let window_handle: gpui::AnyWindowHandle = inbox.into();
         let draw = |app: &mut gpui::TestAppContext| {
@@ -430,8 +432,7 @@ mod tests {
                 inbox.body_refresh.rich.insert(
                     message.id.clone(),
                     Rich::Html(Arc::new(crate::mail_body::prepare_html(
-                        r#"<p><a href="https://example.test/other">Another link</a></p>
-                        <p><a href="https://example.test/stored">Formatted release notes</a></p>"#,
+                        html,
                         &message.mail_headers,
                     ))),
                 );
@@ -439,14 +440,39 @@ mod tests {
             })
             .unwrap();
         draw(&mut app);
+        (app, inbox)
+    }
+
+    #[test]
+    fn list_tab_focuses_the_stored_link_and_hands_off_to_the_matching_formatted_link() {
+        let (mut app, inbox) = handoff_to_formatted_body(
+            r#"<p><a href="https://example.test/other">Another link</a></p>
+            <p><a href="https://example.test/stored">Formatted release notes</a></p>"#,
+        );
         // Dispatch against the newly drawn tree without waiting for another frame.
-        app.simulate_keystrokes(window_handle, "y");
+        app.simulate_keystrokes(inbox.into(), "y");
         assert_eq!(
             app.read_from_clipboard()
                 .and_then(|clipboard| clipboard.text())
                 .as_deref(),
             Some("https://example.test/stored"),
         );
+    }
+
+    #[test]
+    fn a_missing_formatted_link_returns_focus_to_the_reader() {
+        let (mut app, inbox) = handoff_to_formatted_body(
+            r#"<p><a href="https://example.test/other">Another link</a></p>"#,
+        );
+        inbox
+            .update(&mut app, |inbox, window, _| {
+                assert!(inbox.focus.is_focused(window));
+                assert!(inbox.reader_links.pending.is_none());
+                assert!(inbox.session.status_notice().is_none());
+            })
+            .unwrap();
+        app.simulate_keystrokes(inbox.into(), "y");
+        assert!(app.read_from_clipboard().is_none());
     }
 
     #[test]

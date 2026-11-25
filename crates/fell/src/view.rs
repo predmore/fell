@@ -11198,7 +11198,7 @@ fn status_bar(
     let link_preview = link_preview.filter(|_| hints.is_none() && (!narrow || !status_has_details));
     let link_opacity = link_preview.as_ref().map_or(0.0, |(_, alpha)| *alpha);
     let link_layer = link_preview
-        .map(|(preview, alpha)| (preview, alpha * (1.0 - notice_opacity)))
+        .map(|(preview, alpha)| (preview, alpha * (1.0 - status.notice_slot)))
         .filter(|(_, alpha)| *alpha > 0.0);
     let text = status
         .leaving

@@ -88,10 +88,24 @@ struct LinkState {
     place: Rc<Placement>,
 }
 
-struct LinkFragment {
-    bounds: Bounds<Pixels>,
-    starts_line: bool,
-    ends_line: bool,
+fn outline_span(rect: &Bounds<Pixels>) -> Range<Pixels> {
+    rect.left() - px(2.)..rect.right() + px(2.)
+}
+
+/// Horizontal edges stop where two successive fragments touch.
+fn outline_segments(
+    span: Range<Pixels>,
+    adjacent: Option<Range<Pixels>>,
+) -> impl Iterator<Item = Range<Pixels>> {
+    let segments = if let Some(covered) = adjacent {
+        [
+            span.start..span.end.min(covered.start),
+            span.start.max(covered.end)..span.end,
+        ]
+    } else {
+        [span, px(0.)..px(0.)]
+    };
+    segments.into_iter().filter(|edge| edge.start < edge.end)
 }
 
 pub(super) fn link_controls(
@@ -106,8 +120,10 @@ pub(super) fn link_controls(
         focus.handles.clear();
     }
     focus.handles.resize_with(mail.links.len(), || None);
-    let mut fragments: Vec<Vec<LinkFragment>> = (0..mail.links.len()).map(|_| Vec::new()).collect();
-    let clip = window.content_mask().bounds.intersect(&bounds);
+    let mut fragments: Vec<Vec<Bounds<Pixels>>> =
+        (0..mail.links.len()).map(|_| Vec::new()).collect();
+    let mask = window.content_mask().bounds;
+    let clip = mask.intersect(&bounds);
     mail.for_visible_line(bounds, window, None, |line, shaped, origin, _| {
         let layout = &shaped.unwrapped_layout;
         let glyphs = layout.runs.iter().flat_map(|run| &run.glyphs);
@@ -133,12 +149,12 @@ pub(super) fn link_controls(
             let byte = line.range.start + glyph.index + skipped;
             let links = &mail.links[first..last];
             let relative = links.partition_point(|link| link.range.end <= byte);
-            let Some(link) = links
+            if links
                 .get(relative)
-                .filter(|link| link.range.contains(&byte))
-            else {
+                .is_none_or(|link| !link.range.contains(&byte))
+            {
                 continue;
-            };
+            }
             let right = glyphs.peek().map_or(layout.width, |next| next.position.x);
             if right <= glyph.position.x {
                 continue;
@@ -146,23 +162,15 @@ pub(super) fn link_controls(
             let rect = Bounds {
                 origin: point(origin.x + glyph.position.x, origin.y),
                 size: size(right - glyph.position.x, mail.line_height),
-            }
-            .intersect(&clip);
-            if rect.is_empty() {
-                continue;
-            }
+            };
             let rectangles = &mut fragments[first + relative];
             if let Some(previous) = rectangles.last_mut()
-                && previous.bounds.origin.y == rect.origin.y
-                && previous.bounds.right() == rect.left()
+                && previous.origin.y == rect.origin.y
+                && previous.right() == rect.left()
             {
-                previous.bounds.size.width = rect.right() - previous.bounds.left();
+                previous.size.width = rect.right() - previous.left();
             } else {
-                rectangles.push(LinkFragment {
-                    bounds: rect,
-                    starts_line: link.range.start >= line.range.start,
-                    ends_line: link.range.end <= line.range.end,
-                });
+                rectangles.push(rect);
             }
         }
     });
@@ -213,7 +221,8 @@ pub(super) fn link_controls(
             .place
             .line
             .set((top.into(), (top + mail.line_height).into()));
-        state.place.visible.set(!rects.is_empty());
+        let visible = |rect: &Bounds<Pixels>| !rect.intersect(&clip).is_empty();
+        state.place.visible.set(rects.iter().any(visible));
         let handle = &state.handle;
         let focused = handle.is_focused(window);
         if focused {
@@ -239,55 +248,43 @@ pub(super) fn link_controls(
                 }
                 cx.stop_propagation();
             })
-            .children(rects.into_iter().enumerate().map(|(at, fragment)| {
-                let target = link.target.clone();
-                let handle = handle.clone();
-                let hover = handle.clone();
-                let rect = fragment.bounds;
-                div()
-                    .absolute()
-                    .left(rect.left() - bounds.left())
-                    .top(rect.top() - bounds.top())
-                    .w(rect.size.width)
-                    .h(rect.size.height)
-                    .id(ElementId::named_usize("link-fragment", at))
-                    .cursor(CursorStyle::PointingHand)
-                    .when(focused, |hit| {
-                        hit.child(
-                            div()
-                                .absolute()
-                                .top_0()
-                                .bottom_0()
-                                .left(px(-2.))
-                                .right(px(-2.))
-                                .border_t(px(1.))
-                                .border_color(paint(mail.palette.accent))
-                                .when(fragment.starts_line, |outline| {
-                                    outline
-                                        .border_l(px(1.))
-                                        .rounded_tl(px(2.))
-                                        .rounded_bl(px(2.))
-                                })
-                                .when(fragment.ends_line, |outline| {
-                                    outline
-                                        .border_b(px(1.))
-                                        .border_r(px(1.))
-                                        .rounded_tr(px(2.))
-                                        .rounded_br(px(2.))
-                                }),
-                        )
-                    })
-                    .on_hover(move |hovered, window, cx| {
-                        reader_links::hover(window, cx, &hover, *hovered)
-                    })
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(move |_, window, cx| {
-                        reader_links::clicked(window, cx);
-                        window.focus(&handle);
-                        open(target.clone(), window, cx);
-                        cx.stop_propagation();
-                    })
-            }))
+            .children(
+                rects
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, rect)| visible(rect))
+                    .map(|(at, rect)| {
+                        let target = link.target.clone();
+                        let handle = handle.clone();
+                        let hover = handle.clone();
+                        div()
+                            .absolute()
+                            .left(rect.left() - bounds.left())
+                            .top(rect.top() - bounds.top())
+                            .w(rect.size.width)
+                            .h(rect.size.height)
+                            .id(ElementId::named_usize("link-fragment", at))
+                            .cursor(CursorStyle::PointingHand)
+                            .when(focused, |hit| {
+                                hit.child(fragment_outline(
+                                    &rects,
+                                    at,
+                                    mask.left()..mask.right(),
+                                    paint(mail.palette.accent),
+                                ))
+                            })
+                            .on_hover(move |hovered, window, cx| {
+                                reader_links::hover(window, cx, &hover, *hovered)
+                            })
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(move |_, window, cx| {
+                                reader_links::clicked(window, cx);
+                                window.focus(&handle);
+                                open(target.clone(), window, cx);
+                                cx.stop_propagation();
+                            })
+                    }),
+            )
             .into_any_element();
         control.layout_as_root(
             size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
@@ -298,6 +295,67 @@ pub(super) fn link_controls(
         controls.elements.push(control);
     }
     controls
+}
+
+fn fragment_outline(
+    rects: &[Bounds<Pixels>],
+    at: usize,
+    mask: Range<Pixels>,
+    accent: gpui::Rgba,
+) -> gpui::Div {
+    let rect = &rects[at];
+    let visible_span = |rect| {
+        let span = outline_span(rect);
+        span.start.max(mask.start)..span.end.min(mask.end)
+    };
+    let span = visible_span(rect);
+    let successive = |upper: &Bounds<Pixels>, lower: &Bounds<Pixels>| {
+        f32::from(lower.top() - upper.bottom()).abs() < 0.01
+    };
+    let prev = at
+        .checked_sub(1)
+        .and_then(|at| rects.get(at))
+        .filter(|prev| successive(prev, rect));
+    let next = rects.get(at + 1).filter(|next| successive(rect, next));
+    let edges = div()
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .left(span.start - rect.left())
+        .w(span.end - span.start);
+    if prev.is_none() && next.is_none() {
+        return edges.border_1().border_color(accent).rounded(px(2.));
+    }
+    let rule = |edge: Range<Pixels>| {
+        // Meet the next vertical stroke at each inside corner.
+        let start = if edge.start > span.start {
+            edge.start - px(1.)
+        } else {
+            edge.start
+        };
+        let end = if edge.end < span.end {
+            edge.end + px(1.)
+        } else {
+            edge.end
+        };
+        div()
+            .absolute()
+            .left(start - span.start)
+            .w(end - start)
+            .h(px(1.))
+            .bg(accent)
+    };
+    let side = || div().absolute().top_0().bottom_0().w(px(1.)).bg(accent);
+    edges
+        .child(side().left_0())
+        .child(side().right_0())
+        .children(
+            outline_segments(span.clone(), prev.map(visible_span)).map(|edge| rule(edge).top_0()),
+        )
+        .children(
+            outline_segments(span.clone(), next.map(visible_span))
+                .map(|edge| rule(edge).bottom_0()),
+        )
 }
 
 fn open(target: Arc<str>, window: &Window, cx: &mut App) {
@@ -320,4 +378,48 @@ fn open(target: Arc<str>, window: &Window, cx: &mut App) {
             }
         })
         .detach();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrapped_outlines_only_draw_exposed_horizontal_segments() {
+        let fragment = |left, width| Bounds {
+            origin: point(px(left), px(0.)),
+            size: size(px(width), px(20.)),
+        };
+        let segments = |rect: &Bounds<Pixels>, neighbor: Option<&Bounds<Pixels>>| {
+            outline_segments(outline_span(rect), neighbor.map(outline_span)).collect::<Vec<_>>()
+        };
+        let long = fragment(0., 100.);
+        let short = fragment(0., 60.);
+        let full = px(-2.)..px(102.);
+        let overhang = px(62.)..px(102.);
+
+        // Longer first: the first row closes only its overhang at the seam.
+        assert_eq!(segments(&long, None), std::slice::from_ref(&full));
+        assert_eq!(
+            segments(&long, Some(&short)),
+            std::slice::from_ref(&overhang)
+        );
+        assert!(segments(&short, Some(&long)).is_empty());
+        assert_eq!(segments(&short, None), [px(-2.)..px(62.)]);
+
+        // Shorter first: the same overhang belongs to the second row's top.
+        assert_eq!(segments(&short, None), [px(-2.)..px(62.)]);
+        assert!(segments(&short, Some(&long)).is_empty());
+        assert_eq!(segments(&long, Some(&short)), [overhang]);
+        assert_eq!(segments(&long, None), [full]);
+
+        // Equal widths leave the whole seam open.
+        assert!(segments(&long, Some(&long)).is_empty());
+
+        let inset = fragment(20., 60.);
+        assert_eq!(
+            segments(&long, Some(&inset)),
+            [px(-2.)..px(18.), px(82.)..px(102.)]
+        );
+    }
 }

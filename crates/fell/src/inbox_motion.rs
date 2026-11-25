@@ -91,6 +91,8 @@ pub struct StatusMotion {
     /// A notice leaving, fading where it was: a key cleared it, or another
     /// notice replaced it.
     pub leaving: Option<(Toast, f32)>,
+    /// How much of the link destination the notice slot covers.
+    pub notice_slot: f32,
     /// How far below its place the notice is drawn, rising in.
     pub notice_dy: f32,
     /// How far above its place the leaving notice is drawn, rising out.
@@ -242,6 +244,7 @@ pub struct InboxMotion {
     /// The notice that is leaving and its fade.
     toast_out: Option<((Toast, f32), Transition)>,
     last_toast: Option<Toast>,
+    notice_slot_fade: Option<(f32, Transition)>,
     sync_fade: Option<(f32, Transition)>,
     /// The key hints fading out as a notice takes their room, and how
     /// much of them showed when it started.
@@ -394,6 +397,7 @@ impl InboxMotion {
             toast_in: None,
             toast_out: None,
             last_toast: None,
+            notice_slot_fade: None,
             sync_fade: None,
             hints_out: None,
             hints_from: 1.0,
@@ -654,6 +658,9 @@ impl InboxMotion {
             self.narrow_status && self.last_toast.is_some() && self.sync_opacity(now) > 0.0;
         if self.toast_out.is_none() && !sync_leaving {
             self.toast_in = None;
+            if self.last_toast.is_some() {
+                self.notice_slot_fade = None;
+            }
         }
         self.sync_in = None;
         self.hints_out = None;
@@ -733,6 +740,7 @@ impl InboxMotion {
         } else {
             running |= keep_with(&mut self.toast_out, now);
         }
+        running |= keep_with(&mut self.notice_slot_fade, now);
         running |= keep_with(&mut self.sync_fade, now);
         running |= keep(&mut self.hints_out, now);
         running |= keep(&mut self.which, now);
@@ -1012,6 +1020,8 @@ impl InboxMotion {
             return;
         }
         let sync = self.sync_opacity(now);
+        let slot = self.notice_slot(now);
+        let replacing = self.last_toast.is_some() || slot > 0.0;
         let incoming = motion::progress(self.toast_in.as_ref(), now);
         let old = self
             .last_toast
@@ -1063,7 +1073,24 @@ impl InboxMotion {
                     .map(|fade| (sync, fade));
             }
         }
+        // The whole slot stays covered while notices take turns fading.
+        self.notice_slot_fade = match (notice.is_some(), replacing) {
+            (true, true) => None,
+            (true, false) => self.toast_in.map(|fade| (0.0, fade)),
+            (false, _) => start(motion::FADE)
+                .filter(|_| slot > 0.0)
+                .map(|fade| (slot, fade)),
+        };
         self.last_toast = notice.cloned();
+    }
+
+    fn notice_slot(&self, now: Instant) -> f32 {
+        if self.last_toast.is_some() {
+            motion::progress(self.notice_slot_fade.as_ref().map(|(_, fade)| fade), now)
+        } else {
+            self.notice_slot_fade
+                .map_or(0.0, |(from, fade)| from * fade.remaining(now))
+        }
     }
 
     fn sync_opacity(&self, now: Instant) -> f32 {
@@ -1102,6 +1129,7 @@ impl InboxMotion {
             ),
             notice,
             leaving,
+            notice_slot: self.notice_slot(now),
             notice_dy: motion::NOTICE_RISE_PX * (1.0 - rising),
             leaving_dy: -motion::NOTICE_RISE_PX * gone,
             hints,
@@ -1950,6 +1978,41 @@ mod tests {
         assert_eq!(
             notice_opacity(&motion, &session, later(swap, 180)),
             Some(1.0)
+        );
+    }
+
+    #[test]
+    fn the_notice_slot_covers_link_destinations_through_replacements() {
+        let mut motion = InboxMotion::new(Motion::new(true));
+        let mut session = session();
+        let now = Instant::now();
+        assert_eq!(motion.status(&session, now).notice_slot, 0.0);
+        session.show_toast("Copied link", false);
+        motion.observe(&session, (true, true), now);
+        let entering = motion.status(&session, later(now, 30));
+        assert!((0.0..1.0).contains(&entering.notice_slot));
+        assert_eq!(entering.notice_slot, entering.notice.unwrap().1);
+
+        let swap = later(now, 200);
+        session.show_toast("Couldn't open link", true);
+        motion.observe(&session, (true, true), swap);
+        let gap = motion.status(&session, later(swap, 60));
+        assert_eq!(gap.notice.unwrap().1, 0.0);
+        assert_eq!(gap.leaving.unwrap().1, 0.0);
+        for ms in [0, 30, 59, 60, 61, 100, 180] {
+            assert_eq!(motion.status(&session, later(swap, ms)).notice_slot, 1.0);
+        }
+
+        let exit = later(swap, 200);
+        session.clear_toast();
+        motion.observe(&session, (true, true), exit);
+        assert_eq!(motion.status(&session, exit).notice_slot, 1.0);
+        let leaving = motion.status(&session, later(exit, 30));
+        assert!((0.0..1.0).contains(&leaving.notice_slot));
+        assert_eq!(leaving.notice_slot, leaving.leaving.unwrap().1);
+        assert_eq!(
+            motion.status(&session, exit + motion::FADE).notice_slot,
+            0.0
         );
     }
 

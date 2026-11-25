@@ -186,6 +186,22 @@ mod tests {
             ("https://xn--bcher-kva.example/path", false),
             ("https://example.test@elsewhere.test/path", false),
             ("mailto:help@example.test?subject=Release", true),
+            (
+                "mailto:help@example.test?Subject=Release&body=A%20note",
+                true,
+            ),
+            ("mailto:help@example.test?to=other@example.test", false),
+            ("mailto:help@example.test?Cc=other@example.test", false),
+            (
+                "mailto:help@example.test?subject=Hi&%62cC=other@example.test",
+                false,
+            ),
+            (
+                "mailto:help@example.test?subject=Hi%0ABcc:other@example.test",
+                false,
+            ),
+            ("mailto:help@example.test?body=Hi%0dthere", false),
+            ("mailto:help@example.test?s%0Dubject=Hi", false),
             ("mailto:help@bücher.example", false),
             ("mailto:help@example.test,help@xn--bcher-kva.example", false),
             ("https:///example.test", false),
@@ -216,6 +232,27 @@ mod tests {
             "ftp://www.example.test foohttps://example.test http://",
             &[],
         );
+    }
+
+    #[test]
+    fn raw_line_breaks_in_mailto_queries_are_rejected_before_url_cleanup() {
+        for (ch, entity) in [('\r', "&#13;"), ('\n', "&#10;")] {
+            let target = format!("mailto:help@example.test?subject=Hi{ch}there");
+            assert_eq!(reader_link_target(&target), None);
+            let trailing = format!("mailto:help@example.test?subject=Hi{ch}");
+            assert_eq!(reader_link_target(&trailing), None);
+
+            let doc = html_to_document(&format!(
+                "<a href=\"mailto:help@example.test?subject=Hi{entity}there\">link</a>"
+            ));
+            let [Block::Paragraph { inlines }] = doc.blocks.as_slice() else {
+                panic!("{doc:?}");
+            };
+            let [Inline::Link { href, .. }] = inlines.as_slice() else {
+                panic!("{inlines:?}");
+            };
+            assert!(href.is_empty());
+        }
     }
 
     #[test]

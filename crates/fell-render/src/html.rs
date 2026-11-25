@@ -1973,15 +1973,38 @@ pub(crate) fn safe_href(href: &str) -> String {
         .chars()
         .filter(|ch| !matches!(ch, '\t' | '\n' | '\r'))
         .collect();
-    let Some((scheme, _)) = cleaned.split_once(':') else {
+    let Some((scheme, rest)) = cleaned.split_once(':') else {
         return String::new();
     };
     let scheme = scheme.to_ascii_lowercase();
-    if matches!(scheme.as_str(), "http" | "https" | "mailto") {
+    if matches!(scheme.as_str(), "http" | "https")
+        || scheme == "mailto" && safe_mailto_query(href, rest)
+    {
         cleaned
     } else {
         String::new()
     }
+}
+
+fn safe_mailto_query(raw_href: &str, rest: &str) -> bool {
+    fn query(uri: &str) -> Option<&str> {
+        let before_fragment = uri.split('#').next()?;
+        before_fragment.split_once('?').map(|(_, query)| query)
+    }
+
+    // Check the original attribute before URL cleanup can strip line breaks.
+    if query(raw_href).is_some_and(|query| query.contains(['\r', '\n'])) {
+        return false;
+    }
+    query(rest).is_none_or(|query| {
+        url::form_urlencoded::parse(query.as_bytes()).all(|(key, value)| {
+            !key.contains(['\r', '\n'])
+                && !value.contains(['\r', '\n'])
+                && !["to", "cc", "bcc"]
+                    .iter()
+                    .any(|recipient| key.eq_ignore_ascii_case(recipient))
+        })
+    })
 }
 
 /// The RFC 3676 signature delimiter, as the walk keeps it: two dashes and a
