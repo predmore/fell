@@ -508,6 +508,63 @@ fn archive_moves_the_right_uid_and_undo_moves_it_back() {
 }
 
 #[test]
+fn batch_move_and_undo_replay_moves_for_each_source_folder() {
+    let fx = Fixture::with(
+        Store::open_in_memory().unwrap(),
+        state_with(vec![
+            mailbox("INBOX", "", 7, &[(1, "Alpha"), (2, "Unselected")]),
+            mailbox("Work", "", 40, &[(1, "Bravo")]),
+            mailbox("Sent", "\\Sent", 50, &[(1, "Alpha")]),
+            mailbox("Archive", "\\Archive", 30, &[]),
+        ]),
+    );
+    let alpha = fx.thread("INBOX", "Alpha");
+    let bravo = fx.thread("Work", "Bravo");
+    let (action, count) = fx
+        .store
+        .move_scoped_threads(
+            &fx.account.id,
+            &[
+                (alpha.clone(), "INBOX".into()),
+                (bravo.clone(), "Work".into()),
+            ],
+            "Archive",
+        )
+        .unwrap();
+    assert_eq!(action.kind, crate::ActionKind::Move);
+    assert_eq!(count, 2);
+    assert_eq!(fx.subjects("Archive"), ["Alpha", "Bravo"]);
+    assert_eq!(fx.subjects("INBOX"), ["Unselected"]);
+    assert!(fx.subjects("Work").is_empty());
+    assert_eq!(fx.subjects("Sent"), ["Alpha"]);
+
+    let queued = fx.store.outbox(&fx.account.id).unwrap();
+    assert_eq!(queued.len(), 2);
+    for (row, source) in queued.iter().zip(["INBOX", "Work"]) {
+        assert_eq!(row.action_id, Some(action.id));
+        assert_eq!(row.source_mailbox.as_deref(), Some(source));
+        assert_eq!(row.target_mailbox.as_deref(), Some("Archive"));
+    }
+    assert_eq!(fx.replay().sent, 2);
+    assert_eq!(fx.on_server("Archive").len(), 2);
+    assert_eq!(fx.on_server("Sent"), [(1, "Alpha".into())]);
+
+    let (undone, restored) = fx.store.undo_with_threads(&fx.account.id).unwrap();
+    assert_eq!(undone, action);
+    assert_eq!(restored.len(), 2);
+    assert!(restored.contains(&alpha) && restored.contains(&bravo));
+    assert!(fx.store.undo(&fx.account.id).is_err());
+    assert_eq!(fx.replay().sent, 2);
+    assert!(fx.on_server("Archive").is_empty());
+    assert_eq!(fx.on_server("INBOX").len(), 2);
+    assert_eq!(fx.on_server("Work").len(), 1);
+    assert_eq!(fx.on_server("Sent"), [(1, "Alpha".into())]);
+    assert_eq!(fx.subjects("INBOX"), ["Alpha", "Unselected"]);
+    assert_eq!(fx.subjects("Work"), ["Bravo"]);
+    assert!(fx.subjects("Archive").is_empty());
+}
+
+#[test]
 fn undo_before_replay_sends_nothing() {
     let fx = Fixture::new();
     let alpha = fx.thread("INBOX", "Alpha");

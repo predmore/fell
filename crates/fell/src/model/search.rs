@@ -1684,7 +1684,12 @@ mod tests {
             ["INBOX", "Sent"]
         );
         assert!(session.perform(Action::Delete, 10).delete);
-        session.picked.clear();
+        session.perform(Action::Move, 10);
+        assert_eq!(session.folder_prompt(), "Move 2 conversations to");
+        session.folder_query = "Archive".into();
+        let edit = session.confirm_folder().move_edit.unwrap();
+        assert_eq!(edit.scopes, session.search_scopes(&targets).unwrap());
+        assert_eq!(edit.destination, "Archive");
         session.select_if_present("two");
         assert!(session.perform(Action::Archive, 10).archive);
         assert_eq!(session.search_source("two"), Some("Sent"));

@@ -3174,50 +3174,50 @@ impl Inbox {
         .detach();
     }
 
-    fn apply_move(&mut self, destination: String, cx: &mut Context<Self>) {
-        let Some(id) = self.session.cursor_id.clone() else {
-            self.session.show_toast("No conversation", true);
-            return;
-        };
-        if self.session.cursor_draft().is_some() {
-            self.session.show_toast(DRAFT_NOT_THREAD, true);
-            return;
-        }
-        if !self.session.threads.iter().any(|thread| thread.id == id) {
-            self.session.show_toast("No conversation", true);
+    fn apply_move(&mut self, edit: crate::model::MoveEdit, cx: &mut Context<Self>) {
+        let search = self.session.search.is_some();
+        if !search && self.session.folder != self.list_folder {
+            self.session
+                .show_toast("The folder is still loading", false);
             return;
         }
         let account = self.account_id.clone();
-        let thread = ThreadId(id.clone());
-        let Some(from) = self.action_folder(&id) else {
-            return;
-        };
+        let crate::model::MoveEdit {
+            scopes,
+            destination,
+        } = edit;
+        let ids: Vec<_> = scopes.iter().map(|(id, _)| id.0.clone()).collect();
         let to = destination.clone();
         let key = self.selected_key();
-        if self.session.search.is_none() && !self.session.roles.is_view(&from) {
-            self.take_out_of_list(std::slice::from_ref(&id), cx);
+        if !search && !self.session.roles.is_view(&self.list_folder) {
+            self.take_out_of_list(&ids, cx);
         }
         self.change_mailbox(
-            move |store| store.move_thread(&account, &thread, &from, &to).map(|_| ()),
-            move |inbox, result, _| match result {
-                Ok(()) => {
-                    inbox.pending_removals.remove(&id);
-                    let label = inbox.session.folder_text(&destination);
-                    inbox.session.show_toast(format!("Moved to {label}"), false);
-                    inbox.send_to_server();
-                    Some(ReadIntent {
-                        changed: true,
-                        ..ReadIntent::default()
-                    })
+            move |store| store.move_scoped_threads(&account, &scopes, &to),
+            move |inbox, result, _| {
+                for id in &ids {
+                    inbox.pending_removals.remove(id);
                 }
-                Err(err) => {
-                    inbox.pending_removals.remove(&id);
-                    inbox.session.show_toast(err.to_string(), true);
-                    Some(ReadIntent {
-                        changed: true,
-                        select: key,
-                        ..ReadIntent::default()
-                    })
+                match result {
+                    Ok((_, count)) => {
+                        let label = inbox.session.folder_text(&destination);
+                        inbox
+                            .session
+                            .show_toast(move_notice(ids.len(), count, &label), false);
+                        inbox.send_to_server();
+                        Some(ReadIntent {
+                            changed: true,
+                            ..ReadIntent::default()
+                        })
+                    }
+                    Err(err) => {
+                        inbox.session.show_toast(err.to_string(), true);
+                        Some(ReadIntent {
+                            changed: true,
+                            select: key,
+                            ..ReadIntent::default()
+                        })
+                    }
                 }
             },
             cx,
@@ -4377,10 +4377,8 @@ impl Inbox {
                     .show_toast("No attachment action to retry", false);
             }
         }
-        if step.apply_move
-            && let Some(destination) = self.session.pending_move.take()
-        {
-            self.apply_move(destination, cx);
+        if let Some(edit) = step.move_edit {
+            self.apply_move(edit, cx);
         }
         if let Some(edit) = step.labels {
             self.apply_labels(edit, cx);
@@ -11675,7 +11673,7 @@ fn folder_picker(
             - 2.0 * (PAD + 1.0)
             - 3.0 * GAP
             - query_gap
-            - measure(prompt)
+            - measure(prompt.as_ref())
             - measure("·")
             - query_width;
         let target = present::display_safe(&target);
@@ -11732,7 +11730,7 @@ fn folder_picker(
                         } else {
                             prompt_dim
                         }))
-                        .child(prompt),
+                        .child(prompt.into_owned()),
                 )
                 .when_some(target, |prompt, target| {
                     prompt
@@ -11972,6 +11970,14 @@ fn moved_notice(count: usize, to: &str) -> String {
     match count {
         1 => format!("Moved to {to} · u"),
         n => format!("Moved {n} to {to} · u"),
+    }
+}
+
+fn move_notice(selected: usize, moved: usize, to: &str) -> String {
+    if selected == 1 {
+        format!("Moved to {to}")
+    } else {
+        format!("Moved {moved} to {to} · u")
     }
 }
 
@@ -14209,6 +14215,19 @@ mod tests {
         assert_eq!(
             write_back_notice(&session, &[], true),
             "Read/star sync delayed. Retrying"
+        );
+    }
+
+    #[test]
+    fn move_toast_keeps_the_single_text_and_counts_the_batch() {
+        assert_eq!(super::move_notice(1, 1, "Archive"), "Moved to Archive");
+        assert_eq!(
+            super::move_notice(4, 4, "Archive"),
+            "Moved 4 to Archive · u"
+        );
+        assert_eq!(
+            super::move_notice(4, 1, "Archive"),
+            "Moved 1 to Archive · u"
         );
     }
 
