@@ -2191,13 +2191,13 @@ impl Inbox {
             .enumerate()
             .map(|(index, row)| (row.id.as_str(), index))
             .collect();
-        let reach = self.list_viewport().unwrap_or(640.0);
+        let viewport = self.list_viewport().unwrap_or(640.0);
         // Keep the current shift if all drawn rows stayed in place and no
         // row arrived below them in the viewport (undo at the end of a list).
         let end = self.session.threads.len() as f32 * ROW_PX;
         let same_visible_end = drawn.last().is_some_and(|last| {
             let old_end = last.slot + ROW_PX;
-            old_end >= reach || end + offset <= old_end + 0.5
+            old_end >= viewport || end + offset <= old_end + 0.5
         });
         let kept = !replace
             && same_visible_end
@@ -2210,15 +2210,45 @@ impl Inbox {
             return;
         }
         let ids = slots;
-        let before = drawn
+        let mut before: Vec<_> = drawn
             .iter()
             .map(|old| (old.row.id.clone(), old.top))
             .collect();
-        let left = drawn
+        let left: Vec<_> = drawn
             .iter()
             .filter(|old| !ids.contains_key(old.row.id.as_str()))
             .map(|old| (old.row.clone(), old.top - offset))
             .collect();
+        let mut reach = viewport;
+        let batch = left.len() > 1
+            || self
+                .motion
+                .list
+                .as_ref()
+                .is_some_and(ListShift::has_batch_ghosts);
+        if !replace && batch {
+            let (after, previous_bottom) = drawn
+                .iter()
+                .rev()
+                .find_map(|old| {
+                    ids.get(old.row.id.as_str())
+                        .map(|index| (index + 1, old.top + ROW_PX))
+                })
+                .unwrap_or((0, viewport));
+            let first = after.max((-offset / ROW_PX).floor() as usize);
+            let end = ((viewport - offset) / ROW_PX).ceil() as usize;
+            let first_slot = first as f32 * ROW_PX + offset;
+            let dy = InboxMotion::batch_arrival_offset(viewport, previous_bottom, first_slot);
+            before.extend(
+                self.session.threads[..end.min(self.session.threads.len())]
+                    .iter()
+                    .enumerate()
+                    .skip(first)
+                    .map(|(index, row)| (row.id.clone(), index as f32 * ROW_PX + offset + dy)),
+            );
+            // The last tracked row can itself start past the viewport.
+            reach = reach.max(dy);
+        }
         // A row that is back (a quick undo) stops fading where it was.
         let mut carried = self.motion.carried_ghosts();
         carried.retain(|ghost| !ids.contains_key(ghost.row.id.as_str()));
@@ -6678,7 +6708,7 @@ fn thread_list(
                         let element =
                             thread_row(&theme_for_rows, &row, index, &look, text_width, window, cx);
                         let top = index as f32 * ROW_PX + offset;
-                        let (moving, ghosts, overflow) = if let Some(shift) =
+                        let (moving, ghosts, overflow, batch) = if let Some(shift) =
                             inbox.motion.list.as_mut()
                         {
                             let below = inbox.session.threads[index + 1..]
@@ -6689,7 +6719,12 @@ fn thread_list(
                             moving.dy = motion::snap(moving.dy, window.scale_factor());
                             let reach = if index == last { f32::INFINITY } else { ROW_PX };
                             // Ghosts are kept in content pixels, so they scroll.
-                            let ghosts = shift.ghosts_in(index as f32 * ROW_PX, reach, now);
+                            let ghosts = shift.ghosts_for_slot(
+                                index as f32 * ROW_PX,
+                                reach,
+                                index == visible.start,
+                                now,
+                            );
                             // GPUI only asks for in-view slots. Paint rows still
                             // moving across an edge from the nearest drawn slot.
                             let extra = shift.overscan(ROW_PX);
@@ -6738,9 +6773,9 @@ fn thread_list(
                                     )))
                                 })
                                 .collect::<Vec<_>>();
-                            (moving, ghosts, overflow)
+                            (moving, ghosts, overflow, shift.has_batch_ghosts())
                         } else {
-                            (RowMotion::STILL, Vec::new(), Vec::new())
+                            (RowMotion::STILL, Vec::new(), Vec::new(), false)
                         };
                         if capture {
                             painted.push(LeavingRow {
@@ -6760,9 +6795,9 @@ fn thread_list(
                                 ghost_row(
                                     &theme_for_rows,
                                     ghost,
-                                    index,
                                     text_width,
                                     (bar_dx, inbox.list_label.clone()),
+                                    batch,
                                     window,
                                     cx,
                                 )
@@ -6772,6 +6807,7 @@ fn thread_list(
                             0.0,
                             moving,
                             selected.then_some(theme_for_rows.selection),
+                            batch.then_some(theme_for_rows.background),
                             element,
                             window,
                         );
@@ -6839,6 +6875,7 @@ fn leaving_label_rows(
                             frame.top,
                             frame.motion,
                             look.selected.then_some(theme.selection),
+                            None,
                             element,
                             window,
                         )
@@ -6891,11 +6928,12 @@ fn moving_row_layer(
     top: f32,
     motion: RowMotion,
     selection: Option<u32>,
+    cover: Option<u32>,
     element: gpui::AnyElement,
     window: &Window,
 ) -> gpui::Div {
     if motion.reveal.is_none() {
-        return slot_layer(top + motion.dy, motion.opacity).child(element);
+        return fading_row_layer(top + motion.dy, motion.opacity, cover, element);
     }
     // The selected slot is highlighted as soon as it opens. Its content
     // fades in on top while the rows below slide down.
@@ -6903,17 +6941,34 @@ fn moving_row_layer(
     slot_layer(top + motion.dy, 1.0)
         .h(px(shown))
         .overflow_hidden()
-        .when_some(selection, |layer, fill| layer.bg(rgb(fill)))
+        .when_some(selection.or(cover), |layer, fill| layer.bg(rgb(fill)))
         .child(slot_layer(0.0, motion.opacity).child(element))
+}
+
+/// A fading row can cover older ink with the list background while only
+/// its own content fades. An opaque thread row already paints its background.
+fn fading_row_layer(
+    top: f32,
+    opacity: f32,
+    cover: Option<u32>,
+    element: gpui::AnyElement,
+) -> gpui::Div {
+    if let Some(fill) = cover.filter(|_| opacity < 1.0) {
+        slot_layer(top, 1.0)
+            .bg(rgb(fill))
+            .child(slot_layer(0.0, opacity).child(element))
+    } else {
+        slot_layer(top, opacity).child(element)
+    }
 }
 
 /// Paint a row that left, at its last position and with no input handlers.
 fn ghost_row(
     theme: &Theme,
     (row, top, opacity): (ThreadRow, f32, f32),
-    index: usize,
     text_width: f32,
     (bar_dx, label_scope): (f32, Option<String>),
+    batch: bool,
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
@@ -6928,11 +6983,13 @@ fn ghost_row(
         unread_note: false,
         attachment_alpha: 1.0,
     };
-    slot_layer(motion::snap(top, window.scale_factor()), opacity)
-        .child(thread_row(
-            theme, &row, index, &look, text_width, window, cx,
-        ))
-        .into_any_element()
+    fading_row_layer(
+        motion::snap(top, window.scale_factor()),
+        opacity,
+        batch.then_some(theme.background),
+        thread_row(theme, &row, 0, &look, text_width, window, cx),
+    )
+    .into_any_element()
 }
 
 /// A row drawn as it is, with nothing moving: a row that left the list,

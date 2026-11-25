@@ -796,6 +796,13 @@ impl InboxMotion {
             .map_or(0.0, |shift| shift.offset_of(id, top, now))
     }
 
+    /// Keep the tail of a shrinking list sliding even beyond the old
+    /// snapshot. The first unseen row starts below the clip and below the
+    /// last tracked row. Giving the tail one offset keeps its rows spaced.
+    pub fn batch_arrival_offset(viewport: f32, previous_bottom: f32, first_slot: f32) -> f32 {
+        (viewport.max(previous_bottom) - first_slot).max(0.0)
+    }
+
     /// Observe the folder whose page actually supplied the count.
     pub fn observe_header(
         &mut self,
@@ -2130,6 +2137,47 @@ mod tests {
         motion.tick(later(switched, 120));
         assert!(motion.closing_overlay(later(switched, 120)).is_none());
         assert_eq!(motion.card_height(later(switched, 120)), Some(510.));
+    }
+
+    #[test]
+    fn unseen_batch_arrivals_start_at_or_below_the_bottom_edge() {
+        let viewport = 200.0;
+        let first_slot = 68.0;
+        for (previous_bottom, start_top) in [(0.0, 200.0), (150.0, 200.0), (220.0, 220.0)] {
+            let dy = InboxMotion::batch_arrival_offset(viewport, previous_bottom, first_slot);
+            assert_eq!(first_slot + dy, start_top);
+
+            let now = Instant::now();
+            let mut shift = ListShift::start(
+                &Motion::new(true),
+                vec![
+                    ("a".into(), 0.0),
+                    ("b".into(), 68.0),
+                    ("c".into(), start_top),
+                    ("d".into(), start_top + 68.0),
+                ],
+                vec![("a", 0.0), ("b", 68.0)],
+                vec![],
+                viewport,
+                false,
+                now,
+            )
+            .unwrap();
+            for elapsed in [0, 16, 60, 120] {
+                let at = later(now, elapsed);
+                let c = shift.row("c", first_slot, 68.0, None, at);
+                let d = shift.row("d", first_slot + 68.0, 68.0, None, at);
+                assert_eq!(c, d);
+                assert_eq!(c.opacity, 1.0);
+                if elapsed == 0 {
+                    assert_eq!(c.dy, dy);
+                } else if elapsed == 120 {
+                    assert_eq!(c.dy, 0.0);
+                } else {
+                    assert!((0.0..dy).contains(&c.dy));
+                }
+            }
+        }
     }
 
     #[test]
