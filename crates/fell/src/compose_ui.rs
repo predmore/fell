@@ -2414,13 +2414,16 @@ impl ComposeView {
         window: &mut Window,
         family: &str,
         reply_check: Option<ReplyCheck>,
-        overlay: Option<(Field, gpui::Deferred)>,
+        overlay: Option<(Field, gpui::Div, bool)>,
         view: gpui::WeakEntity<Self>,
     ) -> gpui::Div {
         let mut overlay = overlay;
         let mut overlay_for = |field| {
-            if overlay.as_ref().is_some_and(|(anchor, _)| *anchor == field) {
-                overlay.take().map(|(_, popup)| popup)
+            if overlay
+                .as_ref()
+                .is_some_and(|(anchor, _, _)| *anchor == field)
+            {
+                overlay.take().map(|(_, popup, closing)| (popup, closing))
             } else {
                 None
             }
@@ -2518,13 +2521,29 @@ impl ComposeView {
                     });
                 },
             );
+            let overlay = overlay_for(field).map(|(popup, closing)| {
+                let growth = if closing {
+                    self.recipient_heights[index].remaining_growth(now)
+                } else {
+                    px(0.)
+                };
+                deferred(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top(gpui::relative(1.))
+                        .mt(px(4.) + growth)
+                        .w_full()
+                        .child(popup),
+                )
+            });
             column = column.child(field_row(
                 label,
                 active,
                 colors,
                 recipient_rows::label_width(window),
                 shown,
-                overlay_for(field),
+                overlay,
             ));
         }
         let fit = |who: &str, what: &str, when: &str| {

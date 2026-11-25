@@ -348,7 +348,7 @@ impl Menu {
         self.anchored_exit_height = Some(self.height_at(now));
         self.height = None;
         self.close = motion.start(motion::QUICK, now);
-        self.panel_fade = self.close;
+        self.panel_fade = motion.start(PANEL_FADE, now + motion::QUICK);
         self.open = false;
         true
     }
@@ -374,6 +374,7 @@ impl Menu {
 
     pub fn animating(&self, now: Instant) -> bool {
         self.close.is_some_and(|fade| fade.running(now))
+            || self.panel_fade.is_some_and(|fade| fade.running(now))
             || self.animations.iter().any(|row| row.animating(now))
             || self
                 .status_arrival
@@ -399,17 +400,13 @@ impl Menu {
         on_row: impl Fn(usize, Div) -> gpui::AnyElement,
     ) -> Option<Div> {
         let now = Instant::now();
-        if !self.open && !self.close.is_some_and(|fade| fade.running(now)) {
+        if !self.open && !self.panel_fade.is_some_and(|fade| fade.running(now)) {
             return None;
         }
         if self.animating(now) {
             window.request_animation_frame();
         }
-        let alpha = if self.anchored_exit_height.is_some() {
-            1.
-        } else {
-            self.close.map_or(1., |fade| fade.remaining(now))
-        };
+        let alpha = self.close.map_or(1., |fade| fade.remaining(now));
         let highlight = self.highlight_at(selected, now);
         Some(
             div()
@@ -649,7 +646,7 @@ mod tests {
     }
 
     #[test]
-    fn compose_dismisses_at_the_current_height_and_fades_over_eighty_ms() {
+    fn compose_fades_the_text_before_revealing_the_rows_behind_it() {
         let start = Instant::now();
         let motion = Motion::new(true);
         let mut menu = Menu::default();
@@ -660,8 +657,19 @@ mod tests {
         assert!(menu.rows().is_empty());
         let halfway = dismissed + motion::QUICK / 2;
         assert_eq!(menu.height_at(halfway), height);
-        assert_eq!(menu.panel_fade.unwrap().remaining(halfway), 0.25);
-        assert!(!menu.animating(dismissed + motion::QUICK));
+        assert_eq!(menu.close.unwrap().remaining(halfway), 0.25);
+        assert_eq!(menu.panel_fade.unwrap().remaining(halfway), 1.);
+        let text_gone = dismissed + motion::QUICK;
+        assert_eq!(menu.close.unwrap().remaining(text_gone), 0.);
+        assert_eq!(menu.panel_fade.unwrap().remaining(text_gone), 1.);
+        assert_eq!(
+            menu.panel_fade
+                .unwrap()
+                .remaining(text_gone + PANEL_FADE / 2),
+            0.25
+        );
+        assert!(menu.animating(text_gone + PANEL_FADE / 2));
+        assert!(!menu.animating(text_gone + PANEL_FADE));
     }
 
     fn person(name: &str) -> Address {

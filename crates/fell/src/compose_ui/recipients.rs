@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use fell_core::Address;
 use fell_core::compose::email_of;
-use gpui::{Context, Deferred, MouseButton, Window, deferred, div, prelude::*, px};
+use gpui::{Context, Div, MouseButton, Window, prelude::*};
 
 use super::{
     ComposeView, Field,
@@ -323,7 +323,7 @@ impl ComposeView {
         window: &mut Window,
         cx: &mut Context<Self>,
         theme: &crate::theme::Theme,
-    ) -> Option<(Field, Deferred)> {
+    ) -> Option<(Field, Div, bool)> {
         if self.preview || self.palette.is_some() {
             return None;
         }
@@ -351,18 +351,7 @@ impl ComposeView {
                     .into_any_element()
             },
         )?;
-        Some((
-            completion.anchor,
-            deferred(
-                div()
-                    .absolute()
-                    .left_0()
-                    .top(gpui::relative(1.))
-                    .mt(px(4.))
-                    .w_full()
-                    .child(popup),
-            ),
-        ))
+        Some((completion.anchor, popup, !completion.menu.is_open()))
     }
 }
 
