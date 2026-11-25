@@ -1981,7 +1981,11 @@ fn row(
                     div()
                         .min_w_0()
                         .overflow_hidden()
-                        .children(excerpt.map(|line| paint_shaped_text(line, window, true))),
+                        .children(excerpt.map(|line| {
+                            let height =
+                                window.text_style().line_height_in_pixels(window.rem_size());
+                            paint_shaped_text(line, height, true)
+                        })),
                 )
                 .children(labels.map(|(group, _)| group)),
         )
