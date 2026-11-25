@@ -492,8 +492,10 @@ mod tests {
 
     #[test]
     fn escape_retains_invalid_text_and_send_focuses_it_for_repair() {
-        let root = tempfile::tempdir().unwrap();
-        let (hub, id, folder) = open_demo(root.path().to_owned(), ThemeKind::Dark).unwrap();
+        let Some(root) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let (hub, id, folder) = open_demo(root.join("demo"), ThemeKind::Dark).unwrap();
         let mut app = gpui::TestAppContext::single();
         let (view, cx) =
             app.add_window_view(|_, cx| ComposeView::new(hub.clone(), id.clone(), folder, cx));
@@ -547,8 +549,10 @@ mod tests {
 
     #[test]
     fn a_rejected_edit_is_cleared_only_when_its_saved_addresses_change() {
-        let root = tempfile::tempdir().unwrap();
-        let (hub, id, folder) = open_demo(root.path().to_owned(), ThemeKind::Dark).unwrap();
+        let Some(root) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let (hub, id, folder) = open_demo(root.join("demo"), ThemeKind::Dark).unwrap();
         let mut app = gpui::TestAppContext::single();
         let (view, cx) =
             app.add_window_view(|_, cx| ComposeView::new(hub.clone(), id.clone(), folder, cx));

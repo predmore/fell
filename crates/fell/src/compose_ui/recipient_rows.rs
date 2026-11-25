@@ -1015,7 +1015,13 @@ mod tests {
                 } else {
                     width - px(8.) - indicator(1)
                 };
-                let tail = "@example.test (first\u{a0}time)";
+                // Without a note, the address is one word and the comma can
+                // wrap on its own. With a note, test the space for the marker.
+                let tail = if comma_wraps {
+                    "@example.test"
+                } else {
+                    "@example.test (first\u{a0}time)"
+                };
                 let repeats = (1..100)
                     .take_while(|count| measure(&format!("{}{tail}", "a".repeat(*count))) <= limit)
                     .last()
@@ -1029,7 +1035,7 @@ mod tests {
                         saved: &[AddressView {
                             raw: address.clone(),
                             email: address,
-                            fresh: true,
+                            fresh: !comma_wraps,
                         }],
                         redirects: &HashSet::new(),
                         placeholder: ("none", colors.dim),
