@@ -183,7 +183,8 @@ impl WebMail {
                 node.attr("background")
                     .is_some_and(|url| !url.trim().is_empty())
             });
-        let layout = layout::Estimate::prepare(&layout_dom, metrics, author_background);
+        let layout =
+            layout::Estimate::prepare(&layout_dom, metrics, author_background, history.is_some());
         Self {
             content,
             images,
@@ -280,7 +281,7 @@ impl WebMail {
                 write!(
                     link_css,
                     "a:any-link {{ color: #{:06x}; }}
-                     div:has(> br:only-child) {{ min-height: {}px; }}
+                     div:has(> br:only-child:where(:not([data-fell-folded]))) {{ min-height: {}px; }}
                      p:empty {{ min-height: {}px; margin: 0; }}",
                     text.link,
                     reader_paragraph_gap(text.size),
@@ -340,6 +341,11 @@ fn history_nodes(
     use scraper::node::Node;
     type SourceNode<'a> = ego_tree::NodeRef<'a, Node>;
 
+    struct Span {
+        text: Range<usize>,
+        spacing: bool,
+    }
+
     fn normalized(text: &str) -> impl Iterator<Item = char> + '_ {
         text.chars()
             .filter(|ch| !ch.is_whitespace() && !html::is_invisible(*ch))
@@ -348,27 +354,42 @@ fn history_nodes(
     fn measure(
         node: SourceNode<'_>,
         source: &mut String,
-        spans: &mut HashMap<ego_tree::NodeId, Range<usize>>,
+        spans: &mut HashMap<ego_tree::NodeId, Span>,
         depth: u32,
-    ) {
+    ) -> bool {
         if depth >= html::MAX_HTML_DEPTH {
-            return;
+            return false;
         }
         let start = source.len();
-        match node.value() {
-            Node::Text(text) => source.extend(normalized(text)),
+        let spacing = match node.value() {
+            Node::Text(text) => {
+                source.extend(normalized(text));
+                start == source.len()
+            }
             Node::Element(element) => match element.name() {
-                "style" | "script" | "head" | "title" | "template" => return,
-                "img" => source.extend(normalized(element.attr("alt").unwrap_or_default())),
+                "style" | "script" | "head" | "title" | "template" => return true,
+                "img" => {
+                    source.extend(normalized(element.attr("alt").unwrap_or_default()));
+                    false
+                }
                 _ => {
+                    let mut spacing = matches!(element.name(), "br" | "div" | "p" | "span");
                     for child in node.children() {
-                        measure(child, source, spans, depth + 1);
+                        spacing &= measure(child, source, spans, depth + 1);
                     }
+                    spacing
                 }
             },
-            _ => return,
-        }
-        spans.insert(node.id(), start..source.len());
+            _ => return true,
+        };
+        spans.insert(
+            node.id(),
+            Span {
+                text: start..source.len(),
+                spacing,
+            },
+        );
+        spacing
     }
 
     let body = dom.root_element().children().find(|node| {
@@ -406,18 +427,33 @@ fn history_nodes(
     }
 
     let mut nodes = HashSet::new();
+    let mut boundary_spacing = Vec::new();
     for node in body.descendants().skip(1) {
-        let Some(span) = spans.get(&node.id()) else {
+        let Some(Span {
+            text: span,
+            spacing,
+        }) = spans.get(&node.id())
+        else {
+            continue;
+        };
+        // A spacer at the start of a fold shares its text offset with any
+        // alt-free images, rules and other visible nodes beside it.
+        let index = hidden.partition_point(|range| range.end <= span.start);
+        let Some(range) = hidden.get(index).filter(|range| range.start <= span.end) else {
             continue;
         };
         if span.is_empty() {
-            continue;
-        }
-        let index = hidden.partition_point(|range| range.end <= span.start);
-        let Some(range) = hidden.get(index).filter(|range| range.start < span.end) else {
-            continue;
-        };
-        if span.start >= range.start && span.end <= range.end {
+            if span.start == range.start {
+                if *spacing {
+                    boundary_spacing.push(node.id());
+                } else {
+                    boundary_spacing.clear();
+                }
+            } else if *spacing {
+                nodes.insert(node.id());
+            }
+        } else if span.start >= range.start && span.end <= range.end {
+            nodes.extend(boundary_spacing.drain(..));
             nodes.insert(node.id());
         } else if span.start < range.end && span.end > range.start && node.value().is_text() {
             // A source text node can straddle a native history boundary.
@@ -481,7 +517,6 @@ fn serialize_node(
     match node.value() {
         scraper::node::Node::Text(text) => {
             let wrap = folded
-                && !text.trim().is_empty()
                 && !node
                     .ancestors()
                     .any(|parent| history.is_some_and(|nodes| nodes.contains(&parent.id())));
@@ -1511,6 +1546,47 @@ fn escape_attr(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_trailing_spacing_is_folded_beside_visible_empty_nodes() {
+        let html = concat!(
+            "<div>Meet you there.</div><div id='interior'><br></div>",
+            "<div><a id='link' href='https://harbor.test/map'><img id='image' src='cid:map'></a></div>",
+            "<hr id='rule'><svg id='drawing'></svg><video id='movie'></video><canvas id='canvas'></canvas>",
+            "<br id='break'><div id='spacer'><br></div><p id='paragraph'></p><span id='space'>&nbsp;</span>",
+            "<div class='gmail_quote'><div>On Monday, Jo wrote:</div>",
+            "<blockquote><p>Could you share the pier map?</p></blockquote></div>",
+        );
+        let folded = crate::fold_history(crate::html_to_document(html), "Re: Pier map");
+        let mail = WebMail::prepare_with_history(html, &folded);
+        assert!(mail.mapped_history());
+        let page = html::parse_html(&mail.page("light", |_| None));
+        for (id, expect_folded) in [
+            ("interior", false),
+            ("link", false),
+            ("image", false),
+            ("rule", false),
+            ("drawing", false),
+            ("movie", false),
+            ("canvas", false),
+            ("break", true),
+            ("spacer", true),
+            ("paragraph", true),
+            ("space", true),
+        ] {
+            let element = page
+                .root_element()
+                .descendants()
+                .filter_map(scraper::ElementRef::wrap)
+                .find(|element| element.attr("id") == Some(id))
+                .unwrap_or_else(|| panic!("missing {id}"));
+            assert_eq!(
+                element.attr("data-fell-folded").is_some(),
+                expect_folded,
+                "{id}"
+            );
+        }
+    }
 
     #[test]
     fn author_colors_use_light_paper_in_dark_mode() {

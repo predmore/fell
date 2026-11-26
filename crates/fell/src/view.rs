@@ -11645,6 +11645,74 @@ fn html_sections(
         .collect()
 }
 
+#[cfg(test)]
+pub(crate) fn gmail_reply_geometry(
+    body: &HtmlBody,
+    snapshot: &crate::render::webview::Snapshot,
+) -> [(f32, f32); 2] {
+    use gpui::{VisualTestContext, point, size};
+
+    let (mut app, inbox) = tests::pending_inbox();
+    let entity = inbox.root(&mut app).unwrap();
+    let mut app = VisualTestContext::from_window(*inbox, &app);
+    let width = snapshot.width + CONVERSATION_RULE_PX + 2. * (CONVERSATION_PAD_PX + MESSAGE_PAD_PX);
+    let columns = ReaderColumns::split(width);
+    [false, true].map(|web| {
+        let measured = Rc::new(Cell::new(None));
+        let output = measured.clone();
+        app.draw(
+            point(px(0.), px(0.)),
+            size(px(width), px(400.)),
+            |window, cx| {
+                entity.update(cx, |inbox, cx| {
+                    let mut theme = inbox.theme.clone();
+                    theme.ui_px = 15.;
+                    let style = conversation_line_style(window, &theme, px(theme.ui_px));
+                    let markers = crate::render::ListMarkerFont::new(window, style);
+                    let folds = FoldView {
+                        open: false,
+                        columns,
+                        name_key: true,
+                        focused: 1.,
+                        fill: theme.surface,
+                        index: 0,
+                        live: false,
+                        image_consent: false,
+                    };
+                    div()
+                        .when(web, |body| {
+                            body.child(columns.card.place(crate::render::web_snapshot(
+                                snapshot,
+                                columns.card.width,
+                                theme.surface,
+                                theme.dimmed,
+                                None,
+                            )))
+                        })
+                        .children(html_sections(
+                            &theme,
+                            (body, None, web),
+                            folds,
+                            None,
+                            &markers,
+                            cx,
+                        ))
+                        .on_children_prepainted(move |bounds, _, _| {
+                            let [reply, fold] = bounds.as_slice() else {
+                                panic!("expected a reply and a fold row");
+                            };
+                            output.set(Some((
+                                f32::from(fold.top() - reply.top()),
+                                f32::from(fold.bottom() - reply.top()),
+                            )));
+                        })
+                })
+            },
+        );
+        measured.get().expect("measured reply and fold row")
+    })
+}
+
 fn history_section(
     blocks: &[fell_render::Block],
     kind: Option<fell_render::Fold>,

@@ -31,6 +31,7 @@ pub(super) const READER_BOTTOM_PAD: f32 = 8.;
 #[derive(Debug)]
 pub(super) struct Estimate {
     layouts: Vec<(i32, Option<Layout>)>,
+    collapsed_layouts: Vec<(i32, Option<Layout>)>,
     pub author_colors: bool,
     pub native_body_inset: bool,
 }
@@ -40,6 +41,7 @@ impl Estimate {
         layout_dom: &scraper::Html,
         metrics: TextMetrics,
         author_background: bool,
+        mapped_history: bool,
     ) -> Self {
         let mut styles = LayoutStyles::from_document(layout_dom);
         let elements = layout_dom
@@ -74,21 +76,31 @@ impl Estimate {
             serif: false,
             relative_size: !author_colors,
         };
-        let layouts = if styles.breakpoints.len() <= 8 {
-            std::iter::once(1)
-                .chain(styles.breakpoints.iter().copied())
-                .map(|width| {
-                    (
-                        width,
-                        Layout::from_node(root, &styles, Some(width), font, false),
-                    )
-                })
-                .collect()
+        let build = |styles: &LayoutStyles| {
+            if styles.breakpoints.len() <= 8 {
+                std::iter::once(1)
+                    .chain(styles.breakpoints.iter().copied())
+                    .map(|width| {
+                        (
+                            width,
+                            Layout::from_node(root, styles, Some(width), font, false),
+                        )
+                    })
+                    .collect()
+            } else {
+                vec![(1, Layout::from_node(root, styles, None, font, false))]
+            }
+        };
+        let layouts = build(&styles);
+        let collapsed_layouts = if mapped_history && !author_colors {
+            styles.collapse_history = true;
+            build(&styles)
         } else {
-            vec![(1, Layout::from_node(root, &styles, None, font, false))]
+            Vec::new()
         };
         Self {
             layouts,
+            collapsed_layouts,
             author_colors,
             native_body_inset,
         }
@@ -124,11 +136,15 @@ impl Estimate {
             native_line_height: (native_line && !self.author_colors)
                 .then(|| super::reader_line_height(font_size)),
         };
+        let collapsed = native_line && !self.collapsed_layouts.is_empty();
+        let layouts = if collapsed {
+            &self.collapsed_layouts
+        } else {
+            &self.layouts
+        };
         let width = width.max(1.);
-        let index = self
-            .layouts
-            .partition_point(|(min, _)| *min <= width.round() as i32);
-        let Some(layout) = self.layouts[index.saturating_sub(1)].1.as_ref() else {
+        let index = layouts.partition_point(|(min, _)| *min <= width.round() as i32);
+        let Some(layout) = layouts[index.saturating_sub(1)].1.as_ref() else {
             return Some(HEIGHT_ALLOWANCE);
         };
         // WebKit excludes the trailing body padding from an overflowing
@@ -151,7 +167,8 @@ impl Estimate {
             0.
         };
         let height = (layout.measure(width, style).outer_height() + footer) * width / raster_width;
-        Some((height + HEIGHT_ALLOWANCE).min(MAX_ESTIMATED_HEIGHT))
+        let allowance = if collapsed { 0. } else { HEIGHT_ALLOWANCE };
+        Some((height + allowance).min(MAX_ESTIMATED_HEIGHT))
     }
 }
 
@@ -529,6 +546,7 @@ pub(crate) struct LayoutStyles {
     order: usize,
     author_colors: bool,
     native_body_inset: bool,
+    collapse_history: bool,
 }
 
 struct LayoutRules<'a> {
@@ -1218,6 +1236,7 @@ struct Flow {
     height: f32,
     min_height: f32,
     max_height: f32,
+    reader_blank_line: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1581,7 +1600,9 @@ impl Layout {
             _ => return None,
         };
         let name = element.name();
-        if matches!(name, "head" | "script" | "style" | "title") {
+        if matches!(name, "head" | "script" | "style" | "title")
+            || styles.collapse_history && element.attr("data-fell-folded").is_some()
+        {
             return None;
         }
         let (style, incomplete) = styles.cascade(scraper::ElementRef::wrap(node)?, width);
@@ -1627,6 +1648,19 @@ impl Layout {
             [Length::Px(if cell { 1. } else { 0. }); 4]
         };
         let padding = std::array::from_fn(|edge| padding[edge].unwrap_or(default_padding[edge]));
+        // The themed reader gives these author spacers a native paragraph gap.
+        let empty_paragraph = styles.collapse_history
+            && name == "p"
+            && node
+                .children()
+                .all(|child| !matches!(child.value(), Node::Element(_) | Node::Text(_)));
+        let reader_blank_line = empty_paragraph
+            || styles.collapse_history && name == "div" && {
+                let mut elements = node.children().filter_map(scraper::ElementRef::wrap);
+                elements.next().is_some_and(|child| {
+                    child.value().name() == "br" && child.attr("data-fell-folded").is_none()
+                }) && elements.next().is_none()
+            };
         let default_margin = match name {
             "h1" => font.size * 0.67,
             "h2" => font.size * 0.83,
@@ -1634,6 +1668,7 @@ impl Layout {
             "h4" => font.size * 1.33,
             "h5" => font.size * 1.67,
             "h6" => font.size * 2.33,
+            "p" if empty_paragraph => 0.,
             "p" | "pre" | "ul" | "ol" | "blockquote" => font.size,
             _ => 0.,
         };
@@ -1837,6 +1872,7 @@ impl Layout {
             height,
             min_height,
             max_height,
+            reader_blank_line: reader_blank_line && length("min-height").is_none(),
         })))
     }
 
@@ -2265,7 +2301,11 @@ impl Flow {
         };
         let insets = top + bottom;
         let border_box = if self.border_box { insets } else { 0. };
-        let minimum = self.min_height.max(0.);
+        let minimum = if self.reader_blank_line {
+            super::reader_paragraph_gap(BODY_FONT_SIZE * style.font_scale)
+        } else {
+            self.min_height.max(0.)
+        };
         measured.height = content
             .max(self.height.max(minimum) - border_box)
             .min(self.max_height.max(minimum) - border_box)
@@ -2303,6 +2343,52 @@ fn grouped_resets_and_idle_selectors_keep_their_declarations() {
     ] {
         let grouped = format!("p, h1, td {{ margin: 0 }} {card} {{ height: 400px }}");
         assert_eq!(estimate(&grouped), expected, "{grouped}");
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn gmail_reply_estimates_the_simple_reader_height_before_the_fold() {
+    let html = include_str!("../../fixtures/web-gmail-reply.html");
+    let folded = crate::fold_history(crate::html_to_document(html), "Re: Pier lanterns");
+    let mail = WebMail::prepare_with_history(html, &folded);
+    let style = super::WebTextStyle {
+        family: None,
+        size: BODY_FONT_SIZE,
+        foreground: 0x4c4f69,
+        link: 0x1758ad,
+        inset: false,
+    };
+    let [reply, fold] = folded.sections.as_slice() else {
+        panic!("expected the reply and its history");
+    };
+    let blocks = folded.blocks(reply);
+    assert!(matches!(
+        blocks,
+        [
+            crate::Block::Paragraph { .. },
+            crate::Block::Paragraph { .. },
+            crate::Block::Paragraph { .. }
+        ]
+    ));
+    assert_eq!(fold.fold, Some(crate::Fold::SignatureAndQuote));
+    let lines = blocks.len() as f32;
+    let simple_fold_y = lines * super::reader_line_height(style.size)
+        + (lines - 1.) * super::reader_paragraph_gap(style.size)
+        + READER_BOTTOM_PAD;
+    let with_inline_break = html.replace(
+        "Meet you by the pier.</div>",
+        "Meet you by the pier.<br></div>",
+    );
+    let with_inline_break = WebMail::prepare_with_history(&with_inline_break, &folded);
+    for mail in [mail, with_inline_break] {
+        for width in [432., 530.] {
+            assert_eq!(
+                mail.estimated_height_with_style(width, Some(&style)),
+                Some(simple_fold_y)
+            );
+            assert!(mail.estimated_height(width) > simple_fold_y);
+        }
     }
 }
 

@@ -1636,7 +1636,7 @@ mod tests {
             Some(fell_render::Fold::SignatureAndQuote)
         );
         for (scheme, fg, accent) in [("dark", 0xa9b1d6, 0x7aa2f7), ("light", 0x4c4f69, 0x1758ad)] {
-            for width in [440, 490, 960] {
+            for width in [432, 530] {
                 let style = fell_render::WebTextStyle {
                     family: Some("Inter".into()),
                     size: 15.,
@@ -1648,15 +1648,22 @@ mod tests {
                     body.web.page_with_style(scheme, Some(&style), |_| None),
                     width,
                 );
-                // Empty author spacers and line breaks survive beside the fold.
-                assert_eq!(closed.height, 5. * 22. + 3. * 24. + 8.);
                 assert!(closed.links.is_empty() && closed.fallback_links.is_empty());
+                let [(simple_fold_y, simple_height), (web_fold_y, web_height)] =
+                    crate::view::gmail_reply_geometry(&body, &closed);
+                let estimate = body
+                    .web
+                    .estimated_height_with_style(width as f32, Some(&style));
+                assert_eq!(estimate, Some(simple_fold_y), "{scheme}, {width}px");
+                assert_eq!(web_fold_y, simple_fold_y, "{scheme}, {width}px");
+                assert_eq!(web_height, simple_height, "{scheme}, {width}px");
             }
         }
 
         let before_quote = concat!(
             "<div>Thursday works for me.</div>",
             "<div><a href='https://harbor.test/map'><img src='cid:pier-map' width='80' height='40'></a></div>",
+            "<div><br></div>",
             "<div class='gmail_quote'><div>On Monday, Jo wrote:</div>",
             "<blockquote><p>Could you share the pier map?</p></blockquote></div>",
         );
@@ -1678,6 +1685,10 @@ mod tests {
         );
         assert_eq!(closed.links.len(), 1);
         assert_eq!(closed.links[0].href, "https://harbor.test/map");
+        let [[_, _, width, height]] = closed.links[0].rects.as_slice() else {
+            panic!("expected the CID image's link rectangle");
+        };
+        assert_eq!((*width, *height), (80., 40.));
         assert!(closed.fallback_links.is_empty());
     }
 }
