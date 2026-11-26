@@ -6003,7 +6003,16 @@ impl Render for Inbox {
                 cx,
             )
         } else {
-            self.web_mail.stop();
+            if reader_current && preview_current {
+                self.web_mail.prefetch(
+                    self.session.messages.get(self.session.message_cursor),
+                    &self.theme,
+                    reader.columns.header.width,
+                    cx,
+                );
+            } else {
+                self.web_mail.stop();
+            }
             HashMap::new()
         };
         let conv = ConvFrame {
@@ -10495,6 +10504,7 @@ fn expanded_message_header(
     columns: ReaderColumns,
     status: Option<ReaderStatusSlot<'_>>,
     marker: GroupingMarker<'_>,
+    web: bool,
     window: &Window,
 ) -> gpui::Div {
     let style = conversation_line_style(window, theme, px(theme.ui_px - 1.));
@@ -10504,9 +10514,23 @@ fn expanded_message_header(
     let line_height = sender_style.line_height_in_pixels(window.rem_size());
     let date = present::relative_date(now_unix(), message.date_unix);
     let date_width = line_px_with_style(window, &sender_style, &date, FontWeight::NORMAL).ceil();
+    let web = web
+        .then(|| {
+            shape_ui_line(
+                window,
+                &style,
+                "web",
+                FontWeight::NORMAL,
+                Some(theme.dimmed),
+            )
+        })
+        .flatten();
+    let web_width = web.as_ref().map_or(0., |line| {
+        f32::from(line.width).ceil() + MESSAGE_HEADER_GAP_PX
+    });
     let marker = marker.render(
         |text| {
-            let available = (columns.card.width - date_width - 64.).max(0.);
+            let available = (columns.card.width - date_width - web_width - 64.).max(0.);
             clip_shaped(
                 window,
                 &style,
@@ -10531,7 +10555,7 @@ fn expanded_message_header(
         reader_status_width(
             theme,
             retry,
-            columns.card.width - date_width - marker_width - 96.,
+            columns.card.width - date_width - web_width - marker_width - 96.,
             window,
         )
     });
@@ -10574,6 +10598,7 @@ fn expanded_message_header(
         measure(&style, &email, FontWeight::NORMAL, theme.dimmed),
         measure(&style, &joined, FontWeight::NORMAL, theme.dimmed) + mute_room,
         date_width
+            + web_width
             + marker_width
             + if status.is_some() {
                 status_width + MESSAGE_HEADER_GAP_PX
@@ -10682,6 +10707,7 @@ fn expanded_message_header(
                 .overflow_hidden()
                 .children(status.map(|slot| reader_status_text(theme, slot, status_width)))
                 .children(marker.map(|(label, _)| label))
+                .children(web.map(|tag| paint_shaped_text(tag, line_height, false)))
                 .child(paint_shaped_text(line, line_height, false))
         }),
     )
@@ -10741,6 +10767,10 @@ fn expanded_message(
             columns,
             status.filter(|_| message.recipients.is_none()),
             marker,
+            frame
+                .web
+                .get(&message.id)
+                .is_some_and(web_mail::Frame::draws_web),
             window,
         ))
         .children(message.recipients.as_ref().map(|line| {
@@ -10859,18 +10889,27 @@ fn measured_message_body(
     frame: &ConvFrame,
     body: gpui::AnyElement,
 ) -> gpui::AnyElement {
-    let Some(probe) = frame.body_probes.get(&message.id).cloned() else {
+    let probe = frame.body_probes.get(&message.id).cloned();
+    let web = frame.web.get(&message.id);
+    let web_probe = web.and_then(|web| web.height.clone());
+    if probe.is_none() && web_probe.is_none() {
         return body;
-    };
+    }
     let body = match frame.heights.get(&message.id) {
-        Some(&(from, progress)) if progress < 1.0 => GrowingMessage {
-            inner: body,
-            width: px(columns.pane_right),
-            from,
-            progress,
-            gap: px(0.),
+        Some(&(from, progress))
+            if progress < 1.0
+                && probe.is_some()
+                && !web.is_some_and(web_mail::Frame::owns_body) =>
+        {
+            GrowingMessage {
+                inner: body,
+                width: px(columns.pane_right),
+                from,
+                progress,
+                gap: px(0.),
+            }
+            .into_any_element()
         }
-        .into_any_element(),
         _ => body,
     };
     div()
@@ -10878,7 +10917,15 @@ fn measured_message_body(
         .child(body)
         .child(
             gpui::canvas(
-                move |bounds, _, _| probe.set(f32::from(bounds.size.height)),
+                move |bounds, _, _| {
+                    let height = f32::from(bounds.size.height);
+                    if let Some(probe) = probe {
+                        probe.set(height);
+                    }
+                    if let Some(probe) = web_probe {
+                        probe.set(Some(height));
+                    }
+                },
                 |_, _, _, _| {},
             )
             .absolute()
@@ -10918,6 +10965,14 @@ fn message_body(
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
+    if let Rich::Html(body) = &message.rich
+        && let Some(web) = frame.web.get(&message.id).filter(|web| web.owns_body())
+    {
+        let style = conversation_line_style(window, theme, px(theme.ui_px));
+        let markers = crate::render::ListMarkerFont::new(window, style);
+        let reveal = frame.disclosures().quotes.get(&message.id).copied();
+        return web_message_body(theme, (message, body), folds, reveal, web, &markers, cx);
+    }
     let managed = frame
         .reader_feedback()
         .part_status
@@ -11012,37 +11067,56 @@ fn missing_message_body(
     )
 }
 
-fn stored_message_body(
+fn web_message_body(
     theme: &Theme,
-    message: &ConvMessage,
+    (message, body): (&ConvMessage, &mail_body::HtmlBody),
     folds: FoldView,
-    frame: &ConvFrame,
-    alpha: f32,
+    reveal: Option<f32>,
+    web: &web_mail::Frame,
     markers: &crate::render::ListMarkerFont,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
-    let reveal = frame.disclosures().quotes.get(&message.id).copied();
-    if let Rich::Html(body) = &message.rich {
-        let Some(web) = frame
-            .web
-            .get(&message.id)
-            .filter(|web| web.image.is_some() || web.outgoing.is_some())
-        else {
-            return div()
-                .opacity(alpha)
-                .children(html_sections(theme, body, folds, reveal, markers, cx))
-                .into_any_element();
-        };
-        let web_body = |picture: &crate::render::webview::Snapshot, live| {
+    use web_mail::Body;
+    let mut layer = |shown: &Body, live| match shown {
+        Body::Placeholder => folds
+            .columns
+            .prose
+            .place(
+                div()
+                    .h(px(theme.ui_px * 1.45 + 8.))
+                    .line_height(px(theme.ui_px * 1.45))
+                    .text_color(rgb(theme.dimmed))
+                    .truncate()
+                    .child(present::display_safe(&message.snippet)),
+            )
+            .into_any_element(),
+        Body::Native => div()
+            .bg(rgb(folds.fill))
+            .children(html_sections(
+                theme,
+                body,
+                FoldView { live, ..folds },
+                reveal,
+                markers,
+                cx,
+            ))
+            .into_any_element(),
+        Body::Web(picture) => {
+            let snapshot = div()
+                .relative()
+                .child(crate::render::web_snapshot(picture, folds.columns.card.width).rounded_md())
+                .when(!theme.is_light(), |snapshot| {
+                    snapshot.child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(theme.border)),
+                    )
+                });
             div()
-                .child(
-                    folds
-                        .columns
-                        .card
-                        .place(div().overflow_hidden().rounded_sm().child(
-                            crate::render::web_snapshot(picture, folds.columns.card.width),
-                        )),
-                )
+                .child(folds.columns.card.place(snapshot))
                 .when(!body.web_links.is_empty(), |pane| {
                     let palette = mail_body::palette(theme);
                     pane.child(div().mt(px(7.)).child(crate::render::blocks_column_spaced(
@@ -11056,31 +11130,36 @@ fn stored_message_body(
                     )))
                 })
                 .into_any_element()
-        };
-        let mut layer = |picture: Option<&crate::render::webview::Snapshot>, live| {
-            if let Some(picture) = picture {
-                web_body(picture, live)
-            } else {
-                div()
-                    .children(html_sections(
-                        theme,
-                        body,
-                        FoldView { live, ..folds },
-                        reveal,
-                        markers,
-                        cx,
-                    ))
-                    .into_any_element()
-            }
-        };
-        let incoming = layer(web.image.as_ref(), folds.live);
-        let contents = if web.progress < 1.0 {
-            let outgoing = layer(web.outgoing.as_ref(), false);
-            disclosure::crossfade(folds.columns.pane_right, web.progress, [outgoing, incoming])
-        } else {
-            incoming
-        };
-        return div().opacity(alpha).child(contents).into_any_element();
+        }
+    };
+    let incoming = layer(&web.body, folds.live);
+    if let Some(outgoing) = &web.outgoing {
+        disclosure::crossfade(
+            folds.columns.pane_right,
+            web.progress,
+            web.from_height,
+            [layer(outgoing, false), incoming],
+        )
+    } else {
+        incoming
+    }
+}
+
+fn stored_message_body(
+    theme: &Theme,
+    message: &ConvMessage,
+    folds: FoldView,
+    frame: &ConvFrame,
+    alpha: f32,
+    markers: &crate::render::ListMarkerFont,
+    cx: &mut Context<Inbox>,
+) -> gpui::AnyElement {
+    let reveal = frame.disclosures().quotes.get(&message.id).copied();
+    if let Rich::Html(body) = &message.rich {
+        return div()
+            .opacity(alpha)
+            .children(html_sections(theme, body, folds, reveal, markers, cx))
+            .into_any_element();
     }
     let blocks: Vec<gpui::AnyElement> = match &message.rich {
         Rich::Html(_) => unreachable!(),
@@ -15291,6 +15370,7 @@ mod tests {
                             ReaderColumns::split(600.),
                             None,
                             super::GroupingMarker::default(),
+                            false,
                             window,
                         )
                     });

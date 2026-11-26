@@ -136,14 +136,16 @@ pub(crate) fn reflow(
     layered(width, layers, frame.alpha, frame.height, [true; 2])
 }
 
-pub(super) fn crossfade(width: f32, progress: f32, layers: [AnyElement; 2]) -> AnyElement {
-    layered(
-        width,
-        layers,
-        [1.0 - progress, progress],
-        progress,
-        [false, true],
-    )
+/// Fade the new body over the old one without exposing the card underneath.
+pub(super) fn crossfade(
+    width: f32,
+    progress: f32,
+    from_height: Option<f32>,
+    layers: [AnyElement; 2],
+) -> AnyElement {
+    let mut fade = layer_pair(width, layers, [1.0, progress], progress, [true; 2]);
+    fade.from_height = from_height;
+    fade.into_any_element()
 }
 
 /// Reveal a measured child at its natural width while its slot grows or closes.
@@ -179,6 +181,16 @@ pub(crate) fn layered(
     height: f32,
     clipped: [bool; 2],
 ) -> AnyElement {
+    layer_pair(width, layers, alpha, height, clipped).into_any_element()
+}
+
+fn layer_pair(
+    width: f32,
+    layers: [AnyElement; 2],
+    alpha: [f32; 2],
+    height: f32,
+    clipped: [bool; 2],
+) -> Layered {
     let layer = |element, opacity| {
         div()
             .w(px(width))
@@ -192,8 +204,8 @@ pub(crate) fn layered(
         alpha,
         height,
         clipped,
+        from_height: None,
     }
-    .into_any_element()
 }
 
 struct Layered {
@@ -201,6 +213,7 @@ struct Layered {
     alpha: [f32; 2],
     height: f32,
     clipped: [bool; 2],
+    from_height: Option<f32>,
 }
 
 impl IntoElement for Layered {
@@ -235,7 +248,7 @@ impl Element for Layered {
             .layers
             .each_mut()
             .map(|layer| f32::from(layer.layout_as_root(space, window, cx).height));
-        let height = motion::lerp(from, to, self.height);
+        let height = motion::lerp(self.from_height.unwrap_or(from), to, self.height);
         let style = Style {
             size: Size {
                 height: px(height).into(),

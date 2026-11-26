@@ -97,6 +97,7 @@ fn run(rx: glib::Receiver<Job>) -> Result<(), Box<dyn std::error::Error>> {
         }))
         .with_incognito(true)
         .with_javascript_disabled()
+        // Leave Wry's opt-in Allow policy off. secure() supplies Deny for each load.
         .with_autoplay(false)
         .with_clipboard(false)
         .with_new_window_req_handler(|_, _| wry::NewWindowResponse::Deny)
@@ -224,7 +225,11 @@ fn secure(widget: &webkit2gtk::WebView) -> Result<(), Box<dyn std::error::Error>
     settings.set_enable_page_cache(false);
     settings.set_enable_webaudio(false);
     settings.set_enable_webgl(false);
-    widget.connect_decide_policy(|_, decision, kind| {
+    settings.set_media_playback_requires_user_gesture(true);
+    let no_autoplay = webkit2gtk::WebsitePolicies::builder()
+        .autoplay(webkit2gtk::AutoplayPolicy::Deny)
+        .build();
+    widget.connect_decide_policy(move |_, decision, kind| {
         use webkit2gtk::{
             NavigationPolicyDecisionExt, NavigationType, PolicyDecisionType, URIRequestExt,
         };
@@ -239,10 +244,12 @@ fn secure(widget: &webkit2gtk::WebView) -> Result<(), Box<dyn std::error::Error>
                             && action.request().and_then(|req| req.uri()).as_deref()
                                 == Some("about:blank")
                     });
-                if !internal {
+                if internal {
+                    decision.use_with_policies(&no_autoplay);
+                } else {
                     decision.ignore();
                 }
-                !internal
+                true
             }
             _ => {
                 decision.ignore();
@@ -390,15 +397,59 @@ mod tests {
 
     #[test]
     fn hostile_email_makes_zero_webkit_requests() {
-        if std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none() {
-            eprintln!("headless WebKit proof requires the isolated display");
+        use fell_core::test_support::{skip_unless_available, test_net_missing};
+
+        const TEST: &str = "render::webview::tests::hostile_email_makes_zero_webkit_requests";
+        let no_display =
+            std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none();
+        if no_display && std::env::var_os("CI").is_some_and(|ci| ci == "true") {
+            // The Ubuntu runner ships Xvfb. Give just this test a display,
+            // leaving the rest of the suite independent of GTK.
+            let output = std::process::Command::new("xvfb-run")
+                .args(["-a", "--"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env("GDK_BACKEND", "x11")
+                .env_remove("DBUS_SESSION_BUS_ADDRESS")
+                .output()
+                .expect("start WebKit test on the CI virtual display");
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
             return;
         }
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let local = format!("http://{}", listener.local_addr().unwrap());
-        let public = "http://192.0.2.1:33449";
-        let probe = format!(
+        let missing = if no_display {
+            Some("WebKit requires an isolated Wayland or X11 display".into())
+        } else {
+            test_net_missing()
+        };
+        if skip_unless_available(TEST, missing) {
+            return;
+        }
+
+        let listener = |host| {
+            let listener = TcpListener::bind((host, 0)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            listener
+        };
+        let local_listener = listener("127.0.0.1");
+        let public_listener = listener("192.0.2.1");
+        let local = format!("http://{}", local_listener.local_addr().unwrap());
+        let public = format!("http://{}", public_listener.local_addr().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let image_path = dir.path().join("probe.png");
+        image::RgbImage::from_pixel(16, 16, image::Rgb([0x15, 0xba, 0x3f]))
+            .save(&image_path)
+            .unwrap();
+        let file = url::Url::from_file_path(image_path).unwrap();
+
+        // Deliberately bypass the sanitizer and CSP. The WebKit defenses
+        // must still render the document without issuing a resource request.
+        let html = format!(
             r#"<head>
             <link rel="preconnect" href="{public}">
             <link rel="dns-prefetch" href="//render-probe.invalid">
@@ -406,11 +457,14 @@ mod tests {
             <link rel="icon" href="{local}/favicon">
             <meta http-equiv="refresh" content="0; url={local}/refresh">
             <style>@import "{public}/style";
+            @im/*x*/port "{public}/split-style";
             @font-face {{ font-family: Probe; src: url({public}/font); }}
             p {{ font-family: Probe; background: image-set(url({public}/bg) 1x); }}
+            div {{ background: url/*x*/({public}/split-bg); }}
             </style></head>
-            <body><p style="background-color:#7a163f">Offline preview</p>
-            <img src="{local}/pixel" srcset="{public}/srcset 2x">
+            <body><p style="background-color:#7a163f">Offline preview</p><div>Probe</div>
+            <img src="{local}/pixel"><img src="{public}/pixel" srcset="{public}/srcset 2x">
+            <img src="{file}" width="16" height="16">
             <iframe src="{public}/frame"></iframe>
             <form action="{local}/form"><input></form>
             <script>fetch("{local}/script");</script>
@@ -419,18 +473,20 @@ mod tests {
             </body>"#
         );
         let start = super::super::proxy::requests();
-        let page = fell_render::WebMail::prepare(&probe);
         let picture = futures::executor::block_on(render(WebRequest {
-            html: page.page("light", |_| None),
+            html,
             width: 440,
             background: 0xffffff,
-            settle_images: false,
+            settle_images: true,
         }))
         .expect("WebKit drew the hostile document");
-        let pixels = picture.image.as_bytes(0).unwrap();
-        assert!(pixels.as_chunks::<4>().0.contains(&[0x3f, 0x16, 0x7a, 255]));
+        let pixels = picture.image.as_bytes(0).unwrap().as_chunks::<4>().0;
+        assert!(pixels.contains(&[0x3f, 0x16, 0x7a, 255]));
+        assert!(!pixels.contains(&[0x3f, 0xba, 0x15, 255]));
         assert_eq!(super::super::proxy::requests() - start, 0);
-        assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
-        eprintln!("hostile WebKit corpus drew a frame with zero proxy and loopback requests");
+        for listener in [local_listener, public_listener] {
+            assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+        }
+        eprintln!("hostile WebKit corpus drew a frame without proxy, origin or file loads");
     }
 }

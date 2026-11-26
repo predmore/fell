@@ -1,5 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::ops::Deref;
+use std::ops::{Deref, Range};
+
+use cssparser::{Delimiter, ParseError, Parser, ParserInput, Token};
 
 fn web_page(body: &str, scheme: &str) -> String {
     format!(
@@ -15,7 +17,13 @@ fn web_page(body: &str, scheme: &str) -> String {
   html, body {{ margin: 0; padding: 0; background: transparent; }}
   table, img {{ max-width: 100%; }}
   body {{ overflow-wrap: anywhere; }}
-  img[src=""] {{ background-color: rgba(128, 128, 128, 0.12); }}
+  img[src=""] {{
+    background-color: rgba(128, 128, 128, 0.12);
+    border: 0 !important;
+    outline: 0 !important;
+    color: transparent !important;
+    content: url("data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7") !important;
+  }}
   img {{ object-fit: contain; }}
 </style>
 </head>
@@ -181,9 +189,9 @@ fn serialize_node(
                     .collect::<String>();
                 out.push_str("<style>");
                 if let Some(slots) = images.as_deref_mut() {
-                    serialize_css(&css, out, slots, escape_style);
+                    serialize_css(&css, out, Some(slots), escape_style);
                 } else {
-                    out.push_str(&escape_style(&sanitize_css(&css, allow_remote_images)));
+                    serialize_css(&css, out, None, escape_style);
                 }
                 out.push_str("</style>");
                 return;
@@ -209,7 +217,7 @@ fn serialize_node(
                     }
                     if attr == "style" {
                         out.push_str(" style=\"");
-                        serialize_css(value, out, slots, escape_attr);
+                        serialize_css(value, out, Some(slots), escape_attr);
                         out.push('"');
                         continue;
                     }
@@ -283,7 +291,7 @@ fn keep_attr(tag: &str, name: &str, value: &str, allow_remote_images: bool) -> b
 
 fn rewrite_attr(tag: &str, name: &str, value: &str, allow_remote_images: bool) -> String {
     if name.eq_ignore_ascii_case("style") {
-        return sanitize_css(value, allow_remote_images);
+        return strip_remote_css_urls(value);
     }
     if name.eq_ignore_ascii_case("srcset") {
         return value
@@ -490,130 +498,140 @@ fn is_css_whitespace(ch: char) -> bool {
 }
 
 pub fn strip_remote_css_urls(css: &str) -> String {
-    sanitize_css(css, false)
+    let mut out = String::new();
+    serialize_css(css, &mut out, None, str::to_owned);
+    out
 }
 
-/// Decode CSS escapes first, then drop remote `@import` and any `url(` the
-/// reader is not allowed to fetch. A private or link-local host is never fetched.
-fn sanitize_css(css: &str, allow_remote_images: bool) -> String {
-    let decoded = decode_css_escapes(css);
-    let without_import = strip_css_imports(&decoded, allow_remote_images);
-    strip_css_urls(&without_import, allow_remote_images)
+fn strip_css_comments(css: &str) -> String {
+    let mut out = String::with_capacity(css.len());
+    let mut chars = css.chars().peekable();
+    let mut quote = None;
+    while let Some(ch) = chars.next() {
+        match (quote, ch) {
+            (_, '\\') => {
+                out.push(ch);
+                out.extend(chars.next());
+                continue;
+            }
+            (None, '"' | '\'') => quote = Some(ch),
+            (Some(open), ch) if ch == open => quote = None,
+            (None, '/') if chars.next_if_eq(&'*').is_some() => {
+                while let Some(ch) = chars.next() {
+                    if ch == '*' && chars.next_if_eq(&'/').is_some() {
+                        break;
+                    }
+                }
+                continue;
+            }
+            _ => {}
+        }
+        out.push(ch);
+    }
+    out
+}
+
+enum CssResource {
+    Remove,
+    Url(String),
+}
+
+fn css_resources(
+    css: &mut Parser<'_, '_>,
+    depth: usize,
+    resources: &mut Vec<(Range<usize>, CssResource)>,
+) {
+    loop {
+        let start = css.position().byte_index();
+        let resource = match css.next_including_whitespace_and_comments() {
+            Ok(Token::AtKeyword(name)) if name.eq_ignore_ascii_case("import") => {
+                let _ = css.parse_until_after(Delimiter::Semicolon, |rule| {
+                    while rule.next().is_ok() {}
+                    Ok::<_, ParseError<'_, ()>>(())
+                });
+                CssResource::Remove
+            }
+            Ok(Token::UnquotedUrl(url)) => CssResource::Url(url.to_string()),
+            Ok(Token::Function(name)) if name.eq_ignore_ascii_case("url") => css
+                .parse_nested_block(|args| {
+                    Ok::<_, ParseError<'_, ()>>(args.expect_string()?.to_string())
+                })
+                .map_or(CssResource::Remove, CssResource::Url),
+            Ok(Token::BadUrl(_)) => CssResource::Remove,
+            Ok(
+                Token::Function(_)
+                | Token::ParenthesisBlock
+                | Token::SquareBracketBlock
+                | Token::CurlyBracketBlock,
+            ) => {
+                let _ = css.parse_nested_block(|nested| {
+                    if depth < 64 {
+                        css_resources(nested, depth + 1, resources);
+                    }
+                    Ok::<_, ParseError<'_, ()>>(())
+                });
+                if depth < 64 {
+                    continue;
+                }
+                CssResource::Remove
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        };
+        resources.push((start..css.position().byte_index(), resource));
+    }
 }
 
 fn serialize_css(
     css: &str,
     out: &mut String,
-    images: &mut Vec<(usize, String)>,
+    mut images: Option<&mut Vec<(usize, String)>>,
     escape: impl Fn(&str) -> String,
 ) {
-    let css = strip_css_imports(&decode_css_escapes(css), false);
-    let lower = css.to_ascii_lowercase();
+    // Classify comment-split spellings before tokenizing. The tokenizer also
+    // handles CSS escapes and keeps semicolons and parentheses inside strings.
+    let css = strip_css_comments(css);
+    let mut input = ParserInput::new(&css);
+    let mut resources = Vec::new();
+    css_resources(&mut Parser::new(&mut input), 0, &mut resources);
     let mut from = 0;
-    let mut search = 0;
-    while let Some(relative) = lower[search..].find("url(") {
-        let start = search + relative;
-        let url_start = start + 4;
-        let Some(end) = css[url_start..].find(')').map(|i| i + url_start) else {
-            break;
-        };
-        search = end + 1;
-        let property = lower[..start]
-            .rsplit([';', '{', '}'])
-            .next()
-            .unwrap_or_default();
-        let name = property.split_once(':').map(|(name, _)| name.trim());
-        if !matches!(
-            name,
-            Some("background" | "background-image" | "border-image" | "list-style-image")
-        ) {
+    for (range, resource) in resources {
+        if let CssResource::Url(value) = &resource
+            && normalize_resource_url(value)
+                .to_ascii_lowercase()
+                .starts_with("data:image/")
+        {
             continue;
         }
-        let value = css[url_start..end].trim().trim_matches(['"', '\'']);
-        let Some(url) = remote_image_url(value) else {
-            continue;
-        };
-        if images.len() >= 48 {
-            break;
-        }
-        out.push_str(&escape(&strip_css_urls(&css[from..start], false)));
-        out.push_str(&escape("url(\""));
-        images.push((out.len(), url));
-        out.push_str(&escape("\")"));
-        from = end + 1;
-    }
-    out.push_str(&escape(&strip_css_urls(&css[from..], false)));
-}
-
-fn strip_css_imports(css: &str, allow_remote_images: bool) -> String {
-    let mut out = String::with_capacity(css.len());
-    let mut rest = css;
-    loop {
-        let lower = rest.to_ascii_lowercase();
-        let Some(idx) = lower.find("@import") else {
-            out.push_str(rest);
-            break;
-        };
-        out.push_str(&rest[..idx]);
-        let after = &rest[idx + "@import".len()..];
-        let Some(semi) = after.find(';') else {
-            out.push_str(&rest[idx..]);
-            break;
-        };
-        let drop = import_target(&after[..semi])
-            .is_some_and(|target| resource_is_disallowed(&target, allow_remote_images));
-        if !drop {
-            out.push_str(&rest[idx..idx + "@import".len() + semi + 1]);
-        }
-        rest = &after[semi + 1..];
-    }
-    out
-}
-
-fn import_target(prelude: &str) -> Option<String> {
-    let prelude = prelude.trim();
-    let lower = prelude.to_ascii_lowercase();
-    if let Some(rest) = lower.strip_prefix("url(") {
-        let end = rest.find(')')?;
-        let inside = rest[..end]
-            .trim()
-            .trim_matches(|ch| ch == '"' || ch == '\'' || ch == ' ');
-        return Some(inside.to_string());
-    }
-    let quote = prelude.chars().next()?;
-    if quote != '"' && quote != '\'' {
-        return None;
-    }
-    let end = prelude[1..].find(quote)?;
-    Some(prelude[1..1 + end].to_string())
-}
-
-fn strip_css_urls(css: &str, allow_remote_images: bool) -> String {
-    let mut out = String::with_capacity(css.len());
-    let mut rest = css;
-    loop {
-        let lower = rest.to_ascii_lowercase();
-        let Some(idx) = lower.find("url(") else {
-            out.push_str(rest);
-            break;
-        };
-        out.push_str(&rest[..idx]);
-        let after = &rest[idx + 4..];
-        let Some(end) = after.find(')') else {
-            out.push_str(&rest[idx..]);
-            break;
-        };
-        let inside = after[..end]
-            .trim()
-            .trim_matches(|ch| ch == '"' || ch == '\'' || ch == ' ');
-        if resource_is_disallowed(inside, allow_remote_images) {
-            out.push_str("url(\"about:blank\")");
+        out.push_str(&escape(&css[from..range.start]));
+        if let CssResource::Url(value) = resource {
+            let declaration = css[..range.start]
+                .rsplit([';', '{', '}'])
+                .next()
+                .unwrap_or_default();
+            let name = declaration.split_once(':').map(|(name, _)| name.trim());
+            let slot = images.as_deref_mut().filter(|slots| slots.len() < 48);
+            if let Some(slots) = slot
+                && name.is_some_and(|name| {
+                    matches!(
+                        name.to_ascii_lowercase().as_str(),
+                        "background" | "background-image" | "border-image" | "list-style-image"
+                    )
+                })
+                && let Some(url) = remote_image_url(&value)
+            {
+                out.push_str(&escape("url(\""));
+                slots.push((out.len(), url));
+                out.push_str(&escape("\")"));
+            } else {
+                out.push_str(" none ");
+            }
         } else {
-            out.push_str(&rest[idx..idx + 4 + end + 1]);
+            out.push(' ');
         }
-        rest = &after[end + 1..];
+        from = range.end;
     }
-    out
+    out.push_str(&escape(&css[from..]));
 }
 
 fn image_attr_is_blocked(tag: &str, name: &str, value: &str, allow_remote_images: bool) -> bool {
@@ -667,44 +685,39 @@ pub fn address_is_blocked(ip: IpAddr) -> bool {
 }
 
 fn ipv4_is_blocked(ip: Ipv4Addr) -> bool {
-    let [first, second, _, _] = ip.octets();
-    first == 0
-        || first == 10
-        || first == 127
-        || (first == 100 && (64..=127).contains(&second))
-        || (first == 169 && second == 254)
-        || (first == 172 && (16..=31).contains(&second))
-        || (first == 192 && second == 168)
+    // IANA special-purpose address blocks, plus multicast. Sub-allocations
+    // with global reachability still have protocol-specific purposes.
+    matches!(
+        ip.octets(),
+        [0 | 10 | 127 | 224..=255, ..]
+            | [100, 64..=127, ..]
+            | [169, 254, ..]
+            | [172, 16..=31, ..]
+            | [192, 0, 0 | 2, _]
+            | [192, 31, 196, _]
+            | [192, 52, 193, _]
+            | [192, 88, 99, _]
+            | [192, 168, ..]
+            | [192, 175, 48, _]
+            | [198, 18 | 19, ..]
+            | [198, 51, 100, _]
+            | [203, 0, 113, _]
+    )
 }
 
 fn ipv6_is_blocked(ip: Ipv6Addr) -> bool {
-    if ip.is_unspecified() || ip.is_loopback() {
-        return true;
-    }
-    if let Some(mapped) = ip.to_ipv4_mapped() {
-        return ipv4_is_blocked(mapped);
-    }
-    // IPv4-compatible ::a.b.c.d. The mapped form was handled above.
-    if ip.to_ipv4().is_some() {
-        return true;
-    }
-    let segments = ip.segments();
-    let [first, second, ..] = ip.octets();
-    // fe80::/10 link-local, fc00::/7 unique-local.
-    if (first == 0xfe && (second & 0xc0) == 0x80) || (first & 0xfe) == 0xfc {
-        return true;
-    }
-    // NAT64 64:ff9b::/96 and 6to4 2002::/16.
-    (segments[0] == 0x64
-        && segments[1] == 0xff9b
-        && segments[2] == 0
-        && segments[3] == 0
-        && segments[4] == 0
-        && segments[5] == 0)
-        || segments[0] == 0x2002
+    // Require global unicast. This rules out mapped and compatible IPv4,
+    // translation prefixes, loopback, ULA, link-local and multicast.
+    !matches!(ip.segments()[0], 0x2000..=0x3fff)
+        || matches!(
+            ip.segments(),
+            [0x2001, 0x0000..=0x01ff | 0x0db8, ..]
+                | [0x2002, ..]
+                | [0x2620, 0x004f, 0x8000, ..]
+                | [0x3fff, 0x0000..=0x0fff, ..]
+        )
 }
 
-/// `true` when the URL names a loopback, private, or link-local host.
 pub fn targets_private_network(value: &str) -> bool {
     let Some(host) = resource_host(value) else {
         return false;
@@ -735,12 +748,12 @@ fn host_is_private(host: &str) -> bool {
         return true;
     }
     if let Some(octets) = parse_ipv4_url(&host) {
-        return ipv4_is_private(octets);
+        return ipv4_is_blocked(Ipv4Addr::from(octets));
     }
     if host.contains(':')
         && let Some(groups) = parse_ipv6(&host)
     {
-        return ipv6_is_private(groups);
+        return ipv6_is_blocked(Ipv6Addr::from(groups));
     }
     false
 }
@@ -821,13 +834,6 @@ fn parse_ipv4_number(input: &str) -> Option<u64> {
     u64::from_str_radix(digits, radix).ok()
 }
 
-fn ipv4_is_private(octets: [u8; 4]) -> bool {
-    matches!(
-        octets,
-        [0, ..] | [10, ..] | [127, ..] | [169, 254, ..] | [172, 16..=31, ..] | [192, 168, ..]
-    )
-}
-
 fn parse_ipv6(host: &str) -> Option<[u16; 8]> {
     if host.matches("::").count() > 1 {
         return None;
@@ -891,25 +897,6 @@ fn hextet(piece: &str) -> Option<u16> {
         return None;
     }
     u16::from_str_radix(piece, 16).ok()
-}
-
-fn ipv6_is_private(groups: [u16; 8]) -> bool {
-    if groups == [0, 0, 0, 0, 0, 0, 0, 0] || groups == [0, 0, 0, 0, 0, 0, 0, 1] {
-        return true;
-    }
-    if groups[0] & 0xffc0 == 0xfe80 || groups[0] & 0xfe00 == 0xfc00 {
-        return true;
-    }
-    if groups[..5] == [0, 0, 0, 0, 0] && groups[5] == 0xffff {
-        let octets = [
-            (groups[6] >> 8) as u8,
-            groups[6] as u8,
-            (groups[7] >> 8) as u8,
-            groups[7] as u8,
-        ];
-        return ipv4_is_private(octets);
-    }
-    false
 }
 
 /// `<` would close the style element. A CSS escape keeps the stylesheet and
@@ -1084,35 +1071,73 @@ mod tests {
         assert!(math.contains("</math>"), "{math}");
     }
 
-    fn css_url_request(value: &str) -> Option<String> {
-        let mut stripped = String::new();
-        let mut rest = value;
-        while let Some(start) = rest.find("/*") {
-            stripped.push_str(&rest[..start]);
-            let after = &rest[start + 2..];
-            let end = after.find("*/")?;
-            rest = &after[end + 2..];
+    #[test]
+    fn sanitized_page_removes_comment_split_imports_and_unapproved_urls() {
+        let mail = WebMail::prepare(
+            r#"<style>
+            @im/*x*/port "https://example.test/import;with-semicolon";
+            @import url("data:text/css,body{}");
+            @font-face { src: u/*x*/rl("http://example.test/font"); }
+            p { background: url/*x*/("https://example.test/slot(a).png"); }
+            i { background: url(/*x*/"http://192.0.0.192/metadata"); }
+            b { background: url("file:///probe.png"); }
+            em { background: url("data:image/png;base64,AAAA"); }
+            </style><p style="mask: u/*x*/rl(https://example.test/mask)">Sample</p>"#,
+        );
+        let blocked = mail.page("light", |_| None);
+        let mut slots = Vec::new();
+        let allowed = mail.page("light", |url| {
+            slots.push(url.to_owned());
+            Some("data:image/png;base64,BBBB".into())
+        });
+        for page in [&blocked, &allowed] {
+            assert!(!page.contains("example.test"), "{page}");
+            assert!(!page.contains("192.0.0.192"), "{page}");
+            assert!(!page.contains("file:"), "{page}");
+            assert!(!page.contains("@import"), "{page}");
+            assert!(!page.contains("/*x*/"), "{page}");
+            assert!(page.contains("data:image/png;base64,AAAA"), "{page}");
         }
-        stripped.push_str(rest);
-        let open = stripped.find("url(")? + 4;
-        let close = stripped[open..].find(')')? + open;
-        let token = stripped[open..close]
-            .trim()
-            .trim_matches(|ch| ch == '"' || ch == '\'');
-        (!token.is_empty()).then(|| token.to_string())
+        assert_eq!(slots, ["https://example.test/slot(a).png"]);
+        assert!(allowed.contains("data:image/png;base64,BBBB"));
     }
 
     #[test]
-    fn comment_in_url_is_denied_when_the_request_is_issued() {
-        for css in [
-            r#"url(/*x*/"http://169.254.169.254/latest/meta-data")"#,
-            r#"url(/*x*/"http://127.0.0.1/x.png")"#,
+    fn special_purpose_addresses_are_blocked_before_connect() {
+        for ip in [
+            "192.0.0.192",
+            "192.0.2.1",
+            "192.31.196.1",
+            "192.52.193.1",
+            "192.88.99.2",
+            "192.175.48.1",
+            "198.19.255.255",
+            "198.51.100.1",
+            "203.0.113.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+            "::ffff:1.1.1.1",
+            "64:ff9b:1::1",
+            "100::1",
+            "2001:2::1",
+            "2001:db8::1",
+            "2620:4f:8000::1",
+            "3fff:fff::1",
+            "5f00::1",
+            "fc00::1",
+            "fe80::1",
+            "ff02::1",
         ] {
-            let request = css_url_request(css).expect(css);
+            let address = ip.parse().unwrap();
+            assert!(address_is_blocked(address), "{ip}");
             assert!(
-                super::request_is_blocked_with(&request, |_| Vec::new()),
-                "{css} -> {request}"
+                request_is_blocked_with("https://cdn.example/image", |_| vec![address]),
+                "{ip}"
             );
+        }
+        for ip in ["192.0.1.1", "223.255.255.254", "2606:4700:4700::1111"] {
+            assert!(!address_is_blocked(ip.parse().unwrap()), "{ip}");
         }
     }
 

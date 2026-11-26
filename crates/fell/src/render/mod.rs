@@ -451,14 +451,12 @@ fn banner_edge(theme: Theme, web: bool, border: u32) -> u32 {
     }
 }
 
-pub(crate) fn web_snapshot(snapshot: &webview::Snapshot, width: f32) -> gpui::Div {
+pub(crate) fn web_snapshot(snapshot: &webview::Snapshot, width: f32) -> gpui::Img {
     let height = snapshot.height * width / snapshot.width;
-    div().w(px(width)).h(px(height)).child(
-        gpui::img(snapshot.image.clone())
-            .w(px(width))
-            .h(px(height))
-            .object_fit(gpui::ObjectFit::Fill),
-    )
+    gpui::img(snapshot.image.clone())
+        .w(px(width))
+        .h(px(height))
+        .object_fit(gpui::ObjectFit::Fill)
 }
 
 #[cfg(test)]
