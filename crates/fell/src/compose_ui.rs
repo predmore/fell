@@ -541,23 +541,14 @@ impl ComposeView {
                     .await;
                 if this
                     .update(cx, |this, cx| {
-                        let identities = result
-                            .as_ref()
-                            .ok()
-                            .and_then(|config| config.as_ref())
-                            .map(fell_core::AccountConfig::compose_identities)
-                            .unwrap_or_default();
                         let changed = this
                             .hub
                             .with_session(this.draft_id.as_ref(), |session| {
-                                session.set_identities(identities)
+                                this.send_feedback
+                                    .update_account_config(session, generation, result)
                             })
                             .unwrap_or(false);
-                        if this
-                            .send_feedback
-                            .update_readiness(generation, result.err())
-                            || changed
-                        {
+                        if changed {
                             cx.notify();
                         }
                     })
@@ -2228,57 +2219,48 @@ impl Render for ComposeView {
             }
         }
         window.focus(&self.focus);
-        let (mut snap, mut lock, reply_check, can_pick_from, default_from, managed_signature) =
-            self.hub
-                .with_session(self.draft_id.as_ref(), |session| {
-                    let snap = session.snapshot();
-                    let check = snap.reply_to_unverified.then(|| {
-                        if snap
-                            .reply_context
-                            .as_ref()
-                            .is_some_and(|parent| parent.reply_to.is_some())
-                        {
-                            ReplyCheck::Verified
-                        } else if let Some(parent) = snap.in_reply_to.as_deref() {
-                            cx.global::<ReplyChecks>()
-                                .for_draft(session.account_id(), parent)
-                        } else {
-                            ReplyCheck::Waiting
-                        }
-                    });
-                    let lock = session.send_lock();
-                    let can_pick = lock.is_none() && identity::can_pick(session, &snap.from);
-                    let default = session.identities().first().is_none_or(|identity| {
-                        fell_core::compose::email_of(&snap.from)
-                            .is_some_and(|email| identity.address.eq_ignore_ascii_case(&email))
-                    });
-                    (
-                        snap,
-                        lock,
-                        check,
-                        can_pick,
-                        default,
-                        session.managed_signature().map(str::to_owned),
-                    )
-                })
-                .unwrap_or_else(|| {
-                    (
-                        empty_snapshot(self.draft_id.as_ref()),
-                        None,
-                        None,
-                        false,
-                        true,
-                        None,
-                    )
+        let motion = self.motion;
+        let display = &mut self.identity_display;
+        let (mut snap, mut lock, reply_check, can_pick_from, kept_signature) = self
+            .hub
+            .with_session(self.draft_id.as_ref(), |session| {
+                let snap = session.snapshot();
+                let check = snap.reply_to_unverified.then(|| {
+                    if snap
+                        .reply_context
+                        .as_ref()
+                        .is_some_and(|parent| parent.reply_to.is_some())
+                    {
+                        ReplyCheck::Verified
+                    } else if let Some(parent) = snap.in_reply_to.as_deref() {
+                        cx.global::<ReplyChecks>()
+                            .for_draft(session.account_id(), parent)
+                    } else {
+                        ReplyCheck::Waiting
+                    }
                 });
-        if self.identity_display.update(
-            &snap.from,
-            default_from,
-            managed_signature,
-            &snap.body,
-            self.motion,
-            window,
-        ) {
+                let lock = session.send_lock();
+                let can_pick = lock.is_none() && identity::can_pick(session, &snap.from);
+                let default = session.identities().first().is_none_or(|identity| {
+                    fell_core::compose::email_of(&snap.from)
+                        .is_some_and(|email| identity.address.eq_ignore_ascii_case(&email))
+                });
+                let kept = display.update(
+                    &snap.from,
+                    default,
+                    session.managed_signature(),
+                    &snap.body,
+                    motion,
+                    window,
+                );
+                (snap, lock, check, can_pick, kept)
+            })
+            .unwrap_or_else(|| {
+                let snap = empty_snapshot(self.draft_id.as_ref());
+                display.update(&snap.from, true, None, &snap.body, motion, window);
+                (snap, None, None, false, false)
+            });
+        if kept_signature {
             cx.spawn(async |this, cx| {
                 cx.background_executor().timer(identity::NOTICE_HOLD).await;
                 let _ = this.update(cx, |_, cx| cx.notify());
@@ -2406,7 +2388,17 @@ impl Render for ComposeView {
             .look
             .as_ref()
             .and_then(|theme| theme.mono_family.clone());
-        let from_label = self.identity_display.label(recipient_theme);
+        let can_pick_from = can_pick_from && lock.is_none();
+        let from_width =
+            ((window.viewport_size().width - window.rem_size() * 2.) * 0.70).max(px(0.));
+        let from_label = self.identity_display.label(
+            recipient_theme,
+            window,
+            from_width,
+            self.ui_px,
+            &ui_family,
+            can_pick_from,
+        );
         let from_picker = self.identity_picker_view(recipient_theme, window, cx);
         let feedback = feedback.map(|feedback| {
             send_feedback_view(feedback, self.send_panel, &self.send_detail_scroll, colors)
@@ -2447,16 +2439,7 @@ impl Render for ComposeView {
                     .size_0(),
                 )
             })
-            .child(
-                header(
-                    &snap,
-                    from_label,
-                    colors,
-                    can_pick_from && lock.is_none(),
-                    cx,
-                )
-                .flex_shrink_0(),
-            )
+            .child(header(&snap, from_label, from_width, colors, can_pick_from, cx).flex_shrink_0())
             // Everything between the header and the Attachments divider:
             // the HTML preview panel covers exactly this, so it never ends
             // partway into a row below.
@@ -3330,6 +3313,7 @@ impl PreparedSend {
 fn header(
     snap: &Snapshot,
     from_label: gpui::Div,
+    from_width: gpui::Pixels,
     colors: Palette,
     can_pick_from: bool,
     cx: &mut Context<ComposeView>,
@@ -3365,12 +3349,12 @@ fn header(
         .child(
             div()
                 .id("compose-from")
-                .w(gpui::relative(0.70))
+                .w(from_width)
+                .flex_none()
                 .justify_end()
                 .min_w_0()
                 .flex()
                 .items_center()
-                .gap_2()
                 .text_color(rgb(colors.dim))
                 .when(can_pick_from, |from| {
                     from.cursor_pointer()
@@ -3379,10 +3363,7 @@ fn header(
                             cx.notify();
                         }))
                 })
-                .child(from_label)
-                .when(can_pick_from, |from| {
-                    from.child(div().flex_none().child("⌄"))
-                }),
+                .child(from_label),
         )
 }
 
@@ -4026,22 +4007,33 @@ fn styled_body(
         .map(|row| (row, cursor_byte(&text, row, 0)))
         .filter(|&(_, start)| hunks.iter().all(|(_, end, _, _)| *end <= start))
         .map_or((None, text.len()), |(row, start)| (Some(row), start));
-    let doc = markdown_to_doc(&text[..body_end]);
+    let body_text = &text[..body_end];
+    let doc = markdown_to_doc(body_text);
     let mut column = div().flex().flex_col();
     let mut previous: Option<&BlockBody> = None;
-    let items: Vec<BodyItem> =
-        if editor.caret_hidden || signature.is_some_and(|row| editor.row >= row) {
-            // Typing goes to a header field: every block shows styled, with
-            // no caret line, so there is one caret on screen.
-            (0..doc.blocks.len())
-                .map(|index| BodyItem::Block { index, raw: false })
-                .collect()
-        } else {
-            body_layout(&text, editor.row, editor.col, &doc)
-        };
+    let mut previous_blank = false;
+    let caret = (!editor.caret_hidden && signature.is_none_or(|row| editor.row < row))
+        .then_some((editor.row, editor.col));
+    let items = body_layout(
+        body_text,
+        caret,
+        &doc,
+        signature.is_some() || paint.signature_swap.is_some(),
+    );
     for (index, item) in items.into_iter().enumerate() {
+        let blank = matches!(item, BodyItem::BlankRow { .. });
         let (body, mut painted) = match item {
             BodyItem::CaretRow => (None, cursor_line_row(editor, paint)),
+            BodyItem::BlankRow { caret } => (
+                None,
+                if caret {
+                    cursor_line_row(editor, paint)
+                } else {
+                    div()
+                }
+                .h(paint.line_height())
+                .flex_none(),
+            ),
             BodyItem::Block { index, raw } => {
                 let block = &doc.blocks[index];
                 let edits: Vec<&(usize, usize, String, u64)> = block
@@ -4074,10 +4066,11 @@ fn styled_body(
                 ((!raw && edits.is_empty()).then_some(&block.body), painted)
             }
         };
-        if index > 0 && !joins_previous(previous, body) {
+        if index > 0 && !blank && !previous_blank && !joins_previous(previous, body) {
             painted = painted.mt_2();
         }
         previous = body;
+        previous_blank = blank;
         column = column.child(painted);
     }
     column.children(signature_view(editor, signature, Some(links), paint))
@@ -4088,29 +4081,60 @@ fn styled_body(
 enum BodyItem {
     /// The cursor line when no block covers it, such as a blank line.
     CaretRow,
+    /// A source line reserved above the signature, even without the cursor.
+    BlankRow { caret: bool },
     /// A block of the document, in source form when it holds the cursor.
     Block { index: usize, raw: bool },
 }
 
-fn body_layout(text: &str, row: usize, col: usize, doc: &StyledDoc) -> Vec<BodyItem> {
-    let cursor_at_col = cursor_byte(text, row, col);
-    let cursor_at = cursor_byte(text, row, 0);
-    let mut caret_placed = cursor_line_covered(text, row, doc);
-    let mut items = Vec::with_capacity(doc.blocks.len() + 1);
-    for (index, block) in doc.blocks.iter().enumerate() {
-        if !caret_placed && block.source.is_some_and(|(start, _)| cursor_at < start) {
-            items.push(BodyItem::CaretRow);
-            caret_placed = true;
+fn body_layout(
+    text: &str,
+    caret: Option<(usize, usize)>,
+    doc: &StyledDoc,
+    keep_blank_lines: bool,
+) -> Vec<BodyItem> {
+    let mut rows = Vec::new();
+    if keep_blank_lines {
+        let mut start = 0;
+        for (row, line) in text.split_inclusive('\n').enumerate() {
+            if line.trim().is_empty() {
+                rows.push((
+                    start,
+                    BodyItem::BlankRow {
+                        caret: caret.is_some_and(|(at, _)| row == at),
+                    },
+                ));
+            }
+            start += line.len();
         }
-        let raw = match block.source {
-            Some(range) => block_holds_cursor(range, cursor_at_col, text.len()),
-            None => row == 0,
-        };
+    }
+    if let Some((row, _)) = caret.filter(|(row, _)| !cursor_line_covered(text, *row, doc)) {
+        let start = cursor_byte(text, row, 0);
+        if let Err(index) = rows.binary_search_by_key(&start, |&(offset, _)| offset) {
+            rows.insert(index, (start, BodyItem::CaretRow));
+        }
+    }
+    let cursor = caret.map(|(row, col)| cursor_byte(text, row, col));
+    let mut items = Vec::with_capacity(doc.blocks.len() + rows.len());
+    let mut rows = rows.into_iter().peekable();
+    for (index, block) in doc.blocks.iter().enumerate() {
+        if let Some((start, end)) = block.source {
+            while rows.peek().is_some_and(|&(offset, _)| offset < end) {
+                let (offset, item) = rows.next().unwrap();
+                if offset < start {
+                    items.push(item);
+                }
+            }
+        }
+        let raw = cursor.is_some_and(|cursor| {
+            block.source.map_or_else(
+                || caret.is_some_and(|(row, _)| row == 0),
+                |range| block_holds_cursor(range, cursor, text.len()),
+            )
+        });
         items.push(BodyItem::Block { index, raw });
     }
-    if !caret_placed {
-        items.push(BodyItem::CaretRow);
-    }
+    items.extend(rows.map(|(_, item)| item));
     items
 }
 
@@ -4231,11 +4255,11 @@ fn signature_view(
             Some(start),
         )
     });
-    if let Some((old, progress)) = paint.signature_swap {
-        let old = if old.is_empty() {
+    if let Some(fade) = paint.signature_swap {
+        let old = if fade.text.is_empty() {
             div()
         } else {
-            rows(&mut old.lines(), None)
+            rows(&mut fade.text.lines(), None)
         };
         let width =
             (paint.window.viewport_size().width - paint.window.rem_size() * 2.5).max(px(1.));
@@ -4245,9 +4269,11 @@ fn signature_view(
                 old.into_any_element(),
                 current.unwrap_or_else(div).into_any_element(),
             ],
-            [1. - progress, progress],
-            progress,
-            [true; 2],
+            [fade.outgoing, fade.progress],
+            fade.progress,
+            // The outgoing text is the last content in the editor, so it
+            // can finish fading without its glyphs crossing the moving clip.
+            [false, true],
         ))
     } else {
         current.map(IntoElement::into_any_element)
@@ -4451,7 +4477,7 @@ struct SourcePaint<'a> {
     view: gpui::WeakEntity<ComposeView>,
     row: usize,
     window: &'a Window,
-    signature_swap: Option<(&'a str, f32)>,
+    signature_swap: Option<identity::FooterFade<'a>>,
 }
 
 impl SourcePaint<'_> {
@@ -5893,6 +5919,22 @@ impl SendFeedbackState {
         }
         self.readiness = readiness;
         true
+    }
+
+    fn update_account_config(
+        &mut self,
+        session: &mut fell_core::compose::DraftSession,
+        generation: u64,
+        result: Result<Option<fell_core::AccountConfig>, AccountConfigError>,
+    ) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        let changed = match &result {
+            Ok(Some(config)) => session.set_identities(config.compose_identities()),
+            _ => false,
+        };
+        self.update_readiness(generation, result.err()) || changed
     }
 
     fn feedback<'a>(
@@ -7646,7 +7688,7 @@ mod tests {
         let text = "# Q3\n\nNext\n";
         let doc = markdown_to_doc(text);
         assert_eq!(
-            super::body_layout(text, 1, 0, &doc),
+            super::body_layout(text, Some((1, 0)), &doc, false),
             vec![
                 Block {
                     index: 0,
@@ -7660,7 +7702,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            super::body_layout(text, 0, 4, &doc),
+            super::body_layout(text, Some((0, 4)), &doc, false),
             vec![
                 Block {
                     index: 0,
@@ -7681,7 +7723,7 @@ mod tests {
         let doc = markdown_to_doc(text);
         assert_eq!(doc.blocks.len(), 2);
         assert_eq!(
-            super::body_layout(text, 1, 0, &doc),
+            super::body_layout(text, Some((1, 0)), &doc, false),
             vec![
                 Block {
                     index: 0,
@@ -7701,7 +7743,7 @@ mod tests {
         let text = "hello\n\n";
         let doc = markdown_to_doc(text);
         assert_eq!(
-            super::body_layout(text, 1, 0, &doc),
+            super::body_layout(text, Some((1, 0)), &doc, false),
             vec![
                 Block {
                     index: 0,
@@ -7711,7 +7753,80 @@ mod tests {
             ]
         );
         let empty = markdown_to_doc("\n");
-        assert_eq!(super::body_layout("\n", 0, 0, &empty), vec![CaretRow]);
+        assert_eq!(
+            super::body_layout("\n", Some((0, 0)), &empty, false),
+            vec![CaretRow]
+        );
+    }
+
+    #[test]
+    fn each_blank_line_above_the_signature_keeps_its_height() {
+        struct SignedBody {
+            blank_lines: usize,
+            row: usize,
+            caret_hidden: bool,
+        }
+
+        impl gpui::Render for SignedBody {
+            fn render(
+                &mut self,
+                window: &mut gpui::Window,
+                _: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                use super::*;
+                let mut editor =
+                    Editor::from_body(&format!("{}-- \nStudio\n", "\n".repeat(self.blank_lines)));
+                editor.row = self.row;
+                editor.caret_hidden = self.caret_hidden;
+                let paint = SourcePaint {
+                    colors: palette(ThemeKind::Dark),
+                    font: window.text_style().font(),
+                    text_px: 15.,
+                    view: gpui::WeakEntity::new_invalid(),
+                    row: self.row,
+                    window,
+                    signature_swap: None,
+                };
+                styled_body(
+                    &editor,
+                    Path::new(""),
+                    &[],
+                    None,
+                    Links::Label,
+                    &paint,
+                    &|_| Vec::new(),
+                )
+                .debug_selector(|| "signed-body".to_owned())
+            }
+        }
+
+        let mut app = gpui::TestAppContext::single();
+        let (view, cx) = app.add_window_view(|_, _| SignedBody {
+            blank_lines: 0,
+            row: 0,
+            caret_hidden: true,
+        });
+        let footer = cx.debug_bounds("signed-body").unwrap().size.height;
+        for blank_lines in [1, 3] {
+            for row in 0..=blank_lines {
+                for caret_hidden in [false, true] {
+                    view.update(cx, |view, cx| {
+                        *view = SignedBody {
+                            blank_lines,
+                            row,
+                            caret_hidden,
+                        };
+                        cx.notify();
+                    });
+                    cx.run_until_parked();
+                    assert_eq!(
+                        cx.debug_bounds("signed-body").unwrap().size.height - footer,
+                        gpui::px(24. * blank_lines as f32),
+                        "caret row {row}, hidden {caret_hidden}",
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -8506,6 +8621,77 @@ mod tests {
         for wide in [false, true] {
             assert!(super::status_right(&snap, "insert", false, wide).is_empty());
         }
+    }
+
+    #[test]
+    fn an_unreadable_account_keeps_the_drafts_saved_identity_addresses() {
+        use super::*;
+        use fell_core::{
+            Account, BackendKind, Store,
+            compose::{DraftFields, DraftSession},
+        };
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        let Some(root) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let account = AccountId("mail".into());
+        let db = root.join("mail.db");
+        let store = Store::open(&db).unwrap();
+        store
+            .upsert_account(&Account {
+                id: account.clone(),
+                email: "primary@example.com".into(),
+                display_name: String::new(),
+                backend_kind: BackendKind::Bridge,
+            })
+            .unwrap();
+        let fields = DraftFields {
+            from: "Studio <alias@example.com>".into(),
+            to: vec!["recipient@example.com".into()],
+            ..DraftFields::default()
+        };
+        let folder = DraftSession::start_in(
+            &root.join("drafts"),
+            "config-edit",
+            account.clone(),
+            fields,
+            "Letter\n",
+            &db,
+        )
+        .unwrap();
+        let mut session = DraftSession::open_folder(&folder, account.clone()).unwrap();
+        let mut feedback = SendFeedbackState::default();
+        let config = root.join("config/fell/account.toml");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let valid = "id = 'mail'\nemail = 'primary@example.com'\npassword = 'test'\n[[identities]]\naddress = 'alias@example.com'\nname = 'Studio'\n";
+        fs::write(&config, valid).unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+        let read = || crate::mailbox::send_account_config(&account);
+        assert!(feedback.update_account_config(&mut session, 0, read()));
+        assert_eq!(session.identities().len(), 2);
+
+        fs::write(&config, "email = '").unwrap();
+        assert!(feedback.update_account_config(&mut session, 0, read()));
+        assert!(matches!(
+            feedback.feedback(None, None),
+            Some(SendFeedback::Unavailable {
+                attempted: false,
+                ..
+            })
+        ));
+        assert_eq!(session.identities().len(), 2);
+        session.set_body_from_user("Still writing\n".into());
+        session.flush().unwrap();
+
+        let mut reopened = DraftSession::open_folder(&folder, account.clone()).unwrap();
+        reopened.mark_seen();
+        assert_eq!(reopened.snapshot().send_block, None);
+        assert_eq!(reopened.identities().len(), 2);
+
+        fs::write(&config, valid).unwrap();
+        assert!(feedback.update_account_config(&mut session, 0, read()));
+        assert!(feedback.readiness.is_none());
     }
 
     #[test]

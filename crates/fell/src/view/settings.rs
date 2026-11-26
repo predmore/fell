@@ -1226,10 +1226,7 @@ pub(super) fn card(
                             .child(row_label(
                                 theme,
                                 crate::present::display_safe(label),
-                                Some(
-                                    secondary
-                                        .map_or_else(String::new, crate::present::display_safe),
-                                ),
+                                secondary.map(crate::present::display_safe),
                                 false,
                             ))
                             .when(index == 0, |row| {

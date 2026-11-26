@@ -12,13 +12,16 @@ use crate::{keymap, motion, present, theme};
 pub(super) const KEPT_SIGNATURE: &str = "Kept your edited signature";
 pub(super) const SIGNATURE_SEPARATOR: &str = "-- ";
 pub(super) const NOTICE_HOLD: Duration = Duration::from_millis(2500);
+const NAME_WEIGHT: FontWeight = FontWeight(550.);
+const FROM_GAP: f32 = 8.;
+const FOOTER_FADE_FRACTION: f32 = 0.6;
 
 #[derive(Default)]
 pub(super) struct Display {
     current: Sender,
     managed: Option<String>,
     fade: Option<SenderFade>,
-    progress: f32,
+    linear_progress: f32,
     kept_since: Option<Instant>,
 }
 
@@ -30,9 +33,16 @@ struct Sender {
 }
 
 struct SenderFade {
-    from: Sender,
+    from: Option<Sender>,
     footer: Option<String>,
     transition: motion::Transition,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct FooterFade<'a> {
+    pub text: &'a str,
+    pub progress: f32,
+    pub outgoing: f32,
 }
 
 impl Display {
@@ -40,7 +50,7 @@ impl Display {
         &mut self,
         from: &str,
         default: bool,
-        managed: Option<String>,
+        managed: Option<&str>,
         body: &str,
         motion: motion::Motion,
         window: &mut Window,
@@ -53,20 +63,25 @@ impl Display {
         let changed_address = !self.current.address.is_empty()
             && !self.current.address.eq_ignore_ascii_case(&address);
         let changed = self.current.address != address || self.current.name != name;
-        if changed {
-            let previous = std::mem::replace(
+        let managed_changed = managed != self.managed.as_deref();
+        let footer_changed = managed.is_some() && managed_changed;
+        let had_sender = !self.current.address.is_empty();
+        let previous = changed.then(|| {
+            std::mem::replace(
                 &mut self.current,
                 Sender {
                     name,
                     address,
                     other_than_default: !default,
                 },
-            );
+            )
+        });
+        if changed || footer_changed {
             self.fade = motion
                 .start(motion::FADE, now)
-                .filter(|_| !previous.address.is_empty())
+                .filter(|_| had_sender)
                 .map(|transition| {
-                    let footer = if managed.is_some() && managed != self.managed {
+                    let footer = if footer_changed {
                         self.managed.take()
                     } else {
                         None
@@ -79,14 +94,16 @@ impl Display {
                 });
         }
         self.current.other_than_default = !default;
-        self.managed = managed;
+        if managed_changed {
+            self.managed = managed.map(str::to_owned);
+        }
         self.fade = self
             .fade
             .take()
             .filter(|fade| motion.enabled() && fade.transition.running(now));
-        self.progress = self.fade.as_ref().map_or(1., |fade| {
+        self.linear_progress = self.fade.as_ref().map_or(1., |fade| {
             window.request_animation_frame();
-            fade.transition.progress(now)
+            fade.transition.linear(now)
         });
 
         let kept = changed_address
@@ -100,7 +117,7 @@ impl Display {
 
     pub(super) fn settle(&mut self) {
         self.fade = None;
-        self.progress = 1.;
+        self.linear_progress = 1.;
     }
 
     pub(super) fn kept_opacity(
@@ -126,30 +143,95 @@ impl Display {
         None
     }
 
-    pub(super) fn footer(&self) -> Option<(&str, f32)> {
-        self.fade
-            .as_ref()?
-            .footer
-            .as_deref()
-            .map(|footer| (footer, self.progress))
+    pub(super) fn footer(&self) -> Option<FooterFade<'_>> {
+        Some(FooterFade {
+            text: self.fade.as_ref()?.footer.as_deref()?,
+            progress: motion::ease_out(self.linear_progress),
+            outgoing: motion::fade_out(self.linear_progress / FOOTER_FADE_FRACTION),
+        })
     }
 
-    pub(super) fn label(&self, theme: &theme::Theme) -> gpui::Div {
+    pub(super) fn label(
+        &self,
+        theme: &theme::Theme,
+        window: &Window,
+        width: gpui::Pixels,
+        font_px: f32,
+        family: &str,
+        can_pick: bool,
+    ) -> gpui::Div {
+        let mut style = window.text_style();
+        style.font_family = family.to_owned().into();
+        let measure = |text: &str, weight: FontWeight| {
+            let mut run = style.to_run(text.len());
+            run.font.weight = weight;
+            f32::from(
+                window
+                    .text_system()
+                    .shape_line(text.to_owned().into(), px(font_px), &[run], None)
+                    .width,
+            )
+        };
+        let regular = FontWeight(400.);
+        let chevron = if can_pick {
+            measure("⌄", regular) + FROM_GAP
+        } else {
+            0.
+        };
+        let available = (f32::from(width) - measure("From", regular) - FROM_GAP - chevron).max(0.);
+        let sender_width = |sender: &Sender| {
+            let name = sender.name.as_ref().map_or(0., |name| {
+                measure(name, NAME_WEIGHT).min(available * 0.45) + FROM_GAP
+            });
+            (name + measure(&sender.address, regular)).min(available)
+        };
+        let previous = self.fade.as_ref().and_then(|fade| fade.from.as_ref());
+        let progress = previous.map_or(1., |_| motion::ease_out(self.linear_progress));
+        let current_width = sender_width(&self.current);
+        let from_width = previous.map_or(current_width, sender_width);
+        let shown_width = motion::lerp(from_width, current_width, progress);
         div()
-            .relative()
-            .flex_1()
+            .flex()
+            .justify_end()
+            .items_center()
+            .gap(px(FROM_GAP))
             .min_w_0()
-            .child(sender_label(&self.current, theme).opacity(self.progress))
-            .children(self.fade.as_ref().map(|fade| {
-                sender_label(&fade.from, theme)
-                    .absolute()
-                    .inset_0()
-                    .opacity(1. - self.progress)
-            }))
+            .w_full()
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(rgb(theme.dimmed))
+                    .child("From"),
+            )
+            .child(
+                div()
+                    .relative()
+                    .flex_none()
+                    .w(px(shown_width.ceil() + 1.))
+                    .flex()
+                    .justify_end()
+                    .overflow_hidden()
+                    .child(
+                        sender_label(&self.current, theme, available)
+                            .flex_none()
+                            .w(px(current_width.ceil() + 1.))
+                            .opacity(progress),
+                    )
+                    .children(previous.map(|from| {
+                        sender_label(from, theme, available)
+                            .absolute()
+                            .right_0()
+                            .top_0()
+                            .w(px(from_width.ceil() + 1.))
+                            .opacity(1. - progress)
+                    })),
+            )
+            // The right edge anchors the chevron through both measurements.
+            .when(can_pick, |label| label.child(div().flex_none().child("⌄")))
     }
 }
 
-fn sender_label(sender: &Sender, theme: &theme::Theme) -> gpui::Div {
+fn sender_label(sender: &Sender, theme: &theme::Theme, available: f32) -> gpui::Div {
     let dim = theme.dimmed;
     let name_color = if sender.other_than_default {
         theme.foreground
@@ -161,13 +243,13 @@ fn sender_label(sender: &Sender, theme: &theme::Theme) -> gpui::Div {
         .items_baseline()
         .justify_end()
         .min_w_0()
-        .gap(px(8.))
-        .child(div().flex_none().text_color(rgb(dim)).child("From"))
+        .max_w(px(available))
+        .gap(px(FROM_GAP))
         .children(sender.name.as_ref().map(|name| {
             div()
-                .max_w(gpui::relative(0.45))
+                .max_w(px(available * 0.45))
                 .truncate()
-                .font_weight(FontWeight::MEDIUM)
+                .font_weight(NAME_WEIGHT)
                 .text_color(rgb(name_color))
                 .child(name.clone())
         }))
@@ -283,9 +365,9 @@ impl ComposeView {
         }
     }
 
-    fn pick_identity(&mut self, identity: &Identity, cx: &mut Context<Self>) {
+    fn pick_identity(&mut self, address: &str, cx: &mut Context<Self>) {
         let result = self.hub.with_session(self.draft_id.as_ref(), |session| {
-            let changed = session.set_from_user(identity)?;
+            let changed = session.set_from_user(address)?;
             if changed {
                 session.arm_outbound(super::now_ms());
             }
@@ -312,12 +394,12 @@ impl ComposeView {
         match key {
             "escape" => self.close_identity_picker(),
             "enter" => {
-                if let Some(identity) = picker
+                if let Some(address) = picker
                     .matches()
                     .get(picker.selected)
-                    .map(|item| (*item).clone())
+                    .map(|item| item.address.clone())
                 {
-                    self.pick_identity(&identity, cx);
+                    self.pick_identity(&address, cx);
                 }
             }
             "up" | "down" => {
@@ -433,7 +515,7 @@ impl ComposeView {
                             });
                             let name = present::display_safe(&identity.name);
                             let address = present::display_safe(&identity.address);
-                            let option = identity.clone();
+                            let option = identity.address.clone();
                             div()
                                 .id(gpui::ElementId::named_usize("compose-identity", index))
                                 .h(px(42.))
@@ -464,7 +546,7 @@ impl ComposeView {
                                                 div()
                                                     .max_w(gpui::relative(0.45))
                                                     .truncate()
-                                                    .font_weight(FontWeight(550.))
+                                                    .font_weight(NAME_WEIGHT)
                                                     .child(name),
                                             )
                                         })
@@ -487,7 +569,7 @@ impl ComposeView {
                                         div()
                                             .flex_none()
                                             .text_size(px(12.))
-                                            .text_color(rgb(theme.dimmed))
+                                            .text_color(rgb(received_color(theme, selected)))
                                             .child("received here"),
                                     )
                                 })
@@ -518,5 +600,26 @@ impl ComposeView {
                 })
                 .child(card),
         )
+    }
+}
+
+fn received_color(theme: &theme::Theme, selected: bool) -> u32 {
+    if selected {
+        theme.on_selection
+    } else {
+        theme.dimmed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn received_here_stays_legible_on_the_selected_row() {
+        for theme in theme::every_test_theme() {
+            let ratio = theme::contrast(received_color(&theme, true), theme.selection);
+            assert!(ratio >= 4.5, "{}: {ratio:.2}", theme.name);
+        }
     }
 }

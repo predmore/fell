@@ -525,7 +525,7 @@ impl DraftSession {
         session.check_signature();
         if let Some(identity) = verified {
             if email_of(&previous_from) != email_of(&session.fields.from) {
-                session.swap_signature(&identity);
+                session.swap_signature(signature_block(&identity));
             }
             session.fields.from = identity.from_header();
         } else if session.fields.from != previous_from {
@@ -859,27 +859,36 @@ impl DraftSession {
     }
 
     fn identity(&self, from: &str) -> Option<&Identity> {
-        let email = email_of(from)?;
-        self.identities
-            .iter()
-            .find(|identity| identity.address.eq_ignore_ascii_case(&email))
+        self.identity_at_address(&email_of(from)?)
     }
 
-    pub fn set_from_user(&mut self, identity: &Identity) -> Result<bool, String> {
+    fn identity_at_address(&self, address: &str) -> Option<&Identity> {
+        self.identities
+            .iter()
+            .find(|identity| identity.address.eq_ignore_ascii_case(address))
+    }
+
+    pub fn set_from_user(&mut self, address: &str) -> Result<bool, String> {
         self.ensure_editable()?;
+        let identity = self
+            .identity_at_address(address)
+            .ok_or("from is not one of your addresses")?;
         let from = identity.from_header();
-        if from == self.fields.from {
+        let signature = self
+            .managed_signature
+            .as_ref()
+            .map(|_| signature_block(identity));
+        if from == self.fields.from && signature == self.managed_signature {
             return Ok(false);
-        }
-        if self.identity(&from) != Some(identity) {
-            return Err("from is not one of your addresses".into());
         }
         self.end_user_change();
         self.begin_user_change();
         self.end_user_change();
         let before = self.hunk_base();
         self.fields.from = from;
-        self.swap_signature(identity);
+        if let Some(signature) = signature {
+            self.swap_signature(signature);
+        }
         self.bump();
         self.follow_user_change(before);
         self.refresh_issues();
@@ -895,11 +904,10 @@ impl DraftSession {
         }
     }
 
-    fn swap_signature(&mut self, identity: &Identity) {
+    fn swap_signature(&mut self, next: String) {
         let Some(block) = &self.managed_signature else {
             return;
         };
-        let next = signature_block(identity);
         if *block == next {
             return;
         }
@@ -1834,7 +1842,7 @@ impl DraftSession {
         self.body = parsed.body;
         self.check_signature();
         if let Some(identity) = identity.filter(|_| changed_address) {
-            self.swap_signature(&identity);
+            self.swap_signature(signature_block(&identity));
         }
         self.issues = parsed.issues;
         self.bump();
@@ -2071,14 +2079,14 @@ mod tests {
         let (root, mut session) = temp_session(&body);
         session.set_identities(vec![first.clone(), second.clone(), unsigned.clone()]);
         session.managed_signature = Some(first_signature.clone());
-        session.set_from_user(&second).unwrap();
+        session.set_from_user(&second.address).unwrap();
         assert_eq!(session.fields().from, "Studio <alias@example.com>");
         assert_eq!(session.body(), "Letter\n\n-- \n**Studio**\nSupport\n");
         assert!(session.undo());
         assert_eq!(session.body(), body);
-        session.set_from_user(&unsigned).unwrap();
+        session.set_from_user(&unsigned.address).unwrap();
         assert_eq!(session.body(), "Letter\n\n");
-        session.set_from_user(&first).unwrap();
+        session.set_from_user(&first.address).unwrap();
         assert!(session.body().ends_with(&first_signature));
 
         let db = root.join("mail.db");
@@ -2097,15 +2105,43 @@ mod tests {
         session.flush().unwrap();
         let mut reopened = DraftSession::open_with_store(&folder, account.clone(), &store).unwrap();
         reopened.set_identities(vec![first.clone(), second.clone()]);
-        reopened.set_from_user(&second).unwrap();
+        reopened.set_from_user(&second.address).unwrap();
         assert!(reopened.body().ends_with(&signature_block(&second)));
 
         reopened.set_body_from_user(reopened.body().replace("Support", "My edit"));
         reopened.flush().unwrap();
         let mut reopened = DraftSession::open_with_store(&folder, account, &store).unwrap();
         reopened.set_identities(vec![first.clone(), second]);
-        reopened.set_from_user(&first).unwrap();
+        reopened.set_from_user(&first.address).unwrap();
         assert!(reopened.body().ends_with("-- \n**Studio**\nMy edit\n"));
+    }
+
+    #[test]
+    fn picking_an_address_uses_its_latest_name_and_signature() {
+        if crate::test_support::in_isolated_process().is_none() {
+            return;
+        }
+        let (_, mut session) = temp_session("Letter\n\n");
+        session.managed_signature = Some(String::new());
+        let mut alias = address_only("alias@example.com".into());
+        session.set_identities(vec![alias.clone()]);
+        let picked = session.identities()[0].address.to_uppercase();
+
+        alias.name = "Studio".into();
+        alias.signature = Some("Studio team".into());
+        session.set_identities(vec![alias.clone()]);
+        assert!(session.set_from_user(&picked).unwrap());
+        assert_eq!(session.fields().from, "Studio <alias@example.com>");
+        assert_eq!(session.body(), "Letter\n\n-- \nStudio team\n");
+
+        alias.signature = Some("New studio footer".into());
+        session.set_identities(vec![alias]);
+        assert!(session.set_from_user(&picked).unwrap());
+        assert_eq!(session.body(), "Letter\n\n-- \nNew studio footer\n");
+        assert!(!session.set_from_user(&picked).unwrap());
+
+        session.set_identities(vec![address_only("jon@example.com".into())]);
+        assert!(session.set_from_user(&picked).is_err());
     }
 
     #[test]
