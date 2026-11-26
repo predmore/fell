@@ -893,8 +893,8 @@ struct Inbox {
     /// Bumped by every conversation read. The store thread skips a read that
     /// is already stale, so holding `j` does not build a backlog.
     conv_gen: Arc<AtomicU64>,
-    /// Where `c` keeps a new draft. `None` when the mailbox did not open.
-    draft_home: Option<DraftHome>,
+    /// Where `c` keeps a new draft, or why the workspace is unavailable.
+    draft_home: Result<DraftHome, String>,
     reviews: Option<gpui::Task<()>>,
     opening_draft: Option<OpeningServerDraft>,
     /// The compose drafts at the top of the Drafts list, as last read.
@@ -938,6 +938,8 @@ struct Warm {
 /// milliseconds.
 const WARM_ROWS: usize = 2;
 
+const DRAFT_MAILBOX_UNAVAILABLE: &str = "The mailbox did not open, so a draft has nowhere to go";
+
 impl Inbox {
     fn account_setup_handoff(&mut self, setup: gpui::Entity<Onboarding>) {
         self.first_preview = FirstPreview::Handoff;
@@ -969,7 +971,11 @@ impl Inbox {
         let values = settings.values;
         let theme = theme::load_with(values);
         let path = startup.path.clone();
-        let draft_home = startup.path.clone().ok().map(DraftHome::real);
+        let draft_home = startup
+            .path
+            .clone()
+            .map_err(|_| DRAFT_MAILBOX_UNAVAILABLE.into())
+            .and_then(|path| DraftHome::real(path).map_err(|err| err.to_string()));
         let (notices, store_restarts) = futures::channel::mpsc::unbounded();
         let (store, ready) = StoreClient::spawn(
             {
@@ -1281,7 +1287,7 @@ impl Inbox {
         let store_failed = opened.sync == SyncKind::StoreError;
         if store_failed {
             // The window reads a stand-in; a draft kept there would be lost.
-            self.draft_home = None;
+            self.draft_home = Err(DRAFT_MAILBOX_UNAVAILABLE.into());
         }
         self.session.sync = opened.sync;
         self.first_preview.sync_changed(&self.session.sync);
@@ -4153,12 +4159,12 @@ impl Inbox {
             self.watch_held_draft(&hub, id, cx);
             return;
         }
-        let Some(home) = self.draft_home.clone() else {
-            self.session.show_toast(
-                "The mailbox did not open, so a draft has nowhere to go",
-                true,
-            );
-            return;
+        let home = match self.draft_home.clone() {
+            Ok(home) => home,
+            Err(err) => {
+                self.session.show_toast(err, true);
+                return;
+            }
         };
         let remote_open = remote.is_some();
         if let Some((thread, _)) = &remote {
@@ -4327,12 +4333,12 @@ impl Inbox {
                 .show_toast("Compose is not available here", true);
             return;
         };
-        let Some(home) = self.draft_home.clone() else {
-            self.session.show_toast(
-                "The mailbox did not open, so a draft has nowhere to go",
-                true,
-            );
-            return;
+        let home = match self.draft_home.clone() {
+            Ok(home) => home,
+            Err(err) => {
+                self.session.show_toast(err, true);
+                return;
+            }
         };
         if let Some(note) = &suggestion {
             self.note_in_flight = Some(note.id);

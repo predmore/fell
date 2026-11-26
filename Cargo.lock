@@ -2045,6 +2045,7 @@ dependencies = [
  "prost",
  "rcgen",
  "rusqlite",
+ "rustix 1.1.6",
  "rustls",
  "rustls-native-certs",
  "saphyr",

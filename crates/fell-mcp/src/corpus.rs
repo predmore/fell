@@ -330,7 +330,7 @@ fn agent_draft_from_hostile_mail_marks_new_recipients() {
 
     // The inbox serves the draft socket like this; see `draft_host.rs`.
     let hub = std::sync::Arc::new(DraftHub::new());
-    let listener = DraftHub::bind(&fell_core::compose::draft_socket_path()).unwrap();
+    let listener = DraftHub::bind(&fell_core::compose::draft_socket_path().unwrap()).unwrap();
     let serving = std::sync::Arc::clone(&hub);
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {

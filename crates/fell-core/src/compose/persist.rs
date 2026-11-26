@@ -1252,7 +1252,7 @@ pub(crate) fn drafts_for_removal(
         };
         drafts = read().map_err(|err| err.to_string())?;
     }
-    let root = workspace::draft_root();
+    let root = workspace::draft_root().map_err(|err| err.to_string())?;
     for dir in [
         root.as_path(),
         compose_index_file("draft")
@@ -1278,7 +1278,7 @@ pub(crate) fn drafts_for_removal(
             }
             let folder = root.join(id);
             if workspace::read_account(&folder).as_deref() == Some(account.as_str())
-                || draft_store_matches(id, mailbox)
+                || draft_store_matches(id, mailbox, &folder)
             {
                 drafts.push(id.to_owned());
             }
@@ -1287,11 +1287,10 @@ pub(crate) fn drafts_for_removal(
     Ok(drafts)
 }
 
-fn draft_store_matches(id: &str, mailbox: &Path) -> bool {
-    let folder = workspace::draft_root().join(id);
+fn draft_store_matches(id: &str, mailbox: &Path, folder: &Path) -> bool {
     [
         compose_index_file(id),
-        Some(workspace::control_dir(&folder).join("store")),
+        Some(workspace::control_dir(folder).join("store")),
     ]
     .into_iter()
     .flatten()

@@ -9,7 +9,9 @@ use fell_core::compose::AccountDraftRemoval;
 use futures::{FutureExt as _, StreamExt as _, channel::oneshot, future::Shared};
 use gpui::{App, Context, Entity, IntoElement, Render, Window, div, prelude::*, rgb};
 
-use super::{ExternalCompose, FontOpt, Inbox, InboxWindow, Onboarding, mailbox};
+use super::{
+    DRAFT_MAILBOX_UNAVAILABLE, ExternalCompose, FontOpt, Inbox, InboxWindow, Onboarding, mailbox,
+};
 use crate::inbox_motion::Layer;
 use crate::model::settings::AccountRemovalKind;
 use crate::model::{Overlay, PickerChoice, SyncKind};
@@ -210,20 +212,21 @@ impl AccountWindow {
                         break target;
                     }
                 };
-                let result = if let Some((home, account, from)) = target {
-                    let hub = hub.clone();
-                    let (fields, body) = request.input.into_fields_and_body(from);
-                    let start = fell_core::compose::ReplyStart {
-                        fields,
-                        parts: Default::default(),
-                    };
-                    cx.background_executor()
-                        .spawn(async move {
-                            home.new_seeded(&hub, &account, start, body, request.files)
-                        })
-                        .await
-                } else {
-                    Err("The mailbox did not open, so a draft has nowhere to go".into())
+                let result = match target {
+                    Ok((home, account, from)) => {
+                        let hub = hub.clone();
+                        let (fields, body) = request.input.into_fields_and_body(from);
+                        let start = fell_core::compose::ReplyStart {
+                            fields,
+                            parts: Default::default(),
+                        };
+                        cx.background_executor()
+                            .spawn(async move {
+                                home.new_seeded(&hub, &account, start, body, request.files)
+                            })
+                            .await
+                    }
+                    Err(err) => Err(err),
                 };
                 match result {
                     Ok(id) => {
@@ -494,7 +497,7 @@ impl AccountWindow {
                     queue.set_viewing(false);
                 }
                 parts = Some(inbox.attachment_fetcher.clone());
-                inbox.draft_home = None;
+                inbox.draft_home = Err(DRAFT_MAILBOX_UNAVAILABLE.into());
                 inbox.reader_bodies.active = None;
                 workers.extend(
                     inbox

@@ -9,6 +9,8 @@ use fell::{ComposeView, ThemeKind, open_demo};
 use fell_core::{diagnostic, diagnostics};
 use std::ffi::OsString;
 use std::io::{self, Write as _};
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::time::Instant;
 
 use gpui::{
@@ -269,6 +271,13 @@ fn mcp(args: &[OsString]) -> ! {
     std::process::exit(2);
 }
 
+fn compose_preview_dir(parent: &Path) -> io::Result<tempfile::TempDir> {
+    tempfile::Builder::new()
+        .prefix("fell-compose-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir_in(parent)
+}
+
 fn compose_preview(preview: ComposePreview) {
     let ComposePreview {
         light,
@@ -281,9 +290,10 @@ fn compose_preview(preview: ComposePreview) {
     } else {
         ThemeKind::Dark
     };
-    let root = std::env::temp_dir().join(format!("fell-compose-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    let (hub, draft_id, folder) = open_demo(root, theme).expect("open demo draft");
+    let root =
+        compose_preview_dir(&std::env::temp_dir()).expect("create compose preview directory");
+    let (hub, draft_id, folder) =
+        open_demo(root.path().to_path_buf(), theme).expect("open demo draft");
     fell::draft_host::serve_socket(hub.clone());
     let _watcher =
         fell::draft_host::watch_folder(hub.clone(), Some((draft_id.clone(), folder.clone())));
@@ -363,6 +373,22 @@ fn preview(fixture: String, light: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compose_preview_directory_is_cleaned_up_on_exit() {
+        let Some(parent) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let path = {
+            let root = compose_preview_dir(&parent).unwrap();
+            let path = root.path().to_path_buf();
+            let (_hub, _, folder) = open_demo(path.clone(), ThemeKind::Dark).unwrap();
+            assert!(folder.join("draft.md").is_file());
+            assert!(path.join("mail.db").is_file());
+            path
+        };
+        assert!(!path.exists());
+    }
 
     fn parse(list: &[&str]) -> Result<Command, String> {
         parse_args(&list.iter().map(OsString::from).collect::<Vec<_>>())

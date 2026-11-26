@@ -543,8 +543,7 @@ pub(crate) const O_NOFOLLOW: i32 = libc::O_NOFOLLOW;
 const O_NONBLOCK: i32 = libc::O_NONBLOCK;
 const O_NOCTTY: i32 = libc::O_NOCTTY;
 
-/// This process's user id, read from `/proc/self` as `compose::workspace`
-/// does (the crate forbids the `unsafe` a `geteuid` call needs).
+/// This process's user id, read from `/proc/self` without unsafe code.
 pub(crate) fn user_id() -> u32 {
     fs::metadata("/proc/self")
         .map(|meta| meta.uid())
