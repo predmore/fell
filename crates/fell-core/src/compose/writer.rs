@@ -93,7 +93,7 @@ fn persist_mailbox_with_server(
     let Some(path) = path.filter(|path| path.is_file()) else {
         return Ok(SaveReceipt::Local);
     };
-    let store = crate::Store::open(&path).map_err(|err| err.to_string())?;
+    let store = crate::Store::open_existing(&path).map_err(|err| err.to_string())?;
     let draft = mailbox.draft;
     let review = Some(&mailbox.review);
     let stamp = super::session::attachment_stamp(folder, &draft.fields, &draft.body);

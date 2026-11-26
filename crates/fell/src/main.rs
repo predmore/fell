@@ -20,7 +20,7 @@ Usage:
   fell                         set up a mail account or open the inbox
   fell --demo                  open a sample inbox if no account is configured
   fell --trace                 record inbox startup and frame timing
-  fell account setup|show|check
+  fell account setup|list|remove|show|check
                                connect and test a mail account
   fell embeddings status|install|remove
                                the local search model

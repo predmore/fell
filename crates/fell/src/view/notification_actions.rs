@@ -25,7 +25,8 @@ impl Inbox {
         let Some(queue) = &self.notifications else {
             return;
         };
-        let viewing = window.is_window_active()
+        let viewing = self.window_active
+            && window.is_window_active()
             && self.session.search.is_none()
             && self.session.label_scope.is_none()
             && self.session.list_label.is_none()
@@ -79,6 +80,14 @@ impl Inbox {
         cx.spawn(async move |this, cx| {
             while let Some(invoked) = invoked.next().await {
                 let result = window.update(cx, |_, window, cx| {
+                    if matches!(
+                        invoked.action,
+                        notifications::Action::Open | notifications::Action::OpenInbox
+                    ) && let Some(inbox) = this.upgrade()
+                    {
+                        let id = inbox.read(cx).account_id.clone();
+                        super::accounts::switch(id.as_str(), false, window, cx);
+                    }
                     this.update(cx, |inbox, cx| {
                         inbox.notification_action(invoked, window, cx)
                     })

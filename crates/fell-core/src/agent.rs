@@ -188,6 +188,18 @@ impl WriteScope {
 }
 
 impl crate::Store {
+    pub(crate) fn disable_account_grants(&self, account: &AccountId) -> Result<()> {
+        let tx = crate::store::immediate_transaction(&self.conn)?;
+        tx.execute(
+            "UPDATE agent_grants
+             SET enabled = 0, can_read = 0, can_triage = 0, can_draft = 0, can_annotate = 0
+             WHERE account_id = ?1",
+            [account.as_str()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn set_agent_grant(
         &self,
         account_id: &AccountId,
@@ -3906,7 +3918,7 @@ mod tests {
     #[test]
     fn list_agent_grants_reports_scopes_and_the_last_action_per_agent() {
         let (store, acct, thread) = seeded();
-        store.upsert_account(&account("a2")).unwrap();
+        store.testing_seed_legacy_account(&account("a2")).unwrap();
         assert!(store.list_agent_grants().unwrap().is_empty());
         store
             .set_agent_grant(&acct, "bot", AgentGrant::enabled(true, true, true))
@@ -4375,7 +4387,7 @@ mod tests {
     fn labels_stay_inside_the_account() {
         let (store, account_id, thread_id) = seeded();
         let other = account("a2");
-        store.upsert_account(&other).unwrap();
+        store.testing_seed_legacy_account(&other).unwrap();
         store
             .upsert_message(&message(
                 "a2",

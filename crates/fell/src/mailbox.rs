@@ -6,6 +6,8 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
+pub(crate) use fell_core::accounts::FileError as AccountConfigError;
+use fell_core::accounts::{self, Registry};
 use fell_core::{Account, AccountConfig, AccountId, Store};
 
 use crate::fixtures::{fixture_account, seed_if_empty};
@@ -30,20 +32,45 @@ pub struct Opened {
     pub account: Account,
     pub sync: SyncKind,
     pub error: Option<String>,
-    pub warning: Option<String>,
 }
 
 pub fn startup() -> Startup {
+    let registry = Registry::resolve();
+    let base = store_path();
+    let accounts = registry.as_ref().ok().map(|registry| match &base {
+        Ok(base) => registry.load_with_removals(base),
+        Err(_) => registry.load(),
+    });
+    let config = accounts
+        .as_ref()
+        .and_then(|accounts| accounts.default_config())
+        .cloned();
+    let account_missing = accounts.as_ref().is_some_and(accounts::Accounts::is_empty);
+    let config_error = registry.as_ref().err().map(ToString::to_string);
+    let path = base.and_then(|base| match (&registry, &config) {
+        (Ok(registry), Some(config)) => registry
+            .store_path(&base, &config.id)
+            .map_err(|err| err.cli_message()),
+        _ if accounts
+            .as_ref()
+            .is_some_and(|accounts| !accounts.is_empty()) =>
+        {
+            Err("No readable account configuration".into())
+        }
+        _ => Ok(base),
+    });
+    startup_for(config, account_missing, config_error, path)
+}
+
+pub fn startup_for(
+    config: Option<AccountConfig>,
+    account_missing: bool,
+    config_error: Option<String>,
+    path: Result<PathBuf, String>,
+) -> Startup {
     let (keymap, keymap_error) = load_keymap();
     let split = load_split();
     let read_dwell_ms = load_read_dwell();
-    let (config, account_missing, config_error) = match load_account_config() {
-        Ok(config) => {
-            let missing = config.is_none();
-            (config, missing, None)
-        }
-        Err(err) => (None, false, Some(err)),
-    };
     Startup {
         keymap,
         split,
@@ -51,7 +78,45 @@ pub fn startup() -> Startup {
         error: join_errors([keymap_error, config_error]),
         account_missing,
         config,
-        path: store_path(),
+        path,
+    }
+}
+
+pub fn open_registered_store(
+    path: Result<PathBuf, String>,
+    config: Option<&AccountConfig>,
+    demo: bool,
+) -> (Store, Opened) {
+    let locked = (|| {
+        let Some(config) = config else {
+            return Ok(None);
+        };
+        let registry = Registry::resolve().map_err(|err| err.to_string())?;
+        let base = store_path()?;
+        let lock = registry
+            .lock_for_mailbox_open(&base, &config.id)
+            .map_err(|err| err.cli_message())?;
+        let account = AccountId(config.id.clone());
+        if registry
+            .get(&account)
+            .map_err(|err| err.to_string())?
+            .as_ref()
+            .is_none_or(|current| !config.same_except_identities(current))
+        {
+            return Err("The account file changed while opening the mailbox.".into());
+        }
+        let current = registry
+            .configured_store_path(&base, config)
+            .map_err(|err| err.cli_message())?;
+        if path.as_ref().is_ok_and(|path| *path != current) {
+            return Err("The mailbox link changed while opening the account.".into());
+        }
+        Ok(Some((lock, current)))
+    })();
+    match locked {
+        Ok(Some((_lock, current))) => open_store(Ok(current), config, demo),
+        Ok(None) => open_store(path, config, demo),
+        Err(error) => fallback(error),
     }
 }
 
@@ -83,77 +148,91 @@ fn join_errors<const N: usize>(errors: [Option<String>; N]) -> Option<String> {
     }
 }
 
-pub fn account_config_path() -> Option<PathBuf> {
-    config_dir().map(|dir| dir.join("account.toml"))
+pub(crate) fn next_account_id() -> Result<String, String> {
+    let registry = Registry::resolve().map_err(|err| err.to_string())?;
+    registry.migrate().map_err(|err| err.to_string())?;
+    let base = store_path()?;
+    next_account_id_at(&registry, &base)
 }
 
-/// `Ok(None)` when there is no account file. An unreadable, malformed, or
-/// group/world-readable file is an error so the window can say so.
-fn load_account_config() -> Result<Option<AccountConfig>, String> {
-    let Some(path) = account_config_path() else {
-        return Ok(None);
-    };
-    read_account_config(&path).map_err(|err| err.to_string())
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AccountConfigError {
-    pub(crate) detail: String,
-    pub(crate) recovery: &'static str,
-}
-
-impl AccountConfigError {
-    fn new(detail: impl Into<String>, recovery: &'static str) -> Self {
-        Self {
-            detail: detail.into(),
-            recovery,
+fn next_account_id_at(registry: &Registry, base: &Path) -> Result<String, String> {
+    for number in 1.. {
+        let id = if number == 1 {
+            "mail".into()
+        } else {
+            format!("mail-{number}")
+        };
+        if account_id_available(registry, base, &id)? {
+            return Ok(id);
         }
     }
+    unreachable!()
 }
 
-impl std::fmt::Display for AccountConfigError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.detail)
+fn account_id_available(registry: &Registry, base: &Path, id: &str) -> Result<bool, String> {
+    let path = registry.path(id).map_err(|err| err.to_string())?;
+    if accounts::path_exists(&path).map_err(|err| err.to_string())? {
+        return Ok(false);
+    }
+    registry
+        .mailbox_reserved(base, id)
+        .map(|reserved| !reserved)
+        .map_err(|err| err.to_string())
+}
+
+pub(crate) fn retained_mailbox(email: &str) -> Option<String> {
+    let registry = Registry::resolve().ok()?;
+    let base = store_path().ok()?;
+    let original = accounts::mailbox_owner(&base)
+        .ok()
+        .flatten()
+        .map(|(id, _)| id);
+    let siblings = fs::read_dir(base.with_extension("accounts"))
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name();
+            Some(name.to_str()?.strip_suffix(".db")?.to_owned())
+        });
+    // Offer an unambiguous match only. The user can name a specific ID in
+    // the CLI when they have kept multiple mailboxes with the same address.
+    let mut candidates: Vec<_> = original
+        .into_iter()
+        .chain(siblings)
+        .filter(|id| can_reconnect_at(&registry, &base, id, email))
+        .collect();
+    candidates.sort();
+    candidates.dedup();
+    if candidates.len() == 1 {
+        candidates.pop()
+    } else {
+        None
     }
 }
 
+pub(crate) fn can_reconnect(id: &str, email: &str) -> bool {
+    Registry::resolve()
+        .ok()
+        .zip(store_path().ok())
+        .is_some_and(|(registry, base)| can_reconnect_at(&registry, &base, id, email))
+}
+
+fn can_reconnect_at(registry: &Registry, base: &Path, id: &str, email: &str) -> bool {
+    registry
+        .path(id)
+        .is_ok_and(|path| accounts::path_exists(&path).is_ok_and(|exists| !exists))
+        && registry.store_path(base, id).is_ok_and(|path| {
+            accounts::mailbox_owner(&path).is_ok_and(|owner| {
+                owner.is_some_and(|(stored_id, stored_email)| {
+                    stored_id == id && stored_email.eq_ignore_ascii_case(email)
+                })
+            })
+        })
+}
+
+#[cfg(test)]
 fn read_account_config(path: &Path) -> Result<Option<AccountConfig>, AccountConfigError> {
-    Ok(read_account_config_text(path)?.map(|(config, _)| config))
-}
-
-fn read_account_config_text(
-    path: &Path,
-) -> Result<Option<(AccountConfig, String)>, AccountConfigError> {
-    let shown = path.display();
-    let unreadable = |err: std::io::Error| {
-        AccountConfigError::new(
-            format!("{shown}: {err}"),
-            "Restore read access to account.toml.",
-        )
-    };
-    let meta = match fs::metadata(path) {
-        Ok(meta) => meta,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(unreadable(err)),
-    };
-    let mode = meta.permissions().mode();
-    if mode & 0o077 != 0 {
-        return Err(AccountConfigError::new(
-            format!(
-                "{shown} is open to other users (mode {:o}); run chmod 600 on it",
-                mode & 0o777
-            ),
-            "Set account.toml permissions to 600.",
-        ));
-    }
-    let text = fs::read_to_string(path).map_err(unreadable)?;
-    let config = AccountConfig::parse(&text).map_err(|err| {
-        AccountConfigError::new(
-            format!("{shown}: {err}"),
-            "Fix the settings in account.toml.",
-        )
-    })?;
-    Ok(Some((config, text)))
+    Ok(accounts::read(path, None)?.map(|(config, _)| config))
 }
 
 /// The account file a send from `account` takes its login and SMTP settings
@@ -165,52 +244,62 @@ pub(crate) fn send_account_config(
     if fell_core::is_demo_account(account) {
         return Ok(None);
     }
-    let path = account_config_path().ok_or_else(|| {
-        AccountConfigError::new("no config directory", "Set HOME or XDG_CONFIG_HOME.")
+    let registry = Registry::resolve()?;
+    let config = registry.get(account)?.ok_or_else(|| {
+        registry
+            .path(account.as_str())
+            .map_or_else(|err| err, |path| accounts::missing(&path))
     })?;
-    send_config_at(&path, account).map(Some)
+    if let Ok(base) = store_path() {
+        registry.configured_store_path(&base, &config)?;
+    }
+    Ok(Some(config))
 }
 
-pub(crate) fn send_config_at(
-    path: &Path,
-    account: &AccountId,
-) -> Result<AccountConfig, AccountConfigError> {
-    let config = read_account_config(path)?.ok_or_else(|| {
-        AccountConfigError::new(
-            format!("{} does not exist", path.display()),
-            "Run fell account setup.",
-        )
-    })?;
-    if config.id != account.as_str() {
-        return Err(AccountConfigError::new(
-            format!(
-                "{} has no entry for account {}",
-                path.display(),
-                account.as_str()
-            ),
-            "Restore this draft’s account ID in account.toml.",
-        ));
-    }
-    Ok(config)
+#[cfg(test)]
+fn send_config_at(path: &Path, account: &AccountId) -> Result<AccountConfig, AccountConfigError> {
+    accounts::read(path, Some(account.as_str()))?
+        .map(|(config, _)| config)
+        .ok_or_else(|| accounts::missing(path))
 }
 
-/// The account file for `fell account show|check`, with the same mode check
-/// the window applies. Nothing in a file other users can change is run.
-pub fn load_account_file() -> Result<(PathBuf, AccountConfig), String> {
-    let path = account_config_path()
-        .ok_or_else(|| "no config directory; set HOME or XDG_CONFIG_HOME".to_string())?;
-    match read_account_config(&path).map_err(|err| err.to_string())? {
-        Some(config) => Ok((path, config)),
-        None => Err(format!(
-            "{} does not exist; run fell account setup",
-            path.display()
-        )),
+pub fn load_account_file(id: Option<&str>) -> Result<(PathBuf, AccountConfig), String> {
+    let registry = Registry::resolve().map_err(|err| err.to_string())?;
+    if let Some(id) = id {
+        let path = registry.path(id).map_err(|err| err.to_string())?;
+        return registry
+            .get(&AccountId(id.to_owned()))
+            .map_err(|err| err.to_string())?
+            .map(|config| (path.clone(), config))
+            .ok_or_else(|| accounts::missing(&path).to_string());
     }
+    let accounts = match store_path() {
+        Ok(base) => registry.load_with_removals(&base),
+        Err(_) => registry.load(),
+    };
+    if let Some(config) = accounts.default_config() {
+        let path = registry.path(&config.id).map_err(|err| err.to_string())?;
+        return Ok((path, config.clone()));
+    }
+    Err(accounts
+        .error
+        .as_ref()
+        .or_else(|| {
+            accounts
+                .entries
+                .iter()
+                .find_map(|entry| entry.config.as_ref().err())
+        })
+        .map_or_else(
+            || "No account file. Run fell account setup.".into(),
+            ToString::to_string,
+        ))
 }
 
 #[derive(Debug)]
 pub(crate) enum AccountFileError {
     AlreadyConfigured,
+    MailboxAddressConflict { id: String, email: String },
     Write(String),
 }
 
@@ -232,60 +321,134 @@ impl std::fmt::Display for AccountFileError {
             Self::AlreadyConfigured => {
                 f.write_str("An account is already configured. Reopen Fell to use it.")
             }
+            Self::MailboxAddressConflict { id, email } => write!(
+                f,
+                "{id} already holds mail for {email} · run with --replace to start an empty mailbox, or use the same address"
+            ),
             Self::Write(detail) => f.write_str(detail),
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AccountSave {
+    New,
+    Update,
+    Reconnect,
+    ReplaceMailbox,
 }
 
 /// Prepare the file so setup can save its keyring password before publishing
 /// the new config with mode 0600. Dropping the staged file keeps the current
 /// config in place.
 pub(crate) fn stage_account_config(
-    config: &AccountConfig,
+    config: &mut AccountConfig,
+    save: AccountSave,
 ) -> Result<StagedAccountConfig, AccountFileError> {
-    stage_config(config, false)
-}
-
-pub(crate) fn stage_new_account_config(
-    config: &AccountConfig,
-) -> Result<StagedAccountConfig, AccountFileError> {
-    stage_config(config, true)
-}
-
-fn stage_config(
-    config: &AccountConfig,
-    first_run: bool,
-) -> Result<StagedAccountConfig, AccountFileError> {
-    let path = account_config_path()
-        .ok_or_else(|| "no config directory; set HOME or XDG_CONFIG_HOME".to_string())?;
-    stage_account_config_at(path, config, first_run)
+    let registry = Registry::resolve().map_err(|err| err.to_string())?;
+    registry.migrate().map_err(|err| err.to_string())?;
+    let mut path = registry.path(&config.id).map_err(|err| err.to_string())?;
+    let lock = lock_account_dir(&path)?;
+    let base = store_path()?;
+    let mailbox = registry
+        .store_path(&base, &config.id)
+        .map_err(|err| err.cli_message())?;
+    let mut configured = accounts::path_exists(&path).map_err(|err| err.to_string())?;
+    if configured && save == AccountSave::New {
+        return Err(AccountFileError::AlreadyConfigured);
+    }
+    let mut keep = None;
+    if save == AccountSave::Reconnect {
+        if !can_reconnect_at(&registry, &base, &config.id, &config.email) {
+            return Err("The kept mailbox changed. Review the account and try again.".into());
+        }
+    } else if let Some((_, email)) = accounts::mailbox_owner(&mailbox)
+        .map_err(|err| err.to_string())?
+        .filter(|(_, email)| !email.eq_ignore_ascii_case(&config.email))
+    {
+        if save != AccountSave::ReplaceMailbox {
+            return Err(AccountFileError::MailboxAddressConflict {
+                id: config.id.clone(),
+                email,
+            });
+        }
+        let next = next_account_id_at(&registry, &base)?;
+        let previous = std::mem::replace(&mut config.id, next);
+        if configured {
+            let (_, snapshot) = accounts::read(&path, Some(&previous))
+                .map_err(|err| err.to_string())?
+                .ok_or("The account file changed. Review it and try again.")?;
+            keep = Some((previous, snapshot));
+        }
+        path = registry.path(&config.id).map_err(|err| err.to_string())?;
+        configured = false;
+    } else if !configured && accounts::mailbox_exists(&mailbox).map_err(|err| err.to_string())? {
+        return Err("This ID has a local mailbox. Choose a new ID or confirm reconnecting the same account.".into());
+    }
+    let mut staged = stage_account_text_at(path, &config.render(), !configured, lock)?;
+    if let Some((id, snapshot)) = keep {
+        staged.keep = Some((registry, base, id, snapshot));
+    } else if !configured && save != AccountSave::Reconnect {
+        staged.original = Some((registry, base, config.id.clone()));
+    }
+    Ok(staged)
 }
 
 pub(crate) struct StagedAccountConfig {
     path: PathBuf,
     file: tempfile::NamedTempFile,
     first_run: bool,
-    _lock: fs::File,
+    lock: fs::File,
+    original: Option<(Registry, PathBuf, String)>,
+    keep: Option<(Registry, PathBuf, String, String)>,
 }
 
 impl StagedAccountConfig {
     pub(crate) fn publish(self) -> Result<PathBuf, AccountFileError> {
+        let marker = match self.original {
+            Some((registry, base, id)) => registry
+                .initialize_original(&self.lock, &base, &id)
+                .map_err(|err| err.to_string())?,
+            None => None,
+        };
         let installed = if self.first_run {
             self.file.persist_noclobber(&self.path)
         } else {
             self.file.persist(&self.path)
         };
-        installed.map_err(|err| {
-            if self.first_run && err.error.kind() == std::io::ErrorKind::AlreadyExists {
-                AccountFileError::AlreadyConfigured
-            } else {
-                format!("{}: {}", self.path.display(), err.error).into()
+        if let Err(error) = installed {
+            if let Some(marker) = marker {
+                fs::remove_file(&marker)
+                    .and_then(|()| self.lock.sync_all())
+                    .map_err(|err| format!("{}: {err}", marker.display()))?;
             }
-        })?;
+            return Err(
+                if self.first_run && error.error.kind() == std::io::ErrorKind::AlreadyExists {
+                    AccountFileError::AlreadyConfigured
+                } else {
+                    format!("{}: {}", self.path.display(), error.error).into()
+                },
+            );
+        }
+        self.lock.sync_all().map_err(|err| err.to_string())?;
+        if let Some((registry, base, id, snapshot)) = self.keep
+            && let Err(error) = registry.keep_for_replacement(&self.lock, &base, &id, &snapshot)
+        {
+            // If disconnect never happened, roll back the new account file.
+            // A completed disconnect leaves the old mailbox available to reconnect.
+            let old = registry.path(&id).map_err(|err| err.to_string())?;
+            if accounts::path_exists(&old).map_err(|err| err.to_string())? {
+                fs::remove_file(&self.path)
+                    .and_then(|()| self.lock.sync_all())
+                    .map_err(|err| format!("{error}; couldn't roll back the new account: {err}"))?;
+            }
+            return Err(error.into());
+        }
         Ok(self.path)
     }
 }
 
+#[cfg(test)]
 pub(crate) fn stage_account_config_at(
     path: PathBuf,
     config: &AccountConfig,
@@ -301,7 +464,11 @@ pub(crate) fn import_identities(
     account: &AccountId,
     addresses: Vec<String>,
 ) -> Result<AccountConfig, String> {
-    let path = account_config_path().ok_or("No account file")?;
+    let registry = Registry::resolve().map_err(|err| err.to_string())?;
+    registry.get(account).map_err(|err| err.to_string())?;
+    let path = registry
+        .path(account.as_str())
+        .map_err(|err| err.to_string())?;
     import_identities_at(path, account, addresses)
 }
 
@@ -311,7 +478,7 @@ fn import_identities_at(
     addresses: Vec<String>,
 ) -> Result<AccountConfig, String> {
     let lock = lock_account_dir(&path).map_err(|err| err.to_string())?;
-    let (config, mut text) = read_account_config_text(&path)
+    let (config, mut text) = accounts::read(&path, Some(account.as_str()))
         .map_err(|err| err.to_string())?
         .ok_or("No account file")?;
     if config.id != account.as_str() {
@@ -338,7 +505,8 @@ fn import_identities_at(
         text.push('\n');
     }
     AccountConfig::render_identities(&mut text, &identities);
-    let updated = AccountConfig::parse(&text).map_err(|err| err.to_string())?;
+    let updated =
+        accounts::parse(&path, &text, Some(account.as_str())).map_err(|err| err.to_string())?;
     stage_account_text_at(path, &text, false, lock)
         .and_then(StagedAccountConfig::publish)
         .map_err(|err| err.to_string())?;
@@ -380,7 +548,9 @@ fn stage_account_text_at(
         path,
         file,
         first_run,
-        _lock: lock,
+        lock,
+        original: None,
+        keep: None,
     })
 }
 
@@ -399,7 +569,6 @@ fn fallback(error: String) -> (Store, Opened) {
             },
             sync: SyncKind::StoreError,
             error: Some(error),
-            warning: None,
         },
     )
 }
@@ -407,14 +576,11 @@ fn fallback(error: String) -> (Store, Opened) {
 fn prepare(store: &Store, config: Option<&AccountConfig>, demo: bool) -> fell_core::Result<Opened> {
     if let Some(config) = config {
         let account = config.account();
-        let retained = store.configure_account(&account, config.write_back)?;
-        let warning =
-            (!retained.is_empty()).then(|| "Kept older local mail, drafts, and outbox".to_owned());
+        store.configure_account(&account, config.write_back)?;
         return Ok(Opened {
             account,
             sync: SyncKind::Connecting,
             error: None,
-            warning,
         });
     }
     let accounts = store.list_accounts()?;
@@ -425,7 +591,6 @@ fn prepare(store: &Store, config: Option<&AccountConfig>, demo: bool) -> fell_co
             account,
             sync: SyncKind::FixtureOffline,
             error: None,
-            warning: None,
         });
     }
     let account = accounts
@@ -443,7 +608,6 @@ fn prepare(store: &Store, config: Option<&AccountConfig>, demo: bool) -> fell_co
         account,
         sync,
         error: None,
-        warning: None,
     })
 }
 
@@ -617,6 +781,159 @@ mod tests {
     use super::*;
 
     #[test]
+    fn first_setup_records_the_original_id_with_a_broken_legacy_file() {
+        let Some(_root) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        use std::io::Write;
+
+        let registry = Registry::resolve().unwrap();
+        fs::create_dir_all(registry.directory()).unwrap();
+        let legacy = registry.directory().parent().unwrap().join("account.toml");
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&legacy)
+            .unwrap()
+            .write_all(b"invalid = [")
+            .unwrap();
+        let mut config = AccountConfig::bridge(
+            "first@example.test",
+            "first@example.test",
+            fell_core::PasswordSource::Inline("fixture".into()),
+        );
+        config.id = "first".into();
+        let marker = registry.directory().join(".original-id");
+        let staged = stage_account_config(&mut config, AccountSave::New).unwrap();
+        assert!(!marker.exists());
+        drop(staged);
+        assert!(!marker.exists());
+        assert!(!registry.path("first").unwrap().exists());
+        stage_account_config(&mut config, AccountSave::New)
+            .unwrap()
+            .publish()
+            .unwrap();
+        assert_eq!(fs::read_to_string(marker).unwrap(), "first");
+        let base = store_path().unwrap();
+        assert_eq!(registry.store_path(&base, "first").unwrap(), base);
+        assert_eq!(fs::read_to_string(legacy).unwrap(), "invalid = [");
+    }
+
+    #[test]
+    fn kept_mailboxes_require_explicit_reconnect_and_matching_email() {
+        let Some(_root) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let registry = Registry::resolve().unwrap();
+        let base = store_path().unwrap();
+        let mut config = AccountConfig::bridge(
+            "kept@example.test",
+            "kept@example.test",
+            fell_core::PasswordSource::Inline("fixture".into()),
+        );
+        open_at(&base)
+            .unwrap()
+            .upsert_account(&config.account())
+            .unwrap();
+        let other = registry.mailbox_path(&base, "mail-2").unwrap();
+        open_at(&other).unwrap();
+        assert_eq!(next_account_id().unwrap(), "mail-3");
+        assert_eq!(
+            retained_mailbox("Kept@example.test").as_deref(),
+            Some("mail")
+        );
+        assert!(stage_account_config(&mut config, AccountSave::Update).is_err());
+        config.email = "different@example.test".into();
+        assert!(stage_account_config(&mut config, AccountSave::Reconnect).is_err());
+        assert!(!registry.path("mail").unwrap().exists());
+        config.email = "kept@example.test".into();
+        stage_account_config(&mut config, AccountSave::Reconnect)
+            .unwrap()
+            .publish()
+            .unwrap();
+        assert!(registry.path("mail").unwrap().is_file());
+        assert_eq!(registry.store_path(&base, "mail").unwrap(), base);
+    }
+
+    #[test]
+    fn replacing_a_configured_address_keeps_the_old_mailbox_under_its_id() {
+        let Some(_root) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let registry = Registry::resolve().unwrap();
+        let base = store_path().unwrap();
+        let mut original = AccountConfig::bridge(
+            "old@example.test",
+            "test-user",
+            fell_core::PasswordSource::Inline("fixture".into()),
+        );
+        original.id = "work".into();
+        let old_path = stage_account_config(&mut original, AccountSave::New)
+            .unwrap()
+            .publish()
+            .unwrap();
+        let old_mailbox = registry.store_path(&base, "work").unwrap();
+        let old_store = open_at(&old_mailbox).unwrap();
+        let old_id = AccountId("work".into());
+        old_store.upsert_account(&original.account()).unwrap();
+        old_store
+            .set_agent_grant(
+                &old_id,
+                "atlas",
+                fell_core::AgentGrant::enabled(true, false, false),
+            )
+            .unwrap();
+        let mut update = original.clone();
+        update.port = 1234;
+        update.email = "OLD@example.test".into();
+        stage_account_config(&mut update, AccountSave::Update)
+            .unwrap()
+            .publish()
+            .unwrap();
+        assert_eq!(registry.get(&old_id).unwrap().unwrap().port, 1234);
+        let mut replacement = original.clone();
+        replacement.email = "new@example.test".into();
+        assert!(matches!(
+            stage_account_config(&mut replacement, AccountSave::Update),
+            Err(AccountFileError::MailboxAddressConflict { id, email })
+                if id == "work" && email == "old@example.test"
+        ));
+        assert!(
+            old_store
+                .configure_account(&replacement.account(), false)
+                .is_err()
+        );
+        assert!(old_path.is_file());
+        let mut cancelled = replacement.clone();
+        drop(stage_account_config(&mut cancelled, AccountSave::ReplaceMailbox).unwrap());
+        assert!(old_path.is_file());
+        let new_path = stage_account_config(&mut replacement, AccountSave::ReplaceMailbox)
+            .unwrap()
+            .publish()
+            .unwrap();
+        assert_ne!(replacement.id, "work");
+        assert!(!old_path.exists());
+        assert!(new_path.is_file());
+        let new_mailbox = registry.store_path(&base, &replacement.id).unwrap();
+        assert_ne!(old_mailbox, new_mailbox);
+        assert!(!new_mailbox.exists());
+        assert_eq!(
+            old_store.get_account(&old_id).unwrap().unwrap(),
+            original.account()
+        );
+        assert!(!old_store.agent_grant(&old_id, "atlas").unwrap().enabled);
+        assert!(
+            open_at(&new_mailbox)
+                .unwrap()
+                .list_accounts()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(can_reconnect("work", &original.email));
+    }
+
+    #[test]
     fn config_permissions_are_repaired_without_chmodding_parents_or_symlinks() {
         use std::os::unix::fs::symlink;
 
@@ -670,10 +987,8 @@ mod tests {
 
     #[test]
     fn account_file_must_be_private_and_valid() {
-        let dir = std::env::temp_dir().join(format!("fell-acct-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("account.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mail.toml");
         let account = AccountId("mail".into());
         assert_eq!(read_account_config(&path).unwrap(), None);
         let missing = send_config_at(&path, &account).unwrap_err();
@@ -682,29 +997,27 @@ mod tests {
         fs::write(&path, "email = \"a@b\"\npassword = \"x\"\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         let err = send_config_at(&path, &account).unwrap_err();
-        assert!(err.detail.contains("chmod 600"), "{err}");
-        assert_eq!(err.recovery, "Set account.toml permissions to 600.");
+        assert!(err.detail.contains("mode 600"), "{err}");
+        assert_eq!(err.recovery, "Set account file permissions to 600.");
 
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         let config = send_config_at(&path, &account).unwrap();
         assert_eq!(config.email, "a@b");
         let mismatch = send_config_at(&path, &AccountId("other".into())).unwrap_err();
-        assert_eq!(
-            mismatch.recovery,
-            "Restore this draft’s account ID in account.toml."
-        );
+        assert_eq!(mismatch.recovery, "Fix the settings in the account file.");
 
         fs::write(&path, "email = \"a@b\"\n").unwrap();
         let err = send_config_at(&path, &account).unwrap_err();
         assert!(err.detail.contains("password"), "{err}");
-        assert_eq!(err.recovery, "Fix the settings in account.toml.");
-        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(err.recovery, "Fix the settings in the account file.");
     }
 
     #[test]
     fn import_appends_only_confirmed_new_aliases_and_keeps_the_account_text() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("fell/account.toml");
+        let Some(root) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let path = root.join("fell/accounts/mail.toml");
         let original = "# Keep my notes\nemail = 'primary@example.com'\npassword = 'demo'";
         let lock = lock_account_dir(&path).unwrap();
         stage_account_text_at(path.clone(), original, true, lock)
@@ -791,9 +1104,17 @@ mod tests {
         assert_eq!(opened.sync, SyncKind::FixtureOffline);
         let fixture = opened.account;
         assert!(prepare(&store, None, false).is_err());
-        for id in ["local", "fixture", "demo"] {
-            let mut demo = fixture.clone();
-            demo.id = AccountId(id.into());
+        let config = AccountConfig::bridge(
+            "me@example.test",
+            "me@example.test",
+            fell_core::PasswordSource::Inline("x".into()),
+        );
+        for id in ["local", "fixture", "demo"].map(|id| AccountId(id.into())) {
+            let store = Store::open_in_memory().unwrap();
+            let demo = Account {
+                id,
+                ..fixture.clone()
+            };
             seed_if_empty(&store, &demo).unwrap();
             assert!(!store.list_threads(&demo.id).unwrap().is_empty());
             store
@@ -803,24 +1124,16 @@ mod tests {
                     fell_core::AgentGrant::enabled(true, true, true),
                 )
                 .unwrap();
-        }
-        let config = AccountConfig::bridge(
-            "me@proton.me",
-            "me@proton.me",
-            fell_core::PasswordSource::Inline("x".into()),
-        );
-        let opened = prepare(&store, Some(&config), true).unwrap();
-        assert_eq!(opened.sync, SyncKind::Connecting);
-        assert!(opened.warning.is_none());
-        let account = opened.account;
-        assert_eq!(account.email, "me@proton.me");
-        assert_eq!(store.list_accounts().unwrap(), [account]);
-        assert!(store.list_agent_grants().unwrap().is_empty());
-        for id in ["local", "fixture", "demo"].map(|id| AccountId(id.into())) {
-            assert!(store.list_threads(&id).unwrap().is_empty());
+            let opened = prepare(&store, Some(&config), true).unwrap();
+            assert_eq!(opened.sync, SyncKind::Connecting);
+            let account = opened.account;
+            assert_eq!(account.email, config.email);
+            assert_eq!(store.list_accounts().unwrap(), [account]);
+            assert!(store.list_agent_grants().unwrap().is_empty());
+            assert!(store.list_threads(&demo.id).unwrap().is_empty());
             assert!(
                 store
-                    .agent_grant(&id, "bot")
+                    .agent_grant(&demo.id, "bot")
                     .unwrap_err()
                     .to_string()
                     .contains("unknown account")
@@ -829,36 +1142,36 @@ mod tests {
     }
 
     #[test]
-    fn a_reserved_real_account_keeps_the_disk_mailbox_open_on_each_launch() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("mail.db");
-        let legacy = Account {
-            email: "legacy@example.test".into(),
-            ..fixture_account()
-        };
-        let store = Store::open(&path).unwrap();
-        store.upsert_account(&legacy).unwrap();
-        drop(store);
-
+    fn a_reserved_real_account_stays_the_only_owner_on_each_launch() {
         let config = AccountConfig::bridge(
             "configured@example.test",
             "configured@example.test",
             fell_core::PasswordSource::Inline("test".into()),
         );
-        for _ in 0..2 {
+        let fixture = fixture_account();
+        for legacy in [
+            Account {
+                email: "legacy@example.test".into(),
+                ..fixture.clone()
+            },
+            Account {
+                backend_kind: fell_core::BackendKind::Imap,
+                ..fixture
+            },
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("mail.db");
+            Store::open(&path).unwrap().upsert_account(&legacy).unwrap();
             let (store, opened) = open_store(Ok(path.clone()), Some(&config), false);
-            assert_eq!(store.db_path(), Some(path.as_path()));
-            assert_eq!(opened.sync, SyncKind::Connecting);
-            assert!(opened.error.is_none());
+            assert_eq!(opened.sync, SyncKind::StoreError);
+            let error = opened.error.unwrap();
+            assert!(error.contains(legacy.id.as_str()), "{error}");
+            assert!(error.contains(&legacy.email), "{error}");
+            assert!(error.contains(&*path.to_string_lossy()), "{error}");
+            assert!(store.list_accounts().unwrap().is_empty());
             assert_eq!(
-                opened.warning.as_deref(),
-                Some("Kept older local mail, drafts, and outbox")
-            );
-            assert_eq!(opened.account.id, config.account().id);
-            assert!(store.get_account(&opened.account.id).unwrap().is_some());
-            assert_eq!(
-                store.get_account(&legacy.id).unwrap().unwrap().email,
-                legacy.email
+                Store::open(&path).unwrap().list_accounts().unwrap(),
+                [legacy]
             );
         }
     }

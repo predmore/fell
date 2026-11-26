@@ -391,7 +391,7 @@ impl Onboarding {
                 "",
                 "",
                 column()
-                    .child(
+                    .when(self.form.retained_mailbox.is_none(), |column| column.child(
                         div()
                             .border_1()
                             .rounded_lg()
@@ -401,15 +401,17 @@ impl Onboarding {
                             .font_weight(FontWeight::SEMIBOLD)
                             .truncate()
                             .child(self.form.text(Field::Email).trim().to_owned()),
-                    )
+                    ))
                     .child(
                         self.feedback.save_note.paint(false, |state, _| match state {
+                            SaveState::Ready if self.form.retained_mailbox.is_some() =>
+                                self.meta("Start empty keeps the old mail on this device but doesn't show it."),
                             SaveState::Ready => self.meta("Fell keeps your password in the desktop keyring."),
                             SaveState::SavingKeyring => self.meta("Approve any keyring prompt to continue."),
                             SaveState::ConfirmFile => self.meta(
-                                "Your password will be saved as plain text in account.toml. Fell restricts access to the file to your user account.",
+                                "Your password will be saved as plain text in the account file. Fell restricts access to the file to your user account.",
                             ),
-                            SaveState::Failed { title, detail, .. } => self.error(title, detail.as_deref()),
+                            SaveState::Failed { title, detail } => self.error(title, detail.as_deref()),
                         }).min_h(px((self.theme.ui_px + 4.) * 5.)),
                     ),
                 [None, None],
@@ -421,18 +423,43 @@ impl Onboarding {
                     let (title, detail) = state.heading();
                     self.heading(title, detail)
                 });
-                self.reserved_heading(Connection::ALL.map(Connection::heading), heading)
+                self.reserved_heading(
+                    Connection::ALL.map(|state| {
+                        let (title, detail) = state.heading();
+                        self.heading(title, detail)
+                    }),
+                    heading,
+                )
             }
             Step::Done => {
-                let heading = self.heading_column(
-                    self.feedback
-                        .save_title
-                        .paint(false, |title, _| self.title(title)),
-                    self.feedback
-                        .save_subtitle
-                        .paint(false, |detail, _| self.meta(*detail)),
-                );
-                self.reserved_heading(SaveState::HEADINGS, heading)
+                let reconnect_email = self
+                    .form
+                    .retained_mailbox
+                    .as_ref()
+                    .map(|_| crate::present::display_safe(self.form.text(Field::Email).trim()));
+                let heading = if let Some(email) = &reconnect_email
+                    && (matches!(self.form.storage, super::Storage::Keyring) || self.reconnect)
+                {
+                    self.reconnect_heading(email)
+                } else {
+                    self.heading_column(
+                        self.feedback
+                            .save_title
+                            .paint(false, |title, _| self.title(title)),
+                        self.feedback
+                            .save_subtitle
+                            .paint(false, |detail, _| self.meta(*detail)),
+                    )
+                };
+                let measures = SaveState::HEADINGS
+                    .into_iter()
+                    .map(|(title, detail)| self.heading(title, detail))
+                    .chain(
+                        reconnect_email
+                            .as_ref()
+                            .map(|email| self.reconnect_heading(email)),
+                    );
+                self.reserved_heading(measures, heading)
             }
             _ => self.heading(title, detail),
         };
@@ -509,6 +536,26 @@ impl Onboarding {
         self.heading_column(self.title(title), self.meta(detail.to_owned()))
     }
 
+    fn reconnect_heading(&self, email: &str) -> Div {
+        let title = div()
+            .flex()
+            .flex_wrap()
+            .gap_x_2()
+            .text_size(px(self.theme.ui_px + 12.))
+            .line_height(px(self.theme.ui_px + 18.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .child(div().flex_none().child("Reconnect"))
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .max_w_full()
+                    .child(div().min_w_0().truncate().child(email.to_owned()))
+                    .child(div().flex_none().child("?")),
+            );
+        self.heading_column(title, self.meta("Use the mail already on this device."))
+    }
+
     fn title(&self, title: &str) -> Div {
         div()
             .text_size(px(self.theme.ui_px + 15.))
@@ -521,15 +568,19 @@ impl Onboarding {
         div().flex().flex_col().gap_1p5().child(title).child(detail)
     }
 
-    fn reserved_heading<const N: usize>(&self, headings: [(&str, &str); N], current: Div) -> Div {
+    fn reserved_heading(&self, headings: impl IntoIterator<Item = Div>, current: Div) -> Div {
         // Each measuring copy takes the full column width. The row keeps
         // the tallest heading's height at the current window size.
         div()
             .relative()
             .overflow_hidden()
-            .child(div().flex().children(headings.map(|(title, detail)| {
-                self.heading(title, detail).w_full().flex_none().opacity(0.)
-            })))
+            .child(
+                div().flex().children(
+                    headings
+                        .into_iter()
+                        .map(|heading| heading.w_full().flex_none().opacity(0.)),
+                ),
+            )
             .child(current.absolute().inset_0())
     }
 
@@ -541,19 +592,6 @@ impl Onboarding {
         cx: &Context<Self>,
     ) -> [Footer; 2] {
         std::array::from_fn(|index| {
-            if saving && index == 1 {
-                return Some(
-                    self.feedback
-                        .save_note
-                        .paint(live, |state, live| {
-                            div().when(state.inline_available(), |el| {
-                                el.child(self.button(Control::Inline, "Save in file…", live, cx))
-                            })
-                        })
-                        .flex_none()
-                        .into_any_element(),
-                );
-            }
             Some(
                 actions[index]
                     .paint(live, |action, live| {

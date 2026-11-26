@@ -283,7 +283,11 @@ fn map_palette(
         selected_label_outline: label_outline(selection, on_selection),
         // A warning chip sits on a selected row too, so the error colour
         // holds AA on the selection as well as on the page.
-        error: ensure_all(error_raw, &[background, surface, selection], TEXT_CONTRAST),
+        error: ensure_all(
+            error_raw,
+            &[background, surface, selection],
+            DETAIL_TEXT_CONTRAST,
+        ),
         success: ensure_all(success_raw, &[background, surface], TEXT_CONTRAST),
         border,
         input_border: ensure_all(
@@ -470,8 +474,10 @@ pub(crate) fn watched_dirs() -> Vec<PathBuf> {
     if let Some(path) = crate::settings::path() {
         dirs.extend(crate::settings::watched_dirs(&path));
     }
-    if let Some(path) = crate::mailbox::account_config_path() {
-        dirs.extend(crate::settings::watched_dirs(&path));
+    if let Ok(registry) = fell_core::accounts::Registry::resolve() {
+        dirs.extend(crate::settings::watched_dirs(
+            &registry.directory().join("mail.toml"),
+        ));
     }
     dirs.sort();
     dirs.dedup();
@@ -843,6 +849,13 @@ pub(crate) fn mix(a: u32, b: u32, t: f64) -> u32 {
         mixed << shift
     }
     mix_channel(a, b, 16, t) | mix_channel(a, b, 8, t) | mix_channel(a, b, 0, t)
+}
+
+const DETAIL_TEXT_CONTRAST: f64 = 5.2;
+
+/// Give small account labels room above the normal text contrast minimum.
+pub(crate) fn account_detail_color(color: u32, background: u32) -> u32 {
+    ensure(color, background, DETAIL_TEXT_CONTRAST)
 }
 
 fn ensure(fg: u32, bg: u32, min: f64) -> u32 {

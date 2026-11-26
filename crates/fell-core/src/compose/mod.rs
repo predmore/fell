@@ -22,9 +22,9 @@ pub use frontmatter::{
     mailbox_parts, parse_address_line, recipient_display_char,
 };
 pub use hub::{
-    ClosedDraftSave, DraftCloseNotice, DraftHub, HubEvent, LOCAL_SENT_COPY_FAILED,
-    MAYBE_SENT_NOTICE, editor_is_running, file_fallback_edit, file_fallback_get,
-    file_fallback_replace_body, request_send_without_editor, rpc_call,
+    AccountDraftRemoval, ClosedDraftSave, DraftCloseNotice, DraftHub, HubEvent,
+    LOCAL_SENT_COPY_FAILED, MAYBE_SENT_NOTICE, editor_is_running, file_fallback_edit,
+    file_fallback_get, file_fallback_replace_body, request_send_without_editor, rpc_call,
 };
 pub(crate) use markdown::content_id as draft_content_id;
 pub(crate) use markdown::document_to_markdown;
@@ -39,7 +39,8 @@ pub use persist::{
     remember_compose_store, remembered_store_path, stored_compose_account, stored_compose_owner,
 };
 pub(crate) use persist::{
-    confirm_synced_sends, mark_discarded, record_confirmed_send, undo_discard,
+    confirm_synced_sends, drafts_for_removal, mark_discarded, record_confirmed_send,
+    remove_draft_workspaces, undo_discard,
 };
 pub(crate) use reply::format_address;
 pub use reply::{

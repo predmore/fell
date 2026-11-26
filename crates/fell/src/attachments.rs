@@ -78,6 +78,7 @@ pub struct Fetcher {
     config: Option<AccountConfig>,
     store_path: Option<PathBuf>,
     worker: Arc<Mutex<Option<PartFetcher>>>,
+    stopping: Arc<std::sync::atomic::AtomicBool>,
 }
 
 type FetchEvents = (UnboundedReceiver<PartEvent>, CancelFetch);
@@ -88,11 +89,22 @@ impl Fetcher {
             config,
             store_path,
             worker: Arc::new(Mutex::new(None)),
+            stopping: Default::default(),
         }
+    }
+
+    pub fn stop(&self) {
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::Release);
+        let stopped = self.worker.lock().expect("attachment fetcher lock").take();
+        drop(stopped);
     }
 
     pub fn queue(&self, request: PartRequest) -> Result<FetchEvents, String> {
         let mut worker = self.worker.lock().expect("attachment fetcher lock");
+        if self.stopping.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("the mailbox was closed".into());
+        }
         if worker.is_none() {
             let path = self
                 .store_path

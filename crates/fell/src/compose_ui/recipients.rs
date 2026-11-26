@@ -16,7 +16,8 @@ use crate::motion::Motion;
 use crate::recipient_menu::{self, Menu};
 use crate::store_actor::StoreClient;
 
-pub(crate) struct RecipientStore(pub StoreClient);
+#[derive(Default)]
+pub(crate) struct RecipientStore(pub std::collections::HashMap<fell_core::AccountId, StoreClient>);
 
 impl gpui::Global for RecipientStore {}
 
@@ -127,12 +128,6 @@ impl ComposeView {
         else {
             return;
         };
-        let Some(store) = cx
-            .try_global::<RecipientStore>()
-            .map(|store| store.0.clone())
-        else {
-            return;
-        };
         let Some(account) = self
             .hub
             .with_session(draft.as_ref(), |session| {
@@ -142,6 +137,12 @@ impl ComposeView {
                     .then(|| session.account_id().clone())
             })
             .flatten()
+        else {
+            return;
+        };
+        let Some(store) = cx
+            .try_global::<RecipientStore>()
+            .and_then(|store| store.0.get(&account).cloned())
         else {
             return;
         };

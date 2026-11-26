@@ -204,7 +204,7 @@ impl Layout {
         Self::measure(
             theme.ui_px,
             window.viewport_size(),
-            &session.keymap,
+            help_rows(&session.keymap, |action| session.discovers(action)),
             error
                 .into_iter()
                 .chain(subject_join.then(|| (SUBJECT_JOIN_HELP.into(), false))),
@@ -232,7 +232,7 @@ impl Layout {
     fn measure(
         ui_px: f32,
         viewport: Size<Pixels>,
-        keymap: &Keymap,
+        rows: impl IntoIterator<Item = HelpRow>,
         details: impl IntoIterator<Item = (String, bool)>,
         count_detail_rows: impl Fn(&str, f32) -> usize,
     ) -> Self {
@@ -254,7 +254,7 @@ impl Layout {
             .collect();
         let detail_rows: usize = details.iter().map(|(_, _, lines)| *lines).sum();
         let detail_gap = if detail_rows > 0 { DETAIL_GAP } else { 0. };
-        let rows = help_rows(keymap).collect::<Vec<_>>();
+        let rows = rows.into_iter().collect::<Vec<_>>();
         let total = rows.len() + detail_rows;
         let page = (((height - header - 2. - 2. * INSET - detail_gap) / row) as usize)
             .max(1)
@@ -283,10 +283,14 @@ enum HelpRow {
     Action(Action, String),
 }
 
-fn help_rows(keymap: &Keymap) -> impl Iterator<Item = HelpRow> {
+fn help_rows(
+    keymap: &Keymap,
+    visible: impl Fn(Action) -> bool + Copy,
+) -> impl Iterator<Item = HelpRow> {
     ACTION_SECTIONS.iter().flat_map(move |&(section, actions)| {
         let mut rows = actions
             .iter()
+            .filter(move |&&action| visible(action))
             .filter_map(move |&action| {
                 let keys = binding_text(keymap, action);
                 (!keys.is_empty()).then_some(HelpRow::Action(action, keys))
@@ -513,7 +517,7 @@ mod tests {
         Layout::measure(
             15.,
             gpui::size(px(520.), px(720.)),
-            &Keymap::default(),
+            help_rows(&Keymap::default(), |_| true),
             None,
             |_, _| 0,
         )
@@ -526,8 +530,15 @@ mod tests {
         let mut scroll = HelpScroll::default();
         assert_eq!(scroll.page, 0);
         let keymap = Keymap::default();
-        let measure =
-            || Layout::measure(13., gpui::size(px(520.), px(720.)), &keymap, None, |_, _| 0);
+        let measure = || {
+            Layout::measure(
+                13.,
+                gpui::size(px(520.), px(720.)),
+                help_rows(&keymap, |_| true),
+                None,
+                |_, _| 0,
+            )
+        };
         scroll.prepare(now, measure);
         let half_page = scroll.page / 2;
         assert!(half_page > 1);
@@ -542,7 +553,7 @@ mod tests {
     #[test]
     fn section_headers_and_bound_actions_follow_the_palette_order() {
         let keymap = Keymap::default();
-        let rows: Vec<_> = help_rows(&keymap).collect();
+        let rows: Vec<_> = help_rows(&keymap, |_| true).collect();
         let headings: Vec<_> = rows
             .iter()
             .filter_map(|row| match row {
@@ -588,7 +599,7 @@ mod tests {
                 let layout = Layout::measure(
                     ui_px,
                     gpui::size(px(420.), px(380.)),
-                    &keymap,
+                    help_rows(&keymap, |_| true),
                     detail,
                     |_, _| 1,
                 );
@@ -619,7 +630,7 @@ mod tests {
         let layout = Layout::measure(
             15.,
             gpui::size(px(520.), px(720.)),
-            &Keymap::default(),
+            help_rows(&Keymap::default(), |_| true),
             Some(("A full detail line".into(), true)),
             |_, _| 1,
         );
@@ -648,7 +659,7 @@ mod tests {
             let layout = Layout::measure(
                 15.,
                 gpui::size(px(520.), px(720.)),
-                &Keymap::default(),
+                help_rows(&Keymap::default(), |_| true),
                 Some(("A detail banner".into(), true)),
                 |_, _| banner_lines,
             );

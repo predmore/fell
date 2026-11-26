@@ -593,7 +593,7 @@ impl ComposeView {
                         }
                         let store = cx
                             .try_global::<RecipientStore>()
-                            .map(|store| store.0.clone());
+                            .and_then(|store| store.0.get(&account).cloned());
                         Some((id, account, revision, receipt, store))
                     })
                 else {
@@ -1375,7 +1375,11 @@ impl ComposeView {
                 if !saved {
                     hub.report_sent_copy_failure(&sent_id);
                 }
-                let _ = cx.update(crate::view::wake_sent_copy_sync);
+                if let Some(account) =
+                    hub.with_session(&sent_id, |session| session.account_id().clone())
+                {
+                    hub.wake_server_draft(&account);
+                }
             }
         })
         .detach();
@@ -7205,10 +7209,8 @@ mod tests {
         use super::{
             AccountConfigError, SendAttempts, SendFailure, SendFeedback, SendFeedbackState,
         };
-        let missing = AccountConfigError {
-            detail: "account.toml does not exist".into(),
-            recovery: "Run fell account setup.",
-        };
+        let missing =
+            AccountConfigError::new("account file does not exist", "Run fell account setup.");
         let mut state = SendFeedbackState::default();
         let mut attempts = SendAttempts::default();
         let before_send = state.generation;
@@ -7246,10 +7248,8 @@ mod tests {
         use super::{
             AccountConfigError, SendAttempts, SendFailure, SendFeedback, SendFeedbackState,
         };
-        let missing = AccountConfigError {
-            detail: "account.toml does not exist".into(),
-            recovery: "Run fell account setup.",
-        };
+        let missing =
+            AccountConfigError::new("account file does not exist", "Run fell account setup.");
         let mut state = SendFeedbackState::default();
         let mut attempts = SendAttempts::default();
         state.invalidate_readiness();
@@ -8683,7 +8683,7 @@ mod tests {
         .unwrap();
         let mut session = DraftSession::open_folder(&folder, account.clone()).unwrap();
         let mut feedback = SendFeedbackState::default();
-        let config = root.join("config/fell/account.toml");
+        let config = root.join("config/fell/accounts/mail.toml");
         fs::create_dir_all(config.parent().unwrap()).unwrap();
         let valid = "id = 'mail'\nemail = 'primary@example.com'\nname = 'Primary'\npassword = 'test'\n\
                      [[identities]]\naddress = 'primary@example.com'\nsignature = 'Primary team'\n\

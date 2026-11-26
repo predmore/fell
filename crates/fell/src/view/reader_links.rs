@@ -127,7 +127,7 @@ impl ReaderLinks {
 }
 
 pub(crate) fn register(window: &Window, cx: &App, handle: &FocusHandle, place: &Rc<Placement>) {
-    if let Some(inbox) = window.root::<Inbox>().flatten() {
+    if let Some(inbox) = super::accounts::active_inbox(window, cx) {
         inbox
             .read(cx)
             .reader_links
@@ -138,7 +138,7 @@ pub(crate) fn register(window: &Window, cx: &App, handle: &FocusHandle, place: &
 }
 
 pub(crate) fn hover(window: &mut Window, cx: &mut App, handle: &FocusHandle, hovered: bool) {
-    if let Some(inbox) = window.root::<Inbox>().flatten() {
+    if let Some(inbox) = super::accounts::active_inbox(window, cx) {
         inbox.update(cx, |inbox, cx| {
             if hovered && inbox.reader_links.hovered.as_ref() != Some(handle) {
                 inbox.reader_links.hovered = Some(handle.clone());
@@ -152,7 +152,7 @@ pub(crate) fn hover(window: &mut Window, cx: &mut App, handle: &FocusHandle, hov
 }
 
 pub(crate) fn clicked(window: &mut Window, cx: &mut App) {
-    if let Some(inbox) = window.root::<Inbox>().flatten() {
+    if let Some(inbox) = super::accounts::active_inbox(window, cx) {
         inbox.update(cx, |inbox, cx| {
             if inbox.session.pane == Pane::List {
                 inbox.focus_message(inbox.session.message_cursor);
@@ -163,7 +163,7 @@ pub(crate) fn clicked(window: &mut Window, cx: &mut App) {
 }
 
 pub(crate) fn notice(window: &mut Window, cx: &mut App, text: &'static str, alert: bool) {
-    if let Some(inbox) = window.root::<Inbox>().flatten() {
+    if let Some(inbox) = super::accounts::active_inbox(window, cx) {
         inbox.update(cx, |inbox, cx| {
             inbox.session.show_toast(text, alert);
             inbox.expire_action_notice(cx);

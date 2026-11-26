@@ -46,7 +46,6 @@ pub(super) enum SaveState {
     Failed {
         title: &'static str,
         detail: Option<String>,
-        inline_available: bool,
     },
 }
 
@@ -88,14 +87,17 @@ impl SaveState {
                         "An account is already configured",
                         Some("Quit and reopen Fell to use it."),
                     ),
+                    SaveAccountError::File(AccountFileError::MailboxAddressConflict { .. }) => (
+                        "This mailbox belongs to a different address",
+                        Some(fell_core::accounts::MAILBOX_ADDRESS_RECOVERY),
+                    ),
                     SaveAccountError::File(AccountFileError::Write(detail)) => {
-                        ("Couldn’t save account.toml", Some(detail.as_str()))
+                        ("Couldn’t save the account file", Some(detail.as_str()))
                     }
                 };
                 Self::Failed {
                     title,
                     detail: detail.map(str::to_owned),
-                    inline_available: storage.inline_available(),
                 }
             }
         }
@@ -107,16 +109,6 @@ impl SaveState {
             Self::Failed { .. } => Self::FAILED,
             _ => Self::KEYRING,
         }
-    }
-
-    pub fn inline_available(&self) -> bool {
-        matches!(
-            self,
-            Self::Failed {
-                inline_available: true,
-                ..
-            }
-        )
     }
 }
 
@@ -163,7 +155,7 @@ impl Connection {
     }
 }
 
-fn save_actions(storage: &Storage) -> [Option<Action>; 3] {
+fn save_actions(storage: &Storage, retained_mailbox: bool) -> [Option<Action>; 3] {
     let back = Action::new(Control::Back, "Back");
     let use_keyring = Action::new(Control::Back, "Use keyring");
     let next = |label| Action::new(Control::Next, label);
@@ -175,7 +167,16 @@ fn save_actions(storage: &Storage) -> [Option<Action>; 3] {
         ],
         Storage::ConfirmInline(_) => [Some(use_keyring), None, Some(next("Save in file"))],
         _ if storage.must_reopen() => [None, None, Some(next("Quit"))],
-        _ if storage.inline_available() => [Some(back), None, Some(next("Retry keyring"))],
+        _ if storage.inline_available() => [
+            Some(back),
+            Some(Action::new(Control::Inline, "Save in file…")),
+            Some(next("Retry keyring")),
+        ],
+        Storage::Keyring if retained_mailbox => [
+            Some(back),
+            Some(next("Start empty")),
+            Some(Action::new(Control::Reconnect, "Reconnect")),
+        ],
         _ => [Some(back), None, Some(next("Save account"))],
     }
 }
@@ -405,7 +406,7 @@ impl Feedback {
         for (action, value) in self
             .save_actions
             .iter_mut()
-            .zip(save_actions(&Storage::Keyring))
+            .zip(save_actions(&Storage::Keyring, false))
         {
             *action = Change {
                 value,
@@ -524,7 +525,8 @@ impl Feedback {
             self.save_title.replace(title, motion, now);
             self.save_subtitle.replace(subtitle, motion, now);
             self.save_note.replace(state, motion, now);
-            let [back, secondary, next] = save_actions(&form.storage);
+            let [back, secondary, next] =
+                save_actions(&form.storage, form.retained_mailbox.is_some());
             primary = next;
             for (action, value) in self.save_actions.iter_mut().zip([back, secondary]) {
                 action.update_optional(value, false, motion, now);

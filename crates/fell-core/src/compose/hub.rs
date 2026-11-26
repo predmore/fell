@@ -3,7 +3,7 @@
 //! The socket is mode 0600 under the user's runtime directory. It is not a
 //! network listener, and no request on it transmits mail.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use super::persist::SEND_IN_PROGRESS;
 use super::session::{DraftSession, SendLock};
 use super::workspace::{self, draft_socket_path};
+use crate::AccountId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HubEvent;
@@ -72,6 +73,7 @@ impl ClosedDraftSave {
 
 /// A notice whose result can be checked on the mailbox worker after close.
 pub struct DraftCloseNotice {
+    account: crate::AccountId,
     text: String,
     alert: bool,
     server_save: Option<ClosedDraftSave>,
@@ -125,7 +127,7 @@ impl DraftCloseNotice {
 }
 
 pub struct DraftHub {
-    server_draft_wake: Mutex<Option<super::server::Wake>>,
+    server_draft_wake: Mutex<HashMap<crate::AccountId, super::server::Wake>>,
     sessions: Mutex<HashMap<String, DraftSession>>,
     listeners: Mutex<Vec<Listener>>,
     focused: Mutex<Option<String>>,
@@ -141,7 +143,31 @@ pub struct DraftHub {
     last_closed: Mutex<Option<String>>,
     /// Drafts being read from disk to go live, so two opens of one draft
     /// never write its folder at the same time. See [`DraftHub::begin_open`].
-    opening: Mutex<std::collections::HashSet<String>>,
+    opening: Mutex<OpeningDrafts>,
+    draft_opened: Condvar,
+}
+
+#[derive(Default)]
+struct OpeningDrafts {
+    by_id: HashMap<String, AccountId>,
+    removing: HashSet<AccountId>,
+}
+
+/// Keeps new drafts for this account from going live during local deletion.
+pub struct AccountDraftRemoval {
+    hub: Arc<DraftHub>,
+    account: AccountId,
+}
+
+impl Drop for AccountDraftRemoval {
+    fn drop(&mut self) {
+        self.hub
+            .opening
+            .lock()
+            .expect("opening")
+            .removing
+            .remove(&self.account);
+    }
 }
 
 /// Held while draft `id` is read from disk to go live. Dropping it lets the
@@ -153,7 +179,13 @@ pub struct OpenGuard<'a> {
 
 impl Drop for OpenGuard<'_> {
     fn drop(&mut self) {
-        self.hub.opening.lock().expect("opening").remove(&self.id);
+        self.hub
+            .opening
+            .lock()
+            .expect("opening")
+            .by_id
+            .remove(&self.id);
+        self.hub.draft_opened.notify_all();
     }
 }
 
@@ -181,7 +213,7 @@ impl Default for DraftHub {
 impl DraftHub {
     pub fn new() -> Self {
         Self {
-            server_draft_wake: Mutex::new(None),
+            server_draft_wake: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             listeners: Mutex::new(Vec::new()),
             focused: Mutex::new(None),
@@ -190,7 +222,8 @@ impl DraftHub {
             reveals: AtomicU64::new(0),
             closed: Mutex::new(Vec::new()),
             last_closed: Mutex::new(None),
-            opening: Mutex::new(std::collections::HashSet::new()),
+            opening: Mutex::default(),
+            draft_opened: Condvar::new(),
         }
     }
 
@@ -230,21 +263,24 @@ impl DraftHub {
     /// live already, or another open of it is running: that one shows it,
     /// and this one must not touch its folder. Checked under the sessions
     /// lock, so a draft that goes live meanwhile is seen.
-    pub fn begin_open(&self, id: &str) -> Option<OpenGuard<'_>> {
+    pub fn begin_open(
+        &self,
+        id: &str,
+        account: &AccountId,
+    ) -> Result<Option<OpenGuard<'_>>, String> {
         let sessions = self.sessions.lock().expect("sessions");
-        if sessions.contains_key(id) {
-            return None;
-        }
         let mut opening = self.opening.lock().expect("opening");
-        if !opening.insert(id.to_string()) {
-            return None;
+        if opening.removing.contains(account) {
+            return Err("Local mail for this account is being deleted.".into());
         }
-        drop(opening);
-        drop(sessions);
-        Some(OpenGuard {
+        if sessions.contains_key(id) || opening.by_id.contains_key(id) {
+            return Ok(None);
+        }
+        opening.by_id.insert(id.to_string(), account.clone());
+        Ok(Some(OpenGuard {
             hub: self,
             id: id.to_string(),
-        })
+        }))
     }
 
     /// Add a live draft unless one with its id is already live, which then
@@ -316,7 +352,7 @@ impl DraftHub {
             let mut sessions = self.sessions.lock().expect("sessions");
             let opening = self.opening.lock().expect("opening");
             for id in ids {
-                if opening.contains(id) {
+                if opening.by_id.contains_key(id) {
                     return Err(changed());
                 }
                 if let Some(session) = sessions.get_mut(id) {
@@ -353,7 +389,7 @@ impl DraftHub {
         let mut sessions = self.sessions.lock().expect("sessions");
         let opening = self.opening.lock().expect("opening");
         for id in ids {
-            if opening.contains(id)
+            if opening.by_id.contains_key(id)
                 || sessions.get(id).map(DraftSession::paint_generation)
                     != generations.get(id).copied()
             {
@@ -372,10 +408,9 @@ impl DraftHub {
         }
         drop(opening);
         drop(sessions);
-        if let Some(wake) = self.server_draft_wake() {
-            wake();
-        }
+        self.wake_server_draft(account);
         self.closed.lock().expect("closed").push(DraftCloseNotice {
+            account: account.clone(),
             text: format!("{}  ·  u", action.summary),
             alert: false,
             server_save: None,
@@ -426,15 +461,36 @@ impl DraftHub {
     }
 
     /// The GUI's sync worker wakes once an editor save reaches the outbox.
-    pub fn on_server_draft_queued(&self, wake: impl Fn() + Send + Sync + 'static) {
-        *self.server_draft_wake.lock().expect("server draft wake") = Some(Arc::new(wake));
-    }
-
-    fn server_draft_wake(&self) -> Option<super::server::Wake> {
+    pub fn on_server_draft_queued(
+        &self,
+        account: crate::AccountId,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) {
         self.server_draft_wake
             .lock()
             .expect("server draft wake")
-            .clone()
+            .insert(account, Arc::new(wake));
+    }
+
+    pub fn remove_server_draft_wake(&self, account: &crate::AccountId) {
+        self.server_draft_wake
+            .lock()
+            .expect("server draft wake")
+            .remove(account);
+    }
+
+    pub fn wake_server_draft(&self, account: &crate::AccountId) {
+        if let Some(wake) = self.server_draft_wake(account) {
+            wake();
+        }
+    }
+
+    fn server_draft_wake(&self, account: &crate::AccountId) -> Option<super::server::Wake> {
+        self.server_draft_wake
+            .lock()
+            .expect("server draft wake")
+            .get(account)
+            .cloned()
     }
 
     /// Called only by the compose window. Agent request_send can reveal a
@@ -443,18 +499,17 @@ impl DraftHub {
         if self.shown.lock().expect("shown").as_deref() != Some(id) {
             return;
         }
-        if let Some(wake) = self.server_draft_wake() {
-            self.with_session(id, |session| {
-                session.flush_server_if_due(Some(now_ms), &wake)
-            });
-        }
+        self.with_session(id, |session| {
+            if let Some(wake) = self.server_draft_wake(session.account_id()) {
+                session.flush_server_if_due(Some(now_ms), &wake);
+            }
+        });
     }
 
     /// Queue every save still waiting on the editor's debounce, then wait
     /// until each live draft's saves are on disk. The app calls this when it
     /// quits.
     pub fn settle_all(&self) {
-        let wake = self.server_draft_wake();
         let shown = self.shown.lock().expect("shown").clone();
         let waiters: Vec<super::SaveWaiter> = self
             .sessions
@@ -462,10 +517,10 @@ impl DraftHub {
             .expect("sessions")
             .values_mut()
             .filter_map(|session| {
-                if let Some(wake) = &wake
-                    && shown.as_deref() == Some(session.id())
+                if shown.as_deref() == Some(session.id())
+                    && let Some(wake) = self.server_draft_wake(session.account_id())
                 {
-                    session.flush_server_if_due(None, wake);
+                    session.flush_server_if_due(None, &wake);
                 }
                 let _ = session.flush_pending();
                 session.save_waiter()
@@ -499,8 +554,10 @@ impl DraftHub {
         };
         // No window has it open for editing any more. Typing still waiting
         // on the save debounce is saved now.
-        let wake = was_shown.then(|| self.server_draft_wake()).flatten();
         let summary = self.with_session(id, |session| {
+            let wake = was_shown
+                .then(|| self.server_draft_wake(session.account_id()))
+                .flatten();
             if let Some(wake) = &wake {
                 session.flush_server_if_due(None, wake);
             }
@@ -563,6 +620,7 @@ impl DraftHub {
                 id,
                 sent,
                 DraftCloseNotice {
+                    account: account.clone(),
                     text: line,
                     alert: failed || locked == Some(SendLock::MaybeSent.reason()),
                     server_save,
@@ -614,10 +672,14 @@ impl DraftHub {
     /// Queue `line` for the inbox. Mail that went out is not offered again
     /// by reopen; anything else is the draft reopen brings back.
     fn push_closed(&self, id: &str, line: String, sent: bool, warn: bool) {
+        let Some(account) = self.with_session(id, |session| session.account_id().clone()) else {
+            return;
+        };
         self.push_notice(
             id,
             sent,
             DraftCloseNotice {
+                account,
                 text: line,
                 alert: warn,
                 server_save: None,
@@ -689,6 +751,14 @@ impl DraftHub {
         std::mem::take(&mut *self.closed.lock().expect("closed"))
     }
 
+    pub fn take_close_notices_for(&self, account: &crate::AccountId) -> Vec<DraftCloseNotice> {
+        self.closed
+            .lock()
+            .expect("closed")
+            .extract_if(.., |notice| &notice.account == account)
+            .collect()
+    }
+
     fn wait_shown(&self, id: &str) -> bool {
         {
             let shown = self.shown.lock().expect("shown");
@@ -719,6 +789,53 @@ impl DraftHub {
             .collect()
     }
 
+    /// Explicit account deletion closes its draft writers before the mailbox
+    /// and workspaces are moved. An in-flight send must finish first.
+    /// Wait on a background thread so a draft opening for this account can finish.
+    pub fn release_account_drafts(
+        self: &Arc<Self>,
+        account: &AccountId,
+    ) -> Result<AccountDraftRemoval, String> {
+        {
+            let mut opening = self.opening.lock().expect("opening");
+            if !opening.removing.insert(account.clone()) {
+                return Err("Local mail for this account is already being deleted.".into());
+            }
+        }
+        let removal = AccountDraftRemoval {
+            hub: self.clone(),
+            account: account.clone(),
+        };
+        drop(
+            self.draft_opened
+                .wait_while(self.opening.lock().expect("opening"), |opening| {
+                    opening.by_id.values().any(|owner| owner == account)
+                })
+                .expect("opening"),
+        );
+        let mut sessions = self.sessions.lock().expect("sessions");
+        let mut ids = Vec::new();
+        for (id, session) in sessions.iter() {
+            if session.account_id() == account {
+                if session.send_lock() == Some(SendLock::InFlight) {
+                    return Err(SEND_IN_PROGRESS.into());
+                }
+                ids.push(id.clone());
+            }
+        }
+        let released: Vec<_> = ids.iter().filter_map(|id| sessions.remove(id)).collect();
+        for slot in [&self.focused, &self.shown, &self.last_closed] {
+            let mut slot = slot.lock().expect("draft window");
+            if slot.as_ref().is_some_and(|id| ids.contains(id)) {
+                *slot = None;
+            }
+        }
+        drop(sessions);
+        drop(released);
+        self.emit();
+        Ok(removal)
+    }
+
     /// How many `request_send` calls have asked for the editor. A host opens
     /// or raises the compose window when this changes.
     pub fn reveal_count(&self) -> u64 {
@@ -730,7 +847,19 @@ impl DraftHub {
     }
 
     fn open_agent_draft(&self, draft_id: &str, agent: &str) -> Result<(), String> {
-        let Some(_opening) = self.begin_open(draft_id) else {
+        if self
+            .opening
+            .lock()
+            .expect("opening")
+            .by_id
+            .contains_key(draft_id)
+        {
+            return Err("the draft is opening in Fell; try again".into());
+        }
+        let account = super::persist::stored_compose_account(draft_id)
+            .map(AccountId)
+            .ok_or("draft has no mailbox record")?;
+        let Some(_opening) = self.begin_open(draft_id, &account)? else {
             return if self
                 .sessions
                 .lock()
@@ -742,8 +871,6 @@ impl DraftHub {
                 Err("the draft is opening in Fell; try again".into())
             };
         };
-        let account = super::persist::stored_compose_account(draft_id)
-            .ok_or("draft has no mailbox record")?;
         match super::persist::stored_compose_owner(draft_id).as_deref() {
             Some(owner) if owner == agent => {}
             Some(_) => return Err("this draft belongs to another agent".into()),
@@ -753,7 +880,7 @@ impl DraftHub {
         if workspace::draft_file_is_symlink(&folder) || !folder.join("draft.md").is_file() {
             return Err("draft has no mailbox record".into());
         }
-        let mut session = DraftSession::open_folder(&folder, crate::AccountId(account))?;
+        let mut session = DraftSession::open_folder(&folder, account)?;
         // As in insert_new, keep any live session that was inserted while opening.
         session.attach_writer();
         self.sessions
@@ -1922,19 +2049,76 @@ mod tests {
     #[test]
     fn one_open_of_a_draft_at_a_time_and_none_once_it_is_live() {
         let hub = DraftHub::new();
-        let first = hub.begin_open("d1").expect("nothing is opening d1");
-        assert!(hub.begin_open("d1").is_none(), "d1 is being opened");
-        assert!(hub.begin_open("d2").is_some(), "other drafts are not held");
+        let account = AccountId("a".into());
+        let first = hub
+            .begin_open("d1", &account)
+            .unwrap()
+            .expect("nothing is opening d1");
+        assert!(
+            hub.begin_open("d1", &account).unwrap().is_none(),
+            "d1 is being opened"
+        );
+        assert!(
+            hub.begin_open("d2", &account).unwrap().is_some(),
+            "other drafts are not held"
+        );
         drop(first);
-        assert!(hub.begin_open("d1").is_some());
+        assert!(hub.begin_open("d1", &account).unwrap().is_some());
         let live = hub_with_d1("open-guard");
-        assert!(live.begin_open("d1").is_none(), "d1 is live");
+        assert!(
+            live.begin_open("d1", &account).unwrap().is_none(),
+            "d1 is live"
+        );
+    }
+
+    #[test]
+    fn account_removal_waits_only_for_drafts_from_that_account() {
+        let hub = Arc::new(DraftHub::new());
+        let mail = AccountId("mail".into());
+        let work = AccountId("work".into());
+        let work_open = hub.begin_open("work-draft", &work).unwrap().unwrap();
+        let mail_open = hub.begin_open("mail-draft", &mail).unwrap().unwrap();
+        let (ready, removal) = mpsc::channel();
+        let worker = std::thread::spawn({
+            let hub = hub.clone();
+            let mail = mail.clone();
+            move || ready.send(hub.release_account_drafts(&mail)).unwrap()
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !hub.opening.lock().unwrap().removing.contains(&mail) {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(removal.try_recv().is_err());
+        assert!(hub.begin_open("another-mail-draft", &mail).is_err());
+        assert!(
+            hub.begin_open("another-work-draft", &work)
+                .unwrap()
+                .is_some()
+        );
+        drop(mail_open);
+        let removal = removal
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert!(hub.begin_open("another-mail-draft", &mail).is_err());
+        drop(removal);
+        assert!(
+            hub.begin_open("another-mail-draft", &mail)
+                .unwrap()
+                .is_some()
+        );
+        drop(work_open);
+        worker.join().unwrap();
     }
 
     #[test]
     fn the_socket_waits_for_a_draft_the_inbox_is_opening() {
         let hub = DraftHub::new();
-        let _opening = hub.begin_open("d9").unwrap();
+        let _opening = hub
+            .begin_open("d9", &AccountId("a".into()))
+            .unwrap()
+            .unwrap();
         let reply: Value = serde_json::from_str(
             &hub.handle_line(
                 &json!({ "id": 1, "op": "get_draft", "draft_id": "d9", "agent": "agent:bot" })

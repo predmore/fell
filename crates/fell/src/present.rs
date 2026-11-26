@@ -1285,6 +1285,9 @@ pub fn fit_notice(text: &str, max_px: f32, measure: impl Fn(&str) -> f32) -> Str
     if measure(text) <= max_px {
         return text.to_string();
     }
+    if text.starts_with("Couldn't remove ") && measure("…") <= max_px {
+        return cut_to(text, "", "", max_px, &measure);
+    }
     if let Some(fitted) = shorten_name(text, max_px, &measure) {
         return fitted;
     }
@@ -2044,6 +2047,17 @@ mod tests {
         let local = "Server copy stays. Remove here?  ·  20 marked  ·  No undo  ·  y";
         let fitted = fit_notice(local, 37.0, |text| text.chars().count() as f32);
         assert_eq!(fitted, "Server copy stays. Remove here?  ·  y");
+    }
+
+    #[test]
+    fn a_narrow_failed_account_removal_notice_keeps_the_account_name() {
+        let notice =
+            "Couldn't remove Harbor Desk · close other Fell or fell-mcp sessions, then retry";
+        let fitted = fit_notice(notice, 43.0, |text| text.chars().count() as f32);
+        assert!(
+            fitted.starts_with("Couldn't remove Harbor Desk"),
+            "{fitted}"
+        );
     }
 
     #[test]

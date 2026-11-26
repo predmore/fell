@@ -1,5 +1,6 @@
 //! Two-pane inbox. The window reads the local store and never talks to IMAP.
 
+mod accounts;
 mod activity;
 mod agent_notes;
 mod agents;
@@ -39,12 +40,12 @@ use gpui::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use fell_core::actions::LabelUndoTarget;
-use fell_core::compose::{DraftSummary, ReplyKind, ReplyStart};
+use fell_core::compose::{DraftSummary, ReplyKind};
 
 use crate::attachments::{self, Download, Fetcher, Request as AttachmentRequest};
 use crate::compose_launch::ComposeLaunch;
 use crate::compose_ui::ComposeView;
-use crate::draft_host::{self, AgentDrafts, DraftHome};
+use crate::draft_host::{self, DraftHome};
 use crate::frame_log::{FrameLog, SharedFrameLog};
 use crate::inbox_motion::{Disclosures, InboxMotion, PaneEntry, StatusMotion, ThreadGhost};
 use crate::keymap::{self, Action, KeyId};
@@ -137,7 +138,7 @@ pub fn run(
                 if let Some(trace) = &trace {
                     trace.window_created(window);
                 }
-                cx.new(|cx| Inbox::focused(startup, demo, window, cx))
+                cx.new(|cx| accounts::AccountWindow::new(startup, demo, None, window, cx))
             })
             .map(gpui::AnyWindowHandle::from)
         };
@@ -177,8 +178,8 @@ impl gpui::Global for InboxWindow {}
 
 impl InboxWindow {
     fn update(self, cx: &mut App, update: impl FnOnce(&mut Inbox, &mut Context<Inbox>)) {
-        let _ = self.0.update(cx, |root, _, cx| {
-            if let Ok(inbox) = root.downcast::<Inbox>() {
+        let _ = self.0.update(cx, |_, window, cx| {
+            if let Some(inbox) = accounts::active_inbox(window, cx) {
                 inbox.update(cx, update);
             }
         });
@@ -275,17 +276,6 @@ pub(crate) fn compose_draft_window_failed(id: &str, cx: &mut App) {
     }
 }
 
-pub(crate) fn wake_sent_copy_sync(cx: &mut App) {
-    if let Some(inbox) = cx.try_global::<InboxWindow>().copied() {
-        inbox.update(cx, |inbox, _| {
-            // A failed local insert can still have queued the server copy.
-            if let Some(sync) = &inbox.sync {
-                sync.write_back_now();
-            }
-        });
-    }
-}
-
 pub(crate) fn finish_onboarding(
     setup: gpui::Entity<Onboarding>,
     window: &mut Window,
@@ -293,17 +283,7 @@ pub(crate) fn finish_onboarding(
 ) {
     let startup = mailbox::startup();
     window.replace_root(cx, |window, cx| {
-        let mut inbox = Inbox::focused(startup, false, window, cx);
-        inbox.first_preview = FirstPreview::Handoff;
-        inbox.waiting_for_first_rows = true;
-        inbox.waiting_for_inbox_total = true;
-        let now = inbox.motion.clock.now();
-        inbox
-            .motion
-            .observe_header(&inbox.session.list_folder, None, None, now);
-        inbox.setup_exit = LayerSwap::start(inbox.motion.motion, now, motion::QUICK, motion::FADE)
-            .map(|swap| (setup, swap));
-        inbox
+        accounts::AccountWindow::new(startup, false, Some(setup), window, cx)
     });
 }
 
@@ -709,6 +689,47 @@ const ROW_PX: f32 = 68.0;
 const LONG_GLIDE_PX: f32 = 4.0 * ROW_PX;
 
 const FIRST_PREVIEW_WAIT: Duration = Duration::from_millis(1500);
+const ACCOUNT_SWITCH_ENTER_QUIET: Duration = Duration::from_millis(250);
+const ACCOUNT_SWITCH_ENTER_MAX_FRAME: Duration = Duration::from_millis(120);
+const ACCOUNT_SWITCH_ENTER_LIMIT: Duration = Duration::from_secs(1);
+const ACCOUNT_READER_WAIT: Duration = Duration::from_millis(150);
+
+struct AccountSwitchEnterGuard {
+    remaining: Duration,
+    last_frame: Option<Instant>,
+    deadline: Instant,
+}
+
+impl AccountSwitchEnterGuard {
+    fn new(now: Instant) -> Self {
+        Self {
+            remaining: ACCOUNT_SWITCH_ENTER_QUIET,
+            last_frame: None,
+            deadline: now + ACCOUNT_SWITCH_ENTER_LIMIT,
+        }
+    }
+
+    fn frame(&mut self, now: Instant) -> bool {
+        // Start on the incoming inbox's first frame. A late frame cannot
+        // clear the guard ahead of key events queued while the UI stalled.
+        if let Some(last) = self.last_frame.replace(now) {
+            let elapsed = now.saturating_duration_since(last);
+            self.remaining = self
+                .remaining
+                .saturating_sub(elapsed.min(ACCOUNT_SWITCH_ENTER_MAX_FRAME));
+        }
+        self.armed(now)
+    }
+
+    fn armed(&self, now: Instant) -> bool {
+        now < self.deadline && !self.remaining.is_zero()
+    }
+}
+
+enum AccountReaderArrival {
+    Waiting(Instant),
+    Fading(Transition),
+}
 
 #[derive(Default, PartialEq, Eq)]
 enum FirstPreview {
@@ -834,6 +855,13 @@ struct Inbox {
     merge_feedback_at: Option<Instant>,
     /// Background sync for the account file. `None` for the demo mailbox.
     sync: Option<SyncHandle>,
+    retired: bool,
+    compose_ready: futures::future::Shared<futures::channel::oneshot::Receiver<()>>,
+    account_arrival: Option<Transition>,
+    account_header_leaving: Option<(String, String)>,
+    account_reader_arrival: Option<AccountReaderArrival>,
+    switch_enter_guard: Option<AccountSwitchEnterGuard>,
+    legacy_account_focus: Option<usize>,
     /// Visible label rows as they looked in the last list prepaint.
     painted_label_rows: Vec<LeavingRow>,
     leaving_rows: Option<Arc<[LeavingRow]>>,
@@ -867,6 +895,7 @@ struct Inbox {
     conv_gen: Arc<AtomicU64>,
     /// Where `c` keeps a new draft. `None` when the mailbox did not open.
     draft_home: Option<DraftHome>,
+    reviews: Option<gpui::Task<()>>,
     opening_draft: Option<OpeningServerDraft>,
     /// The compose drafts at the top of the Drafts list, as last read.
     drafts: Vec<DraftSummary>,
@@ -910,38 +939,15 @@ struct Warm {
 const WARM_ROWS: usize = 2;
 
 impl Inbox {
-    fn focused(
-        startup: mailbox::Startup,
-        demo: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let inbox = Self::with_startup(startup, demo, Some(window), cx);
-        window.focus(&inbox.focus);
-        cx.on_focus_lost(window, |inbox, window, _| {
-            // A focused link can disappear when its message closes.
-            window.focus(&inbox.focus);
-        })
-        .detach();
-        cx.set_global(InboxWindow(window.window_handle()));
-        let mut viewport = (window.viewport_size(), window.scale_factor());
-        cx.observe_window_bounds(window, move |_, window, cx| {
-            let previous = viewport;
-            viewport = (window.viewport_size(), window.scale_factor());
-            if viewport != previous {
-                // Draw at the new bounds for the next compositor frame.
-                window.defer(cx, |window, cx| window.draw(cx).clear());
-            }
-        })
-        .detach();
-        cx.observe_window_activation(window, |this, window, cx| {
-            if window.is_window_active() {
-                this.refresh_settings_identities(cx);
-                cx.notify();
-            }
-        })
-        .detach();
-        inbox
+    fn account_setup_handoff(&mut self, setup: gpui::Entity<Onboarding>) {
+        self.first_preview = FirstPreview::Handoff;
+        self.waiting_for_first_rows = true;
+        self.waiting_for_inbox_total = true;
+        let now = self.motion.clock.now();
+        self.motion
+            .observe_header(&self.session.list_folder, None, None, now);
+        self.setup_exit = LayerSwap::start(self.motion.motion, now, motion::QUICK, motion::FADE)
+            .map(|swap| (setup, swap));
     }
 
     fn with_startup(
@@ -968,11 +974,10 @@ impl Inbox {
         let (store, ready) = StoreClient::spawn(
             {
                 let config = config.clone();
-                move || mailbox::open_store(path.clone(), config.as_ref(), demo)
+                move || mailbox::open_registered_store(path.clone(), config.as_ref(), demo)
             },
             notices,
         );
-        cx.set_global(crate::compose_ui::RecipientStore(store.clone()));
         let (name, email) = match &config {
             Some(config) => {
                 let account = config.account();
@@ -1006,10 +1011,15 @@ impl Inbox {
                 config.account().id,
             );
             Self::watch_notifications(window.window_handle(), invoked, cx);
-            cx.observe_window_activation(window, Self::notification_window_activation)
-                .detach();
+            cx.observe_window_activation(window, |inbox, window, cx| {
+                if accounts::active_inbox(window, cx).as_ref() == Some(&cx.entity()) {
+                    inbox.notification_window_activation(window, cx);
+                }
+            })
+            .detach();
             queue
         });
+        let (compose_ready_tx, compose_ready) = futures::channel::oneshot::channel();
         let mut inbox = Self {
             focus: cx.focus_handle(),
             notifications,
@@ -1082,6 +1092,13 @@ impl Inbox {
             regroup_selection: None,
             merge_feedback_at: None,
             sync: None,
+            retired: false,
+            compose_ready: futures::FutureExt::shared(compose_ready),
+            account_arrival: None,
+            account_header_leaving: None,
+            account_reader_arrival: None,
+            switch_enter_guard: None,
+            legacy_account_focus: None,
             painted_label_rows: Vec::new(),
             leaving_rows: None,
             leaving_reader: None,
@@ -1098,6 +1115,7 @@ impl Inbox {
             row_widths: RowWidths::new(motion),
             conv_gen: Arc::new(AtomicU64::new(0)),
             draft_home,
+            reviews: None,
             opening_draft: None,
             drafts: Vec::new(),
             motion: InboxMotion::new(motion),
@@ -1116,17 +1134,93 @@ impl Inbox {
             let Ok(opened) = ready.await else {
                 return;
             };
-            let _ = this.update(cx, |inbox, cx| inbox.on_store_ready(opened, sync_with, cx));
+            let _ = this.update(cx, |inbox, cx| {
+                if !inbox.retired {
+                    inbox.on_store_ready(opened, sync_with, cx);
+                }
+            });
+            let _ = compose_ready_tx.send(());
         })
         .detach();
         inbox.show_crash_notice(cx);
         inbox.watch_store_restarts(store_restarts, cx);
         inbox.refresh_settings_availability();
         inbox.watch_settings(legacy, cx);
-        inbox.watch_reviews(cx);
         inbox.watch_notes(cx);
         inbox.watch_dates(cx);
         inbox
+    }
+
+    fn adopt_account_view(&mut self, previous: &Self) {
+        let mut session = previous.session.clone();
+        session.reset_after_account_reload();
+        session.account_name = std::mem::take(&mut self.session.account_name);
+        session.account_email = std::mem::take(&mut self.session.account_email);
+        session.startup_error = self.session.startup_error.take();
+        session.sync = self.session.sync.clone();
+        self.session = session;
+        self.open_thread.clone_from(&previous.open_thread);
+        self.open_subject.clone_from(&previous.open_subject);
+        self.list_scroll = previous.list_scroll.clone();
+        self.conv_scroll = previous.conv_scroll.clone();
+        self.preview_laid_out = previous.preview_laid_out;
+        self.reveal = previous.reveal;
+        self.split = previous.split;
+        self.frames.clone_from(&previous.frames);
+    }
+
+    fn account_opacity(&self, now: Instant) -> f32 {
+        motion::lerp(
+            motion::ARRIVE_FROM,
+            1.0,
+            motion::progress(self.account_arrival.as_ref(), now),
+        )
+    }
+
+    fn start_account_arrival(&mut self, real: Instant) {
+        self.motion.clock.idle();
+        let now = self.motion.clock.now_at(real);
+        self.account_arrival = self.motion.motion.start(motion::FADE, now);
+        self.account_reader_arrival = self.account_arrival.map(|fade| {
+            if self.account_reader_ready() {
+                AccountReaderArrival::Fading(fade)
+            } else {
+                AccountReaderArrival::Waiting(real + ACCOUNT_READER_WAIT)
+            }
+        });
+    }
+
+    fn account_reader_ready(&self) -> bool {
+        !self.session.loading
+            && self.open_thread == self.session.cursor_id
+            && !self.session.cursor_awaits_body()
+            && self
+                .session
+                .messages
+                .get(self.session.message_cursor)
+                .is_none_or(|message| !self.body_loads.awaiting(&message.id))
+    }
+
+    fn account_reader_opacity(&mut self, real: Instant, now: Instant) -> Option<f32> {
+        if let Some(AccountReaderArrival::Waiting(until)) = self.account_reader_arrival
+            && (real >= until || self.account_reader_ready())
+        {
+            self.account_reader_arrival = self
+                .motion
+                .motion
+                .start(motion::FADE, now)
+                .map(AccountReaderArrival::Fading);
+        }
+        match self.account_reader_arrival {
+            Some(AccountReaderArrival::Waiting(_)) => Some(motion::ARRIVE_FROM),
+            Some(AccountReaderArrival::Fading(fade)) if fade.running(now) => {
+                Some(motion::lerp(motion::ARRIVE_FROM, 1.0, fade.progress(now)))
+            }
+            _ => {
+                self.account_reader_arrival = None;
+                None
+            }
+        }
     }
 
     fn refresh_reply_checks(&self, ids: Vec<fell_core::MessageId>, cx: &mut Context<Self>) {
@@ -1134,6 +1228,7 @@ impl Inbox {
             return;
         }
         let account = self.account_id.clone();
+        let self_account = account.clone();
         let read = self.store.call(move |store| {
             let mut verified = Vec::new();
             for id in ids {
@@ -1152,6 +1247,7 @@ impl Inbox {
             {
                 let _ = this.update(cx, |_, cx| {
                     cx.global_mut::<ReplyChecks>()
+                        .for_account_mut(&self_account)
                         .apply(fell_core::ReplyToProgress::Verified(verified));
                     cx.notify();
                 });
@@ -1170,6 +1266,9 @@ impl Inbox {
             trace.store_opened(opened.error.as_deref());
         }
         self.account_id = opened.account.id.clone();
+        cx.default_global::<crate::compose_ui::RecipientStore>()
+            .0
+            .insert(self.account_id.clone(), self.store.clone());
         self.session.account_name = opened.account.display_name.clone();
         self.session.account_email = opened.account.email.clone();
         if let Some(error) = opened.error {
@@ -1186,15 +1285,8 @@ impl Inbox {
         }
         self.session.sync = opened.sync;
         self.first_preview.sync_changed(&self.session.sync);
-        if let Some(warning) = opened.warning {
-            self.session.show_toast(warning, false);
-            self.dismiss_notice_after(
-                self.session.toast_generation(),
-                std::time::Duration::from_secs(8),
-                cx,
-            );
-        }
         cx.default_global::<ReplyChecks>()
+            .for_account_mut(&self.account_id)
             .start(self.account_id.clone(), sync_with.is_none() || store_failed);
         if !store_failed {
             self.cid_repair = Some(self.store.call(fell_core::Store::cid_repair_progress));
@@ -1209,68 +1301,15 @@ impl Inbox {
                 let sync = handle.clone();
                 drafts
                     .0
-                    .on_server_draft_queued(move || sync.write_back_now());
+                    .on_server_draft_queued(self.account_id.clone(), move || sync.write_back_now());
             }
             self.sync = Some(handle);
             self.watch_sync(events, cx);
         }
         self.request_threads(ReadIntent::default(), cx);
         self.search_store_ready(cx);
-        self.watch_external_compose(cx);
+        self.watch_reviews(cx);
         cx.notify();
-    }
-
-    fn watch_external_compose(&self, cx: &mut Context<Self>) {
-        if cx.try_global::<ExternalCompose>().is_none() {
-            return;
-        }
-        let Some(mut requests) = cx.global_mut::<ExternalCompose>().0.take() else {
-            return;
-        };
-        let home = self.draft_home.clone();
-        let hub = cx.global::<AgentDrafts>().0.clone();
-        let account = self.account_id.clone();
-        let from = fell_core::compose::configured_from(
-            &self.session.account_name,
-            &self.session.account_email,
-        );
-        cx.spawn(async move |this, cx| {
-            while let Some(request) = futures::StreamExt::next(&mut requests).await {
-                let result = if let Some(home) = home.clone() {
-                    let hub = hub.clone();
-                    let account = account.clone();
-                    let (fields, body) = request.input.into_fields_and_body(from.clone());
-                    let start = ReplyStart {
-                        fields,
-                        parts: Default::default(),
-                    };
-                    cx.background_executor()
-                        .spawn(async move {
-                            home.new_seeded(&hub, &account, start, body, request.files)
-                        })
-                        .await
-                } else {
-                    Err("The mailbox did not open, so a draft has nowhere to go".into())
-                };
-                if this
-                    .update(cx, |inbox, cx| {
-                        match result {
-                            Ok(id) => {
-                                draft_host::show_draft(&hub, &id);
-                            }
-                            Err(err) => inbox
-                                .session
-                                .show_toast(format!("Couldn't start a draft. {err}"), true),
-                        }
-                        cx.notify();
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
-        .detach();
     }
 
     fn repair_cached_cids(
@@ -1385,11 +1424,13 @@ impl Inbox {
                             SyncEvent::ReplyTo(progress) => {
                                 let finished =
                                     matches!(progress, fell_core::ReplyToProgress::Finished);
-                                cx.global_mut::<ReplyChecks>().apply(progress);
+                                cx.global_mut::<ReplyChecks>()
+                                    .for_account_mut(&inbox.account_id)
+                                    .apply(progress);
                                 if finished {
                                     // Also resolve watched drafts whose parent has since become an alias.
                                     inbox.refresh_reply_checks(
-                                        cx.global::<ReplyChecks>().pending(),
+                                        cx.global::<ReplyChecks>().pending(&inbox.account_id),
                                         cx,
                                     );
                                 }
@@ -1507,7 +1548,9 @@ impl Inbox {
                         let wrote = matches!(kind, SyncKind::Syncing { .. })
                             || matches!(kind, SyncKind::Synced { changed: true, .. });
                         if matches!(kind, SyncKind::Failed(_)) {
-                            cx.global_mut::<ReplyChecks>().set_offline(true);
+                            cx.global_mut::<ReplyChecks>()
+                                .for_account_mut(&inbox.account_id)
+                                .set_offline(true);
                         }
                         let active =
                             matches!(kind, SyncKind::Connecting | SyncKind::Syncing { .. });
@@ -1527,10 +1570,14 @@ impl Inbox {
                                 .wait_for_read(inbox.conv_gen.load(Ordering::SeqCst));
                         }
                         if matches!(kind, SyncKind::Synced { .. }) {
-                            cx.global_mut::<ReplyChecks>().set_offline(false);
+                            cx.global_mut::<ReplyChecks>()
+                                .for_account_mut(&inbox.account_id)
+                                .set_offline(false);
                             if wrote {
-                                inbox
-                                    .refresh_reply_checks(cx.global::<ReplyChecks>().pending(), cx);
+                                inbox.refresh_reply_checks(
+                                    cx.global::<ReplyChecks>().pending(&inbox.account_id),
+                                    cx,
+                                );
                             }
                             inbox.reader_bodies.failed.retain(|_, failure| {
                                 !matches!(failure, reader_body_worker::Failure::Connection)
@@ -3277,7 +3324,7 @@ impl Inbox {
 
     /// Say so in the status bar when a review window an agent opened closes,
     /// so the person knows the draft was kept and nothing was sent.
-    fn watch_reviews(&self, cx: &mut Context<Self>) {
+    fn watch_reviews(&mut self, cx: &mut Context<Self>) {
         let Some(hub) = cx
             .try_global::<crate::draft_host::AgentDrafts>()
             .map(|drafts| drafts.0.clone())
@@ -3287,10 +3334,11 @@ impl Inbox {
         let (tx, mut events) = futures::channel::mpsc::unbounded::<()>();
         hub.subscribe_with(move || tx.unbounded_send(()).is_ok());
         let store = self.store.clone();
-        cx.spawn(async move |this, cx| {
+        let account = self.account_id.clone();
+        self.reviews = Some(cx.spawn(async move |this, cx| {
             while events.next().await.is_some() {
                 while events.try_recv().is_ok() {}
-                let closed = if let Some(notice) = hub.take_close_notices().pop() {
+                let closed = if let Some(notice) = hub.take_close_notices_for(&account).pop() {
                     let notice = if notice.needs_local_write() {
                         cx.background_executor()
                             .spawn(async move { notice.after_local_write() })
@@ -3328,8 +3376,7 @@ impl Inbox {
                     break;
                 }
             }
-        })
-        .detach();
+        }));
     }
 
     fn show_sent_copy(&mut self, thread: ThreadId, mut message: fell_core::Message, rich: Rich) {
@@ -4050,7 +4097,11 @@ impl Inbox {
     }
 
     fn watch_reply_check(&self, id: fell_core::MessageId, cx: &mut Context<Self>) {
-        if cx.global_mut::<ReplyChecks>().watch(id.clone()) {
+        if cx
+            .global_mut::<ReplyChecks>()
+            .for_account_mut(&self.account_id)
+            .watch(id.clone())
+        {
             self.refresh_reply_checks(vec![id], cx);
             cx.notify();
         }
@@ -4503,6 +4554,12 @@ impl Inbox {
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let started = Instant::now();
+        if key_from(&event.keystroke) == Some(KeyId::Enter)
+            && self.swallow_switch_enter(event.is_held, started)
+        {
+            cx.stop_propagation();
+            return;
+        }
         if self.reveal == Reveal::Preview {
             self.reader_took_over(false);
             cx.notify();
@@ -4516,6 +4573,40 @@ impl Inbox {
             return;
         }
         let stroke = &event.keystroke;
+        if self.session.overlay == Overlay::None
+            && self.session.sync == SyncKind::StoreError
+            && self.settings_view.broken_legacy_path().is_some()
+            && self.session.chord.is_empty()
+            && !stroke.modifiers.control
+            && !stroke.modifiers.alt
+            && !stroke.modifiers.platform
+        {
+            let activate = match stroke.key.as_str() {
+                "tab" => {
+                    self.legacy_account_focus = Some(
+                        self.legacy_account_focus
+                            .map_or(usize::from(stroke.modifiers.shift), |index| 1 - index),
+                    );
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
+                "a" => Some(0),
+                "e" => Some(1),
+                "enter" | "space" => self.legacy_account_focus,
+                _ => None,
+            };
+            if let Some(index) = activate {
+                if !event.is_held {
+                    self.settings_request(settings::LEGACY_ACCOUNT_REQUESTS[index], false, cx);
+                }
+                cx.stop_propagation();
+                return;
+            }
+        }
+        if self.legacy_account_focus.take().is_some() {
+            cx.notify();
+        }
         if self.session.pane == Pane::Conversation
             && self.session.overlay == Overlay::None
             && self.session.chord.is_empty()
@@ -4556,6 +4647,8 @@ impl Inbox {
             log.borrow_mut().key(started, event.keystroke.unparse());
         }
         // Input never waits on an animation.
+        self.account_arrival = None;
+        self.account_reader_arrival = None;
         self.settle_motion();
         self.regroup_motion = None;
         self.regroup_selection = None;
@@ -4567,6 +4660,7 @@ impl Inbox {
             });
             if self.help_scroll.on_key(key, &self.motion.motion, now) {
                 self.motion.end_key();
+                self.account_arrival = None;
                 cx.notify();
                 cx.stop_propagation();
                 return;
@@ -4611,8 +4705,26 @@ impl Inbox {
         if let Some((trace, started)) = trace {
             trace.key(started, step.action.map_or("Inbox input", Action::label));
         }
-        self.apply_step(step, before, cx);
+        self.apply_step_with_input(step, before, key == KeyId::Enter, cx);
         cx.stop_propagation();
+    }
+
+    fn swallow_switch_enter(&self, held: bool, now: Instant) -> bool {
+        held || self
+            .switch_enter_guard
+            .as_ref()
+            .is_some_and(|guard| guard.armed(now))
+    }
+
+    fn advance_switch_enter_guard(&mut self, now: Instant) -> bool {
+        let armed = self
+            .switch_enter_guard
+            .as_mut()
+            .is_some_and(|guard| guard.frame(now));
+        if !armed {
+            self.switch_enter_guard = None;
+        }
+        armed
     }
 
     /// Where the reader was before a key or action: [`Inbox::apply_step`]
@@ -4633,6 +4745,16 @@ impl Inbox {
     }
 
     fn apply_step(&mut self, step: Step, before: StepBefore, cx: &mut Context<Self>) {
+        self.apply_step_with_input(step, before, false, cx);
+    }
+
+    fn apply_step_with_input(
+        &mut self,
+        step: Step,
+        before: StepBefore,
+        confirmed_with_enter: bool,
+        cx: &mut Context<Self>,
+    ) {
         let StepBefore {
             message: message_before,
             thread: thread_before,
@@ -4644,6 +4766,15 @@ impl Inbox {
             overlay,
             settings_page,
         } = before;
+        if let Some(id) = step.switch_account.clone()
+            && let Some(window) = cx.try_global::<InboxWindow>().copied()
+        {
+            cx.defer(move |cx| {
+                let _ = window.0.update(cx, |_, window, cx| {
+                    accounts::switch(&id, confirmed_with_enter, window, cx)
+                });
+            });
+        }
         if pane_before != Pane::Conversation && self.session.pane == Pane::Conversation {
             self.reader_entered_conversation();
         }
@@ -4804,24 +4935,22 @@ impl Inbox {
         if let Some(mode) = step.notification_mode {
             self.settings_request(
                 crate::model::settings::Request::Save(crate::settings::Edit::Notifications(mode)),
+                false,
                 cx,
             );
         }
         if let Some(request) = step.settings {
-            self.settings_request(request, cx);
+            self.settings_request(request, confirmed_with_enter, cx);
         }
         if self.session.overlay == Overlay::Settings {
+            use crate::model::settings::Page;
             self.validate_settings_step(cx);
             let page = self.session.settings_nav.page;
             if settings_page != Some(page) {
                 self.settings_view.reset_scroll();
                 self.refresh_settings_identities(cx);
             }
-            if matches!(
-                page,
-                crate::model::settings::Page::Section(_)
-                    | crate::model::settings::Page::IdentityImport
-            ) {
+            if matches!(page, Page::Section(_) | Page::IdentityImport) {
                 self.settings_view
                     .scroll_to(self.session.settings_nav.selected);
             }
@@ -5444,6 +5573,7 @@ impl Render for Inbox {
         self.bodies
             .release_unused_images(|image| cx.drop_image(image, Some(window)));
         let real = Instant::now();
+        let guarding_switch = self.advance_switch_enter_guard(real);
         // Motion time: a frame the compositor held back moves what is
         // moving one step on, not to its end.
         let now = self.motion.clock.frame(real);
@@ -5740,6 +5870,7 @@ impl Render for Inbox {
             .take()
             .filter(|motion| motion.running(now));
         let conv = ConvFrame {
+            account_opacity: self.account_reader_opacity(real, now),
             syncing: self.pending_bodies.downloading(&self.session.sync),
             missing_fade: self.pending_bodies.fade(now),
             feedback,
@@ -5796,7 +5927,7 @@ impl Render for Inbox {
             let selected = self.session.reply_target().filter(|_| {
                 self.open_thread.is_some() && self.open_thread == self.session.cursor_id
             });
-            selected.and_then(|target| checks.for_message(&target.id))
+            selected.and_then(|target| checks.for_message(&self.account_id, &target.id))
         });
         let status =
             if self.opening_draft.as_ref().is_some_and(|open| {
@@ -5817,7 +5948,10 @@ impl Render for Inbox {
             cx,
         );
         let (merge_feedback, merge_animating) = self.merge_feedback(real);
+        self.account_arrival = self.account_arrival.filter(|fade| fade.running(now));
         let animating = self.motion.tick(now)
+            | self.account_arrival.is_some_and(|fade| fade.running(now))
+            | conv.account_opacity.is_some()
             | link_fading
             | waiting_for_resize
             | self.note_view.running()
@@ -5852,7 +5986,7 @@ impl Render for Inbox {
             | settings_animating
             | self.search_view.animating(now)
             | (self.session.overlay == Overlay::Help && self.help_scroll.running(now));
-        if animating {
+        if animating || guarding_switch {
             window.request_animation_frame();
         } else {
             self.motion.clock.idle();
@@ -5965,7 +6099,11 @@ impl Render for Inbox {
                         &theme,
                         session,
                         &self.settings_view,
-                        live,
+                        if live {
+                            settings::CardMode::Live
+                        } else {
+                            settings::CardMode::Leaving
+                        },
                         (
                             card.unwrap_or_else(|| {
                                 settings::card_height(
@@ -6025,6 +6163,7 @@ impl Render for Inbox {
         let background = theme.background;
         let leaving_banner = self.motion.leaving_banner(now);
         let recipient_popup = self.search_recipient_popup(window, cx);
+        let account_opacity = self.account_opacity(now);
         let root = shell(
             theme,
             &self.session,
@@ -6045,10 +6184,22 @@ impl Render for Inbox {
                     leaving_banner,
                     leaving: self.leaving_rows.clone().map(|rows| (rows, exit)),
                     cached_results: cached_search_rows,
+                    legacy_account_actions: (self.settings_view.broken_legacy_path().is_some()
+                        && self.session.sync == SyncKind::StoreError)
+                        .then(|| {
+                            [Some(0), Some(1)].map(|index| index == self.legacy_account_focus)
+                        }),
                 },
                 status_labels,
                 link_preview,
                 recipient_popup,
+                account_opacity,
+                account_header_fade: self
+                    .account_arrival
+                    .zip(self.account_header_leaving.as_ref())
+                    .map(|(fade, (name, email))| {
+                        ((name.as_str(), email.as_str()), fade.progress(now))
+                    }),
             },
             width,
             (list_width, split_width),
@@ -6112,7 +6263,7 @@ struct Drawn {
 }
 
 /// What the frame shows beyond the session.
-struct Shown {
+struct Shown<'a> {
     /// The open conversation's subject. It changes with the messages, not
     /// with the selection, so a subject never sits over another thread.
     subject: String,
@@ -6133,6 +6284,8 @@ struct Shown {
     status_labels: StatusLabelsFrame,
     link_preview: reader_links::PreviewFrame,
     recipient_popup: Option<gpui::Deferred>,
+    account_opacity: f32,
+    account_header_fade: Option<((&'a str, &'a str), f32)>,
 }
 
 struct LeavingReader {
@@ -6170,11 +6323,13 @@ struct ListContent {
     leaving_banner: Option<(Banner, f32)>,
     leaving: Option<(Arc<[LeavingRow]>, f32)>,
     cached_results: Option<(u64, gpui::AnyView)>,
+    legacy_account_actions: Option<[bool; 2]>,
 }
 
 /// What the conversation's bodies show this frame beyond the session.
 #[derive(Default)]
 struct ConvFrame {
+    account_opacity: Option<f32>,
     agent_note: Option<agent_notes::NoteFrame>,
     pin: Option<agent_notes::PinnedFrame>,
     note_details_only: bool,
@@ -6309,7 +6464,7 @@ fn shell(
     session: &Session,
     motion: &mut InboxMotion,
     now: Instant,
-    shown: Shown,
+    shown: Shown<'_>,
     width: f32,
     (list_width, split_width): (f32, f32),
     list_scroll: UniformListScrollHandle,
@@ -6337,6 +6492,8 @@ fn shell(
         status_labels,
         link_preview,
         recipient_popup,
+        account_opacity,
+        account_header_fade,
     } = shown;
     let frames = conv.frames.clone();
     let same_scope = session.search.is_none()
@@ -6372,6 +6529,7 @@ fn shell(
                 list_scroll.clone(),
                 ListContent {
                     banner: list.banner.clone(),
+                    legacy_account_actions: list.legacy_account_actions,
                     ..ListContent::default()
                 },
                 cx,
@@ -6471,15 +6629,15 @@ fn shell(
             )
         })
         .child(match &session.search {
-            Some(search) => search::header(&theme, search, width, window, cx),
+            Some(search) => search::header(&theme, search, session, width, window, cx),
             None => header(
                 &theme,
                 session,
                 (&folder, label.as_deref()),
                 motion,
                 now,
-                width,
-                window,
+                (width, window),
+                account_header_fade,
             ),
         })
         .children(recipient_popup)
@@ -6520,7 +6678,7 @@ fn shell(
                                         .flex()
                                         .flex_row()
                                         .opacity(motion.reading_list_opacity(now) * empty_list_pane)
-                                        .child(list)
+                                        .child(list.opacity(account_opacity))
                                         .child(splitter(&theme, cx)),
                                 )
                                 .when(!show_list, |clip| {
@@ -6536,7 +6694,10 @@ fn shell(
                                 }),
                         )
                     } else {
-                        row.child(entering(list.opacity(empty_list_pane), list_entry))
+                        row.child(entering(
+                            list.opacity(empty_list_pane * account_opacity),
+                            list_entry,
+                        ))
                     }
                 })
                 .when(
@@ -6562,7 +6723,7 @@ fn shell(
                                         ))
                                     },
                                 );
-                            return row.child(pane);
+                            return row.child(pane.opacity(conv.account_opacity.unwrap_or(1.)));
                         }
                         row.child(entering(
                             conversation(
@@ -6844,13 +7005,13 @@ struct HeaderAccount {
 
 impl HeaderAccount {
     fn fit(
-        session: &Session,
+        account: (&str, &str),
         room: f32,
         gap: f32,
         show_email: bool,
         fit: &impl Fn(&str, f32, FontWeight) -> Option<gpui::ShapedLine>,
     ) -> Self {
-        let (name, email) = account_header(&session.account_name, &session.account_email);
+        let (name, email) = account_header(account.0, account.1);
         let full = fit(name, room, FontWeight::SEMIBOLD).filter(|line| line.text == name);
         let quiet = full.is_none();
         let name = full.or_else(|| fit(name, room, FontWeight::NORMAL));
@@ -6905,8 +7066,8 @@ fn header(
     scope: (&str, Option<&str>),
     motion: &mut InboxMotion,
     now: Instant,
-    width: f32,
-    window: &Window,
+    (width, window): (f32, &Window),
+    account_fade: Option<((&str, &str), f32)>,
 ) -> gpui::Div {
     const PAD: f32 = 16.;
     const FOLDER_GAP: f32 = 24.;
@@ -7063,26 +7224,37 @@ fn header(
     let (outgoing, incoming) = fade
         .as_ref()
         .map_or((0., label_header_opacity), |fade| fade.label_opacities(now));
-    let fit_account = |folder_width| {
+    let fit_account = |account, folder_width| {
         HeaderAccount::fit(
-            session,
+            account,
             room - folder_width,
             COUNT_GAP,
             width >= DETAIL_MIN_WIDTH,
             &fit,
         )
     };
-    let account = fit_account(current_width);
+    let account_text = (
+        session.account_name.as_str(),
+        session.account_email.as_str(),
+    );
+    let account = fit_account(account_text, current_width);
     // Each account fit shares its half of the fade with its folder. This
     // keeps both fits at their own widths and the right edge anchored.
     let (account, account_opacities) = if let Some(fade) = fade {
-        let old = fit_account(old_width);
+        let old = fit_account(account_text, old_width);
         let name_changes = old.name != account.name || old.quiet != account.quiet;
         let email_changes = name_changes || old.email != account.email;
         let (leaving, opacities) = fade.account_frame([name_changes, email_changes], now);
         (if leaving { old } else { account }, opacities)
     } else {
         (account, [1.; 2])
+    };
+    let (account_opacities, leaving_account) = match account_fade {
+        Some((old, shown)) if old != account_text => (
+            account_opacities.map(|value| value * shown),
+            Some(fit_account(old, current_width).render(theme, COUNT_GAP, [1. - shown; 2])),
+        ),
+        _ => (account_opacities, None),
     };
     let folder_slot = |group: gpui::Div, width: f32| {
         div()
@@ -7103,11 +7275,15 @@ fn header(
         .border_b(px(1.))
         .border_color(rgb(theme.border))
         .bg(rgb(theme.surface))
-        .child(div().flex_1().min_w_0().flex().child(account.render(
-            theme,
-            COUNT_GAP,
-            account_opacities,
-        )))
+        .child(
+            div()
+                .relative()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .child(account.render(theme, COUNT_GAP, account_opacities))
+                .children(leaving_account.map(|old| old.absolute().left_0().top_0())),
+        )
         .child(
             div()
                 .flex_none()
@@ -7179,11 +7355,15 @@ fn thread_list(
     if session.threads.is_empty() {
         return pane
             .relative()
-            .children(
-                content
-                    .banner
-                    .map(|(banner, opacity)| empty_state(theme, banner).opacity(opacity)),
-            )
+            .children(content.banner.map(|(mut banner, opacity)| {
+                let actions = content.legacy_account_actions.map(|focus| {
+                    banner.hint.clear();
+                    settings::legacy_account_actions(theme, focus, cx)
+                });
+                empty_state(theme, banner)
+                    .children(actions)
+                    .opacity(opacity)
+            }))
             .children(content.leaving_banner.map(|(banner, opacity)| {
                 empty_state(theme, banner)
                     .absolute()
@@ -9475,7 +9655,12 @@ fn conversation(
         None => (subject, session.messages.as_slice(), 1.0),
     };
     let live = Live(live.0 && leaving.is_none());
-    let arrival = leaving.map_or_else(|| motion.arrival(now), |(reader, _)| reader.arrival);
+    // A cold account and its first thread can arrive together. Share their
+    // lower opacity so two fades do not multiply into an almost empty frame.
+    let arrival = leaving.map_or_else(
+        || motion.arrival(now).min(frame.account_opacity.unwrap_or(1.)),
+        |(reader, _)| reader.arrival,
+    );
     let chip_probe = (live.0 && frame.reveal_attachment).then(LayoutSlot::default);
     let hold = frame
         .anchor
@@ -12133,7 +12318,10 @@ fn card_fit(
             let empty_label = choices.is_empty()
                 && matches!(
                     session.folder_intent,
-                    FolderIntent::Label | FolderIntent::LabelList | FolderIntent::Merge
+                    FolderIntent::Label
+                        | FolderIntent::LabelList
+                        | FolderIntent::Merge
+                        | FolderIntent::Account
                 );
             Some(picker_card_height(
                 choices
@@ -12262,10 +12450,12 @@ fn overlay(
                 .when_some(card, |card, height| card.h(px(height)))
                 .opacity(opacity)
                 .into_any_element(),
-            Overlay::Folders => folder_picker(theme, session, folder_scroll, picker, window, cx)
-                .when_some(card, |card, height| card.h(px(height)))
-                .opacity(opacity)
-                .into_any_element(),
+            Overlay::Folders => {
+                folder_picker(theme, session, folder_scroll, picker, live, window, cx)
+                    .when_some(card, |card, height| card.h(px(height)))
+                    .opacity(opacity)
+                    .into_any_element()
+            }
             Overlay::Snooze => snooze::card(
                 theme,
                 &session.snooze,
@@ -12471,6 +12661,7 @@ fn folder_picker(
         mark_opacity,
         merge_feedback,
     }: PickerCard<'_>,
+    live: bool,
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::Div {
@@ -12489,9 +12680,10 @@ fn folder_picker(
         FolderIntent::Label | FolderIntent::LabelList
     );
     let merging = session.folder_intent == FolderIntent::Merge;
+    let accounts = session.folder_intent == FolderIntent::Account;
     let selected = session.folder_index;
     let match_query = session.folder_query.trim().to_ascii_lowercase();
-    let inset = if labeling || merging {
+    let inset = if labeling || merging || accounts {
         2.0 * MARGIN
     } else {
         0.0
@@ -12537,7 +12729,7 @@ fn folder_picker(
     div()
         .w(px(width))
         .max_w_full()
-        .when(labeling || merging, |card| card.mx(px(MARGIN)))
+        .when(labeling || merging || accounts, |card| card.mx(px(MARGIN)))
         .min_w_0()
         .max_h(px(PICKER_MAX_PX))
         .bg(rgb(theme.surface))
@@ -12616,32 +12808,36 @@ fn folder_picker(
                 .overflow_y_scroll()
                 .track_scroll(scroll)
                 .my(px(present::CARD_ROW_INSET_PX))
-                .children(((labeling || merging) && choices.is_empty()).then(|| {
-                    div()
-                        .h(px(PICKER_ROW_PX))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .px(px(14.))
-                        .text_color(rgb(theme.dimmed))
-                        .child(if merging {
-                            if !session.merge_loading {
-                                "No matching conversations"
-                            } else if merge_feedback > 0. {
-                                "Searching…"
+                .children(
+                    ((labeling || merging || accounts) && choices.is_empty()).then(|| {
+                        div()
+                            .h(px(PICKER_ROW_PX))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .px(px(14.))
+                            .text_color(rgb(theme.dimmed))
+                            .child(if merging {
+                                if !session.merge_loading {
+                                    "No matching conversations"
+                                } else if merge_feedback > 0. {
+                                    "Searching…"
+                                } else {
+                                    ""
+                                }
+                            } else if accounts {
+                                "No matching accounts"
+                            } else if session.folder_query.is_empty() {
+                                "No labels yet"
                             } else {
-                                ""
-                            }
-                        } else if session.folder_query.is_empty() {
-                            "No labels yet"
-                        } else {
-                            "No matching labels"
-                        })
-                }))
+                                "No matching labels"
+                            })
+                    }),
+                )
                 .children(choices.iter().enumerate().map(|(index, choice)| {
                     let label = present::display_safe(&choice.title);
                     let room = label_room
-                        - if session.folder_intent == crate::model::FolderIntent::Label {
+                        - if session.folder_intent == FolderIntent::Label || accounts {
                             16.0 + 8.0
                         } else {
                             0.0
@@ -12655,7 +12851,7 @@ fn folder_picker(
                         clip_shaped(window, &style, text, room, FontWeight::NORMAL, None)
                             .filter(|line| f32::from(line.width).ceil() <= room)
                     };
-                    let label = if labeling || merging {
+                    let label = if labeling || merging || accounts {
                         clip(&label)
                     } else {
                         fit_folder_path(&label, FolderFit::Picker(&match_query), clip, |line| {
@@ -12683,6 +12879,18 @@ fn folder_picker(
                     } else {
                         theme.dimmed
                     };
+                    let detail_color = if accounts {
+                        theme::account_detail_color(
+                            detail_color,
+                            if index == selected {
+                                theme.selection
+                            } else {
+                                theme.surface
+                            },
+                        )
+                    } else {
+                        detail_color
+                    };
                     let row = div()
                         .id(gpui::ElementId::named_usize("folder", index))
                         .h(px(PICKER_ROW_PX))
@@ -12704,44 +12912,49 @@ fn folder_picker(
                         } else {
                             theme.foreground
                         }))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |inbox, _, window, cx| {
-                                // A picker fading out takes no clicks.
-                                if inbox.session.visible_overlay() != Overlay::Folders
-                                    || (merging && inbox.session.merge_loading)
-                                {
-                                    return;
-                                }
-                                cx.stop_propagation();
-                                window.focus(&inbox.focus);
-                                inbox.session.clear_toast();
-                                inbox.session.folder_index = index;
-                                let before = inbox.before_step();
-                                let step = inbox.session.confirm_folder();
-                                inbox.apply_step(step, before, cx);
-                            }),
-                        )
-                        .gap(px(if merging { 0.0 } else { GAP }))
-                        .overflow_hidden()
-                        .when(session.folder_intent == FolderIntent::Label, |row| {
-                            row.child(
-                                div()
-                                    .w(px(16.))
-                                    .flex_none()
-                                    .opacity(if choice.mark == Some("+") {
-                                        1.0
-                                    } else {
-                                        mark_opacity
-                                    })
-                                    .text_color(rgb(if index == selected {
-                                        theme.on_selection
-                                    } else {
-                                        theme.accent
-                                    }))
-                                    .children(choice.mark),
+                        .when(live, |row| {
+                            row.on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |inbox, _, window, cx| {
+                                    // A picker fading out takes no clicks.
+                                    if inbox.session.visible_overlay() != Overlay::Folders
+                                        || (merging && inbox.session.merge_loading)
+                                    {
+                                        return;
+                                    }
+                                    cx.stop_propagation();
+                                    window.focus(&inbox.focus);
+                                    inbox.session.clear_toast();
+                                    inbox.session.folder_index = index;
+                                    let before = inbox.before_step();
+                                    let step = inbox.session.confirm_folder();
+                                    inbox.apply_step(step, before, cx);
+                                }),
                             )
                         })
+                        .gap(px(if merging { 0.0 } else { GAP }))
+                        .overflow_hidden()
+                        .when(
+                            session.folder_intent == FolderIntent::Label || accounts,
+                            |row| {
+                                row.child(
+                                    div()
+                                        .w(px(16.))
+                                        .flex_none()
+                                        .opacity(if accounts || choice.mark == Some("+") {
+                                            1.0
+                                        } else {
+                                            mark_opacity
+                                        })
+                                        .text_color(rgb(if index == selected {
+                                            theme.on_selection
+                                        } else {
+                                            theme.accent
+                                        }))
+                                        .children(choice.mark),
+                                )
+                            },
+                        )
                         .children(label.map(|line| {
                             let matched = folder_match(&line.text, &match_query);
                             let (label_dim, match_color) = if index == selected {
@@ -14523,8 +14736,8 @@ mod tests {
                                 ("INBOX", None),
                                 &mut motion,
                                 at + Duration::from_millis(60),
-                                width,
-                                window,
+                                (width, window),
+                                None,
                             )
                         }),
                     )

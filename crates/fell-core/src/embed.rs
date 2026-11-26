@@ -1488,7 +1488,7 @@ mod tests {
     fn open(ids: &[&str]) -> Store {
         let store = Store::open_in_memory().unwrap();
         for id in ids {
-            store.upsert_account(&account(id)).unwrap();
+            store.testing_seed_legacy_account(&account(id)).unwrap();
         }
         store
     }

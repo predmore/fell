@@ -449,16 +449,28 @@ pub use bodies::cid_upgrade::{CidRepairBatch, CidRepairProgress};
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_mailbox(path.as_ref(), true)
+        Self::open_mailbox(path.as_ref(), true, true)
+    }
+
+    /// Open an existing mailbox without recreating a recently removed file.
+    pub fn open_existing(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_mailbox(path.as_ref(), true, false)
     }
 
     pub(crate) fn open_for_part_fetch(path: &Path) -> Result<Self> {
-        Self::open_mailbox(path, false)
+        Self::open_mailbox(path, false, true)
     }
 
-    fn open_mailbox(requested: &Path, index: bool) -> Result<Self> {
+    pub(crate) fn open_existing_without_index(path: &Path) -> Result<Self> {
+        Self::open_mailbox(path, false, false)
+    }
+
+    fn open_mailbox(requested: &Path, index: bool, create: bool) -> Result<Self> {
+        check_mailbox_removal(requested)?;
         // The mailbox holds message text. Create it owner-only before SQLite writes.
-        create_private_file(requested)?;
+        if create {
+            create_private_file(requested)?;
+        }
         // One path string per inode. A symlink or a second hard link must not
         // open a different `-wal` while another connection still has the file.
         let claimed = claim_mailbox(requested)?;
@@ -552,6 +564,25 @@ impl Store {
 
     pub fn db_path(&self) -> Option<&Path> {
         self.path.as_deref()
+    }
+
+    /// Keep the inode locked while the caller closes SQLite and stages its files.
+    pub(crate) fn take_exclusive_mailbox_lock(&mut self) -> Result<std::fs::File> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let lock = self
+            ._mailbox_lock
+            .as_ref()
+            .ok_or_else(|| crate::Error::Invalid("Expected a mailbox file".into()))?;
+        if lock.metadata()?.nlink() != 1 {
+            return Err(crate::Error::Invalid(
+                "Expected a mailbox file with one link".into(),
+            ));
+        }
+        lock.try_lock().map_err(|err| crate::Error::Invalid(format!(
+            "Close Fell and any fell-mcp sessions using this account before deleting local mail: {err}"
+        )))?;
+        Ok(self._mailbox_lock.take().expect("locked mailbox file"))
     }
 
     #[cfg(test)]
@@ -722,9 +753,18 @@ impl Store {
     }
 
     pub fn upsert_account(&self, account: &Account) -> Result<()> {
-        upsert_account_on(&self.conn, account)?;
+        let tx = begin_immediate(&self.conn)?;
+        crate::accounts::validate_account_write(&tx, self.db_path(), account)?;
+        upsert_account_on(&tx, account)?;
+        tx.commit()?;
         self.seal_private_files()?;
         Ok(())
+    }
+
+    /// Seed rows that an older Fell could have written to a shared mailbox.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn testing_seed_legacy_account(&self, account: &Account) -> Result<()> {
+        upsert_account_on(&self.conn, account)
     }
 
     /// Distinct addresses recorded on this account's deliveries. These are
@@ -749,12 +789,7 @@ impl Store {
 
     /// Install a configured account and retire the in-process demo mailbox
     /// in the same transaction. Demo grants never follow the new account.
-    /// Return the reserved IDs of real accounts left in place.
-    pub fn configure_account(
-        &self,
-        account: &Account,
-        write_back: bool,
-    ) -> Result<Vec<&'static str>> {
+    pub fn configure_account(&self, account: &Account, write_back: bool) -> Result<()> {
         if crate::is_demo_account(&account.id) {
             return Err(crate::Error::Invalid(format!(
                 "Account ID {:?} is reserved for demo mail",
@@ -763,7 +798,6 @@ impl Store {
         }
         let tx = immediate_transaction(&self.conn)?;
         crate::outbox::ensure_schema(&tx)?;
-        let mut retained = Vec::new();
         for id in crate::backend::DEMO_ACCOUNT_IDS {
             let demo = tx
                 .query_row(
@@ -772,17 +806,16 @@ impl Store {
                     |row| row.get::<_, bool>(0),
                 )
                 .optional()?;
-            match demo {
-                Some(true) => delete_demo_account(&tx, id)?,
-                Some(false) => retained.push(id),
-                None => {}
+            if demo == Some(true) {
+                delete_demo_account(&tx, id)?;
             }
         }
+        crate::accounts::validate_account_write(&tx, self.db_path(), account)?;
         upsert_account_on(&tx, account)?;
         crate::outbox::set_write_back_on(&tx, &account.id, write_back)?;
         tx.commit()?;
         self.seal_private_files()?;
-        Ok(retained)
+        Ok(())
     }
 
     pub fn get_account(&self, id: &AccountId) -> Result<Option<Account>> {
@@ -2476,6 +2509,7 @@ fn claim_mailbox_unix(requested: &Path) -> Result<ClaimedMailbox> {
     use fs4::fs_std::FileExt;
 
     let canonical = absolute_opened(&requested.canonicalize()?)?;
+    check_mailbox_removal(&canonical)?;
     loop {
         let db = std::fs::File::open(requested)?;
         let nlink = db.metadata()?.nlink();
@@ -2504,6 +2538,12 @@ fn claim_mailbox_unix(requested: &Path) -> Result<ClaimedMailbox> {
             // Block until the exclusive holder shares or exits. Replaying a
             // large WAL can take longer than a short poll.
             db.lock_shared()?;
+            check_mailbox_removal(requested)?;
+            if !same_inode(&db, requested) {
+                return Err(crate::Error::Invalid(
+                    "mailbox was moved during open".into(),
+                ));
+            }
             if let Some(path) = read_published_path(&db) {
                 let conn = open_mailbox_db(&path)?;
                 if read_published_path(&db).as_ref() == Some(&path) {
@@ -2527,6 +2567,12 @@ fn claim_mailbox_unix(requested: &Path) -> Result<ClaimedMailbox> {
             }
             return Err(crate::Error::Invalid(
                 "mailbox is already open and its path was not published".into(),
+            ));
+        }
+        check_mailbox_removal(requested)?;
+        if !same_inode(&db, requested) {
+            return Err(crate::Error::Invalid(
+                "mailbox was moved during open".into(),
             ));
         }
         let (path, conn) = if let Some(published) = read_published_path(&db) {
@@ -2610,13 +2656,24 @@ fn canonical_wal_has_frames(canonical: &Path) -> bool {
 }
 
 fn open_mailbox_db(path: &Path) -> Result<Connection> {
-    let conn = Connection::open(path)?;
+    let flags = rusqlite::OpenFlags::default() & !rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
+    let conn = Connection::open_with_flags(path, flags)?;
     // Wait for other writers from the first statement on, including the
     // journal mode below, not only after `from_connection` sets it.
     conn.busy_timeout(Duration::from_secs(5))?;
     // The UI and `fell-mcp` share this file. WAL lets a reader run beside a writer.
     conn.pragma_update(None, "journal_mode", "WAL")?;
     Ok(conn)
+}
+
+fn check_mailbox_removal(path: &Path) -> Result<()> {
+    match crate::accounts::removal_trash(path).symlink_metadata() {
+        Ok(_) => Err(crate::Error::Invalid(
+            "mailbox removal is in progress".into(),
+        )),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
 }
 
 #[cfg(unix)]
@@ -5298,8 +5355,10 @@ mod tests {
     }
 
     #[test]
-    fn configure_account_preserves_real_mail_under_a_reserved_id() {
-        let store = Store::open_in_memory().unwrap();
+    fn configure_account_refuses_to_add_an_owner_beside_a_real_reserved_id() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("mail.db");
+        let store = Store::open(&path).unwrap();
         let demo = Account {
             id: AccountId("local".into()),
             email: crate::DEMO_MAILBOX_ADDRESS.into(),
@@ -5307,35 +5366,43 @@ mod tests {
         };
         let real = Account {
             id: AccountId("fixture".into()),
+            email: "old@example.test".into(),
             ..account_b()
         };
-        store.upsert_account(&demo).unwrap();
         store.upsert_account(&real).unwrap();
         store
             .conn
             .execute_batch(
                 "INSERT INTO compose_drafts (id, account_id, from_addr, to_addrs, cc_addrs,
                bcc_addrs, subject, body, updated_unix)
-             VALUES ('draft', 'fixture', 'o@x', '', '', '', '', 'Unsent text', 0);
+             VALUES ('draft', 'fixture', 'old@example.test', '', '', '', '', 'Unsent text', 0);
              INSERT INTO server_outbox (account_id, kind, state, message_id, source_folder,
                target_folder, created_unix)
              VALUES ('fixture', 'move', 'pending', 'message', 'Inbox', 'Archive', 0);",
             )
             .unwrap();
 
-        let configured = account();
-        assert_eq!(
-            store.configure_account(&configured, true).unwrap(),
-            ["fixture"]
-        );
-        assert!(store.get_account(&demo.id).unwrap().is_none());
-        assert!(store.get_account(&configured.id).unwrap().is_some());
-        assert!(store.write_back(&configured.id).unwrap());
-        assert_eq!(
-            store.get_account(&real.id).unwrap().unwrap().email,
-            real.email
-        );
-        assert_eq!(store.list_accounts().unwrap().len(), 2);
+        let configured = Account {
+            id: AccountId("mail".into()),
+            email: "me@example.test".into(),
+            ..account()
+        };
+        for with_demo in [false, true] {
+            if with_demo {
+                store.testing_seed_legacy_account(&demo).unwrap();
+            }
+            let before = store.list_accounts().unwrap();
+            let error = store
+                .configure_account(&configured, true)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("Account \"fixture\" (old@example.test)"),
+                "{error}"
+            );
+            assert!(error.contains(&*path.to_string_lossy()), "{error}");
+            assert_eq!(store.list_accounts().unwrap(), before);
+        }
         assert_eq!(
             store
                 .conn
@@ -5351,6 +5418,33 @@ mod tests {
             store.outbox(&real.id).unwrap()[0].state,
             crate::outbox::OutboxState::Pending
         );
+    }
+
+    #[test]
+    fn upsert_account_only_accepts_the_same_owner_in_an_existing_mailbox() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("mail.db");
+        let store = Store::open(&path).unwrap();
+        let mut owner = account();
+        store.upsert_account(&owner).unwrap();
+        let writer = Store::open(&path).unwrap();
+        owner.display_name = "Updated name".into();
+        owner.email.make_ascii_uppercase();
+        writer.upsert_account(&owner).unwrap();
+        let other = account_b();
+        let error = writer.upsert_account(&other).unwrap_err().to_string();
+        assert!(error.contains(owner.id.as_str()), "{error}");
+        assert!(error.contains(&owner.email), "{error}");
+        let rebound = Account {
+            email: other.email.clone(),
+            ..owner.clone()
+        };
+        assert!(writer.upsert_account(&rebound).is_err());
+        assert_eq!(store.list_accounts().unwrap(), [owner.clone()]);
+
+        store.testing_seed_legacy_account(&other).unwrap();
+        let error = writer.upsert_account(&owner).unwrap_err().to_string();
+        assert!(error.contains("Multiple owners"), "{error}");
     }
 
     #[test]
@@ -5801,7 +5895,7 @@ mod tests {
         let first = account();
         let second = account_b();
         store.upsert_account(&first).unwrap();
-        store.upsert_account(&second).unwrap();
+        store.testing_seed_legacy_account(&second).unwrap();
         store
             .upsert_message(&msg("post@x", None, None, "First account", "first"))
             .unwrap();
@@ -5987,7 +6081,7 @@ mod tests {
     fn two_accounts_keep_separate_rows_for_same_message_id() {
         let store = Store::open_in_memory().unwrap();
         store.upsert_account(&account()).unwrap();
-        store.upsert_account(&account_b()).unwrap();
+        store.testing_seed_legacy_account(&account_b()).unwrap();
         store
             .upsert_message(&msg_for(
                 "a1",
@@ -6241,7 +6335,7 @@ mod tests {
     fn apply_delta_rejects_other_account_messages() {
         let store = Store::open_in_memory().unwrap();
         store.upsert_account(&account()).unwrap();
-        store.upsert_account(&account_b()).unwrap();
+        store.testing_seed_legacy_account(&account_b()).unwrap();
         let err = store
             .apply_delta(
                 &AccountId("a1".into()),
@@ -6521,7 +6615,7 @@ mod tests {
     fn seed_search() -> Store {
         let store = Store::open_in_memory().unwrap();
         store.upsert_account(&account()).unwrap();
-        store.upsert_account(&account_b()).unwrap();
+        store.testing_seed_legacy_account(&account_b()).unwrap();
 
         let mut ada = msg(
             "ada@msg",
@@ -6851,7 +6945,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let account = account();
         store.upsert_account(&account).unwrap();
-        store.upsert_account(&account_b()).unwrap();
+        store.testing_seed_legacy_account(&account_b()).unwrap();
         let person = |name: &str, email: &str| Address {
             name: Some(name.into()),
             email: email.into(),
@@ -7429,6 +7523,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mail.sqlite");
+        create_private_file(&path).unwrap();
         let writer = open_mailbox_db(&path).unwrap();
         writer.execute_batch(SCHEMA).unwrap();
         writer.execute_batch(FTS_TRIGGERS).unwrap();

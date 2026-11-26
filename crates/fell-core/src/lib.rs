@@ -7,6 +7,7 @@
 
 pub mod account;
 pub mod account_config;
+pub mod accounts;
 pub mod actions;
 pub mod agent;
 pub mod backend;
@@ -78,8 +79,8 @@ pub use store::{
 };
 pub use sync::{
     InboxArrival, ReaderBodyFetcher, ReplyToBackfill, ReplyToProgress, SyncReport,
-    fetch_message_bodies, fetch_message_body, fetch_missing_bodies, sync_once, sync_with_arrivals,
-    sync_with_progress,
+    fetch_message_bodies, fetch_message_body, fetch_missing_bodies, sync_once, sync_until,
+    sync_with_arrivals, sync_with_progress,
 };
 pub use threading::{ThreadId, header_parent_thread_id, resolve_thread_id};
 

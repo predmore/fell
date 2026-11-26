@@ -1,6 +1,6 @@
 //! One configured mail account, read from a small `key = value` file.
 //!
-//! The app keeps this at `~/.config/fell/account.toml`, mode `0600`. Only
+//! The app keeps each file under `~/.config/fell/accounts/`, mode `0600`. Only
 //! flat account keys and `[[identities]]` tables are understood. Unknown
 //! keys are errors. The top-level email remains the default sender. Give
 //! it an identity table to set its signature.
@@ -149,6 +149,14 @@ pub struct AccountConfig {
     pub notifications: NotificationMode,
 }
 
+impl AccountConfig {
+    pub fn same_except_identities(&self, other: &Self) -> bool {
+        let mut current = self.clone();
+        current.identities.clone_from(&other.identities);
+        &current == other
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NotificationMode {
     #[default]
@@ -217,6 +225,10 @@ impl AccountConfig {
     }
 
     pub fn parse(text: &str) -> Result<Self> {
+        Self::parse_for(text, "mail")
+    }
+
+    pub(crate) fn parse_for(text: &str, default_id: &str) -> Result<Self> {
         let mut fields = Vec::new();
         let mut tables: Vec<Vec<(String, Value)>> = Vec::new();
         for (index, raw) in text.lines().enumerate() {
@@ -273,7 +285,7 @@ impl AccountConfig {
         let id = get("id")
             .map(|v| v.text("id"))
             .transpose()?
-            .unwrap_or_else(|| "mail".into());
+            .unwrap_or_else(|| default_id.into());
         let (default_host, default_port, default_security) = match backend {
             BackendKind::Bridge => ("127.0.0.1", 1143, ImapSecurity::StartTls),
             _ => ("", 993, ImapSecurity::Tls),
@@ -939,27 +951,11 @@ pub(crate) fn configured_sender(
 }
 
 fn configured_account(account: &AccountId) -> Option<AccountConfig> {
-    use std::io::Read;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    use std::path::PathBuf;
-
-    let directory = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(directory.join("fell/account.toml"))
-        .ok()?;
-    let metadata = file.metadata().ok()?;
-    if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
-        return None;
-    }
-    let mut text = String::new();
-    file.read_to_string(&mut text).ok()?;
-    let config = AccountConfig::parse(&text).ok()?;
-    (config.id == account.as_str()).then_some(config)
+    crate::accounts::Registry::resolve()
+        .ok()?
+        .get(account)
+        .ok()
+        .flatten()
 }
 
 fn take_field(fields: &mut Vec<(String, Value)>, key: &str) -> Option<Value> {

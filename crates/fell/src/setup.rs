@@ -1,4 +1,4 @@
-//! `fell account setup|show|check`: write and test `~/.config/fell/account.toml`.
+//! Account setup and management from the terminal.
 //!
 //! Setup asks for anything not given as a flag, checks the login against the
 //! server, and only then saves the credentials and writes the file (mode 0600).
@@ -7,27 +7,32 @@
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 
+use fell_core::accounts::{Registry, validate_id};
 use fell_core::credentials::{PasswordStore, SecretService};
 use fell_core::onboarding::{ConnectionProgress, check_connection, connection_recovery};
 use fell_core::{AccountConfig, BackendKind, ImapSecurity, PasswordSource};
 
 use crate::mailbox::{
-    AccountFileError, StagedAccountConfig, load_account_file, stage_account_config,
+    AccountFileError, AccountSave, StagedAccountConfig, can_reconnect, load_account_file,
+    next_account_id, stage_account_config,
 };
 
 const USAGE: &str = "\
-fell account setup [options]   write ~/.config/fell/account.toml after a login check
-fell account show              print the account file without the password
-fell account check             log in to IMAP and SMTP with the account file, send nothing
+fell account setup [--id ID]   save an account after a login check
+fell account list              list configured accounts
+fell account remove ID         disconnect an account and offer to delete local mail
+fell account show [--id ID]    print account settings without the password
+fell account check [--id ID]   log in to IMAP and SMTP, send nothing
 
 setup options (anything missing is asked for on a terminal):
   Entered passwords are saved in the desktop keyring by default.
   --imap                       a plain IMAP account instead of Proton Mail Bridge
   --email ADDRESS              the address you send as
+  --replace                    with --id, keep the old mail and use a new ID for a different address
   --name NAME                  display name
   --username USER              IMAP username (Bridge shows it under the account's mailbox details)
   --password-stdin             read the password from the first line of stdin
-  --password-inline            store the entered password in account.toml
+  --password-inline            store the entered password in the account file
   --password-command CMD       run CMD (sh -c) for the password at each sync
   --host HOST --port PORT      default 127.0.0.1:1143 for Bridge, PORT 993 for IMAP
   --security starttls|tls|plain
@@ -42,14 +47,18 @@ setup options (anything missing is asked for on a terminal):
 pub fn account_command(args: &[String]) -> i32 {
     let result = match args.first().map(String::as_str) {
         Some("setup") => setup(&args[1..]),
-        Some(cmd @ ("show" | "check")) => match args.get(1).map(String::as_str) {
-            Some("--help" | "-h" | "help") => {
+        Some("list") if args.len() == 1 => list(),
+        Some("remove") if args.len() == 2 => remove(&args[1]),
+        Some(cmd @ ("show" | "check")) => match &args[1..] {
+            [help] if matches!(help.as_str(), "--help" | "-h") => {
                 println!("{USAGE}");
                 Ok(())
             }
-            Some(other) => Err(format!("unknown option {other:?}\n\n{USAGE}")),
-            None if cmd == "show" => show(),
-            None => check(),
+            [] if cmd == "show" => show(None),
+            [] => check(None),
+            [flag, id] if flag == "--id" && cmd == "show" => show(Some(id)),
+            [flag, id] if flag == "--id" => check(Some(id)),
+            _ => Err(format!("Expected {cmd} [--id ID]\n\n{USAGE}")),
         },
         Some("--help" | "-h" | "help") | None => {
             println!("{USAGE}");
@@ -71,6 +80,7 @@ pub fn account_command(args: &[String]) -> i32 {
 
 #[derive(Debug, Default)]
 struct Flags {
+    id: Option<String>,
     imap: bool,
     email: Option<String>,
     name: Option<String>,
@@ -83,6 +93,7 @@ struct Flags {
     security: Option<ImapSecurity>,
     smtp: SmtpFlags,
     no_check: bool,
+    replace: bool,
     help: bool,
 }
 
@@ -103,6 +114,7 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
                 .ok_or_else(|| format!("{name} needs a value\n\n{USAGE}"))
         };
         match arg.as_str() {
+            "--id" => flags.id = Some(value("--id")?),
             "--imap" => flags.imap = true,
             "--email" => flags.email = Some(value("--email")?),
             "--name" => flags.name = Some(value("--name")?),
@@ -119,12 +131,16 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
                 flags.smtp.security = Some(security("--smtp-security", &value("--smtp-security")?)?)
             }
             "--no-check" => flags.no_check = true,
+            "--replace" => flags.replace = true,
             "--help" | "-h" => flags.help = true,
             other => return Err(format!("unknown option {other:?}\n\n{USAGE}")),
         }
     }
     if flags.password_stdin && flags.password_command.is_some() {
         return Err("use --password-stdin or --password-command, not both".into());
+    }
+    if flags.replace && flags.id.is_none() {
+        return Err(format!("--replace requires --id\n\n{USAGE}"));
     }
     if flags.password_inline && flags.password_command.is_some() {
         return Err("use --password-inline or --password-command, not both".into());
@@ -203,6 +219,14 @@ fn setup(args: &[String]) -> Result<(), String> {
         println!("{USAGE}");
         return Ok(());
     }
+    let named = flags.id.is_some();
+    let id = match flags.id {
+        Some(id) => {
+            validate_id(&id).map_err(|err| format!("{id:?}: {err}"))?;
+            id
+        }
+        None => next_account_id()?,
+    };
     let tty = io::stdin().is_terminal() && !flags.password_stdin;
     let backend = if flags.imap {
         BackendKind::Imap
@@ -257,6 +281,7 @@ fn setup(args: &[String]) -> Result<(), String> {
     };
 
     let mut config = AccountConfig::bridge(email, username, password);
+    config.id = id;
     config.name = name;
     config.backend = backend;
     config.host = host;
@@ -289,6 +314,18 @@ fn setup(args: &[String]) -> Result<(), String> {
     })?;
     config.validate().map_err(|err| err.to_string())?;
 
+    let reconnect = named
+        && tty
+        && can_reconnect(&config.id, &config.email)
+        && matches!(
+            prompt(
+                "Reconnect this account to its existing local mailbox? [y/N]",
+                Some("")
+            )?
+            .to_ascii_lowercase()
+            .as_str(),
+            "y" | "yes"
+        );
     if !flags.no_check {
         check_both(&config).map_err(|err| {
             format!(
@@ -296,11 +333,18 @@ fn setup(args: &[String]) -> Result<(), String> {
             )
         })?;
     }
+    let save = match (reconnect, flags.replace, named) {
+        (true, _, _) => AccountSave::Reconnect,
+        (_, true, _) => AccountSave::ReplaceMailbox,
+        (_, _, true) => AccountSave::Update,
+        _ => AccountSave::New,
+    };
+    let previous_id = config.id.clone();
     let path = save_account(
         config,
         flags.password_inline,
         &SecretService,
-        stage_account_config,
+        |config| stage_account_config(config, save),
     )
     .map_err(|err| match err {
         SaveAccountError::File(detail) => detail.to_string(),
@@ -309,6 +353,12 @@ fn setup(args: &[String]) -> Result<(), String> {
             format!("{detail}\n{recovery}\nUse --password-inline or --password-command to choose a different password source.")
         }
     })?;
+    if path
+        .file_stem()
+        .is_some_and(|id| id != previous_id.as_str())
+    {
+        println!("Kept local mail under {previous_id}.");
+    }
     println!("Saved {} (mode 600). Open Fell to sync.", path.display());
     Ok(())
 }
@@ -327,7 +377,7 @@ pub(crate) fn save_account(
     mut config: AccountConfig,
     password_inline: bool,
     keyring: &dyn PasswordStore,
-    stage: impl FnOnce(&AccountConfig) -> Result<StagedAccountConfig, AccountFileError>,
+    stage: impl FnOnce(&mut AccountConfig) -> Result<StagedAccountConfig, AccountFileError>,
 ) -> Result<PathBuf, SaveAccountError> {
     let keyring_password = match (password_inline, config.password) {
         (false, PasswordSource::Inline(password)) => {
@@ -339,7 +389,7 @@ pub(crate) fn save_account(
             None
         }
     };
-    let staged = stage(&config).map_err(SaveAccountError::File)?;
+    let staged = stage(&mut config).map_err(SaveAccountError::File)?;
     if let Some(password) = keyring_password {
         config
             .store_keyring_password(keyring, &password)
@@ -355,8 +405,147 @@ pub(crate) fn save_account(
     staged.publish().map_err(SaveAccountError::File)
 }
 
-fn show() -> Result<(), String> {
-    let (path, config) = load_account_file()?;
+fn list() -> Result<(), String> {
+    let registry = Registry::resolve().map_err(|err| err.to_string())?;
+    let accounts = match crate::mailbox::store_path() {
+        Ok(base) => registry.load_with_removals(&base),
+        Err(_) => registry.load(),
+    };
+    if accounts.is_empty() {
+        println!("No accounts configured.");
+    }
+    if let Some(error) = accounts.error {
+        eprintln!("{}", error.cli_message());
+    }
+    for entry in accounts.entries {
+        if accounts
+            .interrupted
+            .iter()
+            .any(|pending| pending.path == entry.path)
+        {
+            continue;
+        }
+        match entry.config {
+            Ok(config) => println!("{}\t{}", config.id, config.email),
+            Err(error) => println!(
+                "{}\t{}",
+                entry.path.file_stem().unwrap_or_default().to_string_lossy(),
+                error.cli_message(),
+            ),
+        }
+    }
+    for pending in accounts.interrupted {
+        println!(
+            "{}\t{} · Deletion interrupted. Open Fell Settings → Accounts to recover it.",
+            pending.id, pending.name
+        );
+    }
+    Ok(())
+}
+
+fn remove(id: &str) -> Result<(), String> {
+    use fell_core::accounts::RemovalOutcome;
+
+    let registry = Registry::resolve().map_err(|err| err.to_string())?;
+    let path = registry.path(id).map_err(|err| err.to_string())?;
+    let base = crate::mailbox::store_path()?;
+    let catalog = registry.load_with_removals(&base);
+    let pending = catalog.interrupted.iter().find(|pending| pending.id == id);
+    let entry = catalog.entries.iter().find(|entry| entry.path == path);
+    let name = pending
+        .map(|pending| pending.name.clone())
+        .or_else(|| {
+            entry?
+                .config
+                .as_ref()
+                .ok()
+                .map(|config| config.account().display_name)
+        })
+        .unwrap_or_else(|| id.to_owned());
+    if let Some(entry) = entry
+        && pending.is_none()
+        && entry.config.is_err()
+    {
+        registry.remove_broken_file(
+            &path,
+            entry
+                .file_identity
+                .ok_or_else(|| entry.config.as_ref().unwrap_err().cli_message())?,
+        )?;
+        println!("Deleted {id}.toml.");
+        return Ok(());
+    }
+    if pending.is_none() && entry.is_none() {
+        return Err(format!("No account file for {id:?}"));
+    }
+    let terminal = io::stdin().is_terminal();
+    let expected = entry.and_then(|entry| entry.file_identity);
+    let outcome = if let Some(pending) = pending {
+        let Some(delete) = recovery_choice(terminal, pending.can_restore, &name, |question| {
+            prompt(question, Some(""))
+        })?
+        else {
+            println!("Left the interrupted deletion as is.");
+            return Ok(());
+        };
+        registry.recover_removal(&base, id, delete, expected)?
+    } else {
+        let store = registry
+            .store_path(&base, id)
+            .map_err(|err| err.cli_message())?;
+        let delete = store.is_file()
+            && terminal
+            && matches!(
+                prompt(
+                    "Delete the local mail, drafts and grants for this account? [y/N]",
+                    Some("")
+                )?
+                .to_ascii_lowercase()
+                .as_str(),
+                "y" | "yes"
+            );
+        registry.remove_if_unchanged(&base, id, delete, expected)?
+    };
+    match outcome {
+        RemovalOutcome::Kept => println!("Removed {name}. Local mail kept."),
+        RemovalOutcome::Deleted => println!("Removed {name}. Local mail deleted."),
+        RemovalOutcome::Restored { connected: true } => {
+            println!("Restored {name} · account and local mail")
+        }
+        RemovalOutcome::Restored { connected: false } => {
+            println!("Restored local mail for {name} · account disconnected")
+        }
+        RemovalOutcome::Cleared => println!("Cleared interrupted deletion for {name}"),
+    }
+    Ok(())
+}
+
+fn recovery_choice(
+    terminal: bool,
+    can_restore: bool,
+    name: &str,
+    mut ask: impl FnMut(&str) -> Result<String, String>,
+) -> Result<Option<bool>, String> {
+    if !terminal {
+        return Err(format!(
+            "{name} · Deletion interrupted. Open Fell Settings → Accounts or run this command in a terminal to recover it."
+        ));
+    }
+    let restore = if can_restore { "[r] Restore · " } else { "" };
+    let question =
+        format!("{name} · Deletion interrupted. {restore}[f] Finish deleting · Enter to leave it");
+    match ask(&question)?.to_ascii_lowercase().as_str() {
+        "r" if can_restore => Ok(Some(false)),
+        "f" => {
+            let answer = ask(&format!("Delete {name}'s local mail for good? [y/N]"))?;
+            Ok(matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes").then_some(true))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn show(id: Option<&str>) -> Result<(), String> {
+    let (path, config) = load_account_file(id)?;
     println!("# {}", path.display());
     let mut redacted = config.clone();
     if let PasswordSource::Inline(_) = redacted.password {
@@ -366,8 +555,8 @@ fn show() -> Result<(), String> {
     Ok(())
 }
 
-fn check() -> Result<(), String> {
-    let (_, config) = load_account_file()?;
+fn check(id: Option<&str>) -> Result<(), String> {
+    let (_, config) = load_account_file(id)?;
     check_both(&config)
 }
 
@@ -528,6 +717,43 @@ impl Drop for QuietTerminal {
 mod tests {
     use super::*;
 
+    #[test]
+    fn interrupted_removal_requires_an_explicit_terminal_choice() {
+        assert_eq!(
+            recovery_choice(false, true, "Field Desk", |_| panic!()).unwrap_err(),
+            "Field Desk · Deletion interrupted. Open Fell Settings → Accounts or run this command in a terminal to recover it."
+        );
+        for answer in ["", "n", "yes", "r", "R"] {
+            for can_restore in [false, true] {
+                let expected = match answer {
+                    "r" | "R" if can_restore => Some(false),
+                    _ => None,
+                };
+                assert_eq!(
+                    recovery_choice(true, can_restore, "Field Desk", |question| {
+                        assert!(question.starts_with("Field Desk · Deletion interrupted."));
+                        assert_eq!(question.contains("[r] Restore"), can_restore);
+                        Ok(answer.into())
+                    })
+                    .unwrap(),
+                    expected
+                );
+            }
+        }
+        for (answer, expected) in [("", None), ("n", None), ("y", Some(true))] {
+            let mut answers = ["f", answer].into_iter();
+            let choice = recovery_choice(true, true, "Field Desk", |question| {
+                let answer = answers.next().unwrap();
+                if answer != "f" {
+                    assert_eq!(question, "Delete Field Desk's local mail for good? [y/N]");
+                }
+                Ok(answer.into())
+            });
+            assert_eq!(choice.unwrap(), expected);
+            assert!(answers.next().is_none());
+        }
+    }
+
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|arg| arg.to_string()).collect()
     }
@@ -663,7 +889,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("account.toml");
-        let stage = |config: &AccountConfig| {
+        let stage = |config: &mut AccountConfig| {
             crate::mailbox::stage_account_config_at(path.clone(), config, false)
         };
         let keyring = FakeKeyring {

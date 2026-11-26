@@ -60,6 +60,7 @@ pub enum Action {
     SaveAllAttachments,
     RetryAttachment,
     FolderPicker,
+    AccountPicker,
     Label,
     LabelList,
     Search,
@@ -134,6 +135,7 @@ impl Action {
             Self::SaveAllAttachments => "Save all attachments",
             Self::RetryAttachment => "Retry attachment action",
             Self::FolderPicker => "Choose folder",
+            Self::AccountPicker => "Switch account",
             Self::Label => "Apply or remove label",
             Self::LabelList => "Go to label",
             Self::Search => "Search mail",
@@ -207,6 +209,7 @@ pub const ACTION_SECTIONS: &[(&str, &[Action])] = &[
             Action::Sent,
             Action::Drafts,
             Action::FolderPicker,
+            Action::AccountPicker,
             Action::LabelList,
             Action::Snoozed,
             Action::Muted,
@@ -299,6 +302,7 @@ pub const ACTION_SECTIONS: &[(&str, &[Action])] = &[
             Action::Setting(SettingsRow::Value(Preference::WhichKey)),
             Action::Setting(SettingsRow::Value(Preference::Notifications)),
             Action::Setting(SettingsRow::AccountSetup),
+            Action::Setting(SettingsRow::RemoveAccount),
             Action::Setting(SettingsRow::EditAccount),
             Action::Setting(SettingsRow::ImportIdentities),
             Action::Setting(SettingsRow::EffectiveBindings),
@@ -407,6 +411,16 @@ fn default_bindings() -> Vec<Binding> {
         &[KeyId::Char('g'), KeyId::Char('f')],
         Action::FolderPicker,
         Some("Go"),
+    );
+    bind(
+        &[KeyId::Char('g'), KeyId::Char('A')],
+        Action::AccountPicker,
+        Some("Go"),
+    );
+    bind(
+        &[KeyId::Leader, KeyId::Char('A')],
+        Action::AccountPicker,
+        None,
     );
     bind(&[KeyId::Char('l')], Action::Label, None);
     bind(
@@ -627,10 +641,22 @@ pub struct WhichItem {
     pub is_group: bool,
 }
 
+#[cfg(test)]
 pub fn which_key(keymap: &Keymap, prefix: &[KeyId]) -> Vec<WhichItem> {
+    which_key_filtered(keymap, prefix, |_| true)
+}
+
+pub fn which_key_filtered(
+    keymap: &Keymap,
+    prefix: &[KeyId],
+    visible: impl Fn(Action) -> bool,
+) -> Vec<WhichItem> {
     let mut groups: Vec<(String, Vec<&Binding>)> = Vec::new();
     for binding in &keymap.bindings {
-        if binding.keys.len() <= prefix.len() || !binding.keys.starts_with(prefix) {
+        if binding.keys.len() <= prefix.len()
+            || !binding.keys.starts_with(prefix)
+            || !visible(binding.action)
+        {
             continue;
         }
         let key = key_label(binding.keys[prefix.len()], &keymap.leader_name);
@@ -730,6 +756,13 @@ pub fn palette_items(keymap: &Keymap, query: &str, recent: &[Action]) -> Vec<Pal
 }
 
 pub fn binding_text(keymap: &Keymap, action: Action) -> String {
+    if action == Action::Setting(SettingsRow::RemoveAccount) {
+        let key = key_label(
+            crate::model::settings::REMOVE_ACCOUNT_KEY,
+            &keymap.leader_name,
+        );
+        return format!("{key} in Accounts");
+    }
     keymap
         .bindings_for(action)
         .iter()

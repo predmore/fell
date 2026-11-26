@@ -450,7 +450,7 @@ mod tests {
         let acct = account("a1");
         store.upsert_account(&acct).unwrap();
         let other = account("a2");
-        store.upsert_account(&other).unwrap();
+        store.testing_seed_legacy_account(&other).unwrap();
         let thread = store
             .upsert_message(&message(
                 "a1",
@@ -1145,7 +1145,7 @@ mod tests {
                 backend_kind,
                 ..account("a1")
             };
-            session.store.upsert_account(&account).unwrap();
+            session.store.testing_seed_legacy_account(&account).unwrap();
             session.store.set_write_back(&account.id, true).unwrap();
             init(&mut session);
             for name in names {

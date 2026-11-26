@@ -8,7 +8,7 @@ use fell_core::embed::{
     LocalEmbedder, MINILM_L6_V2_INT8, ModelError, default_models_dir, load_local_embedder,
     model_dir, remove_model,
 };
-use fell_core::{AccountConfig, BackendKind, Identity};
+use fell_core::{AccountConfig, Identity};
 use futures::channel::mpsc;
 use futures::{FutureExt, StreamExt};
 use gpui::{
@@ -18,6 +18,7 @@ use gpui::{
 };
 
 use super::{FontOpt, Inbox};
+use crate::keymap::KeyId;
 use crate::model::Overlay;
 use crate::model::settings::{self as nav, Availability, Page, Request, Row, Section};
 use crate::motion::{self, Glide, LayerSwap, Motion, SwapFrame, Transition};
@@ -95,7 +96,8 @@ pub(super) struct View {
     chevrons: Option<Transition>,
     page: Option<Page>,
     page_fade: Option<Transition>,
-    server: Option<String>,
+    accounts: Vec<AccountRow>,
+    removal: Option<AccountRow>,
     identities: Vec<Identity>,
     identity_read: Option<gpui::Task<()>>,
     identity_candidates: Option<Result<Vec<IdentityCandidate>, String>>,
@@ -105,6 +107,91 @@ pub(super) struct View {
     model: ModelStatus,
     model_generation: u64,
     model_notice: Option<(String, bool)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AccountRow {
+    id: String,
+    path: PathBuf,
+    file_identity: Option<fell_core::accounts::FileIdentity>,
+    name: String,
+    email: Option<String>,
+    status: String,
+    link_damaged: bool,
+    alert: bool,
+    active: bool,
+    removing: bool,
+    kind: crate::model::settings::AccountRemovalKind,
+}
+
+pub(super) struct FrozenAccounts {
+    rows: Vec<AccountRow>,
+    scroll: ScrollHandle,
+}
+
+pub(super) fn selected_account_path<'a>(
+    catalog: &'a fell_core::accounts::Accounts,
+    path: &Path,
+    usable: impl Fn(&fell_core::AccountConfig) -> bool,
+) -> Option<&'a Path> {
+    let mut paths: Vec<_> = catalog
+        .entries
+        .iter()
+        .map(|entry| entry.path.as_path())
+        .filter(|path| path.file_stem().is_some())
+        .chain(
+            catalog
+                .interrupted
+                .iter()
+                .map(|pending| pending.path.as_path()),
+        )
+        .collect();
+    paths.sort_unstable();
+    paths.dedup();
+    let index = paths.partition_point(|candidate| *candidate < path);
+    paths[index..]
+        .iter()
+        .chain(paths[..index].iter().rev())
+        .copied()
+        .find(|path| {
+            catalog.entries.iter().any(|entry| {
+                entry.path == *path
+                    && entry.config.as_ref().is_ok_and(|config| {
+                        catalog
+                            .interrupted
+                            .iter()
+                            .all(|pending| pending.id != config.id)
+                            && usable(config)
+                    })
+            })
+        })
+}
+
+fn account_index<'a>(
+    mut paths: impl ExactSizeIterator<Item = &'a Path>,
+    index: usize,
+    path: &Path,
+) -> Option<usize> {
+    let last = paths.len().checked_sub(1)?;
+    Some(
+        paths
+            .position(|candidate| candidate == path)
+            .unwrap_or(index.min(last)),
+    )
+}
+
+pub(super) enum CardMode<'a> {
+    Live,
+    Leaving,
+    AccountSwitch(&'a FrozenAccounts),
+}
+
+impl AccountRow {
+    fn can_remove(&self) -> bool {
+        !self.removing
+            && (self.kind != crate::model::settings::AccountRemovalKind::BrokenFile
+                || self.file_identity.is_some())
+    }
 }
 
 struct IdentityCandidate {
@@ -136,19 +223,8 @@ impl View {
             chevrons: None,
             page: None,
             page_fade: None,
-            server: account.map(|config| {
-                let host = crate::present::display_safe(&config.host);
-                let host = if host.contains(':') && !host.starts_with('[') {
-                    format!("[{host}]")
-                } else {
-                    host
-                };
-                match config.backend {
-                    BackendKind::Bridge => format!("Proton Mail Bridge on {host}:{}", config.port),
-                    BackendKind::Imap => format!("IMAP · {host}:{}", config.port),
-                    BackendKind::ProtonApi => "Proton Mail".into(),
-                }
-            }),
+            accounts: Vec::new(),
+            removal: None,
             identities: account
                 .map(AccountConfig::compose_identities)
                 .unwrap_or_default(),
@@ -163,12 +239,146 @@ impl View {
         }
     }
 
+    pub fn set_accounts(
+        &mut self,
+        catalog: &fell_core::accounts::Accounts,
+        active: Option<&str>,
+        statuses: &std::collections::HashMap<String, (String, bool)>,
+        removing: impl Fn(&str) -> bool,
+    ) -> bool {
+        use crate::model::settings::AccountRemovalKind;
+
+        let mut accounts: Vec<_> = catalog
+            .entries
+            .iter()
+            .filter(|entry| {
+                catalog
+                    .interrupted
+                    .iter()
+                    .all(|pending| pending.path != entry.path)
+            })
+            .filter_map(|entry| {
+                let id = entry.path.file_stem()?.to_string_lossy().into_owned();
+                let active = entry.config.is_ok() && active == Some(id.as_str());
+                let link_damaged = entry
+                    .config
+                    .as_ref()
+                    .is_err_and(|error| error.is_mailbox_link());
+                let (name, email, status, alert) = match &entry.config {
+                    Ok(config) => {
+                        let (status, alert) = statuses
+                            .get(&id)
+                            .cloned()
+                            .unwrap_or_else(|| ("Opening mailbox…".into(), false));
+                        (
+                            config.account().display_name,
+                            Some(config.email.clone()),
+                            status,
+                            alert,
+                        )
+                    }
+                    Err(error) if link_damaged => {
+                        use fell_core::accounts::MAILBOX_LINK_DAMAGED;
+                        let title = entry.damaged_link_name().map_or_else(
+                            || MAILBOX_LINK_DAMAGED.into(),
+                            |name| format!("{name} · {MAILBOX_LINK_DAMAGED}"),
+                        );
+                        (
+                            title,
+                            None,
+                            error.detail.lines().next().unwrap_or_default().into(),
+                            true,
+                        )
+                    }
+                    Err(error) => (
+                        entry
+                            .damaged_link_name()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| {
+                                entry
+                                    .path
+                                    .file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .into_owned()
+                            }),
+                        None,
+                        if entry.file_identity.is_none() {
+                            error.cli_message()
+                        } else {
+                            error.reason(&entry.path).to_owned()
+                        },
+                        true,
+                    ),
+                };
+                let removing = entry.config.is_ok() && removing(&id);
+                Some(AccountRow {
+                    id,
+                    path: entry.path.clone(),
+                    file_identity: entry.file_identity,
+                    name,
+                    email,
+                    status: if removing {
+                        "Removing…".into()
+                    } else {
+                        status
+                    },
+                    link_damaged,
+                    alert: alert && !removing,
+                    active,
+                    removing,
+                    kind: if entry.config.is_ok() {
+                        AccountRemovalKind::Account
+                    } else {
+                        AccountRemovalKind::BrokenFile
+                    },
+                })
+            })
+            .collect();
+        accounts.extend(catalog.interrupted.iter().map(|pending| {
+            let entry = catalog
+                .entries
+                .iter()
+                .find(|entry| entry.path == pending.path);
+            AccountRow {
+                id: pending.id.clone(),
+                path: pending.path.clone(),
+                file_identity: entry.and_then(|entry| entry.file_identity),
+                name: pending.name.clone(),
+                email: entry
+                    .and_then(|entry| entry.config.as_ref().ok())
+                    .map(|config| config.email.clone()),
+                status: if removing(&pending.id) {
+                    "Recovering…"
+                } else {
+                    "Deletion interrupted"
+                }
+                .into(),
+                link_damaged: false,
+                alert: !removing(&pending.id),
+                active: false,
+                removing: removing(&pending.id),
+                kind: AccountRemovalKind::Interrupted {
+                    can_restore: pending.can_restore,
+                },
+            }
+        }));
+        accounts.sort_by(|a, b| a.path.cmp(&b.path));
+        if self.accounts == accounts {
+            return false;
+        }
+        self.accounts = accounts;
+        true
+    }
+
     pub fn availability(&self) -> Availability {
-        let configured = account_file_exists(mailbox::account_config_path().as_deref());
         Availability {
-            account_setup: !configured,
-            edit_account: configured,
-            identity_count: if configured { self.identities.len() } else { 0 },
+            account_setup: true,
+            edit_account: self.accounts.iter().any(|account| account.active)
+                || self.broken_legacy_path().is_some(),
+            identity_count: self.identities.len(),
+            accounts: self.accounts.len(),
+            active_account: self.accounts.iter().position(|account| account.active),
             install_model: matches!(
                 self.model,
                 ModelStatus::Checking | ModelStatus::Missing | ModelStatus::NeedsRepair
@@ -178,6 +388,50 @@ impl View {
                 ModelStatus::Checking | ModelStatus::Installed | ModelStatus::NeedsRepair
             ),
         }
+    }
+
+    pub fn broken_legacy_path(&self) -> Option<&Path> {
+        let [account] = self.accounts.as_slice() else {
+            return None;
+        };
+        (account.kind == crate::model::settings::AccountRemovalKind::BrokenFile
+            && account.file_identity.is_some()
+            && account
+                .path
+                .file_name()
+                .is_some_and(|name| name == "account.toml")
+            && account
+                .path
+                .parent()
+                .is_some_and(|parent| !parent.ends_with("accounts")))
+        .then_some(account.path.as_path())
+    }
+
+    pub(super) fn account_selection(
+        &self,
+        nav: &crate::model::settings::Nav,
+    ) -> Option<(usize, PathBuf)> {
+        let Some(Row::Account(index)) = nav.row() else {
+            return None;
+        };
+        self.accounts
+            .get(index)
+            .map(|row| (index, row.path.clone()))
+    }
+
+    pub(super) fn restore_account_selection(
+        &mut self,
+        nav: &mut crate::model::settings::Nav,
+        (index, path): (usize, PathBuf),
+    ) {
+        let row = account_index(
+            self.accounts.iter().map(|row| row.path.as_path()),
+            index,
+            &path,
+        )
+        .map_or(Row::AccountSetup, Row::Account);
+        nav.select_row(row);
+        self.scroll_to(nav.selected);
     }
 
     pub fn scroll_to(&self, row: usize) {
@@ -203,7 +457,16 @@ impl View {
 
     pub fn reset_scroll(&mut self) {
         self.scroll_glide = None;
-        self.scroll.set_offset(gpui::point(px(0.), px(0.)));
+        self.scroll = ScrollHandle::new();
+    }
+
+    pub fn freeze_accounts(&self) -> FrozenAccounts {
+        let scroll = ScrollHandle::new();
+        scroll.set_offset(self.scroll.offset());
+        FrozenAccounts {
+            rows: self.accounts.clone(),
+            scroll,
+        }
     }
 
     pub fn settle(&mut self) {
@@ -413,7 +676,12 @@ impl Inbox {
         cx.notify();
     }
 
-    pub(super) fn settings_request(&mut self, request: Request, cx: &mut Context<Self>) {
+    pub(super) fn settings_request(
+        &mut self,
+        request: Request,
+        confirmed_with_enter: bool,
+        cx: &mut Context<Self>,
+    ) {
         match request {
             Request::Save(edit) => {
                 if let Some(edits) = &self.settings_view.edits
@@ -424,7 +692,67 @@ impl Inbox {
                 self.settings_notice("Could not save settings", true, cx);
             }
             Request::AccountSetup => self.open_account_setup(cx),
-            Request::EditAccount => self.open_account_editor(cx),
+            Request::EditAccount => {
+                if let Some(path) = self
+                    .settings_view
+                    .accounts
+                    .iter()
+                    .find(|account| account.active)
+                    .map(|account| account.path.as_path())
+                    .or_else(|| self.settings_view.broken_legacy_path())
+                {
+                    self.open_account_editor(path.to_owned(), cx);
+                }
+            }
+            Request::OpenAccount(index) => {
+                if let Some(account) = self
+                    .settings_view
+                    .accounts
+                    .get(index)
+                    .cloned()
+                    .filter(|account| !account.removing)
+                {
+                    match account.kind {
+                        crate::model::settings::AccountRemovalKind::BrokenFile
+                            if account.file_identity.is_some() =>
+                        {
+                            self.open_account_editor(account.path, cx);
+                        }
+                        crate::model::settings::AccountRemovalKind::Interrupted { .. } => {
+                            self.confirm_account_removal(index);
+                        }
+                        crate::model::settings::AccountRemovalKind::Account if !account.active => {
+                            self.account_action(account.id, None, confirmed_with_enter, cx);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Request::ConfirmAccountRemoval(index) => self.confirm_account_removal(index),
+            Request::RemoveAccount { delete } => {
+                if let Some(target) = self.settings_view.removal.clone() {
+                    if self.settings_view.accounts.iter().any(|account| {
+                        account.path == target.path
+                            && account.file_identity == target.file_identity
+                            && account.kind == target.kind
+                    }) {
+                        let removal = super::accounts::RequestedRemoval {
+                            kind: target.kind,
+                            path: target.path,
+                            expected: target.file_identity,
+                            delete,
+                            name: target.name,
+                        };
+                        self.account_action(target.id, Some(removal), false, cx);
+                    } else {
+                        self.settings_notice(
+                            "The account file changed. Select the account again.",
+                            true,
+                            cx,
+                        );
+                    }
+                }
+            }
             Request::ReadIdentityCandidates => self.read_identity_candidates(cx),
             Request::ToggleIdentityCandidate(index) => {
                 if !self.settings_view.importing_identities
@@ -468,10 +796,6 @@ impl Inbox {
     }
 
     fn open_account_setup(&mut self, cx: &mut Context<Self>) {
-        if account_file_exists(mailbox::account_config_path().as_deref()) {
-            self.settings_notice("An account file already exists", true, cx);
-            return;
-        }
         if let Some(handle) = self.settings_view.setup
             && handle
                 .update(cx, |_, window, _| window.activate_window())
@@ -504,20 +828,50 @@ impl Inbox {
         }
     }
 
-    fn open_account_editor(&mut self, cx: &mut Context<Self>) {
+    fn confirm_account_removal(&mut self, index: usize) {
+        if let Some(target) = self
+            .settings_view
+            .accounts
+            .get(index)
+            .filter(|row| row.can_remove())
+        {
+            self.session.settings_nav.page = Page::ConfirmAccountRemoval {
+                delete: false,
+                kind: target.kind,
+            };
+            self.settings_view.removal = Some(target.clone());
+        } else {
+            self.session.settings_nav.page = Page::Section(Section::Accounts);
+        }
+    }
+
+    fn account_action(
+        &self,
+        id: String,
+        remove: Option<super::accounts::RequestedRemoval>,
+        confirmed_with_enter: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(window) = cx.try_global::<super::InboxWindow>().copied() {
+            cx.defer(move |cx| {
+                let _ = window.0.update(cx, |_, window, cx| match remove {
+                    Some(removal) => super::accounts::remove(&id, removal, window, cx),
+                    None => super::accounts::switch(&id, confirmed_with_enter, window, cx),
+                });
+            });
+        }
+    }
+
+    fn open_account_editor(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async {
-                    let path = mailbox::account_config_path()
-                        .ok_or_else(|| io::Error::other("No account file"))?;
-                    super::diagnostics::open_in_editor(&path)
-                })
+                .spawn(async move { super::diagnostics::open_in_editor(&path) })
                 .await;
             if let Err(error) = result {
                 let _ = this.update(cx, |inbox, cx| {
                     inbox.settings_notice(
-                        format!("Could not open account.toml · {error}"),
+                        format!("Could not open account file · {error}"),
                         true,
                         cx,
                     );
@@ -550,6 +904,17 @@ impl Inbox {
                 }
             });
         }));
+    }
+
+    pub(super) fn set_settings_identities(
+        &mut self,
+        config: &AccountConfig,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings_view.identity_read = None;
+        self.settings_view.identities = config.compose_identities();
+        self.refresh_settings_availability();
+        cx.notify();
     }
 
     fn read_identity_candidates(&mut self, cx: &mut Context<Self>) {
@@ -805,10 +1170,63 @@ impl Inbox {
     }
 }
 
-fn account_file_exists(path: Option<&Path>) -> bool {
-    path.is_some_and(|path| {
-        !matches!(fs::symlink_metadata(path), Err(error) if error.kind() == io::ErrorKind::NotFound)
-    })
+pub(super) const LEGACY_ACCOUNT_REQUESTS: [Request; 2] =
+    [Request::AccountSetup, Request::EditAccount];
+
+pub(super) fn legacy_account_actions(
+    theme: &theme::Theme,
+    focus: [bool; 2],
+    cx: &Context<Inbox>,
+) -> gpui::Div {
+    div()
+        .flex()
+        .flex_wrap()
+        .justify_center()
+        .gap_2()
+        .mt_2()
+        .children(
+            [("Add account", "a"), ("Open account.toml", "e")]
+                .into_iter()
+                .zip(LEGACY_ACCOUNT_REQUESTS)
+                .zip(focus)
+                .map(|(((label, key), request), focused)| {
+                    div()
+                        .id(label)
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .py_1p5()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(if focused { theme.accent } else { theme.border }))
+                        .when(focused, |button| {
+                            button
+                                .bg(rgb(theme.selection))
+                                .text_color(rgb(theme.on_selection))
+                        })
+                        .text_size(px(12.))
+                        .cursor_pointer()
+                        .hover(|button| button.bg(rgb(theme.surface)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |inbox, _, _, cx| {
+                                cx.stop_propagation();
+                                inbox.settings_request(request, false, cx);
+                            }),
+                        )
+                        .child(label)
+                        .child(
+                            div()
+                                .text_color(rgb(if focused {
+                                    theme.on_selection_dim
+                                } else {
+                                    theme.dimmed
+                                }))
+                                .child(key),
+                        )
+                }),
+        )
 }
 
 fn shows_invalid_value(page: Page, snapshot: &Snapshot) -> bool {
@@ -862,7 +1280,10 @@ fn report_unknown(snapshot: &Snapshot) {
 const HEADER_HEIGHT: f32 = 64.;
 const SECTION_ROW_HEIGHT: f32 = 64.;
 const INDEX_ROW_HEIGHT: f32 = 49.;
-const ACCOUNT_SUMMARY_HEIGHT: f32 = 80.;
+const ACCOUNT_ROW_HEIGHT: f32 = 64.;
+const CARD_WIDTH: f32 = 530.;
+const BROKEN_FILE_BUTTON_WIDTH: f32 = 88.;
+const BROKEN_FILE_LINK_WIDTH: f32 = 14.;
 const BODY_PADDING: f32 = 16.;
 const BINDING_ROW_HEIGHT: f32 = 39.;
 const MAX_BINDING_ROWS: f32 = 9.;
@@ -884,28 +1305,23 @@ pub(super) fn card_height(nav: &nav::Nav, room: f32, narrow: bool) -> f32 {
         Page::Index => Section::ALL.len() as f32 * INDEX_ROW_HEIGHT + INDEX_FOOTER_HEIGHT,
         Page::Section(section) => {
             nav.rows(section)
-                .map(|row| {
-                    SECTION_ROW_HEIGHT
-                        + if narrow && matches!(row, Row::Value(_)) {
-                            8.
-                        } else {
-                            0.
-                        }
+                .map(|row| match row {
+                    Row::Account(_) => ACCOUNT_ROW_HEIGHT,
+                    Row::EditAccount | Row::ImportIdentities => 45.,
+                    _ if narrow && matches!(row, Row::Value(_)) => SECTION_ROW_HEIGHT + 8.,
+                    _ => SECTION_ROW_HEIGHT,
                 })
                 .sum::<f32>()
                 + match section {
-                    Section::Accounts => {
-                        ACCOUNT_SUMMARY_HEIGHT
-                            + if nav.availability.identity_count > 0 {
-                                28. + nav.availability.identity_count as f32 * IDENTITY_ROW_HEIGHT
-                            } else {
-                                0.
-                            }
+                    Section::Accounts if nav.availability.identity_count > 0 => {
+                        28. + nav.availability.identity_count as f32 * IDENTITY_ROW_HEIGHT
                     }
                     Section::Search => SEARCH_SUMMARY_HEIGHT,
                     _ => 0.,
                 }
         }
+        Page::ConfirmAccountRemoval { .. } if narrow => 115.,
+        Page::ConfirmAccountRemoval { .. } => 98.,
         Page::ConfirmModel { install: true } if narrow => 445.,
         Page::ConfirmModel { .. } => 370.,
         Page::IdentityImport => 54. + (nav.identity_candidates + 1) as f32 * IDENTITY_ROW_HEIGHT,
@@ -918,11 +1334,19 @@ pub(super) fn card(
     theme: &theme::Theme,
     session: &crate::model::Session,
     view: &View,
-    live: bool,
+    mode: CardMode<'_>,
     (height, window): (f32, &Window),
     now: Instant,
     cx: &mut Context<Inbox>,
 ) -> gpui::Div {
+    use crate::model::settings::AccountRemovalKind;
+
+    let live = matches!(mode, CardMode::Live);
+    let (accounts, scroll) = match mode {
+        CardMode::Live => (&view.accounts, Some(&view.scroll)),
+        CardMode::Leaving => (&view.accounts, None),
+        CardMode::AccountSwitch(frozen) => (&frozen.rows, Some(&frozen.scroll)),
+    };
     let page = session.settings_nav.page;
     let width = f32::from(window.viewport_size().width);
     let content_opacity = if live {
@@ -938,16 +1362,34 @@ pub(super) fn card(
         Page::Index => None,
         Page::Section(_) => Some("Settings"),
         Page::Bindings => Some("Keymap"),
-        Page::IdentityImport => Some("Accounts"),
+        Page::IdentityImport | Page::ConfirmAccountRemoval { .. } => Some("Accounts"),
         Page::ConfirmModel { .. } => Some("Search"),
     };
+    let account_name = view
+        .removal
+        .as_ref()
+        .map_or("This account", |account| account.name.as_str());
     let title = match page {
-        Page::Index => "Settings",
-        Page::Section(section) => section.label(),
-        Page::Bindings => "Effective bindings",
-        Page::IdentityImport => "Import sender addresses",
-        Page::ConfirmModel { install: true } => "Install local search model",
-        Page::ConfirmModel { install: false } => "Remove local search model",
+        Page::Index => "Settings".into(),
+        Page::Section(section) => section.label().into(),
+        Page::Bindings => "Effective bindings".into(),
+        Page::IdentityImport => "Import sender addresses".into(),
+        Page::ConfirmAccountRemoval {
+            kind: AccountRemovalKind::BrokenFile,
+            ..
+        } => format!("Delete {account_name}?"),
+        Page::ConfirmAccountRemoval {
+            delete: false,
+            kind: AccountRemovalKind::Interrupted { .. },
+        } => "Deletion interrupted".into(),
+        Page::ConfirmAccountRemoval {
+            delete: true,
+            kind: AccountRemovalKind::Interrupted { .. },
+        } => "Finish deleting local mail?".into(),
+        Page::ConfirmAccountRemoval { delete: false, .. } => "Remove account".into(),
+        Page::ConfirmAccountRemoval { delete: true, .. } => "Delete local mail?".into(),
+        Page::ConfirmModel { install: true } => "Install local search model".into(),
+        Page::ConfirmModel { install: false } => "Remove local search model".into(),
     };
     let header = div()
         .h(px(HEADER_HEIGHT))
@@ -997,7 +1439,7 @@ pub(super) fn card(
         .overflow_y_scroll()
         .px(px(10.))
         .py(px(8.))
-        .when(live, |body| body.track_scroll(&view.scroll));
+        .when_some(scroll, |body, scroll| body.track_scroll(scroll));
     let selected = session.settings_nav.selected;
     let mut details = None;
     let mut footer = None;
@@ -1038,9 +1480,79 @@ pub(super) fn card(
             // Keep scroll indices aligned with the selectable rows.
             for (index, setting) in session.settings_nav.rows(section).enumerate() {
                 let selected = selected == index;
-                let mut control =
-                    row(theme, index, selected, live, SECTION_ROW_HEIGHT, cx).py(px(10.));
-                if let Row::Value(preference) = setting {
+                let height = match setting {
+                    Row::Account(_) => ACCOUNT_ROW_HEIGHT,
+                    Row::EditAccount | Row::ImportIdentities => 45.,
+                    _ => SECTION_ROW_HEIGHT,
+                };
+                let mut control = row(theme, index, selected, live, height, cx);
+                if let Row::Account(account) = setting {
+                    if let Some(account) = accounts.get(account) {
+                        let restore = matches!(
+                            account.kind,
+                            AccountRemovalKind::Interrupted { can_restore: true }
+                        );
+                        let recover =
+                            matches!(account.kind, AccountRemovalKind::Interrupted { .. });
+                        let broken = account.kind == AccountRemovalKind::BrokenFile;
+                        let editable_file = broken && account.file_identity.is_some();
+                        let status = if editable_file {
+                            // Card borders, body and row padding, then the link
+                            // and the optional Remove button with their gaps.
+                            let room = CARD_WIDTH.min(width * 0.94)
+                                - 42.
+                                - BROKEN_FILE_LINK_WIDTH
+                                - 9.
+                                - if account.can_remove() {
+                                    BROKEN_FILE_BUTTON_WIDTH + 9.
+                                } else {
+                                    0.
+                                };
+                            super::clip_line(
+                                window,
+                                &super::conversation_line_style(window, theme, px(12.)),
+                                &crate::present::display_safe(&account.status),
+                                room,
+                                FontWeight::NORMAL,
+                            )
+                        } else {
+                            crate::present::display_safe(&account.status)
+                        };
+                        control = control
+                            .child(account_label(theme, account, status, selected))
+                            .when(account.can_remove(), |row| {
+                                let button = account_button(
+                                    theme,
+                                    "remove-account",
+                                    match (restore, recover) {
+                                        (true, _) => "Restore",
+                                        (_, true) => "Finish deleting",
+                                        _ => "Remove · d",
+                                    },
+                                    crate::model::settings::REMOVE_ACCOUNT_KEY,
+                                    false,
+                                    !restore,
+                                    live && selected,
+                                    cx,
+                                );
+                                row.child(
+                                    button
+                                        .when(broken, |button| {
+                                            button.w(px(BROKEN_FILE_BUTTON_WIDTH)).text_center()
+                                        })
+                                        .opacity(if selected { 1. } else { 0. }),
+                                )
+                            })
+                            .when(editable_file, |row| {
+                                row.child(
+                                    trailing(theme, "↗", selected)
+                                        .w(px(BROKEN_FILE_LINK_WIDTH))
+                                        .text_right(),
+                                )
+                            });
+                    }
+                } else if let Row::Value(preference) = setting {
+                    control = control.py(px(10.));
                     let state = preference.display(view.snapshot.values);
                     let note = preference_note(&view.snapshot, preference, &state, width);
                     let previous = view.value_fade(now);
@@ -1122,14 +1634,11 @@ pub(super) fn card(
                         );
                 } else {
                     let (label, description, suffix, info) = match setting {
-                        Row::AccountSetup => (
-                            "Open account setup",
-                            "Connect via Bridge or IMAP.",
-                            "›",
-                            false,
-                        ),
+                        Row::AccountSetup => {
+                            ("Add account", "Connect via Bridge or IMAP.", "›", false)
+                        }
                         Row::EditAccount => (
-                            "Edit account.toml",
+                            "Edit account file",
                             "Set display names and Markdown signatures.",
                             "↗",
                             false,
@@ -1174,7 +1683,7 @@ pub(super) fn card(
                             "›",
                             false,
                         ),
-                        Row::Value(_) => unreachable!(),
+                        Row::Value(_) | Row::Account(_) | Row::RemoveAccount => unreachable!(),
                     };
                     let suffix = if info {
                         div()
@@ -1190,104 +1699,21 @@ pub(super) fn card(
                         trailing(theme, suffix, selected)
                     };
                     control = control
+                        .when(
+                            matches!(setting, Row::EditAccount | Row::ImportIdentities),
+                            |row| row.pl(px(26.)),
+                        )
                         .child(row_label(theme, label, Some(description), selected))
                         .child(suffix);
                 }
-                body = body.child(control);
-            }
-
-            if section == Section::Accounts && session.settings_nav.availability.identity_count > 0
-            {
-                body = body.child(
-                    div()
-                        .px(px(10.))
-                        .h(px(28.))
-                        .flex()
-                        .items_center()
-                        .text_color(rgb(theme.dimmed))
-                        .text_size(px(12.))
-                        .child("Sender identities"),
-                );
-                for (index, identity) in view.identities.iter().enumerate() {
-                    let label = if identity.name.is_empty() {
-                        &identity.address
-                    } else {
-                        &identity.name
-                    };
-                    let secondary =
-                        (!identity.name.is_empty()).then_some(identity.address.as_str());
-                    body = body.child(
-                        div()
-                            .h(px(IDENTITY_ROW_HEIGHT))
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .px(px(10.))
-                            .child(row_label(
-                                theme,
-                                crate::present::display_safe(label),
-                                secondary.map(crate::present::display_safe),
-                                false,
-                            ))
-                            .when(index == 0, |row| {
-                                row.child(
-                                    div()
-                                        .flex_none()
-                                        .text_size(px(12.))
-                                        .text_color(rgb(theme.dimmed))
-                                        .child("Default"),
-                                )
-                            }),
-                    );
-                }
+                body = if setting == Row::ImportIdentities {
+                    body.child(div().child(control).child(sender_identities(theme, view)))
+                } else {
+                    body.child(control)
+                };
             }
 
             details = match section {
-                Section::Accounts => {
-                    let setup = session.settings_nav.availability.account_setup;
-                    let (title, description) = if setup && view.server.is_some() {
-                        (
-                            "Account file not found".to_owned(),
-                            "This mailbox stays open until you reopen Fell.",
-                        )
-                    } else if setup {
-                        (
-                            "No account configured".to_owned(),
-                            "Set up an account to sync your mailbox.",
-                        )
-                    } else if let Some(server) = &view.server {
-                        (
-                            crate::present::display_safe(&session.account_email),
-                            server.as_str(),
-                        )
-                    } else {
-                        (
-                            "Account unavailable".to_owned(),
-                            "Check account.toml or reopen Fell to connect.",
-                        )
-                    };
-                    let sync = view.server.as_ref().filter(|_| !setup).map(|_| {
-                        session.last_sync_at.map_or_else(
-                            || "Waiting for first sync".into(),
-                            |at| {
-                                format!(
-                                    "Last sync · {}",
-                                    crate::present::activity_time(super::now_unix(), at)
-                                )
-                            },
-                        )
-                    });
-                    Some(
-                        detail(theme, title, description, false, setup)
-                            .h(px(ACCOUNT_SUMMARY_HEIGHT))
-                            .children(sync.map(|label| {
-                                div()
-                                    .text_size(px(12.))
-                                    .text_color(rgb(theme.dimmed))
-                                    .child(label)
-                            })),
-                    )
-                }
                 Section::Search => {
                     let (status, description) = view.model.status();
                     let (message, alert) = view
@@ -1362,7 +1788,7 @@ pub(super) fn card(
                         .text_size(px(12.))
                         .line_height(px(17.))
                         .text_color(rgb(theme.dimmed))
-                        .child("Found in delivered mail. Selected addresses go into account.toml."),
+                        .child("Found in delivered mail. Selected addresses go into this account’s file."),
                 );
                 for (index, candidate) in candidates.iter().enumerate() {
                     let label = crate::present::display_safe(&candidate.address);
@@ -1448,6 +1874,96 @@ pub(super) fn card(
                 );
             }
         },
+        Page::ConfirmAccountRemoval { delete, kind } => {
+            let (message, choice, destructive) = match (delete, kind) {
+                (_, AccountRemovalKind::BrokenFile) => (
+                    "Delete this unreadable account file.".into(),
+                    None,
+                    Some(("Delete file · y", KeyId::Char('y'))),
+                ),
+                (true, AccountRemovalKind::Interrupted { .. }) => (
+                    format!(
+                        "Permanently delete the remaining local mail and drafts for {account_name}?"
+                    ),
+                    None,
+                    Some(("Finish deleting · y", KeyId::Char('y'))),
+                ),
+                (false, AccountRemovalKind::Interrupted { can_restore }) => (
+                    if can_restore {
+                        format!("You can restore local mail for {account_name}.")
+                    } else {
+                        format!("Local mail for {account_name} can no longer be restored.")
+                    },
+                    can_restore.then_some("Restore local mail"),
+                    Some(("Finish deleting · f", KeyId::Char('f'))),
+                ),
+                (true, AccountRemovalKind::Account) => (
+                    format!(
+                        "Delete the downloaded mail and drafts for {account_name} from this device?"
+                    ),
+                    None,
+                    Some(("Delete local mail · y", KeyId::Char('y'))),
+                ),
+                (false, AccountRemovalKind::Account) => (
+                    format!("Disconnect {account_name} and revoke its agent access."),
+                    Some("Keep local mail"),
+                    Some(("Delete local mail · d", KeyId::Char('d'))),
+                ),
+            };
+            body = body.child(
+                div()
+                    .px(px(10.))
+                    .py(px(6.))
+                    .text_size(px(13.))
+                    .line_height(px(19.))
+                    .child(message),
+            );
+            footer = Some(
+                div()
+                    .flex_none()
+                    .flex()
+                    .justify_end()
+                    .flex_wrap()
+                    .gap(px(8.))
+                    .p(px(12.))
+                    .border_t_1()
+                    .border_color(rgb(theme.border))
+                    .child(account_button(
+                        theme,
+                        "cancel-remove",
+                        "Cancel",
+                        KeyId::Escape,
+                        false,
+                        false,
+                        live,
+                        cx,
+                    ))
+                    .when_some(choice, |footer, label| {
+                        footer.child(account_button(
+                            theme,
+                            "keep-mail",
+                            label,
+                            KeyId::Enter,
+                            true,
+                            false,
+                            live,
+                            cx,
+                        ))
+                    })
+                    .when_some(destructive, |footer, (label, key)| {
+                        footer.child(account_button(
+                            theme,
+                            "delete-mail",
+                            label,
+                            key,
+                            false,
+                            true,
+                            live,
+                            cx,
+                        ))
+                    }),
+            );
+        }
         Page::ConfirmModel { install } => {
             body = body.child(if install {
                 install_plan(theme, view.model_root.as_deref())
@@ -1481,7 +1997,7 @@ pub(super) fn card(
     }
     div()
         .relative()
-        .w(px(530.))
+        .w(px(CARD_WIDTH))
         .max_w(gpui::relative(0.94))
         .h(px(height))
         .bg(rgb(theme.surface))
@@ -1509,6 +2025,155 @@ pub(super) fn card(
         .when(binding_edges.1, |card| {
             card.child(super::help::edge(theme, false, 44.))
         })
+}
+
+fn account_label(
+    theme: &theme::Theme,
+    account: &AccountRow,
+    status: String,
+    selected: bool,
+) -> gpui::Div {
+    let (muted, fill) = if selected {
+        (theme.on_selection_dim, theme.selection)
+    } else {
+        (theme.dimmed, theme.surface)
+    };
+    let muted = theme::account_detail_color(muted, fill);
+    div()
+        .flex_1()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .truncate()
+                .font_weight(FontWeight::MEDIUM)
+                .when(account.link_damaged, |title| {
+                    title.text_color(rgb(theme.error))
+                })
+                .child(crate::present::display_safe(&account.name)),
+        )
+        .when(account.link_damaged, |row| {
+            row.child(
+                div()
+                    .text_size(px(12.))
+                    .line_height(px(14.))
+                    .text_color(rgb(muted))
+                    .child(fell_core::accounts::MAILBOX_LINK_RECOVERY),
+            )
+        })
+        .children(
+            account
+                .email
+                .as_deref()
+                .filter(|email| !email.eq_ignore_ascii_case(&account.name))
+                .map(|email| {
+                    div()
+                        .truncate()
+                        .text_size(px(12.))
+                        .line_height(px(15.))
+                        .text_color(rgb(muted))
+                        .child(crate::present::display_safe(email))
+                }),
+        )
+        .child(
+            div()
+                .when(account.link_damaged, |detail| {
+                    detail.line_clamp(2).text_ellipsis()
+                })
+                .when(!account.link_damaged, |detail| detail.truncate())
+                .text_size(px(12.))
+                .line_height(px(if account.link_damaged { 13. } else { 15. }))
+                .text_color(rgb(if account.alert && !account.link_damaged {
+                    theme.error
+                } else {
+                    muted
+                }))
+                .child(status),
+        )
+}
+
+fn sender_identities(theme: &theme::Theme, view: &View) -> gpui::Div {
+    div()
+        .pl(px(26.))
+        .child(
+            div()
+                .h(px(28.))
+                .flex()
+                .items_center()
+                .text_color(rgb(theme.dimmed))
+                .text_size(px(12.))
+                .child("Sender identities"),
+        )
+        .children(view.identities.iter().enumerate().map(|(index, identity)| {
+            let named = !identity.name.is_empty();
+            div()
+                .h(px(IDENTITY_ROW_HEIGHT))
+                .flex()
+                .items_center()
+                .gap_2()
+                .pr(px(10.))
+                .child(row_label(
+                    theme,
+                    crate::present::display_safe(if named {
+                        &identity.name
+                    } else {
+                        &identity.address
+                    }),
+                    named.then(|| crate::present::display_safe(&identity.address)),
+                    false,
+                ))
+                .when(index == 0, |row| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .text_size(px(12.))
+                            .text_color(rgb(theme.dimmed))
+                            .child("Default"),
+                    )
+                })
+        }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn account_button(
+    theme: &theme::Theme,
+    id: &'static str,
+    title: &'static str,
+    key: KeyId,
+    focused: bool,
+    destructive: bool,
+    live: bool,
+    cx: &mut Context<Inbox>,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .px(px(9.))
+        .py(px(5.))
+        .flex_none()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(theme.border))
+        .text_size(px(12.))
+        .whitespace_nowrap()
+        .when(focused, |button| {
+            button
+                .bg(rgb(theme.selection))
+                .text_color(rgb(theme.on_selection))
+        })
+        .when(destructive, |button| button.text_color(rgb(theme.error)))
+        .when(live, |button| {
+            button.cursor_pointer().on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |inbox, _, _, cx| {
+                    if inbox.session.overlay == Overlay::Settings {
+                        cx.stop_propagation();
+                        inbox.settings_click(inbox.session.settings_nav.selected, key, cx);
+                    }
+                }),
+            )
+        })
+        .child(title)
 }
 
 fn install_plan(theme: &theme::Theme, root: Option<&Path>) -> gpui::Div {
@@ -1845,17 +2510,6 @@ mod tests {
         assert_eq!(ensure_keymap(&dir).unwrap(), path);
         assert!(path.is_symlink());
         assert_eq!(fs::metadata(&owned).unwrap().mode() & 0o777, 0o644);
-    }
-
-    #[test]
-    fn account_setup_guard_rechecks_the_file() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("account.toml");
-        assert!(!account_file_exists(Some(&path)));
-        fs::write(&path, "").unwrap();
-        assert!(account_file_exists(Some(&path)));
-        fs::rename(&path, temp.path().join("account.bak")).unwrap();
-        assert!(!account_file_exists(Some(&path)));
     }
 
     #[test]

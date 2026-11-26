@@ -1042,7 +1042,7 @@ fn only_the_exact_message_id_in_the_same_accounts_sent_role_confirms_a_send() {
     };
     let store = Store::open_in_memory().unwrap();
     store.upsert_account(&acct).unwrap();
-    for (id, message_id) in [("uncertain", Some(exact)), ("legacy", None)] {
+    let claim = |id: &str, message_id: Option<&str>| {
         store
             .save_compose(&StoredCompose {
                 id: id.into(),
@@ -1061,7 +1061,9 @@ fn only_the_exact_message_id_in_the_same_accounts_sent_role_confirms_a_send() {
             })
             .unwrap();
         store.claim_compose_send(&acct.id, id, message_id).unwrap();
-    }
+    };
+    claim("uncertain", Some(exact));
+    claim("legacy", None);
     assert!(
         sync_once(&acct, &backend(&acct), &store)
             .unwrap()
@@ -1080,16 +1082,6 @@ fn only_the_exact_message_id_in_the_same_accounts_sent_role_confirms_a_send() {
     mailbox(&mut server.state.lock().unwrap(), "Filed")
         .messages
         .push(copy(2, exact));
-    assert!(
-        sync_once(&other, &backend(&other), &store)
-            .unwrap()
-            .confirmed_drafts
-            .is_empty()
-    );
-    assert_eq!(
-        store.load_compose_send(&acct.id, "uncertain").unwrap(),
-        Some(SendLock::MaybeSent)
-    );
 
     let hub = crate::compose::DraftHub::new();
     hub.discard(&store, &acct.id, &["uncertain".into()])
@@ -1126,6 +1118,30 @@ fn only_the_exact_message_id_in_the_same_accounts_sent_role_confirms_a_send() {
             .unwrap()
             .confirmed_drafts
             .is_empty()
+    );
+
+    // Apply another account's deltas to a legacy shared store to exercise
+    // the account filter on the send confirmation itself.
+    let other_exact = "other@compose.fell";
+    claim("cross-account", Some(other_exact));
+    mailbox(&mut server.state.lock().unwrap(), "Filed")
+        .messages
+        .push(copy(3, other_exact));
+    store.testing_seed_legacy_account(&other).unwrap();
+    backend(&other)
+        .sync_changes(
+            None,
+            &|folder, validity, range| store.stored_uids(&other.id, folder, validity, range),
+            &mut |delta| {
+                let writes = store.apply_sync_delta(&other.id, &delta)?;
+                assert!(writes.confirmed_drafts.is_empty());
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        store.load_compose_send(&acct.id, "cross-account").unwrap(),
+        Some(SendLock::MaybeSent)
     );
 }
 
@@ -1374,8 +1390,8 @@ fn bad_password_does_not_advance_the_cursor() {
 #[test]
 fn two_accounts_keep_separate_rows() {
     let server = TestServer::spawn(sample_state());
-    let store = Store::open_in_memory().unwrap();
-    for id in ["a1", "a2"] {
+    let sync = |id| {
+        let store = Store::open_in_memory().unwrap();
         let acct = account(id, BackendKind::Imap);
         let backend = ImapBackend {
             account_id: acct.id.clone(),
@@ -1383,17 +1399,20 @@ fn two_accounts_keep_separate_rows() {
             smtp: unused_smtp(),
         };
         sync_once(&acct, &backend, &store).unwrap();
-    }
-    let a = store.list_threads(&AccountId("a1".into())).unwrap();
-    let b = store.list_threads(&AccountId("a2".into())).unwrap();
+        store
+    };
+    let store_a = sync("a1");
+    let store_b = sync("a2");
+    let a_id = AccountId("a1".into());
+    let b_id = AccountId("a2".into());
+    assert!(store_a.list_threads(&b_id).unwrap().is_empty());
+    assert!(store_b.list_threads(&a_id).unwrap().is_empty());
+    let a = store_a.list_threads(&a_id).unwrap();
+    let b = store_b.list_threads(&b_id).unwrap();
     assert_eq!(a.len(), b.len());
     assert!(!a.is_empty());
-    let a_msgs = store
-        .thread_messages(&AccountId("a1".into()), &a[0].thread_id)
-        .unwrap();
-    let b_msgs = store
-        .thread_messages(&AccountId("a2".into()), &b[0].thread_id)
-        .unwrap();
+    let a_msgs = store_a.thread_messages(&a_id, &a[0].thread_id).unwrap();
+    let b_msgs = store_b.thread_messages(&b_id, &b[0].thread_id).unwrap();
     assert_eq!(a_msgs[0].account_id.as_str(), "a1");
     assert_eq!(b_msgs[0].account_id.as_str(), "a2");
 }
@@ -6086,4 +6105,59 @@ fn legacy_reply_to_checks_the_whole_copy_set_before_accepting_absence() {
     assert!(!recovered.parts.reply_to_unverified);
     assert_eq!(recovered.fields.to, ["Ann <ann@x>"]);
     assert_read_only(&server);
+}
+
+#[test]
+fn registry_accounts_sync_in_parallel_into_separate_stores() {
+    use crate::accounts::Registry;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::Barrier;
+
+    let fixture = sample_state();
+    let username = fixture.username.clone();
+    let password = fixture.password.clone();
+    let server = TestServer::spawn_parallel(fixture, Default::default());
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("mail.db");
+    let registry = Registry::at(root.path().join("config/fell"), base.clone());
+    std::fs::create_dir_all(registry.directory()).unwrap();
+    for id in ["mail", "work"] {
+        let path = registry.path(id).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        writeln!(file, "email = '{id}@example.test'\nusername = '{username}'\npassword = '{password}'\nport = {}\nsecurity = 'plain'", server.addr.port()).unwrap();
+    }
+    let configs = registry
+        .load()
+        .entries
+        .into_iter()
+        .map(|entry| entry.config)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(configs.len(), 2);
+    let ready = Barrier::new(configs.len());
+    std::thread::scope(|scope| {
+        for config in configs {
+            let path = registry.store_path(&base, &config.id).unwrap();
+            let ready = &ready;
+            scope.spawn(move || {
+                ready.wait();
+                let account = config.account();
+                let backend = config.backend().unwrap();
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let store = Store::open(path).unwrap();
+                sync_once(&account, backend.as_ref(), &store).unwrap();
+                assert_eq!(
+                    store.list_accounts().unwrap(),
+                    std::slice::from_ref(&account)
+                );
+                assert!(stored(&store, &account, "reply@x").is_some());
+            });
+        }
+    });
 }

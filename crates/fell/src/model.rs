@@ -191,6 +191,7 @@ pub enum Overlay {
 pub enum FolderIntent {
     /// `gf` switches the list to the chosen folder.
     Go,
+    Account,
     /// `m` moves the selected conversations to the chosen folder.
     Move,
     Label,
@@ -404,6 +405,7 @@ pub struct Step {
 
     pub action: Option<Action>,
     pub reload_threads: bool,
+    pub switch_account: Option<String>,
     pub reload_messages: bool,
     pub arm_which: bool,
     /// Conversation pages, in viewport heights. Positive moves down.
@@ -545,6 +547,7 @@ pub struct Session {
     pub worker_outages: HashSet<Worker>,
     /// Mailbox or keymap failure from startup. Folder and message reads do not clear it.
     pub startup_error: Option<String>,
+    pub account_config_error: Option<String>,
     /// Failure from the latest folder or message read.
     pub error: Option<String>,
     pub error_fault: Option<QueryFault>,
@@ -565,6 +568,7 @@ pub struct Session {
     label_selection: LabelSelection,
     pub merge_sources: Vec<String>,
     pub merge_choices: Vec<PickerChoice>,
+    pub account_choices: Vec<PickerChoice>,
     pub merge_search: u64,
     pub merge_loading: bool,
     merge_confirm_pending: bool,
@@ -598,6 +602,16 @@ pub struct Session {
 }
 
 impl Session {
+    pub fn reset_after_account_reload(&mut self) {
+        self.fetch = None;
+        self.pending = None;
+        self.trash_expunge_available = false;
+        self.withdraw_purge();
+        self.purge_ready = None;
+        self.cancel_read_delay();
+        self.worker_outages.clear();
+    }
+
     pub fn new(
         account_name: impl Into<String>,
         account_email: impl Into<String>,
@@ -654,6 +668,7 @@ impl Session {
             },
             sync,
             startup_error: None,
+            account_config_error: None,
             error: None,
             error_fault: None,
             attachment_error: None,
@@ -674,6 +689,7 @@ impl Session {
             label_selection: LabelSelection::default(),
             merge_sources: Vec::new(),
             merge_choices: Vec::new(),
+            account_choices: Vec::new(),
             merge_search: 0,
             merge_loading: false,
             merge_confirm_pending: false,
@@ -792,6 +808,7 @@ impl Session {
             }
             FolderIntent::Merge => "Merge into",
             FolderIntent::Go => "Folder",
+            FolderIntent::Account => "Switch account",
             FolderIntent::Label => "Label",
             FolderIntent::LabelList => "Go to label",
         }
@@ -809,7 +826,10 @@ impl Session {
                 ids => Some(format!("{} conversations", ids.len())),
             },
             FolderIntent::Move => self.move_selection.as_ref()?.subject.clone(),
-            FolderIntent::Go | FolderIntent::LabelList | FolderIntent::Merge => None,
+            FolderIntent::Go
+            | FolderIntent::Account
+            | FolderIntent::LabelList
+            | FolderIntent::Merge => None,
         }
     }
 
@@ -898,12 +918,17 @@ impl Session {
         }
     }
 
-    fn status_details(&self) -> [Option<&str>; 3] {
+    fn status_details(&self) -> [Option<&str>; 4] {
         let sync = match &self.sync {
             SyncKind::Failed(failure) => Some(failure.detail.as_str()),
             _ => None,
         };
-        [self.startup_error.as_deref(), self.error.as_deref(), sync]
+        [
+            self.startup_error.as_deref(),
+            self.account_config_error.as_deref(),
+            self.error.as_deref(),
+            sync,
+        ]
     }
 
     pub fn has_status_details(&self) -> bool {
@@ -1058,7 +1083,15 @@ impl Session {
     }
 
     pub fn which_items(&self) -> Vec<WhichItem> {
-        keymap::which_key(&self.keymap, &self.chord)
+        keymap::which_key_filtered(&self.keymap, &self.chord, |action| self.discovers(action))
+    }
+
+    pub fn discovers(&self, action: Action) -> bool {
+        match action {
+            Action::Setting(row) => self.settings_nav.availability.shows(row),
+            Action::AccountPicker => self.account_choices.len() > 1,
+            _ => true,
+        }
     }
 
     pub fn palette(&self) -> Vec<PaletteItem> {
@@ -1073,10 +1106,7 @@ impl Session {
                 &self.palette_query,
                 &self.recent,
             ))
-            .filter(|item| match item.action {
-                Action::Setting(row) => self.settings_nav.availability.shows(row),
-                _ => true,
-            })
+            .filter(|item| self.discovers(item.action))
             .collect()
     }
 
@@ -1116,6 +1146,21 @@ impl Session {
     }
 
     pub fn picker_choices(&self) -> Vec<PickerChoice> {
+        if self.folder_intent == FolderIntent::Account {
+            let query = self.folder_query.trim().to_ascii_lowercase();
+            return self
+                .account_choices
+                .iter()
+                .filter(|choice| {
+                    choice.title.to_ascii_lowercase().contains(&query)
+                        || choice
+                            .detail
+                            .as_deref()
+                            .is_some_and(|detail| detail.to_ascii_lowercase().contains(&query))
+                })
+                .cloned()
+                .collect();
+        }
         if self.folder_intent == FolderIntent::Merge {
             return self.merge_choices.clone();
         }
@@ -2235,8 +2280,42 @@ impl Session {
     }
 
     fn settings_key(&mut self, key: KeyId, page_rows: usize) -> Step {
-        use settings::{Page, Request, Row, Section};
+        use settings::{AccountRemovalKind, Page, Request, Row, Section};
 
+        if let Page::ConfirmAccountRemoval { delete, kind } = self.settings_nav.page {
+            let request = match (delete, kind, key) {
+                (_, _, KeyId::Escape | KeyId::Char('n')) => {
+                    self.settings_nav.back();
+                    None
+                }
+                (false, AccountRemovalKind::Account, KeyId::Char('d'))
+                | (false, AccountRemovalKind::Interrupted { .. }, KeyId::Char('f')) => {
+                    self.settings_nav.page = Page::ConfirmAccountRemoval { delete: true, kind };
+                    None
+                }
+                (
+                    false,
+                    AccountRemovalKind::Account
+                    | AccountRemovalKind::Interrupted { can_restore: true },
+                    KeyId::Enter | KeyId::Space,
+                )
+                | (false, AccountRemovalKind::BrokenFile, KeyId::Char('y'))
+                | (true, _, KeyId::Char('y')) => {
+                    self.settings_nav.page = Page::Section(Section::Accounts);
+                    Some(Request::RemoveAccount { delete })
+                }
+                _ => None,
+            };
+            return Step {
+                settings: request,
+                ..Step::default()
+            };
+        }
+        if key == settings::REMOVE_ACCOUNT_KEY
+            && matches!(self.settings_nav.row(), Some(Row::Account(_)))
+        {
+            return self.activate_setting(Row::RemoveAccount, page_rows);
+        }
         if let Page::ConfirmModel { install } = self.settings_nav.page
             && matches!(key, KeyId::Char('y' | 'n') | KeyId::Escape)
         {
@@ -2318,12 +2397,33 @@ impl Session {
     pub fn activate_setting(&mut self, row: settings::Row, page_rows: usize) -> Step {
         use settings::{Page, Request, Row};
 
-        self.settings_nav.select_row(row);
+        if row != Row::RemoveAccount {
+            self.settings_nav.select_row(row);
+        }
         let settings = match row {
             Row::Value(preference) => Some(Request::Save(crate::settings::Edit::Cycle(
                 preference, false,
             ))),
             Row::AccountSetup => Some(Request::AccountSetup),
+            Row::Account(index) => Some(Request::OpenAccount(index)),
+            Row::RemoveAccount => {
+                let index = match self.settings_nav.row() {
+                    Some(Row::Account(index)) => Some(index),
+                    _ => self
+                        .settings_nav
+                        .availability
+                        .active_account
+                        .or_else(|| (self.settings_nav.availability.accounts > 0).then_some(0)),
+                };
+                index.map(|index| {
+                    self.settings_nav.select_row(Row::Account(index));
+                    self.settings_nav.page = Page::ConfirmAccountRemoval {
+                        delete: false,
+                        kind: settings::AccountRemovalKind::Account,
+                    };
+                    Request::ConfirmAccountRemoval(index)
+                })
+            }
             Row::EditAccount => Some(Request::EditAccount),
             Row::ImportIdentities => {
                 self.settings_nav.page = Page::IdentityImport;
@@ -2593,6 +2693,10 @@ impl Session {
         self.folder_query.clear();
         self.folder_intent = FolderIntent::Go;
         match intent {
+            FolderIntent::Account => Step {
+                switch_account: Some(name),
+                ..Step::default()
+            },
             FolderIntent::Merge => Step {
                 threading: Some(ThreadEdit::Merge {
                     sources: std::mem::take(&mut self.merge_sources),
@@ -2712,6 +2816,7 @@ impl Session {
                     | Action::Snoozed
                     | Action::Muted
                     | Action::FolderPicker
+                    | Action::AccountPicker
                     | Action::LabelList
                     | Action::Palette
                     | Action::Help
@@ -2877,6 +2982,18 @@ impl Session {
                     };
                     step.triage = Some(snooze::TriageEdit { ids, kind });
                 }
+            }
+            Action::AccountPicker if self.account_choices.len() < 2 => {}
+            Action::AccountPicker => {
+                self.count.clear();
+                self.folder_intent = FolderIntent::Account;
+                self.overlay = Overlay::Folders;
+                self.folder_query.clear();
+                self.folder_index = self
+                    .account_choices
+                    .iter()
+                    .position(|choice| choice.mark.is_some())
+                    .unwrap_or(0);
             }
             Action::FolderPicker => {
                 self.count.clear();
@@ -5391,6 +5508,35 @@ mod tests {
         session.on_key(KeyId::Char('#'), 4);
         assert!(session.clear_toast_if(session.toast_generation()));
         assert!(!session.on_key(KeyId::Char('y'), 4).purge);
+    }
+
+    #[test]
+    fn reloading_an_account_withdraws_server_purge_and_allows_local_purge() {
+        let mut session = session();
+        session.folder = "Trash".into();
+        session.cursor_id = Some("a".into());
+        session.set_trash_expunge_available(true);
+        session.on_key(KeyId::Char('#'), 4);
+        session.reset_after_account_reload();
+        assert!(session.toast.is_none());
+        assert!(!session.on_key(KeyId::Char('y'), 4).purge);
+
+        session.set_trash_expunge_available(true);
+        session.on_key(KeyId::Char('#'), 4);
+        assert!(session.on_key(KeyId::Char('y'), 4).purge);
+        session.reset_after_account_reload();
+        assert_eq!(session.take_purge(), None);
+        session.on_key(KeyId::Char('#'), 4);
+        assert!(
+            session
+                .toast
+                .as_ref()
+                .unwrap()
+                .text
+                .starts_with("Server copy stays.")
+        );
+        assert!(session.on_key(KeyId::Char('y'), 4).purge);
+        assert_eq!(session.take_purge(), Some((vec!["a".into()], false)));
     }
 
     #[test]
