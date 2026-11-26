@@ -46,7 +46,6 @@ pub(super) enum SaveState {
     Failed {
         title: &'static str,
         detail: Option<String>,
-        inline_available: bool,
     },
 }
 
@@ -95,7 +94,6 @@ impl SaveState {
                 Self::Failed {
                     title,
                     detail: detail.map(str::to_owned),
-                    inline_available: storage.inline_available(),
                 }
             }
         }
@@ -107,16 +105,6 @@ impl SaveState {
             Self::Failed { .. } => Self::FAILED,
             _ => Self::KEYRING,
         }
-    }
-
-    pub fn inline_available(&self) -> bool {
-        matches!(
-            self,
-            Self::Failed {
-                inline_available: true,
-                ..
-            }
-        )
     }
 }
 
@@ -175,8 +163,16 @@ fn save_actions(storage: &Storage, retained_mailbox: bool) -> [Option<Action>; 3
         ],
         Storage::ConfirmInline(_) => [Some(use_keyring), None, Some(next("Save in file"))],
         _ if storage.must_reopen() => [None, None, Some(next("Quit"))],
-        _ if storage.inline_available() => [Some(back), None, Some(next("Retry keyring"))],
-        Storage::Keyring if retained_mailbox => [Some(back), None, Some(next("New mailbox"))],
+        _ if storage.inline_available() => [
+            Some(back),
+            Some(Action::new(Control::Inline, "Save in file…")),
+            Some(next("Retry keyring")),
+        ],
+        Storage::Keyring if retained_mailbox => [
+            Some(back),
+            Some(next("Start empty")),
+            Some(Action::new(Control::Reconnect, "Reconnect")),
+        ],
         _ => [Some(back), None, Some(next("Save account"))],
     }
 }

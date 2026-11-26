@@ -123,6 +123,17 @@ struct AccountRow {
     kind: crate::model::settings::AccountRemovalKind,
 }
 
+pub(super) struct FrozenAccounts {
+    rows: Vec<AccountRow>,
+    scroll: ScrollHandle,
+}
+
+pub(super) enum CardMode<'a> {
+    Live,
+    Leaving,
+    AccountSwitch(&'a FrozenAccounts),
+}
+
 impl AccountRow {
     fn can_remove(&self) -> bool {
         !self.removing
@@ -278,7 +289,8 @@ impl View {
     pub fn availability(&self) -> Availability {
         Availability {
             account_setup: true,
-            edit_account: self.accounts.iter().any(|account| account.active),
+            edit_account: self.accounts.iter().any(|account| account.active)
+                || self.broken_legacy_path().is_some(),
             identity_count: self.identities.len(),
             accounts: self.accounts.len(),
             active_account: self.accounts.iter().position(|account| account.active),
@@ -291,6 +303,22 @@ impl View {
                 ModelStatus::Checking | ModelStatus::Installed | ModelStatus::NeedsRepair
             ),
         }
+    }
+
+    pub fn broken_legacy_path(&self) -> Option<&Path> {
+        let [account] = self.accounts.as_slice() else {
+            return None;
+        };
+        (account.kind == crate::model::settings::AccountRemovalKind::BrokenFile
+            && account
+                .path
+                .file_name()
+                .is_some_and(|name| name == "account.toml")
+            && account
+                .path
+                .parent()
+                .is_some_and(|parent| !parent.ends_with("accounts")))
+        .then_some(account.path.as_path())
     }
 
     pub fn scroll_to(&self, row: usize) {
@@ -316,7 +344,16 @@ impl View {
 
     pub fn reset_scroll(&mut self) {
         self.scroll_glide = None;
-        self.scroll.set_offset(gpui::point(px(0.), px(0.)));
+        self.scroll = ScrollHandle::new();
+    }
+
+    pub fn freeze_accounts(&self) -> FrozenAccounts {
+        let scroll = ScrollHandle::new();
+        scroll.set_offset(self.scroll.offset());
+        FrozenAccounts {
+            rows: self.accounts.clone(),
+            scroll,
+        }
     }
 
     pub fn settle(&mut self) {
@@ -543,13 +580,15 @@ impl Inbox {
             }
             Request::AccountSetup => self.open_account_setup(cx),
             Request::EditAccount => {
-                if let Some(account) = self
+                if let Some(path) = self
                     .settings_view
                     .accounts
                     .iter()
                     .find(|account| account.active)
+                    .map(|account| account.path.as_path())
+                    .or_else(|| self.settings_view.broken_legacy_path())
                 {
-                    self.open_account_editor(account.path.clone(), cx);
+                    self.open_account_editor(path.to_owned(), cx);
                 }
             }
             Request::OpenAccount(index) => {
@@ -1016,6 +1055,42 @@ impl Inbox {
     }
 }
 
+pub(super) fn legacy_account_actions(theme: &theme::Theme, cx: &Context<Inbox>) -> gpui::Div {
+    div()
+        .flex()
+        .flex_wrap()
+        .justify_center()
+        .gap_2()
+        .mt_2()
+        .children(
+            [
+                ("Add account", Request::AccountSetup),
+                ("Open account.toml", Request::EditAccount),
+            ]
+            .into_iter()
+            .map(|(label, request)| {
+                div()
+                    .id(label)
+                    .px_3()
+                    .py_1p5()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(theme.border))
+                    .text_size(px(12.))
+                    .cursor_pointer()
+                    .hover(|button| button.bg(rgb(theme.surface)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |inbox, _, _, cx| {
+                            cx.stop_propagation();
+                            inbox.settings_request(request, false, cx);
+                        }),
+                    )
+                    .child(label)
+            }),
+        )
+}
+
 fn shows_invalid_value(page: Page, snapshot: &Snapshot) -> bool {
     let Page::Section(section) = page else {
         return false;
@@ -1121,13 +1196,19 @@ pub(super) fn card(
     theme: &theme::Theme,
     session: &crate::model::Session,
     view: &View,
-    live: bool,
+    mode: CardMode<'_>,
     (height, window): (f32, &Window),
     now: Instant,
     cx: &mut Context<Inbox>,
 ) -> gpui::Div {
     use crate::model::settings::AccountRemovalKind;
 
+    let live = matches!(mode, CardMode::Live);
+    let (accounts, scroll) = match mode {
+        CardMode::Live => (&view.accounts, Some(&view.scroll)),
+        CardMode::Leaving => (&view.accounts, None),
+        CardMode::AccountSwitch(frozen) => (&frozen.rows, Some(&frozen.scroll)),
+    };
     let page = session.settings_nav.page;
     let width = f32::from(window.viewport_size().width);
     let content_opacity = if live {
@@ -1220,7 +1301,7 @@ pub(super) fn card(
         .overflow_y_scroll()
         .px(px(10.))
         .py(px(8.))
-        .when(live, |body| body.track_scroll(&view.scroll));
+        .when_some(scroll, |body, scroll| body.track_scroll(scroll));
     let selected = session.settings_nav.selected;
     let mut details = None;
     let mut footer = None;
@@ -1268,7 +1349,7 @@ pub(super) fn card(
                 };
                 let mut control = row(theme, index, selected, live, height, cx);
                 if let Row::Account(account) = setting {
-                    if let Some(account) = view.accounts.get(account) {
+                    if let Some(account) = accounts.get(account) {
                         let restore = matches!(
                             account.kind,
                             AccountRemovalKind::Interrupted { can_restore: true }

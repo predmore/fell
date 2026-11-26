@@ -23,9 +23,17 @@ pub(super) struct AccountWindow {
     removing: HashMap<String, RequestedRemoval>,
     catalog: Accounts,
     picker_clock: motion::Clock,
-    picker_exit: Option<(Entity<Inbox>, Layer, Option<f32>, Transition)>,
+    picker_exit: Option<PickerExit>,
     active_changed: (oneshot::Sender<()>, Shared<oneshot::Receiver<()>>),
     _compose_listener: Option<gpui::Task<()>>,
+}
+
+struct PickerExit {
+    outgoing: Entity<Inbox>,
+    layer: Layer,
+    height: Option<f32>,
+    fade: Transition,
+    settings: Option<super::settings::FrozenAccounts>,
 }
 
 #[derive(Clone)]
@@ -408,7 +416,7 @@ impl AccountWindow {
             if self
                 .picker_exit
                 .as_ref()
-                .is_some_and(|(outgoing, ..)| outgoing == &view)
+                .is_some_and(|exit| exit.outgoing == view)
             {
                 self.picker_exit = None;
             }
@@ -621,29 +629,21 @@ impl AccountWindow {
                     Some(err.detail.as_str())
                 })
             });
-        for (id, view) in &self.views {
-            self.set_choices(view, Some(id), &statuses, error, catalog_changed, cx);
+        for view in self.views.values() {
+            self.set_choices(view, &statuses, error, catalog_changed, cx);
         }
         if self
             .active_id
             .as_ref()
             .is_none_or(|id| !self.views.contains_key(id))
         {
-            self.set_choices(
-                &self.active,
-                self.active_id.as_ref(),
-                &statuses,
-                error,
-                catalog_changed,
-                cx,
-            );
+            self.set_choices(&self.active, &statuses, error, catalog_changed, cx);
         }
     }
 
     fn set_choices(
         &self,
         view: &Entity<Inbox>,
-        current: Option<&String>,
         statuses: &HashMap<String, (String, bool)>,
         error: Option<&str>,
         catalog_changed: bool,
@@ -661,7 +661,7 @@ impl AccountWindow {
                             title: account.display_name,
                             detail: Some(account.email),
                             date: None,
-                            mark: (current == Some(&config.id)).then_some("✓"),
+                            mark: (self.active_id.as_ref() == Some(&config.id)).then_some("✓"),
                             divider: false,
                         }
                     })
@@ -670,7 +670,7 @@ impl AccountWindow {
             }
             if inbox.settings_view.set_accounts(
                 &self.catalog,
-                current.map(String::as_str),
+                self.active_id.as_deref(),
                 statuses,
                 |id| self.removing.contains_key(id),
             ) || catalog_changed
@@ -703,6 +703,8 @@ impl AccountWindow {
             self.picker_exit = outgoing.update(cx, |inbox, _| {
                 let now = inbox.motion.clock.now();
                 let layer = inbox.motion.settle_account_switch(&inbox.session, now);
+                let settings = (inbox.session.overlay == Overlay::Settings)
+                    .then(|| inbox.settings_view.freeze_accounts());
                 inbox.session.cancel_read_delay();
                 if inbox.session.overlay != Overlay::None {
                     inbox.session.dismiss_overlay();
@@ -712,9 +714,13 @@ impl AccountWindow {
                     queue.set_viewing(false);
                 }
                 let fade = inbox.motion.motion.start(motion::FADE, fade_now);
-                layer
-                    .zip(fade)
-                    .map(|((layer, height), fade)| (outgoing.clone(), layer, height, fade))
+                layer.zip(fade).map(|((layer, height), fade)| PickerExit {
+                    outgoing: outgoing.clone(),
+                    layer,
+                    height,
+                    fade,
+                    settings,
+                })
             });
             self.active = next;
             self.active_id = Some(id.to_owned());
@@ -722,14 +728,21 @@ impl AccountWindow {
             self.active.update(cx, |inbox, cx| {
                 inbox.frames = frames;
                 inbox.notification_window_activation(window, cx);
-                inbox.ignore_enter_until = confirmed_with_enter
-                    .then(|| Instant::now() + super::ACCOUNT_SWITCH_ENTER_QUIET);
+                inbox.switch_enter_guard =
+                    confirmed_with_enter.then(super::AccountSwitchEnterGuard::new);
                 inbox.start_account_arrival(Instant::now());
                 cx.notify();
             });
             self.focus(window, cx);
-            self.update_choices(false, cx);
+            self.update_choices(true, cx);
             cx.notify();
+            #[cfg(debug_assertions)]
+            if confirmed_with_enter
+                && std::env::var_os("FELL_DEBUG_ACCOUNT_SWITCH_STALL").as_deref()
+                    == Some(std::ffi::OsStr::new("1"))
+            {
+                std::thread::sleep(Duration::from_millis(300));
+            }
         }
     }
 
@@ -738,10 +751,10 @@ impl AccountWindow {
         self.picker_exit = self
             .picker_exit
             .take()
-            .filter(|(_, _, _, fade)| fade.running(now));
+            .filter(|exit| exit.fade.running(now));
         self.picker_exit
             .as_ref()
-            .map(|(_, _, _, fade)| fade.remaining(now))
+            .map(|exit| exit.fade.remaining(now))
     }
 }
 
@@ -756,7 +769,16 @@ impl Render for AccountWindow {
             theme.ui_family.clone(),
         );
         let picker = self.picker_exit.as_mut().zip(picker_opacity).map(
-            |((outgoing, layer, height, _), opacity)| {
+            |(
+                PickerExit {
+                    outgoing,
+                    layer,
+                    height,
+                    settings,
+                    ..
+                },
+                opacity,
+            )| {
                 let entity = cx.entity().downgrade();
                 window.on_next_frame(move |_, cx| {
                     let _ = entity.update(cx, |_, cx| cx.notify());
@@ -764,12 +786,12 @@ impl Render for AccountWindow {
                 outgoing.update(cx, |inbox, cx| {
                     layer.swap(&mut inbox.session);
                     let height = height.map(|height| motion::snap(height, window.scale_factor()));
-                    let settings = (inbox.session.overlay == Overlay::Settings).then(|| {
+                    let settings = settings.as_ref().map(|settings| {
                         super::settings::card(
                             &inbox.theme,
                             &inbox.session,
                             &inbox.settings_view,
-                            false,
+                            super::settings::CardMode::AccountSwitch(settings),
                             (
                                 height.unwrap_or_else(|| {
                                     super::settings::card_height(
@@ -1136,18 +1158,47 @@ mod tests {
                 }
                 assert!(view.picker_opacity(at + motion::FADE).is_none());
                 view.active().update(cx, |inbox, _| {
-                    for millis in [10, 115, 240, 370, 530] {
-                        assert!(
-                            inbox.swallow_switch_enter(at + Duration::from_millis(millis), false)
-                        );
+                    // The first queued Enter can be dispatched after a stall
+                    // longer than the entire quiet period, before or after paint.
+                    let after_stall = at + Duration::from_millis(300);
+                    assert!(inbox.advance_switch_enter_guard(after_stall));
+                    assert!(inbox.swallow_switch_enter(false));
+                    for millis in (0..=240).step_by(16) {
+                        assert!(inbox.advance_switch_enter_guard(
+                            after_stall + Duration::from_millis(millis)
+                        ));
                     }
-                    let deliberate = at + Duration::from_millis(800);
-                    assert!(!inbox.swallow_switch_enter(deliberate, false));
-                    assert!(inbox.swallow_switch_enter(deliberate, true));
+                    let next_frame = after_stall + Duration::from_millis(540);
+                    assert!(inbox.advance_switch_enter_guard(next_frame));
+                    assert!(inbox.swallow_switch_enter(false));
+                    for millis in (0..=240).step_by(16) {
+                        assert!(inbox.advance_switch_enter_guard(
+                            next_frame + Duration::from_millis(millis)
+                        ));
+                    }
+                    assert!(
+                        !inbox.advance_switch_enter_guard(next_frame + Duration::from_millis(256))
+                    );
+                    assert!(!inbox.swallow_switch_enter(false));
+                    assert!(inbox.swallow_switch_enter(true));
+
+                    inbox.session.on_key(KeyId::Char('g'), 10);
+                    inbox.session.on_key(KeyId::Char('A'), 10);
+                    assert_eq!(inbox.session.overlay, Overlay::Folders);
+                    let choices = inbox.session.picker_choices();
+                    assert_eq!(
+                        choices
+                            .iter()
+                            .filter(|choice| choice.mark == Some("✓"))
+                            .map(|choice| choice.name.as_str())
+                            .collect::<Vec<_>>(),
+                        ["work"]
+                    );
+                    assert_eq!(choices[inbox.session.folder_index].name, "work");
                 });
                 view.switch("mail", window, cx);
                 original.update(cx, |inbox, _| {
-                    assert!(!inbox.swallow_switch_enter(at, false));
+                    assert!(!inbox.swallow_switch_enter(false));
                 });
             })
             .unwrap();

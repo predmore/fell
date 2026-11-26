@@ -224,7 +224,7 @@ impl Onboarding {
                 Storage::ConfirmInline(_) => vec![Back, Next],
                 _ if self.form.storage.inline_available() => vec![Next, Inline, Back],
                 Storage::Keyring if self.form.retained_mailbox.is_some() => {
-                    vec![Next, Control::Reconnect, Back]
+                    vec![Control::Reconnect, Next, Back]
                 }
                 _ => vec![Next, Back],
             },
@@ -304,7 +304,12 @@ impl Onboarding {
                 Step::Connection if self.form.connected() => {
                     self.form.done();
                     self.feedback.begin_save();
-                    self.change_step(before, Control::Next, cx);
+                    let control = if self.form.retained_mailbox.is_some() {
+                        Control::Reconnect
+                    } else {
+                        Control::Next
+                    };
+                    self.change_step(before, control, cx);
                 }
                 Step::Done if self.form.storage.must_reopen() => cx.quit(),
                 Step::Done => {

@@ -6,8 +6,8 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use super::{
-    Accounts, Entry, FileIdentity, Registry, file_identity, mailbox_exists, mailbox_owner,
-    path_exists, publish, read, real_directory, removal_trash, verify_backup,
+    Accounts, Entry, FileIdentity, OriginalMailbox, Registry, file_identity, mailbox_exists,
+    mailbox_owner, path_exists, publish, read, real_directory, removal_trash, verify_backup,
 };
 use crate::{AccountId, Store, compose};
 
@@ -37,10 +37,13 @@ impl Registry {
     pub fn load_with_removals(&self, base: &Path) -> Accounts {
         let mut catalog = self.load();
         let original = self
-            .original_id(base)
+            .original_mailbox(base)
             .ok()
             .flatten()
-            .and_then(|(id, backup)| {
+            .and_then(|original| {
+                let OriginalMailbox::Known { id, backup } = original else {
+                    return None;
+                };
                 if let Some(backup) = backup
                     && let Err(error) = verify_backup(base, &backup, &id)
                 {
@@ -364,6 +367,13 @@ pub(super) fn mailbox_has_owner(base: &Path, id: &str) -> bool {
         || real_directory(&trash).is_ok()
             && read_plan(&trash).is_ok_and(|plan| plan.account == id)
             && verify_mailbox_owner(base, id)
+}
+
+pub(super) fn staged_mailbox_id(base: &Path) -> Option<String> {
+    let trash = removal_trash(base);
+    real_directory(&trash).ok()?;
+    let plan = read_plan(&trash).ok()?;
+    verify_mailbox_owner(base, &plan.account).then_some(plan.account)
 }
 
 pub(super) fn verify_mailbox_owner(base: &Path, id: &str) -> bool {

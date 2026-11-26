@@ -692,6 +692,32 @@ const FIRST_PREVIEW_WAIT: Duration = Duration::from_millis(1500);
 const ACCOUNT_SWITCH_ENTER_QUIET: Duration = Duration::from_millis(250);
 const ACCOUNT_READER_WAIT: Duration = Duration::from_millis(150);
 
+struct AccountSwitchEnterGuard {
+    remaining: Duration,
+    last_frame: Option<Instant>,
+}
+
+impl AccountSwitchEnterGuard {
+    fn new() -> Self {
+        Self {
+            remaining: ACCOUNT_SWITCH_ENTER_QUIET,
+            last_frame: None,
+        }
+    }
+
+    fn frame(&mut self, now: Instant) -> bool {
+        // Start on the incoming inbox's first frame. A late frame cannot
+        // clear the guard ahead of key events queued while the UI stalled.
+        if let Some(last) = self.last_frame.replace(now) {
+            let elapsed = now.saturating_duration_since(last);
+            if elapsed <= motion::MAX_STEP {
+                self.remaining = self.remaining.saturating_sub(elapsed);
+            }
+        }
+        !self.remaining.is_zero()
+    }
+}
+
 enum AccountReaderArrival {
     Waiting(Instant),
     Fading(Transition),
@@ -825,7 +851,7 @@ struct Inbox {
     compose_ready: futures::future::Shared<futures::channel::oneshot::Receiver<()>>,
     account_arrival: Option<Transition>,
     account_reader_arrival: Option<AccountReaderArrival>,
-    ignore_enter_until: Option<Instant>,
+    switch_enter_guard: Option<AccountSwitchEnterGuard>,
     /// Visible label rows as they looked in the last list prepaint.
     painted_label_rows: Vec<LeavingRow>,
     leaving_rows: Option<Arc<[LeavingRow]>>,
@@ -1060,7 +1086,7 @@ impl Inbox {
             compose_ready: futures::FutureExt::shared(compose_ready),
             account_arrival: None,
             account_reader_arrival: None,
-            ignore_enter_until: None,
+            switch_enter_guard: None,
             painted_label_rows: Vec::new(),
             leaving_rows: None,
             leaving_reader: None,
@@ -4525,7 +4551,7 @@ impl Inbox {
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let started = Instant::now();
         if key_from(&event.keystroke) == Some(KeyId::Enter)
-            && self.swallow_switch_enter(started, event.is_held)
+            && self.swallow_switch_enter(event.is_held)
         {
             cx.stop_propagation();
             return;
@@ -4645,10 +4671,23 @@ impl Inbox {
         cx.stop_propagation();
     }
 
-    fn swallow_switch_enter(&mut self, now: Instant, held: bool) -> bool {
-        let armed = self.ignore_enter_until.is_some_and(|until| now < until);
-        self.ignore_enter_until = armed.then(|| now + ACCOUNT_SWITCH_ENTER_QUIET);
+    fn swallow_switch_enter(&mut self, held: bool) -> bool {
+        let armed = self.switch_enter_guard.is_some();
+        if armed {
+            self.switch_enter_guard = Some(AccountSwitchEnterGuard::new());
+        }
         held || armed
+    }
+
+    fn advance_switch_enter_guard(&mut self, now: Instant) -> bool {
+        let armed = self
+            .switch_enter_guard
+            .as_mut()
+            .is_some_and(|guard| guard.frame(now));
+        if !armed {
+            self.switch_enter_guard = None;
+        }
+        armed
     }
 
     /// Where the reader was before a key or action: [`Inbox::apply_step`]
@@ -4867,17 +4906,17 @@ impl Inbox {
             self.settings_request(request, confirmed_with_enter, cx);
         }
         if self.session.overlay == Overlay::Settings {
+            use crate::model::settings::{Page, Section};
             self.validate_settings_step(cx);
             let page = self.session.settings_nav.page;
+            let returning_to_accounts =
+                matches!(settings_page, Some(Page::ConfirmAccountRemoval { .. }))
+                    && page == Page::Section(Section::Accounts);
             if settings_page != Some(page) {
                 self.settings_view.reset_scroll();
                 self.refresh_settings_identities(cx);
             }
-            if matches!(
-                page,
-                crate::model::settings::Page::Section(_)
-                    | crate::model::settings::Page::IdentityImport
-            ) {
+            if !returning_to_accounts && matches!(page, Page::Section(_) | Page::IdentityImport) {
                 self.settings_view
                     .scroll_to(self.session.settings_nav.selected);
             }
@@ -5500,6 +5539,7 @@ impl Render for Inbox {
         self.bodies
             .release_unused_images(|image| cx.drop_image(image, Some(window)));
         let real = Instant::now();
+        let guarding_switch = self.advance_switch_enter_guard(real);
         // Motion time: a frame the compositor held back moves what is
         // moving one step on, not to its end.
         let now = self.motion.clock.frame(real);
@@ -5912,7 +5952,7 @@ impl Render for Inbox {
             | settings_animating
             | self.search_view.animating(now)
             | (self.session.overlay == Overlay::Help && self.help_scroll.running(now));
-        if animating {
+        if animating || guarding_switch {
             window.request_animation_frame();
         } else {
             self.motion.clock.idle();
@@ -6025,7 +6065,11 @@ impl Render for Inbox {
                         &theme,
                         session,
                         &self.settings_view,
-                        live,
+                        if live {
+                            settings::CardMode::Live
+                        } else {
+                            settings::CardMode::Leaving
+                        },
                         (
                             card.unwrap_or_else(|| {
                                 settings::card_height(
@@ -6106,6 +6150,8 @@ impl Render for Inbox {
                     leaving_banner,
                     leaving: self.leaving_rows.clone().map(|rows| (rows, exit)),
                     cached_results: cached_search_rows,
+                    legacy_account_actions: self.settings_view.broken_legacy_path().is_some()
+                        && self.session.sync == SyncKind::StoreError,
                 },
                 status_labels,
                 link_preview,
@@ -6233,6 +6279,7 @@ struct ListContent {
     leaving_banner: Option<(Banner, f32)>,
     leaving: Option<(Arc<[LeavingRow]>, f32)>,
     cached_results: Option<(u64, gpui::AnyView)>,
+    legacy_account_actions: bool,
 }
 
 /// What the conversation's bodies show this frame beyond the session.
@@ -6437,6 +6484,7 @@ fn shell(
                 list_scroll.clone(),
                 ListContent {
                     banner: list.banner.clone(),
+                    legacy_account_actions: list.legacy_account_actions,
                     ..ListContent::default()
                 },
                 cx,
@@ -7247,11 +7295,15 @@ fn thread_list(
     if session.threads.is_empty() {
         return pane
             .relative()
-            .children(
-                content
-                    .banner
-                    .map(|(banner, opacity)| empty_state(theme, banner).opacity(opacity)),
-            )
+            .children(content.banner.map(|(mut banner, opacity)| {
+                let actions = content.legacy_account_actions.then(|| {
+                    banner.hint.clear();
+                    settings::legacy_account_actions(theme, cx)
+                });
+                empty_state(theme, banner)
+                    .children(actions)
+                    .opacity(opacity)
+            }))
             .children(content.leaving_banner.map(|(banner, opacity)| {
                 empty_state(theme, banner)
                     .absolute()

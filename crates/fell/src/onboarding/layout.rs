@@ -391,7 +391,7 @@ impl Onboarding {
                 "",
                 "",
                 column()
-                    .child(
+                    .when(self.form.retained_mailbox.is_none(), |column| column.child(
                         div()
                             .border_1()
                             .rounded_lg()
@@ -401,19 +401,20 @@ impl Onboarding {
                             .font_weight(FontWeight::SEMIBOLD)
                             .truncate()
                             .child(self.form.text(Field::Email).trim().to_owned()),
-                    )
+                    ))
                     .child(
                         self.feedback.save_note.paint(false, |state, _| match state {
-                            SaveState::Ready if self.form.retained_mailbox.is_some() => column()
-                                .gap_2()
-                                .child(self.meta("Fell found a kept mailbox for this address. Reconnect to resume using its local mail."))
-                                .child(div().child(self.button(Control::Reconnect, "Reconnect existing mailbox", live && matches!(self.form.storage, super::Storage::Keyring), cx))),
+                            SaveState::Ready if self.form.retained_mailbox.is_some() =>
+                                self.meta("Start empty keeps the old mail on this device but doesn't show it."),
                             SaveState::Ready => self.meta("Fell keeps your password in the desktop keyring."),
                             SaveState::SavingKeyring => self.meta("Approve any keyring prompt to continue."),
                             SaveState::ConfirmFile => self.meta(
                                 "Your password will be saved as plain text in the account file. Fell restricts access to the file to your user account.",
                             ),
-                            SaveState::Failed { title, detail, .. } => self.error(title, detail.as_deref()),
+                            SaveState::Failed { title, detail } => column()
+                                .gap_2()
+                                .when(self.reconnect, |column| column.child(self.meta("Reconnecting to the kept mailbox")))
+                                .child(self.error(title, detail.as_deref())),
                         }).min_h(px((self.theme.ui_px + 4.) * 5.)),
                     ),
                 [None, None],
@@ -428,15 +429,44 @@ impl Onboarding {
                 self.reserved_heading(Connection::ALL.map(Connection::heading), heading)
             }
             Step::Done => {
+                let reconnect_title = self.form.retained_mailbox.as_ref().map(|_| {
+                    let email = crate::present::display_safe(self.form.text(Field::Email).trim());
+                    format!("Reconnect {email}?")
+                });
                 let heading = self.heading_column(
-                    self.feedback
-                        .save_title
-                        .paint(false, |title, _| self.title(title)),
-                    self.feedback
-                        .save_subtitle
-                        .paint(false, |detail, _| self.meta(*detail)),
+                    self.feedback.save_title.paint(false, |title, _| {
+                        if let Some(reconnect) = &reconnect_title
+                            && matches!(self.form.storage, super::Storage::Keyring)
+                        {
+                            self.title(reconnect)
+                        } else {
+                            self.title(title)
+                        }
+                    }),
+                    self.feedback.save_subtitle.paint(false, |detail, _| {
+                        if reconnect_title.is_some()
+                            && matches!(self.form.storage, super::Storage::Keyring)
+                        {
+                            self.meta("Use the mail already on this device.")
+                        } else {
+                            self.meta(*detail)
+                        }
+                    }),
                 );
-                self.reserved_heading(SaveState::HEADINGS, heading)
+                if let Some(reconnect) = &reconnect_title {
+                    let [keyring, file, failed] = SaveState::HEADINGS;
+                    self.reserved_heading(
+                        [
+                            keyring,
+                            file,
+                            failed,
+                            (reconnect, "Use the mail already on this device."),
+                        ],
+                        heading,
+                    )
+                } else {
+                    self.reserved_heading(SaveState::HEADINGS, heading)
+                }
             }
             _ => self.heading(title, detail),
         };
@@ -545,19 +575,6 @@ impl Onboarding {
         cx: &Context<Self>,
     ) -> [Footer; 2] {
         std::array::from_fn(|index| {
-            if saving && index == 1 {
-                return Some(
-                    self.feedback
-                        .save_note
-                        .paint(live, |state, live| {
-                            div().when(state.inline_available(), |el| {
-                                el.child(self.button(Control::Inline, "Save in file…", live, cx))
-                            })
-                        })
-                        .flex_none()
-                        .into_any_element(),
-                );
-            }
             Some(
                 actions[index]
                     .paint(live, |action, live| {

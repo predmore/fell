@@ -333,10 +333,8 @@ pub(crate) fn stage_account_config(
         if !can_reconnect_at(&registry, &base, &config.id, &config.email) {
             return Err("The kept mailbox changed. Review the account and try again.".into());
         }
-    } else if !configured {
-        if accounts::mailbox_exists(&mailbox).map_err(|err| err.to_string())? {
-            return Err("This ID has a local mailbox. Choose a new ID or confirm reconnecting the same account.".into());
-        }
+    } else if !configured && accounts::mailbox_exists(&mailbox).map_err(|err| err.to_string())? {
+        return Err("This ID has a local mailbox. Choose a new ID or confirm reconnecting the same account.".into());
     }
     let mut staged = stage_account_text_at(path, &config.render(), !configured, lock)?;
     if !configured && !reconnect {

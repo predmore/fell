@@ -77,6 +77,11 @@ pub struct Entry {
     pub file_identity: Option<FileIdentity>,
 }
 
+enum OriginalMailbox {
+    Known { id: String, backup: Option<PathBuf> },
+    Unavailable { id: String, error: FileError },
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Accounts {
     pub entries: Vec<Entry>,
@@ -283,10 +288,20 @@ impl Registry {
         id: &str,
     ) -> Result<(PathBuf, Option<PathBuf>), FileError> {
         self.path(id)?;
-        if let Some((original, backup)) = self.original_id(base)?
-            && id == original
-        {
-            return Ok((base.to_owned(), backup));
+        match self.original_mailbox(base)? {
+            Some(OriginalMailbox::Known {
+                id: original,
+                backup,
+            }) if id == original => {
+                return Ok((base.to_owned(), backup));
+            }
+            Some(OriginalMailbox::Unavailable {
+                id: original,
+                error,
+            }) if id == original => {
+                return Err(error);
+            }
+            _ => {}
         }
         Ok((
             base.with_extension("accounts").join(format!("{id}.db")),
@@ -294,7 +309,7 @@ impl Registry {
         ))
     }
 
-    fn original_id(&self, base: &Path) -> Result<Option<(String, Option<PathBuf>)>, FileError> {
+    fn original_mailbox(&self, base: &Path) -> Result<Option<OriginalMailbox>, FileError> {
         if let Err(err) = real_directory(&self.config)
             && err.kind() != io::ErrorKind::NotFound
         {
@@ -308,28 +323,51 @@ impl Registry {
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => return Err(FileError::access(&self.directory(), err)),
         }
-        let original = match self.original_marker() {
-            Ok(Some(id)) => Some((id, None)),
-            marker => {
-                let backup = self.config.join("account.toml.bak");
-                match backup.symlink_metadata() {
-                    Ok(_) => {
-                        let id = read(&backup, None)?.ok_or_else(|| missing(&backup))?.0.id;
-                        Some((id, Some(backup)))
-                    }
-                    Err(err) if err.kind() == io::ErrorKind::NotFound => match legacy {
-                        Ok(Some((config, _))) => Some((config.id, None)),
-                        legacy => {
-                            marker?;
-                            self.infer_original_mailbox(base, legacy.is_err())?
-                                .then(|| (DEFAULT_ID.into(), None))
-                        }
-                    },
-                    Err(err) => return Err(FileError::access(&backup, err)),
+        let marker_error = match self.original_marker() {
+            Ok(Some(id)) => return Ok(Some(OriginalMailbox::Known { id, backup: None })),
+            marker => marker.err(),
+        };
+        let backup = self.config.join("account.toml.bak");
+        let metadata_error = match read(&backup, None) {
+            Ok(Some((config, _))) => {
+                return Ok(Some(OriginalMailbox::Known {
+                    id: config.id,
+                    backup: Some(backup),
+                }));
+            }
+            Err(error) => Some(error),
+            Ok(None) => {
+                if let Ok(Some((config, _))) = legacy {
+                    return Ok(Some(OriginalMailbox::Known {
+                        id: config.id,
+                        backup: None,
+                    }));
                 }
+                marker_error
             }
         };
-        Ok(original)
+        if let Some(error) = metadata_error {
+            let id = mailbox_owner(base)
+                .ok()
+                .flatten()
+                .map(|(id, _)| id)
+                .or_else(|| removal::staged_mailbox_id(base))
+                .or_else(|| {
+                    legacy
+                        .as_ref()
+                        .ok()?
+                        .as_ref()
+                        .map(|(config, _)| config.id.clone())
+                })
+                .unwrap_or_else(|| DEFAULT_ID.into());
+            return Ok(Some(OriginalMailbox::Unavailable { id, error }));
+        }
+        Ok(self
+            .infer_original_mailbox(base, legacy.is_err())?
+            .then(|| OriginalMailbox::Known {
+                id: DEFAULT_ID.into(),
+                backup: None,
+            }))
     }
 
     fn infer_original_mailbox(&self, base: &Path, broken_legacy: bool) -> Result<bool, FileError> {
@@ -388,16 +426,23 @@ impl Registry {
             Err(err) => return Err(FileError::access(&marker, err)),
         };
         let mut value = String::new();
-        file.take(65)
+        file.take(129)
             .read_to_string(&mut value)
             .map_err(|err| FileError::access(&marker, err))?;
-        validate_id(&value).map_err(|err| {
+        let id = value.trim();
+        if value.len() > 128 {
+            return Err(FileError::new(
+                ".original-id: File is too large",
+                "Restore the original account ID.",
+            ));
+        }
+        validate_id(id).map_err(|err| {
             FileError::new(
                 format!("{}: {err}", file_name(&marker)),
                 "Restore the original account ID.",
             )
         })?;
-        Ok(Some(value))
+        Ok(Some(id.to_owned()))
     }
 
     /// Copy the original bytes into the new layout, then rename the source
@@ -767,6 +812,37 @@ mod tests {
         }
         fs::write(backup, "broken").unwrap();
         assert!(registry.store_path(&base, "mail").is_err());
+    }
+
+    #[test]
+    fn invalid_original_metadata_blocks_only_the_owner_of_the_base_db() {
+        for metadata in ["account.toml.bak", "accounts/.original-id"] {
+            let root = tempfile::tempdir().unwrap();
+            let config = root.path().join("fell");
+            let registry = Registry::at(config.clone());
+            let base = root.path().join("mail.db");
+            let personal =
+                "id = 'personal'\nemail = 'personal@example.test'\npassword = 'fixture'\n";
+            write_private(&registry.path("personal").unwrap(), personal);
+            write_private(
+                &registry.path("work").unwrap(),
+                "email = 'work@example.test'\npassword = 'fixture'\n",
+            );
+            let db = crate::Store::open(&base).unwrap();
+            db.upsert_account(&AccountConfig::parse(personal).unwrap().account())
+                .unwrap();
+            drop(db);
+            write_private(&config.join(metadata), "invalid = [");
+            let work = registry.store_path(&base, "work").unwrap();
+            assert_eq!(work, base.with_extension("accounts").join("work.db"));
+            assert!(registry.store_path(&base, "personal").is_err());
+            assert!(registry.remove(&base, "personal", true).is_err());
+            assert!(base.is_file());
+
+            fs::write(config.join("accounts/.original-id"), "personal\n").unwrap();
+            assert_eq!(registry.store_path(&base, "personal").unwrap(), base);
+            assert_eq!(registry.store_path(&base, "work").unwrap(), work);
+        }
     }
 
     #[test]
