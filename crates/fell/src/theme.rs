@@ -9,6 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub(crate) const TEXT_CONTRAST: f64 = 4.5;
+pub(crate) const LINK_TEXT_CONTRAST: f64 = 4.6;
 pub(crate) const MARK_CONTRAST: f64 = 3.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1203,6 +1204,23 @@ mod tests {
                 "{}: primary {button:.2}, input against page {border_on_page:.2}, input fill {border_on_input:.2}",
                 theme.name
             );
+        }
+    }
+
+    #[test]
+    fn reader_links_meet_contrast_on_resting_and_focused_cards() {
+        for theme in every_test_theme() {
+            let normal = crate::mail_body::palette(&theme);
+            let history = crate::mail_body::history_palette(&theme);
+            for fill in [theme.background, theme.surface] {
+                for accent in [normal.accent, history.accent] {
+                    assert!(
+                        contrast(accent, fill) >= LINK_TEXT_CONTRAST,
+                        "{}",
+                        theme.name
+                    );
+                }
+            }
         }
     }
 

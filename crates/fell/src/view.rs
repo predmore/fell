@@ -11009,6 +11009,12 @@ fn measured_message_body(
     frame: &ConvFrame,
     body: gpui::AnyElement,
 ) -> gpui::AnyElement {
+    let body = if message.rich == Rich::PendingWeb {
+        // The stored text may be just a snippet while the formatted body is read.
+        div().min_h(px(100.)).child(body).into_any_element()
+    } else {
+        body
+    };
     let probe = frame.body_probes.get(&message.id).cloned();
     let web = frame.web.get(&message.id);
     let web_probe = web.and_then(|web| web.height.clone());
@@ -14616,6 +14622,54 @@ mod tests {
             })
             .unwrap();
         (app, inbox)
+    }
+
+    #[test]
+    fn a_pending_web_body_keeps_room_for_formatting_with_only_a_short_preview() {
+        use super::{ConvFrame, ConvMessage, Rich, measured_message_body};
+        use gpui::{Context, ParentElement, Render, Styled, Window, px};
+        use std::{cell::Cell, rc::Rc};
+
+        struct BodyProbe {
+            message: ConvMessage,
+            preview_height: f32,
+            measured: Rc<Cell<f32>>,
+        }
+
+        impl Render for BodyProbe {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let mut frame = ConvFrame::default();
+                frame
+                    .body_probes
+                    .insert(self.message.id.clone(), self.measured.clone());
+                div().child(measured_message_body(
+                    &self.message,
+                    ReaderColumns::split(500.),
+                    &frame,
+                    div().h(px(self.preview_height)).into_any_element(),
+                ))
+            }
+        }
+
+        let (mut app, inbox) = pending_inbox();
+        let message = inbox
+            .update(&mut app, |inbox, _, _| inbox.session.messages[0].clone())
+            .unwrap();
+        for (rich, preview_height, expected) in [
+            (Rich::PendingWeb, 22., 100.),
+            (Rich::PendingWeb, 140., 140.),
+            (Rich::Pending, 22., 22.),
+        ] {
+            let mut message = message.clone();
+            message.rich = rich;
+            let measured = Rc::new(Cell::new(0.));
+            app.add_window(|_, _| BodyProbe {
+                message,
+                preview_height,
+                measured: measured.clone(),
+            });
+            assert_eq!(measured.get(), expected);
+        }
     }
 
     #[test]

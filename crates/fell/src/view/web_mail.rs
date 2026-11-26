@@ -330,8 +330,11 @@ impl Shown {
                 ]
             }
             Some(outgoing) if outgoing.is_colorless() || self.body.is_colorless() => {
-                let blend = motion::ease_out((linear - 0.5) * 2.);
-                [1. - blend, blend]
+                // Keep one layer fully painted while the matching ink fades.
+                [
+                    1. - motion::ease_out((linear - 0.5) * 2.),
+                    motion::ease_out(linear * 2.),
+                ]
             }
             Some(_) if linear < 1. => [1., progress],
             _ => [0., 1.],
@@ -603,7 +606,7 @@ impl Reader {
                 link: crate::theme::ensure_all(
                     theme.accent,
                     &[theme.background, theme.surface],
-                    4.6,
+                    crate::theme::LINK_TEXT_CONTRAST,
                 ),
                 inset: body.suggested == RenderMode::Web,
             }),
@@ -1039,7 +1042,7 @@ impl Reader {
                 .then(|| self.retry_until(&key))
                 .flatten()
                 .filter(|until| real < *until || entry.is_none());
-            let too_wide = entry.is_some_and(|entry| entry.too_wide);
+            let mut too_wide = entry.is_some_and(|entry| entry.too_wide);
             let failed =
                 retry_until.is_none() && entry.is_some_and(|entry| entry.picture.is_none());
             let retrying = retry_until.is_some();
@@ -1065,6 +1068,7 @@ impl Reader {
             } else {
                 None
             };
+            too_wide |= web && entry.is_none() && image.is_none() && placeholder_height.is_none();
             // A predicted width fallback lays out the actual native body at
             // the pane width while the worker confirms the document width.
             let wait = placeholder_height.is_some() && !large;
@@ -1897,7 +1901,7 @@ mod tests {
     }
 
     #[test]
-    fn colorless_switches_ease_out_the_outgoing_layer_after_the_midpoint() {
+    fn colorless_switches_fill_the_incoming_layer_before_fading_the_outgoing_one() {
         let now = Instant::now();
         let motion = Motion::new(true);
         let mut colorless = snapshot();
@@ -1914,19 +1918,19 @@ mod tests {
             assert_eq!(shown.frame(painted).body_alpha, [1., 0.]);
             shown.renderer_painted.as_ref().unwrap().set(Some(painted));
             shown.start_painted_fade(motion, painted, painted);
-            for ms in 1..=60 {
-                assert_eq!(
-                    shown.frame(painted + Duration::from_millis(ms)).body_alpha,
-                    [1., 0.]
-                );
-            }
-            let mut last = 1.;
-            for ms in 61..120 {
+            let mut last = [1., 0.];
+            for ms in 1..=120 {
                 let [outgoing, incoming] =
                     shown.frame(painted + Duration::from_millis(ms)).body_alpha;
-                assert!(outgoing <= last && outgoing >= 0.);
-                assert_eq!(outgoing + incoming, 1.);
-                last = outgoing;
+                if ms <= 60 {
+                    assert_eq!(outgoing, 1., "{ms} ms");
+                }
+                if ms >= 60 {
+                    assert_eq!(incoming, 1., "{ms} ms");
+                }
+                assert!(outgoing <= last[0] && incoming >= last[1], "{ms} ms");
+                assert!(outgoing + incoming * (1. - outgoing) >= 0.97, "{ms} ms");
+                last = [outgoing, incoming];
             }
             assert_eq!(shown.frame(painted + motion::FADE).body_alpha, [0., 1.]);
         }

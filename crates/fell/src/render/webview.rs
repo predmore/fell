@@ -21,6 +21,7 @@ const UNLAID_HEIGHT: i32 = 1;
 pub(crate) const SNAPSHOT_HEIGHT_LIMIT: i32 = super::native::MAX_IMAGE_EDGE as i32;
 const PAINT_SETTLE: Duration = Duration::from_millis(80);
 pub(crate) const LARGE_HTML_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_FALLBACK_LINKS: usize = 64;
 
 #[derive(Clone)]
 pub(crate) struct Snapshot {
@@ -339,7 +340,7 @@ fn wait_for_images(
     // visible paint. Wait for resource completion and force rasterization
     // with a canvas read before giving the document a chance to paint.
     const READY: &str = r#"
-        ((requestedWidth, requestedHeight, collectLinks) => {
+        ((requestedWidth, requestedHeight, collectLinks, readableWidth) => {
             // WebKit may see the previous GTK allocation until the resize
             // reaches its process. Wait for this job's CSS viewport.
             const root = document.documentElement;
@@ -384,6 +385,7 @@ fn wait_for_images(
             const gutter = width > viewportWidth && Number.isFinite(inset)
                 ? Math.max(0, Math.min(14, Math.round(inset), __WIDTH_LIMIT__ - width))
                 : 0;
+            if (width + gutter > readableWidth) return -1;
             const links = [];
             if (collectLinks) {
                 const visible = element => {
@@ -393,7 +395,19 @@ fn wait_for_images(
                     }
                     return true;
                 };
-                for (const anchor of body.querySelectorAll('a[href]')) {
+                // Computed CSS colors serialize an alpha as rgba(...) or / alpha.
+                const transparent = color => color === 'transparent'
+                    || /^rgba\([^,]+,[^,]+,[^,]+,\s*0(?:\.0+)?\s*\)$/.test(color)
+                    || /\/\s*0(?:\.0+)?%?\s*\)$/.test(color);
+                const hasTextInk = element => {
+                    const style = getComputedStyle(element);
+                    // Shadows by themselves do not establish a text target.
+                    return !transparent(style.color) && !transparent(style.webkitTextFillColor);
+                };
+                const anchors = body.getElementsByTagName('a');
+                for (let index = 0; index < 512; index++) {
+                    const anchor = anchors.item(index);
+                    if (!anchor) break;
                     if (anchor.closest('body[data-fell-collapsed] [data-fell-folded]')) continue;
                     const href = anchor.getAttribute('href');
                     if (!href || href.length > 4096) continue;
@@ -415,12 +429,13 @@ fn wait_for_images(
                             if (rects.length === 64) break;
                         }
                     };
-                    if (links.length < 512 && visible(anchor)) {
+                    if (visible(anchor)) {
                         const walker = document.createTreeWalker(anchor, NodeFilter.SHOW_TEXT);
                         const range = document.createRange();
                         while (rects.length < 64 && walker.nextNode()) {
                             const node = walker.currentNode;
-                            if (!node.data.trim() || !visible(node.parentElement)) continue;
+                            const element = node.parentElement;
+                            if (!node.data.trim() || !visible(element) || !hasTextInk(element)) continue;
                             range.selectNodeContents(node);
                             append(range);
                         }
@@ -452,10 +467,9 @@ fn wait_for_images(
         .is_some_and(|load| load.background.is_none());
     let collect_links = colorless && capture_height.is_some();
     let height = capture_height.unwrap_or(UNLAID_HEIGHT);
-    let ready = format!(
-        "{ready}({}, {height}, {collect_links})",
-        view.width_request()
-    );
+    let width = view.width_request();
+    let readable = fell_render::web_snapshot_readable_width(width as f32);
+    let ready = format!("{ready}({width}, {height}, {collect_links}, {readable})");
     widget.run_javascript_in_world(
         &ready,
         "fell-snapshot",
@@ -828,6 +842,7 @@ fn snapshot_links(
     let fallback = dropped
         .into_iter()
         .filter(|link| seen.insert(destination(&link.href)))
+        .take(MAX_FALLBACK_LINKS)
         .map(|link| Block::Paragraph {
             inlines: vec![Inline::Link {
                 href: link.href,
@@ -1092,6 +1107,41 @@ mod tests {
             );
         }
 
+        for width in [490, 500] {
+            for (newsletter, accepted) in [
+                (600, true),
+                (650, true),
+                (700, true),
+                (1200, false),
+                (2400, false),
+            ] {
+                let mail = fell_render::WebMail::prepare(&format!(
+                    "<table width='{newsletter}' bgcolor='white' cellspacing='0'><tr><td>Harbor news</td></tr></table>"
+                ));
+                assert_eq!(
+                    mail.estimated_height_with_style(width as f32, None)
+                        .is_some(),
+                    accepted
+                );
+                let result = futures::executor::block_on(render(WebRequest {
+                    html: mail.page("light", |_| None),
+                    width,
+                    background: Some(0xffffff),
+                }));
+                if accepted {
+                    assert!(
+                        matches!(result, Ok(Some(_))),
+                        "{newsletter}px in a {width}px card"
+                    );
+                } else {
+                    assert!(
+                        matches!(result, Err(RenderError::TooWide)),
+                        "{newsletter}px in a {width}px card"
+                    );
+                }
+            }
+        }
+
         let blocked = fell_render::WebMail::prepare(
             r#"<style>@media (width:360px) { p { background:#7a163f; } }</style><p>Preview</p>
             <img src="https://cdn.example.test/width-only" width="300" alt="A photo" style="display:block">"#,
@@ -1107,6 +1157,14 @@ mod tests {
             "placeholder height: {}",
             picture.height
         );
+        let without_alt = fell_render::WebMail::prepare(
+            r#"<style>@media (width:360px) { p { background:#7a163f; } }</style><p>Preview</p>
+            <img src="https://cdn.example.test/width-only" width="300" alt="" style="display:block">"#,
+        );
+        let without_alt =
+            estimate_covers_snapshot("blocked image with no label", &without_alt, 360);
+        assert_eq!(picture.height, without_alt.height);
+        assert_ne!(picture.image.as_bytes(0), without_alt.image.as_bytes(0));
 
         let huge = fell_render::WebMail::prepare(
             r#"<p>River news</p><img src="https://cdn.example.test/huge"
@@ -1353,6 +1411,7 @@ mod tests {
         );
 
         check_colorless_links();
+        check_link_probe_budget();
         check_gmail_reply();
 
         let hero = fell_render::WebMail::prepare(
@@ -1433,6 +1492,9 @@ mod tests {
             "<p>See you Thursday.</p></div>",
             "<div style='opacity:0'><a href='https://example.test/ancestor'>Transparent ancestor</a></div>",
             "<a href='https://example.test/descendant'><span style='opacity:0'>Transparent label</span></a>",
+            "<div style='position:relative;height:26px'><a href='https://example.test/no-ink' style='position:absolute;inset:0;color:transparent'>No ink</a></div>",
+            "<a href='https://example.test/no-fill' style='-webkit-text-fill-color:transparent'>No fill</a>",
+            "<a href='https://example.test/shadow' style='color:transparent;text-shadow:0 0 2px #444'>Shadow only</a>",
             "<a href='https://example.test/hidden' style='visibility:hidden'>Hidden link</a>",
             "<div style='position:relative'><a href='https://example.test/covered'>Covered link</a>",
             "<span style='position:absolute;inset:0;z-index:1'>See you Thursday.</span></div>",
@@ -1441,7 +1503,15 @@ mod tests {
             "<p><a href='https://example.test/map' style='visibility:hidden'>Duplicate</a></p>",
         ));
         assert!(!mail.has_author_colors());
-        let picture = colorless_snapshot(mail.page("light", |_| None), 440);
+        let style = fell_render::WebTextStyle {
+            family: None,
+            size: 15.,
+            foreground: 0x4c4f69,
+            link: 0x335500,
+            inset: true,
+        };
+        let picture =
+            colorless_snapshot(mail.page_with_style("light", Some(&style), |_| None), 440);
         let targets: Vec<_> = picture
             .links
             .iter()
@@ -1457,7 +1527,7 @@ mod tests {
         assert_eq!((*w, *h), (80., 40.));
         assert_eq!(
             fell_render::StyledDocument::blocks_text(&picture.fallback_links),
-            "Open\nTransparent ancestor\nTransparent label\nHidden link\nCovered link"
+            "Open\nTransparent ancestor\nTransparent label\nNo ink\nNo fill\nShadow only\nHidden link\nCovered link"
         );
         let destinations: Vec<_> = picture
             .fallback_links
@@ -1474,7 +1544,16 @@ mod tests {
             .collect();
         assert_eq!(
             destinations,
-            ["invisible", "ancestor", "descendant", "hidden", "covered"]
+            [
+                "invisible",
+                "ancestor",
+                "descendant",
+                "no-ink",
+                "no-fill",
+                "shadow",
+                "hidden",
+                "covered"
+            ]
         );
 
         let tall = fell_render::WebMail::prepare(concat!(
@@ -1515,6 +1594,34 @@ mod tests {
         assert_eq!(x + w, 416., "the scrollbar takes 24px of client width");
     }
 
+    fn check_link_probe_budget() {
+        use std::fmt::Write;
+
+        let mut html =
+            "<p><a href='https://example.test/visible'>Visible</a></p><div hidden>".to_string();
+        html.push_str(&"<a href='https://example.test/visible'>Duplicate</a>".repeat(440));
+        for index in 0..71 {
+            write!(
+                html,
+                "<a href='https://example.test/{index}'>Fallback {index}</a>"
+            )
+            .unwrap();
+        }
+        html.push_str("</div><a href='https://example.test/late'>Past the anchor limit</a>");
+        let mail = fell_render::WebMail::prepare(&html);
+        let picture = colorless_snapshot(mail.page("light", |_| None), 440);
+        assert_eq!(picture.links.len(), 1);
+        assert_eq!(picture.links[0].href, "https://example.test/visible");
+        assert_eq!(picture.fallback_links.len(), MAX_FALLBACK_LINKS);
+        assert_eq!(
+            fell_render::StyledDocument::blocks_text(&picture.fallback_links),
+            (0..MAX_FALLBACK_LINKS)
+                .map(|index| format!("Fallback {index}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+
     fn check_gmail_reply() {
         let reply = include_str!("../../../fell-render/fixtures/web-gmail-reply.html");
         let body = crate::mail_body::prepare_html(
@@ -1541,9 +1648,36 @@ mod tests {
                     body.web.page_with_style(scheme, Some(&style), |_| None),
                     width,
                 );
-                assert_eq!(closed.height, 3. * 22. + 2. * 24. + 8.);
+                // Empty author spacers and line breaks survive beside the fold.
+                assert_eq!(closed.height, 5. * 22. + 3. * 24. + 8.);
                 assert!(closed.links.is_empty() && closed.fallback_links.is_empty());
             }
         }
+
+        let before_quote = concat!(
+            "<div>Thursday works for me.</div>",
+            "<div><a href='https://harbor.test/map'><img src='cid:pier-map' width='80' height='40'></a></div>",
+            "<div class='gmail_quote'><div>On Monday, Jo wrote:</div>",
+            "<blockquote><p>Could you share the pier map?</p></blockquote></div>",
+        );
+        let body = crate::mail_body::prepare_html(
+            before_quote,
+            &[("Subject".into(), "Re: Pier map".into())],
+        );
+        assert!(body.web.mapped_history());
+        let style = fell_render::WebTextStyle {
+            family: None,
+            size: 15.,
+            foreground: 0x4c4f69,
+            link: 0x1758ad,
+            inset: false,
+        };
+        let closed = colorless_snapshot(
+            body.web.page_with_style("light", Some(&style), |_| None),
+            440,
+        );
+        assert_eq!(closed.links.len(), 1);
+        assert_eq!(closed.links[0].href, "https://harbor.test/map");
+        assert!(closed.fallback_links.is_empty());
     }
 }

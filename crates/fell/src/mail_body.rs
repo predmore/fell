@@ -27,7 +27,7 @@ use fell_render::{FoldedDocument, MailHeaders, fold_history, prepare};
 use gpui::RenderImage;
 
 use crate::present::{ConvMessage, Rich};
-use crate::render::{ImageGallery, Palette};
+use crate::render::{ImageGallery, Palette, webview::MAX_FALLBACK_LINKS};
 use crate::text_render::{RenderedBody, render_stored_body};
 use crate::theme::Theme;
 
@@ -244,6 +244,9 @@ fn collect_web_links(
 
     fn visit(inlines: &[Inline], links: &mut Vec<WebLink>, seen: &mut HashMap<String, usize>) {
         for inline in inlines {
+            if links.len() == MAX_FALLBACK_LINKS {
+                break;
+            }
             match inline {
                 Inline::Link { href, children } => {
                     let Some(target) = fell_render::reader_link_target(href) else {
@@ -284,6 +287,9 @@ fn collect_web_links(
     }
 
     for block in blocks {
+        if links.len() == MAX_FALLBACK_LINKS {
+            break;
+        }
         match block {
             Block::Paragraph { inlines } | Block::Heading { inlines, .. } => {
                 visit(inlines, links, seen)
@@ -648,7 +654,11 @@ pub fn palette(theme: &Theme) -> Palette {
         background: theme.background,
         foreground: theme.foreground,
         dimmed: theme.dimmed,
-        accent: theme.accent,
+        accent: crate::theme::ensure_all(
+            theme.accent,
+            &[theme.background, theme.surface],
+            crate::theme::LINK_TEXT_CONTRAST,
+        ),
         // Quote rules are marks a reader follows down the page: 3:1.
         quote: crate::theme::strong_border(theme),
         code_bg: mix(theme.surface, theme.border, 0.5),
@@ -660,19 +670,20 @@ pub fn palette(theme: &Theme) -> Palette {
 /// The palette for opened history: its text is the dimmed colour, as the
 /// plain-text quote is.
 pub fn history_palette(theme: &Theme) -> Palette {
+    let palette = palette(theme);
     let subdued = mix(theme.accent, theme.dimmed, 0.35);
     let accent = if [theme.background, theme.surface]
         .into_iter()
-        .all(|surface| crate::theme::contrast(subdued, surface) >= 4.5)
+        .all(|surface| crate::theme::contrast(subdued, surface) >= crate::theme::LINK_TEXT_CONTRAST)
     {
         subdued
     } else {
-        theme.accent
+        palette.accent
     };
     Palette {
         foreground: theme.dimmed,
         accent,
-        ..palette(theme)
+        ..palette
     }
 }
 

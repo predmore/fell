@@ -13,6 +13,11 @@ use layout::style_applies;
 /// Largest scroll width that can be captured in a single raster.
 pub const WEB_SNAPSHOT_WIDTH_LIMIT: i32 = 8192;
 
+/// Keep a 15 px body font at about 9 px or larger when fitting the snapshot.
+pub fn web_snapshot_readable_width(viewport: f32) -> f32 {
+    viewport / 0.6
+}
+
 /// Line height shared by the simple reader and themed web snapshots.
 pub fn reader_line_height(size: f32) -> f32 {
     22. * size / layout::BODY_FONT_SIZE
@@ -48,7 +53,7 @@ fn web_page(content: &str, scheme: &str, body_css: &str, link_css: &str) -> Stri
     background-color: rgba(128, 128, 128, 0.12);
     border: 0 !important;
     outline: 0 !important;
-    color: transparent !important;
+    color: color-mix(in srgb, currentColor 65%, gray) !important;
   }}
   img[src=""]:not([width][height]) {{ aspect-ratio: 3 / 2; }}
   img[src=""]:not([width], [height]) {{ width: 120px; }}
@@ -200,7 +205,7 @@ impl WebMail {
         self.layout.height(width, Self::image_height_limit(width))
     }
 
-    /// Returns no web height when the document exceeds the snapshot width budget.
+    /// Returns no web height when the snapshot would be unreadable or too wide to rasterize.
     pub fn estimated_height_with_style(
         &self,
         width: f32,
@@ -405,8 +410,11 @@ fn history_nodes(
         let Some(span) = spans.get(&node.id()) else {
             continue;
         };
-        let index = hidden.partition_point(|range| range.end < span.start);
-        let Some(range) = hidden.get(index).filter(|range| range.start <= span.end) else {
+        if span.is_empty() {
+            continue;
+        }
+        let index = hidden.partition_point(|range| range.end <= span.start);
+        let Some(range) = hidden.get(index).filter(|range| range.start < span.end) else {
             continue;
         };
         if span.start >= range.start && span.end <= range.end {

@@ -141,6 +141,9 @@ impl Estimate {
             return None;
         }
         let raster_width = outer_width.min(limit).max(width);
+        if raster_width.round() > super::web_snapshot_readable_width(width) {
+            return None;
+        }
         let footer = if style.native_line_height.is_some() && self.native_body_inset && !body_inset
         {
             READER_BOTTOM_PAD
