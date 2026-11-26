@@ -1,7 +1,6 @@
 //! Keep cached copies available for a verified return to their IMAP server.
 
 use rusqlite::{Connection, params};
-use sha2::{Digest, Sha256};
 
 use crate::{AccountConfig, AccountId, Error, Result, Store, outbox};
 
@@ -29,33 +28,23 @@ pub(super) fn bind(conn: &Connection, config: &AccountConfig) -> Result<()> {
 }
 
 impl Store {
-    pub(crate) fn imap_server_matches(
-        &self,
-        config: &AccountConfig,
-        fingerprint: &str,
-    ) -> Result<bool> {
-        let server = server_key(config, fingerprint);
+    pub(crate) fn imap_server_matches(&self, config: &AccountConfig) -> Result<bool> {
         Ok(matches_imap_connection(&self.conn, config)?
             && read_meta(&self.conn, &imap_binding_key(config, "server"))?.as_deref()
-                == Some(&server))
+                == Some(config.imap_endpoint_key().as_str()))
     }
 
     /// Bind the live session before reading a cursor or using an outbox UID.
-    pub(crate) fn observe_imap_server(
-        &self,
-        config: &AccountConfig,
-        fingerprint: &str,
-    ) -> Result<String> {
+    pub(crate) fn observe_imap_server(&self, config: &AccountConfig) -> Result<String> {
         let endpoint = config.imap_endpoint_key();
-        let server = server_key(config, fingerprint);
         let server_key = imap_binding_key(config, "server");
         if !matches_imap_connection(&self.conn, config)? {
             return Err(Error::Invalid(
                 "The IMAP connection changed. Reopen the account.".into(),
             ));
         }
-        if read_meta(&self.conn, &server_key)?.as_deref() == Some(&server) {
-            return Ok(server);
+        if read_meta(&self.conn, &server_key)?.as_deref() == Some(&endpoint) {
+            return Ok(endpoint);
         }
         let tx = immediate_transaction(&self.conn)?;
         if !matches_imap_connection(&tx, config)? {
@@ -63,24 +52,16 @@ impl Store {
                 "The IMAP connection changed. Reopen the account.".into(),
             ));
         }
-        let old = read_meta(&tx, &server_key)?;
-        if old.as_deref() != Some(&server) {
-            if old.is_some() {
-                park(&tx, config, Some(&endpoint))?;
-            }
-            restore_copies(&tx, &config.id, &server)?;
-            set_meta(&tx, &server_key, &server)?;
+        // Binding a different endpoint already parked the live copies.
+        // A greeting-derived key from an earlier build is still the current
+        // endpoint. Leave its cursor and live copies in place.
+        if read_meta(&tx, &server_key)?.is_none() {
+            restore_copies(&tx, &config.id, &endpoint)?;
         }
+        set_meta(&tx, &server_key, &endpoint)?;
         tx.commit()?;
-        Ok(server)
+        Ok(endpoint)
     }
-}
-
-fn server_key(config: &AccountConfig, fingerprint: &str) -> String {
-    format!(
-        "{:x}",
-        Sha256::digest(format!("{}\n{fingerprint}", config.imap_endpoint_key()))
-    )
 }
 
 const COPY_COLUMNS: &str = "account_id, mailbox, uidvalidity, uid, message_id, folder,
@@ -90,13 +71,13 @@ const ORPHAN_COLUMNS: &str = "account_id, message_id, folder";
 fn park(conn: &Connection, config: &AccountConfig, endpoint: Option<&str>) -> Result<()> {
     let id = &config.id;
     let key = imap_binding_key(config, "server");
-    let server = read_meta(conn, &key)?;
+    let server = read_meta(conn, &key)?.as_ref().and(endpoint);
     let account = AccountId(id.clone());
     if server.is_some() {
         let cursor = super::sync_cursor_on(conn, &account)?;
         outbox::endpoint::stamp_mailbox_epochs(conn, &account, cursor.as_ref())?;
     }
-    outbox::hold_for_endpoint_change(conn, &account, endpoint, server.as_deref())?;
+    outbox::hold_for_endpoint_change(conn, &account, endpoint, server)?;
     let has_unverified_copies = server.is_none()
         && conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM message_copies WHERE account_id = ?1)",
@@ -104,7 +85,7 @@ fn park(conn: &Connection, config: &AccountConfig, endpoint: Option<&str>) -> Re
             |row| row.get::<_, bool>(0),
         )?;
     if server.is_some() || has_unverified_copies {
-        let server = server.as_deref().unwrap_or("unverified");
+        let server = server.unwrap_or("unverified");
         for (table, columns) in [
             ("message_copies", COPY_COLUMNS),
             ("copy_orphans", ORPHAN_COLUMNS),

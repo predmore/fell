@@ -70,10 +70,6 @@ impl WriteSession {
         })
     }
 
-    pub(in crate::imap) fn fingerprint(&self) -> String {
-        self.session.fingerprint()
-    }
-
     /// `UID MOVE` is offered.
     pub(in crate::imap) fn has_move(&self) -> bool {
         self.session.has_cap("MOVE")

@@ -147,7 +147,6 @@ pub(super) struct Session {
     io: Option<Io>,
     tag: u32,
     caps: Vec<String>,
-    greeting: String,
     /// Server advertised CONDSTORE after login, so EXAMINE sends that modifier.
     condstore: bool,
     /// The selected mailbox reported HIGHESTMODSEQ, so FETCH can ask for MODSEQ.
@@ -192,7 +191,6 @@ impl Session {
                 io: Some(Io::Tls(Box::new(wrap_tls(stream, Vec::new(), config)?))),
                 tag: 0,
                 caps: Vec::new(),
-                greeting: String::new(),
                 condstore: false,
                 mailbox_modseq: false,
                 qresync: false,
@@ -206,7 +204,6 @@ impl Session {
                 io: Some(Io::Plain(stream)),
                 tag: 0,
                 caps: Vec::new(),
-                greeting: String::new(),
                 condstore: false,
                 mailbox_modseq: false,
                 qresync: false,
@@ -826,16 +823,10 @@ impl Session {
         let (text, _) = self.read_logical()?;
         let upper = text.to_ascii_uppercase();
         if upper.starts_with("* OK") || upper.starts_with("* PREAUTH") {
-            self.greeting = text;
             Ok(())
         } else {
             Err(imap_err(format!("greeting rejected: {text}")))
         }
-    }
-
-    pub(super) fn fingerprint(&self) -> String {
-        use sha2::{Digest, Sha256};
-        format!("{:x}", Sha256::digest(self.greeting.as_bytes()))
     }
 
     fn read_capabilities(&mut self) -> Result<(), Error> {

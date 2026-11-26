@@ -447,6 +447,38 @@ fn archiving_a_withheld_message_rechecks_provisional_parts_and_can_save_them() {
 }
 
 #[test]
+fn reconnecting_with_a_different_greeting_keeps_the_cursor_and_writes() {
+    let fx = Fixture::new();
+    let config = fx.account_config();
+    let account = &fx.account.id;
+    let cursor = fx.store.sync_cursor(account).unwrap().unwrap();
+    fx.store
+        .archive_thread(account, &fx.thread("INBOX", "Alpha"), "INBOX")
+        .unwrap();
+    let queued = fx.store.outbox(account).unwrap();
+    let bytes_before = fx.server.sent.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        bytes_before > 0,
+        "the fixture includes this count in its greeting"
+    );
+    fx.clear_commands();
+    crate::sync_connection_until(&config, &fx.store, &mut |_| {}, None, &|| false).unwrap();
+    assert_eq!(
+        fx.store.sync_cursor(account).unwrap().unwrap().token,
+        cursor.token
+    );
+    assert_eq!(fx.store.outbox(account).unwrap(), queued);
+    assert_eq!(fx.store.held_write_count(account).unwrap(), 0);
+    assert!(
+        fx.commands()
+            .iter()
+            .all(|command| !command.contains("BODY.PEEK[]")),
+        "a new greeting must not trigger a full fetch"
+    );
+    assert_eq!(fx.replay_as_window().sent, 1);
+}
+
+#[test]
 fn endpoint_change_releases_resends_or_discards_held_moves() {
     for action in ["restore", "resend", "discard", "reset"] {
         let mut source = state();
@@ -533,6 +565,52 @@ fn endpoint_change_releases_resends_or_discards_held_moves() {
             _ => unreachable!(),
         }
     }
+}
+
+#[test]
+fn resending_uses_the_listed_folder_and_the_current_archive_destination() {
+    let fx = Fixture::with(
+        Store::open_in_memory().unwrap(),
+        state_with(vec![
+            mailbox("INBOX", "", 7, &[(1, "Alpha"), (2, "Bravo")]),
+            mailbox("Old Archive", "\\Archive", 30, &[]),
+            mailbox("Junk", "\\Junk", 31, &[]),
+            mailbox("Spam", "", 32, &[]),
+        ]),
+    );
+    let account = &fx.account.id;
+    fx.store
+        .move_thread(account, &fx.thread("INBOX", "Alpha"), "INBOX", "Spam")
+        .unwrap();
+    fx.store
+        .archive_thread(account, &fx.thread("INBOX", "Bravo"), "INBOX")
+        .unwrap();
+    let next_server = TestServer::spawn(state_with(vec![
+        mailbox("INBOX", "", 40, &[(91, "Alpha"), (92, "Bravo")]),
+        mailbox("Everything", "\\All", 41, &[]),
+        mailbox("Junk", "\\Junk", 42, &[]),
+        mailbox("Spam", "", 43, &[]),
+    ]));
+    next_server.use_patient_reads();
+    next_server.writes.lock().unwrap().moves = true;
+    let (alpha, bravo) = {
+        let state = next_server.state.lock().unwrap();
+        let inbox = &state.mailboxes[0].messages;
+        (inbox[0].raw.clone(), inbox[1].raw.clone())
+    };
+    let next = crate::AccountConfig {
+        port: next_server.addr.port(),
+        ..fx.account_config()
+    };
+    fx.store.configure_connection(&next).unwrap();
+    assert_eq!(fx.store.held_write_count(account).unwrap(), 2);
+    assert_eq!(next.resend_held_writes(&fx.store).unwrap(), 2);
+    assert_eq!(next.replay_outbox(&fx.store).unwrap().sent, 2);
+    let state = next_server.state.lock().unwrap();
+    assert!(state.mailboxes[0].messages.is_empty());
+    assert_eq!(state.mailboxes[1].messages[0].raw, bravo);
+    assert!(state.mailboxes[2].messages.is_empty());
+    assert_eq!(state.mailboxes[3].messages[0].raw, alpha);
 }
 
 #[test]
@@ -757,7 +835,7 @@ fn a_uidvalidity_change_drops_the_move() {
         inbox.messages[1].uid = 2;
     }
     fx.clear_commands();
-    let report = fx.replay();
+    let report = fx.replay_as_window();
     assert_eq!(report.sent, 0);
     assert_eq!(report.dropped.len(), 1);
     assert_eq!(report.dropped[0].reason, DropReason::FolderReset);
@@ -769,7 +847,7 @@ fn a_uidvalidity_change_drops_the_move() {
     // The local archive stays; nothing is sent again.
     assert_eq!(fx.subjects("Archive"), vec!["Alpha"]);
     fx.clear_commands();
-    assert_eq!(fx.replay(), Default::default());
+    assert_eq!(fx.replay_as_window(), Default::default());
     assert!(fx.commands().is_empty());
 }
 

@@ -311,7 +311,6 @@ pub(crate) fn fetch_imap(
 pub(crate) struct BoundRead {
     session: session::Session,
     config: ImapConfig,
-    namespace: String,
 }
 
 impl BoundRead {
@@ -321,11 +320,10 @@ impl BoundRead {
         store: &crate::Store,
     ) -> crate::Result<Self> {
         let session = session::Session::open(&imap)?;
-        let namespace = store.observe_imap_server(config, &session.fingerprint())?;
+        store.observe_imap_server(config)?;
         Ok(Self {
             session,
             config: imap,
-            namespace,
         })
     }
 
@@ -334,9 +332,8 @@ impl BoundRead {
         account: &crate::Account,
         cursor: Option<&SyncCursor>,
         known: &KnownCopies<'_>,
-        mut persist: impl FnMut(MailboxDelta) -> crate::Result<()>,
+        persist: impl FnMut(MailboxDelta) -> crate::Result<()>,
     ) -> crate::Result<()> {
-        let suffix = format!(".{}", self.namespace);
         fetch_on(
             self.session,
             &account.id,
@@ -344,24 +341,7 @@ impl BoundRead {
             cursor,
             known,
             account.backend_kind == crate::BackendKind::Imap,
-            |mut delta| {
-                // The fallback ID encodes a UID, so it is only unique within this server.
-                let scope = |id: &mut crate::MessageId| {
-                    if rfc822::is_synthetic_message_id(id.as_str()) {
-                        id.0.insert_str(id.0.len() - "@imap.fell".len(), &suffix);
-                    }
-                };
-                for message in &mut delta.messages {
-                    scope(&mut message.headers.message_id);
-                }
-                for link in &mut delta.links {
-                    scope(&mut link.message_id);
-                }
-                for id in &mut delta.too_large {
-                    scope(id);
-                }
-                persist(delta)
-            },
+            persist,
         )
     }
 }

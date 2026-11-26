@@ -105,7 +105,7 @@ pub(super) fn replay_bound(
         && outbox::endpoint::can_resume(store, config_file)?
     {
         let mut session = WriteSession::open(config)?;
-        let server = store.observe_imap_server(config_file, &session.fingerprint())?;
+        let server = store.observe_imap_server(config_file)?;
         resume_held(&mut session, store, config_file, &server)?;
         verified = Some(session);
     }
@@ -147,15 +147,14 @@ pub(super) fn replay_bound(
     };
     let result = match verified.map_or_else(|| WriteSession::open(config), Ok) {
         Ok(mut session) => {
-            if let Some(config) = expected {
-                // An unexpected identity change parks pending rows transactionally.
-                // Reload on the next pass before trying any of those rows.
-                let identity = session.fingerprint();
-                if !store.imap_server_matches(config, &identity)? {
-                    store.observe_imap_server(config, &identity)?;
-                    session.logout();
-                    return Ok(ReplayReport::default());
-                }
+            if let Some(config) = expected
+                && !store.imap_server_matches(config)?
+            {
+                // Bind the authenticated endpoint, then reload the queue
+                // before sending any writes.
+                store.observe_imap_server(config)?;
+                session.logout();
+                return Ok(ReplayReport::default());
             }
             let result = pass.run(config, &mut session);
             if !matches!(
@@ -277,22 +276,39 @@ pub(crate) fn resend_held_writes(
     }
     let imap = config.imap_config()?;
     let mut session = WriteSession::open(&imap)?;
-    store.observe_imap_server(config, &session.fingerprint())?;
+    store.observe_imap_server(config)?;
     let listed = session.list()?;
     let roles = FolderRoles::detect(&listed_mailboxes(&listed), &imap.folder_overrides);
-    let mailbox = |folder: &str| {
-        roles
+    let exact = |folder: &str| {
+        listed
             .iter()
-            .find(|role| {
-                role.name.eq_ignore_ascii_case(folder)
-                    || role.role.default_name().eq_ignore_ascii_case(folder)
+            .find(|item| item.decoded == folder)
+            .map(|item| item.raw.as_str())
+    };
+    let by_role = |role| match role {
+        FolderRole::Archive => exact(roles.archive_name()),
+        _ => roles.get(role).and_then(|folder| exact(&folder.name)),
+    };
+    let mailbox = |folder: &str, original_role: Option<FolderRole>| {
+        exact(folder)
+            .or_else(|| {
+                roles
+                    .iter()
+                    .find(|role| role.name.eq_ignore_ascii_case(folder))
+                    .and_then(|role| exact(&role.name))
             })
-            .map(|role| role.raw.as_str())
             .or_else(|| {
                 listed
                     .iter()
                     .find(|item| item.decoded.eq_ignore_ascii_case(folder))
                     .map(|item| item.raw.as_str())
+            })
+            .or_else(|| original_role.and_then(by_role))
+            .or_else(|| {
+                FolderRole::ALL
+                    .into_iter()
+                    .find(|role| role.default_name().eq_ignore_ascii_case(folder))
+                    .and_then(by_role)
             })
     };
     let mut queued = 0;
@@ -306,11 +322,11 @@ pub(crate) fn resend_held_writes(
         {
             continue;
         }
-        let Some(source) = mailbox(&row.source_folder) else {
+        let Some(source) = mailbox(&row.source_folder, None) else {
             continue;
         };
         let target = (row.kind == OutboxKind::Move)
-            .then(|| mailbox(&row.target_folder))
+            .then(|| mailbox(&row.target_folder, row.target_role))
             .flatten();
         if row.kind == OutboxKind::Move && (target.is_none() || target == Some(source)) {
             continue;

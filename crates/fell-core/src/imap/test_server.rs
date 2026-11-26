@@ -280,7 +280,11 @@ fn handle(
         sent: Arc::clone(sent),
     };
     let mut read = BufReader::new(stream);
-    let _ = write.write_all(b"* OK fell-test ready\r\n");
+    let _ = write!(
+        write,
+        "* OK fell-test ready ({})\r\n",
+        sent.load(Ordering::Relaxed)
+    );
     let _ = write.flush();
     let mut authed = false;
     let mut condstore_enabled = false;

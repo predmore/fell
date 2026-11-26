@@ -5298,9 +5298,7 @@ mod tests {
             crate::ReplayReport::default()
         );
         store.configure_connection(&config).unwrap();
-        let server = store
-            .observe_imap_server(&config, "current file's server")
-            .unwrap();
+        let server = store.observe_imap_server(&config).unwrap();
         assert_eq!(store.held_write_count(&account.id).unwrap(), 1);
         assert!(
             crate::outbox::endpoint::resumable(&store, &config, &server)
@@ -5323,7 +5321,7 @@ mod tests {
         let account = config.account().id;
         assert!(!store.matches_imap_connection(&config).unwrap());
         store.configure_connection(&config).unwrap();
-        let old_server = store.observe_imap_server(&config, "first server").unwrap();
+        let old_server = store.observe_imap_server(&config).unwrap();
         store
             .conn
             .execute(
@@ -5369,18 +5367,16 @@ mod tests {
             edited.replay_outbox(&store).unwrap(),
             crate::ReplayReport::default()
         );
-        store.configure_connection(&config).unwrap();
-        assert_eq!(store.outbox(&account).unwrap(), [held.clone()]);
-        let different = store
-            .observe_imap_server(&config, "different greeting")
-            .unwrap();
+        let different = store.observe_imap_server(&edited).unwrap();
         assert_ne!(different, old_server);
         assert!(
             crate::outbox::endpoint::resumable(&store, &config, &different)
                 .unwrap()
                 .is_empty()
         );
-        let matching = store.observe_imap_server(&config, "first server").unwrap();
+        store.configure_connection(&config).unwrap();
+        assert_eq!(store.outbox(&account).unwrap(), [held.clone()]);
+        let matching = store.observe_imap_server(&config).unwrap();
         let resumable = crate::outbox::endpoint::resumable(&store, &config, &matching).unwrap();
         assert_eq!(resumable, [held]);
         crate::outbox::endpoint::resume_verified(&store, &config, &matching, &resumable[0], true)

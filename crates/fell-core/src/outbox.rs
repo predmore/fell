@@ -140,6 +140,7 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("server_outbox", "held_from", "TEXT"),
     ("server_outbox", "held_source_epoch", "INTEGER"),
     ("server_outbox", "held_target_epoch", "INTEGER"),
+    ("server_outbox", "target_role", "TEXT"),
     (
         "write_back_accounts",
         "generation",
@@ -324,6 +325,7 @@ pub struct OutboxEntry {
     pub uid: Option<u32>,
     pub target_folder: String,
     pub target_mailbox: Option<String>,
+    pub(crate) target_role: Option<FolderRole>,
     pub placed_uidvalidity: Option<u32>,
     pub placed_uid: Option<u32>,
     pub attempts: u32,
@@ -430,7 +432,7 @@ const ENTRY_COLS: &str = "id, kind, state, action_id, message_id, source_folder,
     uidvalidity, uid, target_folder, target_mailbox, placed_uidvalidity, placed_uid,
     attempts, retry_unix, error, generation, sent, reverses,
     flag_value, flag_modseq, flag_base, target_uidvalidity, target_uidnext, move_recovery_end,
-    trash_purge_action_id";
+    trash_purge_action_id, target_role";
 
 impl Store {
     /// Turn write-back on or off for the account (`write_back` in
@@ -556,6 +558,16 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<()> {
             conn.execute_batch(&format!(
                 "ALTER TABLE {table} ADD COLUMN {column} {definition}"
             ))?;
+            if column == &"target_role"
+                && crate::store::copies::table_exists(conn, "local_actions")?
+            {
+                conn.execute_batch(
+                    "UPDATE server_outbox SET target_role = 'archive'
+                     WHERE kind = 'move' AND action_id IN (
+                        SELECT id FROM local_actions WHERE kind = 'archive'
+                     );",
+                )?;
+            }
         }
     }
     conn.execute_batch(
@@ -717,7 +729,7 @@ fn complete_append_in(tx: &Connection, entry: &OutboxEntry) -> Result<bool> {
 pub(crate) fn queue_moves(
     conn: &Connection,
     account_id: &AccountId,
-    action_id: i64,
+    action: &crate::LocalAction,
     messages: &[String],
     from: &str,
     to: &str,
@@ -728,6 +740,18 @@ pub(crate) fn queue_moves(
         return Ok(());
     }
     let target = raw_name(conn, account_id, roles, to)?;
+    let target_role = match action.kind {
+        crate::ActionKind::Archive => Some(FolderRole::Archive),
+        crate::ActionKind::Delete => Some(FolderRole::Trash),
+        crate::ActionKind::Spam | crate::ActionKind::NotSpam => {
+            Some(if roles.name(FolderRole::Inbox).eq_ignore_ascii_case(to) {
+                FolderRole::Inbox
+            } else {
+                FolderRole::Junk
+            })
+        }
+        _ => roles.role_of(to),
+    };
     let source = raw_name(conn, account_id, roles, from)?;
     let now = now_unix();
     let generation = generation(conn, account_id)?;
@@ -754,13 +778,14 @@ pub(crate) fn queue_moves(
                 conn,
                 account_id,
                 &NewRow {
-                    action_id: Some(action_id),
+                    action_id: Some(action.id),
                     message_id,
                     source_folder: from,
                     source_mailbox: Some(&mailbox),
                     copy: Some((uidvalidity, uid)),
                     target_folder: to,
                     target_mailbox: target.as_deref(),
+                    target_role,
                     reverses: None,
                 },
                 now,
@@ -771,13 +796,14 @@ pub(crate) fn queue_moves(
                 conn,
                 account_id,
                 &NewRow {
-                    action_id: Some(action_id),
+                    action_id: Some(action.id),
                     message_id,
                     source_folder: from,
                     source_mailbox: source.as_deref(),
                     copy: None,
                     target_folder: to,
                     target_mailbox: target.as_deref(),
+                    target_role,
                     reverses: None,
                 },
                 now,
@@ -952,6 +978,7 @@ fn queue_reverse_of_unsettled(
             copy: None,
             target_folder: &entry.source_folder,
             target_mailbox: entry.source_mailbox.as_deref(),
+            target_role: None,
             reverses: Some(entry.id),
         },
         now,
@@ -977,6 +1004,7 @@ pub(crate) fn queue_reverse(
             copy,
             target_folder: &entry.source_folder,
             target_mailbox: entry.source_mailbox.as_deref(),
+            target_role: None,
             reverses: None,
         },
         now,
@@ -991,6 +1019,7 @@ struct NewRow<'a> {
     copy: Option<(u32, u32)>,
     target_folder: &'a str,
     target_mailbox: Option<&'a str>,
+    target_role: Option<FolderRole>,
     reverses: Option<i64>,
 }
 
@@ -999,11 +1028,11 @@ fn insert(conn: &Connection, account_id: &AccountId, row: &NewRow<'_>, now: i64)
         "INSERT INTO server_outbox
             (account_id, kind, state, action_id, message_id, source_folder, source_mailbox,
              uidvalidity, uid, target_folder, target_mailbox, created_unix, generation,
-             reverses)
+             reverses, target_role)
          VALUES (?1, ?2, 'pending', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
                  (SELECT COALESCE(MAX(generation), 0) FROM write_back_accounts
                   WHERE account_id = ?1),
-                 ?12)",
+                 ?12, ?13)",
         params![
             account_id.as_str(),
             OutboxKind::Move.as_str(),
@@ -1017,6 +1046,7 @@ fn insert(conn: &Connection, account_id: &AccountId, row: &NewRow<'_>, now: i64)
             row.target_mailbox,
             now,
             row.reverses.unwrap_or(0),
+            row.target_role.map(FolderRole::key),
         ],
     )?;
     Ok(())
@@ -1148,6 +1178,7 @@ fn select_entries(
                 (row.get::<_, u32>(22)?, row.get::<_, u32>(23)?),
                 row.get::<_, Option<u32>>(24)?,
                 row.get::<_, Option<i64>>(25)?,
+                row.get::<_, Option<String>>(26)?,
             ),
         ))
     })?;
@@ -1180,6 +1211,7 @@ fn select_entries(
                 target_bound,
                 move_recovery_end,
                 trash_purge_action_id,
+                target_role,
             ),
         ) = row?;
         out.push(OutboxEntry {
@@ -1194,6 +1226,7 @@ fn select_entries(
             uid,
             target_folder,
             target_mailbox,
+            target_role: target_role.as_deref().and_then(FolderRole::from_key),
             placed_uidvalidity,
             placed_uid,
             attempts,

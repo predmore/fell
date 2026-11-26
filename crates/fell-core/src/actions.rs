@@ -1923,7 +1923,7 @@ fn queue_routes(
     roles: &crate::folders::FolderRoles,
 ) -> Result<()> {
     for ((from, to), ids) in routes {
-        crate::outbox::queue_moves(conn, account, action.id, &ids, &from, to, roles)?;
+        crate::outbox::queue_moves(conn, account, action, &ids, &from, to, roles)?;
     }
     Ok(())
 }
