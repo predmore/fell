@@ -7209,10 +7209,8 @@ mod tests {
         use super::{
             AccountConfigError, SendAttempts, SendFailure, SendFeedback, SendFeedbackState,
         };
-        let missing = AccountConfigError {
-            detail: "account file does not exist".into(),
-            recovery: "Run fell account setup.",
-        };
+        let missing =
+            AccountConfigError::new("account file does not exist", "Run fell account setup.");
         let mut state = SendFeedbackState::default();
         let mut attempts = SendAttempts::default();
         let before_send = state.generation;
@@ -7250,10 +7248,8 @@ mod tests {
         use super::{
             AccountConfigError, SendAttempts, SendFailure, SendFeedback, SendFeedbackState,
         };
-        let missing = AccountConfigError {
-            detail: "account file does not exist".into(),
-            recovery: "Run fell account setup.",
-        };
+        let missing =
+            AccountConfigError::new("account file does not exist", "Run fell account setup.");
         let mut state = SendFeedbackState::default();
         let mut attempts = SendAttempts::default();
         state.invalidate_readiness();

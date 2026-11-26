@@ -6,10 +6,10 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use super::{
-    Accounts, Entry, FileError, FileIdentity, INTERRUPTED_REMOVAL_RECOVERY, MailboxOwnership,
-    OriginalMailbox, Registry, check_live_mailbox, file_identity, inspect_mailbox, mailbox_owner,
-    path_exists, publish, read, read_account_contents, real_directory, removal_trash,
-    sibling_mailbox, validate_mailbox,
+    Accounts, Entry, FileError, FileIdentity, INTERRUPTED_REMOVAL_RECOVERY, LockMode,
+    MAILBOX_OWNER_RECOVERY, MailboxOwnership, OriginalMailbox, Registry, check_live_mailbox,
+    file_identity, inspect_mailbox, mailbox_owner, path_exists, publish, read,
+    read_account_contents, real_directory, removal_trash, sibling_mailbox, validate_mailbox,
 };
 use crate::{AccountId, Store, compose};
 
@@ -37,12 +37,13 @@ pub enum RemovalOutcome {
 
 impl Registry {
     pub fn load_with_removals(&self, base: &Path) -> Accounts {
-        let mut catalog = self.load_at(Some(base));
-        let _lock = self
+        let migration = self.migrate_at(Some(base)).err();
+        let lock = self
             .directory()
             .is_dir()
             .then(|| self.lock_shared().ok())
             .flatten();
+        let mut catalog = self.read_entries(migration);
         let original = match self.original_mailbox(base) {
             Ok(original) => original,
             Err(error) => {
@@ -56,6 +57,7 @@ impl Registry {
                 return catalog;
             }
         };
+        let mut unavailable = None;
         let original = match original {
             Some(OriginalMailbox::Known { id, backup }) => Some((id, backup)),
             Some(OriginalMailbox::Unavailable { id, path, error }) => {
@@ -64,6 +66,7 @@ impl Registry {
                     || !has_removal_plan(&sibling, &id)
                 {
                     self.mark_mailbox_unavailable(&mut catalog, &id, path, error);
+                    unavailable = Some(id);
                 }
                 None
             }
@@ -87,11 +90,21 @@ impl Registry {
             .as_ref()
             .map(|(id, _)| (id.clone(), removal_trash(base)));
         for (id, trash) in base_trash.into_iter().chain(paths) {
-            let Ok(mailbox) = self.removal_mailbox(base, &id) else {
+            if unavailable.as_ref() == Some(&id) {
                 continue;
+            }
+            let sibling;
+            let mailbox = if original
+                .as_ref()
+                .is_some_and(|(original, _)| original == &id)
+            {
+                base
+            } else {
+                sibling = sibling_mailbox(base, &id);
+                &sibling
             };
             if !trash.symlink_metadata().is_ok_and(|meta| meta.is_dir())
-                || removal_trash(&mailbox) != trash
+                || removal_trash(mailbox) != trash
             {
                 continue;
             }
@@ -113,7 +126,7 @@ impl Registry {
                 && (path.is_file()
                     || trash.join("account.toml").is_file()
                     || mailbox.is_file()
-                    || staged_file(&trash, &mailbox, "").is_file());
+                    || staged_file(&trash, mailbox, "").is_file());
             catalog.interrupted.push(InterruptedRemoval {
                 id,
                 name,
@@ -121,6 +134,7 @@ impl Registry {
                 can_restore,
             });
         }
+        drop(lock);
         catalog.interrupted.sort_by(|a, b| a.id.cmp(&b.id));
         for entry in &mut catalog.entries {
             let Ok(config) = &entry.config else { continue };
@@ -139,8 +153,18 @@ impl Registry {
                     (sibling.as_path(), None)
                 }
             };
-            if let Err(error) = check_live_mailbox(mailbox, &config.id, Some(&config.email), backup)
-            {
+            let check = || check_live_mailbox(mailbox, &config.id, Some(&config.email), backup);
+            let result = check().or_else(|error| {
+                if error.recovery == MAILBOX_OWNER_RECOVERY {
+                    // A first open may have started after the registry snapshot.
+                    // Recheck after it finishes publishing the owner.
+                    let _lock = self.lock_shared()?;
+                    check()
+                } else {
+                    Err(error)
+                }
+            });
+            if let Err(error) = result {
                 mark_entry(entry, error);
             }
         }
@@ -207,12 +231,13 @@ impl Registry {
         {
             return Err("The account file changed. Select the account again.".into());
         }
-        let directory = if path == legacy {
-            File::open(&self.config).map_err(|err| err.to_string())?
+        if path == legacy {
+            let legacy_dir = File::open(&self.config).map_err(|err| err.to_string())?;
+            disconnect(path, &legacy_dir)
         } else {
-            directory
-        };
-        disconnect(path, &directory).map_err(|err| err.to_string())
+            disconnect(path, &directory)
+        }
+        .map_err(|err| err.to_string())
     }
 
     /// Revoke grants before disconnecting. A confirmed deletion first moves
@@ -273,7 +298,7 @@ impl Registry {
         recovery_only: bool,
     ) -> Result<RemovalOutcome, String> {
         if !recovery_only {
-            self.migrate_at(Some(base))
+            self.migrate_with(Some(base), LockMode::Exclusive, || Ok(()), || {})
                 .map_err(|err| err.cli_message())?;
         }
         let directory = self.lock().map_err(|err| err.to_string())?;
@@ -731,6 +756,49 @@ fn absent_ok(result: io::Result<()>) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::AgentGrant;
+
+    #[test]
+    fn removal_waits_for_a_shared_catalog_lock() {
+        use std::sync::mpsc::{RecvTimeoutError, channel};
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("mail.db");
+        let registry = Registry::at(root.path().join("fell"), base.clone());
+        let path = registry.path("mail").unwrap();
+        fs::create_dir_all(registry.directory()).unwrap();
+        publish(
+            &registry.directory(),
+            &path,
+            b"email = 'mail@example.test'\npassword = 'fixture'",
+        )
+        .unwrap();
+
+        let scan = registry.lock_shared().unwrap();
+        assert_eq!(registry.load_with_removals(&base).configs().count(), 1);
+        let (started, start) = channel();
+        let (finished, finish) = channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                started.send(()).unwrap();
+                finished
+                    .send(registry.remove(&base, "mail", false))
+                    .unwrap();
+            });
+            start.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(
+                finish.recv_timeout(Duration::from_millis(100)),
+                Err(RecvTimeoutError::Timeout)
+            );
+            assert!(path.is_file());
+            drop(scan);
+            assert_eq!(
+                finish.recv_timeout(Duration::from_secs(5)).unwrap(),
+                Ok(RemovalOutcome::Kept)
+            );
+        });
+        assert!(!path.exists());
+    }
 
     #[test]
     fn keep_revokes_every_grant_and_delete_cleans_drafts_and_resumes() {

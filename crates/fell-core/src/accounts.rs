@@ -1,11 +1,16 @@
 //! The on-disk registry shared by the inbox, SMTP and fell-mcp.
 
-use std::fs::{self, File, OpenOptions};
+use std::cell::RefCell;
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
+use std::marker::PhantomData;
+use std::ops::Deref;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::time::{Duration, Instant};
 
-use rusqlite::{Connection, ErrorCode, OpenFlags};
+use rusqlite::{Connection, ErrorCode, OpenFlags, ffi};
 
 use crate::{AccountConfig, AccountId};
 
@@ -22,6 +27,8 @@ const MAILBOX_READ_RECOVERY: &str =
     "Check the file and close other programs using it. Restore a mailbox backup if it is damaged.";
 const INTERRUPTED_REMOVAL_RECOVERY: &str =
     "Open Settings → Accounts to restore local mail or finish deleting.";
+const LOCK_BUSY: &str = "Another Fell window or fell-mcp is busy with this account · try again";
+const LOCK_WAIT: Duration = Duration::from_secs(3);
 pub type FileIdentity = (u64, u64, i64, i64);
 
 pub fn validate_id(id: &str) -> Result<(), &'static str> {
@@ -46,6 +53,7 @@ pub fn validate_id(id: &str) -> Result<(), &'static str> {
 pub struct FileError {
     pub detail: String,
     pub recovery: &'static str,
+    transient: bool,
 }
 
 impl FileError {
@@ -53,14 +61,17 @@ impl FileError {
         Self {
             detail: detail.into(),
             recovery,
+            transient: false,
         }
     }
 
     fn access(path: &Path, error: io::Error) -> Self {
-        Self::new(
+        let mut failure = Self::new(
             format!("{}: {error}", file_name(path)),
             "Restore read access to the account file.",
-        )
+        );
+        failure.transient = transient_io(&error);
+        failure
     }
 
     pub fn reason(&self, path: &Path) -> &str {
@@ -167,6 +178,96 @@ impl Accounts {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty() && self.interrupted.is_empty() && self.error.is_none()
     }
+
+    /// A refresh can keep an open account while its ownership check is inconclusive.
+    pub fn retain_temporarily_unavailable(&mut self, previous: &Self) {
+        for entry in &mut self.entries {
+            if entry.config.as_ref().is_err_and(|err| err.transient)
+                && let Some(old) = previous.entries.iter().find(|old| {
+                    old.path == entry.path
+                        && old.config.as_ref().is_ok_and(|config| {
+                            previous
+                                .interrupted
+                                .iter()
+                                .all(|pending| pending.id != config.id)
+                        })
+                })
+            {
+                *entry = old.clone();
+            }
+        }
+    }
+}
+
+thread_local! {
+    static REGISTRY_LOCKS: RefCell<Vec<(u64, u64)>> = const { RefCell::new(Vec::new()) };
+}
+
+enum LockMode {
+    Shared,
+    Exclusive,
+    TryExclusive,
+}
+
+#[derive(Debug)]
+pub struct RegistryLock {
+    file: File,
+    identity: (u64, u64),
+    // Drop must update the acquiring thread's lock list.
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+impl RegistryLock {
+    fn acquire(dir: &Path, mode: LockMode) -> Result<Self, FileError> {
+        let file = open_account_directory(dir).map_err(|err| FileError::access(dir, err))?;
+        let meta = file.metadata().map_err(|err| FileError::access(dir, err))?;
+        let identity = (meta.dev(), meta.ino());
+        let nested = REGISTRY_LOCKS.with(|held| held.borrow().contains(&identity));
+        let deadline = Instant::now() + LOCK_WAIT;
+        loop {
+            let result = match mode {
+                LockMode::Shared if !nested => file.lock_shared().map_err(TryLockError::Error),
+                LockMode::Shared => file.try_lock_shared(),
+                LockMode::Exclusive | LockMode::TryExclusive => file.try_lock(),
+            };
+            match result {
+                Ok(()) => break,
+                Err(TryLockError::WouldBlock) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if nested || !matches!(mode, LockMode::Exclusive) || remaining.is_zero() {
+                        return Err(FileError::new(LOCK_BUSY, "Try again."));
+                    }
+                    std::thread::sleep(remaining.min(Duration::from_millis(10)));
+                }
+                Err(TryLockError::Error(err)) => return Err(FileError::access(dir, err)),
+            }
+        }
+        REGISTRY_LOCKS.with(|held| held.borrow_mut().push(identity));
+        Ok(Self {
+            file,
+            identity,
+            _thread_bound: PhantomData,
+        })
+    }
+}
+
+impl Deref for RegistryLock {
+    type Target = File;
+
+    fn deref(&self) -> &File {
+        &self.file
+    }
+}
+
+impl Drop for RegistryLock {
+    fn drop(&mut self) {
+        let _ = REGISTRY_LOCKS.try_with(|held| {
+            let mut held = held.borrow_mut();
+            if let Some(index) = held.iter().rposition(|id| *id == self.identity) {
+                held.swap_remove(index);
+            }
+        });
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -215,28 +316,20 @@ impl Registry {
     }
 
     /// Serialize registry-backed grant changes with account removal.
-    pub fn lock(&self) -> Result<File, FileError> {
-        let dir = self.directory();
+    pub fn lock(&self) -> Result<RegistryLock, FileError> {
         real_directory(&self.config).map_err(|err| FileError::access(&self.config, err))?;
-        let lock = open_account_directory(&dir).map_err(|err| FileError::access(&dir, err))?;
-        lock.try_lock()
-            .map_err(|err| FileError::access(&dir, err.into()))?;
-        Ok(lock)
+        RegistryLock::acquire(&self.directory(), LockMode::Exclusive)
     }
 
     /// Hold the account file stable while opening its mailbox for the UI.
-    pub fn lock_shared(&self) -> Result<File, FileError> {
-        let dir = self.directory();
+    pub fn lock_shared(&self) -> Result<RegistryLock, FileError> {
         real_directory(&self.config).map_err(|err| FileError::access(&self.config, err))?;
-        let lock = open_account_directory(&dir).map_err(|err| FileError::access(&dir, err))?;
-        lock.lock_shared()
-            .map_err(|err| FileError::access(&dir, err))?;
-        Ok(lock)
+        RegistryLock::acquire(&self.directory(), LockMode::Shared)
     }
 
     /// First open creates the schema before installing the owner. Hold the
     /// exclusive registry lock across both steps so readers see a complete mailbox.
-    pub fn lock_for_mailbox_open(&self, base: &Path, id: &str) -> Result<File, FileError> {
+    pub fn lock_for_mailbox_open(&self, base: &Path, id: &str) -> Result<RegistryLock, FileError> {
         let lock = self.lock_shared()?;
         let path = self.mailbox_path(base, id)?;
         match path.symlink_metadata() {
@@ -250,11 +343,9 @@ impl Registry {
                 ));
             }
         }
-        lock.unlock()
-            .and_then(|()| lock.lock())
-            .map_err(|err| FileError::access(&self.directory(), err))?;
         // The caller rechecks the account and route after acquiring this lock.
-        Ok(lock)
+        drop(lock);
+        self.lock()
     }
 
     pub fn path(&self, id: &str) -> Result<PathBuf, FileError> {
@@ -269,12 +360,12 @@ impl Registry {
     }
 
     pub fn load(&self) -> Accounts {
-        self.load_at(self.base.as_deref())
+        self.read_entries(self.migrate().err())
     }
 
-    fn load_at(&self, base: Option<&Path>) -> Accounts {
+    fn read_entries(&self, error: Option<FileError>) -> Accounts {
         let mut accounts = Accounts {
-            error: self.migrate_at(base).err(),
+            error,
             ..Accounts::default()
         };
         let dir = self.directory();
@@ -434,6 +525,7 @@ impl Registry {
         let marker = self.directory().join(".original-id");
         let marker_error = match self.original_marker() {
             Ok(Some(id)) => return Ok(Some(check_original_collision(base, id, marker, None))),
+            Err(error) if error.transient => return Err(error),
             marker => marker.err(),
         };
         let backup = self.config.join("account.toml.bak");
@@ -446,8 +538,14 @@ impl Registry {
                     Some(backup),
                 )));
             }
+            Err(error) if error.transient => return Err(error),
             Err(error) => Some((backup, error)),
             Ok(None) => {
+                if let Err(error) = &legacy
+                    && error.transient
+                {
+                    return Err(error.clone());
+                }
                 if let Ok(Some((config, text))) = legacy {
                     let sibling = sibling_mailbox(base, &config.id);
                     let target = self.path(&config.id)?;
@@ -462,12 +560,22 @@ impl Registry {
                     let different_address = current.as_ref().is_some_and(|(current, _)| {
                         !current.email.eq_ignore_ascii_case(&config.email)
                     });
-                    if sibling_owned
-                        && (!removal::mailbox_has_owner(base, &config.id)
-                            || (different_address
-                                && original_collision(base, &config.id).is_some()))
-                    {
-                        return Ok(None);
+                    if sibling_owned {
+                        let base_owned = possible_mailbox_owner(base)?
+                            .is_some_and(|(id, _)| id == config.id)
+                            || removal::staged_mailbox_id(base).is_some_and(|id| id == config.id);
+                        if !base_owned {
+                            return Ok(None);
+                        }
+                        if different_address
+                            && let Some(error) = original_collision(base, &config.id)
+                        {
+                            return if error.transient {
+                                Err(error)
+                            } else {
+                                Ok(None)
+                            };
+                        }
                     }
                     if target_conflicts {
                         return Ok(Some(OriginalMailbox::Unavailable {
@@ -489,9 +597,7 @@ impl Registry {
             }
         };
         if let Some((path, error)) = metadata_error {
-            let id = mailbox_owner(base)
-                .ok()
-                .flatten()
+            let id = possible_mailbox_owner(base)?
                 .map(|(id, _)| id)
                 .or_else(|| removal::staged_mailbox_id(base))
                 .or_else(|| {
@@ -518,10 +624,7 @@ impl Registry {
         base: &Path,
         broken_legacy: bool,
     ) -> Result<Option<String>, FileError> {
-        let owner = mailbox_owner(base)
-            .ok()
-            .flatten()
-            .filter(|(id, _)| validate_id(id).is_ok());
+        let owner = possible_mailbox_owner(base)?.filter(|(id, _)| validate_id(id).is_ok());
         let dir = self.directory();
         if broken_legacy && has_account_file(&dir).map_err(|err| FileError::access(&dir, err))? {
             // A readable account file for the same address can corroborate
@@ -622,12 +725,14 @@ impl Registry {
     }
 
     fn migrate_at(&self, base: Option<&Path>) -> Result<(), FileError> {
-        self.migrate_with(base, || Ok(()), || {})
+        // A reader can encounter an in-progress migration and use its published files.
+        self.migrate_with(base, LockMode::TryExclusive, || Ok(()), || {})
     }
 
     fn migrate_with(
         &self,
         base: Option<&Path>,
+        mode: LockMode,
         before_publish: impl FnOnce() -> io::Result<()>,
         published: impl FnOnce(),
     ) -> Result<(), FileError> {
@@ -646,9 +751,7 @@ impl Registry {
         if read(&legacy, None).is_err() {
             return Ok(());
         }
-        let lock = open_account_directory(&dir).map_err(|err| FileError::access(&dir, err))?;
-        lock.try_lock()
-            .map_err(|err| FileError::access(&dir, err.into()))?;
+        let lock = RegistryLock::acquire(&dir, mode)?;
         let Ok(Some((config, text))) = read(&legacy, None) else {
             return Ok(());
         };
@@ -729,41 +832,46 @@ fn original_collision(base: &Path, id: &str) -> Option<FileError> {
     let sibling = sibling_mailbox(base, id);
     let trash = removal_trash(&sibling);
     let staged = removal::staged_file(&trash, &sibling, "");
-    let conflict = |path: &Path, staged: bool| {
+    let conflict = |path: &Path, staged: bool| -> Result<Option<String>, FileError> {
         let owner = match inspect_mailbox(path, staged) {
             Ok(MailboxOwnership::Owned(owner)) => owner,
             Ok(MailboxOwnership::Shared(first, second)) => {
-                return Some(format!(
+                return Ok(Some(format!(
                     "{} has multiple owners: {} and {}",
                     path.display(),
                     first.0,
                     second.0,
-                ));
+                )));
             }
-            _ => return None,
+            _ => return Ok(None),
         };
-        if mailbox_owner(base).is_ok_and(|base_owner| {
-            base_owner.is_some_and(|(base_id, base_email)| {
-                base_id == id && base_id == owner.0 && base_email.eq_ignore_ascii_case(&owner.1)
-            })
+        if possible_mailbox_owner(base)?.is_some_and(|(base_id, base_email)| {
+            base_id == id && base_id == owner.0 && base_email.eq_ignore_ascii_case(&owner.1)
         }) {
-            return None;
+            return Ok(None);
         }
-        Some(format!(
+        Ok(Some(format!(
             "{} belongs to account {:?} ({}) and conflicts with {}",
             path.display(),
             owner.0,
             owner.1,
             base.display()
-        ))
+        )))
     };
-    if let Some(detail) = conflict(&staged, true) {
-        return Some(FileError::new(
-            format!("Interrupted removal for {id}: {detail}"),
-            INTERRUPTED_REMOVAL_RECOVERY,
-        ));
+    match conflict(&staged, true) {
+        Ok(Some(detail)) => {
+            return Some(FileError::new(
+                format!("Interrupted removal for {id}: {detail}"),
+                INTERRUPTED_REMOVAL_RECOVERY,
+            ));
+        }
+        Err(error) => return Some(error),
+        Ok(None) => {}
     }
-    conflict(&sibling, false).map(FileError::mailbox_link)
+    match conflict(&sibling, false) {
+        Ok(detail) => detail.map(FileError::mailbox_link),
+        Err(error) => Some(error),
+    }
 }
 
 fn has_classified_owner(path: &Path) -> bool {
@@ -830,6 +938,20 @@ pub fn mailbox_owner(path: &Path) -> Result<Option<(String, String)>, FileError>
     })
 }
 
+fn possible_mailbox_owner(path: &Path) -> Result<Option<Owner>, FileError> {
+    match mailbox_owner(path) {
+        Err(error) if !error.transient => Ok(None),
+        result => result,
+    }
+}
+
+fn transient_io(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    ) || matches!(error.raw_os_error(), Some(libc::EIO | libc::ESTALE))
+}
+
 fn inspect_mailbox(path: &Path, offline: bool) -> Result<MailboxOwnership, FileError> {
     let unavailable = |detail: &str| {
         FileError::new(
@@ -844,7 +966,11 @@ fn inspect_mailbox(path: &Path, offline: bool) -> Result<MailboxOwnership, FileE
         Ok(meta) if meta.len() == 0 => return Ok(MailboxOwnership::New),
         Ok(_) => {}
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(MailboxOwnership::New),
-        Err(err) => return Err(unavailable(&err.to_string())),
+        Err(err) => {
+            let mut error = unavailable(&err.to_string());
+            error.transient = transient_io(&err);
+            return Err(error);
+        }
     }
 
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW;
@@ -859,8 +985,11 @@ fn inspect_mailbox(path: &Path, offline: bool) -> Result<MailboxOwnership, FileE
         } else {
             Connection::open_with_flags(path, flags)?
         };
-        conn.busy_timeout(std::time::Duration::from_millis(50))?;
-        let has_accounts: bool = conn.query_row(
+        conn.busy_timeout(Duration::from_millis(50))?;
+        // Both queries share one read snapshot. Live WAL readers never take
+        // the writer lock or run journal or schema setup.
+        let read = conn.unchecked_transaction()?;
+        let has_accounts: bool = read.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'accounts')",
             [],
             |row| row.get(0),
@@ -868,13 +997,29 @@ fn inspect_mailbox(path: &Path, offline: bool) -> Result<MailboxOwnership, FileE
         if !has_accounts {
             return Ok(MailboxOwnership::Unowned("No accounts table"));
         }
-        read_mailbox_owners(&conn)
+        read_mailbox_owners(&read)
     };
     match query() {
         Err(error) if error.sqlite_error_code() == Some(ErrorCode::NotADatabase) => Ok(
             MailboxOwnership::Unowned("The file is not a SQLite database"),
         ),
-        result => result.map_err(|err| unavailable(&err.to_string())),
+        result => result.map_err(|err| {
+            let mut error = unavailable(&err.to_string());
+            if let rusqlite::Error::SqliteFailure(code, _) = err {
+                error.transient = match code.code {
+                    ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked => true,
+                    ErrorCode::SystemIoFailure => !matches!(
+                        code.extended_code,
+                        ffi::SQLITE_IOERR_AUTH
+                            | ffi::SQLITE_IOERR_DATA
+                            | ffi::SQLITE_IOERR_CORRUPTFS
+                            | ffi::SQLITE_IOERR_SHORT_READ
+                    ),
+                    _ => false,
+                };
+            }
+            error
+        }),
     }
 }
 
@@ -1133,6 +1278,63 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn a_busy_mailbox_refresh_keeps_only_the_last_healthy_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("mail.db");
+        let registry = Registry::at(root.path().join("fell"), base.clone());
+        write_private(&registry.directory().join(".original-id"), "mail");
+        let path = registry.path("mail").unwrap();
+        write_private(&path, "email = 'mail@example.test'\npassword = 'fixture'");
+        let writer = Connection::open(&base).unwrap();
+        writer
+            .execute_batch(
+                "CREATE TABLE accounts (id TEXT, email TEXT);
+                 INSERT INTO accounts VALUES ('mail', 'mail@example.test');",
+            )
+            .unwrap();
+        let previous = registry.load_with_removals(&base);
+        assert_eq!(previous.default_config().unwrap().id, "mail");
+
+        // An exclusive rollback-journal write prevents even a read-only query.
+        writer.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let mut catalog = registry.load_with_removals(&base);
+        assert!(catalog.default_config().is_none());
+        catalog.retain_temporarily_unavailable(&previous);
+        assert_eq!(catalog, previous);
+
+        writer
+            .execute_batch("UPDATE accounts SET email = 'other@example.test'; COMMIT")
+            .unwrap();
+        let mut catalog = registry.load_with_removals(&base);
+        catalog.retain_temporarily_unavailable(&previous);
+        assert!(catalog.default_config().is_none());
+        assert_eq!(
+            catalog.entries[0].config.as_ref().unwrap_err().recovery,
+            MAILBOX_ADDRESS_RECOVERY
+        );
+    }
+
+    #[test]
+    fn a_nested_registry_lock_returns_busy_without_waiting() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = Registry::at(root.path().to_owned(), root.path().join("mail.db"));
+        let shared = registry.lock_shared().unwrap();
+        let start = Instant::now();
+        let error = registry.clone().lock().unwrap_err();
+        assert_eq!(error.cli_message(), LOCK_BUSY);
+        assert!(start.elapsed() < LOCK_WAIT);
+        drop(shared);
+
+        let exclusive = registry.lock().unwrap();
+        let start = Instant::now();
+        assert_eq!(registry.lock().unwrap_err().to_string(), LOCK_BUSY);
+        assert_eq!(registry.lock_shared().unwrap_err().to_string(), LOCK_BUSY);
+        assert!(start.elapsed() < LOCK_WAIT);
+        drop(exclusive);
+        assert!(registry.lock().is_ok());
+    }
+
     #[derive(Default)]
     struct Keyring(std::sync::Mutex<std::collections::HashMap<String, String>>);
 
@@ -1233,6 +1435,7 @@ mod tests {
             registry
                 .migrate_with(
                     Some(&base),
+                    LockMode::TryExclusive,
                     || {
                         assert_eq!(fs::read_to_string(&marker).unwrap(), "mail");
                         write_private(
@@ -1269,6 +1472,7 @@ mod tests {
         let failure = registry
             .migrate_with(
                 Some(&base),
+                LockMode::TryExclusive,
                 || Ok(()),
                 || {
                     fs::rename(&target, config.join("published.toml")).unwrap();
@@ -1809,6 +2013,7 @@ mod tests {
             let migrating = scope.spawn(move || {
                 registry.migrate_with(
                     Some(mailbox),
+                    LockMode::TryExclusive,
                     || Ok(()),
                     || {
                         published.send(()).unwrap();

@@ -242,11 +242,12 @@ impl AccountWindow {
     fn reconcile(
         &mut self,
         registry: &Registry,
-        accounts: Accounts,
+        mut accounts: Accounts,
         preferred: Option<&Path>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        accounts.retain_temporarily_unavailable(&self.catalog);
         let changed = self.catalog != accounts;
         if changed {
             let old_configs: Vec<_> = self.catalog.configs().cloned().collect();
@@ -1003,6 +1004,63 @@ mod tests {
             "email = '{id}@example.test'\npassword = 'fixture'\nport = 1\nnotifications = 'off'\n{suffix}"
         )
         .unwrap();
+    }
+
+    #[test]
+    fn a_catalog_scan_during_a_wal_write_keeps_the_open_account_view() {
+        let Some(_temp) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let registry = Registry::resolve().unwrap();
+        std::fs::create_dir_all(registry.directory()).unwrap();
+        write_account(&registry, "mail", "");
+        let mut app = TestAppContext::single();
+        let window = app.add_window(|window, cx| {
+            AccountWindow::new(mailbox::startup(), false, None, window, cx)
+        });
+        let original = window.update(&mut app, |view, _, _| view.active()).unwrap();
+        let store = original.read_with(&app, |inbox, _| inbox.store.clone());
+        futures::executor::block_on(store.call(|_| ())).unwrap();
+        app.run_until_parked();
+
+        let base = mailbox::store_path().unwrap();
+        let path = registry.store_path(&base, "mail").unwrap();
+        let writer = rusqlite::Connection::open(path).unwrap();
+        assert_eq!(
+            writer
+                .query_row::<String, _, _>("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap(),
+            "wal"
+        );
+        writer
+            .execute_batch(
+                "BEGIN IMMEDIATE; UPDATE accounts SET email = 'uncommitted@example.test'",
+            )
+            .unwrap();
+        window
+            .update(&mut app, |view, window, cx| {
+                original.update(cx, |inbox, _| {
+                    inbox.session.folder = "Sent".into();
+                    inbox.session.cursor_id = Some("selected-thread".into());
+                    inbox.session.search = Some(Default::default());
+                    inbox.session.search.as_mut().unwrap().query = "trail".into();
+                });
+                let accounts = catalog(&registry);
+                assert_eq!(
+                    accounts.default_config().unwrap().email,
+                    "mail@example.test"
+                );
+                view.reconcile(&registry, accounts, None, window, cx);
+                assert_eq!(view.active_id.as_deref(), Some("mail"));
+                assert_eq!(view.active(), original);
+                let inbox = original.read(cx);
+                assert!(!inbox.retired);
+                assert_eq!(inbox.session.folder, "Sent");
+                assert_eq!(inbox.session.cursor_id.as_deref(), Some("selected-thread"));
+                assert_eq!(inbox.session.search.as_ref().unwrap().query, "trail");
+            })
+            .unwrap();
+        writer.execute_batch("ROLLBACK").unwrap();
     }
 
     #[test]
