@@ -32,9 +32,9 @@ use crate::threading::{
 };
 
 mod manual;
-pub use manual::MergeCandidate;
 pub(super) use manual::retarget_override;
 pub(crate) use manual::{ACTION_SCHEMA, undo};
+pub use manual::{MergeCandidate, ThreadEditOutcome};
 
 /// Tables behind [`rethread_dirty`]. Safe to run on every open.
 const THREAD_INDEX_TABLES: &str = r#"
@@ -1230,6 +1230,13 @@ mod tests {
     use crate::message::{Message, RemoteId};
     use crate::store::Store;
 
+    fn applied(outcome: Result<ThreadEditOutcome>) -> ThreadId {
+        match outcome.unwrap() {
+            ThreadEditOutcome::Applied(thread) => thread,
+            ThreadEditOutcome::AlreadyGrouped(thread) => panic!("no manual edit for {thread:?}"),
+        }
+    }
+
     /// Small deterministic generator so failures replay from the seed.
     struct Rng(u64);
 
@@ -1656,9 +1663,7 @@ mod tests {
                     300,
                 ))
                 .unwrap();
-            let detached = store
-                .split_thread(&account.id, &MessageId::new("detached@x"))
-                .unwrap();
+            let detached = applied(store.split_thread(&account.id, &MessageId::new("detached@x")));
             let parents = Op::Batch(vec![
                 mail("parent-a@x", None, None, 100),
                 mail("parent-b@x", None, Some("lookup".into()), 110),
@@ -1707,9 +1712,7 @@ mod tests {
                     mail("c@x", Some("p@x"), "old", 210),
                 ]),
             );
-            let detached = store
-                .split_thread(&acct.id, &MessageId::new("c@x"))
-                .unwrap();
+            let detached = applied(store.split_thread(&acct.id, &MessageId::new("c@x")));
             store
                 .upsert_message(&mail("p@x", None, "team", 100))
                 .unwrap();
@@ -1753,9 +1756,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        let detached = store
-            .split_thread(&acct.id, &MessageId::new("b@x"))
-            .unwrap();
+        let detached = applied(store.split_thread(&acct.id, &MessageId::new("b@x")));
         assert_eq!(thread("b@x"), detached);
         store.undo(&acct.id).unwrap();
         let stale_source = thread("c@x");
@@ -1768,9 +1769,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            store
-                .merge_threads(&acct.id, &[stale_source], &destination)
-                .unwrap(),
+            applied(store.merge_threads(&acct.id, &[stale_source], &destination)),
             destination
         );
         for id in ["a@x", "b@x", "c@x"] {
@@ -1786,39 +1785,83 @@ mod tests {
     }
 
     #[test]
-    fn a_merge_already_done_by_queued_rethreading_commits_the_automatic_join() {
+    fn merge_returns_the_survivor_when_queued_rethreading_already_joined_the_selection() {
+        for whole_account in [false, true] {
+            let (store, acct, threads) = queued_conversation_join(whole_account);
+            let [survivor, target, source] = &threads;
+            assert_eq!(
+                store
+                    .merge_threads(&acct.id, std::slice::from_ref(source), target)
+                    .unwrap(),
+                ThreadEditOutcome::AlreadyGrouped(survivor.clone())
+            );
+            assert_automatic_join(&store, &acct.id, &threads);
+        }
+    }
+
+    #[test]
+    fn split_returns_the_survivor_when_queued_rethreading_leaves_no_other_branch() {
+        for whole_account in [false, true] {
+            let (store, acct, threads) = queued_conversation_join(whole_account);
+            assert_eq!(
+                store
+                    .split_thread(&acct.id, &MessageId::new("b@x"))
+                    .unwrap(),
+                ThreadEditOutcome::AlreadyGrouped(threads[0].clone())
+            );
+            assert_automatic_join(&store, &acct.id, &threads);
+        }
+    }
+
+    fn queued_conversation_join(whole_account: bool) -> (Store, Account, [ThreadId; 3]) {
         let store = Store::open_in_memory().unwrap();
+        store.full_rethread.set(whole_account);
         let acct = account();
         store.upsert_account(&acct).unwrap();
+        crate::actions::ensure_action_schema(&store.conn).unwrap();
         let mail = |id, date| message(id, None, &[], None, "INBOX", "a@x", id, date, None);
-        let target = store.upsert_message(&mail("a@x", 100)).unwrap();
-        let source = store.upsert_message(&mail("b@x", 200)).unwrap();
+        let threads = [("a@x", 100), ("b@x", 200), ("c@x", 300)]
+            .map(|(id, date)| store.upsert_message(&mail(id, date)).unwrap());
+        // The replies join b, but a's earlier thread ID survives the join.
         store
             .conn
             .execute(
-                "UPDATE messages SET in_reply_to = 'a@x' WHERE message_id = 'b@x'",
+                "UPDATE messages SET in_reply_to = 'b@x' WHERE message_id IN ('a@x', 'c@x')",
                 [],
             )
             .unwrap();
+        (store, acct, threads)
+    }
 
-        assert!(matches!(
-            store.merge_threads(&acct.id, std::slice::from_ref(&source), &target),
-            Err(crate::Error::Action(message)) if message == "Choose another conversation"
-        ));
-        assert_eq!(store.thread_messages(&acct.id, &target).unwrap().len(), 2);
-        assert!(
+    fn assert_automatic_join(store: &Store, account: &AccountId, threads: &[ThreadId; 3]) {
+        let [survivor, target, source] = threads;
+        assert_eq!(store.thread_messages(account, survivor).unwrap().len(), 3);
+        assert_eq!(
             store
-                .folder_key_of(&acct.id, "INBOX", &source)
+                .threading_list_key(account, survivor, "INBOX", None)
                 .unwrap()
-                .is_none()
+                .unwrap()
+                .thread_id,
+            *survivor
         );
-        let dirty: i64 = store
+        for replaced in [target, source] {
+            assert!(
+                store
+                    .threading_list_key(account, replaced, "INBOX", None)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let (dirty, actions): (i64, i64) = store
             .conn
-            .query_row("SELECT COUNT(*) FROM thread_dirty_rows", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM thread_dirty_rows), (SELECT COUNT(*) FROM local_actions)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
             .unwrap();
         assert_eq!(dirty, 0);
+        assert_eq!(actions, 0);
     }
 
     #[test]
@@ -1961,7 +2004,7 @@ mod tests {
             store.thread_subject_joins(&account, &original).unwrap(),
             HashSet::from([id.clone()])
         );
-        let detached = store.split_thread(&account, &id).unwrap();
+        let detached = applied(store.split_thread(&account, &id));
         assert_eq!(store.thread_messages(&account, &original).unwrap().len(), 2);
         assert!(
             store
@@ -2113,11 +2156,9 @@ mod tests {
                 ))
                 .unwrap();
             let first = if earlier_split {
-                store
-                    .split_thread(&acct.id, &MessageId::new("first@x"))
-                    .unwrap()
+                applied(store.split_thread(&acct.id, &MessageId::new("first@x")))
             } else {
-                store.merge_threads(&acct.id, &[first], &target).unwrap()
+                applied(store.merge_threads(&acct.id, &[first], &target))
             };
             let second = store
                 .upsert_message(&mail("second@x", None, "two", 300))
@@ -2176,9 +2217,7 @@ mod tests {
         store
             .upsert_message(&mail("b@x", Some("a@x"), "team", 200))
             .unwrap();
-        let detached = store
-            .split_thread(&acct.id, &MessageId::new("b@x"))
-            .unwrap();
+        let detached = applied(store.split_thread(&acct.id, &MessageId::new("b@x")));
         let reply = mail("reply@x", Some("b@x"), "fresh", 300);
         assert_eq!(store.upsert_message(&reply).unwrap(), detached);
         let later = mail("later@x", Some("reply@x"), "fresher", 400);

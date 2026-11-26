@@ -42,6 +42,14 @@ pub struct MergeCandidate {
     pub date_unix: i64,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum ThreadEditOutcome {
+    /// The manual edit was recorded for undo.
+    Applied(ThreadId),
+    /// Existing or automatic grouping left no manual edit to record.
+    AlreadyGrouped(ThreadId),
+}
+
 impl Store {
     /// Rank account-wide merge destinations by topic, people, and recency.
     pub fn merge_candidates(
@@ -206,7 +214,7 @@ impl Store {
     }
 
     /// Detach a message and its reply descendants within this conversation.
-    pub fn split_thread(&self, account: &AccountId, root: &MessageId) -> Result<ThreadId> {
+    pub fn split_thread(&self, account: &AccountId, root: &MessageId) -> Result<ThreadEditOutcome> {
         let tx = immediate_transaction(self.connection())?;
         self.rethread_written(&tx, account)?;
         let root = stored_parent(&tx, account.as_str(), root)?.ok_or(Error::UnknownThread)?;
@@ -235,9 +243,7 @@ impl Store {
         }
         if branch.len() == rows.len() {
             tx.commit()?;
-            return Err(Error::Action(
-                "This message and its replies already make up the conversation".into(),
-            ));
+            return Ok(ThreadEditOutcome::AlreadyGrouped(root.thread));
         }
 
         ensure_action_schema(&tx)?;
@@ -255,7 +261,7 @@ impl Store {
         }
         self.rethread_written(&tx, account)?;
         tx.commit()?;
-        Ok(detached)
+        Ok(ThreadEditOutcome::Applied(detached))
     }
 
     /// Merge the complete selection into the destination conversation.
@@ -264,7 +270,7 @@ impl Store {
         account: &AccountId,
         sources: &[ThreadId],
         target: &ThreadId,
-    ) -> Result<ThreadId> {
+    ) -> Result<ThreadEditOutcome> {
         let tx = immediate_transaction(self.connection())?;
         // Remember a member of each selection before processing the queue:
         // the pass can replace a whole conversation's list key.
@@ -289,7 +295,7 @@ impl Store {
             // The automatic pass already joined the selection. Keep its
             // result even though there is no manual edit to record.
             tx.commit()?;
-            return Err(Error::Action("Choose another conversation".into()));
+            return Ok(ThreadEditOutcome::AlreadyGrouped(target));
         }
         ensure_action_schema(&tx)?;
         let action = insert_local_action(
@@ -325,7 +331,7 @@ impl Store {
         }
         self.rethread_written(&tx, account)?;
         tx.commit()?;
-        Ok(target)
+        Ok(ThreadEditOutcome::Applied(target))
     }
 }
 

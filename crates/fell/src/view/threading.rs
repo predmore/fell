@@ -1,3 +1,5 @@
+use fell_core::store::ThreadEditOutcome;
+
 use super::*;
 
 const MERGE_FEEDBACK_DELAY: Duration = Duration::from_millis(120);
@@ -8,7 +10,7 @@ pub(super) struct RegroupMotion {
     pub anchor: Option<ScrollAnchor>,
     departing: Arc<HashMap<usize, Vec<DepartingMessage>>>,
     title: Option<(String, LayerSwap)>,
-    arriving: HashSet<String>,
+    arriving: Arc<HashSet<String>>,
     previous_markers: Arc<HashMap<String, Option<String>>>,
 }
 
@@ -16,7 +18,7 @@ pub(super) struct RegroupFrame {
     pub departing: Arc<HashMap<usize, Vec<DepartingMessage>>>,
     pub title: Option<(String, motion::SwapFrame)>,
     pub progress: f32,
-    pub arriving: HashSet<String>,
+    pub arriving: Arc<HashSet<String>>,
     pub previous_markers: Arc<HashMap<String, Option<String>>>,
 }
 
@@ -184,14 +186,15 @@ impl Inbox {
         let select = current.clone();
         self.change_mailbox(
             move |store| {
-                let (destination, follow, notice) = match edit {
+                let (outcome, follow, applied_notice, grouped_notice) = match edit {
                     ThreadEdit::Split { message, .. } => {
-                        let destination =
+                        let outcome =
                             store.split_thread(&account, &fell_core::MessageId(message))?;
                         (
-                            destination,
+                            outcome,
                             true,
                             "Split into its own conversation · u".to_owned(),
+                            "This message and its replies already make up the conversation",
                         )
                     }
                     ThreadEdit::Merge {
@@ -204,10 +207,19 @@ impl Inbox {
                             .is_some_and(|id| sources.contains(id) || id == &target);
                         let sources: Vec<_> = sources.into_iter().map(ThreadId).collect();
                         let target = ThreadId(target);
-                        let target = store.merge_threads(&account, &sources, &target)?;
+                        let outcome = store.merge_threads(&account, &sources, &target)?;
                         let subject = present::display_safe(&subject).replace(['“', '”'], "'");
-                        (target, follow, format!("Merged into “{subject}” · u"))
+                        (
+                            outcome,
+                            follow,
+                            format!("Merged into “{subject}” · u"),
+                            "Already in one conversation",
+                        )
                     }
+                };
+                let (destination, notice) = match outcome {
+                    ThreadEditOutcome::Applied(thread) => (thread, applied_notice),
+                    ThreadEditOutcome::AlreadyGrouped(thread) => (thread, grouped_notice.into()),
                 };
                 let key = follow
                     .then(|| {
@@ -351,7 +363,7 @@ impl Inbox {
             anchor,
             departing: Arc::new(departing),
             title,
-            arriving,
+            arriving: Arc::new(arriving),
             previous_markers: Arc::new(previous_markers),
         });
         self.sent_arrival_anchor = anchor.filter(|_| transition.is_none());

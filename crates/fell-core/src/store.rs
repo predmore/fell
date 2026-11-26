@@ -48,7 +48,7 @@ pub use intents::PendingFlags;
 pub(crate) use summaries::folder_names as message_folder_names;
 pub(crate) use summaries::label_names;
 pub use summaries::{FolderPage, FolderSpan, ListFilter, ListKey, ListSource, ThreadList};
-pub use threads::MergeCandidate;
+pub use threads::{MergeCandidate, ThreadEditOutcome};
 
 #[derive(Clone, Debug, Default)]
 pub struct ThreadLabels {
