@@ -93,8 +93,6 @@ fn link_preview(label: &str, target: &str) -> Option<LinkPreview> {
         return None;
     }
     let (destination, mismatch) = crate::compose_ui::reader_link_destination(label, target)?;
-    let mismatch = mismatch
-        && !(target.starts_with("mailto:") && checked_target(label).as_deref() == Some(target));
     Some(LinkPreview {
         destination: destination.into(),
         target: target.to_owned().into(),
@@ -434,6 +432,74 @@ mod tests {
             panic!("{inlines:?}");
         };
         check("Write to us", &checked_target(href).unwrap());
+    }
+
+    #[test]
+    fn mailto_preview_matches_path_recipients_and_flags_other_destinations() {
+        for (raw, target, destination, mismatch) in [
+            (
+                "mailto:ada@example.com?subject=Hi&reply-to=evil@attacker.com",
+                "mailto:ada@example.com?subject=Hi",
+                "ada@example.com",
+                true,
+            ),
+            (
+                "mailto:ada@example.com?subject=See https://user:pass@evil.test",
+                "mailto:ada@example.com?subject=See%20https%3A%2F%2Fuser%3Apass%40evil.test",
+                "ada@example.com",
+                true,
+            ),
+            (
+                "mailto:ada@example.com?subject=https://evil.test",
+                "mailto:ada@example.com?subject=https%3A%2F%2Fevil.test",
+                "ada@example.com",
+                true,
+            ),
+            (
+                "mailto:ada@example.com, bea@example.com?Subject=Hi",
+                "mailto:ada@example.com,bea@example.com?subject=Hi",
+                "ada@example.com,bea@example.com",
+                false,
+            ),
+            (
+                "mailto:ada+tag@example.com,bea@example.com?Subject=Hi",
+                "mailto:ada%2Btag@example.com,bea@example.com?subject=Hi",
+                "ada%2btag@example.com,bea@example.com",
+                false,
+            ),
+        ] {
+            let html = html_to_document(&format!(
+                "<a href=\"{source}\">{source}</a>",
+                source = raw.replace('&', "&amp;"),
+            ));
+            let [Block::Paragraph { inlines }] = html.blocks.as_slice() else {
+                panic!("{html:?}");
+            };
+            let [Inline::Link { href, children }] = inlines.as_slice() else {
+                panic!("{inlines:?}");
+            };
+            let [Inline::Text(text)] = children.as_slice() else {
+                panic!("{children:?}");
+            };
+            let target_link = checked_target(href).unwrap();
+            assert_eq!(target_link.as_ref(), target);
+            let preview = link_preview(text, &target_link).unwrap();
+            assert_eq!(preview.destination.as_str(), destination);
+            assert_eq!(preview.mismatch, mismatch, "{raw}");
+        }
+
+        let target = "mailto:ada@example.com,bea@example.com?subject=Hi";
+        let preview = link_preview("ada@example.com", target).unwrap();
+        assert_eq!(
+            preview.destination.as_str(),
+            "ada@example.com,bea@example.com"
+        );
+        assert!(!preview.mismatch);
+        assert!(
+            link_preview("Write here? &evil.test", target)
+                .unwrap()
+                .mismatch
+        );
     }
 
     #[test]

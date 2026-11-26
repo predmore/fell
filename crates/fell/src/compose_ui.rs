@@ -6549,18 +6549,53 @@ fn dotted_name(name: &str) -> Option<&str> {
 /// another registrable domain or mailbox.
 pub(crate) fn reader_link_destination(text: &str, href: &str) -> Option<(String, bool)> {
     let target = place_of_href(href)?;
-    let mismatch = place_mismatch(
-        text.split_whitespace()
-            .filter_map(|word| place_of_word(word, Links::Label)),
-        Some(&target),
-        registrable_domain,
-    );
+    let words = text.split_whitespace();
+    let mismatch = if let Place::Mail { address, .. } = &target {
+        let places = words.flat_map(reader_mailto_word_places).filter(|place| {
+            !matches!(place, Place::Mail { address: word, .. }
+                if address.split(',').any(|recipient| recipient == word))
+        });
+        place_mismatch(places, Some(&target), registrable_domain)
+    } else {
+        let places = words.filter_map(|word| place_of_word(word, Links::Label));
+        place_mismatch(places, Some(&target), registrable_domain)
+    };
     let destination = match target {
         Place::Host(host) => host,
         Place::Mail { address, .. } => address,
         Place::UserInfo => return None,
     };
     Some((destination, mismatch))
+}
+
+/// Read both the mailboxes and any destinations visible in the query.
+fn reader_mailto_word_places(word: &str) -> impl Iterator<Item = Place> {
+    let mailbox_path = |path: &str| path.contains('@') && !path.contains("://");
+    let (path, query) = if let Some(query) = word.strip_prefix(['?', '&']) {
+        ("", query)
+    } else {
+        word.split_once('?')
+            .filter(|(path, _)| mailbox_path(path))
+            .unwrap_or((word, ""))
+    };
+    let split_recipients = mailbox_path(path);
+    let recipients = path.split(move |ch| split_recipients && ch == ',');
+    let fields = query
+        .split('&')
+        .map(|field| field.split_once('=').map_or(field, |(_, value)| value));
+    recipients.chain(fields).filter_map(move |word| {
+        if mailbox_path(word) {
+            // Match the launcher's mailbox spelling, including encoded local parts.
+            let mailbox = word
+                .get(.."mailto:".len())
+                .filter(|prefix| prefix.eq_ignore_ascii_case("mailto:"))
+                .map_or(word, |prefix| &word[prefix.len()..]);
+            if let Some(target) = fell_render::reader_link_target(&format!("mailto:{mailbox}")) {
+                return place_of_href(&target);
+            }
+        }
+        place_of_word(word, Links::Label)
+    })
 }
 
 fn registrable_domain(host: &str) -> &str {
