@@ -22,8 +22,9 @@ fn web_page(body: &str, scheme: &str) -> String {
     border: 0 !important;
     outline: 0 !important;
     color: transparent !important;
-    content: url("data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7") !important;
   }}
+  img[src=""]:not([width][height]) {{ aspect-ratio: 3 / 2; }}
+  img[src=""]:not([width], [height]) {{ width: 120px; }}
   img {{ object-fit: contain; }}
 </style>
 </head>
@@ -534,11 +535,14 @@ fn strip_css_comments(css: &str) -> String {
 enum CssResource {
     Remove,
     Url(String),
+    ImageString(String),
+    VariableCandidate,
 }
 
 fn css_resources(
     css: &mut Parser<'_, '_>,
     depth: usize,
+    image_strings: bool,
     resources: &mut Vec<(Range<usize>, CssResource)>,
 ) {
     loop {
@@ -557,16 +561,39 @@ fn css_resources(
                     Ok::<_, ParseError<'_, ()>>(args.expect_string()?.to_string())
                 })
                 .map_or(CssResource::Remove, CssResource::Url),
+            Ok(Token::QuotedString(value)) if image_strings => {
+                CssResource::ImageString(value.to_string())
+            }
+            // A standalone URL string can also become an image source via var().
+            Ok(Token::QuotedString(value)) if is_remote_url(value) => {
+                CssResource::VariableCandidate
+            }
+            Ok(Token::BadString(_)) if image_strings => CssResource::Remove,
             Ok(Token::BadUrl(_)) => CssResource::Remove,
             Ok(
-                Token::Function(_)
+                token @ (Token::Function(_)
                 | Token::ParenthesisBlock
                 | Token::SquareBracketBlock
-                | Token::CurlyBracketBlock,
+                | Token::CurlyBracketBlock),
             ) => {
+                let nested_images = match token {
+                    Token::Function(name) => {
+                        [
+                            "image-set",
+                            "-webkit-image-set",
+                            "image",
+                            "cross-fade",
+                            "-webkit-cross-fade",
+                        ]
+                        .iter()
+                        .any(|function| name.eq_ignore_ascii_case(function))
+                            || image_strings && name.eq_ignore_ascii_case("var")
+                    }
+                    _ => false,
+                };
                 let _ = css.parse_nested_block(|nested| {
                     if depth < 64 {
-                        css_resources(nested, depth + 1, resources);
+                        css_resources(nested, depth + 1, nested_images, resources);
                     }
                     Ok::<_, ParseError<'_, ()>>(())
                 });
@@ -582,6 +609,14 @@ fn css_resources(
     }
 }
 
+fn css_declaration(css: &str, start: usize) -> Option<&str> {
+    css[..start]
+        .rsplit([';', '{', '}'])
+        .next()?
+        .split_once(':')
+        .map(|(name, _)| name.trim())
+}
+
 fn serialize_css(
     css: &str,
     out: &mut String,
@@ -593,36 +628,42 @@ fn serialize_css(
     let css = strip_css_comments(css);
     let mut input = ParserInput::new(&css);
     let mut resources = Vec::new();
-    css_resources(&mut Parser::new(&mut input), 0, &mut resources);
+    css_resources(&mut Parser::new(&mut input), 0, false, &mut resources);
     let mut from = 0;
     for (range, resource) in resources {
-        if let CssResource::Url(value) = &resource
-            && normalize_resource_url(value)
-                .to_ascii_lowercase()
-                .starts_with("data:image/")
+        let name = css_declaration(&css, range.start);
+        if matches!(resource, CssResource::VariableCandidate)
+            && !name.is_some_and(|name| name.starts_with("--"))
+        {
+            continue;
+        }
+        if let CssResource::Url(value) | CssResource::ImageString(value) = &resource
+            && (value.is_empty()
+                || normalize_resource_url(value)
+                    .to_ascii_lowercase()
+                    .starts_with("data:image/"))
         {
             continue;
         }
         out.push_str(&escape(&css[from..range.start]));
-        if let CssResource::Url(value) = resource {
-            let declaration = css[..range.start]
-                .rsplit([';', '{', '}'])
-                .next()
-                .unwrap_or_default();
-            let name = declaration.split_once(':').map(|(name, _)| name.trim());
+        let quoted = matches!(resource, CssResource::ImageString(_));
+        if let CssResource::Url(value) | CssResource::ImageString(value) = resource {
             let slot = images.as_deref_mut().filter(|slots| slots.len() < 48);
             if let Some(slots) = slot
                 && name.is_some_and(|name| {
-                    matches!(
-                        name.to_ascii_lowercase().as_str(),
-                        "background" | "background-image" | "border-image" | "list-style-image"
-                    )
+                    (quoted && name.starts_with("--"))
+                        || matches!(
+                            name.to_ascii_lowercase().as_str(),
+                            "background" | "background-image" | "border-image" | "list-style-image"
+                        )
                 })
                 && let Some(url) = remote_image_url(&value)
             {
-                out.push_str(&escape("url(\""));
+                out.push_str(&escape(if quoted { "\"" } else { "url(\"" }));
                 slots.push((out.len(), url));
-                out.push_str(&escape("\")"));
+                out.push_str(&escape(if quoted { "\"" } else { "\")" }));
+            } else if quoted {
+                out.push_str(&escape("\"\""));
             } else {
                 out.push_str(" none ");
             }
@@ -984,6 +1025,60 @@ mod tests {
         );
         assert_eq!(allowed.matches("data:image/png").count(), 2);
         assert!(allowed.contains("img-src data: cid:"));
+    }
+
+    #[test]
+    fn quoted_css_images_are_empty_until_consented() {
+        for declaration in [
+            r#"background: image-set("https://cdn.example.test/a" 1x)"#,
+            r#"background: -webkit-image-set(url("") 1x, "https://cdn.example.test/a" 2x)"#,
+            r#"background: image("https://cdn.example.test/a")"#,
+            r#"background: cross-fade("https://cdn.example.test/a", red)"#,
+            r#"--y: image-set("https://cdn.example.test/a" 1x); background: var(--y)"#,
+            r#"background: IMAGE-SET(var(--y, "https://cdn.example.test/a") 1x)"#,
+        ] {
+            for html in [
+                format!("<style>p {{ {declaration} }}</style><p>Body</p>"),
+                format!("<p style='{declaration}'>Body</p>"),
+            ] {
+                let mail = WebMail::prepare(&html);
+                let blocked = mail.page("light", |_| None);
+                assert!(!blocked.contains("https://"), "{blocked}");
+                assert!(mail.has_remote_images(), "{html}");
+                let allowed = mail.page("light", |url| {
+                    assert_eq!(url, "https://cdn.example.test/a");
+                    Some("data:image/png;base64,AAAA".into())
+                });
+                assert!(allowed.contains("data:image/png;base64,AAAA"), "{allowed}");
+            }
+        }
+        let page = WebMail::prepare(
+            r#"<style>p {--y: "https://cdn.example.test/a"; background: image-set(var(--y) 1x, "data:image/png;base64,AAAA" type("image/png") 2x);}</style>"#,
+        )
+        .page("light", |_| None);
+        assert!(!page.contains("https://"), "{page}");
+        assert!(page.contains(r#""data:image/png;base64,AAAA" type("image/png")"#));
+    }
+
+    #[test]
+    fn blocked_images_keep_layout_hints() {
+        let page = WebMail::prepare(
+            r#"<img src="https://cdn.example.test/hero" width="420" height="240" style="max-width: 90%"><img src="https://cdn.example.test/card" width="240">"#,
+        )
+        .page("light", |_| None);
+        let dom = crate::html::parse_html(&page);
+        let images: Vec<_> = dom
+            .select(&scraper::Selector::parse("img").unwrap())
+            .collect();
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0].attr("src"), Some(""));
+        assert_eq!(images[0].attr("width"), Some("420"));
+        assert_eq!(images[0].attr("height"), Some("240"));
+        assert_eq!(images[0].attr("style"), Some("max-width: 90%"));
+        assert_eq!(images[1].attr("src"), Some(""));
+        assert_eq!(images[1].attr("width"), Some("240"));
+        assert!(page.contains("aspect-ratio: 3 / 2"));
+        assert!(!page.contains("content: url"));
     }
 
     #[test]

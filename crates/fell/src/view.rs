@@ -2828,7 +2828,8 @@ impl Inbox {
                 // Fades in as a synced draft's messages do, so `j` between
                 // the two kinds never pops.
                 self.reveal = Reveal::Waiting;
-                self.motion.show_thread(&mut self.session, shown);
+                self.motion
+                    .show_thread(&mut self.session, shown, motion::QUICK);
                 self.scroll_conversation();
             }
             self.session.clear_query_fault(QueryFault::Message);
@@ -2855,6 +2856,7 @@ impl Inbox {
             Some((generation, search.effective_query().to_owned()))
         });
         let cached = self.bodies.stamps();
+        let sender_preferences = self.web_mail.preferences.clone();
         let wait_for_body = self.first_preview.waits_for_body();
         let expanded: HashSet<_> = self
             .session
@@ -2883,7 +2885,15 @@ impl Inbox {
                         message.expanded |= expanded.contains(&message.id);
                     }
                     let reads = mail_body::read_bodies_with_latest(
-                        store, &account, &mut view, &cached, !opening,
+                        store,
+                        &account,
+                        &mut view,
+                        &cached,
+                        !opening,
+                        |message| {
+                            let sender = web_mail::sender_address(&message.email)?;
+                            sender_preferences.get(&sender)?.0
+                        },
                     );
                     Ok(Some((view, reads)))
                 })
@@ -2918,9 +2928,20 @@ impl Inbox {
             }))
         });
         cx.spawn(async move |this, cx| {
-            let result = reply
+            let mut result = reply
                 .await
                 .unwrap_or_else(|_| Err("Mailbox store stopped".into()));
+            if let Ok(Some(read)) = &mut result
+                && read.reads.has_web_previews()
+            {
+                let mut reads = std::mem::take(&mut read.reads);
+                read.reads = cx
+                    .background_spawn(async move {
+                        reads.prepare_web_previews();
+                        reads
+                    })
+                    .await;
+            }
             let _ = this.update(cx, |inbox, cx| {
                 inbox.receive_conversation(id, generation, result, cx)
             });
@@ -3042,7 +3063,15 @@ impl Inbox {
                 } else {
                     inbox.invalidate_conversation_layout();
                     inbox.reveal = Reveal::Waiting;
-                    inbox.motion.show_thread(&mut inbox.session, view);
+                    let fade = if view
+                        .last()
+                        .is_some_and(|message| inbox.web_mail.prefers_message_web(message))
+                    {
+                        motion::FADE
+                    } else {
+                        motion::QUICK
+                    };
+                    inbox.motion.show_thread(&mut inbox.session, view, fade);
                     inbox.finish_body_refresh(generation, false);
                     // Keep the initial header landing while the
                     // preview's pending bodies fill in.
@@ -5993,10 +6022,10 @@ impl Render for Inbox {
             .regroup_motion
             .take()
             .filter(|motion| motion.running(now));
-        let web = if reader_current && panes.1 && preview_current {
+        let web = if self.open_thread.is_some() && panes.1 {
             self.web_mail.frames(
                 &self.session.messages,
-                self.session.message_cursor,
+                (reader_current && preview_current).then_some(self.session.message_cursor),
                 &self.theme,
                 reader.columns.header.width,
                 (self.motion.motion, now),
@@ -6099,7 +6128,7 @@ impl Render for Inbox {
             | self.account_arrival.is_some_and(|fade| fade.running(now))
             | conv.account_opacity.is_some()
             | link_fading
-            | conv.web.values().any(|frame| frame.progress < 1.0)
+            | conv.web.values().any(web_mail::Frame::animating)
             | waiting_for_resize
             | self.note_view.running()
             | self.note_pin.running()
@@ -10504,7 +10533,7 @@ fn expanded_message_header(
     columns: ReaderColumns,
     status: Option<ReaderStatusSlot<'_>>,
     marker: GroupingMarker<'_>,
-    web: bool,
+    web_alpha: Option<f32>,
     window: &Window,
 ) -> gpui::Div {
     let style = conversation_line_style(window, theme, px(theme.ui_px - 1.));
@@ -10514,17 +10543,15 @@ fn expanded_message_header(
     let line_height = sender_style.line_height_in_pixels(window.rem_size());
     let date = present::relative_date(now_unix(), message.date_unix);
     let date_width = line_px_with_style(window, &sender_style, &date, FontWeight::NORMAL).ceil();
-    let web = web
-        .then(|| {
-            shape_ui_line(
-                window,
-                &style,
-                "web",
-                FontWeight::NORMAL,
-                Some(theme.dimmed),
-            )
-        })
-        .flatten();
+    let web = web_alpha.and_then(|_| {
+        shape_ui_line(
+            window,
+            &style,
+            "web",
+            FontWeight::NORMAL,
+            Some(theme.dimmed),
+        )
+    });
     let web_width = web.as_ref().map_or(0., |line| {
         f32::from(line.width).ceil() + MESSAGE_HEADER_GAP_PX
     });
@@ -10707,7 +10734,11 @@ fn expanded_message_header(
                 .overflow_hidden()
                 .children(status.map(|slot| reader_status_text(theme, slot, status_width)))
                 .children(marker.map(|(label, _)| label))
-                .children(web.map(|tag| paint_shaped_text(tag, line_height, false)))
+                .children(web.zip(web_alpha).map(|(tag, alpha)| {
+                    div()
+                        .opacity(alpha)
+                        .child(paint_shaped_text(tag, line_height, false))
+                }))
                 .child(paint_shaped_text(line, line_height, false))
         }),
     )
@@ -10767,10 +10798,7 @@ fn expanded_message(
             columns,
             status.filter(|_| message.recipients.is_none()),
             marker,
-            frame
-                .web
-                .get(&message.id)
-                .is_some_and(web_mail::Frame::draws_web),
+            frame.web.get(&message.id).and_then(|frame| frame.web_tag),
             window,
         ))
         .children(message.recipients.as_ref().map(|line| {
@@ -10814,11 +10842,11 @@ fn expanded_message(
             frame
                 .web
                 .get(&message.id)
-                .and_then(|frame| frame.prompt)
+                .and_then(|frame| frame.prompt.as_ref())
                 .map(|prompt| {
                     columns
                         .card
-                        .place(web_mail::prompt(prompt, theme, index, live.0, cx))
+                        .place(web_mail::prompt(prompt, theme, &message.id, live.0, cx))
                 }),
         )
         // `q` opens every collapsed block in the message at once, so only
@@ -11139,6 +11167,7 @@ fn web_message_body(
             web.progress,
             web.from_height,
             [layer(outgoing, false), incoming],
+            matches!(outgoing, Body::Placeholder),
         )
     } else {
         incoming
@@ -15370,7 +15399,7 @@ mod tests {
                             ReaderColumns::split(600.),
                             None,
                             super::GroupingMarker::default(),
-                            false,
+                            None,
                             window,
                         )
                     });

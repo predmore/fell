@@ -9,9 +9,10 @@
 //!
 //! None of this runs on the UI thread. The store thread reads the parts and
 //! prepares the bodies the reader could see above the message they land on,
-//! so nothing above it moves once the thread is on screen; the body they land
-//! on, and any message opened later, is prepared on the background executor
-//! and fades in under a header that is already drawn. The store thread
+//! so nothing above it moves once the thread is on screen. Possible web
+//! bodies are prepared on the background executor before the first thread
+//! frame. The newest native body and messages opened later can fade in under
+//! a header that is already drawn. The store thread
 //! prepares at most [`STORE_PREPARE_BYTES`] of HTML per read, so one huge
 //! message cannot hold up the folder; the rest go to the background too.
 //! Prepared bodies are cached by message id and the stored parts' stamp,
@@ -332,8 +333,23 @@ impl BodyCache {
 pub struct BodyReads {
     /// Bodies prepared on the store thread and their positions in the read.
     prepared: Vec<(usize, PreparedBody)>,
+    web_previews: Vec<(usize, BodyJob)>,
     /// The stored revision of each HTML body in the read.
     stamps: HashMap<String, PartStamp>,
+}
+
+impl BodyReads {
+    pub fn has_web_previews(&self) -> bool {
+        !self.web_previews.is_empty()
+    }
+
+    pub fn prepare_web_previews(&mut self) {
+        self.prepared.extend(
+            self.web_previews
+                .drain(..)
+                .map(|(index, job)| (index, job.prepare())),
+        );
+    }
 }
 
 /// Find which messages have HTML on the store thread.
@@ -348,7 +364,7 @@ fn read_bodies(
     messages: &mut [ConvMessage],
     cached: &HashMap<String, PartStamp>,
 ) -> BodyReads {
-    read_bodies_with_latest(store, account, messages, cached, false)
+    read_bodies_with_latest(store, account, messages, cached, false, |_| Some(false))
 }
 
 pub fn read_bodies_with_latest(
@@ -357,6 +373,7 @@ pub fn read_bodies_with_latest(
     messages: &mut [ConvMessage],
     cached: &HashMap<String, PartStamp>,
     prepare_latest: bool,
+    sender_mode: impl Fn(&ConvMessage) -> Option<bool>,
 ) -> BodyReads {
     let mut reads = BodyReads::default();
     let ids: Vec<&str> = messages.iter().map(|message| message.id.as_str()).collect();
@@ -376,19 +393,25 @@ pub fn read_bodies_with_latest(
             Some(kinds) if kinds.html => {
                 message.rich = Rich::Pending;
                 reads.stamps.insert(message.id.clone(), kinds.stamp);
-                if message.expanded
-                    && (index < last || prepare_latest)
-                    && kinds.html_bytes <= budget
-                    && cached.get(&message.id) != Some(&kinds.stamp)
-                {
-                    budget -= kinds.html_bytes;
-                    if let Ok(Some(job)) = read_job_at_stamp(
+                if !message.expanded || cached.get(&message.id) == Some(&kinds.stamp) {
+                    continue;
+                }
+                let web_preview =
+                    !prepare_latest && sender_mode(message).unwrap_or(kinds.has_delivery_headers);
+                let fits = (index < last || prepare_latest) && kinds.html_bytes <= budget;
+                if (web_preview || fits)
+                    && let Ok(Some(job)) = read_job_at_stamp(
                         store,
                         account,
                         &message.id,
                         kinds.stamp,
                         &message.mail_headers,
-                    ) {
+                    )
+                {
+                    if web_preview {
+                        reads.web_previews.push((index, job));
+                    } else {
+                        budget -= kinds.html_bytes;
                         reads.prepared.push((index, job.prepare()));
                     }
                 }
@@ -459,10 +482,12 @@ impl BodyLoads {
         BodyReads {
             mut stamps,
             prepared,
+            web_previews,
         }: BodyReads,
         cache: &mut BodyCache,
         messages: &mut [ConvMessage],
     ) {
+        debug_assert!(web_previews.is_empty());
         for message in messages.iter_mut() {
             let Some(wanted) = stamps.get(&message.id) else {
                 continue;
@@ -869,6 +894,34 @@ mod tests {
             &[("List-Unsubscribe".into(), "<https://news.test/u>".into())],
         );
         assert!(!bulk.folded.has_folds());
+    }
+
+    #[test]
+    fn a_new_thread_prepares_its_latest_web_body_before_display() {
+        let id = "newsletter@fell.test";
+        let store = store_with(&[mail(
+            id,
+            id,
+            0,
+            Some(html_parts(&heavy_newsletter(), &[("Precedence", "bulk")])),
+        )]);
+        let mut view = open(&store, id);
+        let mut reads = read_bodies_with_latest(
+            &store,
+            &account().id,
+            &mut view,
+            &HashMap::new(),
+            false,
+            |_| None,
+        );
+        assert!(reads.has_web_previews());
+        reads.prepare_web_previews();
+        BodyLoads::default().accept(reads, &mut BodyCache::default(), &mut view);
+        let Rich::Html(body) = &view[0].rich else {
+            panic!("expected web body on arrival")
+        };
+        assert_eq!(body.suggested, fell_render::RenderMode::Web);
+        assert!(body.web.has_remote_images());
     }
 
     #[test]

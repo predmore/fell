@@ -17,41 +17,63 @@ const PAGE_BYTES: usize = 12 * 1024 * 1024;
 const FETCH_TIME: Duration = Duration::from_secs(3);
 const PAGE_TIME: Duration = Duration::from_secs(12);
 
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum Failure {
+    Unreachable(String),
+    Address,
+    Response,
+    Format,
+    Limit,
+}
+
+impl Failure {
+    pub(crate) fn label(&self) -> String {
+        match self {
+            Self::Unreachable(host) => format!("Couldn’t reach {host}"),
+            Self::Address => "Image address blocked".into(),
+            Self::Response => "Image server didn’t return an image".into(),
+            Self::Format => "Unsupported or damaged image".into(),
+            Self::Limit => "Image download limit reached".into(),
+        }
+    }
+}
+
 pub(crate) fn inline_page(
     mail: &fell_render::WebMail,
     scheme: &str,
     allowed: impl Fn() -> bool,
-) -> (String, usize) {
+) -> (String, Result<(), Failure>) {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     let deadline = Instant::now() + PAGE_TIME;
     let mut remaining = PAGE_BYTES;
-    let mut fetched: HashMap<String, Option<String>> = HashMap::new();
+    let mut fetched: HashMap<String, Result<String, Failure>> = HashMap::new();
+    let mut result = Err(Failure::Limit);
     let html = mail.page(scheme, |url| {
         if !allowed() || Instant::now() >= deadline || remaining == 0 {
             return None;
         }
-        fetched
-            .entry(url.to_owned())
-            .or_insert_with(|| {
-                let data = fetch(
-                    AGENT.get_or_init(agent),
-                    url,
-                    remaining.min(IMAGE_BYTES),
-                    &allowed,
-                )?;
-                Some(data)
-            })
-            .as_ref()
-            .filter(|data| data.len() <= remaining)
-            .map(|data| {
+        let image = fetched.entry(url.to_owned()).or_insert_with(|| {
+            fetch(
+                AGENT.get_or_init(agent),
+                url,
+                remaining.min(IMAGE_BYTES),
+                &allowed,
+            )
+        });
+        match image {
+            Ok(data) if data.len() <= remaining => {
+                result = Ok(());
                 remaining -= data.len();
-                data.clone()
-            })
+                Some(data.clone())
+            }
+            Err(failure) if matches!(result, Err(Failure::Limit)) => {
+                result = Err(failure.clone());
+                None
+            }
+            _ => None,
+        }
     });
-    (
-        html,
-        fetched.values().filter(|value| value.is_some()).count(),
-    )
+    (html, result)
 }
 
 fn agent() -> ureq::Agent {
@@ -104,20 +126,23 @@ fn fetch(
     source: &str,
     limit: usize,
     allowed: &impl Fn() -> bool,
-) -> Option<String> {
-    let mut url = Url::parse(source).ok()?;
+) -> Result<String, Failure> {
+    let mut url = Url::parse(source).map_err(|_| Failure::Address)?;
     let started = Instant::now();
     for _ in 0..=3 {
-        let time = FETCH_TIME.checked_sub(started.elapsed())?;
+        url.set_fragment(None);
+        let unreachable = || Failure::Unreachable(url.host_str().unwrap_or_default().to_owned());
+        let time = FETCH_TIME
+            .checked_sub(started.elapsed())
+            .ok_or_else(unreachable)?;
         if !allowed()
             || !matches!(url.scheme(), "http" | "https")
             || !url.username().is_empty()
             || url.password().is_some()
             || fell_render::targets_private_network(url.as_str())
         {
-            return None;
+            return Err(Failure::Address);
         }
-        url.set_fragment(None);
         // No cookie jar, credentials, client referrer, or redirect headers.
         let response = agent
             .get(url.as_str())
@@ -126,22 +151,28 @@ fn fetch(
             .timeout_global(Some(time))
             .build()
             .call()
-            .ok()?;
+            .map_err(|error| match error {
+                ureq::Error::StatusCode(_) => Failure::Response,
+                _ => unreachable(),
+            })?;
         if response.status().is_redirection() {
-            let next = url
-                .join(response.headers().get("location")?.to_str().ok()?)
-                .ok()?;
+            let target = response
+                .headers()
+                .get("location")
+                .and_then(|header| header.to_str().ok())
+                .ok_or(Failure::Response)?;
+            let next = url.join(target).map_err(|_| Failure::Address)?;
             if url.scheme() == "https" && next.scheme() != "https" {
-                return None;
+                return Err(Failure::Address);
             }
             url = next;
             continue;
         }
-        let mime = match response.body().mime_type()? {
-            "image/png" => "image/png",
-            "image/jpeg" => "image/jpeg",
-            "image/gif" => "image/gif",
-            _ => return None,
+        let mime = match response.body().mime_type() {
+            Some("image/png") => "image/png",
+            Some("image/jpeg") => "image/jpeg",
+            Some("image/gif") => "image/gif",
+            _ => return Err(Failure::Format),
         };
         let mut bytes = Vec::new();
         response
@@ -149,14 +180,17 @@ fn fetch(
             .into_reader()
             .take(limit as u64 + 1)
             .read_to_end(&mut bytes)
-            .ok()?;
-        if !allowed() || bytes.len() > limit || !super::native::raster_bytes_allowed(&bytes, mime) {
-            return None;
+            .map_err(|_| unreachable())?;
+        if !allowed() || bytes.len() > limit {
+            return Err(Failure::Limit);
         }
-        return Some(format!(
+        if !super::native::raster_bytes_allowed(&bytes, mime) {
+            return Err(Failure::Format);
+        }
+        return Ok(format!(
             "data:{mime};base64,{}",
             base64::engine::general_purpose::STANDARD.encode(bytes)
         ));
     }
-    None
+    Err(Failure::Response)
 }

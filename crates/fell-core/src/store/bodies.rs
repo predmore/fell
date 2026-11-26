@@ -1107,6 +1107,8 @@ pub struct PartKinds {
     /// Bytes of compressed HTML as stored, for a caller deciding where to
     /// prepare it. 0 without HTML.
     pub html_bytes: u64,
+    /// Whether there are delivery headers that can affect the renderer choice.
+    pub has_delivery_headers: bool,
     /// Changes when the stored parts change: a resync that replaces them,
     /// or a backfill that fills HTML into a plain row. A cache of prepared
     /// bodies keys on it as well as on the message id.
@@ -1122,7 +1124,7 @@ pub(super) fn kinds(
 ) -> Result<std::collections::HashMap<String, PartKinds>> {
     let mut stmt = conn.prepare_cached(
         "SELECT b.html IS NOT NULL, b.plain IS NOT NULL, coalesce(length(b.html), 0),
-                coalesce(s.stamp, zeroblob(16))
+                coalesce(s.stamp, zeroblob(16)), length(b.bulk_headers) > 0
          FROM message_bodies b LEFT JOIN message_body_stamps s USING (account_id, message_id)
          WHERE b.account_id = ?1 AND b.message_id = ?2",
     )?;
@@ -1136,6 +1138,7 @@ pub(super) fn kinds(
                     plain: row.get(1)?,
                     html_bytes: html_bytes.max(0) as u64,
                     stamp: PartStamp(row.get(3)?),
+                    has_delivery_headers: row.get(4)?,
                 })
             })
             .optional()?;

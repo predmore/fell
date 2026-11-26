@@ -142,8 +142,14 @@ pub(super) fn crossfade(
     progress: f32,
     from_height: Option<f32>,
     layers: [AnyElement; 2],
+    from_placeholder: bool,
 ) -> AnyElement {
-    let mut fade = layer_pair(width, layers, [1.0, progress], progress, [true; 2]);
+    let outgoing = if from_placeholder {
+        (1.0 - progress / motion::ease_out(0.4)).max(0.0)
+    } else {
+        1.0
+    };
+    let mut fade = layer_pair(width, layers, [outgoing, progress], progress, [true; 2]);
     fade.from_height = from_height;
     fade.into_any_element()
 }

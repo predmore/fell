@@ -3,7 +3,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use futures::channel::oneshot;
@@ -32,6 +32,30 @@ struct Job {
     reply: oneshot::Sender<Snapshot>,
 }
 
+#[derive(Default)]
+struct JobQueue(Mutex<Option<Job>>);
+
+impl JobQueue {
+    fn submit(&self, job: Job) {
+        let superseded = self.0.lock().unwrap().replace(job);
+        drop(superseded);
+    }
+
+    fn next(&self) -> Option<Job> {
+        self.0
+            .lock()
+            .unwrap()
+            .take()
+            .filter(|job| !job.reply.is_canceled())
+    }
+}
+
+#[allow(deprecated)]
+struct Worker {
+    queue: Arc<JobQueue>,
+    wake: glib::Sender<()>,
+}
+
 struct Load {
     reply: oneshot::Sender<Snapshot>,
     cancel: gtk::gio::Cancellable,
@@ -41,15 +65,17 @@ struct Load {
 type Active = Rc<RefCell<Option<Load>>>;
 
 #[allow(deprecated)]
-fn worker() -> Option<&'static glib::Sender<Job>> {
-    static WORKER: OnceLock<Option<glib::Sender<Job>>> = OnceLock::new();
+fn worker() -> Option<&'static Worker> {
+    static WORKER: OnceLock<Option<Worker>> = OnceLock::new();
     WORKER
         .get_or_init(|| {
-            let (tx, rx) = glib::MainContext::channel(glib::Priority::DEFAULT);
+            let (wake, rx) = glib::MainContext::channel(glib::Priority::DEFAULT);
+            let queue = Arc::new(JobQueue::default());
+            let queued = queue.clone();
             std::thread::Builder::new()
                 .name("fell-webview".into())
                 .spawn(move || {
-                    if let Err(error) = run(rx) {
+                    if let Err(error) = run(rx, queued) {
                         #[cfg(test)]
                         eprintln!("WebKit initialization: {error}");
                         fell_core::diagnostic!(
@@ -60,7 +86,7 @@ fn worker() -> Option<&'static glib::Sender<Job>> {
                     }
                 })
                 .ok()?;
-            Some(tx)
+            Some(Worker { queue, wake })
         })
         .as_ref()
 }
@@ -71,7 +97,9 @@ pub(crate) fn prewarm() {
 
 pub(crate) async fn render(request: WebRequest) -> Option<Snapshot> {
     let (reply, done) = oneshot::channel();
-    worker()?.send(Job { request, reply }).ok()?;
+    let worker = worker()?;
+    worker.queue.submit(Job { request, reply });
+    worker.wake.send(()).ok()?;
     // The worker can fail during setup, before GLib attaches its receiver.
     // Bound the wait even when GLib keeps an already queued request alive.
     let timeout = async_io::Timer::after(Duration::from_secs(6));
@@ -82,7 +110,7 @@ pub(crate) async fn render(request: WebRequest) -> Option<Snapshot> {
 }
 
 #[allow(deprecated)]
-fn run(rx: glib::Receiver<Job>) -> Result<(), Box<dyn std::error::Error>> {
+fn run(rx: glib::Receiver<()>, queue: Arc<JobQueue>) -> Result<(), Box<dyn std::error::Error>> {
     gtk::init()?;
     let window = gtk::OffscreenWindow::new();
     window.set_accept_focus(false);
@@ -120,10 +148,10 @@ fn run(rx: glib::Receiver<Job>) -> Result<(), Box<dyn std::error::Error>> {
     window.show_all();
     // Start the web process before the first conversation needs it.
     widget.load_html("<!doctype html>", None);
-    let _source = rx.attach(None, move |job| {
-        if job.reply.is_canceled() {
+    let _source = rx.attach(None, move |()| {
+        let Some(job) = queue.next() else {
             return glib::ControlFlow::Continue;
-        }
+        };
         cancel(&active);
         widget.stop_loading();
         let WebRequest {
@@ -396,6 +424,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_the_latest_queued_snapshot_is_loaded() {
+        let queue = JobQueue::default();
+        let replies = ["first", "second", "third"].map(|html| {
+            let (reply, done) = oneshot::channel();
+            queue.submit(Job {
+                request: WebRequest {
+                    html: html.into(),
+                    width: 440,
+                    background: 0xffffff,
+                    settle_images: false,
+                },
+                reply,
+            });
+            done
+        });
+        assert_eq!(queue.next().unwrap().request.html, "third");
+        assert!(queue.next().is_none());
+        drop(replies);
+    }
+
+    #[test]
     fn hostile_email_makes_zero_webkit_requests() {
         use fell_core::test_support::{skip_unless_available, test_net_missing};
 
@@ -461,8 +510,21 @@ mod tests {
             @font-face {{ font-family: Probe; src: url({public}/font); }}
             p {{ font-family: Probe; background: image-set(url({public}/bg) 1x); }}
             div {{ background: url/*x*/({public}/split-bg); }}
+            .image-set {{ background: image-set("{public}/quoted" 1x); }}
+            .webkit {{ background: -webkit-image-set(url("") 1x, "{public}/webkit-quoted" 2x); }}
+            .image {{ background: image("{public}/image"); }}
+            .cross-fade {{ background: cross-fade("{public}/cross-fade", red); }}
+            .var {{ --y: image-set("{public}/variable" 1x); background: var(--y); }}
             </style></head>
             <body><p style="background-color:#7a163f">Offline preview</p><div>Probe</div>
+            <p class="image-set">Image set</p><p class="webkit">WebKit image set</p>
+            <p class="image">Image</p><p class="cross-fade">Cross fade</p>
+            <p class="var">Custom property</p>
+            <p style='background: image-set("{public}/inline-set" 1x)'>Inline image set</p>
+            <p style='background: -webkit-image-set(url("") 1x, "{public}/inline-webkit" 2x)'>Inline WebKit image set</p>
+            <p style='background: image("{public}/inline-image")'>Inline image</p>
+            <p style='background: cross-fade("{public}/inline-cross-fade", red)'>Inline cross fade</p>
+            <p style='--y: image-set("{public}/inline-variable" 1x); background: var(--y)'>Inline custom property</p>
             <img src="{local}/pixel"><img src="{public}/pixel" srcset="{public}/srcset 2x">
             <img src="{file}" width="16" height="16">
             <iframe src="{public}/frame"></iframe>
@@ -488,5 +550,22 @@ mod tests {
             assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
         }
         eprintln!("hostile WebKit corpus drew a frame without proxy, origin or file loads");
+
+        let blocked = fell_render::WebMail::prepare(
+            r#"<img src="https://cdn.example.test/width-only" width="300" alt="A photo" style="display:block">"#,
+        );
+        assert!(blocked.has_remote_images());
+        let picture = futures::executor::block_on(render(WebRequest {
+            html: blocked.page("light", |_| None),
+            width: 440,
+            background: 0xffffff,
+            settle_images: true,
+        }))
+        .expect("WebKit drew the blocked image placeholder");
+        assert!(
+            picture.height >= 190.,
+            "placeholder height: {}",
+            picture.height
+        );
     }
 }
