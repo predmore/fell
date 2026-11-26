@@ -22,6 +22,7 @@ pub(in crate::imap) struct WriteFixture {
     pub refuse: Option<String>,
     /// Run the hook when the next `SELECT` arrives, then answer it with NO.
     pub before_refusing_select: Option<Box<dyn FnOnce() + Send>>,
+    pub refuse_select_mailbox: Option<String>,
     /// Answer `UID SEARCH HEADER Message-ID` with NO.
     pub refuse_search: bool,
     /// Return this many tagged-OK empty HEADER searches before finding the copy.
@@ -49,6 +50,7 @@ pub(in crate::imap) struct WriteFixture {
     pub modified_no: bool,
     pub omit_store_modseq: bool,
     pub omit_fetch_flags: bool,
+    pub refuse_fetch_flags: bool,
     pub nomodseq: bool,
 }
 
@@ -77,16 +79,21 @@ pub(super) fn handle(
 ) -> bool {
     let reply = match verb {
         "SELECT" => {
-            let (hook, nomodseq, read_only) = {
+            let mailbox = mailbox_name(rest);
+            let (hook, nomodseq, read_only, refused) = {
                 let mut writes = writes.lock().expect("writes");
                 (
                     writes.before_refusing_select.take(),
                     writes.nomodseq,
-                    writes.read_only_mailbox.as_deref() == Some(mailbox_name(rest).as_str()),
+                    writes.read_only_mailbox.as_deref() == Some(mailbox.as_str()),
+                    writes.refuse_select_mailbox.as_deref() == Some(mailbox.as_str()),
                 )
             };
+            let refused = refused || hook.is_some();
             if let Some(hook) = hook {
                 hook();
+            }
+            if refused {
                 format!("{tag} NO SELECT refused\r\n")
             } else {
                 select(
@@ -316,6 +323,9 @@ fn select(tag: &str, rest: &str, state: &TestState, nomodseq: bool, read_only: b
 }
 
 fn fetch_flag(tag: &str, args: &str, state: &TestState, writes: &WriteFixture) -> String {
+    if writes.refuse_fetch_flags {
+        return format!("{tag} NO UID FETCH refused\r\n");
+    }
     let uid = args
         .split_ascii_whitespace()
         .next()

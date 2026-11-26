@@ -835,7 +835,7 @@ impl Session {
         Ok(())
     }
 
-    fn has_cap(&self, name: &str) -> bool {
+    pub(super) fn has_cap(&self, name: &str) -> bool {
         self.caps.iter().any(|cap| cap.eq_ignore_ascii_case(name))
     }
 

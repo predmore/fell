@@ -561,11 +561,9 @@ impl Inbox {
         removal: Removal,
         cx: &mut Context<Self>,
     ) {
-        let Some(scopes) = self
-            .session
-            .search_scopes(&ids)
-            .filter(|scopes| removal != Removal::Purge || scopes.len() == ids.len())
-        else {
+        let Some(scopes) = self.session.search_scopes(&ids).filter(|scopes| {
+            !matches!(removal, Removal::Purge { .. }) || scopes.len() == ids.len()
+        }) else {
             self.session
                 .show_toast("No folder for a selected match", true);
             return;
@@ -581,8 +579,8 @@ impl Inbox {
                 Removal::Archive => store.archive_scoped_threads(&account, &scopes),
                 Removal::Delete => store.delete_scoped_threads(&account, &scopes),
                 Removal::Spam => store.spam_scoped_threads(&account, &scopes),
-                Removal::Purge => store
-                    .purge_scoped_threads(&account, &scopes)
+                Removal::Purge { server_expunge } => store
+                    .purge_confirmed_scoped_threads(&account, &scopes, server_expunge)
                     .map(|action| (action, scopes.len())),
             },
             move |inbox, result, _| match result {
@@ -607,7 +605,7 @@ impl Inbox {
                         }
                         Removal::Spam if count == 1 => "Spam status updated".to_owned(),
                         Removal::Spam => format!("Updated spam status for {count} conversations"),
-                        Removal::Purge => "Removed from Fell".to_owned(),
+                        Removal::Purge { .. } => "Removed from Fell".to_owned(),
                     };
                     inbox.session.show_toast(done, false);
                     inbox.send_to_server();

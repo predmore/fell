@@ -96,10 +96,10 @@ impl WriteSession {
         &mut self,
         entry: &OutboxEntry,
     ) -> Result<(), WriteError> {
-        let Some(uid) = entry.uid.filter(|uid| {
-            *uid != 0 && matches!(entry.kind, OutboxKind::Expunge | OutboxKind::UnflagTrash)
-        }) else {
-            return Err(WriteError::Refused("expected a recorded Trash UID".into()));
+        let Some(uid) = entry.uid.filter(|uid| *uid != 0 && entry.owns_trash_mark()) else {
+            return Err(WriteError::Refused(
+                "expected a recorded Trash delete mark".into(),
+            ));
         };
         self.store_one_flag(uid, "\\Deleted", false)
     }

@@ -167,6 +167,8 @@ pub struct MailboxDelta {
     /// Each role's folder, when this pass listed the server's mailboxes.
     /// Replaces the account's stored roles.
     pub roles: Option<crate::folders::FolderRoles>,
+    /// Whether the latest IMAP session advertised UIDPLUS.
+    pub uidplus: Option<bool>,
     /// How far a first sync of one folder has come, while one runs.
     pub progress: Option<SyncProgress>,
     /// Messages whose body sync read and did not keep, because it is
@@ -647,6 +649,9 @@ fn collect_imap(
             }
             if delta.roles.is_some() {
                 combined.roles = delta.roles;
+            }
+            if delta.uidplus.is_some() {
+                combined.uidplus = delta.uidplus;
             }
             Ok(())
         },

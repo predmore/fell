@@ -536,7 +536,15 @@ fn write_back_notice(
         return "Read/star sync delayed. Retrying".to_string();
     };
     let is_expunge = |write: &DroppedWrite| write.kind == OutboxKind::Expunge;
-    if let Some(expunge) = dropped.iter().find(|write| is_expunge(write)) {
+    if let Some(expunge) = dropped
+        .iter()
+        .filter(|write| is_expunge(write))
+        .min_by_key(|write| match write.reason {
+            DropReason::TrashMarkNotCleared => 0,
+            DropReason::TrashCopyUnconfirmed => 1,
+            _ => 2,
+        })
+    {
         let other: Vec<_> = dropped
             .iter()
             .filter(|write| !is_expunge(write))
@@ -546,6 +554,10 @@ fn write_back_notice(
             DropReason::NoUidPlus => "This server can't delete from Trash. Deletion stays in Fell",
             DropReason::FolderReset => "Trash was reset on the server. Deletion stayed in Fell",
             DropReason::ServerCopyKept => "Deletion stayed in Fell. The server kept the copy",
+            DropReason::TrashCopyUnconfirmed => {
+                "Deletion stayed in Fell. The server may have kept a copy in Trash"
+            }
+            DropReason::TrashMarkNotCleared => "Fell couldn't clear its delete mark on the server",
             _ => "Deletion from Trash failed to sync",
         };
         if other.is_empty() && !flag_recovery_delayed {
@@ -661,7 +673,10 @@ fn not_sent_detail(session: &Session, write: &DroppedWrite, count: usize) -> Str
         DropReason::Refused => format!("The server refused to move {messages}"),
         DropReason::NotFound => format!("{messages} not found in {folder} on the server"),
         DropReason::NoMove => "This server can't move mail; archive stays in Fell".to_string(),
-        DropReason::NoUidPlus | DropReason::ServerCopyKept => {
+        DropReason::NoUidPlus
+        | DropReason::ServerCopyKept
+        | DropReason::TrashCopyUnconfirmed
+        | DropReason::TrashMarkNotCleared => {
             unreachable!("handled with the Trash expunge notices")
         }
         DropReason::Abandoned => format!("{messages} left half moved in {folder} on the server"),
@@ -1481,6 +1496,11 @@ impl Inbox {
                                     },
                                     cx,
                                 );
+                                return;
+                            }
+                            SyncEvent::TrashExpungeAvailability(available) => {
+                                inbox.session.set_trash_expunge_available(available);
+                                cx.notify();
                                 return;
                             }
                         };
@@ -3495,8 +3515,8 @@ impl Inbox {
                         let done_text = match removal {
                             Removal::Archive => archived_notice(count, ids.len()),
                             Removal::Delete | Removal::Spam => moved_notice(count, &destination),
-                            Removal::Purge if count == 1 => "Removed from Fell".to_owned(),
-                            Removal::Purge => format!("Removed {count} from Fell"),
+                            Removal::Purge { .. } if count == 1 => "Removed from Fell".to_owned(),
+                            Removal::Purge { .. } => format!("Removed {count} from Fell"),
                         };
                         inbox.session.show_toast(done_text, false);
                         inbox.send_to_server();
@@ -4731,9 +4751,9 @@ impl Inbox {
             self.remove_threads(ids, Removal::Spam, cx);
         }
         if step.purge
-            && let Some(ids) = self.session.take_purge()
+            && let Some((ids, server_expunge)) = self.session.take_purge()
         {
-            self.remove_threads(ids, Removal::Purge, cx);
+            self.remove_threads(ids, Removal::Purge { server_expunge }, cx);
         }
         if let Some(file) = step.open_diagnostic {
             self.open_diagnostic(file, cx);
@@ -12809,7 +12829,7 @@ enum Removal {
     /// To Spam, or from Spam to the inbox.
     Spam,
     /// Out of Trash for good.
-    Purge,
+    Purge { server_expunge: bool },
 }
 
 impl Removal {
@@ -12820,9 +12840,9 @@ impl Removal {
         threads: Vec<ThreadId>,
         folder: String,
     ) -> fell_core::Result<usize> {
-        if self == Self::Purge {
+        if let Self::Purge { server_expunge } = self {
             return store
-                .purge_threads_counted(account, &threads, &folder)
+                .purge_confirmed_threads(account, &threads, &folder, server_expunge)
                 .map(|(_, count)| count);
         }
         let scopes: Vec<_> = threads.into_iter().map(|id| (id, folder.clone())).collect();
@@ -12830,7 +12850,7 @@ impl Removal {
             Self::Archive => store.archive_scoped_threads(account, &scopes),
             Self::Delete => store.delete_scoped_threads(account, &scopes),
             Self::Spam => store.spam_scoped_threads(account, &scopes),
-            Self::Purge => unreachable!(),
+            Self::Purge { .. } => unreachable!(),
         }
         .map(|(_, count)| count)
     }
@@ -15221,9 +15241,25 @@ mod tests {
             target_folder: String::new(),
         };
         assert_eq!(
-            write_back_notice(&session, &[kept], false),
+            write_back_notice(&session, std::slice::from_ref(&kept), false),
             "Deletion stayed in Fell. The server kept the copy"
         );
+        for (reason, notice) in [
+            (
+                DropReason::TrashCopyUnconfirmed,
+                "Deletion stayed in Fell. The server may have kept a copy in Trash",
+            ),
+            (
+                DropReason::TrashMarkNotCleared,
+                "Fell couldn't clear its delete mark on the server",
+            ),
+        ] {
+            let dropped = DroppedWrite {
+                reason,
+                ..kept.clone()
+            };
+            assert_eq!(write_back_notice(&session, &[dropped], false), notice);
+        }
     }
 
     #[test]

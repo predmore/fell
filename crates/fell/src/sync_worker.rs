@@ -62,6 +62,8 @@ pub enum SyncEvent {
     SendsConfirmed(Vec<String>),
     /// A conflict during replay changed a local flag.
     FlagsChanged,
+    /// The permanent-delete confirmation may need to change.
+    TrashExpungeAvailability(bool),
     /// Write-back problems to show together in one notice.
     WriteBackNotice {
         dropped: Vec<DroppedWrite>,
@@ -234,6 +236,20 @@ fn run(
     let mut idle = true;
     let mut reply_to = ReplyToBackfill::default();
     let mut snippets_repaired = false;
+    let mut previous_trash_expunge = None;
+    let mut refresh_trash_confirmation = || {
+        if !config.write_back {
+            return true;
+        }
+        let available = store.trash_expunge_available(&account.id).unwrap_or(false);
+        previous_trash_expunge.replace(available) == Some(available)
+            || events
+                .unbounded_send(SyncEvent::TrashExpungeAvailability(available))
+                .is_ok()
+    };
+    if !refresh_trash_confirmation() {
+        return;
+    }
     loop {
         // Replay writes before the read-only pass, so it sees their results.
         // A failure here is a connection problem the pass reports.
@@ -264,6 +280,9 @@ fn run(
                 return;
             }
         }
+        if !refresh_trash_confirmation() {
+            return;
+        }
         diagnostic!(DEBUG, "Sync pass started", write_back = config.write_back);
         let mut alive = true;
         let mut progress = PassProgress::default();
@@ -293,7 +312,7 @@ fn run(
                         let _ = store.checkpoint(false);
                     }
                     if let Some(status) = progress.update(report, Instant::now()) {
-                        alive &= send(status);
+                        alive &= refresh_trash_confirmation() && send(status);
                     }
                 },
                 notifications.map(|_| &mut on_arrivals as &mut dyn FnMut(_)),
@@ -302,7 +321,7 @@ fn run(
         if let Some(queue) = notifications {
             queue.pass_ended();
         }
-        if !alive {
+        if !alive || !refresh_trash_confirmation() {
             return;
         }
         // Fold the log back into the file between passes so readers stay fast.

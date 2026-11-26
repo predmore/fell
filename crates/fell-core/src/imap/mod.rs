@@ -297,6 +297,7 @@ pub(crate) fn fetch_imap(
     // first pass is still reading mail.
     persist(MailboxDelta {
         roles: Some(roles.clone()),
+        uidplus: Some(session.has_cap("UIDPLUS")),
         views: Some(views.values().cloned().collect()),
         removals: if keywords {
             Vec::new()
@@ -1995,6 +1996,7 @@ fn progress_delta(
         removals,
         settle: Settle::Later,
         roles: None,
+        uidplus: None,
         progress: None,
         too_large: Vec::new(),
         links: Vec::new(),

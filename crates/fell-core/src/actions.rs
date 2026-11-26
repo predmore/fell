@@ -719,6 +719,32 @@ impl Store {
         threads: &[ThreadId],
         trash_folder: &str,
     ) -> Result<(LocalAction, usize)> {
+        self.purge_threads_with_confirmation(account_id, threads, trash_folder, None)
+    }
+
+    /// Purge after confirming whether the server copy will be kept.
+    pub fn purge_confirmed_threads(
+        &self,
+        account_id: &AccountId,
+        threads: &[ThreadId],
+        trash_folder: &str,
+        server_expunge: bool,
+    ) -> Result<(LocalAction, usize)> {
+        self.purge_threads_with_confirmation(
+            account_id,
+            threads,
+            trash_folder,
+            Some(server_expunge),
+        )
+    }
+
+    fn purge_threads_with_confirmation(
+        &self,
+        account_id: &AccountId,
+        threads: &[ThreadId],
+        trash_folder: &str,
+        server_expunge: Option<bool>,
+    ) -> Result<(LocalAction, usize)> {
         let trash_folder = canonical_folder(trash_folder)?;
         let roles = self.folder_roles(account_id)?;
         if !roles.is(FolderRole::Trash, &trash_folder) {
@@ -729,6 +755,7 @@ impl Store {
         let mut count = 0;
         let action =
             self.apply_threads(account_id, threads, ActionKind::Purge, None, |_, rows| {
+                self.check_purge_confirmation(account_id, server_expunge)?;
                 let plans = plan_expunge(rows, &trash_folder);
                 if plans.is_empty() {
                     return Err(Error::Action(format!("no messages in {trash_folder}")));
@@ -751,9 +778,29 @@ impl Store {
         account: &AccountId,
         targets: &[(ThreadId, String)],
     ) -> Result<LocalAction> {
+        self.purge_scoped_threads_with_confirmation(account, targets, None)
+    }
+
+    /// Purge scoped search results after confirming the server behavior.
+    pub fn purge_confirmed_scoped_threads(
+        &self,
+        account: &AccountId,
+        targets: &[(ThreadId, String)],
+        server_expunge: bool,
+    ) -> Result<LocalAction> {
+        self.purge_scoped_threads_with_confirmation(account, targets, Some(server_expunge))
+    }
+
+    fn purge_scoped_threads_with_confirmation(
+        &self,
+        account: &AccountId,
+        targets: &[(ThreadId, String)],
+        server_expunge: Option<bool>,
+    ) -> Result<LocalAction> {
         self.require_account(account)?;
         let tx = crate::store::immediate_transaction(self.connection())?;
         ensure_action_schema(&tx)?;
+        self.check_purge_confirmation(account, server_expunge)?;
         let roles = self.folder_roles(account)?;
         let mut plans = Vec::new();
         let mut seen = HashSet::new();
@@ -781,6 +828,18 @@ impl Store {
         let action = record_and_apply(&tx, account, ActionKind::Purge, &summary, &plans)?;
         tx.commit()?;
         Ok(action)
+    }
+
+    // Check in the same write transaction that queues the expunge.
+    fn check_purge_confirmation(&self, account: &AccountId, expected: Option<bool>) -> Result<()> {
+        if let Some(expected) = expected
+            && self.trash_expunge_available(account)? != expected
+        {
+            return Err(Error::Action(
+                "Server deletion availability changed. Confirm again".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Discard local drafts together as one undoable action. The row and

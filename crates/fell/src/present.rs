@@ -2041,6 +2041,9 @@ mod tests {
         let prompt = "Delete from Trash for good?  ·  20 marked  ·  No undo  ·  y";
         let fitted = fit_notice(prompt, 34.0, |text| text.chars().count() as f32);
         assert_eq!(fitted, "Delete from Trash for good?  ·  y");
+        let local = "Server copy stays. Remove here?  ·  20 marked  ·  No undo  ·  y";
+        let fitted = fit_notice(local, 37.0, |text| text.chars().count() as f32);
+        assert_eq!(fitted, "Server copy stays. Remove here?  ·  y");
     }
 
     #[test]

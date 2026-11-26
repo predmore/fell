@@ -225,6 +225,7 @@ struct PurgePrompt {
     ids: Vec<String>,
     folder: String,
     notice: u64,
+    server_expunge: bool,
 }
 
 /// Rows the list wants from the store beyond the ones it holds. The view
@@ -491,6 +492,7 @@ pub struct Session {
     pub labels: Vec<String>,
     /// Which folder is Sent, Drafts, Archive and the rest on this account.
     pub roles: FolderRoles,
+    trash_expunge_available: bool,
     /// The loaded part of the folder list: a run of rows in list order.
     pub threads: Vec<ThreadRow>,
     /// The folder has rows above `threads` that are not loaded.
@@ -579,7 +581,7 @@ pub struct Session {
     /// withdraws it, so `y` never answers a question no longer on screen.
     confirm_purge: Option<PurgePrompt>,
     /// The threads `y` confirmed, consumed when the view deletes them.
-    purge_ready: Option<Vec<String>>,
+    purge_ready: Option<(Vec<String>, bool)>,
     /// The folder on screen has not been read from the store yet.
     pub loading: bool,
     /// How long a thread stays open before it is marked read. 0 marks it on
@@ -610,6 +612,7 @@ impl Session {
             list_label: None,
             folders: Vec::new(),
             roles: FolderRoles::default(),
+            trash_expunge_available: false,
             threads: Vec::new(),
             more_before: false,
             more_after: false,
@@ -1325,9 +1328,16 @@ impl Session {
         (ids, drafts)
     }
 
-    /// The threads `y` confirmed for a permanent delete, once.
-    pub fn take_purge(&mut self) -> Option<Vec<String>> {
+    /// The threads and server behavior `y` confirmed, once.
+    pub fn take_purge(&mut self) -> Option<(Vec<String>, bool)> {
         self.purge_ready.take()
+    }
+
+    pub fn set_trash_expunge_available(&mut self, available: bool) {
+        if self.trash_expunge_available != available {
+            self.trash_expunge_available = available;
+            self.withdraw_purge();
+        }
     }
 
     fn withdraw_purge(&mut self) {
@@ -2092,7 +2102,7 @@ impl Session {
             match key {
                 KeyId::Char('y') => {
                     self.count.clear();
-                    self.purge_ready = Some(prompt.ids);
+                    self.purge_ready = Some((prompt.ids, prompt.server_expunge));
                     return Step {
                         purge: true,
                         ..Step::default()
@@ -3039,16 +3049,20 @@ impl Session {
                     ),
                     ids => format!("{} marked", ids.len()),
                 };
+                let question = if self.trash_expunge_available {
+                    "Delete from Trash for good?"
+                } else {
+                    "Server copy stays. Remove here?"
+                };
                 self.show_toast(
-                    format!(
-                        "Delete from Trash for good?{NOTICE_DOT}{target}{NOTICE_DOT}No undo{NOTICE_DOT}y"
-                    ),
+                    format!("{question}{NOTICE_DOT}{target}{NOTICE_DOT}No undo{NOTICE_DOT}y"),
                     true,
                 );
                 self.confirm_purge = Some(PurgePrompt {
                     ids: targets,
                     folder: self.folder.clone(),
                     notice: self.toast_generation,
+                    server_expunge: self.trash_expunge_available,
                 });
             }
             Action::SplitThread => {
@@ -5337,7 +5351,7 @@ mod tests {
         assert!(!step.delete && !step.purge, "nothing happens before y");
         assert_eq!(
             session.toast.as_ref().map(|toast| toast.text.as_str()),
-            Some("Delete from Trash for good?  ·  “a”  ·  No undo  ·  y")
+            Some("Server copy stays. Remove here?  ·  “a”  ·  No undo  ·  y")
         );
         assert!(session.toast.as_ref().unwrap().alert);
         assert_eq!(session.highlighted(), HashSet::from(["a".to_string()]));
@@ -5345,18 +5359,21 @@ mod tests {
         session.clear_toast();
         let step = session.on_key(KeyId::Char('y'), 4);
         assert!(step.purge && !step.delete);
-        assert_eq!(session.take_purge(), Some(vec!["a".into()]));
+        assert_eq!(session.take_purge(), Some((vec!["a".into()], false)));
         assert_eq!(session.take_purge(), None);
         // `y` again answers nothing.
         assert!(!session.on_key(KeyId::Char('y'), 4).purge);
 
         // Another picked row changes the count. An unpicked cursor does not.
         session.picked.insert("c".into(), String::new());
+        session.set_trash_expunge_available(true);
         session.on_key(KeyId::Char('#'), 4);
         assert_eq!(
             session.toast.as_ref().map(|toast| toast.text.as_str()),
             Some("Delete from Trash for good?  ·  2 marked  ·  No undo  ·  y")
         );
+        session.set_trash_expunge_available(false);
+        assert!(!session.on_key(KeyId::Char('y'), 4).purge);
     }
 
     #[test]
