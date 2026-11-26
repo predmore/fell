@@ -1187,6 +1187,13 @@ mod tests {
 
     #[test]
     fn connection_edit_keeps_a_working_key_across_publication() {
+        // This test holds the account-directory flock in-process. A sibling
+        // test that spawns a child between fork and exec shares that open
+        // file description, so the lock outlives our drop and the next
+        // non-blocking `try_lock` fails. Run alone so no sibling can fork.
+        if fell_core::test_support::in_isolated_process().is_none() {
+            return;
+        }
         use std::cell::{Cell, RefCell};
         use std::collections::HashMap;
         use std::os::unix::fs::PermissionsExt;
