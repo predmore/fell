@@ -69,6 +69,7 @@ pub(super) fn replay_with(
     config: &ImapConfig,
     account_id: &AccountId,
     store: &Store,
+    write_back: bool,
     append_sent: bool,
     before_send: &dyn Fn(),
 ) -> crate::Result<ReplayReport> {
@@ -77,7 +78,7 @@ pub(super) fn replay_with(
     if guard.is_none() && store.db_path().is_some() {
         return Ok(ReplayReport::default());
     }
-    let mut entries = outbox::unfinished(store, account_id)?;
+    let mut entries = outbox::unfinished(store, account_id, write_back)?;
     if !append_sent {
         entries.retain(|entry| entry.kind != OutboxKind::AppendSent);
     }
@@ -110,7 +111,10 @@ pub(super) fn replay_with(
             let result = pass.run(&mut session);
             if !matches!(
                 &result,
-                Err(Stop::Connection(_) | Stop::AppendCheckDisconnected(_))
+                Err(Stop::Connection(_)
+                    | Stop::Store(_)
+                    | Stop::AppendCheckDisconnected(_)
+                    | Stop::TrashCleanupRefused(_))
             ) {
                 session.logout();
             }
@@ -160,6 +164,7 @@ pub(super) fn replay_with(
         ) => {
             report.interrupted = Some(err.to_string());
         }
+        Err(Stop::TrashCleanupRefused(message)) => report.interrupted = Some(message),
         // Write-back was turned off by another process mid-pass.
         Err(Stop::Stale) => {}
     }
@@ -174,6 +179,7 @@ enum Stop {
     AppendRefused(String),
     DraftCleanupRefused(String),
     DraftCleanupDisconnected(Error),
+    TrashCleanupRefused(String),
     AppendCheck(String),
     AppendCheckDisconnected(Error),
     /// The row is no longer in this write-back generation: send nothing more.
@@ -281,8 +287,10 @@ impl Pass<'_> {
                         self.replay_append(session, index)?;
                     }
                 }
-                OutboxKind::Expunge if !has_uidplus && entry.retry_unix <= self.now => {
-                    self.drop_row(index, DropReason::NoUidPlus, "server has no UIDPLUS")?;
+                OutboxKind::UnflagTrash => {
+                    if entry.retry_unix <= self.now {
+                        self.replay_trash_cleanup(session, index)?;
+                    }
                 }
                 _ if matches!(held_move, Some(MoveHold::EarlierMove)) => {}
                 OutboxKind::Expunge => {
@@ -309,11 +317,10 @@ impl Pass<'_> {
 
     fn replay_expunge(&mut self, session: &mut WriteSession, index: usize) -> Result<(), Stop> {
         let entry = &self.entries[index];
-        let (Some(mailbox), Some(validity), Some(uid)) =
-            (&entry.source_mailbox, entry.uidvalidity, entry.uid)
-        else {
-            return Err(Error::Action("invalid Trash expunge in outbox".into()).into());
-        };
+        let (mailbox, validity, uid) = trash_copy(entry)?;
+        if !session.has_uidplus() && !entry.sent {
+            return self.drop_row(index, DropReason::NoUidPlus, "server has no UIDPLUS");
+        }
         if self.store_unconfirmed(mailbox, validity, uid) {
             return Ok(());
         }
@@ -321,26 +328,39 @@ impl Pass<'_> {
             Ok(current) if current != validity => {
                 return self.drop_row(index, DropReason::FolderReset, "UIDVALIDITY changed");
             }
+            Err(message) if entry.sent => return Err(self.trash_cleanup_refused(index, message)?),
             Err(message) => return self.retry(index, DropReason::Refused, &message),
             Ok(_) => {}
+        }
+        if !session.has_uidplus() {
+            if self.clear_trash_mark(session, index, true)? {
+                return self.drop_row(index, DropReason::NoUidPlus, "server has no UIDPLUS");
+            }
+            return self.finish_expunge(index);
         }
         let mut expunge = session
             .trash_expunge(entry)
             .ok_or_else(|| Error::Action("invalid Trash expunge in write session".into()))?;
         let mark_sent = || {
             (self.before_send)();
-            if outbox::mark_expunge_sent(self.store, self.account_id, entry)? {
-                Ok(())
-            } else {
-                Err(Stop::Stale)
-            }
+            outbox::mark_expunge_sent(self.store, self.account_id, entry)
         };
         // After a lost reply either the UID is gone or it can still be
         // flagged and expunged. Repeating both commands is safe.
-        mark_sent()?;
+        if !mark_sent()? {
+            if entry.sent {
+                self.replay_trash_cleanup(session, index)?;
+            }
+            return Err(Stop::Stale);
+        }
+        let mut may_be_marked = entry.sent;
         let result = match expunge.mark_deleted() {
             Ok(()) => {
-                mark_sent()?;
+                may_be_marked = true;
+                if !mark_sent()? {
+                    self.replay_trash_cleanup(session, index)?;
+                    return Err(Stop::Stale);
+                }
                 expunge.expunge()
             }
             Err(error) => Err(error),
@@ -353,24 +373,79 @@ impl Pass<'_> {
                 match session.search_uid_range(uid, uid, 1) {
                     Ok(uids) if uids.is_empty() => {}
                     Err(WriteError::Connection(error)) => return Err(Stop::Connection(error)),
-                    _ => return self.retry(index, DropReason::Refused, &message),
+                    _ => {
+                        if may_be_marked {
+                            self.clear_trash_mark(session, index, false)?;
+                        }
+                        return self.retry_as(index, DropReason::Refused, &message, true);
+                    }
                 }
             }
         }
-        match outbox::settle(
-            self.store,
-            self.account_id,
-            entry,
-            Some((mailbox, validity, uid)),
-            None,
-            Outcome::Expunged,
-        )? {
-            Settled::Recorded => self.report.sent += 1,
-            Settled::Stale => return Err(Stop::Stale),
-            Settled::Retired | Settled::Recovering => {}
+        self.finish_expunge(index)
+    }
+
+    fn finish_expunge(&mut self, index: usize) -> Result<(), Stop> {
+        if outbox::finish_expunge(self.store, self.account_id, &self.entries[index])? {
+            self.report.sent += 1;
         }
         self.settled[index] = true;
         Ok(())
+    }
+
+    fn replay_trash_cleanup(
+        &mut self,
+        session: &mut WriteSession,
+        index: usize,
+    ) -> Result<(), Stop> {
+        let entry = &self.entries[index];
+        let (mailbox, validity, _) = trash_copy(entry)?;
+        let kept = match self.select(session, mailbox)? {
+            Ok(current) if current == validity => self.clear_trash_mark(session, index, true)?,
+            Ok(_) => {
+                self.note_drop(index, DropReason::FolderReset);
+                false
+            }
+            Err(message) => return Err(self.trash_cleanup_refused(index, message)?),
+        };
+        outbox::finish_trash_cleanup(self.store, entry.id, kept)?;
+        self.settled[index] = true;
+        Ok(())
+    }
+
+    /// Returns whether the copy is still present when cleanup is the last write.
+    fn clear_trash_mark(
+        &mut self,
+        session: &mut WriteSession,
+        index: usize,
+        check_presence: bool,
+    ) -> Result<bool, Stop> {
+        let entry = &self.entries[index];
+        let (_, _, uid) = trash_copy(entry)?;
+        let refused = match session.clear_trash_deleted(entry) {
+            Ok(()) if !check_presence => return Ok(true),
+            Ok(()) => None,
+            Err(WriteError::Refused(message)) => Some(message),
+            Err(WriteError::Connection(error)) => return Err(Stop::Connection(error)),
+        };
+        match session.search_uid_range(uid, uid, 1) {
+            Ok(uids) if uids.is_empty() => Ok(false),
+            Err(WriteError::Connection(error)) => Err(Stop::Connection(error)),
+            _ => match refused {
+                Some(message) => Err(self.trash_cleanup_refused(index, message)?),
+                None => Ok(true),
+            },
+        }
+    }
+
+    fn trash_cleanup_refused(&self, index: usize, message: String) -> crate::Result<Stop> {
+        // A mark may still be on the server. Keep the row and skip LOGOUT.
+        outbox::defer_trash_cleanup(
+            self.store,
+            self.entries[index].id,
+            self.now + BACKOFF_SECS[0],
+        )?;
+        Ok(Stop::TrashCleanupRefused(message))
     }
 
     fn replay_append(&mut self, session: &mut WriteSession, index: usize) -> Result<(), Stop> {
@@ -1303,7 +1378,13 @@ impl Pass<'_> {
         // Keep confirmed COPYUIDs even if a lookup for another row disconnects.
         for (&(row, uid), &placed) in batch.iter().zip(&placements) {
             if let Some(placed) = placed {
-                self.finish_move(row, (source, uidvalidity, uid), target, placed)?;
+                self.finish_move(
+                    row,
+                    (source, uidvalidity, uid),
+                    target,
+                    placed,
+                    session.has_uidplus(),
+                )?;
             }
         }
         for (at, &(row, uid)) in batch.iter().enumerate() {
@@ -1358,7 +1439,13 @@ impl Pass<'_> {
         match outcome {
             Ok(Transfer::Placed(placed)) => {
                 if let (Some((source, (validity, uid))), Some((target, _))) = (source, target) {
-                    self.finish_move(row, (source, validity, uid), target, placed)?;
+                    self.finish_move(
+                        row,
+                        (source, validity, uid),
+                        target,
+                        placed,
+                        session.has_uidplus(),
+                    )?;
                 }
                 return Ok(Some(placed));
             }
@@ -1443,6 +1530,7 @@ impl Pass<'_> {
         source: (&str, u32, u32),
         target: &str,
         placed: (u32, u32),
+        uidplus: bool,
     ) -> Result<(), Stop> {
         match outbox::settle(
             self.store,
@@ -1450,7 +1538,7 @@ impl Pass<'_> {
             &self.entries[row],
             Some(source),
             Some(target),
-            Outcome::Done { placed },
+            Outcome::Done { placed, uidplus },
         )? {
             Settled::Recorded => self.report.sent += 1,
             Settled::Stale => return Err(Stop::Stale),
@@ -1772,7 +1860,11 @@ impl Pass<'_> {
     fn note_drop(&mut self, index: usize, reason: DropReason) {
         let entry = &self.entries[index];
         self.report.dropped.push(DroppedWrite {
-            kind: entry.kind,
+            kind: if entry.kind == OutboxKind::UnflagTrash {
+                OutboxKind::Expunge
+            } else {
+                entry.kind
+            },
             source_folder: entry.source_folder.clone(),
             target_folder: entry.target_folder.clone(),
             reason,
@@ -1804,6 +1896,19 @@ impl Pass<'_> {
                 .insert(entry.message_id.clone(), MoveHold::EarlierMove);
         }
         Ok(settled)
+    }
+}
+
+fn trash_copy(entry: &OutboxEntry) -> crate::Result<(&str, u32, u32)> {
+    match (
+        entry.source_mailbox.as_deref(),
+        entry.uidvalidity,
+        entry.uid,
+    ) {
+        (Some(mailbox), Some(validity), Some(uid)) if validity != 0 && uid != 0 => {
+            Ok((mailbox, validity, uid))
+        }
+        _ => Err(Error::Action("invalid Trash copy in outbox".into())),
     }
 }
 

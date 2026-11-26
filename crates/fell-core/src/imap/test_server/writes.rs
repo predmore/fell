@@ -41,6 +41,8 @@ pub(in crate::imap) struct WriteFixture {
     /// connection before any reply.
     pub lose_reply_to: Option<&'static str>,
     pub lose_before_store: bool,
+    pub lose_before_expunge: bool,
+    pub refuse_expunge: bool,
     pub before_store: Option<Box<dyn FnOnce() + Send>>,
     pub refuse_store_uid: Option<u32>,
     pub read_only_mailbox: Option<String>,
@@ -188,6 +190,11 @@ pub(super) fn handle(
             } else if let Some(args) = strip_prefix_ignore(rest, "EXPUNGE ") {
                 if !selected_write || !writes.uidplus {
                     format!("{tag} BAD UID EXPUNGE unavailable\r\n")
+                } else if std::mem::take(&mut writes.lose_before_expunge) {
+                    let _ = out.stream.shutdown(std::net::Shutdown::Both);
+                    return true;
+                } else if writes.refuse_expunge {
+                    format!("{tag} NO UID EXPUNGE refused\r\n")
                 } else {
                     expunge_uid(tag, args, &mut state)
                 }

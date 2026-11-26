@@ -176,9 +176,10 @@ pub(crate) fn replay_outbox(
     config: &ImapConfig,
     account_id: &AccountId,
     store: &crate::store::Store,
+    write_back: bool,
     append_sent: bool,
 ) -> Result<crate::outbox::ReplayReport, Error> {
-    write_back::replay_with(config, account_id, store, append_sent, &|| {})
+    write_back::replay_with(config, account_id, store, write_back, append_sent, &|| {})
 }
 
 /// Log in, count selectable mailboxes, and log out. Reads no mail.

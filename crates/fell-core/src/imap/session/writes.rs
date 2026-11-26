@@ -92,6 +92,18 @@ impl WriteSession {
             .then_some(TrashExpunge { session: self, uid })
     }
 
+    pub(in crate::imap) fn clear_trash_deleted(
+        &mut self,
+        entry: &OutboxEntry,
+    ) -> Result<(), WriteError> {
+        let Some(uid) = entry.uid.filter(|uid| {
+            *uid != 0 && matches!(entry.kind, OutboxKind::Expunge | OutboxKind::UnflagTrash)
+        }) else {
+            return Err(WriteError::Refused("expected a recorded Trash UID".into()));
+        };
+        self.store_one_flag(uid, "\\Deleted", false)
+    }
+
     pub(in crate::imap) fn gmail_labels(&self) -> bool {
         self.session.has_cap("X-GM-EXT-1")
     }

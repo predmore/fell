@@ -545,6 +545,7 @@ fn write_back_notice(
         let notice = match expunge.reason {
             DropReason::NoUidPlus => "This server can't delete from Trash. Deletion stays in Fell",
             DropReason::FolderReset => "Trash was reset on the server. Deletion stayed in Fell",
+            DropReason::ServerCopyKept => "Deletion stayed in Fell. The server kept the copy",
             _ => "Deletion from Trash failed to sync",
         };
         if other.is_empty() && !flag_recovery_delayed {
@@ -660,7 +661,9 @@ fn not_sent_detail(session: &Session, write: &DroppedWrite, count: usize) -> Str
         DropReason::Refused => format!("The server refused to move {messages}"),
         DropReason::NotFound => format!("{messages} not found in {folder} on the server"),
         DropReason::NoMove => "This server can't move mail; archive stays in Fell".to_string(),
-        DropReason::NoUidPlus => unreachable!("handled with the Trash expunge notices"),
+        DropReason::NoUidPlus | DropReason::ServerCopyKept => {
+            unreachable!("handled with the Trash expunge notices")
+        }
         DropReason::Abandoned => format!("{messages} left half moved in {folder} on the server"),
         DropReason::UnconfirmedMove
         | DropReason::MoveRestored
@@ -15210,6 +15213,16 @@ mod tests {
         assert_eq!(
             write_back_notice(&session, &[expunge.clone(), expunge], false),
             "This server can't delete from Trash. Deletion stays in Fell"
+        );
+        let kept = DroppedWrite {
+            reason: DropReason::ServerCopyKept,
+            kind: OutboxKind::Expunge,
+            source_folder: "Trash".into(),
+            target_folder: String::new(),
+        };
+        assert_eq!(
+            write_back_notice(&session, &[kept], false),
+            "Deletion stayed in Fell. The server kept the copy"
         );
     }
 

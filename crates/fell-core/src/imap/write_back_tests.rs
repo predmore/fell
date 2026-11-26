@@ -153,7 +153,14 @@ impl Fixture {
     }
 
     fn replay(&self) -> crate::outbox::ReplayReport {
-        replay_outbox(&self.backend.config, &self.account.id, &self.store, true).unwrap()
+        replay_outbox(
+            &self.backend.config,
+            &self.account.id,
+            &self.store,
+            true,
+            true,
+        )
+        .unwrap()
     }
 
     fn account_config(&self) -> crate::AccountConfig {
@@ -1001,7 +1008,7 @@ fn early_keyword_edit_replays_and_undoes_for_every_copy_in_order() {
     assert_eq!(outbox.len(), 1);
     assert_eq!(outbox[0].uid, None);
 
-    let replay = || replay_outbox(&fx.backend.config, account, &store, false).unwrap();
+    let replay = || replay_outbox(&fx.backend.config, account, &store, true, false).unwrap();
     assert_eq!(replay().waiting, 1);
     server_has_label(false);
     sync_once(&fx.account, &fx.backend, &store).unwrap();
@@ -1096,7 +1103,7 @@ fn bridge_labels_create_copy_and_remove_only_the_label_copy() {
     let action = store
         .label_threads(&account.id, &threads, crate::LabelChange::Add(label.into()))
         .unwrap();
-    let replay = || replay_outbox(&backend.imap, &account.id, &store, false).unwrap();
+    let replay = || replay_outbox(&backend.imap, &account.id, &store, true, false).unwrap();
     assert!(replay().interrupted.is_some());
     assert_eq!(
         replay().waiting,
@@ -1201,7 +1208,7 @@ fn bridge_label_undo_survives_a_fetch_after_an_interrupted_copy() {
     let action = store
         .label_thread(&account.id, &thread, crate::LabelChange::Add(label.into()))
         .unwrap();
-    let replay = || replay_outbox(&backend.imap, &account.id, &store, false).unwrap();
+    let replay = || replay_outbox(&backend.imap, &account.id, &store, true, false).unwrap();
     assert!(replay().interrupted.is_some());
     assert_eq!(store.undo(&account.id).unwrap().id, action.id);
     sync_once(&account, &backend, &store).unwrap();
@@ -1251,7 +1258,7 @@ fn bridge_label_removal_resumes_each_copy_after_a_lost_reply() {
                 crate::LabelChange::Remove("Review".into()),
             )
             .unwrap();
-        let replay = || replay_outbox(&backend.imap, &account.id, &store, false).unwrap();
+        let replay = || replay_outbox(&backend.imap, &account.id, &store, true, false).unwrap();
         assert!(replay().interrupted.is_some(), "{command}");
         {
             let state = server.state.lock().unwrap();
@@ -1354,7 +1361,7 @@ fn delete_and_spam_of_a_selection_are_server_moves_and_undo_reverses_them() {
 }
 
 #[test]
-fn purge_uses_only_already_recorded_trash_uids_and_undo_skips_purged_mail() {
+fn purge_expunges_trash_uids_after_queued_or_lost_move_and_undo_skips_purged_mail() {
     for state in ["queued", "sent", "settled"] {
         let fx = with_trash_and_junk();
         let alpha = fx.thread("INBOX", "Alpha");
@@ -1393,22 +1400,25 @@ fn purge_uses_only_already_recorded_trash_uids_and_undo_skips_purged_mail() {
         fx.clear_commands();
         let report = fx.replay();
         assert_eq!(report.waiting, 0, "{state}: {report:?}");
-        fx.sync();
-        if state == "settled" {
-            assert!(fx.on_server("Deleted Items").is_empty());
-        } else {
-            assert!(
-                fx.writes()
-                    .iter()
-                    .all(|command| !command.contains("STORE") && !command.contains("EXPUNGE")),
-                "{state}"
-            );
+        if state != "settled" {
+            let rows = fx.store.outbox(&fx.account.id).unwrap();
+            let expunge = rows
+                .iter()
+                .find(|row| row.kind == OutboxKind::Expunge)
+                .unwrap();
             assert_eq!(
-                fx.on_server("Deleted Items"),
-                vec![(1, "Alpha".to_string())],
+                (expunge.state, expunge.uidvalidity, expunge.uid),
+                (OutboxState::Pending, Some(50), Some(1)),
                 "{state}"
             );
+            assert_eq!(fx.replay().sent, 1, "{state}");
         }
+        assert!(
+            without_tags(&fx.writes()).contains(&"UID EXPUNGE 1".into()),
+            "{state}"
+        );
+        assert!(fx.on_server("Deleted Items").is_empty(), "{state}");
+        fx.sync();
         assert_eq!(fx.subjects("INBOX"), vec!["Bravo"], "{state}");
         assert!(fx.subjects("Deleted Items").is_empty(), "{state}");
     }
@@ -1436,13 +1446,11 @@ fn queued_moves_can_still_carry_a_purged_message_to_server_trash() {
         .purge_threads(&fx.account.id, one, "Deleted Items")
         .unwrap();
     assert_eq!(fx.replay().sent, 2);
+    assert_eq!(fx.replay().sent, 1);
     fx.sync();
     assert!(fx.on_server("INBOX").is_empty());
     assert!(fx.on_server("Archive").is_empty());
-    assert_eq!(
-        fx.on_server("Deleted Items"),
-        vec![(1, "Alpha".to_string())]
-    );
+    assert!(fx.on_server("Deleted Items").is_empty());
     assert!(fx.subjects("Deleted Items").is_empty());
 }
 
@@ -1638,27 +1646,229 @@ fn purge_rechecks_write_back_before_both_mutating_commands() {
         purge_from_server_trash(&fx, "Alpha");
         fx.clear_commands();
         let commands = std::cell::Cell::new(0);
-        let report =
-            super::write_back::replay_with(&fx.backend.config, account, &fx.store, true, &|| {
+        let report = super::write_back::replay_with(
+            &fx.backend.config,
+            account,
+            &fx.store,
+            true,
+            true,
+            &|| {
                 commands.set(commands.get() + 1);
                 if commands.get() == disable_on {
                     fx.store.set_write_back(account, false).unwrap();
                     fx.store.set_write_back(account, true).unwrap();
                 }
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         assert_eq!(report.sent, 0);
         let writes = without_tags(&fx.writes());
-        assert_eq!(
-            writes
+        if disable_on == 1 {
+            assert_eq!(writes, [r#"SELECT "Deleted Items""#]);
+        } else {
+            assert_eq!(
+                writes,
+                [
+                    r#"SELECT "Deleted Items""#,
+                    "UID STORE 11 +FLAGS.SILENT (\\Deleted)",
+                    "UID STORE 11 -FLAGS.SILENT (\\Deleted)"
+                ]
+            );
+            let commands = without_tags(&fx.commands());
+            let cleanup = commands
                 .iter()
-                .filter(|command| command.starts_with("UID STORE"))
-                .count(),
-            disable_on - 1
-        );
-        assert!(writes.iter().all(|command| !command.contains("EXPUNGE")));
-        assert!(fx.store.outbox(account).unwrap().is_empty());
+                .position(|command| command == &writes[2])
+                .unwrap();
+            let logout = commands
+                .iter()
+                .position(|command| command == "LOGOUT")
+                .unwrap();
+            assert!(cleanup < logout);
+        }
+        assert!(!fx.flags(SERVER_TRASH, 11).contains(&"\\Deleted".into()));
         assert_eq!(fx.on_server(SERVER_TRASH).len(), 2);
+        assert_eq!(
+            fx.replay_as_window().dropped[0].reason,
+            DropReason::ServerCopyKept
+        );
+        assert_eq!(fx.replay_as_window(), Default::default());
+    }
+}
+
+#[test]
+fn purge_with_lost_expunge_reply_only_cleans_up_when_write_back_is_off() {
+    for expunged in [false, true] {
+        let fx = with_trash_copies("\\Trash", SERVER_TRASH);
+        let account = &fx.account.id;
+        fx.server.state.lock().unwrap().mailboxes[1].messages[1]
+            .flags
+            .push("\\Deleted".into());
+        purge_from_server_trash(&fx, "Alpha");
+        {
+            let mut writes = fx.server.writes.lock().unwrap();
+            if expunged {
+                writes.lose_reply_to = Some("EXPUNGE");
+            } else {
+                writes.lose_before_expunge = true;
+            }
+        }
+        assert!(fx.replay().interrupted.is_some());
+        assert_eq!(
+            fx.flags(SERVER_TRASH, 11).contains(&"\\Deleted".into()),
+            !expunged
+        );
+
+        fx.store.set_write_back(account, false).unwrap();
+        if expunged {
+            // This config still permits cleanup only if another process
+            // re-enables write-back and queues a write.
+            fx.store.set_write_back(account, true).unwrap();
+            purge_from_server_trash(&fx, "Bravo");
+        }
+        let mut config = fx.account_config();
+        config.write_back = false;
+        fx.server.writes.lock().unwrap().uidplus = false;
+        fx.clear_commands();
+        let report = config.replay_outbox(&fx.store).unwrap();
+        assert_eq!(report.waiting, 0);
+        if expunged {
+            assert!(report.dropped.is_empty());
+        } else {
+            assert_eq!(report.dropped[0].reason, DropReason::ServerCopyKept);
+            assert!(!fx.flags(SERVER_TRASH, 11).contains(&"\\Deleted".into()));
+        }
+        assert_eq!(
+            fx.on_server(SERVER_TRASH).len(),
+            if expunged { 1 } else { 2 }
+        );
+        assert!(fx.flags(SERVER_TRASH, 12).contains(&"\\Deleted".into()));
+        assert_eq!(
+            without_tags(&fx.writes()),
+            [
+                r#"SELECT "Deleted Items""#,
+                "UID STORE 11 -FLAGS.SILENT (\\Deleted)"
+            ]
+        );
+        assert_eq!(config.replay_outbox(&fx.store).unwrap(), Default::default());
+    }
+}
+
+#[test]
+fn purge_cleanup_stays_pending_if_the_server_refuses_to_clear_the_flag() {
+    let fx = with_trash_copies("\\Trash", SERVER_TRASH);
+    purge_from_server_trash(&fx, "Alpha");
+    fx.server.writes.lock().unwrap().lose_before_expunge = true;
+    assert!(fx.replay().interrupted.is_some());
+    fx.store.set_write_back(&fx.account.id, false).unwrap();
+    let mut config = fx.account_config();
+    config.write_back = false;
+
+    fx.server.writes.lock().unwrap().refuse_store_uid = Some(11);
+    fx.clear_commands();
+    let report = config.replay_outbox(&fx.store).unwrap();
+    assert!(report.interrupted.is_some());
+    assert_eq!(report.waiting, 1);
+    assert!(report.dropped.is_empty());
+    assert!(!without_tags(&fx.commands()).contains(&"LOGOUT".into()));
+    assert!(fx.flags(SERVER_TRASH, 11).contains(&"\\Deleted".into()));
+
+    fx.server.writes.lock().unwrap().refuse_store_uid = None;
+    fx.make_due();
+    assert_eq!(
+        config.replay_outbox(&fx.store).unwrap().dropped[0].reason,
+        DropReason::ServerCopyKept
+    );
+    assert!(!fx.flags(SERVER_TRASH, 11).contains(&"\\Deleted".into()));
+}
+
+#[test]
+fn purge_cleanup_does_not_unflag_reused_uids_after_a_folder_reset() {
+    let fx = with_trash_copies("\\Trash", SERVER_TRASH);
+    purge_from_server_trash(&fx, "Alpha");
+    fx.server.writes.lock().unwrap().lose_reply_to = Some("STORE");
+    assert!(fx.replay().interrupted.is_some());
+    fx.store.set_write_back(&fx.account.id, false).unwrap();
+    fx.server.state.lock().unwrap().mailboxes[1].uidvalidity += 1;
+    fx.clear_commands();
+    let mut config = fx.account_config();
+    config.write_back = false;
+    assert_eq!(
+        config.replay_outbox(&fx.store).unwrap().dropped[0].reason,
+        DropReason::FolderReset
+    );
+    assert_eq!(without_tags(&fx.writes()), [r#"SELECT "Deleted Items""#]);
+    assert!(fx.flags(SERVER_TRASH, 11).contains(&"\\Deleted".into()));
+    assert_eq!(config.replay_outbox(&fx.store).unwrap(), Default::default());
+}
+
+#[test]
+fn purge_unflags_after_each_expunge_refusal_including_the_last() {
+    let fx = with_trash_copies("\\Trash", SERVER_TRASH);
+    purge_from_server_trash(&fx, "Alpha");
+    fx.server.writes.lock().unwrap().refuse_expunge = true;
+    fx.server.state.lock().unwrap().mailboxes[1].messages[1]
+        .flags
+        .push("\\Deleted".into());
+    let max_attempts = super::write_back::MAX_ATTEMPTS;
+    for attempt in 1..=max_attempts {
+        fx.make_due();
+        fx.clear_commands();
+        let report = fx.replay();
+        assert_eq!(report.sent, 0);
+        assert_eq!(
+            without_tags(&fx.writes()),
+            [
+                r#"SELECT "Deleted Items""#,
+                "UID STORE 11 +FLAGS.SILENT (\\Deleted)",
+                "UID EXPUNGE 11",
+                "UID STORE 11 -FLAGS.SILENT (\\Deleted)"
+            ]
+        );
+        assert!(!fx.flags(SERVER_TRASH, 11).contains(&"\\Deleted".into()));
+        assert!(fx.flags(SERVER_TRASH, 12).contains(&"\\Deleted".into()));
+        let row = &fx.store.outbox(&fx.account.id).unwrap()[0];
+        assert_eq!(row.attempts, attempt);
+        assert!(!row.sent);
+        if attempt < max_attempts {
+            assert_eq!(row.state, OutboxState::Pending);
+            assert!(row.retry_unix > crate::outbox::now_unix());
+            assert_eq!(report.waiting, 1);
+        } else {
+            assert_eq!(row.state, OutboxState::Dropped);
+            assert_eq!(report.dropped[0].reason, DropReason::Refused);
+            assert_eq!(report.waiting, 0);
+        }
+    }
+}
+
+#[test]
+fn purge_after_a_pending_move_reports_when_the_server_keeps_the_copy() {
+    for (role, folder, uidplus) in [("", "Trash", true), ("\\Trash", SERVER_TRASH, false)] {
+        let fx = Fixture::with(
+            Store::open_in_memory().unwrap(),
+            state_with(vec![
+                mailbox("INBOX", "", 7, &[(1, "Alpha")]),
+                mailbox(folder, role, 50, &[]),
+            ]),
+        );
+        let thread = fx.thread("INBOX", "Alpha");
+        let one = std::slice::from_ref(&thread);
+        fx.store
+            .delete_threads(&fx.account.id, one, "INBOX")
+            .unwrap();
+        fx.store.purge_threads(&fx.account.id, one, folder).unwrap();
+        fx.server.writes.lock().unwrap().uidplus = uidplus;
+        fx.clear_commands();
+        let report = fx.replay_as_window();
+        assert_eq!(report.sent, 1);
+        assert_eq!(report.dropped[0].reason, DropReason::ServerCopyKept);
+        assert_eq!(fx.replay_as_window(), Default::default());
+        assert_eq!(fx.on_server(folder), [(1, "Alpha".into())]);
+        assert!(
+            fx.writes()
+                .iter()
+                .all(|command| !command.contains("STORE") && !command.contains("EXPUNGE"))
+        );
     }
 }
 
@@ -1718,7 +1928,10 @@ fn undo_while_a_move_is_on_the_wire_queues_the_reverse() {
         &sending,
         Some(("INBOX", 7, 1)),
         Some("Archive"),
-        crate::outbox::Outcome::Done { placed: (30, 1) },
+        crate::outbox::Outcome::Done {
+            placed: (30, 1),
+            uidplus: true,
+        },
     )
     .unwrap();
 
@@ -2196,7 +2409,7 @@ fn undo_leaves_both_copies_when_move_recovery_cannot_search_the_full_span() {
     fx.store.archive_thread(account, &bravo, "INBOX").unwrap();
     fx.server.writes.lock().unwrap().lose_reply_to = Some("MOVE");
     let report =
-        super::write_back::replay_with(&fx.backend.config, account, &fx.store, true, &|| {
+        super::write_back::replay_with(&fx.backend.config, account, &fx.store, true, true, &|| {
             // Arrive after STATUS and before MOVE gets the next UID.
             fx.deliver(
                 "Archive",
@@ -2250,7 +2463,7 @@ fn undo_of_a_move_without_a_recorded_window_moves_nothing() {
     fx.store.archive_thread(account, &bravo, "INBOX").unwrap();
     fx.server.writes.lock().unwrap().lose_reply_to = Some("MOVE");
     let report =
-        super::write_back::replay_with(&fx.backend.config, account, &fx.store, true, &|| {
+        super::write_back::replay_with(&fx.backend.config, account, &fx.store, true, true, &|| {
             fx.deliver(
                 "Archive",
                 30,
@@ -2599,6 +2812,7 @@ fn a_lost_move_reply_takes_only_the_exact_message_id_that_arrived_after() {
         &fx.account.id,
         &fx.store,
         true,
+        true,
         &|| {
             fx.deliver(
                 "Archive",
@@ -2673,6 +2887,7 @@ fn turning_write_back_off_after_the_pass_loaded_its_rows_sends_nothing() {
         &fx.account.id,
         &fx.store,
         true,
+        true,
         &|| fx.store.set_write_back(&fx.account.id, false).unwrap(),
     )
     .unwrap();
@@ -2694,9 +2909,16 @@ fn an_undo_after_the_pass_loaded_its_rows_sends_nothing() {
         .archive_thread(&fx.account.id, &alpha, "INBOX")
         .unwrap();
     fx.clear_commands();
-    super::write_back::replay_with(&fx.backend.config, &fx.account.id, &fx.store, true, &|| {
-        fx.store.undo(&fx.account.id).unwrap();
-    })
+    super::write_back::replay_with(
+        &fx.backend.config,
+        &fx.account.id,
+        &fx.store,
+        true,
+        true,
+        &|| {
+            fx.store.undo(&fx.account.id).unwrap();
+        },
+    )
     .unwrap();
     assert!(
         !without_tags(&fx.commands())
@@ -3368,6 +3590,7 @@ fn an_edit_during_select_retires_the_unsent_snapshot() {
         &fx.account.id,
         &fx.store,
         true,
+        true,
         &|| {
             assert!(without_tags(&fx.commands()).contains(&"SELECT \"INBOX\" (CONDSTORE)".into()));
             fx.flag(&alpha, FlagChange::Unstar);
@@ -3446,6 +3669,7 @@ fn a_copy_without_a_revision_fetches_a_baseline_before_writing() {
         &fx.backend.config,
         &fx.account.id,
         &fx.store,
+        true,
         true,
         &|| {
             if !changed_once.replace(true) {

@@ -647,17 +647,22 @@ impl AccountConfig {
 
     /// Send the writes queued for this account on a separate
     /// `SELECT` session. Run it on the sync thread; it connects only when a
-    /// row is due. Sends nothing while `write_back` is off, but still
-    /// reports, once, a copy an earlier build of write-back left half done.
+    /// row is due. With `write_back` off, it can only clear a pending Trash
+    /// delete mark and report server copies left in place.
     pub fn replay_outbox(&self, store: &crate::Store) -> Result<crate::ReplayReport> {
         let account_id = AccountId(self.id.clone());
         let append_sent = self.append_sent();
-        let report =
-            if !self.write_back || !crate::outbox::any_due(store, &account_id, append_sent)? {
-                crate::ReplayReport::default()
-            } else {
-                crate::imap::replay_outbox(&self.imap_config()?, &account_id, store, append_sent)?
-            };
+        let report = if crate::outbox::any_due(store, &account_id, self.write_back, append_sent)? {
+            crate::imap::replay_outbox(
+                &self.imap_config()?,
+                &account_id,
+                store,
+                self.write_back,
+                append_sent,
+            )?
+        } else {
+            crate::ReplayReport::default()
+        };
         crate::outbox::report_for_status(store, &account_id, report)
     }
 
