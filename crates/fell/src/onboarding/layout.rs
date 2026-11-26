@@ -426,47 +426,43 @@ impl Onboarding {
                     let (title, detail) = state.heading();
                     self.heading(title, detail)
                 });
-                self.reserved_heading(Connection::ALL.map(Connection::heading), heading)
+                self.reserved_heading(
+                    Connection::ALL.map(|state| {
+                        let (title, detail) = state.heading();
+                        self.heading(title, detail)
+                    }),
+                    heading,
+                )
             }
             Step::Done => {
-                let reconnect_title = self.form.retained_mailbox.as_ref().map(|_| {
-                    let email = crate::present::display_safe(self.form.text(Field::Email).trim());
-                    format!("Reconnect {email}?")
-                });
-                let heading = self.heading_column(
-                    self.feedback.save_title.paint(false, |title, _| {
-                        if let Some(reconnect) = &reconnect_title
-                            && matches!(self.form.storage, super::Storage::Keyring)
-                        {
-                            self.title(reconnect)
-                        } else {
-                            self.title(title)
-                        }
-                    }),
-                    self.feedback.save_subtitle.paint(false, |detail, _| {
-                        if reconnect_title.is_some()
-                            && matches!(self.form.storage, super::Storage::Keyring)
-                        {
-                            self.meta("Use the mail already on this device.")
-                        } else {
-                            self.meta(*detail)
-                        }
-                    }),
-                );
-                if let Some(reconnect) = &reconnect_title {
-                    let [keyring, file, failed] = SaveState::HEADINGS;
-                    self.reserved_heading(
-                        [
-                            keyring,
-                            file,
-                            failed,
-                            (reconnect, "Use the mail already on this device."),
-                        ],
-                        heading,
-                    )
+                let reconnect_email = self
+                    .form
+                    .retained_mailbox
+                    .as_ref()
+                    .map(|_| crate::present::display_safe(self.form.text(Field::Email).trim()));
+                let heading = if let Some(email) = &reconnect_email
+                    && matches!(self.form.storage, super::Storage::Keyring)
+                {
+                    self.reconnect_heading(email)
                 } else {
-                    self.reserved_heading(SaveState::HEADINGS, heading)
-                }
+                    self.heading_column(
+                        self.feedback
+                            .save_title
+                            .paint(false, |title, _| self.title(title)),
+                        self.feedback
+                            .save_subtitle
+                            .paint(false, |detail, _| self.meta(*detail)),
+                    )
+                };
+                let measures = SaveState::HEADINGS
+                    .into_iter()
+                    .map(|(title, detail)| self.heading(title, detail))
+                    .chain(
+                        reconnect_email
+                            .as_ref()
+                            .map(|email| self.reconnect_heading(email)),
+                    );
+                self.reserved_heading(measures, heading)
             }
             _ => self.heading(title, detail),
         };
@@ -543,6 +539,26 @@ impl Onboarding {
         self.heading_column(self.title(title), self.meta(detail.to_owned()))
     }
 
+    fn reconnect_heading(&self, email: &str) -> Div {
+        let title = div()
+            .flex()
+            .flex_wrap()
+            .gap_x_2()
+            .text_size(px(self.theme.ui_px + 12.))
+            .line_height(px(self.theme.ui_px + 18.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .child(div().flex_none().child("Reconnect"))
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .max_w_full()
+                    .child(div().min_w_0().truncate().child(email.to_owned()))
+                    .child(div().flex_none().child("?")),
+            );
+        self.heading_column(title, self.meta("Use the mail already on this device."))
+    }
+
     fn title(&self, title: &str) -> Div {
         div()
             .text_size(px(self.theme.ui_px + 15.))
@@ -555,15 +571,19 @@ impl Onboarding {
         div().flex().flex_col().gap_1p5().child(title).child(detail)
     }
 
-    fn reserved_heading<const N: usize>(&self, headings: [(&str, &str); N], current: Div) -> Div {
+    fn reserved_heading(&self, headings: impl IntoIterator<Item = Div>, current: Div) -> Div {
         // Each measuring copy takes the full column width. The row keeps
         // the tallest heading's height at the current window size.
         div()
             .relative()
             .overflow_hidden()
-            .child(div().flex().children(headings.map(|(title, detail)| {
-                self.heading(title, detail).w_full().flex_none().opacity(0.)
-            })))
+            .child(
+                div().flex().children(
+                    headings
+                        .into_iter()
+                        .map(|heading| heading.w_full().flex_none().opacity(0.)),
+                ),
+            )
             .child(current.absolute().inset_0())
     }
 
