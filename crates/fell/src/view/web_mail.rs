@@ -223,16 +223,16 @@ impl Shown {
                 self.prompt_from = 1.;
                 self.outgoing_prompts.clear();
             }
-            self.prompt_swap = retry_failed
-                .then(|| {
-                    motion::LayerSwap::start(
-                        motion,
-                        now,
-                        RENDERER_EXIT,
-                        RENDERER_CHANGE - RENDERER_EXIT,
-                    )
-                })
-                .flatten();
+            self.prompt_swap = if retry_failed {
+                motion::LayerSwap::start(
+                    motion,
+                    now,
+                    RENDERER_EXIT,
+                    RENDERER_CHANGE - RENDERER_EXIT,
+                )
+            } else {
+                None
+            };
             self.prompt_fade = motion.start(
                 if retry_failed {
                     RENDERER_CHANGE
@@ -1667,6 +1667,38 @@ mod tests {
         assert_eq!(frame.height, 1.);
         assert_eq!(frame.incoming_alpha, 1.);
         assert!(matches!(frame.incoming, Some(Prompt::Retrying)));
+    }
+
+    #[test]
+    fn a_retry_label_leaves_before_the_failure_arrives() {
+        let now = Instant::now();
+        let motion = Motion::new(true);
+        let mut shown = Shown::new(Weak::new(), None, false, false, Some(Prompt::Retrying));
+        shown.update(
+            Body::Native,
+            Some(Prompt::Unavailable {
+                verified: false,
+                always: false,
+                images: true,
+                failure: None,
+            }),
+            true,
+            motion,
+            now,
+        );
+        let halfway_out = shown.frame(now + RENDERER_EXIT / 2).prompt.unwrap();
+        assert_eq!(halfway_out.incoming_alpha, 0.);
+        assert!(halfway_out.outgoing[0].1 > 0.);
+        let seam = shown.frame(now + RENDERER_EXIT).prompt.unwrap();
+        assert_eq!(seam.incoming_alpha, 0.);
+        assert_eq!(seam.outgoing[0].1, 0.);
+        assert_eq!(seam.height, 1.);
+        let arriving = shown
+            .frame(now + (RENDERER_EXIT + RENDERER_CHANGE) / 2)
+            .prompt
+            .unwrap();
+        assert!(arriving.incoming_alpha > 0.);
+        assert_eq!(arriving.outgoing[0].1, 0.);
     }
 
     #[test]

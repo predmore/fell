@@ -259,14 +259,6 @@ fn wait_for_images(widget: &webkit2gtk::WebView, active: Active, token: gtk::gio
     const READY: &str = r#"
         (() => {
             const all = Array.from(document.images);
-            for (const image of all) {
-                if (image.getAttribute('src') !== '') continue;
-                // With no image bytes, the intrinsic ratio can come from
-                // the broken-image icon and the alt text. Use the layout
-                // hint explicitly for the blocked slot.
-                const ratio = getComputedStyle(image).aspectRatio;
-                if (ratio.startsWith('auto ')) image.style.aspectRatio = ratio.slice(5);
-            }
             const images = all.filter(image =>
                 /^data:image\/(?:png|jpe?g|gif|webp|avif|bmp|x-icon|vnd\.microsoft\.icon)[;,]/i
                     .test(image.currentSrc || image.getAttribute('src') || ''));
@@ -274,6 +266,15 @@ fn wait_for_images(widget: &webkit2gtk::WebView, active: Active, token: gtk::gio
                 if (image.loading === 'lazy') image.loading = 'eager';
             }
             if (images.some(image => !image.complete)) return [0];
+            for (const image of images) {
+                // Use the same placeholder for missing and damaged bytes.
+                if (image.naturalWidth === 0) image.setAttribute('src', '');
+            }
+            for (const image of all) {
+                if (image.getAttribute('src') !== '') continue;
+                const ratio = getComputedStyle(image).aspectRatio;
+                if (ratio.startsWith('auto ')) image.style.aspectRatio = ratio.slice(5);
+            }
             if (images.length > 0) {
                 const canvas = document.createElement('canvas');
                 canvas.width = canvas.height = 1;
@@ -608,6 +609,20 @@ mod tests {
             .any(|&[blue, green, red, alpha]| alpha == 255 && [red, green, blue] == rgb)
     }
 
+    fn estimate_covers_snapshot(label: &str, mail: &fell_render::WebMail, width: i32) -> Snapshot {
+        let picture = futures::executor::block_on(render(WebRequest {
+            html: mail.page("light", |_| None),
+            width,
+            background: 0xffffff,
+        }))
+        .unwrap_or_else(|| panic!("WebKit painted {label}"));
+        let estimate = mail.estimated_height(width as f32);
+        let height = picture.height * width as f32 / picture.width;
+        eprintln!("{label} ({width}px): {height}px snapshot, {estimate}px estimate");
+        assert!(estimate >= height, "{label}: {estimate} < {height}");
+        picture
+    }
+
     #[test]
     fn only_the_latest_queued_snapshot_is_loaded() {
         let queue = JobQueue::default();
@@ -780,12 +795,7 @@ mod tests {
             <img src="https://cdn.example.test/width-only" width="300" alt="A photo" style="display:block">"#,
         );
         assert!(blocked.has_remote_images());
-        let picture = futures::executor::block_on(render(WebRequest {
-            html: blocked.page("light", |_| None),
-            width: 360,
-            background: 0xffffff,
-        }))
-        .expect("WebKit drew the blocked image placeholder");
+        let picture = estimate_covers_snapshot("blocked width-only image", &blocked, 360);
         assert!(
             contains_display_color(&picture, [0x7a, 0x16, 0x3f]),
             "the reused snapshot uses a 360px CSS viewport",
@@ -798,25 +808,15 @@ mod tests {
 
         let huge = fell_render::WebMail::prepare(
             r#"<p>River news</p><img src="https://cdn.example.test/huge"
-            width="600" height="200000" style="display:block">"#,
+            width="600" height="200000" style="display:block;min-height:200000px !important">"#,
         );
-        let picture = futures::executor::block_on(render(WebRequest {
-            html: huge.page("light", |_| None),
-            width: 440,
-            background: 0xffffff,
-        }))
-        .expect("WebKit drew the oversized image placeholder");
+        let picture = estimate_covers_snapshot("oversized image with author minimum", &huge, 440);
         assert!(
             (680. ..740.).contains(&picture.height)
                 && (0. ..=32.).contains(&(huge.estimated_height(440.) - picture.height)),
             "snapshot: {}, estimate: {}",
             picture.height,
             huge.estimated_height(440.),
-        );
-        eprintln!(
-            "600 × 200,000 image: {} px snapshot, {} px estimate",
-            picture.height,
-            huge.estimated_height(440.)
         );
 
         let newsletter = fell_render::WebMail::prepare(
@@ -834,31 +834,50 @@ mod tests {
             </tr></table></td></tr></table>"#,
         );
         for width in [493, 560] {
-            let picture = futures::executor::block_on(render(WebRequest {
-                html: newsletter.page("light", |_| None),
-                width,
-                background: 0xffffff,
-            }))
-            .expect("WebKit drew the newsletter");
-            let estimate = newsletter.estimated_height(width as f32);
-            eprintln!(
-                "{width} px newsletter: {} px snapshot, {estimate} px estimate",
-                picture.height
+            let picture = estimate_covers_snapshot("newsletter", &newsletter, width);
+            assert!(
+                (0. ..=25.).contains(&(newsletter.estimated_height(width as f32) - picture.height))
             );
-            assert!((0. ..=25.).contains(&(estimate - picture.height)));
         }
 
-        let tall = futures::executor::block_on(render(WebRequest {
-            html: r#"<div style="height:200000px;background:#7a163f">Tall page</div>
-                     <div style="background:#3f167a">Offscreen</div>"#
-                .into(),
-            width: 440,
-            background: 0xffffff,
-        }))
-        .expect("WebKit drew the clipped beginning of a tall document");
-        assert!(contains_display_color(&tall, [0x7a, 0x16, 0x3f]));
-        assert!(!contains_display_color(&tall, [0x3f, 0x16, 0x7a]));
-        assert!(tall.height > 1000. && tall.height <= SNAPSHOT_HEIGHT_LIMIT as f32);
+        let mobile = fell_render::WebMail::prepare(concat!(
+            "<style>@media (max-width:600px) { .mobile { display:block !important; ",
+            "visibility:visible !important; font-size:16px !important; ",
+            "max-height:none !important; overflow:visible !important; background:#7a163f; } }</style>",
+            r#"<div class="mobile" style="display:none;visibility:hidden;font-size:0;max-height:0;overflow:hidden">"#,
+            "Mobile dispatch<br>Edition 42</div>",
+        ));
+        let picture = estimate_covers_snapshot("mobile media reveal", &mobile, 360);
+        assert!(contains_display_color(&picture, [0x7a, 0x16, 0x3f]));
+
+        let spacer = fell_render::WebMail::prepare(concat!(
+            r#"<style media="print">.show {display:none !important}</style>"#,
+            r#"<style media="screen">.show {display:block !important;background:#7a163f}</style>"#,
+            r#"<body style="padding-block:8px 12px"><div hidden class="show">Visible in web view</div>"#,
+            r#"<table><tr height="32"><td height="24" style="font-size:0"></td></tr></table>"#,
+            r#"<div style="min-height:86px;border-top:3px solid;border-bottom:5px solid;"#,
+            r#"padding-block:4px 8px;margin-block:7px 9px;background:#3f167a">Spacer</div></body>"#,
+        ));
+        let picture = estimate_covers_snapshot("spacer cells and hidden override", &spacer, 440);
+        assert!(contains_display_color(&picture, [0x7a, 0x16, 0x3f]));
+        assert!(contains_display_color(&picture, [0x3f, 0x16, 0x7a]));
+
+        let hero = fell_render::WebMail::prepare(
+            r#"<div style="height:1000px;background:#7a163f">A tall hero</div>"#,
+        );
+        let picture = estimate_covers_snapshot("solid hero", &hero, 440);
+        assert_eq!(picture.height, 1000.);
+        assert!(!picture.clipped);
+
+        let tall = fell_render::WebMail::prepare(
+            r#"<div style="height:200000px"><span style="background:#7a163f">Tall page</span></div>
+               <div style="background:#3f167a">Offscreen</div>"#,
+        );
+        let picture = estimate_covers_snapshot("clipped page with a uniform tail", &tall, 440);
+        assert!(picture.clipped);
+        assert_eq!(picture.height, SNAPSHOT_HEIGHT_LIMIT as f32);
+        assert!(contains_display_color(&picture, [0x7a, 0x16, 0x3f]));
+        assert!(!contains_display_color(&picture, [0x3f, 0x16, 0x7a]));
 
         let mut png = std::io::Cursor::new(Vec::new());
         let image = image::RgbImage::from_fn(1024, 768, |x, _| {
@@ -870,11 +889,13 @@ mod tests {
         });
         image.write_to(&mut png, image::ImageFormat::Png).unwrap();
         let png = base64::engine::general_purpose::STANDARD.encode(png.get_ref());
-        let picture = futures::executor::block_on(render(WebRequest {
-            html: format!(r#"<p>Local image below</p><img loading="lazy" src="data:image/png;base64,{png}" width="320" height="240">"#),
-            width: 360,
-            background: 0xffffff,
-        })).expect("paint after the lazy image decodes");
+        let images = fell_render::WebMail::prepare(&format!(
+            r#"<p style="background:#7a163f">Local image below</p>
+            <img src="data:image/png;base64,AAAA" width="160" height="26" alt="Damaged image" style="display:block">
+            <img loading="lazy" src="data:image/png;base64,{png}" width="320" height="240">"#,
+        ));
+        let picture = estimate_covers_snapshot("broken image beside a decoded image", &images, 360);
+        assert!(contains_display_color(&picture, [0x7a, 0x16, 0x3f]));
         assert!(contains_display_color(&picture, [0xd1, 0x63, 0x26]));
         assert!(contains_display_color(&picture, [0x25, 0x79, 0x9d]));
 
@@ -882,13 +903,7 @@ mod tests {
             let mail = fell_render::WebMail::prepare(&format!(
                 r#"<body style="padding-bottom:{padding}px"><div style="height:96px">Padding probe</div></body>"#,
             ));
-            futures::executor::block_on(render(WebRequest {
-                html: mail.page("light", |_| None),
-                width: 360,
-                background: 0xffffff,
-            }))
-            .expect("WebKit drew the white text page")
-            .height
+            estimate_covers_snapshot("body padding", &mail, 360).height
         };
         let default = padded(0);
         assert_eq!(padded(24) - default, 12.);

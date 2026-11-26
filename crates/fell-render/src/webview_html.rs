@@ -11,7 +11,8 @@ use scraper::node::{Element, Node};
 use crate::html::{self, Declaration};
 
 const MAX_ESTIMATED_HEIGHT: f32 = 8_192.;
-const HEIGHT_ALLOWANCE: f32 = 20.;
+// Allow for font metrics and line rounding across WebKit installations.
+const HEIGHT_ALLOWANCE: f32 = 25.;
 
 fn web_page(body: &str, scheme: &str, body_padding: &str) -> String {
     format!(
@@ -207,6 +208,7 @@ fn can_model(declaration: &Declaration) -> bool {
             .split_ascii_whitespace()
             .all(|value| matches!(value, "visible" | "hidden" | "clip" | "auto" | "scroll")),
         "font-size" => css_pixels(value).is_some(),
+        "font" => shorthand_font_size(value).is_some(),
         "line-height" => {
             value == "normal"
                 || css_pixels(value).is_some()
@@ -218,7 +220,28 @@ fn can_model(declaration: &Declaration) -> bool {
             matches!(value, "auto" | "none") || css_pixels(value).is_some()
         }
         "gap" => css_pixels(value).is_some(),
-        name if name.starts_with("padding") || name.starts_with("margin") => {
+        "padding"
+        | "margin"
+        | "padding-top"
+        | "padding-right"
+        | "padding-bottom"
+        | "padding-left"
+        | "padding-block"
+        | "padding-block-start"
+        | "padding-block-end"
+        | "padding-inline"
+        | "padding-inline-start"
+        | "padding-inline-end"
+        | "margin-top"
+        | "margin-right"
+        | "margin-bottom"
+        | "margin-left"
+        | "margin-block"
+        | "margin-block-start"
+        | "margin-block-end"
+        | "margin-inline"
+        | "margin-inline-start"
+        | "margin-inline-end" => {
             !value.is_empty()
                 && value
                     .split_ascii_whitespace()
@@ -374,10 +397,14 @@ impl LayoutStyles {
 #[derive(Debug)]
 enum Layout {
     Text(f32),
+    Break {
+        after_text: bool,
+    },
     Image {
         width: f32,
         height: f32,
         min_height: f32,
+        vertical: f32,
     },
     Flow {
         children: Vec<Layout>,
@@ -385,6 +412,8 @@ enum Layout {
         line_height: Option<f32>,
         vertical: f32,
         horizontal: f32,
+        width_hint: f32,
+        conservative: bool,
         min_height: f32,
         max_height: f32,
         row: bool,
@@ -475,27 +504,61 @@ fn box_edges(style: &[Declaration], property: &str, sides: [&str; 4]) -> [Option
     edges.map(|edge| edge.and_then(|(_, length)| length))
 }
 
+fn shorthand_font_size(value: &str) -> Option<f32> {
+    // An absolute size with a family is enough for these font hints.
+    let mut words = value.split_ascii_whitespace().peekable();
+    while let Some(word) = words.next() {
+        if let Some(size) = css_pixels(word.split('/').next()?) {
+            return words.peek().map(|_| size);
+        }
+    }
+    None
+}
+
 fn authored_line_height(style: &[Declaration]) -> Option<f32> {
     let size = style
         .iter()
-        .filter(|declaration| matches!(declaration.name.as_str(), "font" | "font-size"))
-        .max_by_key(|declaration| declaration.important)
-        .and_then(|declaration| {
+        .filter_map(|decl| {
+            let size = match decl.name.as_str() {
+                "font" => shorthand_font_size(&decl.value),
+                "font-size" => css_pixels(&decl.value),
+                _ => None,
+            }?;
+            (size > 0.).then_some((decl.important, size))
+        })
+        .max_by_key(|(important, _)| *important)
+        .map(|(_, size)| size);
+    let line = html::declared_value(style, "line-height").and_then(|value| {
+        css_pixels(value).or_else(|| {
+            let multiplier = value.parse::<f32>().ok()?;
+            (multiplier.is_finite() && multiplier >= 1.).then(|| multiplier * size.unwrap_or(16.))
+        })
+    });
+    match (size, line) {
+        (Some(size), Some(line)) => Some(line.max(size * 1.25)),
+        (Some(size), None) => Some(size * 1.25),
+        (None, line) => line,
+    }
+}
+
+fn border_width(style: &[Declaration], names: [&str; 4]) -> f32 {
+    style
+        .iter()
+        .filter(|declaration| names.contains(&declaration.name.as_str()))
+        .map(|declaration| {
             declaration
                 .value
                 .split_ascii_whitespace()
-                .filter_map(|word| css_pixels(word.split('/').next()?))
-                .find(|size| *size > 0.)
-        });
-    html::declared_value(style, "line-height")
-        .and_then(|value| {
-            css_pixels(value).or_else(|| {
-                let multiplier = value.parse::<f32>().ok()?;
-                (multiplier.is_finite() && multiplier >= 1.)
-                    .then(|| multiplier * size.unwrap_or(16.))
-            })
+                .filter_map(|value| match value {
+                    "thin" => Some(1.),
+                    "medium" => Some(3.),
+                    "thick" => Some(5.),
+                    _ => css_pixels(value),
+                })
+                .reduce(f32::max)
+                .unwrap_or(3.)
         })
-        .or_else(|| size.map(|size| size * 1.25))
+        .fold(0., f32::max)
 }
 
 impl Layout {
@@ -512,10 +575,7 @@ impl Layout {
             Node::Element(element) => element,
             _ => return None,
         };
-        if matches!(
-            element.name(),
-            "head" | "script" | "style" | "title" | "svg"
-        ) {
+        if matches!(element.name(), "head" | "script" | "style" | "title") {
             return None;
         }
         let style = styles.declarations(element);
@@ -529,7 +589,9 @@ impl Layout {
         {
             return None;
         }
-        let zero = !styles.incomplete && html::has_zero_font_size(element, &style, inherited_zero);
+        let zero = !styles.incomplete
+            && html::declared_value(&style, "font").is_none()
+            && html::has_zero_font_size(element, &style, inherited_zero);
         Self::from_element(node, element, styles, &style, zero)
     }
 
@@ -554,37 +616,9 @@ impl Layout {
             0.
         };
         let min_height = length("min-height");
-        if name == "img" {
-            let dimension = |name| {
-                html::declared_value(style, name)
-                    .and_then(css_pixels)
-                    .or_else(|| element.attr(name).and_then(html_pixels))
-                    .filter(|value| *value > 0.)
-            };
-            let width = dimension("width");
-            let height = dimension("height");
-            return Some(Self::Image {
-                width: width
-                    .or_else(|| height.map(|height| height * 1.5))
-                    .unwrap_or(120.),
-                height: height
-                    .or_else(|| width.map(|width| width / 1.5))
-                    .unwrap_or(80.),
-                min_height,
-            });
+        if name == "br" {
+            return (!zero_font).then_some(Self::Break { after_text: false });
         }
-        let mut children: Vec<Layout> = Vec::new();
-        for child in node
-            .children()
-            .filter_map(|child| Self::from_node(child, styles, zero_font))
-        {
-            if let (Some(Self::Text(before)), Self::Text(after)) = (children.last_mut(), &child) {
-                *before += 0.25 + after;
-            } else {
-                children.push(child);
-            }
-        }
-        let line_height = authored_line_height(style);
         let [top, right, bottom, left] = box_edges(
             style,
             "padding",
@@ -600,38 +634,74 @@ impl Layout {
             "margin",
             ["margin-top", "margin-right", "margin-bottom", "margin-left"],
         );
-        let border = |side| {
-            style
-                .iter()
-                .filter(|declaration| {
-                    matches!(declaration.name.as_str(), "border" | "border-width")
-                        || declaration.name == format!("border-{side}")
-                        || declaration.name == format!("border-{side}-width")
-                })
-                .map(|declaration| {
-                    declaration
-                        .value
-                        .split_ascii_whitespace()
-                        .filter_map(|value| match value {
-                            "thin" => Some(1.),
-                            "medium" => Some(3.),
-                            "thick" => Some(5.),
-                            _ => css_pixels(value),
-                        })
-                        .reduce(f32::max)
-                        .unwrap_or(3.)
-                })
-                .fold(0., f32::max)
-        };
         let horizontal = left.unwrap_or(0.) + right.unwrap_or(0.);
-        let padding = top.unwrap_or(0.) + bottom.unwrap_or(0.) + border("top") + border("bottom");
+        let padding = top.unwrap_or(0.)
+            + bottom.unwrap_or(0.)
+            + border_width(
+                style,
+                ["border", "border-width", "border-top", "border-top-width"],
+            )
+            + border_width(
+                style,
+                [
+                    "border",
+                    "border-width",
+                    "border-bottom",
+                    "border-bottom-width",
+                ],
+            );
+        let dimension = |name| {
+            html::declared_value(style, name)
+                .and_then(css_pixels)
+                .or_else(|| element.attr(name).and_then(html_pixels))
+                .filter(|value| *value > 0.)
+        };
+        if name == "img" {
+            let width = dimension("width");
+            let height = dimension("height");
+            return Some(Self::Image {
+                width: width
+                    .or_else(|| height.map(|height| height * 1.5))
+                    .unwrap_or(120.),
+                height: height
+                    .or_else(|| width.map(|width| width / 1.5))
+                    .unwrap_or(80.),
+                min_height: if height.is_none()
+                    && element.attr("src").is_some_and(|src| !src.is_empty())
+                {
+                    // A decoded local image can have any intrinsic ratio.
+                    f32::INFINITY
+                } else {
+                    min_height
+                },
+                vertical: padding + above.unwrap_or(0.) + below.unwrap_or(0.),
+            });
+        }
+        let mut children: Vec<Layout> = Vec::new();
+        for mut child in node.children().filter_map(|child| {
+            if name == "svg" {
+                return None;
+            }
+            Self::from_node(child, styles, zero_font)
+        }) {
+            match (children.last_mut(), &mut child) {
+                (Some(Self::Text(before)), Self::Text(after)) => {
+                    *before += 0.25 + *after;
+                    continue;
+                }
+                (Some(Self::Text(_)), Self::Break { after_text }) => *after_text = true,
+                _ => {}
+            }
+            children.push(child);
+        }
+        let line_height = authored_line_height(style);
         let (scale, default_margin) = match name {
             "h1" => (2., 44.),
             "h2" => (1.5, 40.),
             "h3" => (1.2, 38.),
             "h4" | "h5" | "h6" => (1., 44.),
             "p" => (1., 20.),
-            "ul" | "ol" | "blockquote" => (1., 12.),
+            "pre" | "ul" | "ol" | "blockquote" => (1., 32.),
             "a" | "b" | "em" | "font" | "i" | "small" | "span" | "strong" | "u"
                 if children.len() == 1 && line_height.is_none() && style.is_empty() =>
             {
@@ -648,13 +718,15 @@ impl Layout {
         } else {
             None
         };
-        let min_height = min_height.max(attribute_height).max(length("height")).max(
-            if name == "hr" || name == "br" && !zero_font {
-                20.
-            } else {
-                0.
-            },
-        );
+        let intrinsic_height = match name {
+            "hr" => 20.,
+            "svg" => dimension("height").unwrap_or(150.),
+            _ => 0.,
+        };
+        let min_height = min_height
+            .max(attribute_height)
+            .max(length("height"))
+            .max(intrinsic_height);
         if children.is_empty()
             && padding == 0.
             && min_height == 0.
@@ -663,12 +735,21 @@ impl Layout {
         {
             return None;
         }
+        let margin = |edge: Option<f32>| {
+            let default = default_margin / 2.;
+            let margin = edge.unwrap_or(default);
+            if styles.incomplete {
+                margin.max(default)
+            } else {
+                margin
+            }
+        };
         Some(Self::Flow {
             children,
             scale,
             line_height,
-            vertical: above.unwrap_or(default_margin / 2.)
-                + below.unwrap_or(default_margin / 2.)
+            vertical: margin(above)
+                + margin(below)
                 + padding
                 + if matches!(name, "td" | "th") && top.is_none() && bottom.is_none() {
                     4.
@@ -676,6 +757,8 @@ impl Layout {
                     0.
                 },
             horizontal,
+            width_hint: dimension("width").unwrap_or(f32::INFINITY),
+            conservative: styles.incomplete,
             min_height,
             max_height: max_height.map_or(f32::INFINITY, |max| max.max(length("min-height"))),
             row: name == "tr",
@@ -685,25 +768,43 @@ impl Layout {
     fn height(&self, width: f32, line: f32, image_limit: f32) -> f32 {
         match self {
             Self::Text(em) => (em * (line / 1.25) / width.max(1.)).ceil() * line,
+            Self::Break { after_text } => {
+                if *after_text {
+                    0.
+                } else {
+                    line
+                }
+            }
             Self::Image {
                 width: natural,
                 height,
                 min_height,
-            } => (height * (width / natural).min(1.))
-                .max(*min_height)
-                .min(image_limit),
+                vertical,
+            } => {
+                (height * (width / natural).min(1.))
+                    .max(*min_height)
+                    .min(image_limit)
+                    + vertical
+            }
             Self::Flow {
                 children,
                 scale,
                 line_height,
                 vertical,
                 horizontal,
+                width_hint,
+                conservative,
                 min_height,
                 max_height,
                 row,
             } => {
-                let width = (width - horizontal).max(1.);
-                let line = line_height.unwrap_or(line * scale);
+                let width = (width - horizontal).min(*width_hint).max(1.);
+                let default_line = line * scale;
+                let line = match line_height {
+                    Some(line) if *conservative => line.max(default_line),
+                    Some(line) => *line,
+                    None => default_line,
+                };
                 let content = if *row {
                     let width = (width / children.len().max(1) as f32).max(1.);
                     children
@@ -740,6 +841,7 @@ fn height_estimates_cap_image_hints_and_total_layout() {
         width: 1.,
         height: 10_000_000.,
         min_height: 0.,
+        vertical: 0.,
     };
     assert_eq!(
         image.height(440., 20., WebMail::image_height_limit(440.)),
@@ -747,8 +849,8 @@ fn height_estimates_cap_image_hints_and_total_layout() {
     );
     let mail =
         WebMail::prepare(r#"<img width="600" height="200000" src="https://example.test/large">"#);
-    assert_eq!(mail.estimated_height(440.), 680.);
-    assert_eq!(mail.estimated_height(300.), 470.);
+    assert_eq!(mail.estimated_height(440.), 685.);
+    assert_eq!(mail.estimated_height(300.), 475.);
     assert_eq!(
         WebMail::prepare(&"<p>Another line</p>".repeat(500)).estimated_height(440.),
         MAX_ESTIMATED_HEIGHT
@@ -788,7 +890,7 @@ fn height_estimates_respect_stylesheets_escapes_and_clipped_height() {
         <aside class="clipped">{hidden}</aside>
         <aside style="max-height:10px;overflow:hidden">{hidden}</aside>"#
     );
-    assert_eq!(WebMail::prepare(&html).estimated_height(440.), 80.);
+    assert_eq!(WebMail::prepare(&html).estimated_height(440.), 85.);
 }
 
 #[cfg(test)]
@@ -832,9 +934,10 @@ fn height_estimates_discard_a_partial_author_cascade() {
         "@charset \"utf-8\";",
         ".bad {display block}",
         "} div {display:block}",
-        "span {font:16px sans-serif}",
+        "span {font:menu}",
         ".show {all:revert}",
         ".show {unknown-property:10px}",
+        ".show {padding-unknown:10px}",
     ] {
         let html = format!("<style>{unmodeled} div {{display:none}}</style>{body}");
         assert!(
@@ -859,12 +962,17 @@ fn web_style_media_is_shared_by_the_estimator_and_the_page() {
     assert!(!page.contains("height:100px"));
     assert!(page.contains("padding-block:8px"));
     assert!(page.contains("margin-block:10px"));
-    assert_eq!(mail.estimated_height(440.), 76.);
+    assert_eq!(mail.estimated_height(440.), 81.);
 }
 
 #[cfg(test)]
 #[test]
 fn height_estimates_keep_author_reveals_and_spacer_boxes() {
+    let reveal = WebMail::prepare(
+        r#"<style>.show {display:block !important}</style><div class="show" hidden>Story</div>"#,
+    );
+    assert_eq!(reveal.estimated_height(440.), 45.);
+
     let mail = WebMail::prepare(concat!(
         "<style>.show {display:block !important}</style>",
         r#"<body style="padding-block:6px 8px"><div hidden class="show">Story</div>"#,

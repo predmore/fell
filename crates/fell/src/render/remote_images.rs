@@ -351,8 +351,8 @@ mod tests {
         }
     }
 
-    fn respond(mut stream: impl Read + Write, path: &str, headers: &str, body: &[u8]) {
-        let mut reader = BufReader::new(&mut stream);
+    fn read_request(stream: impl Read, path: &str) {
+        let mut reader = BufReader::new(stream);
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
         assert_eq!(line, format!("GET {path} HTTP/1.1\r\n"));
@@ -363,6 +363,10 @@ mod tests {
                 break;
             }
         }
+    }
+
+    fn respond(mut stream: impl Read + Write, path: &str, headers: &str, body: &[u8]) {
+        read_request(&mut stream, path);
         write!(
             stream,
             "HTTP/1.1 {headers}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -498,6 +502,82 @@ mod tests {
                     "{url}"
                 );
             }
+        });
+    }
+
+    #[test]
+    fn page_deadline_and_interrupted_downloads_stay_retryable_and_charge_bytes() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = |path: &str| format!("http://{HOST}:{port}/{path}");
+        let mail = fell_render::WebMail::prepare(&format!(
+            r#"<img src="{}"><img src="{}"><img src="{}">"#,
+            url("closed"),
+            url("slow"),
+            url("skipped")
+        ));
+        let client = ureq::Agent::with_parts(
+            agent_config(ureq::tls::TlsConfig::default()),
+            DefaultConnector::default(),
+            LoopbackResolver,
+        );
+        let partial = b"some png bytes";
+        let reply = |stream: &mut TcpStream, path| {
+            read_request(&mut *stream, path);
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 128\r\nConnection: close\r\n\r\n").unwrap();
+            stream.write_all(partial).unwrap();
+        };
+        let result = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                reply(&mut accept(&listener), "/closed");
+                let mut slow = accept(&listener);
+                reply(&mut slow, "/slow");
+                // Hold the incomplete response open until the client gives up.
+                let _ = slow.read(&mut [0]);
+            });
+            let deadline = Instant::now() + Duration::from_millis(800);
+            let mut seen = 0;
+            let (_, result) = inline_page_with(
+                &mail,
+                "light",
+                PAGE_BYTES,
+                deadline,
+                || true,
+                |url, limit, bytes_read| {
+                    assert_eq!(limit, PAGE_BYTES - seen * partial.len());
+                    seen += 1;
+                    assert!(seen <= 2, "{url}");
+                    let result = fetch(&client, url, limit, deadline, &|| true, bytes_read);
+                    assert_eq!(*bytes_read, partial.len());
+                    result
+                },
+            );
+            assert_eq!(seen, 2);
+            result
+        });
+        assert!(matches!(result,
+            Err(UnavailableImages { first: Failure::Unreachable(host), count: 3, retryable: true })
+                if host == HOST
+        ));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| respond(accept(&listener), "/missing", "404 Not Found", b""));
+            let result = fetch(
+                &client,
+                &url("missing"),
+                PAGE_BYTES,
+                Instant::now() + FETCH_TIME,
+                &|| true,
+                &mut 0,
+            );
+            let failure = result.unwrap_err();
+            assert_eq!(failure, Failure::NotFound);
+            assert_eq!(failure.label(true), "Image not found");
         });
     }
 
