@@ -64,6 +64,7 @@ struct Ctx {
     name: &'static str,
     /// HOME unset (or relative, which `Env::from_process` also drops).
     no_home: bool,
+    registry: Option<fell_core::accounts::Registry>,
 }
 
 struct Ran {
@@ -90,6 +91,7 @@ impl Ctx {
             appimage: None,
             name: "fell-mcp",
             no_home: false,
+            registry: None,
         }
     }
 
@@ -115,7 +117,7 @@ impl Ctx {
                 home: (!self.no_home).then(|| self.home()),
                 ..Env::default()
             },
-            registry: None,
+            registry: self.registry.clone(),
             default_store: Some(self.store()),
             exe: Some(EXE.into()),
             appimage: self.appimage.clone(),
@@ -482,6 +484,107 @@ fn add_never_puts_scopes_or_secrets_in_the_entry() {
             AgentGrant::enabled(false, false, true)
         );
     }
+}
+
+#[test]
+fn registry_grants_cover_secondary_stores_and_disconnect_live_sessions() {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut ctx = Ctx::empty();
+    let registry = fell_core::accounts::Registry::at(ctx.home().join(".config/fell"));
+    std::fs::create_dir_all(registry.directory()).unwrap();
+    for id in ["mail", "work"] {
+        let config_path = registry.path(id).unwrap();
+        writeln!(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(config_path)
+                .unwrap(),
+            "email = '{id}@example.test'\npassword = 'fixture'"
+        )
+        .unwrap();
+        let db = registry.store_path(&ctx.store(), id).unwrap();
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        Store::open(db)
+            .unwrap()
+            .upsert_account(&account(id))
+            .unwrap();
+    }
+    ctx.registry = Some(registry.clone());
+
+    for id in ["mail", "work"] {
+        let granted = ctx.run(
+            &["fell-mcp", "grant", "atlas", "--read", "--account", id],
+            "",
+            false,
+        );
+        granted.result.unwrap();
+        assert!(
+            granted
+                .err
+                .contains(&format!("revoke atlas --account {id}"))
+        );
+    }
+    let listing = ctx.run(&["fell-mcp", "list"], "", false);
+    listing.result.unwrap();
+    for id in ["mail", "work"] {
+        assert!(
+            listing
+                .out
+                .lines()
+                .any(|line| line.starts_with("atlas") && line.contains(id))
+        );
+    }
+    let selected = ctx.run(&["fell-mcp", "list", "--account", "work"], "", false);
+    selected.result.unwrap();
+    assert!(selected.out.contains("work") && !selected.out.contains("mail"));
+    let snippet = ctx.run(
+        &["fell-mcp", "add", "codex", "--account", "work", "--print"],
+        "",
+        false,
+    );
+    snippet.result.unwrap();
+    assert!(snippet.out.contains("--account") && snippet.out.contains("work"));
+    assert!(snippet.out.contains("$TMP/mail.accounts/work.db"));
+    assert!(snippet.err.contains("revoke codex --account work"));
+
+    let work = registry.store_path(&ctx.store(), "work").unwrap();
+    let mut session = Session::new(
+        Store::open(&work).unwrap(),
+        AccountId("work".into()),
+        "atlas",
+    )
+    .unwrap();
+    let tools = |session: &mut Session| {
+        let response = session
+            .handle_line(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
+            .unwrap();
+        let value: Value = serde_json::from_str(&response).unwrap();
+        value["result"]["tools"].as_array().unwrap().len()
+    };
+    session.handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#).unwrap();
+    assert!(tools(&mut session) > 0);
+    let revoked = ctx.run(&["fell-mcp", "revoke", "atlas"], "", false);
+    revoked.result.unwrap();
+    assert!(revoked.err.contains("mail, work"));
+    assert_eq!(tools(&mut session), 0);
+
+    ctx.run(
+        &["fell-mcp", "grant", "atlas", "--read", "--account", "work"],
+        "",
+        false,
+    )
+    .result
+    .unwrap();
+    assert!(tools(&mut session) > 0);
+    registry.remove(&ctx.store(), "work", false).unwrap();
+    assert_eq!(tools(&mut session), 0);
+    let listing = ctx.run(&["fell-mcp", "list"], "", false);
+    listing.result.unwrap();
+    assert!(!listing.out.contains("work"));
 }
 
 #[test]

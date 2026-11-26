@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
-use fell_core::{Account, AccountId, AgentGrant, Store};
+use fell_core::{Account, AccountId, AgentGrant, AgentSummary, Store};
 
 use crate::protocol::Session;
 use crate::setup::{self, Env, Harness, ServerSpec, Written};
@@ -17,8 +17,8 @@ fell-mcp — local MCP server for Fell
 There is no send tool. Agents are off until granted a scope.
 
 Usage:
-  fell-mcp add HARNESS [--read] [--triage] [--draft] [--annotate] [--write | --print]
-  fell-mcp list
+  fell-mcp add HARNESS [--account ID] [--read] [--triage] [--draft] [--annotate] [--write | --print]
+  fell-mcp list [--account ID]
   fell-mcp revoke AGENT [--account ID]
   fell-mcp grant  AGENT [--read] [--triage] [--draft] [--annotate] [--account ID]
   fell-mcp serve  --account ID --agent ID [--store PATH]
@@ -39,8 +39,9 @@ Scopes:
 
 Every command uses Fell's mailbox ($FELL_STORE, else
 $XDG_DATA_HOME/fell/mail.db) unless --store is given, and the only account
-in it unless --account is given. --agent names the agent (default: the
-harness name).
+in it unless --account is given. List and revoke cover every configured
+account unless you name an account or store. --agent names the agent
+(default: the harness name).
 ";
 
 #[derive(Debug)]
@@ -290,12 +291,8 @@ fn parse(args: &[OsString]) -> Result<(Command, Opts), CliError> {
             }
         }
         Command::List => {
-            if !opts.positional.is_empty()
-                || opts.any_scope()
-                || opts.account.is_some()
-                || opts.agent.is_some()
-            {
-                return Err(CliError::new("list takes only --store"));
+            if !opts.positional.is_empty() || opts.any_scope() || opts.agent.is_some() {
+                return Err(CliError::new("list takes only --store and --account"));
             }
         }
         Command::Grant | Command::Revoke => {
@@ -385,14 +382,18 @@ fn open_store(opts: &Opts, io: &Io<'_>) -> Result<(PathBuf, Store), CliError> {
             ));
         }
     };
+    open_store_at(&path, io)
+}
+
+fn open_store_at(path: &Path, io: &Io<'_>) -> Result<(PathBuf, Store), CliError> {
     if !path.is_file() {
         return Err(CliError::new(format!(
             "no Fell mailbox at {}. Connect mail first with `fell account setup`",
-            io.env.display(&path)
+            io.env.display(path)
         )));
     }
-    let path = std::path::absolute(&path)?;
-    let store = Store::open(&path).map_err(store_err)?;
+    let path = std::path::absolute(path)?;
+    let store = Store::open_existing(&path).map_err(store_err)?;
     store.finish_cid_repair().map_err(store_err)?;
     Ok((path, store))
 }
@@ -419,7 +420,105 @@ fn registry_store(
             CliError::new("No readable account configuration. Try `fell account list`.")
         })?,
     };
-    Ok(registry.store_path(base, &config.id))
+    registry
+        .store_path(base, &config.id)
+        .map_err(|err| CliError::new(err.to_string()))
+}
+
+// Explicit paths keep the standalone and shared-store behavior. A registry
+// operation visits account files even if a sibling configuration is broken.
+fn grant_stores(opts: &Opts, io: &Io<'_>) -> Result<Vec<(Option<AccountId>, Store)>, CliError> {
+    if opts.store.is_none()
+        && let (Some(registry), Some(base)) = (&io.registry, &io.default_store)
+        && registry.directory().exists()
+    {
+        let catalog = registry.load();
+        let mut stores = Vec::new();
+        let mut found = opts.account.is_none();
+        for entry in catalog.entries {
+            let Some(id) = entry.path.file_stem().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if fell_core::accounts::validate_id(id).is_err()
+                || opts
+                    .account
+                    .as_deref()
+                    .is_some_and(|selected| selected != id)
+            {
+                continue;
+            }
+            found = true;
+            let path = registry
+                .store_path(base, id)
+                .map_err(|err| CliError::new(err.to_string()))?;
+            if path.is_file() || opts.account.is_some() {
+                stores.push((Some(AccountId(id.to_owned())), open_store_at(&path, io)?.1));
+            }
+        }
+        if !found {
+            return Err(CliError::new(format!(
+                "unknown account {}",
+                opts.account.as_deref().unwrap_or_default()
+            )));
+        }
+        return Ok(stores);
+    }
+    Ok(vec![(
+        opts.account.clone().map(AccountId),
+        open_store(opts, io)?.1,
+    )])
+}
+
+fn grant_rows(store: &Store, account: Option<&AccountId>) -> Result<Vec<AgentSummary>, CliError> {
+    let mut rows = store.list_agent_grants().map_err(store_err)?;
+    if let Some(account) = account {
+        rows.retain(|row| &row.account_id == account);
+    }
+    Ok(rows)
+}
+
+fn set_grant(
+    opts: &Opts,
+    io: &Io<'_>,
+    store: &Store,
+    account: &AccountId,
+    agent: &str,
+    grant: AgentGrant,
+) -> Result<(), CliError> {
+    let _registry_lock = if opts.store.is_none()
+        && let Some(registry) = &io.registry
+        && registry.directory().exists()
+    {
+        let lock = registry
+            .lock()
+            .map_err(|err| CliError::new(err.to_string()))?;
+        registry
+            .get(account)
+            .map_err(|err| CliError::new(err.to_string()))?
+            .ok_or_else(|| CliError::new(format!("unknown account {}", account.as_str())))?;
+        Some(lock)
+    } else {
+        None
+    };
+    store
+        .set_agent_grant(account, agent, grant)
+        .map_err(store_err)
+}
+
+fn revoke_hint(io: &Io<'_>, agent: &str, account: &AccountId) -> String {
+    let target = if io
+        .registry
+        .as_ref()
+        .is_some_and(|registry| registry.load().entries.len() > 1)
+    {
+        format!(" --account {}", account.as_str())
+    } else {
+        String::new()
+    };
+    format!(
+        "Revoke any time with `{} revoke {agent}{target}`.",
+        self_command(io)
+    )
 }
 
 fn ask(io: &mut Io<'_>, question: &str, default: bool) -> Result<bool, CliError> {
@@ -613,26 +712,16 @@ fn add(opts: &Opts, io: &mut Io<'_>) -> Result<(), CliError> {
     } else {
         AgentGrant::enabled(true, false, true)
     };
-    store
-        .set_agent_grant(&account.id, &agent, grant)
-        .map_err(store_err)?;
+    set_grant(opts, io, &store, &account.id, &agent, grant)?;
     writeln!(
         io.err,
         "Granted {agent} {} on {}. It cannot send mail.",
         scope_names(grant),
         account_label(&account)
     )?;
-    let spec = server_spec(
-        io,
-        (opts.store.is_some() || io.registry.is_none()).then_some(store_path.as_path()),
-        &account.id,
-        &agent,
-    )?;
+    let spec = server_spec(io, Some(store_path.as_path()), &account.id, &agent)?;
     let snippet = setup::snippet(harness, &spec);
-    let revoke_hint = format!(
-        "Revoke any time with `{} revoke {agent}`.",
-        self_command(io)
-    );
+    let revoke_hint = revoke_hint(io, &agent, &account.id);
 
     let Some(config) = harness.config_path(&io.env) else {
         if harness.edits_config() {
@@ -736,8 +825,13 @@ fn ago(now: i64, then: i64) -> String {
 }
 
 fn list(opts: &Opts, io: &mut Io<'_>) -> Result<(), CliError> {
-    let (_, store) = open_store(opts, io)?;
-    let rows = store.list_agent_grants().map_err(store_err)?;
+    let mut rows = Vec::new();
+    for (account, store) in grant_stores(opts, io)? {
+        rows.extend(grant_rows(&store, account.as_ref())?);
+    }
+    rows.sort_by(|a, b| {
+        (&a.agent_id, a.account_id.as_str()).cmp(&(&b.agent_id, b.account_id.as_str()))
+    });
     if rows.is_empty() {
         writeln!(
             io.out,
@@ -791,56 +885,62 @@ fn grant(opts: &Opts, io: &mut Io<'_>) -> Result<(), CliError> {
     };
     let grant =
         AgentGrant::enabled(opts.read, opts.triage, opts.draft).with_annotation(opts.annotate);
-    store
-        .set_agent_grant(&account, agent, grant)
-        .map_err(store_err)?;
+    set_grant(opts, io, &store, &account, agent, grant)?;
     writeln!(
         io.err,
         "Granted {agent} {} on {}.",
         scope_names(grant),
         account.as_str()
     )?;
+    if io
+        .registry
+        .as_ref()
+        .is_some_and(|registry| registry.load().entries.len() > 1)
+    {
+        writeln!(io.err, "{}", revoke_hint(io, agent, &account))?;
+    }
     Ok(())
 }
 
 fn revoke(opts: &Opts, io: &mut Io<'_>) -> Result<(), CliError> {
     let agent = opts.agent.as_deref().unwrap_or_default();
-    let (_, store) = open_store(opts, io)?;
-    let accounts: Vec<AccountId> = match &opts.account {
-        Some(id) => vec![AccountId(id.clone())],
-        None => {
-            let rows: Vec<_> = store
-                .list_agent_grants()
-                .map_err(store_err)?
-                .into_iter()
-                .filter(|row| row.agent_id == agent)
-                .collect();
-            if rows.is_empty() {
-                return Err(CliError::new(format!(
-                    "no agent named {agent} (`{} list` shows them)",
-                    self_command(io)
-                )));
-            }
-            if rows.iter().all(|row| !row.grant.enabled) {
-                writeln!(io.err, "{agent} is already revoked.")?;
-                return Ok(());
-            }
-            rows.into_iter()
-                .filter(|row| row.grant.enabled)
-                .map(|row| row.account_id)
-                .collect()
+    let mut found = false;
+    let mut revoked = Vec::new();
+    for (account, store) in grant_stores(opts, io)? {
+        if let Some(id) = opts.account.as_ref() {
+            let id = AccountId(id.clone());
+            store
+                .set_agent_grant(&id, agent, AgentGrant::DISABLED)
+                .map_err(store_err)?;
+            revoked.push(id.0);
+            continue;
         }
-    };
-    for account in &accounts {
-        store
-            .set_agent_grant(account, agent, AgentGrant::DISABLED)
-            .map_err(store_err)?;
+        for row in grant_rows(&store, account.as_ref())? {
+            if row.agent_id == agent {
+                found = true;
+                if row.grant.enabled {
+                    store
+                        .set_agent_grant(&row.account_id, agent, AgentGrant::DISABLED)
+                        .map_err(store_err)?;
+                    revoked.push(row.account_id.0);
+                }
+            }
+        }
     }
-    let names: Vec<&str> = accounts.iter().map(AccountId::as_str).collect();
+    if revoked.is_empty() {
+        if found {
+            writeln!(io.err, "{agent} is already revoked.")?;
+            return Ok(());
+        }
+        return Err(CliError::new(format!(
+            "no agent named {agent} (`{} list` shows them)",
+            self_command(io)
+        )));
+    }
     writeln!(
         io.err,
         "Revoked {agent} on {}. Running sessions get no tools from their next call.",
-        names.join(", ")
+        revoked.join(", ")
     )?;
     Ok(())
 }
