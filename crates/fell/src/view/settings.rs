@@ -1158,7 +1158,7 @@ pub(super) fn card(
                                     theme,
                                     "remove-account",
                                     "Remove",
-                                    KeyId::Char('d'),
+                                    crate::model::settings::REMOVE_ACCOUNT_KEY,
                                     false,
                                     true,
                                     live,

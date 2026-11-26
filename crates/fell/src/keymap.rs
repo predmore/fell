@@ -756,6 +756,13 @@ pub fn palette_items(keymap: &Keymap, query: &str, recent: &[Action]) -> Vec<Pal
 }
 
 pub fn binding_text(keymap: &Keymap, action: Action) -> String {
+    if action == Action::Setting(SettingsRow::RemoveAccount) {
+        let key = key_label(
+            crate::model::settings::REMOVE_ACCOUNT_KEY,
+            &keymap.leader_name,
+        );
+        return format!("{key} in Accounts");
+    }
     keymap
         .bindings_for(action)
         .iter()

@@ -1,6 +1,8 @@
 use crate::keymap::{self, Action, KeyId, Keymap};
 use crate::settings::{Edit, Preference};
 
+pub const REMOVE_ACCOUNT_KEY: KeyId = KeyId::Char('d');
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
     Accounts,

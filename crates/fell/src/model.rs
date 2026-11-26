@@ -1073,9 +1073,15 @@ impl Session {
     }
 
     pub fn which_items(&self) -> Vec<WhichItem> {
-        keymap::which_key_filtered(&self.keymap, &self.chord, |action| {
-            action != Action::AccountPicker || self.account_choices.len() > 1
-        })
+        keymap::which_key_filtered(&self.keymap, &self.chord, |action| self.discovers(action))
+    }
+
+    pub fn discovers(&self, action: Action) -> bool {
+        match action {
+            Action::Setting(row) => self.settings_nav.availability.shows(row),
+            Action::AccountPicker => self.account_choices.len() > 1,
+            _ => true,
+        }
     }
 
     pub fn palette(&self) -> Vec<PaletteItem> {
@@ -1090,11 +1096,7 @@ impl Session {
                 &self.palette_query,
                 &self.recent,
             ))
-            .filter(|item| match item.action {
-                Action::Setting(row) => self.settings_nav.availability.shows(row),
-                Action::AccountPicker => self.account_choices.len() > 1,
-                _ => true,
-            })
+            .filter(|item| self.discovers(item.action))
             .collect()
     }
 
@@ -2292,7 +2294,9 @@ impl Session {
                 ..Step::default()
             };
         }
-        if key == KeyId::Char('d') && matches!(self.settings_nav.row(), Some(Row::Account(_))) {
+        if key == settings::REMOVE_ACCOUNT_KEY
+            && matches!(self.settings_nav.row(), Some(Row::Account(_)))
+        {
             return self.activate_setting(Row::RemoveAccount, page_rows);
         }
         if let Page::ConfirmModel { install } = self.settings_nav.page
