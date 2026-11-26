@@ -66,6 +66,7 @@ fn recovery_uid_range(first: u32, next: u32) -> Option<RangeInclusive<u32>> {
 /// Send every outbox row that is due. Returns what was sent and dropped.
 /// A connection that fails part way is in [`ReplayReport::interrupted`];
 /// what was settled before it stays settled.
+#[cfg(test)]
 pub(super) fn replay_with(
     config: &ImapConfig,
     account_id: &AccountId,
@@ -74,12 +75,32 @@ pub(super) fn replay_with(
     append_sent: bool,
     before_send: &dyn Fn(),
 ) -> crate::Result<ReplayReport> {
+    replay_bound(
+        config,
+        account_id,
+        store,
+        write_back,
+        append_sent,
+        before_send,
+        None,
+    )
+}
+
+pub(super) fn replay_bound(
+    config: &ImapConfig,
+    account_id: &AccountId,
+    store: &Store,
+    write_back: bool,
+    append_sent: bool,
+    before_send: &dyn Fn(),
+    expected: Option<&crate::AccountConfig>,
+) -> crate::Result<ReplayReport> {
     // A second pass must not check for absence while a MOVE is on the wire.
     let guard = store.try_lock_mailbox_operation(".write-back")?;
     if guard.is_none() && store.db_path().is_some() {
         return Ok(ReplayReport::default());
     }
-    let mut entries = outbox::unfinished(store, account_id, write_back)?;
+    let mut entries = outbox::unfinished(store, account_id, write_back, expected)?;
     if !append_sent {
         entries.retain(|entry| entry.kind != OutboxKind::AppendSent);
     }

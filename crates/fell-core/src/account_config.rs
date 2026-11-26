@@ -684,18 +684,12 @@ impl AccountConfig {
     /// delete mark and report server copies left in place.
     pub fn replay_outbox(&self, store: &crate::Store) -> Result<crate::ReplayReport> {
         let account_id = AccountId(self.id.clone());
-        if !store.matches_imap_endpoint(self)? {
+        if !store.matches_imap_connection(self)? {
             return Ok(crate::ReplayReport::default());
         }
         let append_sent = self.append_sent();
         let report = if crate::outbox::any_due(store, &account_id, self.write_back, append_sent)? {
-            crate::imap::replay_outbox(
-                &self.imap_config()?,
-                &account_id,
-                store,
-                self.write_back,
-                append_sent,
-            )?
+            crate::imap::replay_account_outbox(self, &account_id, store)?
         } else {
             crate::ReplayReport::default()
         };

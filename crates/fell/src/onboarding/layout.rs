@@ -413,6 +413,9 @@ impl Onboarding {
                             .truncate()
                             .child(self.form.text(Field::Email).trim().to_owned()),
                     ))
+                    .when(self.form.failed_check, |column| column.child(
+                        self.error(self.form.failed_check_warning(), Some("You can return to Edit connection to fix them.")),
+                    ))
                     .child(
                         self.feedback.save_note.paint(false, |state, _| match state {
                             SaveState::Ready if self.form.retained_mailbox.is_some() =>
@@ -427,9 +430,7 @@ impl Onboarding {
                             ),
                             SaveState::Failed { title, detail } => self.error(title, detail.as_deref()),
                         }).min_h(px((self.theme.ui_px + 4.) * 5.)),
-                    ).when(self.form.failed_check, |column| column.child(
-                        self.error(self.form.failed_check_warning(), Some("You can return to Edit connection to fix them.")),
-                    )),
+                    ),
                 [None, None],
             ),
         };
@@ -488,15 +489,19 @@ impl Onboarding {
                             .paint(false, |detail, _| self.meta(*detail)),
                     )
                 };
-                let measures = SaveState::HEADINGS
-                    .into_iter()
-                    .map(|(title, detail)| self.heading(title, detail))
-                    .chain(
-                        reconnect_email
-                            .as_ref()
-                            .map(|email| self.reconnect_heading(email)),
-                    );
-                self.reserved_heading(measures, heading)
+                if self.form.previous.is_some() {
+                    heading
+                } else {
+                    let measures = SaveState::HEADINGS
+                        .into_iter()
+                        .map(|(title, detail)| self.heading(title, detail))
+                        .chain(
+                            reconnect_email
+                                .as_ref()
+                                .map(|email| self.reconnect_heading(email)),
+                        );
+                    self.reserved_heading(measures, heading)
+                }
             }
             _ => self.heading(title, detail),
         };

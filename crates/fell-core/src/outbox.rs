@@ -1208,8 +1208,14 @@ pub(crate) fn unfinished(
     store: &Store,
     account_id: &AccountId,
     write_back: bool,
+    expected: Option<&crate::AccountConfig>,
 ) -> Result<Vec<OutboxEntry>> {
     let tx = crate::store::immediate_transaction(store.connection())?;
+    if let Some(config) = expected
+        && !crate::store::matches_imap_connection(&tx, config)?
+    {
+        return Ok(Vec::new());
+    }
     ensure_schema(&tx)?;
     let allow_writes = i64::from(write_back && enabled(&tx, account_id)?);
     tx.execute(

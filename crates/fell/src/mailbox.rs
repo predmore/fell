@@ -418,6 +418,10 @@ pub(crate) fn stage_connection_config(
         }
         let next = next_account_id_at(&registry, &base)?;
         let previous = std::mem::replace(&mut config.id, next);
+        config.identities.clear();
+        config.folders.clear();
+        config.save_sent = Default::default();
+        config.write_back = false;
         if let Some((_, snapshot, _)) = &current {
             keep = Some((previous, snapshot.clone()));
         }

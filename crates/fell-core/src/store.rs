@@ -859,11 +859,8 @@ impl Store {
         Ok(login.is_none_or(|login| login == username))
     }
 
-    pub(crate) fn matches_imap_endpoint(&self, config: &crate::AccountConfig) -> Result<bool> {
-        Ok(
-            read_meta(&self.conn, &imap_binding_key(config, "endpoint"))?
-                .is_none_or(|endpoint| endpoint == config.imap_endpoint_key()),
-        )
+    pub(crate) fn matches_imap_connection(&self, config: &crate::AccountConfig) -> Result<bool> {
+        matches_imap_connection(&self.conn, config)
     }
 
     pub fn get_account(&self, id: &AccountId) -> Result<Option<Account>> {
@@ -3065,6 +3062,16 @@ fn delete_demo_account(conn: &Connection, id: &str) -> Result<()> {
 
 fn imap_binding_key(config: &crate::AccountConfig, field: &str) -> String {
     format!("imap:{field}:{}", config.id)
+}
+
+pub(crate) fn matches_imap_connection(
+    conn: &Connection,
+    config: &crate::AccountConfig,
+) -> Result<bool> {
+    Ok(read_meta(conn, &imap_binding_key(config, "endpoint"))?
+        .is_none_or(|endpoint| endpoint == config.imap_endpoint_key())
+        && read_meta(conn, &imap_binding_key(config, "login"))?
+            .is_none_or(|login| login == config.username))
 }
 
 /// Start reading the changed endpoint without reusing the old UID namespace.
@@ -5309,7 +5316,10 @@ mod tests {
         let mut edited = config.clone();
         edited.smtp_port = Some(2525);
         store.configure_connection(&edited).unwrap();
-        assert_eq!(store.outbox(&account).unwrap(), [original.clone()]);
+        assert_eq!(
+            store.outbox(&account).unwrap(),
+            std::slice::from_ref(&original)
+        );
         assert!(store.sync_cursor(&account).unwrap().is_some());
 
         edited.port += 1;
@@ -5320,7 +5330,7 @@ mod tests {
         store.configure_connection(&edited).unwrap();
         let mut held = original;
         held.state = OutboxState::Held;
-        assert_eq!(store.outbox(&account).unwrap(), [held.clone()]);
+        assert_eq!(store.outbox(&account).unwrap(), std::slice::from_ref(&held));
         assert!(store.sync_cursor(&account).unwrap().is_none());
         assert!(store.write_back(&account).unwrap());
         assert_eq!(

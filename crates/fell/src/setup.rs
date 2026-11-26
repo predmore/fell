@@ -373,7 +373,6 @@ fn setup(args: &[String]) -> Result<(), String> {
         if entered.is_none() {
             return Err("Enter a password for the new mailbox.".into());
         }
-        config.identities.clear();
     }
     if !matches!(&config.password, PasswordSource::Inline(password) if !password.is_empty())
         && flags.password_inline

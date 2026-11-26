@@ -172,6 +172,7 @@ impl Drop for BatchLimitGuard {
 
 /// Send the account's queued writes ([`crate::outbox`]) on
 /// a separate `SELECT` session.
+#[cfg(test)]
 pub(crate) fn replay_outbox(
     config: &ImapConfig,
     account_id: &AccountId,
@@ -180,6 +181,22 @@ pub(crate) fn replay_outbox(
     append_sent: bool,
 ) -> Result<crate::outbox::ReplayReport, Error> {
     write_back::replay_with(config, account_id, store, write_back, append_sent, &|| {})
+}
+
+pub(crate) fn replay_account_outbox(
+    config: &crate::AccountConfig,
+    account_id: &AccountId,
+    store: &crate::Store,
+) -> Result<crate::ReplayReport, Error> {
+    write_back::replay_bound(
+        &config.imap_config()?,
+        account_id,
+        store,
+        config.write_back,
+        config.append_sent(),
+        &|| {},
+        Some(config),
+    )
 }
 
 /// Log in, count selectable mailboxes, and log out. Reads no mail.

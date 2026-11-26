@@ -1167,6 +1167,9 @@ mod tests {
 
         // A keyring-only password change publishes a new file with the same
         // parsed settings. The file identity still has to trigger a reload.
+        let reopened_store = reloaded.read_with(&app, |inbox, _| inbox.store.clone());
+        futures::executor::block_on(reopened_store.call(|_| ())).unwrap();
+        app.run_until_parked();
         let (mut unchanged, identity) = registry
             .get_with_identity(&fell_core::AccountId("work".into()))
             .unwrap()
@@ -1187,6 +1190,7 @@ mod tests {
             })
             .unwrap();
         app.run_until_parked();
+        assert!(futures::executor::block_on(reopened_store.call(|_| ())).is_err());
         window
             .update(&mut app, |view, _, cx| {
                 assert_ne!(view.active(), reloaded);

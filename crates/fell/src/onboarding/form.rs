@@ -544,9 +544,6 @@ impl Form {
         }
         config.email = email.into();
         config.username = username.into();
-        if self.replacement() {
-            config.identities.clear();
-        }
         if self.provider == Provider::Custom {
             config.backend = BackendKind::Imap;
         }
