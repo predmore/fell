@@ -58,6 +58,7 @@ pub struct Activity {
     pub generation: u64,
     pub page_revision: u64,
     pub pending: bool,
+    pub pending_bulk_undo: Option<i64>,
     pub loading_slow: bool,
     pub load_failed: bool,
     pub confirmation: Option<Confirmation>,
@@ -88,13 +89,21 @@ impl Activity {
 
     fn start(&mut self, request: Request) -> Request {
         self.pending = true;
+        self.pending_bulk_undo = match &request {
+            Request::Undo {
+                id,
+                confirmed_bulk: Some(_),
+                ..
+            } => Some(*id),
+            _ => None,
+        };
+        self.loading_slow = false;
         self.generation = self.generation.wrapping_add(1);
         request
     }
 
     fn load(&mut self, direction: ActivityDirection) -> Request {
         self.load_failed = false;
-        self.loading_slow = false;
         self.start(Request::Load {
             account: self.account.clone(),
             filter: self.filter.clone(),
