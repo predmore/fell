@@ -1734,11 +1734,12 @@ impl Flow {
                     })
                     .fold(0., f32::max)
             }
-            FlowKind::Block => {
+            FlowKind::Block | FlowKind::InlineBlock | FlowKind::Cell | FlowKind::BlockCell => {
+                let collapses_through_edges = self.kind == FlowKind::Block;
                 let mut previous = 0_f32;
                 let mut height = 0.;
                 for (index, line) in self.inline_lines(available, image_limit).enumerate() {
-                    if index == 0 && top == 0. {
+                    if index == 0 && collapses_through_edges && top == 0. {
                         measured.above = measured.above.max(line.above);
                     } else {
                         height += previous.max(line.above);
@@ -1746,17 +1747,17 @@ impl Flow {
                     height += line.height;
                     previous = line.below;
                 }
-                if bottom == 0. && self.height == 0. && self.min_height == 0. {
+                if collapses_through_edges
+                    && bottom == 0.
+                    && self.height == 0.
+                    && self.min_height == 0.
+                {
                     measured.below = measured.below.max(previous);
                     height
                 } else {
                     height + previous
                 }
             }
-            FlowKind::InlineBlock | FlowKind::Cell | FlowKind::BlockCell => self
-                .inline_lines(available, image_limit)
-                .map(|line| line.outer_height())
-                .sum(),
             FlowKind::Stacked | FlowKind::Table => {
                 let table = self.kind == FlowKind::Table;
                 let width = if table {

@@ -728,6 +728,15 @@ impl Reader {
     }
 
     fn start(&mut self, key: Key, cx: &mut Context<Inbox>) {
+        self.start_with(key, cx, webview::render);
+    }
+
+    fn start_with<F: Future<Output = webview::RenderResult> + 'static>(
+        &mut self,
+        key: Key,
+        cx: &mut Context<Inbox>,
+        render: impl FnOnce(WebRequest) -> F + 'static,
+    ) {
         if self
             .pending
             .as_ref()
@@ -756,7 +765,7 @@ impl Reader {
                     }
                 })
                 .await;
-            let picture = webview::render(WebRequest {
+            let picture = render(WebRequest {
                 html,
                 width,
                 background,
@@ -771,17 +780,19 @@ impl Reader {
                 {
                     return;
                 }
-                if picture.is_some()
-                    && let Some(log) = &inbox.frames
-                {
-                    log.borrow_mut().note("web_snapshot", 1.0);
-                }
-                reader.cache.push_back(Cached {
-                    key: install,
-                    picture,
-                    image_failure,
-                });
                 reader.pending = None;
+                if let Ok(picture) = picture {
+                    if picture.is_some()
+                        && let Some(log) = &inbox.frames
+                    {
+                        log.borrow_mut().note("web_snapshot", 1.0);
+                    }
+                    reader.cache.push_back(Cached {
+                        key: install,
+                        picture,
+                        image_failure,
+                    });
+                }
                 cx.notify();
             });
         });
@@ -1184,6 +1195,8 @@ impl Inbox {
                 self.persist_html_choice(sender, action, next, cx);
             } else if next {
                 self.web_mail.show_web_for(id.to_owned(), None, body);
+            } else {
+                self.web_mail.show_native_for.insert(id.to_owned());
             }
         } else if action == Action::AllowMessageImages {
             self.web_mail
@@ -1542,6 +1555,111 @@ mod tests {
             document_height: 1.,
             last_row_color: 0,
         }
+    }
+
+    #[test]
+    fn switching_accounts_reschedules_a_superseded_snapshot() {
+        let worker = Rc::new(webview::TestWorker::default());
+        let (mut first_app, first) = super::super::tests::pending_inbox();
+        let (mut second_app, second) = super::super::tests::pending_inbox();
+        let first_key = Key {
+            id: "first-account".into(),
+            sender: None,
+            mail: Arc::new(WebMail::prepare("<p>First account</p>")),
+            width: 440,
+            scheme: "light",
+            background: 0xffffff,
+            images: false,
+        };
+        let second_key = Key {
+            id: "second-account".into(),
+            mail: Arc::new(WebMail::prepare("<p>Second account</p>")),
+            ..first_key.clone()
+        };
+        let request = |reader: &mut Reader, key: &Key, cx: &mut Context<Inbox>| {
+            let key = reader.next_snapshot(std::slice::from_ref(key)).unwrap();
+            let worker = worker.clone();
+            reader.start_with(key.clone(), cx, move |request| async move {
+                worker.render(request).await
+            });
+        };
+
+        first
+            .update(&mut first_app, |inbox, _, cx| {
+                request(&mut inbox.web_mail, &first_key, cx);
+            })
+            .unwrap();
+        first_app.run_until_parked();
+        worker.start_next();
+
+        second
+            .update(&mut second_app, |inbox, _, cx| {
+                request(&mut inbox.web_mail, &second_key, cx);
+            })
+            .unwrap();
+        second_app.run_until_parked();
+        worker.start_next();
+        worker.finish(snapshot());
+        second_app.run_until_parked();
+
+        first_app.run_until_parked();
+        first
+            .update(&mut first_app, |inbox, _, cx| {
+                assert!(inbox.web_mail.pending.is_none());
+                assert!(inbox.web_mail.entry(&first_key).is_none());
+                request(&mut inbox.web_mail, &first_key, cx);
+            })
+            .unwrap();
+        first_app.run_until_parked();
+        worker.start_next();
+        worker.finish(snapshot());
+        first_app.run_until_parked();
+
+        first
+            .update(&mut first_app, |inbox, _, _| {
+                assert!(inbox.web_mail.image(&first_key).is_some());
+            })
+            .unwrap();
+        second
+            .update(&mut second_app, |inbox, _, _| {
+                assert!(inbox.web_mail.image(&second_key).is_some());
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn toggle_web_uses_a_message_override_without_a_sender_key() {
+        super::super::tests::with_pending_inbox(|inbox, cx| {
+            split_view(inbox);
+            for email in ["unknown", "a b@example.test", "a@café.test"] {
+                let mut messages = inbox.session.messages.as_slice().to_vec();
+                messages[0].email = email.into();
+                let mut body = crate::mail_body::prepare_html("<p>News</p>", &[]);
+                body.suggested = RenderMode::Web;
+                messages[0].rich = Rich::Html(Arc::new(body));
+                inbox.session.set_messages(messages.into());
+
+                assert!(
+                    inbox
+                        .web_mail
+                        .prefers_message_web(&inbox.session.messages[0])
+                );
+                inbox.html_reading_action("older", Action::ToggleWebView, cx);
+                assert!(
+                    !inbox
+                        .web_mail
+                        .prefers_message_web(&inbox.session.messages[0])
+                );
+                inbox.html_reading_action("older", Action::ToggleWebView, cx);
+                assert!(
+                    inbox
+                        .web_mail
+                        .prefers_message_web(&inbox.session.messages[0])
+                );
+                assert!(inbox.web_mail.preferences.is_empty());
+                inbox.web_mail.close_thread();
+            }
+        });
     }
 
     #[test]

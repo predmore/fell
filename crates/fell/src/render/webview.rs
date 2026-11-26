@@ -50,16 +50,26 @@ impl WebRequest {
 
 struct Job {
     request: WebRequest,
-    reply: oneshot::Sender<Snapshot>,
+    reply: Reply,
 }
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Superseded;
+
+pub(crate) type RenderResult = Result<Option<Snapshot>, Superseded>;
+type Reply = oneshot::Sender<RenderResult>;
 
 #[derive(Default)]
 struct JobQueue(Mutex<Option<Job>>);
 
 impl JobQueue {
-    fn submit(&self, job: Job) {
-        let superseded = self.0.lock().unwrap().replace(job);
-        drop(superseded);
+    fn submit(&self, request: WebRequest) -> oneshot::Receiver<RenderResult> {
+        let (reply, done) = oneshot::channel();
+        let superseded = self.0.lock().unwrap().replace(Job { request, reply });
+        if let Some(job) = superseded {
+            let _ = job.reply.send(Err(Superseded));
+        }
+        done
     }
 
     fn next(&self) -> Option<Job> {
@@ -78,10 +88,21 @@ struct Worker {
 }
 
 struct Load {
-    reply: oneshot::Sender<Snapshot>,
+    reply: Reply,
     cancel: gtk::gio::Cancellable,
     settling: bool,
     background: u32,
+}
+
+impl Load {
+    fn new(reply: Reply, background: u32) -> Self {
+        Self {
+            reply,
+            cancel: gtk::gio::Cancellable::new(),
+            settling: false,
+            background,
+        }
+    }
 }
 
 type Active = Rc<RefCell<Option<Load>>>;
@@ -117,18 +138,21 @@ pub(crate) fn prewarm() {
     worker();
 }
 
-pub(crate) async fn render(request: WebRequest) -> Option<Snapshot> {
-    let (reply, done) = oneshot::channel();
-    let worker = worker()?;
+pub(crate) async fn render(request: WebRequest) -> RenderResult {
+    let Some(worker) = worker() else {
+        return Ok(None);
+    };
     let budget = request.load_budget();
-    worker.queue.submit(Job { request, reply });
-    worker.wake.send(()).ok()?;
+    let done = worker.queue.submit(request);
+    if worker.wake.send(()).is_err() {
+        return Ok(None);
+    }
     // The worker can fail during setup, before GLib attaches its receiver.
     // Bound the wait even when GLib keeps an already queued request alive.
     let timeout = async_io::Timer::after(budget + Duration::from_secs(2));
     match futures::future::select(done, timeout).await {
-        futures::future::Either::Left((result, _)) => result.ok(),
-        futures::future::Either::Right(_) => None,
+        futures::future::Either::Left((result, _)) => result.unwrap_or(Ok(None)),
+        futures::future::Either::Right(_) => Ok(None),
     }
 }
 
@@ -168,7 +192,7 @@ fn run(rx: glib::Receiver<()>, queue: Arc<JobQueue>) -> Result<(), Box<dyn std::
     });
     widget.connect_web_process_terminated({
         let active = active.clone();
-        move |_, _| cancel(&active)
+        move |_, _| stop_load(&active, Ok(None))
     });
     window.show_all();
     // Prepare GTK and the content filter during prewarm. Let the first job
@@ -177,7 +201,7 @@ fn run(rx: glib::Receiver<()>, queue: Arc<JobQueue>) -> Result<(), Box<dyn std::
         let Some(job) = queue.next() else {
             return glib::ControlFlow::Continue;
         };
-        cancel(&active);
+        stop_load(&active, Err(Superseded));
         widget.stop_loading();
         let budget = job.request.load_budget();
         let WebRequest {
@@ -207,13 +231,9 @@ fn run(rx: glib::Receiver<()>, queue: Arc<JobQueue>) -> Result<(), Box<dyn std::
             channel(0),
             1.0,
         ));
-        let cancellable = gtk::gio::Cancellable::new();
-        *active.borrow_mut() = Some(Load {
-            reply: job.reply,
-            cancel: cancellable.clone(),
-            settling: false,
-            background,
-        });
+        let load = Load::new(job.reply, background);
+        let cancellable = load.cancel.clone();
+        *active.borrow_mut() = Some(load);
         widget.load_html(&html, None);
         glib::timeout_add_local_once(budget, {
             let active = active.clone();
@@ -224,7 +244,7 @@ fn run(rx: glib::Receiver<()>, queue: Arc<JobQueue>) -> Result<(), Box<dyn std::
                     .as_ref()
                     .is_some_and(|load| load.cancel == cancellable)
                 {
-                    cancel(&active);
+                    stop_load(&active, Ok(None));
                     if let Some(widget) = widget.upgrade() {
                         widget.stop_loading();
                     }
@@ -237,10 +257,36 @@ fn run(rx: glib::Receiver<()>, queue: Arc<JobQueue>) -> Result<(), Box<dyn std::
     Ok(())
 }
 
-fn cancel(active: &Active) {
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TestWorker {
+    queue: JobQueue,
+    active: Active,
+}
+
+#[cfg(test)]
+impl TestWorker {
+    pub(crate) async fn render(&self, request: WebRequest) -> RenderResult {
+        self.queue.submit(request).await.unwrap()
+    }
+
+    pub(crate) fn start_next(&self) {
+        let job = self.queue.next().expect("queued snapshot");
+        stop_load(&self.active, Err(Superseded));
+        *self.active.borrow_mut() = Some(Load::new(job.reply, job.request.background));
+    }
+
+    pub(crate) fn finish(&self, snapshot: Snapshot) {
+        let load = self.active.borrow_mut().take().expect("in-flight snapshot");
+        assert!(load.reply.send(Ok(Some(snapshot))).is_ok());
+    }
+}
+
+fn stop_load(active: &Active, result: RenderResult) {
     let old = active.borrow_mut().take();
     if let Some(load) = old {
         load.cancel.cancel();
+        let _ = load.reply.send(result);
     }
 }
 
@@ -270,7 +316,7 @@ fn wait_for_images(widget: &webkit2gtk::WebView, active: Active, token: gtk::gio
             for (const image of images) {
                 if (image.loading === 'lazy') image.loading = 'eager';
             }
-            if (images.some(image => !image.complete)) return [0];
+            if (images.some(image => !image.complete)) return 0;
             for (const image of images) {
                 // Use the same placeholder for missing and damaged bytes.
                 if (image.naturalWidth === 0) image.setAttribute('src', '');
@@ -290,23 +336,7 @@ fn wait_for_images(widget: &webkit2gtk::WebView, active: Active, token: gtk::gio
                     context.getImageData(0, 0, 1, 1);
                 }
             }
-            // Keep the padding along the last visible flow of the email.
-            // A nested table or footer can supply it instead of the body.
-            const limit = 64;
-            let bottom = parseFloat(getComputedStyle(document.documentElement).paddingBottom) || 0;
-            for (let node = document.body; node && bottom < limit;) {
-                bottom += parseFloat(getComputedStyle(node).paddingBottom) || 0;
-                let child = node.lastElementChild;
-                while (child) {
-                    const style = getComputedStyle(child);
-                    if (style.position !== 'absolute' && style.position !== 'fixed' &&
-                        style.visibility !== 'hidden' && child.getBoundingClientRect().height > 0) break;
-                    child = child.previousElementSibling;
-                }
-                node = child;
-            }
-            const height = Math.max(document.documentElement.scrollHeight, document.body.scrollHeight);
-            return [Math.max(1, height), Math.ceil(Math.min(limit, bottom))];
+            return Math.max(1, document.documentElement.scrollHeight, document.body.scrollHeight);
         })();
     "#;
     if token.is_cancelled() {
@@ -321,21 +351,14 @@ fn wait_for_images(widget: &webkit2gtk::WebView, active: Active, token: gtk::gio
             if token.is_cancelled() {
                 return;
             }
-            let result = result.ok().and_then(|result| result.js_value());
-            let result_at = |index| {
-                result
-                    .as_ref()?
-                    .object_get_property_at_index(index)
-                    .map(|value| value.to_int32())
-            };
-            match result_at(0) {
+            let height = result.ok().and_then(|result| result.js_value());
+            match height.map(|value| value.to_int32()) {
                 Some(0) => {
                     glib::timeout_add_local_once(PAINT_SETTLE, move || {
                         wait_for_images(&view, active, token);
                     });
                 }
                 Some(height) if height > 0 => {
-                    let bottom_padding = result_at(1).unwrap_or(0) as u32;
                     let region = if height > SNAPSHOT_HEIGHT_LIMIT
                         && let Some(window) = view.toplevel().and_downcast::<gtk::Window>()
                     {
@@ -349,10 +372,10 @@ fn wait_for_images(widget: &webkit2gtk::WebView, active: Active, token: gtk::gio
                         webkit2gtk::SnapshotRegion::FullDocument
                     };
                     glib::timeout_add_local_once(PAINT_SETTLE, move || {
-                        capture(&view, active, token, (bottom_padding, height), region, true);
+                        capture(&view, active, token, height, region, true);
                     });
                 }
-                _ => cancel(&active),
+                _ => stop_load(&active, Ok(None)),
             }
         },
     );
@@ -362,7 +385,7 @@ fn capture(
     widget: &webkit2gtk::WebView,
     active: Active,
     token: gtk::gio::Cancellable,
-    (bottom_padding, document_height): (u32, i32),
+    document_height: i32,
     region: webkit2gtk::SnapshotRegion,
     retry: bool,
 ) {
@@ -380,33 +403,20 @@ fn capture(
             }
             let clipped = region == webkit2gtk::SnapshotRegion::Visible;
             let image = active.borrow().as_ref().and_then(|load| {
-                surface_image(
-                    result.ok()?,
-                    bottom_padding,
-                    load.background,
-                    clipped,
-                    document_height,
-                )
+                surface_image(result.ok()?, load.background, clipped, document_height)
             });
             match image {
                 Some(image) => {
                     if let Some(load) = active.borrow_mut().take() {
-                        let _ = load.reply.send(image);
+                        let _ = load.reply.send(Ok(Some(image)));
                     }
                 }
                 None if retry => {
                     glib::timeout_add_local_once(PAINT_SETTLE, move || {
-                        capture(
-                            &view,
-                            active,
-                            token,
-                            (bottom_padding, document_height),
-                            region,
-                            false,
-                        );
+                        capture(&view, active, token, document_height, region, false);
                     });
                 }
-                None => cancel(&active),
+                None => stop_load(&active, Ok(None)),
             }
         },
     );
@@ -536,7 +546,6 @@ fn install_filter(widget: &webkit2gtk::WebView) -> Result<(), Box<dyn std::error
 
 fn surface_image(
     surface: gtk::cairo::Surface,
-    bottom_padding: u32,
     background: u32,
     clipped: bool,
     document_height: i32,
@@ -593,14 +602,6 @@ fn surface_image(
             *r = ((u16::from(*r) * 255) / alpha) as u8;
         }
     }
-    let dst_h = if clipped {
-        dst_h
-    } else {
-        let keep = 12_u32.max(bottom_padding) * dst_h / height;
-        let backdrop = (background | 0xff000000).to_le_bytes();
-        super::native::trim_uniform_bottom(&bgra, dst_w, dst_h, keep, backdrop).clamp(1, dst_h)
-    };
-    bgra.truncate(dst_w as usize * dst_h as usize * 4);
     let last_row_color = if clipped {
         let mut colors = std::collections::HashMap::new();
         for &[b, g, r, _] in bgra[bgra.len() - dst_w_us * 4..].as_chunks::<4>().0 {
@@ -651,6 +652,7 @@ mod tests {
             width,
             background: 0xffffff,
         }))
+        .unwrap()
         .unwrap_or_else(|| panic!("WebKit painted {label}"));
         let estimate = mail.estimated_height(width as f32);
         let height = picture.height * width as f32 / picture.width;
@@ -662,21 +664,22 @@ mod tests {
     #[test]
     fn only_the_latest_queued_snapshot_is_loaded() {
         let queue = JobQueue::default();
-        let replies = ["first", "second", "third"].map(|html| {
-            let (reply, done) = oneshot::channel();
-            queue.submit(Job {
-                request: WebRequest {
-                    html: html.into(),
-                    width: 440,
-                    background: 0xffffff,
-                },
-                reply,
-            });
-            done
+        let [first, second, third] = ["first", "second", "third"].map(|html| {
+            queue.submit(WebRequest {
+                html: html.into(),
+                width: 440,
+                background: 0xffffff,
+            })
         });
+        for reply in [first, second] {
+            assert!(matches!(
+                futures::executor::block_on(reply),
+                Ok(Err(Superseded))
+            ));
+        }
         assert_eq!(queue.next().unwrap().request.html, "third");
         assert!(queue.next().is_none());
-        drop(replies);
+        drop(third);
     }
 
     #[test]
@@ -841,6 +844,7 @@ mod tests {
             width: 440,
             background: 0xffffff,
         }))
+        .unwrap()
         .expect("WebKit drew the hostile document");
         assert!(
             contains_display_color(&picture, [0x7a, 0x16, 0x3f]),
@@ -948,6 +952,7 @@ mod tests {
             )),
             ("retail", 600, include_str!("../../../fell-render/fixtures/corpus/esp-marketing.html").into()),
             ("ordinary newsletter", 680, include_str!("../../../fell-render/fixtures/web-newsletter.html").into()),
+            ("white article", 440, include_str!("../../../fell-render/fixtures/web-white-article.html").into()),
             ("long article", 440, format!(
                 r#"<article><h1 style="margin:0 0 12px">A walk along the lake</h1>{}</article>"#,
                 "<p>On Saturday the first ferry left the harbor just after sunrise. The new footpath now follows the water from the boat landing to the old railway bridge.</p>".repeat(18),
@@ -968,6 +973,7 @@ mod tests {
                         width,
                         background,
                     }))
+                    .unwrap()
                     .unwrap_or_else(|| panic!("WebKit painted {label}"));
                     let estimate = mail.estimated_height(width as f32);
                     let painted = picture.height * width as f32 / picture.width;
@@ -1004,6 +1010,7 @@ mod tests {
             width: 440,
             background: 0x24283b,
         }))
+        .unwrap()
         .expect("WebKit painted narrow dark mail");
         assert!(contains_display_color(&picture, [0x24, 0x28, 0x3b]));
         assert!(contains_display_color(&picture, [0x7a, 0x16, 0x3f]));
@@ -1054,15 +1061,17 @@ mod tests {
             estimate_covers_snapshot("body padding", &mail, 360).height
         };
         let default = padded(0);
-        assert_eq!(padded(24) - default, 12.);
-        assert_eq!(padded(400) - default, 52.);
-        eprintln!("white text page drew with its 24px bottom padding, capped at 64px");
+        assert_eq!(padded(24) - default, 24.);
+        assert_eq!(padded(400) - default, 400.);
 
         let blank = futures::executor::block_on(render(WebRequest {
             html: "<!doctype html><style>body { height: 240px; }</style>".into(),
             width: 360,
             background: 0xffffff,
         }));
-        assert!(blank.is_none(), "a uniform capture is a failed snapshot");
+        assert!(
+            blank.unwrap().is_none(),
+            "a uniform capture is a failed snapshot"
+        );
     }
 }

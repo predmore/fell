@@ -131,8 +131,13 @@ impl Reader {
             })
             .await;
             let _ = this.update(cx, |reader, cx| {
-                reader.web_failed = image.is_none();
-                reader.web_image = image;
+                match image {
+                    Ok(image) => {
+                        reader.web_failed = image.is_none();
+                        reader.web_image = image;
+                    }
+                    Err(webview::Superseded) => reader.web_key = None,
+                }
                 cx.notify();
             });
         }));
@@ -470,6 +475,7 @@ pub(crate) fn web_snapshot(
             gpui::img(snapshot.image.clone())
                 .w(px(width))
                 .h(px(height))
+                .rounded_md()
                 .object_fit(gpui::ObjectFit::Fill),
         )
         .when(snapshot.clipped, |image| {

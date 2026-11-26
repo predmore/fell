@@ -2940,41 +2940,6 @@ fn image_el(
     placeholder.into_any_element()
 }
 
-/// Trim only the empty backdrop below the page. Solid author colors can
-/// extend below the last line of text, for example in a newsletter hero.
-pub(crate) fn trim_uniform_bottom(
-    rgba: &[u8],
-    width: u32,
-    height: u32,
-    keep: u32,
-    backdrop: [u8; 4],
-) -> u32 {
-    let row_bytes = width as usize * 4;
-    if row_bytes == 0 || height == 0 || rgba.len() < row_bytes * height as usize {
-        return height;
-    }
-    let mut rows = height as usize;
-    while rows > 1 {
-        let start = (rows - 1) * row_bytes;
-        if !row_matches(&rgba[start..start + row_bytes], backdrop) {
-            break;
-        }
-        rows -= 1;
-    }
-    if rows == 1 && row_matches(&rgba[..row_bytes], backdrop) {
-        return height;
-    }
-    let flat = height as usize - rows;
-    (rows + flat.min(keep as usize)) as u32
-}
-
-fn row_matches(row: &[u8], backdrop: [u8; 4]) -> bool {
-    row.as_chunks::<4>()
-        .0
-        .iter()
-        .all(|pixel| pixel.iter().zip(backdrop).all(|(a, b)| a.abs_diff(b) <= 2))
-}
-
 /// A mail image or a web snapshot. Far below the image crate's 512MiB default,
 /// and checked before the pixels are allocated.
 pub(crate) const MAX_IMAGE_EDGE: u32 = 8_192;
@@ -4382,53 +4347,6 @@ mod decode_tests {
         let (width, height) = fit_snapshot(880, 9_500);
         assert!(raster_allowed(width, height), "{width}x{height}");
         assert!(height > 4_000, "{width}x{height}");
-    }
-
-    #[test]
-    fn uniform_page_color_under_a_card_is_trimmed() {
-        use super::trim_uniform_bottom;
-        let width = 4u32;
-        let height = 40u32;
-        let mut rgba = vec![0u8; width as usize * height as usize * 4];
-        for y in 0..10 {
-            for x in 0..width as usize {
-                let i = (y * width as usize + x) * 4;
-                rgba[i] = 20;
-                rgba[i + 1] = x as u8;
-                rgba[i + 2] = 40;
-                rgba[i + 3] = 255;
-            }
-        }
-        for y in 10..40 {
-            for x in 0..width as usize {
-                let i = (y * width as usize + x) * 4;
-                rgba[i] = 231;
-                rgba[i + 1] = 226;
-                rgba[i + 2] = 216;
-                rgba[i + 3] = 255;
-            }
-        }
-        let backdrop = [231, 226, 216, 255];
-        assert_eq!(trim_uniform_bottom(&rgba, width, height, 12, backdrop), 22);
-        assert_eq!(
-            trim_uniform_bottom(&rgba, width, height, 12, [255; 4]),
-            height
-        );
-        assert_eq!(trim_uniform_bottom(&rgba, width, height, 24, backdrop), 34);
-        let short = &rgba[..width as usize * 18 * 4];
-        assert_eq!(trim_uniform_bottom(short, width, 18, 12, backdrop), 18);
-        let mut tall = vec![0u8; width as usize * 200 * 4];
-        tall[..rgba.len()].copy_from_slice(&rgba);
-        for y in 40..200 {
-            for x in 0..width as usize {
-                let i = (y * width as usize + x) * 4;
-                tall[i] = 231;
-                tall[i + 1] = 226;
-                tall[i + 2] = 216;
-                tall[i + 3] = 255;
-            }
-        }
-        assert_eq!(trim_uniform_bottom(&tall, width, 200, 12, backdrop), 22);
     }
 
     #[test]
