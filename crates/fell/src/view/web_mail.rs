@@ -37,6 +37,7 @@ pub(super) struct Reader {
     pub preferences: HashMap<String, (Option<bool>, bool)>,
     allowed_once: HashMap<String, (Option<String>, Weak<WebMail>)>,
     show_images_for: HashMap<String, (Option<String>, Weak<WebMail>)>,
+    show_native_for: HashSet<String>,
     pending: Option<Pending>,
     cache: VecDeque<Cached>,
     measured: VecDeque<MeasuredHeight>,
@@ -119,6 +120,9 @@ struct Shown {
     body: Body,
     outgoing: Option<Body>,
     fade: Option<Transition>,
+    renderer_painted: Option<Rc<Cell<Option<Instant>>>>,
+    snapshot_geometry: Rc<Cell<Option<(f32, f32)>>>,
+    continue_at: Option<f32>,
     height: Rc<Cell<Option<f32>>>,
     from_height: Option<f32>,
     placeholder_height: f32,
@@ -157,6 +161,9 @@ impl Shown {
             body,
             outgoing: None,
             fade: None,
+            renderer_painted: None,
+            snapshot_geometry: Rc::default(),
+            continue_at: None,
             height: Rc::default(),
             from_height: None,
             placeholder_height: 100.,
@@ -182,17 +189,19 @@ impl Shown {
     ) {
         self.reserves_tag |= web;
         if !self.body.same_as(&body) {
-            let duration = if self.body.is_web() != body.is_web() {
-                RENDERER_CHANGE
-            } else {
-                motion::FADE
-            };
+            let renderer_change = self.body.is_web() != body.is_web();
             self.outgoing = Some(std::mem::replace(&mut self.body, body));
             self.from_height = self.height.get();
-            self.fade = motion.start(duration, now);
+            self.renderer_painted = (renderer_change && motion.enabled()).then(Rc::default);
+            self.fade = (!renderer_change)
+                .then(|| motion.start(motion::FADE, now))
+                .flatten();
         }
-        if !motion.enabled() || self.fade.is_none_or(|fade| !fade.running(now)) {
+        if !motion.enabled()
+            || (self.renderer_painted.is_none() && self.fade.is_none_or(|fade| !fade.running(now)))
+        {
             self.fade = None;
+            self.renderer_painted = None;
             self.outgoing = None;
             self.from_height = None;
         }
@@ -219,10 +228,7 @@ impl Shown {
                 }
                 *alpha > 0.0
             });
-            if self.prompt == Some(Prompt::Retrying) {
-                self.prompt_from = 1.;
-                self.outgoing_prompts.clear();
-            }
+            let retry_started = self.prompt == Some(Prompt::Retrying);
             self.prompt_swap = if retry_failed {
                 motion::LayerSwap::start(
                     motion,
@@ -236,6 +242,8 @@ impl Shown {
             self.prompt_fade = motion.start(
                 if retry_failed {
                     RENDERER_CHANGE
+                } else if retry_started {
+                    RENDERER_EXIT
                 } else {
                     motion::FADE
                 },
@@ -268,10 +276,27 @@ impl Shown {
         [motion::lerp(self.prompt_from, 1., progress), 1. - progress]
     }
 
+    fn start_painted_fade(&mut self, motion: Motion, now: Instant, real: Instant) {
+        if let Some(painted) = self
+            .renderer_painted
+            .as_ref()
+            .and_then(|painted| painted.get())
+        {
+            let elapsed = real
+                .saturating_duration_since(painted)
+                .min(motion::MAX_STEP);
+            self.fade = motion.start(RENDERER_CHANGE, now - elapsed);
+            self.renderer_painted = None;
+        }
+    }
+
     fn frame(&self, now: Instant) -> Frame {
-        let progress = motion::progress(self.fade.as_ref(), now);
-        let linear = self.fade.map_or(1., |fade| fade.linear(now));
-        let height_progress = motion::ease_out_quad(linear);
+        let linear = if self.renderer_painted.is_some() {
+            0.
+        } else {
+            self.fade.map_or(1., |fade| fade.linear(now))
+        };
+        let progress = motion::ease_out(linear);
         let body_alpha = match &self.outgoing {
             Some(outgoing) if outgoing.is_web() != self.body.is_web() => {
                 let exit = RENDERER_EXIT.as_secs_f32() / RENDERER_CHANGE.as_secs_f32();
@@ -282,6 +307,14 @@ impl Shown {
             }
             Some(Body::Placeholder) => [(1. - progress / motion::ease_out(0.4)).max(0.), progress],
             _ => [1., progress],
+        };
+        let leaving_clipped = matches!(&self.outgoing, Some(Body::Web(picture)) if picture.clipped)
+            && matches!(self.body, Body::Native);
+        let height_progress = if leaving_clipped {
+            // Change both the height and the reader's position at the fade seam.
+            f32::from(u8::from(body_alpha[0] == 0.))
+        } else {
+            motion::ease_out_quad(linear)
         };
         let current_tag = f32::from(u8::from(self.body.is_web()));
         let previous_tag = self
@@ -295,6 +328,11 @@ impl Shown {
             outgoing: self.outgoing.clone(),
             body_alpha,
             height_progress,
+            fading: linear < 1.,
+            leaving_clipped,
+            renderer_painted: self.renderer_painted.clone(),
+            snapshot_geometry: self.snapshot_geometry.clone(),
+            continuation: None,
             prompt: (self.prompt.is_some() || self.prompt_fade.is_some()).then(|| PromptFrame {
                 incoming: self.prompt.clone(),
                 incoming_alpha,
@@ -352,6 +390,11 @@ pub(super) struct Frame {
     pub outgoing: Option<Body>,
     pub body_alpha: [f32; 2],
     pub height_progress: f32,
+    fading: bool,
+    pub leaving_clipped: bool,
+    pub renderer_painted: Option<Rc<Cell<Option<Instant>>>>,
+    pub snapshot_geometry: Rc<Cell<Option<(f32, f32)>>>,
+    pub continuation: Option<(f32, super::LayoutSlot)>,
     pub prompt: Option<PromptFrame>,
     pub web_tag: Option<f32>,
     pub height: Option<Rc<Cell<Option<f32>>>>,
@@ -366,11 +409,11 @@ impl Frame {
     }
 
     pub(super) fn owns_body(&self) -> bool {
-        !matches!(self.body, Body::Native) || self.outgoing.is_some()
+        !matches!(self.body, Body::Native) || self.outgoing.is_some() || self.continuation.is_some()
     }
 
     pub(super) fn animating(&self) -> bool {
-        self.body_animating()
+        self.fading
             || self
                 .prompt
                 .as_ref()
@@ -523,16 +566,50 @@ impl Reader {
     }
 
     fn prefers_web(&self, id: &str, sender: Option<&str>, body: &HtmlBody) -> bool {
-        self.show_images_for
-            .get(id)
-            .is_some_and(|(_, mail)| Weak::ptr_eq(mail, &Arc::downgrade(&body.web)))
-            || self
-                .known_sender(sender)
-                .0
-                .unwrap_or(body.suggested == RenderMode::Web)
+        !self.show_native_for.contains(id)
+            && (self
+                .show_images_for
+                .get(id)
+                .is_some_and(|(_, mail)| Weak::ptr_eq(mail, &Arc::downgrade(&body.web)))
+                || self
+                    .known_sender(sender)
+                    .0
+                    .unwrap_or(body.suggested == RenderMode::Web))
+    }
+
+    pub(super) fn close_thread(&mut self) {
+        self.show_native_for.clear();
+        for shown in self.shown.values_mut() {
+            shown.continue_at = None;
+        }
+    }
+
+    fn continue_in_native(&mut self, id: &str, viewport: gpui::Bounds<gpui::Pixels>) -> bool {
+        let Some(shown) = self.shown.get_mut(id) else {
+            return false;
+        };
+        let Body::Web(picture) = &shown.body else {
+            return false;
+        };
+        if !picture.clipped {
+            return false;
+        }
+        let fraction = shown.snapshot_geometry.get().map_or(0., |(top, height)| {
+            let into_view = if f32::from(viewport.bottom()) >= top + height {
+                height
+            } else {
+                f32::from(viewport.top()) - top
+            };
+            let snapshot_fraction = (into_view / height).clamp(0., 1.);
+            snapshot_fraction * webview::SNAPSHOT_HEIGHT_LIMIT as f32 / picture.document_height
+        });
+        shown.continue_at = Some(fraction);
+        self.show_native_for.insert(id.to_owned());
+        true
     }
 
     fn show_web_for(&mut self, id: String, sender: Option<String>, body: &HtmlBody) {
+        self.show_native_for.remove(&id);
         self.show_images_for
             .retain(|_, (_, mail)| mail.strong_count() > 0);
         self.show_images_for
@@ -917,10 +994,18 @@ impl Reader {
             if let Some(height) = placeholder_height {
                 shown.placeholder_height = height;
             }
+            shown.start_painted_fade(motion, now, real);
             shown.update(next, prompt, web, motion, now);
             shown.retrying = retrying;
             shown.image_consent = key.images;
-            frames.insert(message.id.clone(), shown.frame(now));
+            let mut frame = shown.frame(now);
+            if matches!(frame.body, Body::Native)
+                && (frame.outgoing.is_none() || frame.body_alpha[0] == 0.)
+                && let Some(fraction) = shown.continue_at.take()
+            {
+                frame.continuation = Some((fraction, super::LayoutSlot::default()));
+            }
+            frames.insert(message.id.clone(), frame);
         }
         self.shown.retain(|id, _| frames.contains_key(id));
         // Keep a one-time snapshot eligible for reuse while its card is native.
@@ -1055,8 +1140,18 @@ impl Inbox {
             return;
         }
         if action == Action::ToggleWebView {
+            if self
+                .web_mail
+                .continue_in_native(id, self.conv_scroll.bounds())
+            {
+                self.reader_took_over(self.message_selected());
+                self.motion.conv_glide = None;
+                cx.notify();
+                return;
+            }
             let next = !self.web_mail.prefers_web(id, sender.as_deref(), body);
             self.web_mail.show_images_for.remove(id);
+            self.web_mail.show_native_for.remove(id);
             if let Some(sender) = sender {
                 self.web_mail
                     .preferences
@@ -1421,7 +1516,46 @@ mod tests {
             width: 1.,
             height: 1.,
             clipped: false,
+            document_height: 1.,
+            last_row_color: 0,
         }
+    }
+
+    #[test]
+    fn continuing_clipped_mail_keeps_the_senders_choice_until_thread_close() {
+        super::super::tests::with_pending_inbox(|inbox, cx| {
+            split_view(inbox);
+            let sender = "newer@example.test";
+            inbox
+                .web_mail
+                .preferences
+                .insert(sender.into(), (Some(true), false));
+            let picture = Snapshot {
+                clipped: true,
+                document_height: 16_384.,
+                ..snapshot()
+            };
+            inbox.web_mail.shown.insert(
+                "newer".into(),
+                Shown::new(Weak::new(), Some(picture), false, false, None),
+            );
+            inbox.html_reading_action("newer", Action::ToggleWebView, cx);
+            assert!(
+                !inbox
+                    .web_mail
+                    .prefers_message_web(&inbox.session.messages[1])
+            );
+            assert_eq!(
+                inbox.web_mail.known_sender(Some(sender)),
+                (Some(true), false)
+            );
+            inbox.web_mail.close_thread();
+            assert!(
+                inbox
+                    .web_mail
+                    .prefers_message_web(&inbox.session.messages[1])
+            );
+        });
     }
 
     #[test]
@@ -1436,7 +1570,11 @@ mod tests {
                 Body::Native
             };
             shown.update(target, None, to_web, motion, now);
-            let at = |ms| shown.frame(now + Duration::from_millis(ms));
+            let painted = now + Duration::from_millis(200);
+            assert_eq!(shown.frame(painted).body_alpha, [1., 0.]);
+            shown.renderer_painted.as_ref().unwrap().set(Some(painted));
+            shown.start_painted_fade(motion, painted, painted);
+            let at = |ms| shown.frame(painted + Duration::from_millis(ms));
             assert_eq!(at(0).body_alpha, [1., 0.]);
             assert!((at(30).body_alpha[0] - 0.5).abs() < 0.001);
             assert_eq!(at(60).body_alpha, [0., 0.]);
@@ -1665,8 +1803,12 @@ mod tests {
         shown.update(Body::Native, Some(Prompt::Retrying), true, motion, retry);
         let frame = shown.frame(retry).prompt.unwrap();
         assert_eq!(frame.height, 1.);
-        assert_eq!(frame.incoming_alpha, 1.);
+        assert_eq!(frame.incoming_alpha, 0.);
         assert!(matches!(frame.incoming, Some(Prompt::Retrying)));
+        let entering = shown.frame(retry + RENDERER_EXIT / 2).prompt.unwrap();
+        assert!(entering.incoming_alpha > 0. && entering.incoming_alpha < 1.);
+        let entered = shown.frame(retry + RENDERER_EXIT).prompt.unwrap();
+        assert_eq!(entered.incoming_alpha, 1.);
     }
 
     #[test]

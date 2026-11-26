@@ -28,6 +28,8 @@ pub(crate) struct Snapshot {
     pub width: f32,
     pub height: f32,
     pub clipped: bool,
+    pub document_height: f32,
+    pub last_row_color: u32,
 }
 
 pub(crate) struct WebRequest {
@@ -344,7 +346,7 @@ fn wait_for_images(widget: &webkit2gtk::WebView, active: Active, token: gtk::gio
                         webkit2gtk::SnapshotRegion::FullDocument
                     };
                     glib::timeout_add_local_once(PAINT_SETTLE, move || {
-                        capture(&view, active, token, bottom_padding, region, true);
+                        capture(&view, active, token, (bottom_padding, height), region, true);
                     });
                 }
                 _ => cancel(&active),
@@ -357,7 +359,7 @@ fn capture(
     widget: &webkit2gtk::WebView,
     active: Active,
     token: gtk::gio::Cancellable,
-    bottom_padding: u32,
+    (bottom_padding, document_height): (u32, i32),
     region: webkit2gtk::SnapshotRegion,
     retry: bool,
 ) {
@@ -375,7 +377,13 @@ fn capture(
             }
             let clipped = region == webkit2gtk::SnapshotRegion::Visible;
             let image = active.borrow().as_ref().and_then(|load| {
-                surface_image(result.ok()?, bottom_padding, load.background, clipped)
+                surface_image(
+                    result.ok()?,
+                    bottom_padding,
+                    load.background,
+                    clipped,
+                    document_height,
+                )
             });
             match image {
                 Some(image) => {
@@ -385,7 +393,14 @@ fn capture(
                 }
                 None if retry => {
                     glib::timeout_add_local_once(PAINT_SETTLE, move || {
-                        capture(&view, active, token, bottom_padding, region, false);
+                        capture(
+                            &view,
+                            active,
+                            token,
+                            (bottom_padding, document_height),
+                            region,
+                            false,
+                        );
                     });
                 }
                 None => cancel(&active),
@@ -518,6 +533,7 @@ fn surface_image(
     bottom_padding: u32,
     background: u32,
     clipped: bool,
+    document_height: i32,
 ) -> Option<Snapshot> {
     let mut image = gtk::cairo::ImageSurface::try_from(surface).ok()?;
     image.flush();
@@ -579,6 +595,18 @@ fn surface_image(
         super::native::trim_uniform_bottom(&bgra, dst_w, dst_h, keep, backdrop).clamp(1, dst_h)
     };
     bgra.truncate(dst_w as usize * dst_h as usize * 4);
+    let last_row_color = if clipped {
+        let mut colors = std::collections::HashMap::new();
+        for &[b, g, r, _] in bgra[bgra.len() - dst_w_us * 4..].as_chunks::<4>().0 {
+            *colors.entry(u32::from_be_bytes([0, r, g, b])).or_insert(0) += 1;
+        }
+        colors
+            .into_iter()
+            .max_by_key(|&(color, count)| (count, color))
+            .map_or(background, |(color, _)| color)
+    } else {
+        background
+    };
     let pixels = image::RgbaImage::from_raw(dst_w, dst_h, bgra)?;
     Some(Snapshot {
         image: Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(
@@ -587,6 +615,8 @@ fn surface_image(
         width: dst_w as f32,
         height: dst_h as f32,
         clipped,
+        document_height: document_height as f32,
+        last_row_color,
     })
 }
 

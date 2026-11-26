@@ -21,6 +21,7 @@ const PAGE_TIME: Duration = Duration::from_secs(12);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Failure {
     Unreachable(String),
+    TimedOut,
     Address,
     Response,
     NotFound,
@@ -34,6 +35,8 @@ impl Failure {
         match self {
             Self::Unreachable(_) if compact => "Couldn’t reach server".into(),
             Self::Unreachable(host) => format!("Couldn’t reach {host}"),
+            Self::TimedOut if compact => "Timed out".into(),
+            Self::TimedOut => "Image server timed out".into(),
             Self::NotFound => "Image not found".into(),
             Self::Response if compact => "Server error".into(),
             Self::Format if compact => "Unsupported format".into(),
@@ -62,7 +65,9 @@ impl UnavailableImages {
         let noun = if self.count == 1 { "image" } else { "images" };
         match (&self.first, self.count) {
             (Failure::Limit, 1) => "1 image too large".into(),
-            (Failure::PageLimit | Failure::NotFound, 1) => self.first.label(compact),
+            (Failure::PageLimit | Failure::NotFound | Failure::TimedOut, 1) => {
+                self.first.label(compact)
+            }
             _ => format!(
                 "{} {noun} unavailable · {}",
                 self.count,
@@ -139,7 +144,7 @@ fn inline_page_with(
             Entry::Vacant(entry) => {
                 let mut bytes_read = 0;
                 let result = if Instant::now() >= deadline {
-                    Err(unreachable(Url::parse(url).ok().as_ref()))
+                    Err(Failure::TimedOut)
                 } else {
                     fetch(url, remaining, &mut bytes_read)
                 };
@@ -235,7 +240,7 @@ fn fetch(
         url.set_fragment(None);
         let time = deadline.saturating_duration_since(Instant::now());
         if time.is_zero() {
-            return Err(unreachable(Some(&url)));
+            return Err(Failure::TimedOut);
         }
         if !allowed()
             || !matches!(url.scheme(), "http" | "https")
@@ -254,6 +259,7 @@ fn fetch(
             .build()
             .call()
             .map_err(|error| match error {
+                ureq::Error::Timeout(_) => Failure::TimedOut,
                 ureq::Error::StatusCode(404) => Failure::NotFound,
                 ureq::Error::StatusCode(_) => Failure::Response,
                 _ => unreachable(Some(&url)),
@@ -290,7 +296,13 @@ fn fetch(
             .take(limit as u64 + 1)
             .read_to_end(&mut bytes);
         *bytes_read = bytes.len();
-        result.map_err(|_| unreachable(Some(&url)))?;
+        result.map_err(|error| {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                Failure::TimedOut
+            } else {
+                unreachable(Some(&url))
+            }
+        })?;
         if !allowed() || bytes.len() > limit {
             return Err(Failure::Limit);
         }

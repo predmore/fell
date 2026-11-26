@@ -479,7 +479,7 @@ pub(crate) fn web_snapshot(
                     .left_0()
                     .right_0()
                     .h(px(48.))
-                    .bg(crate::theme::scroll_fade(fill, false)),
+                    .bg(crate::theme::scroll_fade(snapshot.last_row_color, false)),
             )
         });
     div().child(image).when(snapshot.clipped, |body| {

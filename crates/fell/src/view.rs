@@ -2838,6 +2838,7 @@ impl Inbox {
             return;
         }
         let opening = self.open_thread.as_deref() != Some(&id);
+        let opened_at = Instant::now();
         let generation = self.conv_gen.fetch_add(1, Ordering::SeqCst) + 1;
         let note_generation = self.note_generation;
         let current = self.conv_gen.clone();
@@ -3075,7 +3076,7 @@ impl Inbox {
                     if inbox.web_mail.open_thread(
                         &inbox.session.messages,
                         inbox.motion.motion,
-                        Instant::now(),
+                        opened_at,
                         cx,
                     ) {
                         inbox.motion.hold_thread_arrival();
@@ -4663,6 +4664,7 @@ impl Inbox {
         self.invalidate_conversation_layout();
         self.session.messages.clear();
         self.open_thread = None;
+        self.web_mail.close_thread();
         self.open_subject.clear();
         self.note_pin = agent_notes::NotePin::default();
     }
@@ -4671,6 +4673,7 @@ impl Inbox {
     fn mark_open(&mut self, id: String, latest_note: Option<i64>) {
         self.conversation_revision = self.conversation_revision.wrapping_add(1);
         if self.open_thread.as_deref() != Some(&id) {
+            self.web_mail.close_thread();
             self.reader_bodies.clear();
             let notes = &self.session.agent_notes;
             self.note_pin = agent_notes::NotePin::opened(
@@ -6071,6 +6074,9 @@ impl Render for Inbox {
         if reader_current
             && self.conv_layout_current
             && !scrolling_to_target
+            && !web
+                .values()
+                .any(|frame| frame.leaving_clipped || frame.continuation.is_some())
             && web.values().any(web_mail::Frame::body_animating)
         {
             disclosure::follow_scroll_end(&self.conv_scroll);
@@ -10171,6 +10177,7 @@ fn conversation(
                     scroll,
                     hold,
                     chip_probe,
+                    frame.web.values().find_map(|web| web.continuation.clone()),
                     padding.map(|padding| padding.viewport),
                     arrival,
                     frame.frames.clone(),
@@ -10198,6 +10205,7 @@ fn conversation_body(
     scroll: Option<ScrollHandle>,
     hold: Option<MessageProbes>,
     chip_probe: Option<LayoutSlot>,
+    continuation: Option<(f32, LayoutSlot)>,
     preview_viewport: Option<gpui::Pixels>,
     arrival: f32,
     frames: Option<SharedFrameLog>,
@@ -10228,9 +10236,14 @@ fn conversation_body(
         .when(arrival < 1.0, |body| body.opacity(arrival))
         .children(children)
         .into_any_element();
-    match (scroll, hold, chip_probe) {
-        (Some(scroll), Some(hold), _) => hold.hold(body, scroll, bottom, frames).into_any_element(),
-        (Some(scroll), _, Some(probe)) => {
+    match (scroll, hold, chip_probe, continuation) {
+        (Some(scroll), _, _, Some((fraction, probe))) => {
+            LandingHold::continue_body(body, scroll, probe, fraction, frames).into_any_element()
+        }
+        (Some(scroll), Some(hold), _, _) => {
+            hold.hold(body, scroll, bottom, frames).into_any_element()
+        }
+        (Some(scroll), _, Some(probe), _) => {
             LandingHold::reveal(body, scroll, probe, frames).into_any_element()
         }
         _ => body,
@@ -10990,6 +11003,7 @@ fn measured_message_body(
     let probe = frame.body_probes.get(&message.id).cloned();
     let web = frame.web.get(&message.id);
     let web_probe = web.and_then(|web| web.height.clone());
+    let renderer_painted = web.and_then(|web| web.renderer_painted.clone());
     if probe.is_none() && web_probe.is_none() {
         return body;
     }
@@ -11010,7 +11024,7 @@ fn measured_message_body(
         }
         _ => body,
     };
-    div()
+    let body = div()
         .relative()
         .child(body)
         .child(
@@ -11024,12 +11038,27 @@ fn measured_message_body(
                         probe.set(Some(height));
                     }
                 },
-                |_, _, _, _| {},
+                move |_, _, _, _| {
+                    if let Some(painted) =
+                        renderer_painted.filter(|painted| painted.get().is_none())
+                    {
+                        painted.set(Some(Instant::now()));
+                    }
+                },
             )
             .absolute()
             .inset_0(),
         )
+        .into_any_element();
+    if let Some((_, slot)) = web.and_then(|web| web.continuation.as_ref()) {
+        LayoutProbe {
+            inner: body,
+            slot: slot.clone(),
+        }
         .into_any_element()
+    } else {
+        body
+    }
 }
 
 /// How one message's folds paint.
@@ -11206,6 +11235,20 @@ fn web_message_body(
                     folds.fill,
                     theme.dimmed,
                 ))
+                .when(picture.clipped && live, |snapshot| {
+                    let geometry = web.snapshot_geometry.clone();
+                    let height = picture.height * folds.columns.card.width / picture.width;
+                    snapshot.child(
+                        gpui::canvas(
+                            move |bounds, _, _| {
+                                geometry.set(Some((f32::from(bounds.top()), height)))
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .inset_0(),
+                    )
+                })
                 .when(!theme.is_light(), |snapshot| {
                     snapshot.child(
                         div()
@@ -15312,6 +15355,7 @@ mod tests {
                                 cards,
                                 Some(case.scroll.clone()),
                                 Some(probes),
+                                None,
                                 None,
                                 padding.map(|padding| padding.viewport),
                                 1.,

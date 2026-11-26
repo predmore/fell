@@ -185,6 +185,10 @@ fn visible_top(view: Bounds<Pixels>, offset: Pixels, item: Bounds<Pixels>) -> Op
         .then(|| top - view.top())
 }
 
+fn continuation_offset(fraction: f32, body_height: Pixels) -> Pixels {
+    (body_height * fraction - px(24.)).max(px(0.))
+}
+
 fn offset_to_hold(view: Bounds<Pixels>, item: Bounds<Pixels>, y: Pixels) -> Pixels {
     (y - (item.top() - view.top())).min(px(0.))
 }
@@ -309,6 +313,7 @@ impl MessageProbes {
             y: Some(self.anchor.y),
             glide: self.glide,
             body_scroll: self.anchor.body_scroll,
+            body_fraction: None,
             frames,
         }
     }
@@ -329,6 +334,7 @@ pub(super) struct LandingHold {
     pub y: Option<Pixels>,
     pub glide: Option<LandingGlide>,
     body_scroll: Option<(Pixels, f32)>,
+    body_fraction: Option<f32>,
     /// `FELL_FRAME_LOG`: each offset set here is a `landing` note.
     pub frames: Option<SharedFrameLog>,
 }
@@ -341,6 +347,18 @@ pub(super) struct LandingGlide {
 }
 
 impl LandingHold {
+    pub fn continue_body(
+        inner: AnyElement,
+        scroll: ScrollHandle,
+        probe: LayoutSlot,
+        fraction: f32,
+        frames: Option<SharedFrameLog>,
+    ) -> Self {
+        let mut landing = Self::reveal(inner, scroll, probe, frames);
+        landing.body_fraction = Some(fraction);
+        landing
+    }
+
     pub fn reveal(
         inner: AnyElement,
         scroll: ScrollHandle,
@@ -356,6 +374,7 @@ impl LandingHold {
             y: None,
             glide: None,
             body_scroll: None,
+            body_fraction: None,
             frames,
         }
     }
@@ -406,8 +425,12 @@ impl gpui::Element for LandingHold {
             // The scroll div clamps the result against its new content height.
             let item = window.layout_bounds(item);
             let mut offset = before;
-            offset.y = match self.y {
-                Some(y) => {
+            offset.y = match (self.body_fraction, self.y) {
+                (Some(fraction), _) => {
+                    let into_body = continuation_offset(fraction, item.size.height);
+                    offset_to_hold(bounds, item, -into_body)
+                }
+                (_, Some(y)) => {
                     let headers: smallvec::SmallVec<[_; 16]> = self
                         .headers
                         .iter()
@@ -423,7 +446,7 @@ impl gpui::Element for LandingHold {
                         px(motion::snap(moving, window.scale_factor()))
                     })
                 }
-                None => offset_to_reveal(bounds, item, before.y),
+                _ => offset_to_reveal(bounds, item, before.y),
             };
             self.scroll.set_offset(offset);
         }
@@ -522,6 +545,16 @@ mod tests {
 
     fn vertical_bounds(y: f32, height: f32) -> Bounds<Pixels> {
         Bounds::new(point(px(0.), px(y)), size(px(100.), px(height)))
+    }
+
+    #[test]
+    fn continuation_places_the_mapped_body_position_one_line_below_the_viewport_top() {
+        let view = vertical_bounds(100., 600.);
+        let body = vertical_bounds(250., 12_000.);
+        let into_body = continuation_offset(8_192. / 16_384., body.size.height);
+        assert_eq!(into_body, px(5_976.));
+        assert_eq!(offset_to_hold(view, body, -into_body), px(-6_126.));
+        assert_eq!(continuation_offset(0.01, px(900.)), px(0.));
     }
 
     #[test]
