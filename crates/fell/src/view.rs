@@ -284,7 +284,7 @@ pub(crate) fn finish_onboarding(
         let now = inbox.motion.clock.now();
         inbox
             .motion
-            .observe_header(&inbox.list_folder, None, None, now);
+            .observe_header(&inbox.session.list_folder, None, None, now);
         inbox.setup_exit = LayerSwap::start(inbox.motion.motion, now, motion::QUICK, motion::FADE)
             .map(|swap| (setup, swap));
         inbox
@@ -726,11 +726,6 @@ struct Inbox {
     sent_arrival_anchor: Option<ScrollAnchor>,
     /// Background sync for the account file. `None` for the demo mailbox.
     sync: Option<SyncHandle>,
-    /// The folder the rows on screen came from. `session.folder` changes on
-    /// the key press; this changes when that folder's read lands. Archive and
-    /// move act on this one, the list the reader sees.
-    list_folder: String,
-    list_label: Option<String>,
     /// Visible label rows as they looked in the last list prepaint.
     painted_label_rows: Vec<LeavingRow>,
     leaving_rows: Option<Arc<[LeavingRow]>>,
@@ -968,8 +963,6 @@ impl Inbox {
             painted_reader: None,
             sent_arrival_anchor: None,
             sync: None,
-            list_folder: FolderRole::Inbox.default_name().into(),
-            list_label: None,
             painted_label_rows: Vec::new(),
             leaving_rows: None,
             leaving_reader: None,
@@ -1420,7 +1413,7 @@ impl Inbox {
         let reading_label = label.clone();
         let reading = folder.clone();
         let refresh_labels = self.session.loading || intent.changed || intent.is_refresh();
-        let same_scope = folder == self.list_folder && label == self.list_label;
+        let same_scope = folder == self.session.list_folder && label == self.session.list_label;
         // A folder the rows on screen do not come from opens at its top.
         let span = if let Some(key) = intent
             .select
@@ -1550,8 +1543,8 @@ impl Inbox {
         self.refresh_in_flight = false;
         if self.opening_draft.is_some()
             && self.session.in_drafts()
-            && scope.0 == self.list_folder
-            && scope.1 == self.list_label
+            && scope.0 == self.session.list_folder
+            && scope.1 == self.session.list_label
             && !intent.switch
         {
             self.defer_folder_read(intent);
@@ -1618,8 +1611,10 @@ impl Inbox {
             Ok(found) => found,
             Err(err) => {
                 if intent.switch {
-                    self.session.folder = self.list_folder.clone();
-                    self.session.label_scope.clone_from(&self.list_label);
+                    self.session.folder = self.session.list_folder.clone();
+                    self.session
+                        .label_scope
+                        .clone_from(&self.session.list_label);
                 }
                 self.session.fail_query(QueryFault::Folder, err);
                 self.settle_pending_bodies();
@@ -1645,7 +1640,7 @@ impl Inbox {
             self.session.folders = names;
         }
         self.session.roles = roles;
-        let switched = folder != self.list_folder || label != self.list_label;
+        let switched = folder != self.session.list_folder || label != self.session.list_label;
         let had_store_rows = !rows.is_empty();
         let edges = prepare_list_rows(
             &mut rows,
@@ -1711,13 +1706,13 @@ impl Inbox {
         if let Some(labels) = labels {
             self.session.set_labels(labels);
         }
-        self.list_folder = folder;
-        self.list_label = label;
+        self.session.list_folder = folder;
+        self.session.list_label = label;
         if switched {
             self.session.forget_window();
             self.session
                 .picked
-                .retain(|id| rows.iter().any(|row| &row.id == id));
+                .retain(|id, _| rows.iter().any(|row| &row.id == id));
             self.painted_label_rows.clear();
             self.row_widths.clear();
             if let Some(id) = &self.session.cursor_id
@@ -1743,7 +1738,7 @@ impl Inbox {
         let drawn = self.drawn_rows(now);
         let had_rows = !self.session.threads.is_empty();
         let emptied = !switched
-            && self.list_label.is_some()
+            && self.session.list_label.is_some()
             && had_rows
             && rows.is_empty()
             && !had_store_rows;
@@ -1838,10 +1833,10 @@ impl Inbox {
         if !emptied && (switched || had_rows || !self.session.threads.is_empty()) {
             self.start_list_shift(drawn, switched, intent.select.is_some(), top_arrival);
         }
-        if self.list_label.is_some() {
+        if self.session.list_label.is_some() {
             self.warm = None;
             self.warmed_folder = None;
-        } else if self.warmed_folder.as_deref() != Some(self.list_folder.as_str()) {
+        } else if self.warmed_folder.as_deref() != Some(self.session.list_folder.as_str()) {
             self.warm_bottom(more_after, cx);
         }
         let open_changed = self.open_thread != self.session.cursor_id;
@@ -1874,7 +1869,7 @@ impl Inbox {
     /// while nothing moves. A folder whose rows all fit on screen has
     /// nothing a `G` would show for the first time.
     fn warm_bottom(&mut self, more_after: bool, cx: &mut Context<Self>) {
-        let folder = self.list_folder.clone();
+        let folder = self.session.list_folder.clone();
         self.warmed_folder = Some(folder.clone());
         self.warm = None;
         let shown = (self.list_viewport().unwrap_or(760.0) / ROW_PX).ceil() as usize + 1;
@@ -1912,7 +1907,7 @@ impl Inbox {
                 return;
             };
             let _ = this.update(cx, |inbox, cx| {
-                if inbox.list_folder != folder || inbox.list_label.is_some() {
+                if inbox.session.list_folder != folder || inbox.session.list_label.is_some() {
                     return;
                 }
                 let subject = rows
@@ -1957,7 +1952,7 @@ impl Inbox {
         let ahead = self
             .warm
             .take()
-            .filter(|warm| warm.folder == self.list_folder);
+            .filter(|warm| warm.folder == self.session.list_folder);
         match ahead {
             Some(warm) if animating => self.warm = Some(warm),
             Some(mut warm) if warm.rows_drawn < warm.rows.len() => {
@@ -3174,50 +3169,43 @@ impl Inbox {
         .detach();
     }
 
-    fn apply_move(&mut self, destination: String, cx: &mut Context<Self>) {
-        let Some(id) = self.session.cursor_id.clone() else {
-            self.session.show_toast("No conversation", true);
-            return;
-        };
-        if self.session.cursor_draft().is_some() {
-            self.session.show_toast(DRAFT_NOT_THREAD, true);
-            return;
-        }
-        if !self.session.threads.iter().any(|thread| thread.id == id) {
-            self.session.show_toast("No conversation", true);
-            return;
-        }
+    fn apply_move(&mut self, edit: crate::model::MoveEdit, cx: &mut Context<Self>) {
+        let search = self.session.search.is_some();
         let account = self.account_id.clone();
-        let thread = ThreadId(id.clone());
-        let Some(from) = self.action_folder(&id) else {
-            return;
-        };
+        let crate::model::MoveEdit {
+            scopes,
+            destination,
+        } = edit;
+        let ids: Vec<_> = scopes.iter().map(|(id, _)| id.0.clone()).collect();
         let to = destination.clone();
         let key = self.selected_key();
-        if self.session.search.is_none() && !self.session.roles.is_view(&from) {
-            self.take_out_of_list(std::slice::from_ref(&id), cx);
+        if !search && !self.session.roles.is_view(&self.session.list_folder) {
+            self.take_out_of_list(&ids, cx);
         }
         self.change_mailbox(
-            move |store| store.move_thread(&account, &thread, &from, &to).map(|_| ()),
-            move |inbox, result, _| match result {
-                Ok(()) => {
-                    inbox.pending_removals.remove(&id);
-                    let label = inbox.session.folder_text(&destination);
-                    inbox.session.show_toast(format!("Moved to {label}"), false);
-                    inbox.send_to_server();
-                    Some(ReadIntent {
-                        changed: true,
-                        ..ReadIntent::default()
-                    })
+            move |store| store.move_scoped_threads(&account, &scopes, &to),
+            move |inbox, result, _| {
+                for id in &ids {
+                    inbox.pending_removals.remove(id);
                 }
-                Err(err) => {
-                    inbox.pending_removals.remove(&id);
-                    inbox.session.show_toast(err.to_string(), true);
-                    Some(ReadIntent {
-                        changed: true,
-                        select: key,
-                        ..ReadIntent::default()
-                    })
+                match result {
+                    Ok((_, count)) => {
+                        let label = inbox.session.folder_text(&destination);
+                        inbox.session.show_toast(moved_notice(count, &label), false);
+                        inbox.send_to_server();
+                        Some(ReadIntent {
+                            changed: true,
+                            ..ReadIntent::default()
+                        })
+                    }
+                    Err(err) => {
+                        inbox.session.show_toast(err.to_string(), true);
+                        Some(ReadIntent {
+                            changed: true,
+                            select: key,
+                            ..ReadIntent::default()
+                        })
+                    }
                 }
             },
             cx,
@@ -3244,7 +3232,7 @@ impl Inbox {
             self.remove_search_threads(ids, removal, cx);
             return;
         }
-        if self.session.folder != self.list_folder {
+        if self.session.folder != self.session.list_folder {
             self.session
                 .show_toast("The folder is still loading", false);
             return;
@@ -3261,7 +3249,7 @@ impl Inbox {
                 .map(row_key)
         });
         let roles = &self.session.roles;
-        let folder = self.list_folder.clone();
+        let folder = self.session.list_folder.clone();
         let spam_to = if roles.is(FolderRole::Junk, &folder) {
             FolderRole::Inbox
         } else {
@@ -3400,7 +3388,7 @@ impl Inbox {
     fn apply_labels(&mut self, edit: LabelEdit, cx: &mut Context<Self>) {
         let now = self.motion.clock.now();
         let leaving_scope = !edit.add
-            && self.list_label.as_deref() == Some(&edit.name)
+            && self.session.list_label.as_deref() == Some(&edit.name)
             && self.session.search.is_none();
         self.session.label_rows(&edit, leaving_scope);
         let pending = self.pending_labels.start(edit.clone());
@@ -3632,14 +3620,14 @@ impl Inbox {
             self.protect_flag(id, edit.change, generation, None);
         }
         let account = self.account_id.clone();
-        let folder = if self.list_label.is_some()
+        let folder = if self.session.list_label.is_some()
             || matches!(
-                self.list_folder.as_str(),
+                self.session.list_folder.as_str(),
                 fell_core::store::MUTED | fell_core::store::SNOOZED
             ) {
             String::new()
         } else {
-            self.list_folder.clone()
+            self.session.list_folder.clone()
         };
         let threads: Vec<ThreadId> = edit.ids.iter().cloned().map(ThreadId).collect();
         let change = edit.change;
@@ -3697,14 +3685,16 @@ impl Inbox {
     }
 
     fn toggle_off_page_flags(&mut self, ids: Vec<String>, star: bool, cx: &mut Context<Self>) {
-        if self.session.folder != self.list_folder || self.session.label_scope != self.list_label {
+        if self.session.folder != self.session.list_folder
+            || self.session.label_scope != self.session.list_label
+        {
             self.session
                 .show_toast("The folder is still loading", false);
             return;
         }
         let account = self.account_id.clone();
-        let folder = self.list_folder.clone();
-        let label = self.list_label.clone();
+        let folder = self.session.list_folder.clone();
+        let label = self.session.list_label.clone();
         let selected = ids.len();
         self.flag_gen += 1;
         let generation = self.flag_gen;
@@ -3723,8 +3713,8 @@ impl Inbox {
                     // The transaction decides the direction using every
                     // selected row, including the ones we cannot see yet.
                     if inbox.session.search.is_none()
-                        && inbox.list_folder == scope.0
-                        && inbox.list_label == scope.1
+                        && inbox.session.list_folder == scope.0
+                        && inbox.session.list_label == scope.1
                     {
                         let mut loaded: Vec<_> = inbox
                             .session
@@ -4377,10 +4367,8 @@ impl Inbox {
                     .show_toast("No attachment action to retry", false);
             }
         }
-        if step.apply_move
-            && let Some(destination) = self.session.pending_move.take()
-        {
-            self.apply_move(destination, cx);
+        if let Some(edit) = step.move_edit {
+            self.apply_move(edit, cx);
         }
         if let Some(edit) = step.labels {
             self.apply_labels(edit, cx);
@@ -5187,18 +5175,27 @@ impl Render for Inbox {
             reveal_attachment
         };
         let waiting_for_total = self.waiting_for_inbox_total
-            && self.session.roles.is(FolderRole::Inbox, &self.list_folder);
+            && self
+                .session
+                .roles
+                .is(FolderRole::Inbox, &self.session.list_folder);
         let unread = (!self.waiting_for_first_rows && !waiting_for_total)
             .then(|| self.session.unread_threads());
-        self.motion
-            .observe_header(&self.list_folder, self.list_label.as_deref(), unread, now);
+        self.motion.observe_header(
+            &self.session.list_folder,
+            self.session.list_label.as_deref(),
+            unread,
+            now,
+        );
         let banner = self
             .session
             .search
             .is_none()
             .then(|| {
-                self.session
-                    .list_banner(&self.list_folder, self.list_label.as_deref())
+                self.session.list_banner(
+                    &self.session.list_folder,
+                    self.session.list_label.as_deref(),
+                )
             })
             .flatten();
         let banner = self.motion.list_banner(banner, now);
@@ -5537,75 +5534,74 @@ impl Render for Inbox {
         } else {
             (0.0, CARD_TOP_PX)
         };
-        let mut overlay_card =
-            |session: &Session, motion, live, picker: (&[PickerChoice], Option<String>, f32)| {
-                let help = self
-                    .help_scroll
-                    .card(&theme, session, window, now, live, cx);
-                overlay(
-                    &theme,
-                    session,
-                    motion,
-                    card,
-                    live,
-                    snooze_anchor,
-                    &self.palette_scroll,
-                    &self.folder_scroll,
-                    picker,
-                    help,
-                    match session.overlay {
-                        Overlay::Agents => Some(agents::card(
-                            &theme,
-                            &session.agents,
-                            live.then_some(&self.agents_scroll),
+        let mut overlay_card = |session: &Session, motion, live, picker: PickerCard<'_>| {
+            let help = self
+                .help_scroll
+                .card(&theme, session, window, now, live, cx);
+            overlay(
+                &theme,
+                session,
+                motion,
+                card,
+                live,
+                snooze_anchor,
+                &self.palette_scroll,
+                &self.folder_scroll,
+                picker,
+                help,
+                match session.overlay {
+                    Overlay::Agents => Some(agents::card(
+                        &theme,
+                        &session.agents,
+                        live.then_some(&self.agents_scroll),
+                        card.unwrap_or_else(|| {
+                            agents::card_height(
+                                &session.agents,
+                                viewport_height - CARD_TOP_PX - 16.0,
+                            )
+                        }),
+                        width < 460.,
+                        live.then_some((&self.agents_motion, now)),
+                        cx,
+                    )),
+                    Overlay::AgentActivity => Some(activity::card(
+                        &theme,
+                        &session.activity,
+                        live.then_some(&self.activity_scroll),
+                        (
                             card.unwrap_or_else(|| {
-                                agents::card_height(
-                                    &session.agents,
-                                    viewport_height - CARD_TOP_PX - 16.0,
+                                activity::card_height(viewport_height - CARD_TOP_PX - 16.0)
+                            }),
+                            width < 500.,
+                        ),
+                        live.then_some((&self.activity_motion, now)),
+                        window,
+                        cx,
+                    )),
+                    Overlay::Settings => Some(settings::card(
+                        &theme,
+                        session,
+                        &self.settings_view,
+                        live,
+                        (
+                            card.unwrap_or_else(|| {
+                                settings::card_height(
+                                    &session.settings_nav,
+                                    settings_room,
+                                    width < 500.,
                                 )
                             }),
-                            width < 460.,
-                            live.then_some((&self.agents_motion, now)),
-                            cx,
-                        )),
-                        Overlay::AgentActivity => Some(activity::card(
-                            &theme,
-                            &session.activity,
-                            live.then_some(&self.activity_scroll),
-                            (
-                                card.unwrap_or_else(|| {
-                                    activity::card_height(viewport_height - CARD_TOP_PX - 16.0)
-                                }),
-                                width < 500.,
-                            ),
-                            live.then_some((&self.activity_motion, now)),
                             window,
-                            cx,
-                        )),
-                        Overlay::Settings => Some(settings::card(
-                            &theme,
-                            session,
-                            &self.settings_view,
-                            live,
-                            (
-                                card.unwrap_or_else(|| {
-                                    settings::card_height(
-                                        &session.settings_nav,
-                                        settings_room,
-                                        width < 500.,
-                                    )
-                                }),
-                                window,
-                            ),
-                            now,
-                            cx,
-                        )),
-                        _ => None,
-                    },
-                    window,
-                    cx,
-                )
-            };
+                        ),
+                        now,
+                        cx,
+                    )),
+                    _ => None,
+                },
+                window,
+                cx,
+            )
+        };
         if let Some((layer, opacity)) = self.motion.closing_overlay(now) {
             layer.swap(&mut self.session);
             leaving.push(
@@ -5613,11 +5609,12 @@ impl Render for Inbox {
                     &self.session,
                     (opacity, 0.0),
                     false,
-                    (
-                        &layer.picker_choices,
-                        layer.label_target.clone(),
-                        layer.label_marks,
-                    ),
+                    PickerCard {
+                        choices: &layer.picker_choices,
+                        prompt: &layer.folder_prompt,
+                        target: layer.folder_target.as_deref(),
+                        mark_opacity: layer.label_marks,
+                    },
                 )
                 .into_any_element(),
             );
@@ -5628,11 +5625,12 @@ impl Render for Inbox {
                 &self.session,
                 self.motion.overlay(now),
                 true,
-                (
-                    &picker_choices,
-                    self.session.label_target(),
-                    self.motion.label_marks(now),
-                ),
+                PickerCard {
+                    choices: &picker_choices,
+                    prompt: &self.session.folder_prompt(),
+                    target: self.session.folder_target().as_deref(),
+                    mark_opacity: self.motion.label_marks(now),
+                },
             )
         });
         let warm = self.warm_layer(width, panes, animating, window, cx);
@@ -5649,8 +5647,8 @@ impl Render for Inbox {
             now,
             Shown {
                 subject,
-                folder: self.list_folder.clone(),
-                label: self.list_label.clone(),
+                folder: self.session.list_folder.clone(),
+                label: self.session.list_label.clone(),
                 leaving,
                 warm,
                 active_overlay,
@@ -6834,7 +6832,7 @@ fn thread_list(
                 // The list also asks for row 0 alone to measure a row's
                 // height; only the rows it draws count as on screen.
                 let drawn = range.len() > 1 || inbox.session.threads.len() == 1;
-                let capture = drawn && inbox.list_label.is_some();
+                let capture = drawn && inbox.session.list_label.is_some();
                 let mut painted = Vec::new();
                 if drawn {
                     let ids = inbox.session.threads.iter().map(|row| row.id.as_str());
@@ -6868,7 +6866,7 @@ fn thread_list(
                             bar_dx,
                             frame,
                             previous_labels,
-                            label_scope: inbox.list_label.clone(),
+                            label_scope: inbox.session.list_label.clone(),
                             unread_note: inbox.session.agent_notes.unread.contains(&row.id),
                             attachment_alpha: inbox.row_widths.attachment_alpha(
                                 &row.id,
@@ -6921,7 +6919,7 @@ fn thread_list(
                                         bar_dx,
                                         frame: still_frame(row, window),
                                         previous_labels: None,
-                                        label_scope: inbox.list_label.clone(),
+                                        label_scope: inbox.session.list_label.clone(),
                                         unread_note: inbox
                                             .session
                                             .agent_notes
@@ -6968,7 +6966,7 @@ fn thread_list(
                                     &theme_for_rows,
                                     ghost,
                                     text_width,
-                                    (bar_dx, inbox.list_label.clone()),
+                                    (bar_dx, inbox.session.list_label.clone()),
                                     batch,
                                     window,
                                     cx,
@@ -11400,7 +11398,7 @@ fn overlay(
     snooze_anchor: (f32, f32),
     palette_scroll: &ScrollHandle,
     folder_scroll: &ScrollHandle,
-    picker: (&[PickerChoice], Option<String>, f32),
+    picker: PickerCard<'_>,
     help: Option<(f32, gpui::Div)>,
     section_card: Option<gpui::Div>,
     window: &Window,
@@ -11637,11 +11635,23 @@ fn about(theme: &Theme, cx: &mut Context<Inbox>) -> gpui::Div {
         )
 }
 
+struct PickerCard<'a> {
+    choices: &'a [PickerChoice],
+    prompt: &'a str,
+    target: Option<&'a str>,
+    mark_opacity: f32,
+}
+
 fn folder_picker(
     theme: &Theme,
     session: &Session,
     scroll: &ScrollHandle,
-    (choices, label_target, mark_opacity): (&[PickerChoice], Option<String>, f32),
+    PickerCard {
+        choices,
+        prompt,
+        target,
+        mark_opacity,
+    }: PickerCard<'_>,
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::Div {
@@ -11666,9 +11676,8 @@ fn folder_picker(
     let label_room = (width - 2.0 - 2.0 * (PICKER_ROW_MARGIN + PICKER_ROW_PAD)).max(0.0);
     let style = conversation_line_style(window, theme, px(theme.ui_px));
     let prompt_dim = theme::ensure_all(theme.dimmed, &[theme.surface], 4.8);
-    let prompt = session.folder_prompt();
     let query = present::display_safe(&session.folder_query);
-    let target = label_target.and_then(|target| {
+    let target = target.and_then(|target| {
         let measure = |text| line_px_with_style(window, &style, text, FontWeight::NORMAL).ceil();
         let query_width = measure(&query) + CARET + if query.is_empty() { 0.0 } else { CARET_GAP };
         let room = width
@@ -11678,7 +11687,7 @@ fn folder_picker(
             - measure(prompt)
             - measure("·")
             - query_width;
-        let target = present::display_safe(&target);
+        let target = present::display_safe(target);
         clip_shaped(
             window,
             &style,
@@ -11732,7 +11741,7 @@ fn folder_picker(
                         } else {
                             prompt_dim
                         }))
-                        .child(prompt),
+                        .child(prompt.to_owned()),
                 )
                 .when_some(target, |prompt, target| {
                     prompt
@@ -14210,6 +14219,12 @@ mod tests {
             write_back_notice(&session, &[], true),
             "Read/star sync delayed. Retrying"
         );
+    }
+
+    #[test]
+    fn move_toast_shows_undo_and_counts_a_batch() {
+        assert_eq!(super::moved_notice(1, "Archive"), "Moved to Archive · u");
+        assert_eq!(super::moved_notice(4, "Archive"), "Moved 4 to Archive · u");
     }
 
     #[test]

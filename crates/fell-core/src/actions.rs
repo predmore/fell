@@ -316,6 +316,14 @@ struct Planned {
     view: ViewRelocation,
 }
 
+#[derive(Clone, Copy)]
+enum ScopedRelocation<'a> {
+    Archive,
+    Delete,
+    Spam,
+    Move(&'a str),
+}
+
 #[derive(Default)]
 struct ViewRelocation {
     hidden: Vec<String>,
@@ -388,35 +396,24 @@ impl Store {
         from_folder: &str,
         to_folder: &str,
     ) -> Result<LocalAction> {
-        let from_folder = canonical_folder(from_folder)?;
-        let to_folder = canonical_folder(to_folder)?;
-        if from_folder.eq_ignore_ascii_case(&to_folder) {
-            return Err(Error::Action("move needs a different folder".into()));
-        }
-        let roles = self.folder_roles(account_id)?;
-        let server = Some((to_folder.as_str(), &roles));
-        self.apply_thread(
+        self.move_scoped_threads(
             account_id,
-            thread_id,
-            ActionKind::Move,
-            server,
-            |tx, rows| {
-                let plans = plan_relocate(
-                    tx,
-                    account_id,
-                    rows,
-                    &from_folder,
-                    &to_folder,
-                    &roles,
-                    ActionKind::Move,
-                )?;
-                if plans.is_empty() {
-                    return Err(Error::Action(format!("no messages in {from_folder}")));
-                }
-                let summary = format!("moved {} from {from_folder} to {to_folder}", plans.len());
-                Ok((summary, plans))
-            },
+            &[(thread_id.clone(), from_folder.to_owned())],
+            to_folder,
         )
+        .map(|(action, _)| action)
+    }
+
+    /// Move a selection from its source folders to one destination as a
+    /// single undo entry. Returns the action and the number of threads moved.
+    pub fn move_scoped_threads(
+        &self,
+        account: &AccountId,
+        targets: &[(ThreadId, String)],
+        to: &str,
+    ) -> Result<(LocalAction, usize)> {
+        let to = canonical_folder(to)?;
+        self.relocate_scoped_threads(account, targets, ScopedRelocation::Move(&to))
     }
 
     /// Add or remove `change` on every message in the thread that needs it.
@@ -610,7 +607,7 @@ impl Store {
         account: &AccountId,
         targets: &[(ThreadId, String)],
     ) -> Result<(LocalAction, usize)> {
-        self.relocate_scoped_threads(account, targets, ActionKind::Delete)
+        self.relocate_scoped_threads(account, targets, ScopedRelocation::Delete)
     }
 
     /// Move eligible results to Junk, or out of Junk to Inbox, in one undo
@@ -620,7 +617,7 @@ impl Store {
         account: &AccountId,
         targets: &[(ThreadId, String)],
     ) -> Result<(LocalAction, usize)> {
-        self.relocate_scoped_threads(account, targets, ActionKind::Spam)
+        self.relocate_scoped_threads(account, targets, ScopedRelocation::Spam)
     }
 
     /// Archive eligible results from their source folders in one undo entry.
@@ -630,14 +627,14 @@ impl Store {
         account: &AccountId,
         targets: &[(ThreadId, String)],
     ) -> Result<(LocalAction, usize)> {
-        self.relocate_scoped_threads(account, targets, ActionKind::Archive)
+        self.relocate_scoped_threads(account, targets, ScopedRelocation::Archive)
     }
 
     fn relocate_scoped_threads(
         &self,
         account: &AccountId,
         targets: &[(ThreadId, String)],
-        kind: ActionKind,
+        relocation: ScopedRelocation<'_>,
     ) -> Result<(LocalAction, usize)> {
         self.require_account(account)?;
         let tx = crate::store::immediate_transaction(self.connection())?;
@@ -653,7 +650,7 @@ impl Store {
                 continue;
             }
             let (to, planned, junk) =
-                match plan_scoped_relocation(&tx, account, thread, folder, &roles, kind) {
+                match plan_scoped_relocation(&tx, account, thread, folder, &roles, relocation) {
                     Ok(target) => target,
                     Err(err @ Error::Action(_)) => {
                         ineligible.get_or_insert(err);
@@ -669,13 +666,21 @@ impl Store {
         if plans.is_empty() {
             return Err(ineligible.unwrap_or_else(|| Error::Action("no conversation".into())));
         }
-        let (kind, verb) = match kind {
-            ActionKind::Archive => (kind, "archived"),
-            ActionKind::Spam if only_junk => (ActionKind::NotSpam, "moved out of spam"),
-            ActionKind::Spam => (kind, "changed spam status for"),
-            _ => (kind, "deleted"),
+        let (kind, verb) = match relocation {
+            ScopedRelocation::Archive => (ActionKind::Archive, "archived"),
+            ScopedRelocation::Spam if only_junk => (ActionKind::NotSpam, "moved out of spam"),
+            ScopedRelocation::Spam => (ActionKind::Spam, "changed spam status for"),
+            ScopedRelocation::Delete => (ActionKind::Delete, "deleted"),
+            ScopedRelocation::Move(_) => (ActionKind::Move, "moved"),
         };
-        let summary = format!("{verb} {} messages", plans.len());
+        let summary = match (relocation, targets) {
+            (ScopedRelocation::Move(to), [(_, from)]) => {
+                let from = canonical_folder(from)?;
+                format!("moved {} from {from} to {to}", plans.len())
+            }
+            (ScopedRelocation::Move(to), _) => format!("moved {} messages to {to}", plans.len()),
+            _ => format!("{verb} {} messages", plans.len()),
+        };
         let action = record_and_apply(&tx, account, kind, &summary, &plans)?;
         queue_routes(&tx, account, &action, routes, &roles)?;
         tx.commit()?;
@@ -1015,23 +1020,6 @@ impl Store {
         }
     }
 
-    fn apply_thread(
-        &self,
-        account_id: &AccountId,
-        thread_id: &ThreadId,
-        kind: ActionKind,
-        server: Option<(&str, &crate::folders::FolderRoles)>,
-        plans_for: impl FnOnce(&Connection, &[SavedRow]) -> Result<(String, Vec<Planned>)>,
-    ) -> Result<LocalAction> {
-        self.apply_threads(
-            account_id,
-            std::slice::from_ref(thread_id),
-            kind,
-            server,
-            plans_for,
-        )
-    }
-
     /// One action over every message of `threads`. A thread that is gone
     /// (a sync merged or removed it) adds nothing; the call fails only when
     /// none of them has messages.
@@ -1106,28 +1094,39 @@ fn plan_scoped_relocation<'a>(
     thread: &ThreadId,
     folder: &str,
     roles: &'a FolderRoles,
-    kind: ActionKind,
+    relocation: ScopedRelocation<'a>,
 ) -> Result<(&'a str, Vec<Planned>, bool)> {
     let from = canonical_folder(folder)?;
-    if kind == ActionKind::Delete && roles.is(FolderRole::Trash, &from) {
-        return Err(Error::Action("already in Trash".into()));
-    }
     let junk = roles.is(FolderRole::Junk, &from);
-    let to = match kind {
-        ActionKind::Archive => {
+    let (to, kind) = match relocation {
+        ScopedRelocation::Archive => {
             check_archive_route(roles, &from)?;
-            roles.archive_name()
+            (roles.archive_name(), ActionKind::Archive)
         }
-        ActionKind::Spam if junk => roles.name(FolderRole::Inbox),
-        ActionKind::Spam => roles.name(FolderRole::Junk),
-        _ => roles.name(FolderRole::Trash),
+        ScopedRelocation::Delete => {
+            if roles.is(FolderRole::Trash, &from) {
+                return Err(Error::Action("already in Trash".into()));
+            }
+            (roles.name(FolderRole::Trash), ActionKind::Delete)
+        }
+        ScopedRelocation::Spam if junk => (roles.name(FolderRole::Inbox), ActionKind::Spam),
+        ScopedRelocation::Spam => (roles.name(FolderRole::Junk), ActionKind::Spam),
+        ScopedRelocation::Move(to) => {
+            if from.eq_ignore_ascii_case(to) {
+                return Err(Error::Action("move needs a different folder".into()));
+            }
+            (to, ActionKind::Move)
+        }
     };
+    let rows = load_thread(conn, account, thread)?;
+    if kind == ActionKind::Move && rows.is_empty() {
+        return Err(Error::Action("no such thread".into()));
+    }
     if roles.is_view(to)
         && (kind != ActionKind::Archive || roles.get(FolderRole::Archive).is_some())
     {
         return Err(Error::Action(format!("{} is a view", roles.label(to))));
     }
-    let rows = load_thread(conn, account, thread)?;
     let plans = if kind == ActionKind::Archive {
         plan_archive(conn, account, &rows, &from, roles)?
     } else {
@@ -2768,17 +2767,22 @@ mod tests {
     }
 
     #[test]
-    fn scoped_archive_and_delete_skip_destination_and_stale_sources() {
+    fn scoped_relocations_skip_destination_and_stale_sources() {
         let store = open(&[("a1", "a@x")]);
         let owner = account("a1");
         let (first, second) = two_in_inbox(&store);
-        for (kind, destination, error) in [
+        for (relocation, destination, error) in [
             (
-                ActionKind::Archive,
+                ScopedRelocation::Archive,
                 FOLDER_ARCHIVE,
                 "archive moves messages into Archive",
             ),
-            (ActionKind::Delete, FOLDER_TRASH, "already in Trash"),
+            (ScopedRelocation::Delete, FOLDER_TRASH, "already in Trash"),
+            (
+                ScopedRelocation::Move(FOLDER_ARCHIVE),
+                FOLDER_ARCHIVE,
+                "move needs a different folder",
+            ),
         ] {
             let mut there = sample(
                 "a1",
@@ -2789,7 +2793,7 @@ mod tests {
             there.folders = vec![destination.into()];
             let there = store.upsert_message(&there).unwrap();
             let relocate = |targets: &[(ThreadId, String)]| {
-                store.relocate_scoped_threads(&owner, targets, kind)
+                store.relocate_scoped_threads(&owner, targets, relocation)
             };
             let ineligible = [
                 (there.clone(), destination.into()),

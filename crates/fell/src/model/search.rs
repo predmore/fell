@@ -19,7 +19,7 @@ pub const REFRESH_FEEDBACK_DELAY: Duration = Duration::from_millis(300);
 pub(super) struct FolderList {
     rows: Vec<ThreadRow>,
     cursor: Option<String>,
-    picked: HashSet<String>,
+    picked: HashMap<String, String>,
     anchor: Option<String>,
     visual: bool,
     full_width: bool,
@@ -591,7 +591,7 @@ impl Session {
                     .get(old_index.min(saved.rows.len().saturating_sub(1)))
                     .map(|row| row.id.clone())
             });
-        saved.picked.retain(|id| present(id));
+        saved.picked.retain(|id, _| present(id));
         if saved.anchor.as_ref().is_some_and(|id| !present(id)) {
             saved.anchor = None;
             saved.visual = false;
@@ -719,7 +719,7 @@ impl Session {
             {
                 self.cursor_id = self.threads.first().map(|row| row.id.clone());
             }
-            self.picked.retain(|id| reply.hits.contains_key(id));
+            self.picked.retain(|id, _| reply.hits.contains_key(id));
         }
         if self.threads.is_empty() {
             self.pane = Pane::List;
@@ -1109,7 +1109,7 @@ mod tests {
         initial.hits.get_mut(&thread).unwrap().preview = read_preview();
         land(&mut session, initial);
         session.select_if_present(&thread);
-        session.picked.insert("other".into());
+        session.picked.insert("other".into(), String::new());
         let generation = session.search_generation;
         let other = session.threads[0].clone();
         assert_eq!(session.threads[1].snippet, "HeadingThe invoice is ready.");
@@ -1154,7 +1154,7 @@ mod tests {
             "Heading The invoice is ready."
         );
         assert_eq!(session.cursor_id.as_deref(), Some(thread.as_str()));
-        assert!(session.picked.contains("other"));
+        assert!(session.picked.contains_key("other"));
         assert!(!session.set_search_snippet(
             generation.wrapping_sub(1),
             &thread,
@@ -1477,7 +1477,7 @@ mod tests {
         session.set_threads(initial.rows);
         session.select_if_present("b");
         session.more_after = true;
-        session.picked.insert("a".into());
+        session.picked.insert("a".into(), String::new());
         session.perform(Action::Search, 10);
         session.type_search("old");
         let old = session.search_generation;
@@ -1491,7 +1491,7 @@ mod tests {
         assert_eq!(session.folder, "Archive");
         assert_eq!(session.cursor_id.as_deref(), Some("b"));
         assert!(session.more_after);
-        assert!(session.picked.contains("a"));
+        assert!(session.picked.contains_key("a"));
     }
 
     #[test]
@@ -1578,7 +1578,7 @@ mod tests {
             reply(vec![row_hit("one", "m1"), row_hit("two", "m2")], None),
         );
         session.select_if_present("two");
-        session.picked.insert("one".into());
+        session.picked.insert("one".into(), String::new());
         let mut messages = Vec::new();
         let store = fell_core::Store::open_in_memory().unwrap();
         let account = crate::fixtures::fixture_account();
@@ -1615,7 +1615,7 @@ mod tests {
         assert_eq!(search.accepted_generation(), Some(accepted));
         assert!(!session.apply_search_reply(stale, &mut reply(vec![], None)));
         assert_eq!(session.cursor_id.as_deref(), Some("two"));
-        assert!(session.picked.contains("one"));
+        assert!(session.picked.contains_key("one"));
         assert_eq!(
             query_key(r#"subject:"a  b"   hall  "#),
             r#"subject:"a  b" hall"#
@@ -1671,8 +1671,8 @@ mod tests {
             reply(vec![row_hit("one", "m1"), row_hit("two", "m2")], None),
         );
         session.on_key(KeyId::Enter, 10);
-        session.picked.insert("one".into());
-        session.picked.insert("two".into());
+        session.picked.insert("one".into(), String::new());
+        session.picked.insert("two".into(), String::new());
         let targets = session.action_targets();
         assert_eq!(
             session
@@ -1684,7 +1684,18 @@ mod tests {
             ["INBOX", "Sent"]
         );
         assert!(session.perform(Action::Delete, 10).delete);
-        session.picked.clear();
+        let scopes = session.search_scopes(&targets).unwrap();
+        session.perform(Action::Move, 10);
+        assert_eq!(session.folder_prompt(), "Move 2 conversations to");
+        session.folder_query = "Archive".into();
+        // A same-query refresh can choose another copy as the best hit.
+        assert!(session.refresh_search(Instant::now()));
+        let mut refreshed = reply(vec![row_hit("one", "m1"), row_hit("two", "m2")], None);
+        refreshed.hits.get_mut("one").unwrap().folder = Some("Sent".into());
+        land(&mut session, refreshed);
+        let edit = session.confirm_folder().move_edit.unwrap();
+        assert_eq!(edit.scopes, scopes);
+        assert_eq!(edit.destination, "Archive");
         session.select_if_present("two");
         assert!(session.perform(Action::Archive, 10).archive);
         assert_eq!(session.search_source("two"), Some("Sent"));
@@ -1727,7 +1738,7 @@ mod tests {
         session.on_key(KeyId::Enter, 10);
         session
             .picked
-            .extend(["inbox".into(), "trash".into(), "missing".into()]);
+            .extend(["inbox", "trash", "missing"].map(|id| (id.into(), String::new())));
         let targets = session.action_targets();
         assert_eq!(
             session.search_scopes(&targets).unwrap(),
