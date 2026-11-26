@@ -75,6 +75,8 @@ pub enum Action {
     Delete,
     Spam,
     Undo,
+    SplitThread,
+    MergeThreads,
     SyncNow,
     Notifications(NotificationMode),
     ToggleSelect,
@@ -147,6 +149,8 @@ impl Action {
             Self::Delete => "Delete",
             Self::Spam => "Spam / not spam",
             Self::Undo => "Undo",
+            Self::SplitThread => "Split at message",
+            Self::MergeThreads => "Merge conversations",
             Self::SyncNow => "Sync now",
             Self::Notifications(NotificationMode::On) => "Notifications: Show sender and subject",
             Self::Notifications(NotificationMode::Private) => {
@@ -227,6 +231,8 @@ const ALL_ACTIONS: &[Action] = &[
     Action::Delete,
     Action::Spam,
     Action::Undo,
+    Action::SplitThread,
+    Action::MergeThreads,
     Action::SyncNow,
     Action::Notifications(NotificationMode::On),
     Action::Notifications(NotificationMode::Private),
@@ -393,6 +399,13 @@ fn default_bindings() -> Vec<Binding> {
     bind(&[KeyId::Char('#')], Action::Delete, None);
     bind(&[KeyId::Char('!')], Action::Spam, None);
     bind(&[KeyId::Char('u')], Action::Undo, None);
+    for (key, action) in [('s', Action::SplitThread), ('m', Action::MergeThreads)] {
+        bind(
+            &[KeyId::Leader, KeyId::Char('c'), KeyId::Char(key)],
+            action,
+            Some("Conversations"),
+        );
+    }
     bind(&[KeyId::Char('x')], Action::ToggleSelect, None);
     bind(&[KeyId::Char('V')], Action::Visual, None);
     bind(&[KeyId::Char('z')], Action::FullWidth, None);

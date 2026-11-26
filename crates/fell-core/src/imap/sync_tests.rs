@@ -3933,6 +3933,40 @@ fn a_uidvalidity_change_keeps_a_skipped_message_with_no_message_id() {
 }
 
 #[test]
+fn uidvalidity_repair_keeps_the_manual_group_and_its_undo() {
+    let server = TestServer::spawn(sample_state());
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    let old = "uid.20.5.INBOX@imap.fell";
+    let new = "uid.99.5.INBOX@imap.fell";
+    let source = stored(&store, &acct, old).unwrap().thread_id;
+    let destination = stored(&store, &acct, "html@x").unwrap().thread_id;
+    store
+        .merge_threads(&acct.id, std::slice::from_ref(&source), &destination)
+        .unwrap();
+
+    mailbox(&mut server.state.lock().unwrap(), "INBOX").uidvalidity = 99;
+    sync_once(&acct, &backend, &store).unwrap();
+    assert!(stored(&store, &acct, old).is_none());
+    assert_eq!(stored(&store, &acct, new).unwrap().thread_id, destination);
+    assert_eq!(
+        store.undo(&acct.id).unwrap().kind,
+        crate::ActionKind::MergeThreads
+    );
+    assert_eq!(
+        store.thread_messages(&acct.id, &destination).unwrap().len(),
+        1
+    );
+    assert_eq!(stored(&store, &acct, new).unwrap().thread_id, source);
+}
+
+#[test]
 fn a_vanished_set_ending_in_star_does_not_drop_higher_uids() {
     let mut state = sample_state();
     state.condstore = true;

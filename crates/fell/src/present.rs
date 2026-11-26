@@ -50,6 +50,8 @@ pub struct ThreadRow {
 pub struct ConvMessage {
     pub muted: bool,
     pub wake_at: Option<i64>,
+    pub joined_by_subject: bool,
+    pub merged_by_you: bool,
     /// The message's Message-ID, which open state is kept by.
     pub id: String,
     pub sender: String,
@@ -80,6 +82,17 @@ pub struct ConvMessage {
 }
 
 impl ConvMessage {
+    pub fn grouping_marker(&self, split_key: Option<&str>) -> Option<String> {
+        let marker = if self.merged_by_you {
+            "merged by you"
+        } else if self.joined_by_subject {
+            "joined by subject"
+        } else {
+            return None;
+        };
+        Some(split_key.map_or_else(|| marker.to_owned(), |key| format!("{marker} · {key}")))
+    }
+
     pub fn needs_reader_parts(&self) -> bool {
         match self.reader_parts {
             fell_core::ReaderParts::Unknown => true,
@@ -878,6 +891,8 @@ pub fn conversation(
                 muted: false,
                 wake_at: None,
                 id: message.headers.message_id.as_str().to_string(),
+                joined_by_subject: false,
+                merged_by_you: false,
                 mail_headers: mail_headers(message),
                 sender: display_name(&message.headers.from.name, &email, me),
                 email,
@@ -1513,6 +1528,8 @@ mod tests {
             muted: false,
             wake_at: None,
             id: id.into(),
+            joined_by_subject: false,
+            merged_by_you: false,
             sender: "Ada".into(),
             email: "ada@x".into(),
             mail_headers: Vec::new(),

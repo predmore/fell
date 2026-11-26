@@ -159,7 +159,7 @@ fn fixture_messages(account: &Account) -> Vec<Message> {
             unread: true,
             folders: &["INBOX"],
             labels: &[],
-            reply_to: Some("cabin-1@fell.test"),
+            reply_to: None,
             proton: None,
             starred: false,
             attachment: false,
@@ -832,6 +832,7 @@ fn recipients(row: &DraftMail, me: &str) -> (People, People, People) {
         ("Priya Natarajan", "priya@harbor.test"),
     ];
     match row.id {
+        "cabin-1@fell.test" => (&[("Ada", "ada@harbor.test")], &[], &[]),
         "thread-a-1@fell.test" => (&[("Tessa", "tessa@harbor.test")], TEAM, &[]),
         "thread-a-2@fell.test" => (
             &[("Ruben", "ruben@harbor.test")],

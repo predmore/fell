@@ -192,6 +192,8 @@ pub enum ActionKind {
     Label,
     Delete,
     DiscardDrafts,
+    SplitThread,
+    MergeThreads,
     AnnotateThread,
     AcceptSuggestion,
     DismissNote,
@@ -218,6 +220,8 @@ impl ActionKind {
             Self::AcceptSuggestion => "accept_suggestion",
             Self::DismissNote => "dismiss_note",
             Self::Archive => "archive",
+            Self::SplitThread => "split_thread",
+            Self::MergeThreads => "merge_threads",
             Self::Move => "move",
             Self::Label => "label",
             Self::Delete => "delete",
@@ -242,6 +246,8 @@ impl ActionKind {
             "accept_suggestion" => Ok(Self::AcceptSuggestion),
             "dismiss_note" => Ok(Self::DismissNote),
             "archive" => Ok(Self::Archive),
+            "split_thread" => Ok(Self::SplitThread),
+            "merge_threads" => Ok(Self::MergeThreads),
             "move" => Ok(Self::Move),
             "label" => Ok(Self::Label),
             "delete" => Ok(Self::Delete),
@@ -881,6 +887,11 @@ impl Store {
                 action.id,
                 action.kind == ActionKind::Unmute,
             )?;
+        } else if matches!(
+            action.kind,
+            ActionKind::SplitThread | ActionKind::MergeThreads
+        ) {
+            restored_threads = crate::store::threads::undo(self, &tx, account_id, &action)?;
         } else if action.kind.is_flag() {
             flags::undo(&tx, account_id, &action)?;
         } else if action.kind == ActionKind::Label {
@@ -1166,6 +1177,7 @@ fn plan_archive(
 pub(crate) fn ensure_action_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(ACTION_SCHEMA)?;
     conn.execute_batch(flags::FLAG_SCHEMA)?;
+    conn.execute_batch(crate::store::threads::ACTION_SCHEMA)?;
     ensure_snapshot_columns(conn)?;
     if !crate::store::bodies::has_column(conn, "local_action_bodies", "structure_copy")? {
         conn.execute_batch("ALTER TABLE local_action_bodies ADD COLUMN structure_copy TEXT")?;
@@ -1381,6 +1393,7 @@ fn latest_open_action(conn: &Connection, account_id: &AccountId) -> Result<Optio
                AND (
                    EXISTS (SELECT 1 FROM local_action_messages s WHERE s.action_id = a.id)
                    OR EXISTS (SELECT 1 FROM local_action_flags f WHERE f.action_id = a.id)
+                   OR EXISTS (SELECT 1 FROM local_action_thread_members WHERE action_id = a.id)
                    OR EXISTS (SELECT 1 FROM local_thread_note_actions n WHERE n.action_id = a.id)
                    OR EXISTS (SELECT 1 FROM local_mute_undo m WHERE m.action_id = a.id)
                    OR EXISTS (
@@ -2424,6 +2437,8 @@ pub(crate) fn remove_account_actions(conn: &Connection, account_id: &str) -> Res
         "local_action_bodies",
         "local_action_flags",
         "local_action_parts",
+        "local_action_thread_members",
+        "local_action_thread_notes",
         "local_folder_tombstones",
     ] {
         if action_table_exists(conn, table)? {

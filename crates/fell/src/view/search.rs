@@ -857,6 +857,15 @@ impl Inbox {
                 .as_ref()
                 .is_some_and(|search| search.refresh_started.is_some());
             let old_index = self.session.selected_index();
+            let regroup_previous = self
+                .regroup_to
+                .as_ref()
+                .and(self.session.cursor_thread())
+                .cloned();
+            let drawn = regroup_previous.as_ref().map(|_| {
+                let now = self.motion.clock.now();
+                self.drawn_rows(now)
+            });
             let offset = self.list_offset();
             if self.session.apply_search_reply(generation, &mut reply) {
                 if !self.session.search_results_current() {
@@ -888,7 +897,10 @@ impl Inbox {
                         .filter_map(|row| search.hits.get(&row.id))
                         .map(|hit| hit.message.clone()),
                 );
-                if old_id == self.session.cursor_id {
+                let regroup = self.regroup_to.as_ref().is_some_and(|target| {
+                    self.session.cursor_id.as_deref() == Some(target.as_str())
+                });
+                if regroup || old_id == self.session.cursor_id {
                     if let Some((old, new)) = old_index.zip(self.session.selected_index()) {
                         self.set_list_offset(offset + (old as f32 - new as f32) * ROW_PX);
                     }
@@ -900,6 +912,12 @@ impl Inbox {
                         .start(motion::QUICK, self.motion.clock.now());
                 } else {
                     self.scroll_list_to_cursor();
+                }
+                if regroup && let Some(drawn) = drawn {
+                    self.motion.land_selection(self.session.cursor_id.clone());
+                    let now = self.motion.clock.now();
+                    self.fade_regroup_selection(regroup_previous, now);
+                    self.start_list_shift(drawn, false, false, false);
                 }
                 let same_scope = old_id == self.session.cursor_id
                     && self.session.cursor_id == self.open_thread

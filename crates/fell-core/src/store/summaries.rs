@@ -44,6 +44,8 @@ CREATE TABLE IF NOT EXISTS thread_summary (
     labels TEXT NOT NULL,
     PRIMARY KEY (account_id, thread_id)
 ) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_thread_summary_date
+    ON thread_summary(account_id, last_date DESC, thread_id);
 
 -- One row per folder name in the account: its earliest stored spelling.
 CREATE TABLE IF NOT EXISTS account_folders (
