@@ -38,6 +38,8 @@ pub(crate) mod sent_bcc;
 mod sent_echo_repair;
 mod summaries;
 mod threads;
+pub(crate) mod triage;
+pub use triage::{MUTED, SNOOZED};
 pub(crate) mod views;
 mod write_lock;
 
@@ -162,7 +164,8 @@ CREATE TABLE IF NOT EXISTS agent_actions (
     target_subject TEXT,
     conversation_count INTEGER,
     local_action_floor INTEGER,
-    outbox_floor INTEGER
+    outbox_floor INTEGER,
+    snooze_floor INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_agent_actions_account ON agent_actions(account_id, id);
@@ -608,11 +611,12 @@ impl Store {
         // Summaries first: every write transaction refreshes them on commit,
         // including the one that installs the threading triggers. Then the
         // threading tables, which the version 3 upgrade below already reads.
+        conn.execute_batch(roles::ROLES_TABLE)?;
+        conn.execute_batch(triage::SCHEMA)?;
         summaries::ensure_thread_summaries(&conn)?;
         ensure_agent_grant_revision(&conn)?;
         conn.execute_batch(sent_bcc::SENT_BCC_TABLE)?;
         conn.execute_batch(sent::LOCAL_SENT_TABLE)?;
-        conn.execute_batch(roles::ROLES_TABLE)?;
         conn.execute_batch(intents::INTENT_SCHEMA)?;
         let outbox_tx =
             rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
@@ -656,7 +660,7 @@ impl Store {
         crate::actions::migrate_purge_snapshots(&conn)?;
         keywords::migrate_reserved_labels(&conn)?;
         correspondents::ensure(&conn)?;
-        Ok(Self {
+        let store = Self {
             indexer: None,
             semantic: std::cell::RefCell::new(crate::search::semantic::Semantic::new(
                 crate::embed::EmbedderSource::from_env(),
@@ -672,7 +676,15 @@ impl Store {
             fail_after_flags: std::cell::Cell::new(None),
             #[cfg(unix)]
             _mailbox_lock: None,
-        })
+        };
+        if let Err(err) = store.wake_snoozes(crate::agent::now_unix()) {
+            crate::diagnostic!(
+                WARN,
+                "Could not wake snoozed mail at startup",
+                error = &err as &dyn std::error::Error
+            );
+        }
+        Ok(store)
     }
 
     /// Tests: rows, matrix bytes, and key bytes of the search vector matrix.
@@ -857,6 +869,9 @@ impl Store {
         };
         let mut new_messages = 0;
         let mut inbox_arrivals = Vec::new();
+        let check_snoozes = (!delta.messages.is_empty() || !delta.links.is_empty())
+            && triage::has_snoozes(&tx, account_id)?;
+        let mut wake_candidates = Vec::new();
         let keyword_copies: HashSet<_> = if delta.messages.is_empty() {
             HashSet::new()
         } else {
@@ -875,28 +890,24 @@ impl Store {
                 .get(FolderRole::Drafts)
                 .map(|folder| crate::imap::escape_mailbox(&folder.raw))
         };
-        for message in &delta.messages {
-            if &message.account_id != account_id {
+        for source in &delta.messages {
+            if &source.account_id != account_id {
                 return Err(crate::Error::Backend(format!(
                     "delta for account {} includes message for {}",
                     account_id.as_str(),
-                    message.account_id.as_str()
+                    source.account_id.as_str()
                 )));
             }
+            let id = &source.headers.message_id;
             if let Some(mailbox) = &drafts_mailbox
-                && let Some(copy) = crate::imap::parse_remote_id(&message.remote_id.0)
+                && let Some(copy) = crate::imap::parse_remote_id(&source.remote_id.0)
                 && &copy.mailbox == mailbox
-                && crate::outbox::drafts::hides(
-                    &tx,
-                    account_id,
-                    &copy,
-                    &message.headers.message_id,
-                )?
+                && crate::outbox::drafts::hides(&tx, account_id, &copy, id)?
             {
                 continue;
             }
             // Skip a folder archive or delete already took off this message.
-            let Some(mut message) = crate::actions::message_for_delta(&tx, message)? else {
+            let Some(mut message) = crate::actions::message_for_delta(&tx, source)? else {
                 continue;
             };
             views::project_arrival(&tx, &mut message)?;
@@ -905,13 +916,24 @@ impl Store {
                 message.labels.clear();
             }
             // A combined delta can carry the listing for these messages.
-            if insert_message(&tx, &message, &mut merge_roles)? {
+            let write = insert_message(&tx, &message, &mut merge_roles)?;
+            let can_wake = check_snoozes && write.can_wake();
+            if matches!(write, ArrivalWrite::Inserted) {
                 new_messages += 1;
                 if let Some(watch) = &observer
-                    && watch.is_arrival(&message)
+                    && watch.is_candidate(&message)
                 {
-                    inbox_arrivals.push(message.headers.message_id.clone());
+                    inbox_arrivals.push(inbox_arrivals::Candidate::New(id));
                 }
+            } else if can_wake
+                && observer
+                    .as_ref()
+                    .is_some_and(|watch| watch.is_new_inbox_copy(&message.remote_id))
+            {
+                inbox_arrivals.push(inbox_arrivals::Candidate::OnWake(id));
+            }
+            if can_wake {
+                wake_candidates.push(id);
             }
             if let Some(structure) = delta.body_structures.get(&message.remote_id)
                 && let Some(id) = canonical_id_on(&tx, account_id, &message.headers.message_id)?
@@ -934,11 +956,27 @@ impl Store {
         }
         let mut linked = false;
         for link in &delta.links {
+            let id = &link.message_id;
             if let Some(copy) = crate::imap::parse_remote_id(&link.flags.remote_id.0)
-                && copies::link_arrival(&tx, account_id, &copy, &link.message_id)?
+                && let Some(gained_inbox) = copies::link_arrival(
+                    &tx,
+                    account_id,
+                    &copy,
+                    id,
+                    merge_roles.listed(&tx, account_id)?,
+                )?
             {
                 linked = true;
                 apply_flag(&tx, account_id, &link.flags, bridge)?;
+                if check_snoozes && gained_inbox {
+                    wake_candidates.push(id);
+                    if observer
+                        .as_ref()
+                        .is_some_and(|watch| watch.is_new_inbox_copy(&link.flags.remote_id))
+                    {
+                        inbox_arrivals.push(inbox_arrivals::Candidate::OnWake(id));
+                    }
+                }
             }
         }
         // Apply every flag in one transaction. Local flag intents keep the
@@ -953,17 +991,22 @@ impl Store {
             || delta.settle != crate::backend::Settle::Later;
         let confirmed = crate::compose::confirm_synced_sends(&tx, account_id, delta)?;
         let split = copy_work && delta.flags.len() >= SPLIT_DELTA_AT && confirmed.is_empty();
-        if split {
+        let woken = if split {
             if has_arrivals {
                 self.rethread_written(&tx, account_id)?;
             }
+            let woken =
+                triage::wake_arrivals(&tx, account_id, &wake_candidates, delta.roles.as_ref())?;
             tx.commit()?;
             #[cfg(test)]
             if let Some(hook) = self.on_sync_commit.borrow_mut().as_mut() {
                 hook()?;
             }
             tx = self.begin_sync_write()?;
-        }
+            woken
+        } else {
+            HashSet::new()
+        };
         let repaired = if let Some(found) = &delta.roles {
             correspondents::roles_changed(&tx, account_id, found)?;
             roles::replace(&tx, account_id, found)?;
@@ -977,12 +1020,17 @@ impl Store {
         if (has_arrivals && !split) || repaired || took_over || settled {
             self.rethread_written(&tx, account_id)?;
         }
+        let woken = if split {
+            woken
+        } else {
+            triage::wake_arrivals(&tx, account_id, &wake_candidates, None)?
+        };
         if let Some(cursor) = &delta.cursor {
             set_sync_cursor_on(&tx, account_id, cursor)?;
         }
         tx.commit()?;
         if let Some(watch) = observer {
-            watch.committed(self, &inbox_arrivals);
+            watch.committed(self, &inbox_arrivals, &woken);
         }
         self.seal_private_files()?;
         Ok(DeltaWrites {
@@ -1073,8 +1121,16 @@ impl Store {
 
     pub fn upsert_message(&self, message: &Message) -> Result<ThreadId> {
         let tx = immediate_transaction(&self.conn)?;
-        insert_message(&tx, message, &mut MergeRoles::new(None))?;
+        let write = insert_message(&tx, message, &mut MergeRoles::new(None))?;
         self.rethread_written(&tx, &message.account_id)?;
+        if write.can_wake() && triage::has_snoozes(&tx, &message.account_id)? {
+            triage::wake_arrivals(
+                &tx,
+                &message.account_id,
+                &[&message.headers.message_id],
+                None,
+            )?;
+        }
         let thread_id =
             thread_id_for_message_id(&tx, &message.account_id, &message.headers.message_id)?
                 .ok_or_else(|| {
@@ -2307,6 +2363,7 @@ impl Store {
             let participants: String = row.get::<_, Option<String>>(10)?.unwrap_or_default();
             let labels: String = row.get::<_, Option<String>>(11)?.unwrap_or_default();
             Ok(FolderThread {
+                muted: false,
                 thread_id: ThreadId(row.get(0)?),
                 subject: row.get(1)?,
                 snippet: row.get(2)?,
@@ -2706,6 +2763,7 @@ pub struct Participant {
 /// A thread as it appears in one folder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FolderThread {
+    pub muted: bool,
     pub thread_id: ThreadId,
     pub subject: String,
     pub snippet: String,
@@ -2947,7 +3005,6 @@ fn canonical_id_on(
         .map_err(Into::into)
 }
 
-/// Loaded only when a fingerprint match depends on which folder is Sent.
 /// A sync delta shares one lookup of the recorded roles across its arrivals.
 struct MergeRoles<'a> {
     listed: Option<Cow<'a, FolderRoles>>,
@@ -2998,25 +3055,33 @@ pub(crate) struct DeltaWrites {
     pub confirmed_drafts: Vec<String>,
 }
 
-/// Returns whether the arrival made a new row. Every accepted arrival still
-/// records its remote copy, including arrivals folded into a stored row.
+/// Store the arrival and record its remote copy, even when it folds into a stored row.
 fn insert_message(
     conn: &Connection,
     message: &Message,
     roles: &mut MergeRoles<'_>,
-) -> Result<bool> {
+) -> Result<ArrivalWrite> {
     let arrival = insert_arrival(conn, message, roles)?;
     copies::record(conn, message)?;
-    if let ArrivalWrite::Folded(keeper) = &arrival {
+    if let ArrivalWrite::Folded { keeper, .. } = &arrival {
         intents::finish_fold(conn, &message.account_id, keeper)?;
     }
-    Ok(matches!(arrival, ArrivalWrite::Inserted))
+    Ok(arrival)
 }
 
 enum ArrivalWrite {
     Inserted,
-    Updated,
-    Folded(String),
+    Updated { gained_inbox: bool },
+    Folded { keeper: String, gained_inbox: bool },
+}
+
+impl ArrivalWrite {
+    fn can_wake(&self) -> bool {
+        match self {
+            Self::Inserted => true,
+            Self::Updated { gained_inbox } | Self::Folded { gained_inbox, .. } => *gained_inbox,
+        }
+    }
 }
 
 fn insert_arrival(
@@ -3039,16 +3104,22 @@ fn insert_arrival(
                 roles,
             )?
         {
-            absorb_duplicate(conn, message, &stored, &other)?;
-            return Ok(ArrivalWrite::Folded(other.canonical_id));
+            let gained_inbox = absorb_duplicate(conn, message, &stored, &other, roles)?;
+            return Ok(ArrivalWrite::Folded {
+                keeper: other.canonical_id,
+                gained_inbox,
+            });
         }
-        write_kept(conn, message, &stored, via_alias, &[], None)?;
-        return Ok(ArrivalWrite::Updated);
+        let gained_inbox = write_kept(conn, message, &stored, via_alias, &[], None, roles)?;
+        return Ok(ArrivalWrite::Updated { gained_inbox });
     }
     if let Some(stored) = find_list_collapse(conn, message, &fingerprint, None, false, roles)? {
         remember_alias(conn, message, &stored.canonical_id)?;
-        write_kept(conn, message, &stored, true, &[], None)?;
-        return Ok(ArrivalWrite::Folded(stored.canonical_id));
+        let gained_inbox = write_kept(conn, message, &stored, true, &[], None, roles)?;
+        return Ok(ArrivalWrite::Folded {
+            keeper: stored.canonical_id,
+            gained_inbox,
+        });
     }
     insert_new(conn, message, &fingerprint)?;
     Ok(ArrivalWrite::Inserted)
@@ -3170,7 +3241,8 @@ fn write_kept(
     alias: bool,
     extra_folders: &[String],
     merged_labels: Option<String>,
-) -> Result<ThreadId> {
+    roles: &mut MergeRoles<'_>,
+) -> Result<bool> {
     let stored_list = list_is_set(&stored.list_id);
     let incoming_list = clean_list_id(&message.list_id).is_some();
     // The list copy can be the canonical id. A later sync of that id must not
@@ -3225,6 +3297,13 @@ fn write_kept(
     if archived {
         folders = strip_inbox_tokens(&folders);
     }
+    let gained_inbox = if folders != stored.folders {
+        let roles = roles.listed(conn, &message.account_id)?;
+        inbox_arrivals::has_inbox(roles, &folders)
+            && !inbox_arrivals::has_inbox(roles, &stored.folders)
+    } else {
+        false
+    };
     let labels =
         merged_labels.unwrap_or_else(|| union_tokens(&stored.labels, &message.labels, false));
     let arrived_via = union_tokens(&stored.arrived_via, &message.arrived_via, true);
@@ -3402,7 +3481,7 @@ fn write_kept(
         &stored.canonical_id,
         indexed,
     )?;
-    Ok(thread_id)
+    Ok(gained_inbox)
 }
 
 #[derive(Clone)]
@@ -3696,7 +3775,8 @@ fn absorb_duplicate(
     message: &Message,
     doomed: &Arrival,
     keeper: &Arrival,
-) -> Result<ThreadId> {
+    roles: &mut MergeRoles<'_>,
+) -> Result<bool> {
     let extra_folders = split_field(&doomed.folders);
     let labels = keywords::merge(conn, &message.account_id, doomed, keeper, &message.labels)?;
     copies::repoint(
@@ -3712,7 +3792,15 @@ fn absorb_duplicate(
         &keeper.canonical_id,
     )?;
     let keeper = fold_doomed_local_state(keeper, doomed);
-    let thread = write_kept(conn, message, &keeper, true, &extra_folders, Some(labels))?;
+    let gained_inbox = write_kept(
+        conn,
+        message,
+        &keeper,
+        true,
+        &extra_folders,
+        Some(labels),
+        roles,
+    )?;
     // The stored parts of the doomed row fill what the keeper lacks; the
     // delete below drops the rest with the row.
     if let Some(list) = bodies::move_into(
@@ -3764,7 +3852,7 @@ fn absorb_duplicate(
             doomed.canonical_id,
         ],
     )?;
-    Ok(thread)
+    Ok(gained_inbox)
 }
 
 /// Join fingerprint groups that occur more than once.
@@ -3808,18 +3896,19 @@ fn merge_backfilled_duplicates(conn: &Connection) -> Result<()> {
             if via_alias || alias_points_at(&tx, &message.account_id, &stored.canonical_id)? {
                 continue;
             }
+            let mut roles = MergeRoles::new(None);
             let Some(other) = find_list_collapse(
                 &tx,
                 message,
                 &fingerprint,
                 Some(&stored.canonical_id),
                 true,
-                &mut MergeRoles::new(None),
+                &mut roles,
             )?
             else {
                 continue;
             };
-            absorb_duplicate(&tx, message, &stored, &other)?;
+            absorb_duplicate(&tx, message, &stored, &other, &mut roles)?;
             intents::finish_fold(&tx, &message.account_id, &other.canonical_id)?;
         }
         tx.commit()?;
@@ -4593,6 +4682,7 @@ fn ensure_agent_action_columns(conn: &Connection) -> Result<()> {
         ("conversation_count", "INTEGER"),
         ("local_action_floor", "INTEGER"),
         ("outbox_floor", "INTEGER"),
+        ("snooze_floor", "INTEGER"),
     ] {
         if !actions.iter().any(|column| column == name)
             && let Err(err) = conn.execute(

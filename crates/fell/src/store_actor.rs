@@ -70,11 +70,9 @@ impl StoreClient {
                 // Do not replay an interrupted job. Unwinding rolls back its
                 // SQLite transaction and drops its sender (an Err to the caller).
                 // The channel still owns all jobs we have not started.
+                let mut seen_snoozes = store.snooze_revision().ok();
                 restart.run(|recovered| {
-                    for job in &rx {
-                        job(&store);
-                        recovered();
-                    }
+                    run_interactive(&store, &rx, &notices, &mut seen_snoozes, recovered);
                 });
             })
             .expect("spawn store thread");
@@ -150,6 +148,52 @@ impl StoreClient {
     #[cfg(test)]
     fn has_background_lane(&self) -> bool {
         self.background_ready.load(Ordering::Acquire)
+    }
+}
+
+/// Recheck wall time on the store thread, including while offline or idle.
+fn run_interactive(
+    store: &Store,
+    jobs: &mpsc::Receiver<Job>,
+    notices: &UnboundedSender<WorkerEvent>,
+    seen_snoozes: &mut Option<i64>,
+    recovered: &mut dyn FnMut(),
+) {
+    let mut next_snooze = Instant::now();
+    let mut failed = false;
+    loop {
+        let now = Instant::now();
+        if now >= next_snooze {
+            next_snooze = now + Duration::from_millis(500);
+            match store
+                .wake_snoozes(crate::present::now_unix())
+                .and_then(|()| store.snooze_revision())
+            {
+                Ok(revision) => {
+                    failed = false;
+                    if seen_snoozes.replace(revision) != Some(revision) {
+                        let _ = notices.unbounded_send(WorkerEvent::SnoozesChanged);
+                    }
+                }
+                Err(err) if !failed => {
+                    failed = true;
+                    diagnostic!(
+                        WARN,
+                        "Could not wake snoozed mail",
+                        error = &err as &dyn std::error::Error
+                    );
+                }
+                Err(_) => {}
+            }
+        }
+        match jobs.recv_timeout(next_snooze.saturating_duration_since(Instant::now())) {
+            Ok(job) => {
+                job(store);
+                recovered();
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
     }
 }
 

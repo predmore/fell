@@ -1620,6 +1620,7 @@ pub(super) fn rows(
 }
 
 const ROW_GAP: f32 = 8.0;
+const ROW_META_GAP: f32 = 6.0;
 const MIN_SUBJECT: f32 = 72.0;
 const ROW_PAD: f32 = 14.0;
 const SENDER_GAP: f32 = 5.0;
@@ -1864,7 +1865,12 @@ fn row(
     } else {
         thread_label_group(theme, row, background, dim, row_room * 0.45, None, window)
     };
-    let snippet_room = row_room - labels.as_ref().map_or(0.0, |(_, width)| width + ROW_GAP);
+    let mute_width = row.muted.then(|| super::mute_chip_width(theme, window));
+    let snippet_room = row_room
+        - labels
+            .as_ref()
+            .map_or(0.0, |(_, width)| width + ROW_META_GAP)
+        - mute_width.map_or(0.0, |width| width + ROW_META_GAP);
     let excerpt = match &hit.preview {
         Some(preview) if !preview.highlights.is_empty() => {
             let (text, highlights) = visible_excerpt(preview);
@@ -1976,10 +1982,10 @@ fn row(
             div()
                 .flex()
                 .items_center()
-                .justify_between()
-                .gap(px(ROW_GAP))
+                .gap(px(ROW_META_GAP))
                 .child(
                     div()
+                        .flex_1()
                         .min_w_0()
                         .overflow_hidden()
                         .children(excerpt.map(|line| {
@@ -1988,6 +1994,7 @@ fn row(
                             paint_shaped_text(line, height, true)
                         })),
                 )
+                .children(mute_width.map(|width| super::mute_chip(theme, width, dim)))
                 .children(labels.map(|(group, _)| group)),
         )
         .into_any_element()
@@ -2278,6 +2285,8 @@ mod tests {
     #[test]
     fn narrow_search_rows_fit_compact_dates_without_crowding_the_subject() {
         let mut row = present::ThreadRow {
+            muted: false,
+            wake_at: None,
             id: "field-report".into(),
             spans: vec![present::NameSpan {
                 text: "Regional Field Survey Coordinator".into(),

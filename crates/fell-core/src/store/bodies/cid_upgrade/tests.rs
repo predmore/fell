@@ -110,7 +110,7 @@ fn a_headless_reader_repairs_cid_roles_and_derived_reads_only_once() {
         store
             .conn
             .execute(
-                "UPDATE messages SET unread = 0, starred = 1, snooze_until = 42
+                "UPDATE messages SET unread = 0, starred = 1, snooze_until = 253402300799
              WHERE message_id = 'literal@x'",
                 [],
             )
@@ -155,6 +155,11 @@ fn a_headless_reader_repairs_cid_roles_and_derived_reads_only_once() {
             .folder_threads(&account.id, "INBOX")
             .unwrap()
             .into_iter()
+            .chain(
+                store
+                    .folder_threads(&account.id, crate::store::SNOOZED)
+                    .unwrap(),
+            )
             .filter(|row| row.has_attachment)
             .map(|row| row.subject)
             .collect();

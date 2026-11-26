@@ -22,7 +22,7 @@ pub use activity::{
 };
 
 const ACTION_COLS: &str = "id, account_id, actor, kind, summary, undone, created_unix";
-const SNOOZE_SUMMARY_PREFIX: &str = "snoozed thread until ";
+pub(crate) const SNOOZE_SUMMARY_PREFIX: &str = "snoozed thread until ";
 pub const SNOOZE_CHANGED_NOTICE: &str = "Snooze already changed";
 const SNOOZE_RETIRED: i64 = 2;
 
@@ -456,17 +456,14 @@ impl crate::Store {
         thread_id: &ThreadId,
         actor: &str,
     ) -> Result<Option<RecordedAction>> {
-        let summary = "unsnoozed thread".to_string();
-        self.mutate_thread(
-            account_id,
-            thread_id,
-            actor,
-            "unsnooze",
-            summary,
-            |message| {
-                message.snooze_until = None;
-            },
-        )
+        let actor = require_token(actor, "actor")?;
+        let tx = crate::store::immediate_transaction(&self.conn)?;
+        require_account(&tx, account_id)?;
+        check_actor_grant(&tx, account_id, actor, WriteScope::Triage)?;
+        let result = unsnooze_in(&tx, account_id, thread_id, actor)?;
+        tx.commit()?;
+        self.seal_private_files()?;
+        Ok(result)
     }
 
     /// Move the thread's messages that are in `from` to `to`. Other folders
@@ -794,6 +791,25 @@ pub(crate) fn snooze_in(
     )
 }
 
+pub(crate) fn unsnooze_in(
+    conn: &Connection,
+    account: &AccountId,
+    thread: &ThreadId,
+    actor: &str,
+) -> Result<Option<RecordedAction>> {
+    mutate_thread_in(
+        conn,
+        account,
+        thread,
+        actor,
+        "unsnooze",
+        "unsnoozed thread",
+        |message| {
+            message.snooze_until = None;
+        },
+    )
+}
+
 fn mutate_thread_in(
     conn: &Connection,
     account_id: &AccountId,
@@ -902,17 +918,23 @@ fn undo_action(
     if let Some(blocker) = undo_conflicts::blocker(conn, action)? {
         return Err(Error::AgentActivityBlocked(blocker));
     }
-    let effect = if matches!(action.kind.as_str(), "snooze" | "unsnooze")
-        && !snooze_unchanged(conn, account_id, action)?
-    {
-        UndoEffect::SnoozeChanged
+    let wakes = if matches!(action.kind.as_str(), "snooze" | "unsnooze") {
+        snooze_wakes(conn, account_id, action)?
     } else {
+        Some(Vec::new())
+    };
+    let effect = if let Some(wakes) = wakes {
+        for wake in wakes {
+            crate::store::triage::undo_wake(conn, account_id, wake)?;
+        }
         match action.kind.as_str() {
             "draft" => undo_draft(conn, account_id, action.id)?,
             "annotate" => crate::notes::undo_annotation(conn, action.id)?,
             _ => undo_messages(conn, account_id, action)?,
         }
         UndoEffect::Restored
+    } else {
+        UndoEffect::SnoozeChanged
     };
     conn.execute(
         "UPDATE agent_actions SET undone = ?2 WHERE id = ?1",
@@ -928,16 +950,41 @@ fn undo_action(
     Ok(effect)
 }
 
+fn recorded_action(conn: &Connection, account: &AccountId, id: i64) -> Result<RecordedAction> {
+    Ok(conn.query_row(
+        &format!("SELECT {ACTION_COLS} FROM agent_actions WHERE id = ?1 AND account_id = ?2"),
+        params![id, account.as_str()],
+        map_action,
+    )?)
+}
+
+pub(crate) fn undo_batch_snooze(
+    conn: &Connection,
+    account: &AccountId,
+    id: i64,
+) -> Result<UndoEffect> {
+    let action = recorded_action(conn, account, id)?;
+    if action.undone {
+        return Ok(UndoEffect::Restored);
+    }
+    match undo_action(conn, account, &action) {
+        Err(Error::AgentActivityBlocked(_)) => {
+            conn.execute(
+                "UPDATE agent_actions SET undone = ?2 WHERE id = ?1",
+                [id, SNOOZE_RETIRED],
+            )?;
+            Ok(UndoEffect::SnoozeChanged)
+        }
+        result => result,
+    }
+}
+
 pub(crate) fn undo_recorded(
     conn: &Connection,
     account_id: &AccountId,
     id: i64,
 ) -> Result<UndoEffect> {
-    let action = conn.query_row(
-        &format!("SELECT {ACTION_COLS} FROM agent_actions WHERE id = ?1 AND account_id = ?2"),
-        params![id, account_id.as_str()],
-        map_action,
-    )?;
+    let action = recorded_action(conn, account_id, id)?;
     if action.undone {
         return Ok(UndoEffect::Restored);
     }
@@ -1283,11 +1330,12 @@ pub(crate) fn insert_action(
     conn.execute(
         "INSERT INTO agent_actions (
             account_id, actor, kind, summary, undone, created_unix, target_subject, conversation_count,
-            local_action_floor, outbox_floor
+            local_action_floor, outbox_floor, snooze_floor
          ) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, 1,
                    COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'local_actions'), 0),
                    CASE WHEN ?3 IN ('archive', 'move') THEN
-                       COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'server_outbox'), 0) END)",
+                       COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'server_outbox'), 0) END,
+                   CASE WHEN ?3 = 'snooze' THEN (SELECT revision FROM snooze_revision) END)",
         params![account_id.as_str(), actor, kind, summary, created_unix, subject],
     )?;
     Ok(RecordedAction {
@@ -1429,11 +1477,13 @@ fn undo_messages(conn: &Connection, account_id: &AccountId, action: &RecordedAct
     Ok(())
 }
 
-fn snooze_unchanged(
+/// A changed live snooze blocks undo unless a wake cleared exactly
+/// that deadline for this action. Older events can share the deadline.
+fn snooze_wakes(
     conn: &Connection,
     account_id: &AccountId,
     action: &RecordedAction,
-) -> Result<bool> {
+) -> Result<Option<Vec<i64>>> {
     let until = if action.kind == "unsnooze" {
         None
     } else if let Some(until) = action
@@ -1443,19 +1493,26 @@ fn snooze_unchanged(
     {
         Some(until)
     } else {
-        return Ok(false);
+        return Ok(None);
     };
-    Ok(!conn.query_row(
-        &format!(
-            "{resolved}
-             SELECT EXISTS (SELECT 1 FROM resolved s
-             JOIN messages m ON m.account_id = ?2 AND m.message_id = s.live_id
-             WHERE m.snooze_until IS NOT ?3)",
-            resolved = undo_conflicts::RESOLVED_SNAPSHOTS,
-        ),
-        params![action.id, account_id.as_str(), until],
-        |row| row.get::<_, bool>(0),
-    )?)
+    let mut query = conn.prepare_cached(&format!(
+        "{resolved}
+         SELECT DISTINCT w.event FROM resolved s
+         JOIN messages m ON m.account_id = ?2 AND m.message_id = s.live_id
+         LEFT JOIN snooze_wake_events w ON w.account_id = m.account_id
+           AND w.message_id = m.message_id AND w.until_unix = ?3 AND m.snooze_until IS NULL
+           AND w.event = (SELECT max(event) FROM snooze_wake_events
+                          WHERE account_id = m.account_id AND message_id = m.message_id)
+           AND w.event > COALESCE((SELECT snooze_floor FROM agent_actions WHERE id = ?1), 0)
+         WHERE m.snooze_until IS NOT ?3
+         ORDER BY w.event DESC",
+        resolved = undo_conflicts::RESOLVED_SNAPSHOTS,
+    ))?;
+    Ok(query
+        .query_map(params![action.id, account_id.as_str(), until], |row| {
+            row.get::<_, Option<i64>>(0)
+        })?
+        .collect::<rusqlite::Result<Option<Vec<_>>>>()?)
 }
 
 fn snooze_changed_error() -> Error {
@@ -3071,7 +3128,7 @@ mod tests {
             older.id
         );
         assert_eq!(
-            store.undo_with_note(&account).unwrap().1,
+            store.undo_with_note(&account).unwrap().1.as_deref(),
             Some("Note restored")
         );
         assert_eq!(
@@ -3079,7 +3136,7 @@ mod tests {
             latest.id
         );
         assert_eq!(
-            store.undo_with_note(&account).unwrap().1,
+            store.undo_with_note(&account).unwrap().1.as_deref(),
             Some("Note removed")
         );
         assert_eq!(
@@ -3357,7 +3414,7 @@ mod tests {
                 .is_err()
         );
         assert_eq!(
-            store.undo_with_note(&account).unwrap().1,
+            store.undo_with_note(&account).unwrap().1.as_deref(),
             Some("Reply draft kept · suggestion restored")
         );
         assert_eq!(
@@ -3439,12 +3496,12 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(
-            store.undo_with_note(&account).unwrap().1,
+            store.undo_with_note(&account).unwrap().1.as_deref(),
             Some("Note restored")
         );
         assert_eq!(notes()[0].suggestions.len(), 1);
         assert_eq!(
-            store.undo_with_note(&account).unwrap().1,
+            store.undo_with_note(&account).unwrap().1.as_deref(),
             Some("Unstarred · restored")
         );
         assert_eq!(notes()[0].suggestions.len(), 2);
@@ -3500,7 +3557,7 @@ mod tests {
 
             if mailbox_undo {
                 assert_eq!(
-                    store.undo_with_note(&account).unwrap().1,
+                    store.undo_with_note(&account).unwrap().1.as_deref(),
                     Some("Snooze undone · suggestion restored")
                 );
             } else {
@@ -3517,7 +3574,7 @@ mod tests {
             assert_eq!(snoozed_until(), Some(prior));
             assert_eq!(notes()[0].suggestions.len(), 1);
             assert_eq!(
-                store.undo_with_note(&account).unwrap().1,
+                store.undo_with_note(&account).unwrap().1.as_deref(),
                 Some("Note removed")
             );
             assert!(store.undo_with_note(&account).is_err());
@@ -3628,7 +3685,7 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].snooze_until, Some(until));
         assert_eq!(
-            store.undo_with_note(&account).unwrap().1,
+            store.undo_with_note(&account).unwrap().1.as_deref(),
             Some("Snooze undone · suggestion restored")
         );
         let messages = only_message(&store, &account, &thread);
@@ -3636,7 +3693,7 @@ mod tests {
         assert_eq!(messages[0].snooze_until, None);
         // Undo of the note publication lies between the snooze and the label.
         assert_eq!(
-            store.undo_with_note(&account).unwrap().1,
+            store.undo_with_note(&account).unwrap().1.as_deref(),
             Some("Note removed")
         );
         assert_eq!(store.undo_with_note(&account).unwrap().0.id, older.id);
@@ -3668,7 +3725,7 @@ mod tests {
         assert_eq!(messages[1].snooze_until, Some(until));
 
         assert_eq!(
-            store.undo_with_note(&account).unwrap().1,
+            store.undo_with_note(&account).unwrap().1.as_deref(),
             Some("Snooze already changed")
         );
         assert_eq!(only_message(&store, &account, &thread), messages);
@@ -3684,7 +3741,7 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(
-            store.undo_with_note(&account).unwrap().1,
+            store.undo_with_note(&account).unwrap().1.as_deref(),
             Some("Note removed")
         );
     }
@@ -3835,7 +3892,7 @@ mod tests {
             check_snooze(Some(until));
             assert_eq!(pending(), 0);
             assert_eq!(
-                store.undo_with_note(&account).unwrap().1,
+                store.undo_with_note(&account).unwrap().1.as_deref(),
                 Some("Snooze undone · suggestion restored")
             );
             check_snooze(None);

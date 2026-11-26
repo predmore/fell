@@ -136,6 +136,18 @@ CREATE TABLE IF NOT EXISTS local_action_bodies (
     FOREIGN KEY(action_id) REFERENCES local_actions(id)
 );
 
+CREATE TABLE IF NOT EXISTS local_snooze_actions (
+    action_id INTEGER NOT NULL REFERENCES local_actions(id) ON DELETE CASCADE,
+    agent_action_id INTEGER NOT NULL REFERENCES agent_actions(id) ON DELETE CASCADE,
+    PRIMARY KEY (action_id, agent_action_id)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS local_mute_undo (
+    action_id INTEGER NOT NULL REFERENCES local_actions(id) ON DELETE CASCADE,
+    message_id TEXT NOT NULL,
+    PRIMARY KEY (action_id, message_id)
+) WITHOUT ROWID;
+
 -- The message_parts list of a message an action removed, as stored.
 CREATE TABLE IF NOT EXISTS local_action_parts (
     action_id INTEGER NOT NULL,
@@ -187,6 +199,10 @@ pub enum ActionKind {
     Unread,
     Star,
     Unstar,
+    Snooze,
+    Unsnooze,
+    Mute,
+    Unmute,
     /// Moved into the account's Junk folder.
     Spam,
     /// Moved out of Junk back to the inbox.
@@ -210,6 +226,10 @@ impl ActionKind {
             Self::Unread => "unread",
             Self::Star => "star",
             Self::Unstar => "unstar",
+            Self::Snooze => "snooze",
+            Self::Unsnooze => "unsnooze",
+            Self::Mute => "mute",
+            Self::Unmute => "unmute",
             Self::Spam => "spam",
             Self::NotSpam => "not_spam",
             Self::Purge => "purge",
@@ -230,6 +250,10 @@ impl ActionKind {
             "unread" => Ok(Self::Unread),
             "star" => Ok(Self::Star),
             "unstar" => Ok(Self::Unstar),
+            "snooze" => Ok(Self::Snooze),
+            "unsnooze" => Ok(Self::Unsnooze),
+            "mute" => Ok(Self::Mute),
+            "unmute" => Ok(Self::Unmute),
             "spam" => Ok(Self::Spam),
             "not_spam" => Ok(Self::NotSpam),
             "purge" => Ok(Self::Purge),
@@ -805,7 +829,7 @@ impl Store {
     pub fn undo_with_note(
         &self,
         account_id: &AccountId,
-    ) -> Result<(LocalAction, Option<&'static str>, Vec<ThreadId>)> {
+    ) -> Result<(LocalAction, Option<String>, Vec<ThreadId>)> {
         self.undo_latest_with_note(account_id, None)
     }
 
@@ -813,7 +837,7 @@ impl Store {
         &self,
         account_id: &AccountId,
         expected: Option<i64>,
-    ) -> Result<(LocalAction, Option<&'static str>, Vec<ThreadId>)> {
+    ) -> Result<(LocalAction, Option<String>, Vec<ThreadId>)> {
         self.require_account(account_id)?;
         let tx = crate::store::immediate_transaction(self.connection())?;
         ensure_action_schema(&tx)?;
@@ -826,6 +850,7 @@ impl Store {
             ));
         }
         let mut restored_threads = Vec::new();
+        let mut triage_notice = None;
         if action.kind == ActionKind::DiscardDrafts {
             let (restored, confirmed) =
                 crate::compose::undo_discard(self, &tx, account_id, action.id)?;
@@ -841,6 +866,16 @@ impl Store {
             ActionKind::AnnotateThread | ActionKind::AcceptSuggestion | ActionKind::DismissNote
         ) {
             // The note and any linked snooze are restored below.
+        } else if matches!(action.kind, ActionKind::Snooze | ActionKind::Unsnooze) {
+            (restored_threads, triage_notice) =
+                crate::store::triage::undo_snooze(&tx, account_id, action.id)?;
+        } else if matches!(action.kind, ActionKind::Mute | ActionKind::Unmute) {
+            restored_threads = crate::store::triage::undo_mute(
+                &tx,
+                account_id,
+                action.id,
+                action.kind == ActionKind::Unmute,
+            )?;
         } else if action.kind.is_flag() {
             flags::undo(&tx, account_id, &action)?;
         } else if action.kind == ActionKind::Label {
@@ -907,7 +942,11 @@ impl Store {
         let note =
             crate::notes::undo_local(&tx, account_id, action.id)?.map(|note| note.notice(&action));
         tx.commit()?;
-        Ok((action, note, restored_threads))
+        Ok((
+            action,
+            note.map(str::to_owned).or(triage_notice),
+            restored_threads,
+        ))
     }
 
     /// Threads with at least one message in `folder`, newest activity first.
@@ -957,7 +996,7 @@ impl Store {
         Ok(out)
     }
 
-    fn require_account(&self, account_id: &AccountId) -> Result<()> {
+    pub(crate) fn require_account(&self, account_id: &AccountId) -> Result<()> {
         let found: Option<i64> = self
             .connection()
             .query_row(
@@ -1344,6 +1383,12 @@ fn latest_open_action(conn: &Connection, account_id: &AccountId) -> Result<Optio
                    EXISTS (SELECT 1 FROM local_action_messages s WHERE s.action_id = a.id)
                    OR EXISTS (SELECT 1 FROM local_action_flags f WHERE f.action_id = a.id)
                    OR EXISTS (SELECT 1 FROM local_thread_note_actions n WHERE n.action_id = a.id)
+                   OR EXISTS (SELECT 1 FROM local_mute_undo m WHERE m.action_id = a.id)
+                   OR EXISTS (
+                       SELECT 1 FROM local_snooze_actions s JOIN agent_actions agent
+                         ON agent.id = s.agent_action_id AND agent.undone = 0
+                       WHERE s.action_id = a.id
+                   )
                    OR (a.kind = 'discard_drafts' AND EXISTS (
                        SELECT 1 FROM compose_drafts d
                        WHERE d.account_id = a.account_id AND d.discarded_action_id = a.id

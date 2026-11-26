@@ -32,7 +32,7 @@ Render HTML as native styled text in GPUI wherever possible (paragraphs, heading
 | Memory at rest, 100k messages | 250 MB |
 
 ## Default keymap
-Leader defaults to `Space` and is configurable. Chords are grouped under it, with which-key hints. Direct keys: `j`/`k`, `gg`/`G` move; `Enter`/`o` open; `x`, `V` select / visual range; `e` archive, `#` delete, `!` spam; `m` move the thread's messages out of the current folder (undoable); `r`, `R`, `f` reply, reply all, forward; `c` compose; `l` label, `s` star; `gi`, `gs`, `gd` inbox, sent, drafts; `gf` fuzzy folder picker; `/`, `n`/`N` search; `u` undo (including agent actions). Conversation paging is `Ctrl-d` / `Ctrl-u`, not `Space`. The command palette is `:` and `Ctrl-Shift-p` and lists every action with its binding.
+Leader defaults to `Space` and is configurable. Chords are grouped under it, with which-key hints. Direct keys: `j`/`k`, `gg`/`G` move; `Enter`/`o` open; `x`, `V` select / visual range; `e` archive, `#` delete, `!` spam; `m` move the thread's messages out of the current folder (undoable); `r`, `R`, `f` reply, reply all, forward; `c` compose; `l` label, `s` star, `b` snooze, `B` unsnooze, `M` mute or unmute; `gi`, `gs`, `gd`, `gz`, `gm` inbox, sent, drafts, snoozed, muted; `gf` fuzzy folder picker; `/`, `n`/`N` search; `u` undo (including agent actions). Conversation paging is `Ctrl-d` / `Ctrl-u`, not `Space`. The command palette is `:` and `Ctrl-Shift-p` and lists every action with its binding.
 
 In Drafts, `#` discards the selected local drafts, including agent review drafts. In compose, use `:discard` or `Space m d` to discard and close. Press `u` in the main window to undo.
 

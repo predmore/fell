@@ -21,6 +21,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::Result;
 use crate::account::AccountId;
 use crate::backend::{FolderRemoval, RemovalKind, Settle};
+use crate::folders::{FolderRole, FolderRoles};
 use crate::message::{Message, MessageId};
 use crate::search::{IndexedText, sync_terms, terms_for_indexed};
 
@@ -575,14 +576,16 @@ pub(super) fn link(
 }
 
 /// Attach a newly discovered copy and add a physical folder when it is live.
+/// An attached copy reports whether its row gained Inbox membership.
 pub(super) fn link_arrival(
     conn: &Connection,
     account: &AccountId,
     copy: &crate::imap::RemoteCopy,
     id: &MessageId,
-) -> Result<bool> {
+    roles: &FolderRoles,
+) -> Result<Option<bool>> {
     if !link(conn, account, copy, id)? {
-        return Ok(false);
+        return Ok(None);
     }
     if !super::views::has_view(conn, account, &copy.mailbox)?
         && let Some((stored, _)) = find_stored(conn, account, id)?
@@ -595,11 +598,14 @@ pub(super) fn link_arrival(
                 .iter()
                 .any(|folder| folder.eq_ignore_ascii_case(&copy.folder))
         {
+            let gained_inbox = roles.is(FolderRole::Inbox, &copy.folder)
+                && !super::inbox_arrivals::has_inbox(roles, &stored.folders);
             folders.push(copy.folder.clone());
             write_folders(conn, account, &stored, &folders)?;
+            return Ok(Some(gained_inbox));
         }
     }
-    Ok(true)
+    Ok(Some(false))
 }
 
 /// The imported copy is shown by its local compose row. Settle this UID

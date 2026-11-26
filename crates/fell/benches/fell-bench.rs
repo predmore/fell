@@ -22,6 +22,7 @@ const THREAD_SAMPLES: usize = 5 * LONG_THREADS;
 const WATCH_HEADROOM: f64 = 1.20;
 const HYBRID_PRODUCT_TARGET_MS: f64 = 150.0;
 const PAGE_SIZE: usize = 100;
+const SNOOZED_ROWS: usize = 10_000;
 const INBOX: &str = "INBOX";
 const QUERIES: [(&str, &str, Option<&str>); 5] = [
     ("Single term", "invoice", None),
@@ -484,6 +485,30 @@ fn run_suite() -> Result<(), Box<dyn Error>> {
         );
     }
     let semantic = measure_semantic(&store, &mut report, &budgets);
+    mailbox::add_snoozed_threads(&store, SNOOZED_ROWS)?;
+    assert_eq!(
+        store
+            .folder_threads(&account.id, fell_core::store::SNOOZED)?
+            .len(),
+        SNOOZED_ROWS
+    );
+    for (label, folder) in [
+        ("Inbox page with 10,000 threads snoozed", INBOX),
+        (
+            "Snoozed first page (10,000 threads)",
+            fell_core::store::SNOOZED,
+        ),
+    ] {
+        for _ in 0..PAGE_WARMUPS {
+            let page = store.folder_page(&account.id, folder, &top_span)?;
+            assert_eq!(page.threads.len(), PAGE_SIZE);
+            assert!(page.more_after);
+            black_box(page);
+        }
+        report.latency(label, PAGE_SAMPLES, Some(folder_budget), |_| {
+            store.folder_page(&account.id, folder, &top_span).unwrap()
+        });
+    }
     let semantic_note = match &semantic {
         Ok(note) => note.clone(),
         Err(err) => format!("Hybrid measurement failed: {err}"),

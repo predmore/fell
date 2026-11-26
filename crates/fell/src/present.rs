@@ -1,4 +1,6 @@
-//! Row and conversation presentation. Pure functions, no GPUI.
+//! Row and conversation presentation. No GPUI.
+
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use fell_core::compose::DraftSummary;
 use fell_core::{FolderRole, FolderRoles, FolderThread, Message};
@@ -21,6 +23,8 @@ pub struct NameSpan {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ThreadRow {
+    pub muted: bool,
+    pub wake_at: Option<i64>,
     pub id: String,
     pub spans: Vec<NameSpan>,
     pub extra: usize,
@@ -44,6 +48,8 @@ pub struct ThreadRow {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConvMessage {
+    pub muted: bool,
+    pub wake_at: Option<i64>,
     /// The message's Message-ID, which open state is kept by.
     pub id: String,
     pub sender: String,
@@ -482,6 +488,8 @@ pub fn thread_rows(threads: &[FolderThread], me: &str) -> Vec<ThreadRow> {
         .iter()
         .map(|thread| ThreadRow {
             id: thread.thread_id.0.clone(),
+            muted: thread.muted,
+            wake_at: None,
             spans: participant_spans(thread, me).0,
             extra: participant_spans(thread, me).1,
             message_count: thread.message_count,
@@ -497,6 +505,22 @@ pub fn thread_rows(threads: &[FolderThread], me: &str) -> Vec<ThreadRow> {
             server_draft: None,
         })
         .collect()
+}
+
+pub(crate) fn folder_thread_rows(
+    threads: &[FolderThread],
+    me: &str,
+    folder: &str,
+) -> Vec<ThreadRow> {
+    let mut rows = thread_rows(threads, me);
+    for row in &mut rows {
+        match folder {
+            fell_core::store::SNOOZED => row.wake_at = Some(-row.date_unix),
+            fell_core::store::MUTED => row.muted = false,
+            _ => {}
+        }
+    }
+    rows
 }
 
 /// The row id of compose draft `id`. Thread ids never start with this.
@@ -543,6 +567,8 @@ pub fn draft_rows(drafts: &[DraftSummary]) -> Vec<ThreadRow> {
                 labels.push(agent);
             }
             ThreadRow {
+                muted: false,
+                wake_at: None,
                 id: draft_row_id(&draft.id),
                 spans,
                 extra: names.len().saturating_sub(3),
@@ -849,6 +875,8 @@ pub fn conversation(
         .map(|(index, message)| {
             let email = message.headers.from.email.clone();
             ConvMessage {
+                muted: false,
+                wake_at: None,
                 id: message.headers.message_id.as_str().to_string(),
                 mail_headers: mail_headers(message),
                 sender: display_name(&message.headers.from.name, &email, me),
@@ -1093,14 +1121,14 @@ fn days_in_month(year: i32, month: u8) -> u8 {
     }
 }
 
-fn weekday(wday: u8) -> &'static str {
+pub(crate) fn weekday(wday: u8) -> &'static str {
     ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
         .get(wday as usize)
         .copied()
         .unwrap_or("Day")
 }
 
-fn month_name(month: u8) -> &'static str {
+pub(crate) fn month_name(month: u8) -> &'static str {
     [
         "", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ]
@@ -1120,6 +1148,13 @@ pub fn local_offset(unix: i64) -> i64 {
         }
         (out.tm_gmtoff as i64).clamp(-14 * 3600, 14 * 3600)
     }
+}
+
+pub(crate) fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 pub(crate) fn absolute_date(unix: i64) -> String {
@@ -1475,6 +1510,8 @@ mod tests {
 
     fn shown_message(id: &str, state: fell_core::BodyState, body: &str) -> ConvMessage {
         ConvMessage {
+            muted: false,
+            wake_at: None,
             id: id.into(),
             sender: "Ada".into(),
             email: "ada@x".into(),
@@ -1897,6 +1934,8 @@ mod tests {
     fn a_synced_draft_row_names_who_it_is_to() {
         // #99: synced drafts showed their sender, "me".
         let mut rows = vec![ThreadRow {
+            muted: false,
+            wake_at: None,
             id: "t1".into(),
             spans: vec![NameSpan {
                 text: "me".into(),
@@ -2077,6 +2116,7 @@ mod tests {
     #[test]
     fn latest_sender_is_emphasized_and_you_are_me() {
         let thread = FolderThread {
+            muted: false,
             thread_id: ThreadId("t".into()),
             subject: "Subject".into(),
             snippet: "hello   there\nfriend".into(),
