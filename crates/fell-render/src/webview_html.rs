@@ -11,6 +11,7 @@ use scraper::node::{Element, Node};
 use crate::html::{self, Declaration};
 
 const MAX_ESTIMATED_HEIGHT: f32 = 8_192.;
+const HEIGHT_ALLOWANCE: f32 = 20.;
 
 fn web_page(body: &str, scheme: &str, body_padding: &str) -> String {
     format!(
@@ -68,11 +69,7 @@ impl WebMail {
             0,
             Some(&mut images),
         );
-        let layout_dom = crate::html::parse_html(&body);
-        let styles = LayoutStyles::from_document(&layout_dom);
-        let layout = Layout::from_node(*layout_dom.root_element(), &styles, false);
-        // The surrounding document is ours. Carry over the email body's
-        // padding so the snapshot can honor its bottom inset.
+        // Estimate the same wrapper insets that the snapshot will paint.
         let mut body_padding = String::new();
         if let Some(style) = dom
             .root_element()
@@ -85,9 +82,16 @@ impl WebMail {
                 if rule.split_once(':').is_some_and(|(name, _)| {
                     [
                         "padding",
+                        "padding-top",
+                        "padding-right",
                         "padding-bottom",
+                        "padding-left",
                         "padding-block",
+                        "padding-block-start",
                         "padding-block-end",
+                        "padding-inline",
+                        "padding-inline-start",
+                        "padding-inline-end",
                     ]
                     .iter()
                     .any(|property| name.trim().eq_ignore_ascii_case(property))
@@ -97,6 +101,10 @@ impl WebMail {
                 }
             }
         }
+        let layout_dom =
+            html::parse_html(&format!(r#"<body style="{body_padding}">{body}</body>"#));
+        let styles = LayoutStyles::from_document(&layout_dom);
+        let layout = Layout::from_node(*layout_dom.root_element(), &styles, false);
         Self {
             body,
             body_padding,
@@ -113,7 +121,7 @@ impl WebMail {
     pub fn estimated_height(&self, width: f32) -> f32 {
         (self.layout.as_ref().map_or(0., |layout| {
             layout.height(width, 20., Self::image_height_limit(width))
-        }) + 12.)
+        }) + HEIGHT_ALLOWANCE)
             .min(MAX_ESTIMATED_HEIGHT)
     }
 
@@ -162,6 +170,7 @@ pub(crate) struct LayoutStyles {
     tags: HashMap<String, OrderedDeclarations>,
     classes: HashMap<String, OrderedDeclarations>,
     ids: HashMap<String, OrderedDeclarations>,
+    incomplete: bool,
 }
 
 enum SimpleSelector {
@@ -172,15 +181,67 @@ enum SimpleSelector {
 
 type LayoutRule = (Vec<SimpleSelector>, OrderedDeclarations);
 
-struct LayoutRules;
+struct LayoutRules<'a>(&'a mut bool);
 
-impl<'i> AtRuleParser<'i> for LayoutRules {
+fn can_model(declaration: &Declaration) -> bool {
+    let value = declaration.value.as_str();
+    match declaration.name.as_str() {
+        // Paint properties do not change the size of a box.
+        "background" | "background-color" | "background-image" | "color" | "opacity"
+        | "text-decoration" => true,
+        "display" => matches!(
+            value,
+            "none"
+                | "block"
+                | "inline"
+                | "inline-block"
+                | "flex"
+                | "inline-flex"
+                | "table"
+                | "table-cell"
+                | "table-row"
+                | "contents"
+        ),
+        "visibility" => matches!(value, "visible" | "hidden"),
+        "overflow" | "overflow-y" | "overflow-x" => value
+            .split_ascii_whitespace()
+            .all(|value| matches!(value, "visible" | "hidden" | "clip" | "auto" | "scroll")),
+        "font-size" => css_pixels(value).is_some(),
+        "line-height" => {
+            value == "normal"
+                || css_pixels(value).is_some()
+                || value
+                    .parse::<f32>()
+                    .is_ok_and(|value| value.is_finite() && value >= 0.)
+        }
+        "width" | "height" | "min-height" | "max-height" => {
+            matches!(value, "auto" | "none") || css_pixels(value).is_some()
+        }
+        "gap" => css_pixels(value).is_some(),
+        name if name.starts_with("padding") || name.starts_with("margin") => {
+            !value.is_empty()
+                && value
+                    .split_ascii_whitespace()
+                    .all(|value| css_pixels(value).is_some())
+        }
+        _ => false,
+    }
+}
+
+fn style_applies(element: &Element) -> bool {
+    element.attr("media").is_none_or(|value| {
+        let value = value.trim();
+        value.eq_ignore_ascii_case("all") || value.eq_ignore_ascii_case("screen")
+    })
+}
+
+impl<'i> AtRuleParser<'i> for LayoutRules<'_> {
     type Prelude = ();
     type AtRule = LayoutRule;
     type Error = ();
 }
 
-impl<'i> QualifiedRuleParser<'i> for LayoutRules {
+impl<'i> QualifiedRuleParser<'i> for LayoutRules<'_> {
     type Prelude = Vec<SimpleSelector>;
     type QualifiedRule = LayoutRule;
     type Error = ();
@@ -210,30 +271,8 @@ impl<'i> QualifiedRuleParser<'i> for LayoutRules {
             .into_iter()
             .enumerate()
         {
-            // The estimator cannot resolve shorthands that reset properties
-            // across the cascade.
-            if matches!(declaration.name.as_str(), "all" | "font") {
-                return Err(input.new_custom_error(()));
-            }
-            if matches!(
-                declaration.name.as_str(),
-                "display"
-                    | "font-size"
-                    | "line-height"
-                    | "max-height"
-                    | "overflow"
-                    | "overflow-y"
-                    | "padding"
-                    | "padding-top"
-                    | "padding-right"
-                    | "padding-bottom"
-                    | "padding-left"
-                    | "margin"
-                    | "margin-top"
-                    | "margin-bottom"
-            ) {
-                add_declaration(&mut rules, order, declaration);
-            }
+            *self.0 |= !can_model(&declaration);
+            add_declaration(&mut rules, order, declaration);
         }
         Ok((selectors, rules))
     }
@@ -247,26 +286,44 @@ impl LayoutStyles {
             .root_element()
             .descendants()
             .filter_map(scraper::ElementRef::wrap)
-            .filter(|node| node.value().name() == "style")
         {
+            let element = node.value();
+            if let Some(inline) = element.attr("style") {
+                let mut input = ParserInput::new(inline);
+                styles.incomplete |=
+                    html::parse_stylesheet_declarations(&mut Parser::new(&mut input))
+                        .map_or(true, |rules| rules.iter().any(|decl| !can_model(decl)));
+            }
+            if element.name() != "style" || !style_applies(element) {
+                continue;
+            }
             let css = node.text().collect::<String>();
             let mut input = ParserInput::new(&css);
             let mut parser = Parser::new(&mut input);
             let start = parser.state();
-            // StyleSheetParser normally skips an initial @charset rule.
+            // StyleSheetParser skips an initial @charset rule.
             loop {
                 match parser.next() {
                     Ok(Token::CDO | Token::CDC) => {}
-                    Ok(Token::AtKeyword(_)) => return Self::default(),
+                    Ok(Token::AtKeyword(_)) => {
+                        styles.incomplete = true;
+                        break;
+                    }
                     _ => break,
                 }
             }
             parser.reset(&start);
-            // A rule we cannot model may undo one that hid content. Only
-            // apply the author cascade when we understand the entire sheet.
-            for rule in StyleSheetParser::new(&mut parser, &mut LayoutRules) {
-                let Ok((selectors, declarations)) = rule else {
-                    return Self::default();
+            // Keep understood rules for positive size hints and native flex
+            // spacing. A partial cascade cannot prove that content is hidden.
+            let mut invalid_rule = false;
+            for rule in StyleSheetParser::new(&mut parser, &mut LayoutRules(&mut styles.incomplete))
+            {
+                let (selectors, declarations) = match rule {
+                    Ok(rule) => rule,
+                    Err(_) => {
+                        invalid_rule = true;
+                        continue;
+                    }
                 };
                 let Some(last) = declarations.iter().map(|(index, _)| *index).max() else {
                     continue;
@@ -284,6 +341,7 @@ impl LayoutStyles {
                 }
                 order += last + 1;
             }
+            styles.incomplete |= invalid_rule;
         }
         styles
     }
@@ -319,6 +377,7 @@ enum Layout {
     Image {
         width: f32,
         height: f32,
+        min_height: f32,
     },
     Flow {
         children: Vec<Layout>,
@@ -326,11 +385,9 @@ enum Layout {
         line_height: Option<f32>,
         vertical: f32,
         horizontal: f32,
-    },
-    Row(Vec<Layout>),
-    Clipped {
-        child: Box<Layout>,
+        min_height: f32,
         max_height: f32,
+        row: bool,
     },
 }
 
@@ -361,6 +418,16 @@ fn css_pixels(value: &str) -> Option<f32> {
     (pixels.is_finite() && pixels >= 0.).then_some(pixels)
 }
 
+fn html_pixels(value: &str) -> Option<f32> {
+    let value = value.trim();
+    let pixels = value
+        .strip_suffix("px")
+        .unwrap_or(value)
+        .parse::<f32>()
+        .ok()?;
+    (pixels.is_finite() && pixels >= 0.).then_some(pixels)
+}
+
 fn box_edges(style: &[Declaration], property: &str, sides: [&str; 4]) -> [Option<f32>; 4] {
     let mut edges = [None; 4];
     for declaration in style {
@@ -380,6 +447,29 @@ fn box_edges(style: &[Declaration], property: &str, sides: [&str; 4]) -> [Option
             }
         } else if let Some(side) = sides.iter().position(|side| *side == declaration.name) {
             assign(&mut edges[side], css_pixels(&declaration.value));
+        } else if let Some(axis) = declaration
+            .name
+            .strip_prefix(property)
+            .and_then(|name| name.strip_prefix('-'))
+        {
+            let mut lengths = declaration.value.split_ascii_whitespace().map(css_pixels);
+            let first = lengths.next().flatten();
+            let second = lengths.next().unwrap_or(first);
+            match axis {
+                "block" => {
+                    assign(&mut edges[0], first);
+                    assign(&mut edges[2], second);
+                }
+                "inline" => {
+                    assign(&mut edges[3], first);
+                    assign(&mut edges[1], second);
+                }
+                "block-start" => assign(&mut edges[0], first),
+                "block-end" => assign(&mut edges[2], first),
+                "inline-start" => assign(&mut edges[3], first),
+                "inline-end" => assign(&mut edges[1], first),
+                _ => {}
+            }
         }
     }
     edges.map(|edge| edge.and_then(|(_, length)| length))
@@ -429,24 +519,18 @@ impl Layout {
             return None;
         }
         let style = styles.declarations(element);
-        let max_height = html::declared_value(&style, "max-height");
-        if html::is_hidden_from_layout(element, &style) {
+        let display = html::declared_value(&style, "display");
+        if !styles.incomplete
+            && (display == Some("none")
+                || (display.is_none()
+                    && element
+                        .attr("hidden")
+                        .is_some_and(|value| !value.eq_ignore_ascii_case("until-found"))))
+        {
             return None;
         }
-        let zero = html::has_zero_font_size(element, &style, inherited_zero);
-        let layout = Self::from_element(node, element, styles, &style, zero)?;
-        if html::clips_vertical_overflow(&style)
-            && let Some(height) = max_height.and_then(|value| value.strip_suffix("px"))
-            && let Ok(max_height) = height.parse::<f32>()
-            && max_height.is_finite()
-            && max_height > 0.
-        {
-            return Some(Self::Clipped {
-                child: Box::new(layout),
-                max_height,
-            });
-        }
-        Some(layout)
+        let zero = !styles.incomplete && html::has_zero_font_size(element, &style, inherited_zero);
+        Self::from_element(node, element, styles, &style, zero)
     }
 
     fn from_element(
@@ -457,19 +541,25 @@ impl Layout {
         zero_font: bool,
     ) -> Option<Self> {
         let name = element.name();
+        let length = |property| {
+            style
+                .iter()
+                .filter(|declaration| declaration.name == property)
+                .filter_map(|declaration| css_pixels(&declaration.value))
+                .fold(0., f32::max)
+        };
+        let attribute_height = if matches!(name, "td" | "th" | "tr" | "div") {
+            element.attr("height").and_then(html_pixels).unwrap_or(0.)
+        } else {
+            0.
+        };
+        let min_height = length("min-height");
         if name == "img" {
             let dimension = |name| {
-                let pixels = |value: &str| {
-                    let value = value.trim();
-                    value
-                        .trim_end_matches("px")
-                        .parse::<f32>()
-                        .ok()
-                        .filter(|px| px.is_finite() && *px > 0.)
-                };
                 html::declared_value(style, name)
-                    .and_then(pixels)
-                    .or_else(|| element.attr(name).and_then(pixels))
+                    .and_then(css_pixels)
+                    .or_else(|| element.attr(name).and_then(html_pixels))
+                    .filter(|value| *value > 0.)
             };
             let width = dimension("width");
             let height = dimension("height");
@@ -480,15 +570,7 @@ impl Layout {
                 height: height
                     .or_else(|| width.map(|width| width / 1.5))
                     .unwrap_or(80.),
-            });
-        }
-        if matches!(name, "br" | "hr") {
-            return (!zero_font || name == "hr").then_some(Self::Flow {
-                children: Vec::new(),
-                scale: 1.,
-                line_height: None,
-                vertical: 20.,
-                horizontal: 0.,
+                min_height,
             });
         }
         let mut children: Vec<Layout> = Vec::new();
@@ -501,9 +583,6 @@ impl Layout {
             } else {
                 children.push(child);
             }
-        }
-        if children.is_empty() {
-            return None;
         }
         let line_height = authored_line_height(style);
         let [top, right, bottom, left] = box_edges(
@@ -521,11 +600,36 @@ impl Layout {
             "margin",
             ["margin-top", "margin-right", "margin-bottom", "margin-left"],
         );
+        let border = |side| {
+            style
+                .iter()
+                .filter(|declaration| {
+                    matches!(declaration.name.as_str(), "border" | "border-width")
+                        || declaration.name == format!("border-{side}")
+                        || declaration.name == format!("border-{side}-width")
+                })
+                .map(|declaration| {
+                    declaration
+                        .value
+                        .split_ascii_whitespace()
+                        .filter_map(|value| match value {
+                            "thin" => Some(1.),
+                            "medium" => Some(3.),
+                            "thick" => Some(5.),
+                            _ => css_pixels(value),
+                        })
+                        .reduce(f32::max)
+                        .unwrap_or(3.)
+                })
+                .fold(0., f32::max)
+        };
         let horizontal = left.unwrap_or(0.) + right.unwrap_or(0.);
-        let padding = top.unwrap_or(0.) + bottom.unwrap_or(0.);
+        let padding = top.unwrap_or(0.) + bottom.unwrap_or(0.) + border("top") + border("bottom");
         let (scale, default_margin) = match name {
-            "tr" => return Some(Self::Row(children)),
-            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => (1.9, 18.),
+            "h1" => (2., 44.),
+            "h2" => (1.5, 40.),
+            "h3" => (1.2, 38.),
+            "h4" | "h5" | "h6" => (1., 44.),
             "p" => (1., 20.),
             "ul" | "ol" | "blockquote" => (1., 12.),
             "a" | "b" | "em" | "font" | "i" | "small" | "span" | "strong" | "u"
@@ -535,6 +639,30 @@ impl Layout {
             }
             _ => (1., 0.),
         };
+        let max_height = if !styles.incomplete
+            && matches!(name, "div" | "aside" | "section" | "article" | "p")
+            && matches!(html::declared_value(style, "display"), None | Some("block"))
+            && html::clips_vertical_overflow(style)
+        {
+            html::declared_value(style, "max-height").and_then(css_pixels)
+        } else {
+            None
+        };
+        let min_height = min_height.max(attribute_height).max(length("height")).max(
+            if name == "hr" || name == "br" && !zero_font {
+                20.
+            } else {
+                0.
+            },
+        );
+        if children.is_empty()
+            && padding == 0.
+            && min_height == 0.
+            && above.is_none()
+            && below.is_none()
+        {
+            return None;
+        }
         Some(Self::Flow {
             children,
             scale,
@@ -548,6 +676,9 @@ impl Layout {
                     0.
                 },
             horizontal,
+            min_height,
+            max_height: max_height.map_or(f32::INFINITY, |max| max.max(length("min-height"))),
+            row: name == "tr",
         })
     }
 
@@ -557,32 +688,35 @@ impl Layout {
             Self::Image {
                 width: natural,
                 height,
-            } => (height * (width / natural).min(1.)).min(image_limit),
+                min_height,
+            } => (height * (width / natural).min(1.))
+                .max(*min_height)
+                .min(image_limit),
             Self::Flow {
                 children,
                 scale,
                 line_height,
                 vertical,
                 horizontal,
+                min_height,
+                max_height,
+                row,
             } => {
-                children
-                    .iter()
-                    .map(|node| {
-                        node.height(
-                            (width - horizontal).max(1.),
-                            line_height.unwrap_or(line * scale),
-                            image_limit,
-                        )
-                    })
-                    .sum::<f32>()
-                    + vertical
-            }
-            Self::Row(cells) => cells
-                .iter()
-                .map(|node| node.height((width / cells.len() as f32).max(1.), line, image_limit))
-                .fold(0., f32::max),
-            Self::Clipped { child, max_height } => {
-                child.height(width, line, image_limit).min(*max_height)
+                let width = (width - horizontal).max(1.);
+                let line = line_height.unwrap_or(line * scale);
+                let content = if *row {
+                    let width = (width / children.len().max(1) as f32).max(1.);
+                    children
+                        .iter()
+                        .map(|node| node.height(width, line, image_limit))
+                        .fold(0., f32::max)
+                } else {
+                    children
+                        .iter()
+                        .map(|node| node.height(width, line, image_limit))
+                        .sum()
+                };
+                content.max(*min_height).min(*max_height) + vertical
             }
         }
     }
@@ -595,7 +729,7 @@ fn height_estimates_account_for_headings_image_hints_and_table_rows() {
         r#"<table><tr><td><h1>Today</h1></td><td><h1>News</h1></td></tr><tr><td colspan="2"><img width="300" src="https://example.test/photo"></td></tr></table>"#,
     );
     let height = mail.estimated_height(420.);
-    assert!((260. ..300.).contains(&height), "{height}");
+    assert!((300. ..330.).contains(&height), "{height}");
     assert!(mail.estimated_height(180.) < height);
 }
 
@@ -605,6 +739,7 @@ fn height_estimates_cap_image_hints_and_total_layout() {
     let image = Layout::Image {
         width: 1.,
         height: 10_000_000.,
+        min_height: 0.,
     };
     assert_eq!(
         image.height(440., 20., WebMail::image_height_limit(440.)),
@@ -612,8 +747,8 @@ fn height_estimates_cap_image_hints_and_total_layout() {
     );
     let mail =
         WebMail::prepare(r#"<img width="600" height="200000" src="https://example.test/large">"#);
-    assert_eq!(mail.estimated_height(440.), 672.);
-    assert_eq!(mail.estimated_height(300.), 462.);
+    assert_eq!(mail.estimated_height(440.), 680.);
+    assert_eq!(mail.estimated_height(300.), 470.);
     assert_eq!(
         WebMail::prepare(&"<p>Another line</p>".repeat(500)).estimated_height(440.),
         MAX_ESTIMATED_HEIGHT
@@ -653,7 +788,7 @@ fn height_estimates_respect_stylesheets_escapes_and_clipped_height() {
         <aside class="clipped">{hidden}</aside>
         <aside style="max-height:10px;overflow:hidden">{hidden}</aside>"#
     );
-    assert_eq!(WebMail::prepare(&html).estimated_height(440.), 72.);
+    assert_eq!(WebMail::prepare(&html).estimated_height(440.), 80.);
 }
 
 #[cfg(test)]
@@ -681,26 +816,63 @@ fn height_estimates_keep_stylesheet_overrides_and_visible_overflow() {
 #[cfg(test)]
 #[test]
 fn height_estimates_discard_a_partial_author_cascade() {
-    let visible = "x".repeat(80_000);
-    let body = format!(r#"<div class="show"><span>{visible}</span></div>"#);
-    let inline = r#"<div style="display:none">Hidden</div>"#;
-    let expected = WebMail::prepare(&body).estimated_height(440.);
-    for (weaker, unmodeled) in [
-        ("div {display:none}", "div.show {display:block}"),
-        ("div {display:none}", "@media screen {div {display:block}}"),
-        ("div {display:none}", "@charset \"utf-8\";"),
-        ("div {display:none}", ".bad {display block}"),
-        ("div {display:none}", "} div {display:block}"),
-        ("span {font-size:0}", "div span {font-size:16px}"),
-        ("span {font-size:0}", "span {font:16px sans-serif}"),
+    let body = concat!(
+        r#"<div hidden class="show"><span>Author rules may reveal this text.</span></div>"#,
+        r#"<div style="display:none;visibility:hidden;font-size:0;max-height:0;overflow:hidden">"#,
+        "A media rule can restore this paragraph.</div>",
+    );
+    let expected = WebMail::prepare(concat!(
+        "<div>Author rules may reveal this text.</div>",
+        "<div>A media rule can restore this paragraph.</div>",
+    ))
+    .estimated_height(440.);
+    for unmodeled in [
+        "div.show {display:block}",
+        "@media screen {div {display:block}}",
+        "@charset \"utf-8\";",
+        ".bad {display block}",
+        "} div {display:block}",
+        "span {font:16px sans-serif}",
+        ".show {all:revert}",
+        ".show {unknown-property:10px}",
     ] {
-        let html = format!("<style>{unmodeled}</style><style>{weaker}</style>{inline}{body}");
-        assert_eq!(
-            WebMail::prepare(&html).estimated_height(440.),
-            expected,
+        let html = format!("<style>{unmodeled} div {{display:none}}</style>{body}");
+        assert!(
+            WebMail::prepare(&html).estimated_height(440.) >= expected,
             "{unmodeled}"
         );
     }
+}
+
+#[cfg(test)]
+#[test]
+fn web_style_media_is_shared_by_the_estimator_and_the_page() {
+    let mail = WebMail::prepare(concat!(
+        r#"<style media="print">.box {display:none}</style>"#,
+        r#"<style media="(min-width: 1px)">.box {height:100px}</style>"#,
+        r#"<style media=" SCREEN ">.box {padding-block:8px}</style>"#,
+        r#"<style media="all">.box {margin-block:10px}</style>"#,
+        r#"<div class="box">Story</div>"#,
+    ));
+    let page = mail.page("light", |_| None);
+    assert!(!page.contains("display:none"));
+    assert!(!page.contains("height:100px"));
+    assert!(page.contains("padding-block:8px"));
+    assert!(page.contains("margin-block:10px"));
+    assert_eq!(mail.estimated_height(440.), 76.);
+}
+
+#[cfg(test)]
+#[test]
+fn height_estimates_keep_author_reveals_and_spacer_boxes() {
+    let mail = WebMail::prepare(concat!(
+        "<style>.show {display:block !important}</style>",
+        r#"<body style="padding-block:6px 8px"><div hidden class="show">Story</div>"#,
+        r#"<table><tr height="36"><td height="24" style="font-size:0"></td></tr></table>"#,
+        r#"<div height="40" style="height:30px;min-height:50px;border-top:3px solid;border-bottom:4px solid;padding-block:8px 9px;margin-block:5px 6px"></div>"#,
+        "</body>",
+    ));
+    assert!(mail.estimated_height(440.) >= 175.);
 }
 
 pub fn sanitize_html(html: &str, allow_remote_images: bool) -> String {
@@ -803,7 +975,7 @@ fn serialize_node(
                 return;
             }
             if name == "style" {
-                if !allow_style {
+                if !allow_style || !style_applies(element) {
                     return;
                 }
                 let css = node

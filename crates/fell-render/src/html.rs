@@ -2226,8 +2226,9 @@ pub(crate) fn is_hidden_from_layout(
     style: &[Declaration],
 ) -> bool {
     // mso-hide is Outlook-specific. Its ordinary HTML fallback is visible here.
-    element.attr("hidden").is_some()
-        || declared_value(style, "display") == Some("none")
+    let display = declared_value(style, "display");
+    (element.attr("hidden").is_some() && display.is_none())
+        || display == Some("none")
         || (declared_value(style, "max-height").is_some_and(is_zero_length)
             && clips_vertical_overflow(style))
 }
@@ -2515,7 +2516,7 @@ mod tests {
 
     #[test]
     fn flattened_flex_and_block_items_keep_words_separate() {
-        let html = r#"<style>.masthead {display:flex}</style>
+        let html = r#"<style>@media print {div {display:block}} a:hover {color:blue} .masthead {display:flex}</style>
             <div class="masthead"><b>THE LAKESIDE DISPATCH</b><span>No. 42</span></div>
             <h1><span style="display:block">First</span><span>Second</span></h1>
             <p>un<b>break</b><span>able</span></p>"#;

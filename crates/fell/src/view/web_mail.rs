@@ -127,6 +127,7 @@ struct Shown {
     prompt_from: f32,
     prompt_height_from: f32,
     prompt_fade: Option<Transition>,
+    prompt_swap: Option<motion::LayerSwap>,
     retrying: bool,
     reserves_tag: bool,
     image_consent: bool,
@@ -164,6 +165,7 @@ impl Shown {
             prompt_from: 0.,
             prompt_height_from: 0.,
             prompt_fade: None,
+            prompt_swap: None,
             retrying: false,
             reserves_tag: false,
             image_consent: false,
@@ -199,14 +201,15 @@ impl Shown {
             // Continue from the opacities on screen when that happens.
             let progress = motion::progress(self.prompt_fade.as_ref(), now);
             self.prompt_height_from = self.prompt_height(progress);
+            let [incoming, outgoing] = self.prompt_opacities(progress, now);
+            let retry_failed = self.prompt == Some(Prompt::Retrying)
+                && matches!(prompt, Some(Prompt::Unavailable { .. }));
             let prior = std::mem::replace(&mut self.prompt, prompt);
-            let fade = motion.start(motion::FADE, now);
             for (_, alpha) in &mut self.outgoing_prompts {
-                *alpha *= 1.0 - progress;
+                *alpha *= outgoing;
             }
             if let Some(prior) = prior {
-                self.outgoing_prompts
-                    .push((prior, motion::lerp(self.prompt_from, 1.0, progress)));
+                self.outgoing_prompts.push((prior, incoming));
             }
             self.prompt_from = 0.;
             self.outgoing_prompts.retain(|(label, alpha)| {
@@ -220,10 +223,28 @@ impl Shown {
                 self.prompt_from = 1.;
                 self.outgoing_prompts.clear();
             }
-            self.prompt_fade = fade;
+            self.prompt_swap = retry_failed
+                .then(|| {
+                    motion::LayerSwap::start(
+                        motion,
+                        now,
+                        RENDERER_EXIT,
+                        RENDERER_CHANGE - RENDERER_EXIT,
+                    )
+                })
+                .flatten();
+            self.prompt_fade = motion.start(
+                if retry_failed {
+                    RENDERER_CHANGE
+                } else {
+                    motion::FADE
+                },
+                now,
+            );
         }
         if !motion.enabled() || self.prompt_fade.is_none_or(|fade| !fade.running(now)) {
             self.prompt_fade = None;
+            self.prompt_swap = None;
             self.outgoing_prompts.clear();
         }
     }
@@ -234,6 +255,17 @@ impl Shown {
             f32::from(u8::from(self.prompt.is_some())),
             progress,
         )
+    }
+
+    fn prompt_opacities(&self, progress: f32, now: Instant) -> [f32; 2] {
+        if let Some(swap) = self.prompt_swap {
+            return match swap.frame(now) {
+                Some(motion::SwapFrame::Leaving(alpha)) => [0., alpha],
+                Some(motion::SwapFrame::Arriving(alpha)) => [alpha, 0.],
+                None => [1., 0.],
+            };
+        }
+        [motion::lerp(self.prompt_from, 1., progress), 1. - progress]
     }
 
     fn frame(&self, now: Instant) -> Frame {
@@ -257,6 +289,7 @@ impl Shown {
             .as_ref()
             .map_or(current_tag, |body| f32::from(u8::from(body.is_web())));
         let prompt_progress = motion::progress(self.prompt_fade.as_ref(), now);
+        let [incoming_alpha, outgoing_alpha] = self.prompt_opacities(prompt_progress, now);
         Frame {
             body: self.body.clone(),
             outgoing: self.outgoing.clone(),
@@ -264,11 +297,11 @@ impl Shown {
             height_progress,
             prompt: (self.prompt.is_some() || self.prompt_fade.is_some()).then(|| PromptFrame {
                 incoming: self.prompt.clone(),
-                incoming_alpha: motion::lerp(self.prompt_from, 1.0, prompt_progress),
+                incoming_alpha,
                 outgoing: self
                     .outgoing_prompts
                     .iter()
-                    .map(|(label, alpha)| (label.clone(), alpha * (1.0 - prompt_progress)))
+                    .map(|(label, alpha)| (label.clone(), alpha * outgoing_alpha))
                     .collect(),
                 height: self.prompt_height(prompt_progress),
                 progress: prompt_progress,
@@ -831,7 +864,14 @@ impl Reader {
                     .iter()
                     .find(|measured| measured.matches(&key))
                     .map_or_else(
-                        || body.web.estimated_height(width as f32).max(48.),
+                        || {
+                            let height = body.web.estimated_height(width as f32).max(48.);
+                            if height >= webview::SNAPSHOT_HEIGHT_LIMIT as f32 {
+                                height + crate::render::CLIP_NOTICE_HEIGHT
+                            } else {
+                                height
+                            }
+                        },
                         |measured| measured.height,
                     )
             });
@@ -1380,6 +1420,7 @@ mod tests {
             ])),
             width: 1.,
             height: 1.,
+            clipped: false,
         }
     }
 

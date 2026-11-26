@@ -23,6 +23,7 @@ pub(crate) enum Failure {
     Unreachable(String),
     Address,
     Response,
+    NotFound,
     Format,
     Limit,
     PageLimit,
@@ -33,6 +34,7 @@ impl Failure {
         match self {
             Self::Unreachable(_) if compact => "Couldn’t reach server".into(),
             Self::Unreachable(host) => format!("Couldn’t reach {host}"),
+            Self::NotFound => "Image not found".into(),
             Self::Response if compact => "Server error".into(),
             Self::Format if compact => "Unsupported format".into(),
             Self::Address => "Image address blocked".into(),
@@ -60,7 +62,7 @@ impl UnavailableImages {
         let noun = if self.count == 1 { "image" } else { "images" };
         match (&self.first, self.count) {
             (Failure::Limit, 1) => "1 image too large".into(),
-            (Failure::PageLimit, 1) => self.first.label(compact),
+            (Failure::PageLimit | Failure::NotFound, 1) => self.first.label(compact),
             _ => format!(
                 "{} {noun} unavailable · {}",
                 self.count,
@@ -80,12 +82,23 @@ pub(crate) fn inline_page(
     allowed: impl Fn() -> bool,
 ) -> (String, Result<(), UnavailableImages>) {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    let deadline = Instant::now() + PAGE_TIME;
     inline_page_with(
         mail,
         scheme,
         PAGE_BYTES,
+        deadline,
         &allowed,
-        |url, limit, bytes_read| fetch(AGENT.get_or_init(agent), url, limit, &allowed, bytes_read),
+        |url, limit, bytes_read| {
+            fetch(
+                AGENT.get_or_init(agent),
+                url,
+                limit,
+                deadline,
+                &allowed,
+                bytes_read,
+            )
+        },
     )
 }
 
@@ -93,10 +106,10 @@ fn inline_page_with(
     mail: &fell_render::WebMail,
     scheme: &str,
     mut remaining: usize,
+    deadline: Instant,
     allowed: impl Fn() -> bool,
     mut fetch: impl FnMut(&str, usize, &mut usize) -> Result<String, Failure>,
 ) -> (String, Result<(), UnavailableImages>) {
-    let deadline = Instant::now() + PAGE_TIME;
     let mut fetched: HashMap<String, Result<String, Failure>> = HashMap::new();
     let mut unavailable = None;
     let mut limited = false;
@@ -115,14 +128,22 @@ fn inline_page_with(
         None
     };
     let html = mail.page(scheme, |url| {
-        if !allowed() || Instant::now() >= deadline || remaining < MIN_DATA_URI_BYTES {
+        if !allowed() {
+            return None;
+        }
+        if remaining < MIN_DATA_URI_BYTES {
             return failed(Failure::PageLimit);
         }
         let image = match fetched.entry(url.to_owned()) {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => {
                 let mut bytes_read = 0;
-                let image = entry.insert(fetch(url, remaining, &mut bytes_read));
+                let result = if Instant::now() >= deadline {
+                    Err(unreachable(Url::parse(url).ok().as_ref()))
+                } else {
+                    fetch(url, remaining, &mut bytes_read)
+                };
+                let image = entry.insert(result);
                 if let Err(error) = image {
                     // Failed bodies still spent network bytes. A successful
                     // one is charged its larger encoded length below.
@@ -196,21 +217,26 @@ impl Resolver for PublicResolver {
     }
 }
 
+fn unreachable(url: Option<&Url>) -> Failure {
+    Failure::Unreachable(url.and_then(Url::host_str).unwrap_or_default().to_owned())
+}
+
 fn fetch(
     agent: &ureq::Agent,
     source: &str,
     encoded_limit: usize,
+    deadline: Instant,
     allowed: &impl Fn() -> bool,
     bytes_read: &mut usize,
 ) -> Result<String, Failure> {
     let mut url = Url::parse(source).map_err(|_| Failure::Address)?;
-    let started = Instant::now();
+    let deadline = deadline.min(Instant::now() + FETCH_TIME);
     for _ in 0..=3 {
         url.set_fragment(None);
-        let unreachable = || Failure::Unreachable(url.host_str().unwrap_or_default().to_owned());
-        let time = FETCH_TIME
-            .checked_sub(started.elapsed())
-            .ok_or_else(unreachable)?;
+        let time = deadline.saturating_duration_since(Instant::now());
+        if time.is_zero() {
+            return Err(unreachable(Some(&url)));
+        }
         if !allowed()
             || !matches!(url.scheme(), "http" | "https")
             || !url.username().is_empty()
@@ -228,8 +254,9 @@ fn fetch(
             .build()
             .call()
             .map_err(|error| match error {
+                ureq::Error::StatusCode(404) => Failure::NotFound,
                 ureq::Error::StatusCode(_) => Failure::Response,
-                _ => unreachable(),
+                _ => unreachable(Some(&url)),
             })?;
         if response.status().is_redirection() {
             let target = response
@@ -263,7 +290,7 @@ fn fetch(
             .take(limit as u64 + 1)
             .read_to_end(&mut bytes);
         *bytes_read = bytes.len();
-        result.map_err(|_| unreachable())?;
+        result.map_err(|_| unreachable(Some(&url)))?;
         if !allowed() || bytes.len() > limit {
             return Err(Failure::Limit);
         }
@@ -436,8 +463,16 @@ mod tests {
                     b"",
                 );
             });
+            let deadline = Instant::now() + PAGE_TIME;
             assert_eq!(
-                fetch(&client, &http_url("/start"), data.len(), &|| true, &mut 0),
+                fetch(
+                    &client,
+                    &http_url("/start"),
+                    data.len(),
+                    deadline,
+                    &|| true,
+                    &mut 0
+                ),
                 Ok(data.clone())
             );
             assert_eq!(
@@ -445,6 +480,7 @@ mod tests {
                     &client,
                     &http_url("/image"),
                     data.len() - 1,
+                    deadline,
                     &|| true,
                     &mut 0
                 ),
@@ -457,7 +493,7 @@ mod tests {
                 format!("https://{HOST}:{https_port}/downgrade"),
             ] {
                 assert_eq!(
-                    fetch(&client, &url, PAGE_BYTES, &|| true, &mut 0),
+                    fetch(&client, &url, PAGE_BYTES, deadline, &|| true, &mut 0),
                     Err(Failure::Address),
                     "{url}"
                 );
@@ -481,6 +517,7 @@ mod tests {
                 &mail,
                 "light",
                 PAGE_BYTES,
+                Instant::now() + PAGE_TIME,
                 || true,
                 |url, _, _| {
                     if url == urls[0] {
@@ -516,6 +553,7 @@ mod tests {
             &mail,
             "light",
             data.len(),
+            Instant::now() + PAGE_TIME,
             || true,
             |url, _, _| {
                 if url.ends_with("/bad") {
@@ -549,6 +587,7 @@ mod tests {
             &mail,
             "light",
             PAGE_BYTES,
+            Instant::now() + PAGE_TIME,
             || true,
             |url, limit, bytes_read| {
                 requested.push(url.rsplit('/').next().unwrap().to_owned());
@@ -598,6 +637,7 @@ mod tests {
             &mail,
             "light",
             PAGE_BYTES,
+            Instant::now() + PAGE_TIME,
             || true,
             |url, limit, bytes_read| {
                 let path = format!("/{requested}");
@@ -610,7 +650,14 @@ mod tests {
                             &body,
                         );
                     });
-                    fetch(&client, url, limit, &|| true, bytes_read)
+                    fetch(
+                        &client,
+                        url,
+                        limit,
+                        Instant::now() + FETCH_TIME,
+                        &|| true,
+                        bytes_read,
+                    )
                 });
                 assert_eq!(result, Err(Failure::Limit));
                 requested += 1;

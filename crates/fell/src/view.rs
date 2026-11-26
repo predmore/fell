@@ -11200,7 +11200,12 @@ fn web_message_body(
         Body::Web(picture) => {
             let snapshot = div()
                 .relative()
-                .child(crate::render::web_snapshot(picture, folds.columns.card.width).rounded_md())
+                .child(crate::render::web_snapshot(
+                    picture,
+                    folds.columns.card.width,
+                    folds.fill,
+                    theme.dimmed,
+                ))
                 .when(!theme.is_light(), |snapshot| {
                     snapshot.child(
                         div()

@@ -406,6 +406,8 @@ fn message_body(
             body.child(web_snapshot(
                 &image,
                 f32::from(window.viewport_size().width),
+                palette.background,
+                palette.foreground,
             ))
         } else if reader.web_failed {
             body.child(
@@ -450,12 +452,49 @@ fn banner_edge(theme: Theme, web: bool, border: u32) -> u32 {
     }
 }
 
-pub(crate) fn web_snapshot(snapshot: &webview::Snapshot, width: f32) -> gpui::Img {
+pub(crate) const CLIP_NOTICE_HEIGHT: f32 = 30.;
+
+pub(crate) fn web_snapshot(
+    snapshot: &webview::Snapshot,
+    width: f32,
+    fill: u32,
+    text: u32,
+) -> gpui::Div {
     let height = snapshot.height * width / snapshot.width;
-    gpui::img(snapshot.image.clone())
-        .w(px(width))
-        .h(px(height))
-        .object_fit(gpui::ObjectFit::Fill)
+    let image = div()
+        .relative()
+        .rounded_md()
+        .overflow_hidden()
+        .child(
+            gpui::img(snapshot.image.clone())
+                .w(px(width))
+                .h(px(height))
+                .object_fit(gpui::ObjectFit::Fill),
+        )
+        .when(snapshot.clipped, |image| {
+            image.child(
+                div()
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(48.))
+                    .bg(crate::theme::scroll_fade(fill, false)),
+            )
+        });
+    div().child(image).when(snapshot.clipped, |body| {
+        body.child(
+            div()
+                .h(px(CLIP_NOTICE_HEIGHT))
+                .flex()
+                .items_center()
+                .px_2()
+                .bg(paint(fill))
+                .text_sm()
+                .text_color(paint(crate::theme::note_text(text, fill)))
+                .child("Message continues in simple view · w"),
+        )
+    })
 }
 
 #[cfg(test)]

@@ -18,7 +18,7 @@ use webkit2gtk::{
 use wry::{WebViewBuilderExtUnix, WebViewExtUnix};
 
 const UNLAID_HEIGHT: i32 = 1;
-const SNAPSHOT_HEIGHT_LIMIT: i32 = super::native::MAX_IMAGE_EDGE as i32;
+pub(crate) const SNAPSHOT_HEIGHT_LIMIT: i32 = super::native::MAX_IMAGE_EDGE as i32;
 const PAINT_SETTLE: Duration = Duration::from_millis(80);
 pub(crate) const LARGE_HTML_BYTES: usize = 256 * 1024;
 
@@ -27,6 +27,7 @@ pub(crate) struct Snapshot {
     pub image: Arc<RenderImage>,
     pub width: f32,
     pub height: f32,
+    pub clipped: bool,
 }
 
 pub(crate) struct WebRequest {
@@ -78,6 +79,7 @@ struct Load {
     reply: oneshot::Sender<Snapshot>,
     cancel: gtk::gio::Cancellable,
     settling: bool,
+    background: u32,
 }
 
 type Active = Rc<RefCell<Option<Load>>>;
@@ -187,7 +189,7 @@ fn run(rx: glib::Receiver<()>, queue: Arc<JobQueue>) -> Result<(), Box<dyn std::
         let image_limit = fell_render::WebMail::image_height_limit(width as f32);
         styles.add_style_sheet(&UserStyleSheet::new(
             &format!(
-                "img {{ max-height: {image_limit}px !important; }}
+                "img {{ min-height: 0 !important; max-height: {image_limit}px !important; }}
                  html::-webkit-scrollbar {{ display: none; }}"
             ),
             UserContentInjectedFrames::TopFrame,
@@ -207,6 +209,7 @@ fn run(rx: glib::Receiver<()>, queue: Arc<JobQueue>) -> Result<(), Box<dyn std::
             reply: job.reply,
             cancel: cancellable.clone(),
             settling: false,
+            background,
         });
         widget.load_html(&html, None);
         glib::timeout_add_local_once(budget, {
@@ -271,12 +274,12 @@ fn wait_for_images(widget: &webkit2gtk::WebView, active: Active, token: gtk::gio
                 if (image.loading === 'lazy') image.loading = 'eager';
             }
             if (images.some(image => !image.complete)) return [0];
-            if (images.some(image => image.naturalWidth === 0)) return [-1];
             if (images.length > 0) {
                 const canvas = document.createElement('canvas');
                 canvas.width = canvas.height = 1;
                 const context = canvas.getContext('2d');
                 for (const image of images) {
+                    if (image.naturalWidth === 0) continue;
                     context.drawImage(image, 0, 0);
                     context.getImageData(0, 0, 1, 1);
                 }
@@ -369,10 +372,11 @@ fn capture(
             if token.is_cancelled() {
                 return;
             }
-            match result
-                .ok()
-                .and_then(|surface| surface_image(surface, bottom_padding))
-            {
+            let clipped = region == webkit2gtk::SnapshotRegion::Visible;
+            let image = active.borrow().as_ref().and_then(|load| {
+                surface_image(result.ok()?, bottom_padding, load.background, clipped)
+            });
+            match image {
                 Some(image) => {
                     if let Some(load) = active.borrow_mut().take() {
                         let _ = load.reply.send(image);
@@ -508,7 +512,12 @@ fn install_filter(widget: &webkit2gtk::WebView) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
-fn surface_image(surface: gtk::cairo::Surface, bottom_padding: u32) -> Option<Snapshot> {
+fn surface_image(
+    surface: gtk::cairo::Surface,
+    bottom_padding: u32,
+    background: u32,
+    clipped: bool,
+) -> Option<Snapshot> {
     let mut image = gtk::cairo::ImageSurface::try_from(surface).ok()?;
     image.flush();
     let width = image.width();
@@ -544,7 +553,7 @@ fn surface_image(surface: gtk::cairo::Surface, bottom_padding: u32) -> Option<Sn
     }
     let (pixels, _) = bgra.as_chunks_mut::<4>();
     let first = *pixels.first()?;
-    if pixels.iter().all(|pixel| *pixel == first) {
+    if !clipped && pixels.iter().all(|pixel| *pixel == first) {
         return None;
     }
     // Cairo stores native-endian, premultiplied ARGB32. GPUI uploads Frame's
@@ -561,8 +570,13 @@ fn surface_image(surface: gtk::cairo::Surface, bottom_padding: u32) -> Option<Sn
             *r = ((u16::from(*r) * 255) / alpha) as u8;
         }
     }
-    let keep = 12_u32.max(bottom_padding) * dst_h / height;
-    let dst_h = super::native::trim_uniform_bottom(&bgra, dst_w, dst_h, keep).clamp(1, dst_h);
+    let dst_h = if clipped {
+        dst_h
+    } else {
+        let keep = 12_u32.max(bottom_padding) * dst_h / height;
+        let backdrop = (background | 0xff000000).to_le_bytes();
+        super::native::trim_uniform_bottom(&bgra, dst_w, dst_h, keep, backdrop).clamp(1, dst_h)
+    };
     bgra.truncate(dst_w as usize * dst_h as usize * 4);
     let pixels = image::RgbaImage::from_raw(dst_w, dst_h, bgra)?;
     Some(Snapshot {
@@ -571,6 +585,7 @@ fn surface_image(surface: gtk::cairo::Surface, bottom_padding: u32) -> Option<Sn
         )])),
         width: dst_w as f32,
         height: dst_h as f32,
+        clipped,
     })
 }
 
