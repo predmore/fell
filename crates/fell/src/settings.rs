@@ -384,11 +384,10 @@ fn resolve(path: &Path) -> io::Result<PathBuf> {
 
 fn account_files(settings: &Path) -> impl Iterator<Item = PathBuf> {
     let config = settings.parent().unwrap_or_else(|| Path::new("."));
-    let registry = fell_core::accounts::Registry::at(config.to_path_buf());
     [config.join("account.toml"), config.join("account.toml.bak")]
         .into_iter()
         .chain(
-            fs::read_dir(registry.directory())
+            fs::read_dir(config.join("accounts"))
                 .into_iter()
                 .flatten()
                 .flatten()

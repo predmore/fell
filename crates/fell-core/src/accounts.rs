@@ -13,6 +13,7 @@ mod removal;
 pub use removal::{InterruptedRemoval, RemovalOutcome};
 
 pub const DEFAULT_ID: &str = "mail";
+pub const MAILBOX_LINK_RECOVERY: &str = "Restore account.toml.bak or accounts/.original-id";
 pub type FileIdentity = (u64, u64, i64, i64);
 
 pub fn validate_id(id: &str) -> Result<(), &'static str> {
@@ -61,6 +62,14 @@ impl FileError {
             .and_then(|rest| rest.strip_prefix(": ").or_else(|| rest.strip_prefix(' ')))
             .unwrap_or(&self.detail)
     }
+
+    fn mailbox_link(detail: impl Into<String>) -> Self {
+        Self::new(detail, MAILBOX_LINK_RECOVERY)
+    }
+
+    pub fn is_mailbox_link(&self) -> bool {
+        self.recovery == MAILBOX_LINK_RECOVERY
+    }
 }
 
 impl std::fmt::Display for FileError {
@@ -78,8 +87,15 @@ pub struct Entry {
 }
 
 enum OriginalMailbox {
-    Known { id: String, backup: Option<PathBuf> },
-    Unavailable { id: String, error: FileError },
+    Known {
+        id: String,
+        backup: Option<PathBuf>,
+    },
+    Unavailable {
+        id: String,
+        path: PathBuf,
+        error: FileError,
+    },
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -122,6 +138,7 @@ impl Accounts {
 #[derive(Clone, Debug)]
 pub struct Registry {
     config: PathBuf,
+    base: Option<PathBuf>,
 }
 
 impl Registry {
@@ -129,7 +146,7 @@ impl Registry {
         if let Some(xdg) =
             std::env::var_os("XDG_CONFIG_HOME").filter(|path| Path::new(path).is_absolute())
         {
-            return Ok(Self::at(PathBuf::from(xdg).join("fell")));
+            return Ok(Self::resolved(PathBuf::from(xdg).join("fell")));
         }
         // The draft/socket test helpers set XDG_CONFIG_HOME in an isolated
         // child. A test without an explicit directory must never use HOME.
@@ -137,7 +154,7 @@ impl Registry {
             && let Some(home) =
                 std::env::var_os("HOME").filter(|path| Path::new(path).is_absolute())
         {
-            return Ok(Self::at(PathBuf::from(home).join(".config/fell")));
+            return Ok(Self::resolved(PathBuf::from(home).join(".config/fell")));
         }
         Err(FileError::new(
             "No account configuration directory",
@@ -145,8 +162,18 @@ impl Registry {
         ))
     }
 
-    pub fn at(config: PathBuf) -> Self {
-        Self { config }
+    fn resolved(config: PathBuf) -> Self {
+        Self {
+            config,
+            base: crate::compose::mailbox_db_path(),
+        }
+    }
+
+    pub fn at(config: PathBuf, base: PathBuf) -> Self {
+        Self {
+            config,
+            base: Some(base),
+        }
     }
 
     pub fn directory(&self) -> PathBuf {
@@ -185,8 +212,12 @@ impl Registry {
     }
 
     pub fn load(&self) -> Accounts {
+        self.load_at(self.base.as_deref())
+    }
+
+    fn load_at(&self, base: Option<&Path>) -> Accounts {
         let mut accounts = Accounts {
-            error: self.migrate().err(),
+            error: self.migrate_at(base).err(),
             ..Accounts::default()
         };
         let dir = self.directory();
@@ -298,15 +329,13 @@ impl Registry {
             Some(OriginalMailbox::Unavailable {
                 id: original,
                 error,
+                ..
             }) if id == original => {
                 return Err(error);
             }
             _ => {}
         }
-        Ok((
-            base.with_extension("accounts").join(format!("{id}.db")),
-            None,
-        ))
+        Ok((sibling_mailbox(base, id), None))
     }
 
     fn original_mailbox(&self, base: &Path) -> Result<Option<OriginalMailbox>, FileError> {
@@ -323,30 +352,39 @@ impl Registry {
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => return Err(FileError::access(&self.directory(), err)),
         }
+        let marker = self.directory().join(".original-id");
         let marker_error = match self.original_marker() {
-            Ok(Some(id)) => return Ok(Some(OriginalMailbox::Known { id, backup: None })),
+            Ok(Some(id)) => return Ok(Some(check_original_collision(base, id, marker, None))),
             marker => marker.err(),
         };
         let backup = self.config.join("account.toml.bak");
         let metadata_error = match read(&backup, None) {
             Ok(Some((config, _))) => {
-                return Ok(Some(OriginalMailbox::Known {
-                    id: config.id,
-                    backup: Some(backup),
-                }));
+                return Ok(Some(check_original_collision(
+                    base,
+                    config.id,
+                    backup.clone(),
+                    Some(backup),
+                )));
             }
-            Err(error) => Some(error),
+            Err(error) => Some((backup, error)),
             Ok(None) => {
                 if let Ok(Some((config, _))) = legacy {
+                    // A repaired legacy file does not replace a mailbox already
+                    // in use under the newer layout.
+                    let sibling = sibling_mailbox(base, &config.id);
+                    if mailbox_exists(&sibling).map_err(|err| FileError::access(&sibling, err))? {
+                        return Ok(None);
+                    }
                     return Ok(Some(OriginalMailbox::Known {
                         id: config.id,
                         backup: None,
                     }));
                 }
-                marker_error
+                marker_error.map(|error| (marker, error))
             }
         };
-        if let Some(error) = metadata_error {
+        if let Some((path, error)) = metadata_error {
             let id = mailbox_owner(base)
                 .ok()
                 .flatten()
@@ -360,7 +398,11 @@ impl Registry {
                         .map(|(config, _)| config.id.clone())
                 })
                 .unwrap_or_else(|| DEFAULT_ID.into());
-            return Ok(Some(OriginalMailbox::Unavailable { id, error }));
+            return Ok(Some(OriginalMailbox::Unavailable {
+                id,
+                path,
+                error: FileError::mailbox_link(error.detail),
+            }));
         }
         Ok(self
             .infer_original_mailbox(base, legacy.is_err())?
@@ -371,7 +413,7 @@ impl Registry {
     }
 
     fn infer_original_mailbox(&self, base: &Path, broken_legacy: bool) -> Result<bool, FileError> {
-        let sibling = base.with_extension("accounts").join("mail.db");
+        let sibling = sibling_mailbox(base, DEFAULT_ID);
         if mailbox_exists(&sibling).map_err(|err| FileError::access(&sibling, err))? {
             return Ok(false);
         }
@@ -404,6 +446,7 @@ impl Registry {
             if path_exists(&marker)?
                 || path_exists(&self.config.join("account.toml.bak"))?
                 || mailbox_exists(base)?
+                || mailbox_exists(&sibling_mailbox(base, id))?
                 || has_account_file(&dir)?
             {
                 return Ok(false);
@@ -413,7 +456,7 @@ impl Registry {
                 .sync_all()
                 .and_then(|()| File::open(&self.config)?.sync_all())
             {
-                fs::remove_file(&marker)?;
+                fs::remove_file(&marker).and_then(|()| directory.sync_all())?;
                 return Err(error);
             }
             Ok(true)
@@ -457,10 +500,19 @@ impl Registry {
     /// to its backup. Both names survive a crash between those operations.
     /// The account directory lock also serializes setup and removal.
     pub fn migrate(&self) -> Result<(), FileError> {
-        self.migrate_with(|| {})
+        self.migrate_at(self.base.as_deref())
     }
 
-    fn migrate_with(&self, published: impl FnOnce()) -> Result<(), FileError> {
+    fn migrate_at(&self, base: Option<&Path>) -> Result<(), FileError> {
+        self.migrate_with(base, || Ok(()), || {})
+    }
+
+    fn migrate_with(
+        &self,
+        base: Option<&Path>,
+        before_publish: impl FnOnce() -> io::Result<()>,
+        published: impl FnOnce(),
+    ) -> Result<(), FileError> {
         match real_directory(&self.config) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -484,21 +536,84 @@ impl Registry {
         };
         let target = self.path(&config.id)?;
         let backup = self.config.join("account.toml.bak");
-        let write = || -> io::Result<()> {
-            if backup.symlink_metadata().is_ok() {
+        let marker = dir.join(".original-id");
+        let mut created_marker = false;
+        let mut created_target = false;
+        let mut backed_up = false;
+        let mut write = || -> io::Result<()> {
+            if path_exists(&backup)? {
                 return Err(io::Error::other("account.toml.bak already exists"));
             }
-            publish(&dir, &dir.join(".original-id"), config.id.as_bytes())?;
+            let base = base.ok_or_else(|| io::Error::other("No local mailbox path"))?;
+            if mailbox_exists(&sibling_mailbox(base, &config.id))?
+                || (path_exists(&target)? && !path_exists(&marker)?)
+            {
+                return Err(io::Error::other(
+                    "An account file or local mailbox already uses this ID",
+                ));
+            }
+            created_marker = publish(&dir, &marker, config.id.as_bytes())?;
             lock.sync_all()?;
-            publish(&dir, &target, text.as_bytes())?;
+            before_publish()?;
+            created_target = publish(&dir, &target, text.as_bytes())?;
             lock.sync_all()?;
             File::open(&self.config)?.sync_all()?;
             published();
             fs::rename(&legacy, &backup)?;
+            backed_up = true;
             File::open(&self.config)?.sync_all()
         };
-        write().map_err(|err| FileError::access(&legacy, err))
+        if let Err(error) = write() {
+            // Keep an installed backup and config if the final fsync failed.
+            // Roll back only files this attempt published.
+            let target_cleanup = if created_target && !backed_up {
+                fs::remove_file(&target)
+            } else {
+                Ok(())
+            };
+            let marker_cleanup = if created_marker {
+                fs::remove_file(&marker)
+            } else {
+                Ok(())
+            };
+            if created_marker || created_target {
+                let synced = lock.sync_all();
+                target_cleanup
+                    .and(marker_cleanup)
+                    .and(synced)
+                    .map_err(|err| FileError::access(&legacy, err))?;
+            }
+            return Err(FileError::access(&legacy, error));
+        }
+        Ok(())
     }
+}
+
+fn sibling_mailbox(base: &Path, id: &str) -> PathBuf {
+    base.with_extension("accounts").join(format!("{id}.db"))
+}
+
+fn check_original_collision(
+    base: &Path,
+    id: String,
+    path: PathBuf,
+    backup: Option<PathBuf>,
+) -> OriginalMailbox {
+    let sibling = sibling_mailbox(base, &id);
+    if !matches!(mailbox_exists(&sibling), Ok(false))
+        && !matches!(
+            (mailbox_owner(base), mailbox_owner(&sibling)),
+            (Ok(Some((base_id, base_email))), Ok(Some((sibling_id, sibling_email))))
+                if base_id == id && base_id == sibling_id && base_email.eq_ignore_ascii_case(&sibling_email)
+        )
+    {
+        let error = FileError::mailbox_link(format!(
+            "{}: The original and per-account mailboxes have conflicting ownership",
+            file_name(&path)
+        ));
+        return OriginalMailbox::Unavailable { id, path, error };
+    }
+    OriginalMailbox::Known { id, backup }
 }
 
 fn has_account_file(dir: &Path) -> io::Result<bool> {
@@ -562,13 +677,10 @@ fn verify_backup(base: &Path, backup: &Path, id: &str) -> Result<(), FileError> 
     if removal::verify_mailbox_owner(base, id) {
         Ok(())
     } else {
-        Err(FileError::new(
-            format!(
-                "{}: Account ID does not match the local mailbox",
-                file_name(backup)
-            ),
-            "Restore the original account ID from a verified account file.",
-        ))
+        Err(FileError::mailbox_link(format!(
+            "{}: Account ID does not match the local mailbox",
+            file_name(backup)
+        )))
     }
 }
 
@@ -603,12 +715,12 @@ fn open_account_directory(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
-fn publish(dir: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
+fn publish(dir: &Path, path: &Path, bytes: &[u8]) -> io::Result<bool> {
     let mut staged = tempfile::NamedTempFile::new_in(dir)?;
     staged.write_all(bytes)?;
     staged.as_file().sync_all()?;
     match staged.persist_noclobber(path) {
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(true),
         Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
             let mut existing = OpenOptions::new()
                 .read(true)
@@ -622,7 +734,7 @@ fn publish(dir: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
                 let mut contents = Vec::new();
                 existing.read_to_end(&mut contents)?;
                 if contents == bytes {
-                    return Ok(());
+                    return Ok(false);
                 }
             }
             Err(error.error)
@@ -744,7 +856,7 @@ mod tests {
         for id in ["mail", "personal"] {
             let root = tempfile::tempdir().unwrap();
             let dir = root.path().join("config/fell");
-            let registry = Registry::at(dir.clone());
+            let registry = Registry::at(dir.clone(), root.path().join("data/fell/mail.db"));
             let legacy = dir.join("account.toml");
             let text = format!(
                 "# A note\nid = \"{id}\"\nemail = \"mailbox@example.test\"\npassword_source = \"keyring\"\n\n[[identities]]\naddress = \"alias@example.test\"\nsignature = \"Regards\"\n"
@@ -784,7 +896,7 @@ mod tests {
     fn a_failed_marker_never_publishes_a_new_mailbox_path() {
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join("fell");
-        let registry = Registry::at(config.clone());
+        let registry = Registry::at(config.clone(), root.path().join("mail.db"));
         let legacy = config.join("account.toml");
         let text = "id = 'personal'\nemail = 'personal@example.test'\npassword = 'fixture'\n";
         write_private(&legacy, text);
@@ -801,10 +913,48 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_account_publish_rolls_back_only_its_new_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("fell");
+        let base = root.path().join("mail.db");
+        let registry = Registry::at(config.clone(), base.clone());
+        let legacy = config.join("account.toml");
+        let marker = registry.directory().join(".original-id");
+        let target = registry.path("mail").unwrap();
+        write_private(
+            &legacy,
+            "email = 'original@example.test'\npassword = 'fixture'\n",
+        );
+        assert!(
+            registry
+                .migrate_with(
+                    Some(&base),
+                    || {
+                        assert_eq!(fs::read_to_string(&marker).unwrap(), "mail");
+                        write_private(
+                            &target,
+                            "email = 'new@example.test'\npassword = 'fixture'\n",
+                        );
+                        Ok(())
+                    },
+                    || panic!("the conflicting account file must not be replaced"),
+                )
+                .is_err()
+        );
+        assert!(!marker.exists());
+        assert!(legacy.exists());
+        assert!(
+            fs::read_to_string(&target)
+                .unwrap()
+                .contains("new@example.test")
+        );
+    }
+
+    #[test]
     fn a_lost_or_invalid_marker_uses_the_migration_backup() {
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join("fell");
-        let registry = Registry::at(config.clone());
+        let registry = Registry::at(config.clone(), root.path().join("mail.db"));
         let base = root.path().join("mail.db");
         let backup = config.join("account.toml.bak");
         write_private(
@@ -827,7 +977,7 @@ mod tests {
         for metadata in ["account.toml.bak", "accounts/.original-id"] {
             let root = tempfile::tempdir().unwrap();
             let config = root.path().join("fell");
-            let registry = Registry::at(config.clone());
+            let registry = Registry::at(config.clone(), root.path().join("mail.db"));
             let base = root.path().join("mail.db");
             let personal =
                 "id = 'personal'\nemail = 'personal@example.test'\npassword = 'fixture'\n";
@@ -854,10 +1004,45 @@ mod tests {
     }
 
     #[test]
+    fn damaged_original_metadata_is_listed_with_or_without_an_account_file() {
+        for metadata in ["account.toml.bak", "accounts/.original-id"] {
+            let root = tempfile::tempdir().unwrap();
+            let config = root.path().join("fell");
+            let base = root.path().join("mail.db");
+            let registry = Registry::at(config.clone(), base.clone());
+            fs::write(&base, "unreadable SQLite").unwrap();
+            let damaged = config.join(metadata);
+            write_private(&damaged, "invalid = [");
+            assert!(registry.mailbox_path(&base, "mail").is_err());
+            let catalog = registry.load_with_removals(&base);
+            assert!(!catalog.is_empty());
+            let [entry] = catalog.entries.as_slice() else {
+                panic!("expected a damaged-link entry");
+            };
+            assert_eq!(entry.path, damaged);
+            assert!(entry.config.as_ref().unwrap_err().is_mailbox_link());
+            assert!(entry.file_identity.is_none());
+
+            for id in ["mail", "work"] {
+                write_private(
+                    &registry.path(id).unwrap(),
+                    "email = 'synthetic@example.test'\npassword = 'fixture'\n",
+                );
+            }
+            let catalog = registry.load_with_removals(&base);
+            assert_eq!(catalog.default_config().unwrap().id, "work");
+            let entry = &catalog.entries[0];
+            assert_eq!(entry.path, registry.path("mail").unwrap());
+            assert!(entry.config.as_ref().unwrap_err().is_mailbox_link());
+            assert!(entry.file_identity.is_none());
+        }
+    }
+
+    #[test]
     fn a_broken_legacy_leftover_is_listed_without_blocking_mailboxes() {
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join("fell");
-        let registry = Registry::at(config.clone());
+        let registry = Registry::at(config.clone(), root.path().join("mail.db"));
         let legacy = config.join("account.toml");
         let base = root.path().join("mail.db");
         write_private(
@@ -888,7 +1073,7 @@ mod tests {
     fn a_markerless_registry_routes_around_a_broken_legacy_file() {
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join("fell");
-        let registry = Registry::at(config.clone());
+        let registry = Registry::at(config.clone(), root.path().join("mail.db"));
         let legacy = config.join("account.toml");
         let base = root.path().join("mail.db");
         let live = base.with_extension("accounts").join("mail.db");
@@ -933,12 +1118,44 @@ mod tests {
         assert!(registry.recover_removal(&base, "mail", true, None).is_err());
         assert!(live.is_file());
         assert_eq!(mailbox_owner(&base).unwrap().unwrap().1, "old@example.test");
+
+        // Fixing the legacy file must neither redirect the live account nor
+        // leave a marker for a failed migration.
+        fs::write(
+            config.join("account.toml"),
+            "email = 'old@example.test'\npassword = 'fixture'\n",
+        )
+        .unwrap();
+        assert!(registry.migrate().is_err());
+        let marker = registry.directory().join(".original-id");
+        assert!(!marker.exists());
+        assert_eq!(registry.store_path(&base, "mail").unwrap(), live);
+        assert_eq!(registry.mailbox_path(&base, "mail").unwrap(), live);
+
+        // An installation affected by the old migration bug fails closed.
+        write_private(&marker, "mail");
+        assert!(registry.store_path(&base, "mail").is_err());
+        assert!(registry.remove(&base, "mail", true).is_err());
+        let catalog = registry.load_with_removals(&base);
+        assert_eq!(catalog.default_config().unwrap().id, "work");
+        assert!(
+            catalog.entries[0]
+                .config
+                .as_ref()
+                .unwrap_err()
+                .is_mailbox_link()
+        );
+        assert_eq!(
+            mailbox_owner(&live).unwrap().unwrap().1,
+            "live@example.test"
+        );
+        assert_eq!(mailbox_owner(&base).unwrap().unwrap().1, "old@example.test");
     }
 
     #[test]
     fn a_missing_legacy_config_does_not_rebind_a_base_db_with_another_owner() {
         let root = tempfile::tempdir().unwrap();
-        let registry = Registry::at(root.path().join("fell"));
+        let registry = Registry::at(root.path().join("fell"), root.path().join("mail.db"));
         let base = root.path().join("mail.db");
         let mut original = AccountConfig::bridge(
             "other@example.test",
@@ -963,7 +1180,7 @@ mod tests {
     fn a_backup_id_must_match_the_mailbox_before_binding_or_removal() {
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join("fell");
-        let registry = Registry::at(config.clone());
+        let registry = Registry::at(config.clone(), root.path().join("mail.db"));
         let base = root.path().join("mail.db");
         let verified = "id = 'personal'\nemail = 'personal@example.test'\npassword = 'fixture'\n";
         write_private(&config.join("account.toml.bak"), verified);
@@ -994,7 +1211,7 @@ mod tests {
     fn a_reader_during_migration_sees_the_legacy_mailbox() {
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join("fell");
-        let registry = Registry::at(config.clone());
+        let registry = Registry::at(config.clone(), root.path().join("mail.db"));
         let legacy = config.join("account.toml");
         write_private(
             &legacy,
@@ -1005,11 +1222,16 @@ mod tests {
             let (published, observed) = std::sync::mpsc::channel();
             let (read, done) = std::sync::mpsc::channel();
             let registry = &registry;
+            let mailbox = &base;
             let migrating = scope.spawn(move || {
-                registry.migrate_with(|| {
-                    published.send(()).unwrap();
-                    done.recv().unwrap();
-                })
+                registry.migrate_with(
+                    Some(mailbox),
+                    || Ok(()),
+                    || {
+                        published.send(()).unwrap();
+                        done.recv().unwrap();
+                    },
+                )
             });
             observed.recv().unwrap();
             let during = registry.store_path(&base, "personal");
@@ -1029,7 +1251,7 @@ mod tests {
     #[test]
     fn one_invalid_account_does_not_hide_its_neighbors() {
         let root = tempfile::tempdir().unwrap();
-        let registry = Registry::at(root.path().join("fell"));
+        let registry = Registry::at(root.path().join("fell"), root.path().join("mail.db"));
         write_private(
             &registry.path("work").unwrap(),
             "email = 'work@example.test'\npassword = 'fixture'\n",

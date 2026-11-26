@@ -492,7 +492,7 @@ fn registry_grants_cover_secondary_stores_and_disconnect_live_sessions() {
     use std::os::unix::fs::OpenOptionsExt as _;
 
     let mut ctx = Ctx::empty();
-    let registry = fell_core::accounts::Registry::at(ctx.home().join(".config/fell"));
+    let registry = fell_core::accounts::Registry::at(ctx.home().join(".config/fell"), ctx.store());
     std::fs::create_dir_all(registry.directory()).unwrap();
     for id in ["mail", "work"] {
         let config_path = registry.path(id).unwrap();

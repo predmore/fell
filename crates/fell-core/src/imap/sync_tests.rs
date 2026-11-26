@@ -6100,9 +6100,9 @@ fn registry_accounts_sync_in_parallel_into_separate_stores() {
     let password = fixture.password.clone();
     let server = TestServer::spawn_parallel(fixture, Default::default());
     let root = tempfile::tempdir().unwrap();
-    let registry = Registry::at(root.path().join("config/fell"));
-    std::fs::create_dir_all(registry.directory()).unwrap();
     let base = root.path().join("mail.db");
+    let registry = Registry::at(root.path().join("config/fell"), base.clone());
+    std::fs::create_dir_all(registry.directory()).unwrap();
     for id in ["mail", "work"] {
         let path = registry.path(id).unwrap();
         let mut file = std::fs::OpenOptions::new()

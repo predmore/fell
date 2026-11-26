@@ -35,37 +35,56 @@ pub enum RemovalOutcome {
 
 impl Registry {
     pub fn load_with_removals(&self, base: &Path) -> Accounts {
-        let mut catalog = self.load();
-        let original = self
-            .original_mailbox(base)
-            .ok()
-            .flatten()
-            .and_then(|original| {
-                let OriginalMailbox::Known { id, backup } = original else {
-                    return None;
-                };
-                if let Some(backup) = backup
-                    && let Err(error) = verify_backup(base, &backup, &id)
-                {
-                    let config = self.directory().join(format!("{id}.toml"));
-                    if let Some(entry) = catalog
-                        .entries
-                        .iter_mut()
-                        .find(|entry| entry.path == config)
-                    {
-                        entry.config = Err(error);
+        let mut catalog = self.load_at(Some(base));
+        let original = match self.original_mailbox(base) {
+            Ok(original) => original,
+            Err(error) => {
+                for entry in &mut catalog.entries {
+                    if entry.config.is_ok() {
+                        entry.config = Err(error.clone());
                         entry.file_identity = None;
-                    } else {
-                        catalog.entries.push(Entry {
-                            path: backup,
-                            config: Err(error),
-                            file_identity: None,
-                        });
                     }
-                    return None;
                 }
-                Some((id, removal_trash(base)))
-            });
+                catalog.error = Some(error);
+                return catalog;
+            }
+        };
+        let original = match original {
+            Some(OriginalMailbox::Known {
+                id,
+                backup: Some(backup),
+            }) => Some(match verify_backup(base, &backup, &id) {
+                Ok(()) => OriginalMailbox::Known { id, backup: None },
+                Err(error) => OriginalMailbox::Unavailable {
+                    id,
+                    path: backup,
+                    error,
+                },
+            }),
+            other => other,
+        };
+        let original = match original {
+            Some(OriginalMailbox::Known { id, .. }) => Some((id, removal_trash(base))),
+            Some(OriginalMailbox::Unavailable { id, path, error }) => {
+                let config = self.directory().join(format!("{id}.toml"));
+                if let Some(entry) = catalog
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.path == config)
+                {
+                    entry.config = Err(error);
+                    entry.file_identity = None;
+                } else {
+                    catalog.entries.push(Entry {
+                        path,
+                        config: Err(error),
+                        file_identity: None,
+                    });
+                }
+                None
+            }
+            None => None,
+        };
         let siblings = base.with_extension("accounts");
         let paths = real_directory(&siblings)
             .and_then(|()| fs::read_dir(&siblings))
@@ -182,7 +201,7 @@ impl Registry {
         expected: Option<FileIdentity>,
         recovery_only: bool,
     ) -> Result<RemovalOutcome, String> {
-        self.migrate().map_err(|err| err.to_string())?;
+        self.migrate_at(Some(base)).map_err(|err| err.to_string())?;
         let directory = self.lock().map_err(|err| err.to_string())?;
         let account = self.path(id).map_err(|err| err.to_string())?;
         let mailbox = self.mailbox_path(base, id).map_err(|err| err.to_string())?;
@@ -652,8 +671,8 @@ mod tests {
         let config = "email = 'work@example.test'\npassword = 'fixture'\n";
         for moved in 0..=MAILBOX_SUFFIXES.len() + 1 {
             let root = tempfile::tempdir().unwrap();
-            let registry = Registry::at(root.path().join("fell"));
             let base = root.path().join("mail.db");
+            let registry = Registry::at(root.path().join("fell"), base.clone());
             let account = registry.path("work").unwrap();
             let mailbox = registry.mailbox_path(&base, "work").unwrap();
             let trash = removal_trash(&mailbox);
