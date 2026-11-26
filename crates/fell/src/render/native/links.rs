@@ -88,6 +88,18 @@ struct LinkState {
     place: Rc<Placement>,
 }
 
+fn link_preview(label: &str, target: &str) -> Option<LinkPreview> {
+    if label == target {
+        return None;
+    }
+    let (destination, mismatch) = crate::compose_ui::reader_link_destination(label, target)?;
+    Some(LinkPreview {
+        destination: destination.into(),
+        target: target.to_owned().into(),
+        mismatch,
+    })
+}
+
 fn outline_span(rect: &Bounds<Pixels>) -> Range<Pixels> {
     rect.left() - px(2.)..rect.right() + px(2.)
 }
@@ -186,23 +198,12 @@ pub(super) fn link_controls(
         }
         let state = slot.get_or_insert_with(|| {
             let label = mail.text[link.range.clone()].trim();
-            let preview = if label == link.target.as_ref() {
-                None
-            } else {
-                crate::compose_ui::reader_link_destination(label, &link.target).map(
-                    |(destination, mismatch)| LinkPreview {
-                        destination: destination.into(),
-                        target: link.target.to_string().into(),
-                        mismatch,
-                    },
-                )
-            };
             let handle = cx.focus_handle().tab_stop(true);
             let place = Rc::new(Placement {
                 line: Cell::default(),
                 visible: Cell::default(),
                 target: link.target.clone(),
-                preview,
+                preview: link_preview(label, &link.target),
             });
             reader_links::register(window, cx, &handle, &place);
             LinkState {
@@ -358,13 +359,19 @@ fn fragment_outline(
         )
 }
 
+fn open_command(target: &str) -> Command {
+    let mut command = Command::new("xdg-open");
+    command
+        .arg(target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
 fn open(target: Arc<str>, window: &Window, cx: &mut App) {
     let task = cx.background_executor().spawn(async move {
-        Command::new("xdg-open")
-            .arg(target.as_ref())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+        open_command(&target)
             .status()
             .is_ok_and(|status| status.success())
     });
@@ -383,6 +390,39 @@ fn open(target: Arc<str>, window: &Window, cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::text_render::PlainText;
+    use fell_render::{Block, Inline, html_to_document};
+
+    #[test]
+    fn mailto_status_bar_and_opener_use_the_same_canonical_target() {
+        let raw = "mailto:a@x,b@y?Subject=Hi&body=Text&priority=high";
+        let canonical = "mailto:a@x,b@y?subject=Hi&body=Text";
+        let check = |label: &str, target: &str| {
+            let preview = link_preview(label, target).unwrap();
+            let command = open_command(target);
+            assert_eq!(command.get_program(), "xdg-open");
+            assert!(command.get_args().eq([std::ffi::OsStr::new(canonical)]));
+            assert_eq!(preview.target.as_str(), canonical);
+        };
+
+        let plain = PlainText::from(raw);
+        let [link] = plain.links.as_ref() else {
+            panic!("{plain:?}");
+        };
+        check(&plain[link.range.clone()], &link.target);
+
+        let html = html_to_document(&format!(
+            "<a href=\"{}\">Write to us</a>",
+            raw.replace('&', "&amp;")
+        ));
+        let [Block::Paragraph { inlines }] = html.blocks.as_slice() else {
+            panic!("{html:?}");
+        };
+        let [Inline::Link { href, .. }] = inlines.as_slice() else {
+            panic!("{inlines:?}");
+        };
+        check("Write to us", &checked_target(href).unwrap());
+    }
 
     #[test]
     fn wrapped_outlines_only_draw_exposed_horizontal_segments() {

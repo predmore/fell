@@ -1,12 +1,12 @@
-use std::ops::Range;
+use std::{borrow::Cow, ops::Range};
 
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use url::{Host, Url};
 
 use crate::{Inline, html};
 
 /// Keep the HTML scheme allowlist and require a destination the native
-/// reader can show as written. Opaque or internationalized hosts remain
-/// visible text.
+/// reader can show. Opaque or internationalized hosts remain visible text.
 pub fn reader_link_target(href: &str) -> Option<String> {
     let target = html::safe_href(href);
     if target
@@ -26,17 +26,109 @@ pub fn reader_link_target(href: &str) -> Option<String> {
                 && !authority.contains('@')
                 && url.host().is_some_and(ordinary_host)
         }
-        "mailto" => url.path().split(',').all(|address| {
-            address.rsplit_once('@').is_some_and(|(local, domain)| {
-                !local.is_empty()
-                    && !local.contains('@')
-                    && !domain.contains('%')
-                    && Host::parse(domain).is_ok_and(ordinary_host)
-            })
-        }),
+        "mailto" => true, // Already parsed and rebuilt by safe_href.
         _ => false,
     };
     allowed.then_some(target)
+}
+
+const URI_COMPONENT: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+/// Build the URI the system mail client receives from the visible recipient
+/// list and the two supported fields. Mail clients disagree about separators
+/// and header names, so never forward the input query verbatim.
+pub(crate) fn canonical_mailto(rest: &str) -> Option<String> {
+    let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let mut target = String::from("mailto:");
+    for (index, address) in path.trim_matches(' ').split(',').enumerate() {
+        let (raw_local, domain) = address.split_once('@')?;
+        let local = decode_mailto_component(raw_local)?;
+        // A client may decode the path before parsing mailboxes. Accept a
+        // local part only if decoding can't introduce mailbox syntax.
+        if local.is_empty()
+            || local.contains([
+                '@', ',', ';', ':', '"', '\'', '\\', '<', '>', '[', ']', '(', ')',
+            ])
+            || local.chars().any(char::is_whitespace)
+            || !domain.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'.' | b'-' | b'_' | b':' | b'[' | b']')
+            })
+            || !Host::parse(domain).is_ok_and(ordinary_host)
+        {
+            return None;
+        }
+        if index > 0 {
+            target.push(',');
+        }
+        target.extend(utf8_percent_encode(&local, URI_COMPONENT));
+        target.push('@');
+        target.push_str(domain);
+    }
+
+    let (mut subject, mut body) = (None, None);
+    for field in query.split('&').filter(|field| !field.is_empty()) {
+        let parts = field.split_once('=');
+        let (key, value) = parts.unwrap_or((field, ""));
+        let key = decode_mailto_component(key)?.trim().to_ascii_lowercase();
+        let value = decode_mailto_component(value)?;
+        let slot = match key.as_str() {
+            "subject" => &mut subject,
+            "body" => &mut body,
+            _ if ["to", "cc", "bcc", "from"]
+                .iter()
+                .any(|name| key.contains(name)) =>
+            {
+                return None;
+            }
+            _ => continue,
+        };
+        if parts.is_none() || slot.is_some() || value.contains(['\u{2028}', '\u{2029}']) {
+            return None;
+        }
+        *slot = Some(value);
+    }
+
+    let mut separator = '?';
+    for (key, value) in [("subject", subject), ("body", body)] {
+        if let Some(value) = value {
+            target.push(separator);
+            target.push_str(key);
+            target.push('=');
+            target.extend(utf8_percent_encode(&value, URI_COMPONENT));
+            separator = '&';
+        }
+    }
+    Some(target)
+}
+
+fn is_percent_escape(bytes: &[u8]) -> bool {
+    matches!(bytes, [b'%', a, b, ..] if a.is_ascii_hexdigit() && b.is_ascii_hexdigit())
+}
+
+fn decode_mailto_component(raw: &str) -> Option<Cow<'_, str>> {
+    if raw
+        .match_indices('%')
+        .any(|(at, _)| !is_percent_escape(&raw.as_bytes()[at..]))
+    {
+        return None;
+    }
+    let decoded = percent_decode_str(raw).decode_utf8().ok()?;
+    // Reject separators some clients interpret after decoding, and a second
+    // layer of escapes whose interpretation would depend on the opener.
+    if decoded.contains(['#', '|'])
+        || decoded
+            .chars()
+            .any(|ch| (ch.is_control() && ch != '\t') || html::is_invisible(ch))
+        || decoded.as_bytes().windows(3).any(is_percent_escape)
+    {
+        return None;
+    }
+    Some(decoded)
 }
 
 fn ordinary_host<S: AsRef<str>>(host: Host<S>) -> bool {
@@ -49,8 +141,8 @@ fn ordinary_host<S: AsRef<str>>(host: Host<S>) -> bool {
     }
 }
 
-/// The byte ranges of links in plain text, in source order.
-pub fn plain_link_ranges(text: &str) -> Vec<Range<usize>> {
+/// The label ranges and checked targets of links in plain text, in source order.
+pub fn plain_link_targets(text: &str) -> Vec<(Range<usize>, String)> {
     let mut links = Vec::new();
     let mut scanned = 0;
     for (colon, _) in text.match_indices(':') {
@@ -81,8 +173,10 @@ pub fn plain_link_ranges(text: &str) -> Vec<Range<usize>> {
             .map_or(text.len(), |end| colon + 1 + end);
         scanned = end;
         let label = trim_url_end(&text[start..end]);
-        if reader_link_target(label).as_deref() == Some(label) {
-            links.push(start..start + label.len());
+        if let Some(target) = reader_link_target(label)
+            && (target == label || target.starts_with("mailto:"))
+        {
+            links.push((start..start + label.len(), target));
         }
     }
     links
@@ -91,14 +185,14 @@ pub fn plain_link_ranges(text: &str) -> Vec<Range<usize>> {
 pub(crate) fn plain_link_inlines(text: &str) -> Vec<Inline> {
     let mut inlines = Vec::new();
     let mut copied = 0;
-    for range in plain_link_ranges(text) {
+    for (range, href) in plain_link_targets(text) {
         if copied < range.start {
             inlines.push(Inline::Text(text[copied..range.start].into()));
         }
         copied = range.end;
         let label = &text[range];
         inlines.push(Inline::Link {
-            href: label.into(),
+            href,
             children: vec![Inline::Text(label.into())],
         });
     }
@@ -186,10 +280,6 @@ mod tests {
             ("https://xn--bcher-kva.example/path", false),
             ("https://example.test@elsewhere.test/path", false),
             ("mailto:help@example.test?subject=Release", true),
-            (
-                "mailto:help@example.test?Subject=Release&body=A%20note",
-                true,
-            ),
             ("mailto:help@example.test?to=other@example.test", false),
             ("mailto:help@example.test?Cc=other@example.test", false),
             (
@@ -219,19 +309,86 @@ mod tests {
                     &[]
                 },
             );
-            let doc = html_to_document(&format!("<a href=\"{target}\">link</a>"));
-            let [Block::Paragraph { inlines }] = doc.blocks.as_slice() else {
-                panic!("{doc:?}");
-            };
-            let [Inline::Link { href, .. }] = inlines.as_slice() else {
-                panic!("{inlines:?}");
-            };
-            assert_eq!(reader_link_target(href).is_some(), allowed, "{target}");
+            assert_eq!(
+                reader_link_target(&html_href(target)).is_some(),
+                allowed,
+                "{target}"
+            );
         }
         check(
             "ftp://www.example.test foohttps://example.test http://",
             &[],
         );
+    }
+
+    fn html_href(target: &str) -> String {
+        let target = target.replace('&', "&amp;");
+        let doc = html_to_document(&format!("<a href=\"{target}\">link</a>"));
+        assert_eq!(doc.plain_text(), "link");
+        let [Block::Paragraph { inlines }] = doc.blocks.as_slice() else {
+            panic!("{doc:?}");
+        };
+        let [Inline::Link { href, .. }] = inlines.as_slice() else {
+            panic!("{inlines:?}");
+        };
+        href.clone()
+    }
+
+    #[test]
+    fn mailto_is_rebuilt_from_the_recipients_and_supported_fields() {
+        for (raw, expected) in [
+            (
+                "mailto:a@x,b@y?subject=Hi&body=Text",
+                "mailto:a@x,b@y?subject=Hi&body=Text",
+            ),
+            (
+                "MAILTO:a%2Bb@x?body=Note&%20Subject%09=Hello%20world&priority=high",
+                "mailto:a%2Bb@x?subject=Hello%20world&body=Note",
+            ),
+            (
+                "mailto:a@x?subject=100%25+done&body=A%26B%3DC%3F",
+                "mailto:a@x?subject=100%25%2Bdone&body=A%26B%3DC%3F",
+            ),
+            ("mailto:a@x?priority=high", "mailto:a@x"),
+        ] {
+            let inlines = plain_link_inlines(raw);
+            assert_eq!(
+                inlines,
+                [Inline::Link {
+                    href: expected.into(),
+                    children: vec![Inline::Text(raw.into())],
+                }]
+            );
+            let html = html_href(raw);
+            assert_eq!(html, expected);
+            assert_eq!(reader_link_target(&html).as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn ambiguous_mailto_targets_remain_text() {
+        for rest in [
+            "help@example.test?subject=Hi#&bcc=other@example.test",
+            "help@example.test#&bcc=other@example.test",
+            "help@example.test?subject=Hi|bcc=other@example.test",
+            "help@example.test?subject=Hi%7Cbcc=other@example.test",
+            "help@example.test?subject=Hi%257Cbcc=other@example.test",
+            "help@example.test?to%20=other@example.test",
+            "help@example.test?bcc%20=other@example.test",
+            "help@example.test?cc%20=other@example.test",
+            "help@example.test?bcc%09=other@example.test",
+            "help@example.test?%62cc%20=other@example.test",
+            "help@example.test?subjectbcc=other@example.test",
+            "help@example.test?from=other@example.test",
+            "help@example.test?subject=one&Subject=two",
+            "help@example.test?body=broken%ZZ",
+            "help%40example.test%2Cother@example.test",
+        ] {
+            let target = format!("mailto:{rest}");
+            assert_eq!(reader_link_target(&target), None, "{target}");
+            assert_eq!(plain_link_inlines(&target), [Inline::Text(target.clone())]);
+            assert!(html_href(&target).is_empty(), "{target}");
+        }
     }
 
     #[test]

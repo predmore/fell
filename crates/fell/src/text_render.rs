@@ -53,10 +53,10 @@ impl From<&str> for PlainText {
     fn from(text: &str) -> Self {
         Self {
             text: text.to_owned().into(),
-            links: fell_render::plain_link_ranges(text)
+            links: fell_render::plain_link_targets(text)
                 .into_iter()
-                .map(|range| PlainLink {
-                    target: Arc::from(&text[range.clone()]),
+                .map(|(range, target)| PlainLink {
+                    target: Arc::from(target),
                     range,
                 })
                 .collect(),

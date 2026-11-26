@@ -2084,6 +2084,7 @@ dependencies = [
  "cssparser 0.34.0",
  "ego-tree",
  "html5ever 0.29.1",
+ "percent-encoding",
  "pulldown-cmark",
  "scraper",
  "tendril 0.4.3",

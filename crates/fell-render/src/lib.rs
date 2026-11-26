@@ -34,7 +34,7 @@ pub use html::{
     plain_to_document,
 };
 pub use markdown::markdown_to_document;
-pub use plain_links::{plain_link_ranges, reader_link_target};
+pub use plain_links::{plain_link_targets, reader_link_target};
 pub use typed_list::plain_list_runs;
 pub use webview_html::{
     WebFrame, address_is_blocked, request_is_blocked, request_is_blocked_with, sanitize_html,
