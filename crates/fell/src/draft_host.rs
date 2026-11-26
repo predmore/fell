@@ -367,6 +367,10 @@ impl DraftHome {
         body: String,
         files: Vec<ResolvedFile>,
     ) -> Result<String, String> {
+        let id = new_draft_id();
+        let Some(_opening) = hub.begin_open(&id, account)? else {
+            return Err("This draft is already opening".into());
+        };
         let _account_lock = if let Some(registry) = &self.registry
             && registry.directory().is_dir()
             && !fell_core::is_demo_account(account)
@@ -380,7 +384,6 @@ impl DraftHome {
         } else {
             None
         };
-        let id = new_draft_id();
         let draft = new_compose_row(
             &id,
             account,
@@ -389,14 +392,16 @@ impl DraftHome {
             files,
             self.account_config(account).as_ref(),
         );
-        if draft.files.is_empty() {
+        let store = if draft.files.is_empty() {
             DraftSession::start_stored_in(&self.root, draft, &self.store)?;
+            fell_core::Store::open_existing(&self.store).map_err(|err| err.to_string())?
         } else {
             let store =
                 fell_core::Store::open_existing(&self.store).map_err(|err| err.to_string())?;
             store.save_compose(&draft).map_err(|err| err.to_string())?;
-        }
-        self.open(hub, &id, account)?;
+            store
+        };
+        self.open_reserved(hub, &id, account, &store)?;
         Ok(id)
     }
 
@@ -406,15 +411,28 @@ impl DraftHome {
         account: &AccountId,
         source: &fell_core::RemoteId,
     ) -> Result<String, fell_core::Error> {
+        let proposed = new_draft_id();
+        let Some(_opening) = hub
+            .begin_open(&proposed, account)
+            .map_err(fell_core::Error::Action)?
+        else {
+            return Err(fell_core::Error::Action(
+                "The draft is already opening".into(),
+            ));
+        };
         let config = crate::mailbox::send_account_config(account)
             .map_err(|_| fell_core::Error::Action("The account is unavailable".into()))?
             .ok_or_else(|| {
                 fell_core::Error::Action("There is no server draft in the demo mailbox".into())
             })?;
         let store = fell_core::Store::open_existing(&self.store)?;
-        let id = config.import_server_draft_copy(&store, source, &new_draft_id())?;
-        self.open(hub, &id, account)
-            .map_err(fell_core::Error::Action)?;
+        let id = config.import_server_draft_copy(&store, source, &proposed)?;
+        if id == proposed {
+            self.open_reserved(hub, &id, account, &store)
+        } else {
+            self.open(hub, &id, account)
+        }
+        .map_err(fell_core::Error::Action)?;
         Ok(id)
     }
 
@@ -441,7 +459,7 @@ impl DraftHome {
         let fell_core::notes::NoteDecision::Accept(position) = note.decision else {
             return Err("The agent note changed".into());
         };
-        let Some(_opening) = hub.begin_open(id) else {
+        let Some(_opening) = hub.begin_open(id, account)? else {
             return Err("The reply draft is already opening".into());
         };
         let store = fell_core::Store::open_existing(&self.store).map_err(|err| err.to_string())?;
@@ -490,7 +508,7 @@ impl DraftHome {
     /// left alone: its folder may hold typing the mailbox does not have yet.
     /// The caller shows it either way. Disk only; run it off the UI thread.
     pub fn open(&self, hub: &DraftHub, id: &str, account: &AccountId) -> Result<(), String> {
-        let Some(_opening) = hub.begin_open(id) else {
+        let Some(_opening) = hub.begin_open(id, account)? else {
             return Ok(());
         };
         let store = fell_core::Store::open_existing(&self.store).map_err(|err| err.to_string())?;
@@ -1584,7 +1602,10 @@ pub(crate) mod tests {
         let file = write_outside(&home, &id, "outside\n");
         let before = std::fs::read_to_string(&file).unwrap();
         // Another Enter's open is still reading this draft.
-        let first = cold.begin_open(&id).expect("nothing opens it yet");
+        let first = cold
+            .begin_open(&id, &account.id)
+            .unwrap()
+            .expect("nothing opens it yet");
         home.open(&cold, &id, &account.id).unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
         assert!(

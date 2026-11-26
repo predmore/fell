@@ -117,6 +117,7 @@ struct AccountRow {
     name: String,
     email: Option<String>,
     status: String,
+    link_damaged: bool,
     alert: bool,
     active: bool,
     removing: bool,
@@ -208,6 +209,10 @@ impl View {
             .filter_map(|entry| {
                 let id = entry.path.file_stem()?.to_string_lossy().into_owned();
                 let active = entry.config.is_ok() && active == Some(id.as_str());
+                let link_damaged = entry
+                    .config
+                    .as_ref()
+                    .is_err_and(|error| error.is_mailbox_link());
                 let (name, email, status, alert) = match &entry.config {
                     Ok(config) => {
                         let (status, alert) = statuses
@@ -221,6 +226,12 @@ impl View {
                             alert,
                         )
                     }
+                    Err(error) if link_damaged => (
+                        "Mailbox link damaged".into(),
+                        None,
+                        error.detail.lines().next().unwrap_or_default().into(),
+                        true,
+                    ),
                     Err(error) => (
                         entry.path.file_name()?.to_string_lossy().into_owned(),
                         None,
@@ -240,6 +251,7 @@ impl View {
                     } else {
                         status
                     },
+                    link_damaged,
                     alert: alert && !removing,
                     active,
                     removing,
@@ -270,6 +282,7 @@ impl View {
                     "Deletion interrupted"
                 }
                 .into(),
+                link_damaged: false,
                 alert: !removing(&pending.id),
                 active: false,
                 removing: removing(&pending.id),
@@ -310,6 +323,7 @@ impl View {
             return None;
         };
         (account.kind == crate::model::settings::AccountRemovalKind::BrokenFile
+            && account.file_identity.is_some()
             && account
                 .path
                 .file_name()
@@ -319,6 +333,37 @@ impl View {
                 .parent()
                 .is_some_and(|parent| !parent.ends_with("accounts")))
         .then_some(account.path.as_path())
+    }
+
+    pub(super) fn account_selection(
+        &self,
+        nav: &crate::model::settings::Nav,
+    ) -> Option<(usize, PathBuf)> {
+        let Some(Row::Account(index)) = nav.row() else {
+            return None;
+        };
+        self.accounts
+            .get(index)
+            .map(|row| (index, row.path.clone()))
+    }
+
+    pub(super) fn restore_account_selection(
+        &mut self,
+        nav: &mut crate::model::settings::Nav,
+        (index, path): (usize, PathBuf),
+    ) {
+        let row = if self.accounts.is_empty() {
+            Row::AccountSetup
+        } else {
+            Row::Account(
+                self.accounts
+                    .iter()
+                    .position(|account| account.path == path)
+                    .unwrap_or_else(|| index.min(self.accounts.len() - 1)),
+            )
+        };
+        nav.select_row(row);
+        self.scroll_to(nav.selected);
     }
 
     pub fn scroll_to(&self, row: usize) {
@@ -600,7 +645,9 @@ impl Inbox {
                     .filter(|account| !account.removing)
                 {
                     match account.kind {
-                        crate::model::settings::AccountRemovalKind::BrokenFile => {
+                        crate::model::settings::AccountRemovalKind::BrokenFile
+                            if account.file_identity.is_some() =>
+                        {
                             self.open_account_editor(account.path, cx);
                         }
                         crate::model::settings::AccountRemovalKind::Interrupted { .. } => {
@@ -1055,7 +1102,14 @@ impl Inbox {
     }
 }
 
-pub(super) fn legacy_account_actions(theme: &theme::Theme, cx: &Context<Inbox>) -> gpui::Div {
+pub(super) const LEGACY_ACCOUNT_REQUESTS: [Request; 2] =
+    [Request::AccountSetup, Request::EditAccount];
+
+pub(super) fn legacy_account_actions(
+    theme: &theme::Theme,
+    focus: [bool; 2],
+    cx: &Context<Inbox>,
+) -> gpui::Div {
     div()
         .flex()
         .flex_wrap()
@@ -1063,31 +1117,47 @@ pub(super) fn legacy_account_actions(theme: &theme::Theme, cx: &Context<Inbox>) 
         .gap_2()
         .mt_2()
         .children(
-            [
-                ("Add account", Request::AccountSetup),
-                ("Open account.toml", Request::EditAccount),
-            ]
-            .into_iter()
-            .map(|(label, request)| {
-                div()
-                    .id(label)
-                    .px_3()
-                    .py_1p5()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(theme.border))
-                    .text_size(px(12.))
-                    .cursor_pointer()
-                    .hover(|button| button.bg(rgb(theme.surface)))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |inbox, _, _, cx| {
-                            cx.stop_propagation();
-                            inbox.settings_request(request, false, cx);
-                        }),
-                    )
-                    .child(label)
-            }),
+            [("Add account", "a"), ("Open account.toml", "e")]
+                .into_iter()
+                .zip(LEGACY_ACCOUNT_REQUESTS)
+                .zip(focus)
+                .map(|(((label, key), request), focused)| {
+                    div()
+                        .id(label)
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .py_1p5()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(if focused { theme.accent } else { theme.border }))
+                        .when(focused, |button| {
+                            button
+                                .bg(rgb(theme.selection))
+                                .text_color(rgb(theme.on_selection))
+                        })
+                        .text_size(px(12.))
+                        .cursor_pointer()
+                        .hover(|button| button.bg(rgb(theme.surface)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |inbox, _, _, cx| {
+                                cx.stop_propagation();
+                                inbox.settings_request(request, false, cx);
+                            }),
+                        )
+                        .child(label)
+                        .child(
+                            div()
+                                .text_color(rgb(if focused {
+                                    theme.on_selection_dim
+                                } else {
+                                    theme.dimmed
+                                }))
+                                .child(key),
+                        )
+                }),
         )
 }
 
@@ -1357,7 +1427,8 @@ pub(super) fn card(
                         let recover =
                             matches!(account.kind, AccountRemovalKind::Interrupted { .. });
                         let broken = account.kind == AccountRemovalKind::BrokenFile;
-                        let status = if broken {
+                        let editable_file = broken && account.file_identity.is_some();
+                        let status = if editable_file {
                             // Card borders, body and row padding, then the link
                             // and the optional Remove button with their gaps.
                             let room = CARD_WIDTH.min(width * 0.94)
@@ -1404,7 +1475,7 @@ pub(super) fn card(
                                         .opacity(if selected { 1. } else { 0. }),
                                 )
                             })
-                            .when(broken, |row| {
+                            .when(editable_file, |row| {
                                 row.child(
                                     trailing(theme, "↗", selected)
                                         .w(px(BROKEN_FILE_LINK_WIDTH))
@@ -1909,8 +1980,20 @@ fn account_label(
             div()
                 .truncate()
                 .font_weight(FontWeight::MEDIUM)
+                .when(account.link_damaged, |title| {
+                    title.text_color(rgb(theme.error))
+                })
                 .child(crate::present::display_safe(&account.name)),
         )
+        .when(account.link_damaged, |row| {
+            row.child(
+                div()
+                    .text_size(px(12.))
+                    .line_height(px(14.))
+                    .text_color(rgb(muted))
+                    .child(fell_core::accounts::MAILBOX_LINK_RECOVERY),
+            )
+        })
         .children(
             account
                 .email
@@ -1930,7 +2013,11 @@ fn account_label(
                 .truncate()
                 .text_size(px(12.))
                 .line_height(px(15.))
-                .text_color(rgb(if account.alert { theme.error } else { muted }))
+                .text_color(rgb(if account.alert && !account.link_damaged {
+                    theme.error
+                } else {
+                    muted
+                }))
                 .child(status),
         )
 }

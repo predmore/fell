@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use fell_core::accounts::{Accounts, FileIdentity, Registry, RemovalOutcome};
+use fell_core::compose::AccountDraftRemoval;
 use futures::{FutureExt as _, StreamExt as _, channel::oneshot, future::Shared};
 use gpui::{App, Context, Entity, IntoElement, Render, Window, div, prelude::*, rgb};
 
@@ -20,7 +21,8 @@ pub(super) struct AccountWindow {
     views: HashMap<String, Entity<Inbox>>,
     stopping: HashSet<String>,
     reloading: HashMap<String, Entity<Inbox>>,
-    removing: HashMap<String, RequestedRemoval>,
+    preparing_removal: HashSet<String>,
+    removing: HashMap<String, (RequestedRemoval, Option<AccountDraftRemoval>)>,
     catalog: Accounts,
     picker_clock: motion::Clock,
     picker_exit: Option<PickerExit>,
@@ -79,6 +81,7 @@ impl AccountWindow {
             views,
             stopping: HashSet::new(),
             reloading: HashMap::new(),
+            preparing_removal: HashSet::new(),
             removing: HashMap::new(),
             catalog: Accounts::default(),
             picker_clock: motion::Clock::default(),
@@ -296,13 +299,15 @@ impl AccountWindow {
             self.views.insert(config.id.clone(), entity);
             added = true;
         }
-        self.reloading
-            .retain(|id, _| accounts.configs().any(|config| config.id == *id));
+        self.reloading.retain(|id, _| {
+            self.removing.contains_key(id) || accounts.configs().any(|config| config.id == *id)
+        });
 
         let removed = self
             .active_id
             .as_deref()
             .filter(|id| !self.views.contains_key(*id))
+            .filter(|id| !self.removing.contains_key(*id))
             .filter(|id| {
                 !self.stopping.contains(*id) || !accounts.configs().any(|config| config.id == *id)
             })
@@ -374,23 +379,77 @@ impl AccountWindow {
         }
     }
 
+    fn request_removal(
+        &mut self,
+        id: &str,
+        registry: &Registry,
+        removal: RequestedRemoval,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.removing.contains_key(id) || self.preparing_removal.contains(id) {
+            return;
+        }
+        let hub = cx
+            .try_global::<crate::draft_host::AgentDrafts>()
+            .map(|drafts| drafts.0.clone());
+        if let Some(hub) =
+            hub.filter(|_| removal.delete && removal.kind != AccountRemovalKind::BrokenFile)
+        {
+            self.preparing_removal.insert(id.to_owned());
+            self.update_choices(false, cx);
+            let account = fell_core::AccountId(id.to_owned());
+            let registry = registry.clone();
+            cx.spawn_in(window, async move |this, cx| {
+                let id = account.0.clone();
+                let drafts = cx
+                    .background_executor()
+                    .spawn(async move { hub.release_account_drafts(&account) })
+                    .await;
+                let _ = this.update_in(cx, |view, window, cx| {
+                    view.preparing_removal.remove(&id);
+                    match drafts {
+                        Ok(drafts) => view.retire(
+                            &id,
+                            &registry,
+                            Some((removal, Some(drafts))),
+                            false,
+                            window,
+                            cx,
+                        ),
+                        Err(error) => {
+                            view.update_choices(false, cx);
+                            view.notice(
+                                format!("Couldn't remove {} · {error}", removal.name),
+                                true,
+                                cx,
+                            );
+                        }
+                    }
+                });
+            })
+            .detach();
+        } else {
+            self.retire(id, registry, Some((removal, None)), false, window, cx);
+        }
+    }
+
     fn retire(
         &mut self,
         id: &str,
         registry: &Registry,
-        remove: Option<RequestedRemoval>,
+        mut remove: Option<(RequestedRemoval, Option<AccountDraftRemoval>)>,
         reload: bool,
         window: &Window,
         cx: &mut Context<Self>,
     ) {
         let broken = remove
             .as_ref()
-            .is_some_and(|request| request.kind == AccountRemovalKind::BrokenFile);
+            .is_some_and(|(request, _)| request.kind == AccountRemovalKind::BrokenFile);
+        let keep_view = reload || remove.is_some();
         if !broken {
-            if let Some(request) = remove.as_ref() {
-                self.removing
-                    .entry(id.to_owned())
-                    .or_insert_with(|| request.clone());
+            if let Some(request) = remove.take() {
+                self.removing.entry(id.to_owned()).or_insert(request);
                 self.update_choices(false, cx);
             }
             if !self.stopping.insert(id.to_owned()) {
@@ -445,7 +504,7 @@ impl AccountWindow {
             if self.active_id.as_deref() == Some(id) {
                 self.signal_active_changed();
             }
-            if reload {
+            if keep_view {
                 self.reloading.insert(id.to_owned(), view);
             }
         } else if !broken && let Some(hub) = &hub {
@@ -454,8 +513,8 @@ impl AccountWindow {
         let registry = registry.clone();
         let id = id.to_owned();
         cx.spawn_in(window, async move |this, cx| {
-            let (request, removing_active) = if broken {
-                (remove.expect("broken removal has a request"), false)
+            let (request, drafts, removing_active) = if broken {
+                (remove.expect("broken removal has a request").0, None, false)
             } else {
                 let read = registry.clone();
                 let catalog = cx
@@ -471,8 +530,12 @@ impl AccountWindow {
                     })
                     .await;
                 let Ok(Some(pending)) = this.update_in(cx, |view, window, cx| {
-                    if let Some(request) = view.removing.get(&id) {
-                        return Some((request.clone(), view.active_id.as_deref() == Some(&id)));
+                    if let Some((request, drafts)) = view.removing.get_mut(&id) {
+                        return Some((
+                            request.clone(),
+                            drafts.take(),
+                            view.active_id.as_deref() == Some(&id),
+                        ));
                     }
                     view.stopping.remove(&id);
                     view.reconcile(&registry, catalog, window, cx);
@@ -497,11 +560,6 @@ impl AccountWindow {
                                 )?;
                                 return Ok(None);
                             }
-                            if request.delete
-                                && let Some(hub) = hub
-                            {
-                                hub.release_account_drafts(&account)?;
-                            }
                             let base = mailbox::store_path()?;
                             match request.kind {
                                 AccountRemovalKind::Interrupted { .. } => read.recover_removal(
@@ -521,15 +579,39 @@ impl AccountWindow {
                         };
                         run()
                     };
+                    drop(drafts);
                     (result, catalog(&read))
                 })
                 .await;
             let _ = this.update_in(cx, |view, window, cx| {
+                use crate::model::settings::{Page, Section};
+                let active = view.active.read(cx);
+                let selection = (result.is_ok()
+                    && active.session.overlay == Overlay::Settings
+                    && active.session.settings_nav.page == Page::Section(Section::Accounts))
+                .then(|| {
+                    active
+                        .settings_view
+                        .account_selection(&active.session.settings_nav)
+                })
+                .flatten();
                 if !broken {
                     view.stopping.remove(&id);
                     view.removing.remove(&id);
+                    if result.is_ok() {
+                        view.reloading.remove(&id);
+                    }
                 }
                 view.reconcile(&registry, catalog, window, cx);
+                if let Some(selection) = selection {
+                    view.active.update(cx, |inbox, cx| {
+                        inbox.session.overlay = Overlay::Settings;
+                        inbox
+                            .settings_view
+                            .restore_account_selection(&mut inbox.session.settings_nav, selection);
+                        cx.notify();
+                    });
+                }
                 let message = match result {
                     Ok(Some(outcome @ (RemovalOutcome::Kept | RemovalOutcome::Deleted))) => {
                         let removed = if removing_active && view.active_id.is_some() {
@@ -556,7 +638,12 @@ impl AccountWindow {
                     }
                     Ok(None) => format!("Deleted {name}"),
                     Err(err) => {
-                        view.notice(format!("Couldn't finish account action. {err}"), true, cx);
+                        let hint = if err.contains("Close Fell and any fell-mcp sessions") {
+                            "Close other Fell or fell-mcp sessions using this account and try again"
+                        } else {
+                            err.as_str()
+                        };
+                        view.notice(format!("Couldn't remove {name} · {hint}"), true, cx);
                         return;
                     }
                 };
@@ -672,7 +759,7 @@ impl AccountWindow {
                 &self.catalog,
                 self.active_id.as_deref(),
                 statuses,
-                |id| self.removing.contains_key(id),
+                |id| self.preparing_removal.contains(id) || self.removing.contains_key(id),
             ) || catalog_changed
             {
                 inbox.refresh_settings_availability();
@@ -697,6 +784,11 @@ impl AccountWindow {
         }
         if let Some(next) = self.views.get(id).cloned() {
             let frames = self.active.read(cx).frames.clone();
+            let account_text = &self.active.read(cx).session;
+            let header_leaving = (
+                account_text.account_name.clone(),
+                account_text.account_email.clone(),
+            );
             let outgoing = self.active.clone();
             self.picker_clock.idle();
             let fade_now = self.picker_clock.now();
@@ -728,21 +820,16 @@ impl AccountWindow {
             self.active.update(cx, |inbox, cx| {
                 inbox.frames = frames;
                 inbox.notification_window_activation(window, cx);
+                let now = Instant::now();
                 inbox.switch_enter_guard =
-                    confirmed_with_enter.then(super::AccountSwitchEnterGuard::new);
-                inbox.start_account_arrival(Instant::now());
+                    confirmed_with_enter.then(|| super::AccountSwitchEnterGuard::new(now));
+                inbox.account_header_leaving = Some(header_leaving);
+                inbox.start_account_arrival(now);
                 cx.notify();
             });
             self.focus(window, cx);
             self.update_choices(true, cx);
             cx.notify();
-            #[cfg(debug_assertions)]
-            if confirmed_with_enter
-                && std::env::var_os("FELL_DEBUG_ACCOUNT_SWITCH_STALL").as_deref()
-                    == Some(std::ffi::OsStr::new("1"))
-            {
-                std::thread::sleep(Duration::from_millis(300));
-            }
         }
     }
 
@@ -859,7 +946,7 @@ pub(super) fn remove(id: &str, removal: RequestedRemoval, window: &mut Window, c
         && let Ok(registry) = Registry::resolve()
     {
         root.update(cx, |view, cx| {
-            view.retire(id, &registry, Some(removal), false, window, cx);
+            view.request_removal(id, &registry, removal, window, cx);
         });
     }
 }
@@ -1115,7 +1202,7 @@ mod tests {
     }
 
     #[test]
-    fn account_switch_guards_only_enter_and_extends_the_quiet_period() {
+    fn account_switch_rebuilds_the_picker_and_guards_queued_enter() {
         let Some(_temp) = fell_core::test_support::in_isolated_process() else {
             return;
         };
@@ -1158,29 +1245,17 @@ mod tests {
                 }
                 assert!(view.picker_opacity(at + motion::FADE).is_none());
                 view.active().update(cx, |inbox, _| {
-                    // The first queued Enter can be dispatched after a stall
-                    // longer than the entire quiet period, before or after paint.
                     let after_stall = at + Duration::from_millis(300);
                     assert!(inbox.advance_switch_enter_guard(after_stall));
-                    assert!(inbox.swallow_switch_enter(false));
-                    for millis in (0..=240).step_by(16) {
-                        assert!(inbox.advance_switch_enter_guard(
-                            after_stall + Duration::from_millis(millis)
-                        ));
+                    for _ in 0..4 {
+                        assert!(inbox.swallow_switch_enter(false, after_stall));
                     }
-                    let next_frame = after_stall + Duration::from_millis(540);
-                    assert!(inbox.advance_switch_enter_guard(next_frame));
-                    assert!(inbox.swallow_switch_enter(false));
-                    for millis in (0..=240).step_by(16) {
-                        assert!(inbox.advance_switch_enter_guard(
-                            next_frame + Duration::from_millis(millis)
-                        ));
+                    for millis in (316..=600).step_by(16) {
+                        inbox.advance_switch_enter_guard(at + Duration::from_millis(millis));
                     }
-                    assert!(
-                        !inbox.advance_switch_enter_guard(next_frame + Duration::from_millis(256))
-                    );
-                    assert!(!inbox.swallow_switch_enter(false));
-                    assert!(inbox.swallow_switch_enter(true));
+                    let deliberate = at + Duration::from_millis(600);
+                    assert!(!inbox.swallow_switch_enter(false, deliberate));
+                    assert!(inbox.swallow_switch_enter(true, deliberate));
 
                     inbox.session.on_key(KeyId::Char('g'), 10);
                     inbox.session.on_key(KeyId::Char('A'), 10);
@@ -1198,10 +1273,113 @@ mod tests {
                 });
                 view.switch("mail", window, cx);
                 original.update(cx, |inbox, _| {
-                    assert!(!inbox.swallow_switch_enter(false));
+                    assert!(!inbox.swallow_switch_enter(false, Instant::now()));
                 });
             })
             .unwrap();
+    }
+
+    #[test]
+    fn the_switch_enter_guard_expires_with_slow_frames() {
+        let start = Instant::now();
+        let mut guard = super::super::AccountSwitchEnterGuard::new(start);
+        for millis in (0..=600).step_by(50) {
+            guard.frame(start + Duration::from_millis(millis));
+        }
+        assert!(!guard.armed(start + Duration::from_millis(600)));
+    }
+
+    #[test]
+    fn the_switch_enter_guard_keeps_queued_input_blocked_after_a_stall() {
+        let start = Instant::now();
+        let mut guard = super::super::AccountSwitchEnterGuard::new(start);
+        assert!(guard.frame(start));
+        let late_frame = start + Duration::from_millis(300);
+        assert!(guard.frame(late_frame));
+        for millis in [300, 310, 320] {
+            assert!(guard.armed(start + Duration::from_millis(millis)));
+        }
+    }
+
+    #[test]
+    fn the_switch_enter_guard_expires_during_repeated_presses_without_frames() {
+        let start = Instant::now();
+        let guard = super::super::AccountSwitchEnterGuard::new(start);
+        for millis in [300, 601, 950] {
+            assert!(guard.armed(start + Duration::from_millis(millis)));
+        }
+        for millis in [1000, 1050, 1200] {
+            assert!(!guard.armed(start + Duration::from_millis(millis)));
+        }
+    }
+
+    #[test]
+    fn a_failed_removal_reopens_the_outgoing_mailbox_view() {
+        let Some(_temp) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let registry = Registry::resolve().unwrap();
+        std::fs::create_dir_all(registry.directory()).unwrap();
+        write_account(&registry, "mail", "name = 'Harbor Desk'");
+        write_account(&registry, "work", "");
+        let mut app = TestAppContext::single();
+        let window = app.add_window(|window, cx| {
+            AccountWindow::new(mailbox::startup(), false, None, window, cx)
+        });
+        let original = window.update(&mut app, |view, _, _| view.active()).unwrap();
+        let store = original.read_with(&app, |inbox, _| inbox.store.clone());
+        futures::executor::block_on(store.call(|_| ())).unwrap();
+        app.run_until_parked();
+        let base = mailbox::store_path().unwrap();
+        let mailbox = registry.mailbox_path(&base, "mail").unwrap();
+        let other_session = fell_core::Store::open_existing(&mailbox).unwrap();
+        let path = registry.path("mail").unwrap();
+        let expected = catalog(&registry)
+            .entries
+            .into_iter()
+            .find(|entry| entry.path == path)
+            .unwrap()
+            .file_identity;
+        window
+            .update(&mut app, |view, window, cx| {
+                original.update(cx, |inbox, _| {
+                    inbox.session.folder = "Sent".into();
+                    inbox.session.cursor_id = Some("selected-thread".into());
+                    inbox.session.search = Some(Default::default());
+                    inbox.session.search.as_mut().unwrap().query = "trail".into();
+                });
+                view.request_removal(
+                    "mail",
+                    &registry,
+                    RequestedRemoval {
+                        kind: AccountRemovalKind::Account,
+                        path: path.clone(),
+                        expected,
+                        delete: true,
+                        name: "Harbor Desk".into(),
+                    },
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+        app.run_until_parked();
+        window
+            .update(&mut app, |view, _, cx| {
+                assert_eq!(view.active_id.as_deref(), Some("mail"));
+                assert_ne!(view.active(), original);
+                let inbox = view.active.read(cx);
+                assert_eq!(inbox.session.folder, "Sent");
+                assert_eq!(inbox.session.cursor_id.as_deref(), Some("selected-thread"));
+                assert_eq!(inbox.session.search.as_ref().unwrap().query, "trail");
+                let toast = inbox.session.toast.as_ref().unwrap();
+                assert!(toast.text.starts_with("Couldn't remove Harbor Desk"));
+                assert!(toast.text.contains("fell-mcp"));
+            })
+            .unwrap();
+        assert!(path.is_file());
+        assert!(mailbox.is_file());
+        drop(other_session);
     }
 
     #[test]
@@ -1247,17 +1425,16 @@ mod tests {
             .update(&mut app, |view, window, cx| {
                 view.reconcile(&registry, catalog, window, cx);
                 assert!(view.stopping.contains("work"));
-                view.retire(
+                view.request_removal(
                     "work",
                     &registry,
-                    Some(RequestedRemoval {
+                    RequestedRemoval {
                         kind: AccountRemovalKind::Account,
                         path: path.clone(),
                         expected,
                         delete: false,
                         name: "New work".into(),
-                    }),
-                    false,
+                    },
                     window,
                     cx,
                 );

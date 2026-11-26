@@ -369,12 +369,26 @@ impl Registry {
             }
             Err(error) => Some((backup, error)),
             Ok(None) => {
-                if let Ok(Some((config, _))) = legacy {
+                if let Ok(Some((config, text))) = legacy {
                     // A repaired legacy file does not replace a mailbox already
                     // in use under the newer layout.
                     let sibling = sibling_mailbox(base, &config.id);
                     if mailbox_exists(&sibling).map_err(|err| FileError::access(&sibling, err))? {
                         return Ok(None);
+                    }
+                    let target = self.path(&config.id)?;
+                    if path_exists(&target).map_err(|err| FileError::access(&target, err))?
+                        && !read(&target, Some(&config.id)).is_ok_and(|existing| {
+                            existing.is_some_and(|(_, current)| current == text)
+                        })
+                    {
+                        return Ok(Some(OriginalMailbox::Unavailable {
+                            id: config.id,
+                            path: self.config.join("account.toml"),
+                            error: FileError::mailbox_link(
+                                "account.toml: Conflicts with the account file in accounts/",
+                            ),
+                        }));
                     }
                     return Ok(Some(OriginalMailbox::Known {
                         id: config.id,
@@ -540,7 +554,7 @@ impl Registry {
         let mut created_marker = false;
         let mut created_target = false;
         let mut backed_up = false;
-        let mut write = || -> io::Result<()> {
+        let write = || -> io::Result<()> {
             if path_exists(&backup)? {
                 return Err(io::Error::other("account.toml.bak already exists"));
             }

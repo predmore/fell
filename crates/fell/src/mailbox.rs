@@ -103,6 +103,12 @@ pub fn open_registered_store(
         {
             return Err("The account file changed while opening the mailbox.".into());
         }
+        let current = registry
+            .store_path(&store_path()?, &config.id)
+            .map_err(|err| err.to_string())?;
+        if path.as_ref().is_ok_and(|path| *path != current) {
+            return Err("The mailbox link changed while opening the account.".into());
+        }
         Ok(Some(lock))
     })();
     match locked {
@@ -260,7 +266,10 @@ pub fn load_account_file(id: Option<&str>) -> Result<(PathBuf, AccountConfig), S
             .map(|config| (path.clone(), config))
             .ok_or_else(|| accounts::missing(&path).to_string());
     }
-    let accounts = registry.load();
+    let accounts = match store_path() {
+        Ok(base) => registry.load_with_removals(&base),
+        Err(_) => registry.load(),
+    };
     if let Some(config) = accounts.default_config() {
         let path = registry.path(&config.id).map_err(|err| err.to_string())?;
         return Ok((path, config.clone()));
@@ -877,8 +886,10 @@ mod tests {
 
     #[test]
     fn import_appends_only_confirmed_new_aliases_and_keeps_the_account_text() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("fell/accounts/mail.toml");
+        let Some(root) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let path = root.join("fell/accounts/mail.toml");
         let original = "# Keep my notes\nemail = 'primary@example.com'\npassword = 'demo'";
         let lock = lock_account_dir(&path).unwrap();
         stage_account_text_at(path.clone(), original, true, lock)

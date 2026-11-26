@@ -690,18 +690,21 @@ const LONG_GLIDE_PX: f32 = 4.0 * ROW_PX;
 
 const FIRST_PREVIEW_WAIT: Duration = Duration::from_millis(1500);
 const ACCOUNT_SWITCH_ENTER_QUIET: Duration = Duration::from_millis(250);
+const ACCOUNT_SWITCH_ENTER_LIMIT: Duration = Duration::from_secs(1);
 const ACCOUNT_READER_WAIT: Duration = Duration::from_millis(150);
 
 struct AccountSwitchEnterGuard {
     remaining: Duration,
     last_frame: Option<Instant>,
+    deadline: Instant,
 }
 
 impl AccountSwitchEnterGuard {
-    fn new() -> Self {
+    fn new(now: Instant) -> Self {
         Self {
             remaining: ACCOUNT_SWITCH_ENTER_QUIET,
             last_frame: None,
+            deadline: now + ACCOUNT_SWITCH_ENTER_LIMIT,
         }
     }
 
@@ -710,11 +713,13 @@ impl AccountSwitchEnterGuard {
         // clear the guard ahead of key events queued while the UI stalled.
         if let Some(last) = self.last_frame.replace(now) {
             let elapsed = now.saturating_duration_since(last);
-            if elapsed <= motion::MAX_STEP {
-                self.remaining = self.remaining.saturating_sub(elapsed);
-            }
+            self.remaining = self.remaining.saturating_sub(elapsed.min(motion::MAX_STEP));
         }
-        !self.remaining.is_zero()
+        self.armed(now)
+    }
+
+    fn armed(&self, now: Instant) -> bool {
+        now < self.deadline && !self.remaining.is_zero()
     }
 }
 
@@ -850,8 +855,10 @@ struct Inbox {
     retired: bool,
     compose_ready: futures::future::Shared<futures::channel::oneshot::Receiver<()>>,
     account_arrival: Option<Transition>,
+    account_header_leaving: Option<(String, String)>,
     account_reader_arrival: Option<AccountReaderArrival>,
     switch_enter_guard: Option<AccountSwitchEnterGuard>,
+    legacy_account_focus: Option<usize>,
     /// Visible label rows as they looked in the last list prepaint.
     painted_label_rows: Vec<LeavingRow>,
     leaving_rows: Option<Arc<[LeavingRow]>>,
@@ -1085,8 +1092,10 @@ impl Inbox {
             retired: false,
             compose_ready: futures::FutureExt::shared(compose_ready),
             account_arrival: None,
+            account_header_leaving: None,
             account_reader_arrival: None,
             switch_enter_guard: None,
+            legacy_account_focus: None,
             painted_label_rows: Vec::new(),
             leaving_rows: None,
             leaving_reader: None,
@@ -4551,7 +4560,7 @@ impl Inbox {
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let started = Instant::now();
         if key_from(&event.keystroke) == Some(KeyId::Enter)
-            && self.swallow_switch_enter(event.is_held)
+            && self.swallow_switch_enter(event.is_held, started)
         {
             cx.stop_propagation();
             return;
@@ -4569,6 +4578,40 @@ impl Inbox {
             return;
         }
         let stroke = &event.keystroke;
+        if self.session.overlay == Overlay::None
+            && self.session.sync == SyncKind::StoreError
+            && self.settings_view.broken_legacy_path().is_some()
+            && self.session.chord.is_empty()
+            && !stroke.modifiers.control
+            && !stroke.modifiers.alt
+            && !stroke.modifiers.platform
+        {
+            let activate = match stroke.key.as_str() {
+                "tab" => {
+                    self.legacy_account_focus = Some(
+                        self.legacy_account_focus
+                            .map_or(usize::from(stroke.modifiers.shift), |index| 1 - index),
+                    );
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
+                "a" => Some(0),
+                "e" => Some(1),
+                "enter" | "space" => self.legacy_account_focus,
+                _ => None,
+            };
+            if let Some(index) = activate {
+                if !event.is_held {
+                    self.settings_request(settings::LEGACY_ACCOUNT_REQUESTS[index], false, cx);
+                }
+                cx.stop_propagation();
+                return;
+            }
+        }
+        if self.legacy_account_focus.take().is_some() {
+            cx.notify();
+        }
         if self.session.pane == Pane::Conversation
             && self.session.overlay == Overlay::None
             && self.session.chord.is_empty()
@@ -4671,12 +4714,11 @@ impl Inbox {
         cx.stop_propagation();
     }
 
-    fn swallow_switch_enter(&mut self, held: bool) -> bool {
-        let armed = self.switch_enter_guard.is_some();
-        if armed {
-            self.switch_enter_guard = Some(AccountSwitchEnterGuard::new());
-        }
-        held || armed
+    fn swallow_switch_enter(&self, held: bool, now: Instant) -> bool {
+        held || self
+            .switch_enter_guard
+            .as_ref()
+            .is_some_and(|guard| guard.armed(now))
     }
 
     fn advance_switch_enter_guard(&mut self, now: Instant) -> bool {
@@ -4906,17 +4948,14 @@ impl Inbox {
             self.settings_request(request, confirmed_with_enter, cx);
         }
         if self.session.overlay == Overlay::Settings {
-            use crate::model::settings::{Page, Section};
+            use crate::model::settings::Page;
             self.validate_settings_step(cx);
             let page = self.session.settings_nav.page;
-            let returning_to_accounts =
-                matches!(settings_page, Some(Page::ConfirmAccountRemoval { .. }))
-                    && page == Page::Section(Section::Accounts);
             if settings_page != Some(page) {
                 self.settings_view.reset_scroll();
                 self.refresh_settings_identities(cx);
             }
-            if !returning_to_accounts && matches!(page, Page::Section(_) | Page::IdentityImport) {
+            if matches!(page, Page::Section(_) | Page::IdentityImport) {
                 self.settings_view
                     .scroll_to(self.session.settings_nav.selected);
             }
@@ -6150,13 +6189,22 @@ impl Render for Inbox {
                     leaving_banner,
                     leaving: self.leaving_rows.clone().map(|rows| (rows, exit)),
                     cached_results: cached_search_rows,
-                    legacy_account_actions: self.settings_view.broken_legacy_path().is_some()
-                        && self.session.sync == SyncKind::StoreError,
+                    legacy_account_actions: (self.settings_view.broken_legacy_path().is_some()
+                        && self.session.sync == SyncKind::StoreError)
+                        .then(|| {
+                            [Some(0), Some(1)].map(|index| index == self.legacy_account_focus)
+                        }),
                 },
                 status_labels,
                 link_preview,
                 recipient_popup,
                 account_opacity,
+                account_header_fade: self
+                    .account_arrival
+                    .zip(self.account_header_leaving.as_ref())
+                    .map(|(fade, (name, email))| {
+                        ((name.as_str(), email.as_str()), fade.progress(now))
+                    }),
             },
             width,
             (list_width, split_width),
@@ -6220,7 +6268,7 @@ struct Drawn {
 }
 
 /// What the frame shows beyond the session.
-struct Shown {
+struct Shown<'a> {
     /// The open conversation's subject. It changes with the messages, not
     /// with the selection, so a subject never sits over another thread.
     subject: String,
@@ -6242,6 +6290,7 @@ struct Shown {
     link_preview: reader_links::PreviewFrame,
     recipient_popup: Option<gpui::Deferred>,
     account_opacity: f32,
+    account_header_fade: Option<((&'a str, &'a str), f32)>,
 }
 
 struct LeavingReader {
@@ -6279,7 +6328,7 @@ struct ListContent {
     leaving_banner: Option<(Banner, f32)>,
     leaving: Option<(Arc<[LeavingRow]>, f32)>,
     cached_results: Option<(u64, gpui::AnyView)>,
-    legacy_account_actions: bool,
+    legacy_account_actions: Option<[bool; 2]>,
 }
 
 /// What the conversation's bodies show this frame beyond the session.
@@ -6420,7 +6469,7 @@ fn shell(
     session: &Session,
     motion: &mut InboxMotion,
     now: Instant,
-    shown: Shown,
+    shown: Shown<'_>,
     width: f32,
     (list_width, split_width): (f32, f32),
     list_scroll: UniformListScrollHandle,
@@ -6449,6 +6498,7 @@ fn shell(
         link_preview,
         recipient_popup,
         account_opacity,
+        account_header_fade,
     } = shown;
     let frames = conv.frames.clone();
     let same_scope = session.search.is_none()
@@ -6593,6 +6643,7 @@ fn shell(
                 now,
                 width,
                 window,
+                account_header_fade,
             ),
         })
         .children(recipient_popup)
@@ -6960,13 +7011,13 @@ struct HeaderAccount {
 
 impl HeaderAccount {
     fn fit(
-        session: &Session,
+        account: (&str, &str),
         room: f32,
         gap: f32,
         show_email: bool,
         fit: &impl Fn(&str, f32, FontWeight) -> Option<gpui::ShapedLine>,
     ) -> Self {
-        let (name, email) = account_header(&session.account_name, &session.account_email);
+        let (name, email) = account_header(account.0, account.1);
         let full = fit(name, room, FontWeight::SEMIBOLD).filter(|line| line.text == name);
         let quiet = full.is_none();
         let name = full.or_else(|| fit(name, room, FontWeight::NORMAL));
@@ -7023,6 +7074,7 @@ fn header(
     now: Instant,
     width: f32,
     window: &Window,
+    account_fade: Option<((&str, &str), f32)>,
 ) -> gpui::Div {
     const PAD: f32 = 16.;
     const FOLDER_GAP: f32 = 24.;
@@ -7179,26 +7231,37 @@ fn header(
     let (outgoing, incoming) = fade
         .as_ref()
         .map_or((0., label_header_opacity), |fade| fade.label_opacities(now));
-    let fit_account = |folder_width| {
+    let fit_account = |account, folder_width| {
         HeaderAccount::fit(
-            session,
+            account,
             room - folder_width,
             COUNT_GAP,
             width >= DETAIL_MIN_WIDTH,
             &fit,
         )
     };
-    let account = fit_account(current_width);
+    let account_text = (
+        session.account_name.as_str(),
+        session.account_email.as_str(),
+    );
+    let account = fit_account(account_text, current_width);
     // Each account fit shares its half of the fade with its folder. This
     // keeps both fits at their own widths and the right edge anchored.
     let (account, account_opacities) = if let Some(fade) = fade {
-        let old = fit_account(old_width);
+        let old = fit_account(account_text, old_width);
         let name_changes = old.name != account.name || old.quiet != account.quiet;
         let email_changes = name_changes || old.email != account.email;
         let (leaving, opacities) = fade.account_frame([name_changes, email_changes], now);
         (if leaving { old } else { account }, opacities)
     } else {
         (account, [1.; 2])
+    };
+    let (account_opacities, leaving_account) = match account_fade {
+        Some((old, shown)) if old != account_text => (
+            account_opacities.map(|value| value * shown),
+            Some(fit_account(old, current_width).render(theme, COUNT_GAP, [1. - shown; 2])),
+        ),
+        _ => (account_opacities, None),
     };
     let folder_slot = |group: gpui::Div, width: f32| {
         div()
@@ -7219,11 +7282,15 @@ fn header(
         .border_b(px(1.))
         .border_color(rgb(theme.border))
         .bg(rgb(theme.surface))
-        .child(div().flex_1().min_w_0().flex().child(account.render(
-            theme,
-            COUNT_GAP,
-            account_opacities,
-        )))
+        .child(
+            div()
+                .relative()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .child(account.render(theme, COUNT_GAP, account_opacities))
+                .children(leaving_account.map(|old| old.absolute().left_0().top_0())),
+        )
         .child(
             div()
                 .flex_none()
@@ -7296,9 +7363,9 @@ fn thread_list(
         return pane
             .relative()
             .children(content.banner.map(|(mut banner, opacity)| {
-                let actions = content.legacy_account_actions.then(|| {
+                let actions = content.legacy_account_actions.map(|focus| {
                     banner.hint.clear();
-                    settings::legacy_account_actions(theme, cx)
+                    settings::legacy_account_actions(theme, focus, cx)
                 });
                 empty_state(theme, banner)
                     .children(actions)
@@ -12819,6 +12886,18 @@ fn folder_picker(
                     } else {
                         theme.dimmed
                     };
+                    let detail_color = if accounts {
+                        theme::account_detail_color(
+                            detail_color,
+                            if index == selected {
+                                theme.selection
+                            } else {
+                                theme.surface
+                            },
+                        )
+                    } else {
+                        detail_color
+                    };
                     let row = div()
                         .id(gpui::ElementId::named_usize("folder", index))
                         .h(px(PICKER_ROW_PX))
@@ -14666,6 +14745,7 @@ mod tests {
                                 at + Duration::from_millis(60),
                                 width,
                                 window,
+                                None,
                             )
                         }),
                     )

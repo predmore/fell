@@ -411,10 +411,7 @@ impl Onboarding {
                             SaveState::ConfirmFile => self.meta(
                                 "Your password will be saved as plain text in the account file. Fell restricts access to the file to your user account.",
                             ),
-                            SaveState::Failed { title, detail } => column()
-                                .gap_2()
-                                .when(self.reconnect, |column| column.child(self.meta("Reconnecting to the kept mailbox")))
-                                .child(self.error(title, detail.as_deref())),
+                            SaveState::Failed { title, detail } => self.error(title, detail.as_deref()),
                         }).min_h(px((self.theme.ui_px + 4.) * 5.)),
                     ),
                 [None, None],
@@ -441,7 +438,7 @@ impl Onboarding {
                     .as_ref()
                     .map(|_| crate::present::display_safe(self.form.text(Field::Email).trim()));
                 let heading = if let Some(email) = &reconnect_email
-                    && matches!(self.form.storage, super::Storage::Keyring)
+                    && (matches!(self.form.storage, super::Storage::Keyring) || self.reconnect)
                 {
                     self.reconnect_heading(email)
                 } else {

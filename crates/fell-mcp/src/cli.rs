@@ -406,7 +406,7 @@ fn registry_store(
     let Some(registry) = registry else {
         return Ok(base.to_owned());
     };
-    let accounts = registry.load();
+    let accounts = registry.load_with_removals(base);
     if accounts.is_empty() && !registry.directory().exists() {
         // A demo or standalone store may have no account file.
         return Ok(base.to_owned());
@@ -486,7 +486,7 @@ fn grant_stores(opts: &Opts, io: &Io<'_>) -> Result<Vec<GrantStore>, CliError> {
             found = true;
             stores.push(Err((
                 format!("{} ({})", pending.name, pending.id),
-                CliError::new("Delete interrupted"),
+                CliError::new("Deletion interrupted"),
             )));
         }
         if !found {

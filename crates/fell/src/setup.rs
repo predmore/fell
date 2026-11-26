@@ -504,12 +504,11 @@ fn recovery_choice(
     mut ask: impl FnMut(&str) -> Result<String, String>,
 ) -> Result<Option<bool>, String> {
     if !terminal {
-        return Ok(None);
+        return Err("Deletion interrupted. Open Settings → Accounts or run this command in a terminal to recover it.".into());
     }
     let restore = if can_restore { "[r] Restore · " } else { "" };
-    let question = format!(
-        "{name}: deletion was interrupted. {restore}[f] Finish deleting · Enter to leave it"
-    );
+    let question =
+        format!("{name} · Deletion interrupted. {restore}[f] Finish deleting · Enter to leave it");
     match ask(&question)?.to_ascii_lowercase().as_str() {
         "r" if can_restore => Ok(Some(false)),
         "f" => {
@@ -696,8 +695,8 @@ mod tests {
     #[test]
     fn interrupted_removal_requires_an_explicit_terminal_choice() {
         assert_eq!(
-            recovery_choice(false, true, "Field Desk", |_| panic!()).unwrap(),
-            None
+            recovery_choice(false, true, "Field Desk", |_| panic!()).unwrap_err(),
+            "Deletion interrupted. Open Settings → Accounts or run this command in a terminal to recover it."
         );
         for answer in ["", "n", "yes", "r", "R"] {
             for can_restore in [false, true] {
@@ -707,7 +706,7 @@ mod tests {
                 };
                 assert_eq!(
                     recovery_choice(true, can_restore, "Field Desk", |question| {
-                        assert!(question.starts_with("Field Desk: deletion was interrupted."));
+                        assert!(question.starts_with("Field Desk · Deletion interrupted."));
                         assert_eq!(question.contains("[r] Restore"), can_restore);
                         Ok(answer.into())
                     })
