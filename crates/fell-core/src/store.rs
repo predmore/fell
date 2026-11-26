@@ -5449,8 +5449,8 @@ mod tests {
 
     #[test]
     fn configure_account_retires_an_old_demo_database_without_an_outbox() {
-        let path = std::env::temp_dir().join(format!("fell-legacy-demo-{}.db", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fell-legacy-demo.db");
         let store = Store::open(&path).unwrap();
         let demo = Account {
             id: AccountId("local".into()),
@@ -5498,7 +5498,6 @@ mod tests {
         }
         assert!(store.write_back(&configured.id).unwrap());
         drop(store);
-        std::fs::remove_file(&path).unwrap();
     }
 
     fn msg_for(
@@ -7439,11 +7438,8 @@ mod tests {
 
     #[test]
     fn search_reads_a_database_from_before_recipient_columns() {
-        let path = std::env::temp_dir().join(format!(
-            "fell-m2-migrate-{}-pre-recipients.sqlite",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fell-m2-migrate-pre-recipients.sqlite");
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
             conn.execute_batch(
@@ -7514,7 +7510,6 @@ mod tests {
             .unwrap();
         assert_eq!(version, "5");
         drop(store);
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -7573,11 +7568,8 @@ mod tests {
 
     #[test]
     fn empty_fts_index_is_refilled_on_open() {
-        let path = std::env::temp_dir().join(format!(
-            "fell-m2-empty-fts-{}-refill.sqlite",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fell-m2-empty-fts-refill.sqlite");
         {
             let store = Store::open(&path).unwrap();
             store.upsert_account(&account()).unwrap();
@@ -7612,7 +7604,6 @@ mod tests {
             1
         );
         drop(store);
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -7771,15 +7762,8 @@ mod tests {
     #[test]
     fn database_wal_and_shm_are_owner_only() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!(
-            "fell-store-mode-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let path = dir.join("mail.sqlite");
         let store = Store::open(&path).unwrap();
         store.upsert_account(&account()).unwrap();
@@ -7795,7 +7779,6 @@ mod tests {
             let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "{}", file.display());
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -7848,15 +7831,8 @@ mod tests {
 
     #[test]
     fn concurrent_column_migration_succeeds() {
-        let dir = std::env::temp_dir().join(format!(
-            "fell-migrate-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let path = dir.join("old.sqlite");
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
@@ -7888,7 +7864,6 @@ mod tests {
         let names = column_names(&conn, "messages").unwrap();
         assert!(names.iter().any(|name| name == "archived"));
         assert!(names.iter().any(|name| name == "snooze_until"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn listed(store: &Store) -> Vec<Message> {
@@ -8754,11 +8729,8 @@ mod tests {
 
     #[test]
     fn upgrade_keeps_a_sent_copy_beside_a_list_post_on_another_subject() {
-        let path = std::env::temp_dir().join(format!(
-            "fell-schema-v2-{}-sent-subject.sqlite",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fell-schema-v2-sent-subject.sqlite");
         let fingerprint = crate::message::body_fingerprint("Sounds good to me");
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
@@ -8845,7 +8817,6 @@ mod tests {
                 .any(|message| message.headers.subject == "Re: Patch")
         );
         drop(store);
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -9246,11 +9217,13 @@ mod tests {
         assert!(rows[0].folders.contains(&"INBOX".into()));
     }
 
-    fn sent_repair_fixture(tag: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("fell-sent-repair-{}-{tag}", std::process::id()));
-        std::fs::create_dir(&dir).unwrap();
-        dir.join("mail.sqlite")
+    fn sent_repair_fixture(tag: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let temp = tempfile::Builder::new()
+            .prefix(&format!("fell-sent-repair-{tag}-"))
+            .tempdir()
+            .unwrap();
+        let path = temp.path().join("mail.sqlite");
+        (temp, path)
     }
 
     fn split_sent_pair(tag: &str, folder: &str, uid: u32) -> (Message, Message) {
@@ -9298,7 +9271,7 @@ mod tests {
             ("nested", "INBOX.Sent", None),
             ("special-use", "[Gmail]/Sent Mail", Some(&gmail_roles)),
         ] {
-            let path = sent_repair_fixture(tag);
+            let (_temp, path) = sent_repair_fixture(tag);
             let acct = account();
             let store = Store::open(&path).unwrap();
             store.upsert_account(&acct).unwrap();
@@ -9424,13 +9397,12 @@ mod tests {
                 assert!(message_row_present(&store, new_echo_id.as_str()));
             }
             drop(store);
-            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
         }
     }
 
     #[test]
     fn sent_echo_repair_waits_for_the_first_applicable_listing() {
-        let path = sent_repair_fixture("listing");
+        let (_temp, path) = sent_repair_fixture("listing");
         let acct = account();
         let folder = "[Gmail]/Sent Mail";
         let store = Store::open(&path).unwrap();
@@ -9505,7 +9477,6 @@ mod tests {
         list(&store, gmail_roles);
         assert!(message_row_present(&store, "Later-echo@x"));
         drop(store);
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
@@ -9890,9 +9861,8 @@ mod tests {
 
     #[test]
     fn v2_store_backfills_fingerprints_before_list_echo() {
-        let path =
-            std::env::temp_dir().join(format!("fell-schema-v2-{}-fp.sqlite", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fell-schema-v2-fp.sqlite");
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
             conn.execute_batch(
@@ -9973,7 +9943,6 @@ mod tests {
         assert_eq!(rows[0].folders, vec!["Sent", "INBOX"]);
         assert_eq!(rows[0].list_id.as_deref(), Some("list.example"));
         drop(store);
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -10022,11 +9991,8 @@ mod tests {
 
     #[test]
     fn backfill_hashes_bodies_in_batches_before_version_3() {
-        let path = std::env::temp_dir().join(format!(
-            "fell-schema-v2-{}-batch.sqlite",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fell-schema-v2-batch.sqlite");
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
             conn.execute_batch(
@@ -10109,7 +10075,6 @@ mod tests {
             .unwrap();
         assert!(empty.is_empty());
         drop(store);
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -10493,11 +10458,8 @@ mod tests {
 
     #[test]
     fn upgrade_joins_a_stored_pair_and_rethreads_the_reply() {
-        let path = std::env::temp_dir().join(format!(
-            "fell-schema-v2-{}-rethread.sqlite",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fell-schema-v2-rethread.sqlite");
         let fingerprint = crate::message::body_fingerprint("hello body");
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
@@ -10604,16 +10566,12 @@ mod tests {
         assert_eq!(kept.labels, vec!["work".to_string()]);
         assert!(!kept.folders.iter().any(|folder| folder == "INBOX"));
         drop(store);
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn upgrade_joins_a_v2_pair_that_has_no_list_id() {
-        let path = std::env::temp_dir().join(format!(
-            "fell-schema-v2-{}-no-list.sqlite",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fell-schema-v2-no-list.sqlite");
         let fingerprint = crate::message::body_fingerprint("hello body");
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
@@ -10684,16 +10642,12 @@ mod tests {
         assert!(rows[0].folders.iter().any(|folder| folder == "Sent"));
         assert!(rows[0].folders.iter().any(|folder| folder == "INBOX"));
         drop(store);
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn upgrade_from_v2_queues_the_merged_row_for_its_parts() {
-        let path = std::env::temp_dir().join(format!(
-            "fell-schema-v2-{}-bodies.sqlite",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fell-schema-v2-bodies.sqlite");
         let fingerprint = crate::message::body_fingerprint("hello body");
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
@@ -10786,16 +10740,12 @@ mod tests {
         let store = Store::open(&path).unwrap();
         assert_eq!(store.missing_bodies(&account().id, 10).unwrap(), wanted);
         drop(store);
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn upgrade_keeps_two_sent_replies_that_share_a_short_body() {
-        let path = std::env::temp_dir().join(format!(
-            "fell-schema-v2-{}-thanks.sqlite",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fell-schema-v2-thanks.sqlite");
         let fingerprint = crate::message::body_fingerprint("Thanks!");
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
@@ -10870,7 +10820,6 @@ mod tests {
                 .any(|message| message.headers.subject == "Re: Q3 budget")
         );
         drop(store);
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -10937,15 +10886,8 @@ mod open_while_writing {
     /// instead of waiting, about one open in five.
     #[test]
     fn concurrent_opens_wait_instead_of_failing() {
-        let root = std::env::temp_dir().join(format!(
-            "fell-open-race-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
         let db = root.join("mail.db");
         let _held = super::Store::open(&db).unwrap();
         let workers: Vec<_> = (0..8)
@@ -10968,6 +10910,5 @@ mod open_while_writing {
             failures.len(),
             failures.first()
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 }

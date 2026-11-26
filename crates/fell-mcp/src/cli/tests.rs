@@ -2,8 +2,6 @@ use super::*;
 use fell_core::{Account, AccountId, BackendKind};
 use serde_json::{Value, json};
 use std::os::unix::fs::{PermissionsExt, symlink};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const NOW: i64 = 1_800_000_000;
 const EXE: &str = "/opt/fell/fell-mcp";
@@ -18,36 +16,6 @@ fn version_works_without_a_mailbox() {
     assert!(!ctx.store().exists());
 }
 
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new() -> Self {
-        static N: AtomicU64 = AtomicU64::new(0);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "fell-mcp-{}-{}-{}",
-            std::process::id(),
-            nanos,
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        Self(dir)
-    }
-
-    fn path(&self) -> &std::path::Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 fn account(id: &str) -> Account {
     Account {
         id: AccountId(id.into()),
@@ -59,7 +27,7 @@ fn account(id: &str) -> Account {
 
 /// A home folder and Fell's mailbox in it, with one account.
 struct Ctx {
-    dir: TempDir,
+    dir: tempfile::TempDir,
     appimage: Option<PathBuf>,
     name: &'static str,
     /// HOME unset (or relative, which `Env::from_process` also drops).
@@ -84,7 +52,7 @@ impl Ctx {
     }
 
     fn empty() -> Self {
-        let dir = TempDir::new();
+        let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("home")).unwrap();
         Self {
             dir,
@@ -890,7 +858,7 @@ fn inside_an_appimage_harnesses_start_the_appimage() {
 
 #[test]
 fn appimage_detection_rejects_symlinked_bundled_binary() {
-    let dir = TempDir::new();
+    let dir = tempfile::tempdir().unwrap();
     let appdir = dir.path().join("AppDir");
     let bin_dir = appdir.join("usr/bin");
     let running = dir.path().join("fell-mcp");
@@ -908,7 +876,7 @@ fn appimage_detection_rejects_symlinked_bundled_binary() {
 
 #[test]
 fn appimage_detection_rejects_symlinked_image() {
-    let dir = TempDir::new();
+    let dir = tempfile::tempdir().unwrap();
     let appdir = dir.path().join("AppDir");
     let bin_dir = appdir.join("usr/bin");
     let running = bin_dir.join("fell-mcp");
@@ -927,7 +895,7 @@ fn appimage_detection_rejects_symlinked_image() {
 
 #[test]
 fn appimage_detection_rejects_symlinked_parent_directories() {
-    let dir = TempDir::new();
+    let dir = tempfile::tempdir().unwrap();
     let appdir = dir.path().join("AppDir");
     let bin_dir = appdir.join("usr/bin");
     let running = bin_dir.join("fell-mcp");
@@ -1007,7 +975,7 @@ fn flags_are_checked() {
 
 #[test]
 fn grant_and_revoke_round_trip() {
-    let dir = TempDir::new();
+    let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("mail.sqlite");
     {
         let store = Store::open(&path).unwrap();
@@ -1063,7 +1031,7 @@ fn grant_requires_a_scope_and_a_known_account() {
     ])
     .unwrap_err();
     assert!(err.to_string().contains("at least one"));
-    let dir = TempDir::new();
+    let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("mail.sqlite");
     Store::open(&path).unwrap();
     let err = cli_main([

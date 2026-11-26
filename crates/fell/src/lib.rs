@@ -134,16 +134,9 @@ mod tests {
         .unwrap();
     }
 
-    fn real_session(name: &str) -> fell_core::compose::DraftSession {
-        let root = std::env::temp_dir().join(format!(
-            "fell-editor-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+    fn real_session(name: &str) -> (tempfile::TempDir, fell_core::compose::DraftSession) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
         let fields = fell_core::compose::DraftFields {
             from: "jon@example.com".into(),
             to: vec!["ada@example.com".into()],
@@ -151,7 +144,7 @@ mod tests {
             ..fell_core::compose::DraftFields::default()
         };
         let folder = fell_core::compose::materialize_in(
-            &root,
+            root,
             name,
             &fields,
             "body\n",
@@ -180,7 +173,7 @@ mod tests {
         session.bind_store(&db);
         session.flush().unwrap();
         session.mark_seen();
-        session
+        (temp, session)
     }
 
     fn mailbox_of(session: &fell_core::compose::DraftSession) -> std::path::PathBuf {
@@ -189,7 +182,7 @@ mod tests {
 
     #[test]
     fn a_real_account_without_an_account_file_has_no_backend() {
-        let session = real_session("real");
+        let (_temp, session) = real_session("real");
         let err = fell_core::backend_for(session.account_id(), None)
             .err()
             .expect("no credentials, no backend");
@@ -270,7 +263,7 @@ mod tests {
 
     #[test]
     fn a_second_send_after_success_does_not_transmit() {
-        let mut session = real_session("twice");
+        let (_temp, mut session) = real_session("twice");
         let backend = Counting::new(|| Ok(()));
         send_from_editor(&mut session, &backend).unwrap();
         let again = send_from_editor(&mut session, &backend).unwrap_err();
@@ -285,7 +278,7 @@ mod tests {
     #[test]
     fn a_direct_editor_send_queues_the_sent_copy_and_reports_a_failed_local_save() {
         for reject_local in [false, true] {
-            let mut session = real_session("editor-append");
+            let (_temp, mut session) = real_session("editor-append");
             let account = session.account_id().clone();
             let db = mailbox_of(&session);
             let store = fell_core::Store::open(&db).unwrap();
@@ -343,7 +336,7 @@ mod tests {
 
     #[test]
     fn a_failure_after_data_may_have_been_sent_and_locks_the_draft() {
-        let mut session = real_session("uncertain");
+        let (_temp, mut session) = real_session("uncertain");
         let backend = Counting::new(|| {
             Err(fell_core::Error::SendUncertain(
                 "smtp: read timed out".into(),
@@ -364,7 +357,7 @@ mod tests {
 
     #[test]
     fn a_failure_before_data_is_not_sent_and_can_be_retried() {
-        let mut session = real_session("retry");
+        let (_temp, mut session) = real_session("retry");
         let backend =
             Counting::new(|| Err(fell_core::Error::Backend("smtp: RCPT rejected".into())));
         let err = send_from_editor(&mut session, &backend).unwrap_err();
@@ -376,7 +369,7 @@ mod tests {
 
     #[test]
     fn a_claim_the_mailbox_cannot_record_blocks_the_send() {
-        let mut session = real_session("unrecorded");
+        let (_temp, mut session) = real_session("unrecorded");
         // The mailbox refuses the write, as a full or read-only disk would.
         rusqlite::Connection::open(mailbox_of(&session))
             .unwrap()
@@ -398,7 +391,7 @@ mod tests {
 
     #[test]
     fn a_press_while_a_send_is_in_flight_does_not_transmit() {
-        let mut session = real_session("inflight");
+        let (_temp, mut session) = real_session("inflight");
         let backend = Counting::new(|| Ok(()));
         let first = crate::compose_ui::prepare_from_editor(&mut session).unwrap();
         let second = send_from_editor(&mut session, &backend).unwrap_err();
@@ -412,8 +405,9 @@ mod tests {
 
     #[test]
     fn the_window_path_locks_the_draft_in_the_hub_after_a_send() {
+        let (_temp, session) = real_session("hub");
         let hub = fell_core::compose::DraftHub::new();
-        hub.insert(real_session("hub"));
+        hub.insert(session);
         let backend = Counting::new(|| Ok(()));
         for press in 0..2 {
             let prepared = hub
@@ -647,17 +641,15 @@ mod tests {
     }
 
     /// A draft with a Bcc, bound to a mailbox file the test can read.
-    fn bcc_session(name: &str) -> (fell_core::compose::DraftSession, fell_core::Store) {
-        let root = std::env::temp_dir().join(format!(
-            "fell-editor-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+    fn bcc_session(
+        name: &str,
+    ) -> (
+        tempfile::TempDir,
+        fell_core::compose::DraftSession,
+        fell_core::Store,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
         let db = root.join("mail.db");
         let store = fell_core::Store::open(&db).unwrap();
         store
@@ -693,7 +685,7 @@ mod tests {
         .unwrap();
         session.bind_store(&db);
         session.mark_seen();
-        (session, store)
+        (temp, session, store)
     }
 
     /// The copy the server files in Sent for `id`: no Bcc header.
@@ -739,7 +731,7 @@ mod tests {
 
     #[test]
     fn a_sent_message_keeps_its_bcc_for_the_sent_copy() {
-        let (mut session, store) = bcc_session("bcc-sent");
+        let (_temp, mut session, store) = bcc_session("bcc-sent");
         let backend = Counting::new(|| Ok(()));
         send_from_editor(&mut session, &backend).unwrap();
         let mime = String::from_utf8(backend.mime.lock().unwrap().clone()).unwrap();
@@ -753,7 +745,7 @@ mod tests {
 
     #[test]
     fn a_message_that_may_have_been_sent_keeps_its_bcc() {
-        let (mut session, store) = bcc_session("bcc-uncertain");
+        let (_temp, mut session, store) = bcc_session("bcc-uncertain");
         let backend = Counting::new(|| {
             Err(fell_core::Error::SendUncertain(
                 "smtp: read timed out".into(),
@@ -769,7 +761,7 @@ mod tests {
 
     #[test]
     fn a_message_that_was_not_sent_leaves_no_bcc_record() {
-        let (mut session, store) = bcc_session("bcc-refused");
+        let (_temp, mut session, store) = bcc_session("bcc-refused");
         let backend =
             Counting::new(|| Err(fell_core::Error::Backend("smtp: RCPT rejected".into())));
         send_from_editor(&mut session, &backend).unwrap_err();

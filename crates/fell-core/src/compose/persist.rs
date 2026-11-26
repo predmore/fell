@@ -1797,14 +1797,8 @@ mod tests {
                 reply: Default::default(),
             })
             .unwrap();
-        let folder = std::env::temp_dir().join(format!(
-            "fell-own-save-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("draft");
         std::fs::create_dir_all(&folder).unwrap();
         // Fell saved a new chart and its text; the mailbox row missed both.
         let text = "---\nfrom: jon@example.com\n---\n![chart](chart.png) ![logo](logo.png) v2\n";
@@ -1815,21 +1809,12 @@ mod tests {
         assert_eq!(std::fs::read(folder.join("chart.png")).unwrap(), b"new");
         // A file the folder lost still comes back from the row.
         assert_eq!(std::fs::read(folder.join("logo.png")).unwrap(), b"logo");
-        let _ = std::fs::remove_dir_all(&folder);
     }
 
     #[test]
     fn a_flushed_edit_restores_when_the_runtime_folder_is_gone() {
-        let dir = std::env::temp_dir().join(format!(
-            "fell-persist-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let drafts = dir.join("drafts");
         let db = dir.join("mail.db");
         let store = Store::open(&db).unwrap();
@@ -1878,15 +1863,8 @@ mod tests {
 
     #[test]
     fn another_account_or_agent_cannot_open_the_folder() {
-        let dir = std::env::temp_dir().join(format!(
-            "fell-owned-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let fields = DraftFields {
             from: "jon@example.com".into(),
             to: vec!["ada@example.com".into()],
@@ -1945,16 +1923,8 @@ mod tests {
 
     #[test]
     fn restore_does_not_follow_an_attachment_symlink() {
-        let dir = std::env::temp_dir().join(format!(
-            "fell-restore-link-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let db = dir.join("mail.db");
         let store = Store::open(&db).unwrap();
         let account = Account {

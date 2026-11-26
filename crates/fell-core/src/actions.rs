@@ -3775,12 +3775,8 @@ mod tests {
 
     #[test]
     fn reopening_cleans_up_legacy_purge_snapshots_and_suppresses_their_aliases() {
-        let folder = std::env::temp_dir().join(format!(
-            "fell-legacy-purge-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir(&folder).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().to_path_buf();
         let path = folder.join("mailbox.db");
         let store = Store::open(&path).unwrap();
         store
@@ -3833,7 +3829,6 @@ mod tests {
         assert!(!message_row_exists(store.connection(), &account("a1"), "alias@x").unwrap());
         assert_eq!(text(store.undo(&account("a1"))), "nothing to undo");
         drop(store);
-        std::fs::remove_dir_all(folder).unwrap();
     }
 
     #[test]

@@ -2368,14 +2368,8 @@ mod tests {
 
     #[test]
     fn an_existing_mailbox_is_indexed_once_on_open() {
-        let path = std::env::temp_dir().join(format!(
-            "fell-thread-index-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fell-thread-index.sqlite");
         {
             let store = Store::open(&path).unwrap();
             store.upsert_account(&account()).unwrap();
@@ -2420,9 +2414,6 @@ mod tests {
         let threads = threads_of(&store);
         assert_eq!(threads[0].1, threads[1].1, "{threads:?}");
         drop(store);
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-        }
     }
 
     #[test]
@@ -2517,14 +2508,8 @@ mod tests {
 
     #[test]
     fn a_current_mailbox_reopens_without_rebuilding_triggers() {
-        let path = std::env::temp_dir().join(format!(
-            "fell-thread-triggers-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fell-thread-triggers.sqlite");
         let trigger_sql = |store: &Store| -> String {
             store
                 .conn
@@ -2556,9 +2541,6 @@ mod tests {
         );
         drop(second);
         drop(first);
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-        }
     }
 
     fn mail(id: &str, subject: &str, from: &str, to: &str, date: i64) -> Message {

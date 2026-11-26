@@ -2995,8 +2995,8 @@ mod tests {
 
     #[test]
     fn a_committed_grant_change_blocks_writes_already_authorized_by_mcp() {
-        let root = std::env::temp_dir().join(format!("fell-agent-revoke-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
         let path = root.join("mail.db");
         let (mcp, account, thread) = seed(Store::open(&path).unwrap());
         let settings = Store::open(&path).unwrap();
@@ -3062,9 +3062,8 @@ mod tests {
 
     #[test]
     fn annotation_and_its_agent_undo_recheck_a_scope_changed_by_settings() {
-        let root =
-            std::env::temp_dir().join(format!("fell-annotation-revoke-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
         let path = root.join("mail.db");
         let (mcp, account, thread) = seed(Store::open(&path).unwrap());
         let settings = Store::open(&path).unwrap();

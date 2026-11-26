@@ -291,6 +291,8 @@ pub(crate) struct DraftHome {
     pub root: PathBuf,
     pub store: PathBuf,
     registry: Option<fell_core::accounts::Registry>,
+    #[cfg(test)]
+    _temp: Option<Arc<tempfile::TempDir>>,
 }
 
 impl DraftHome {
@@ -300,6 +302,8 @@ impl DraftHome {
             root: fell_core::compose::draft_root(),
             store,
             registry: fell_core::accounts::Registry::resolve().ok(),
+            #[cfg(test)]
+            _temp: None,
         }
     }
 
@@ -943,16 +947,11 @@ pub(crate) mod tests {
 
     /// A drafts root and a mailbox with `account` in it, under a fresh temp dir.
     pub(crate) fn temp_home(tag: &str, account: &fell_core::Account) -> DraftHome {
-        let root = std::env::temp_dir().join(format!(
-            "fell-inbox-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let temp = tempfile::Builder::new()
+            .prefix(&format!("fell-inbox-{tag}-"))
+            .tempdir()
+            .unwrap();
+        let root = temp.path();
         let store = root.join("mail.db");
         fell_core::Store::open(&store)
             .unwrap()
@@ -962,6 +961,7 @@ pub(crate) mod tests {
             root: root.join("drafts"),
             store,
             registry: None,
+            _temp: Some(Arc::new(temp)),
         }
     }
 

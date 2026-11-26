@@ -1143,14 +1143,8 @@ mod tests {
 
     #[test]
     fn the_watch_sees_a_rewritten_and_a_replaced_theme_folder() {
-        let root = std::env::temp_dir().join(format!(
-            "fell-theme-watch-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
         let theme = root.join("current/theme");
         fs::create_dir_all(&theme).unwrap();
         fs::write(theme.join("colors.toml"), "background = \"#000000\"\n").unwrap();
@@ -1194,7 +1188,6 @@ mod tests {
             "a reload's own reads woke the watcher"
         );
         drop(rx);
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

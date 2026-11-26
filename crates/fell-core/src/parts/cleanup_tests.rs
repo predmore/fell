@@ -3,8 +3,9 @@ use super::*;
 use crate::backend::{FolderRemoval, MailboxDelta, RemovalKind, Settle};
 use crate::{Account, BackendKind, Message};
 
-fn open_fixture(tag: &str) -> (PathBuf, PartCache, Store) {
-    let root = temp_root(tag);
+fn open_fixture(tag: &str) -> (tempfile::TempDir, PartCache, Store) {
+    let temp = temp_root(tag);
+    let root = temp.path();
     let cache = PartCache::open(root.join("parts"), DEFAULT_CACHE_BYTES).unwrap();
     let store = Store::open_for_part_fetch(&root.join("mail.db")).unwrap();
     for id in ["a1", "a2"] {
@@ -17,7 +18,7 @@ fn open_fixture(tag: &str) -> (PathBuf, PartCache, Store) {
             })
             .unwrap();
     }
-    (root, cache, store)
+    (temp, cache, store)
 }
 
 fn message(account: &str, id: &str, folder: &str, uid: u32) -> Message {
@@ -39,16 +40,17 @@ fn listed_parts(store: &Store, message: &Message) -> Vec<PartRequest> {
     list
 }
 
-pub(super) fn listed_fixture(tag: &str) -> (PathBuf, PartCache, Store, PartRequest) {
-    let (root, cache, store) = open_fixture(tag);
+pub(super) fn listed_fixture(tag: &str) -> (tempfile::TempDir, PartCache, Store, PartRequest) {
+    let (temp, cache, store) = open_fixture(tag);
     let target = message("a1", "part@x", "INBOX", 1);
     store.upsert_message(&target).unwrap();
     let part = listed_parts(&store, &target).remove(0);
-    (root, cache, store, part)
+    (temp, cache, store, part)
 }
 
 fn delete_and_sweep_during_download(role: PartRole) {
-    let (root, cache, store) = open_fixture("sweep-during-download");
+    let (temp, cache, store) = open_fixture("sweep-during-download");
+    let root = temp.path();
     let mut target = message("a1", "expunge@x", "Trash", 1);
     let part = &mut target.parts.as_mut().unwrap().mime_parts[0];
     part.role = role;
@@ -93,7 +95,6 @@ fn delete_and_sweep_during_download(role: PartRole) {
         "the stale download did not recreate the entry"
     );
     drop((fetch_store, store));
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -110,7 +111,7 @@ fn inline_prefetch_cannot_republish_after_delete_and_sweep() {
 fn a_cached_hit_remains_readable_after_delete_and_sweep() {
     use std::io::Read;
 
-    let (root, cache, store) = open_fixture("sweep-after-hit");
+    let (_temp, cache, store) = open_fixture("sweep-after-hit");
     let target = message("a1", "hit@x", "Trash", 1);
     let thread = store.upsert_message(&target).unwrap();
     let part = listed_parts(&store, &target).remove(0);
@@ -130,12 +131,11 @@ fn a_cached_hit_remains_readable_after_delete_and_sweep() {
     hit.file.read_to_end(&mut bytes).unwrap();
     assert_eq!(bytes, b"data");
     drop(store);
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn sync_settle_cleans_current_and_retired_sections_in_only_the_deleted_account() {
-    let (root, cache, store) = open_fixture("sync-cleanup");
+    let (_temp, cache, store) = open_fixture("sync-cleanup");
     let mut target = message("a1", "target@x", "INBOX", 1);
     let other_account = message("a2", "target@x", "INBOX", 1);
     let other_message = message("a1", "other@x", "INBOX", 2);
@@ -197,12 +197,11 @@ fn sync_settle_cleans_current_and_retired_sections_in_only_the_deleted_account()
         assert_eq!(fs::read(retained.path).unwrap(), b"data");
     }
     drop(store);
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn duplicate_merge_cleans_the_absorbed_rows_cache_and_keeps_the_canonical_rows_cache() {
-    let (root, cache, store) = open_fixture("merge-cleanup");
+    let (_temp, cache, store) = open_fixture("merge-cleanup");
     let mut keeper = message("a1", "keeper@x", "INBOX", 1);
     let mut duplicate = message("a1", "echo@x", "INBOX", 2);
     keeper.body_text = Some("A synthetic message body for the list echo. ".repeat(6));
@@ -229,12 +228,12 @@ fn duplicate_merge_cleans_the_absorbed_rows_cache_and_keeps_the_canonical_rows_c
     assert!(!removed.path.exists());
     assert_eq!(fs::read(retained.path).unwrap(), b"keep");
     drop(store);
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn a_rolled_back_delete_keeps_its_cache_and_a_committed_purge_retries_after_reopen() {
-    let (root, cache, store) = open_fixture("purge-cleanup");
+    let (temp, cache, store) = open_fixture("purge-cleanup");
+    let root = temp.path();
     let target = message("a1", "purge@x", "Trash", 1);
     let thread = store.upsert_message(&target).unwrap();
     let requests = listed_parts(&store, &target);
@@ -276,12 +275,12 @@ fn a_rolled_back_delete_keeps_its_cache_and_a_committed_purge_retries_after_reop
     assert!(!blocked.path.exists());
     reopened.clean_part_cache(&cache).unwrap();
     drop(reopened);
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn an_in_flight_fetch_publishes_after_an_html_rewrite() {
-    let (root, cache, store) = open_fixture("rewrite-during-fetch");
+    let (temp, cache, store) = open_fixture("rewrite-during-fetch");
+    let root = temp.path();
     let mut target = message("a1", "rewrite@x", "INBOX", 1);
     target.parts.as_mut().unwrap().html = Some("<p>Original</p>".into());
     store.upsert_message(&target).unwrap();
@@ -318,12 +317,12 @@ fn an_in_flight_fetch_publishes_after_an_html_rewrite() {
     assert_eq!(fs::read(&published.path).unwrap(), b"data");
     assert_eq!(cache.lookup(&part).unwrap().path, published.path);
     drop((worker, store));
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn undo_rejects_an_in_flight_fetch_from_a_reinserted_message() {
-    let (root, cache, store) = open_fixture("undo-after-reinsert");
+    let (temp, cache, store) = open_fixture("undo-after-reinsert");
+    let root = temp.path();
     let original = message("a1", "note@x", "Trash", 1);
     let account = &original.account_id;
     let message_id = &original.headers.message_id;
@@ -393,12 +392,12 @@ fn undo_rejects_an_in_flight_fetch_from_a_reinserted_message() {
     assert_eq!(error.to_string(), part_removed().to_string());
     assert!(cache.lookup(&restored_part).is_none());
     drop((worker, store));
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn an_in_flight_fetch_cannot_repopulate_the_cache_after_expunge_and_undo() {
-    let (root, cache, store) = open_fixture("cleanup-during-fetch");
+    let (temp, cache, store) = open_fixture("cleanup-during-fetch");
+    let root = temp.path();
     let mut target = message("a1", "expunge@x", "Trash", 1);
     for part in &mut target.parts.as_mut().unwrap().mime_parts {
         part.size = 5;
@@ -456,5 +455,4 @@ fn an_in_flight_fetch_cannot_repopulate_the_cache_after_expunge_and_undo() {
     assert!(cache.lookup(&parts[0]).is_none());
     assert_eq!(fs::read(new_hit.path).unwrap(), b"fresh");
     drop((worker, other_worker, store));
-    fs::remove_dir_all(root).unwrap();
 }

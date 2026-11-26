@@ -1762,15 +1762,8 @@ mod tests {
     fn opening_a_symlink_replays_its_wal() {
         let _reset = PauseReset;
         testing_start_indexer_paused(true);
-        let dir = std::env::temp_dir().join(format!(
-            "fell-embed-wal-alias-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         std::os::unix::fs::symlink("mail.sqlite", dir.join("alias.sqlite")).unwrap();
         let alias = dir.join("alias.sqlite");
         let hold = rusqlite::Connection::open(&alias).unwrap();
@@ -1803,7 +1796,6 @@ mod tests {
         );
         drop(store);
         drop(hold);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -1811,15 +1803,8 @@ mod tests {
     fn a_busy_symlink_uses_the_canonical_wal() {
         let _reset = PauseReset;
         testing_start_indexer_paused(true);
-        let dir = std::env::temp_dir().join(format!(
-            "fell-embed-alias-unpub-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         std::os::unix::fs::symlink("mail.sqlite", dir.join("alias.sqlite")).unwrap();
         let alias = dir.join("alias.sqlite");
         let hold = rusqlite::Connection::open(&alias).unwrap();
@@ -1850,7 +1835,6 @@ mod tests {
         );
         drop(store);
         drop(hold);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -1858,15 +1842,8 @@ mod tests {
     fn a_symlink_does_not_open_over_a_canonical_wal() {
         let _reset = PauseReset;
         testing_start_indexer_paused(true);
-        let dir = std::env::temp_dir().join(format!(
-            "fell-embed-canon-wal-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let real = dir.join("mail.sqlite");
         let held = rusqlite::Connection::open(&real).unwrap();
         held.pragma_update(None, "journal_mode", "WAL").unwrap();
@@ -1889,7 +1866,6 @@ mod tests {
         );
         drop(store);
         drop(held);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -1897,15 +1873,8 @@ mod tests {
     fn an_idle_symlink_opens_the_canonical_mailbox() {
         let _reset = PauseReset;
         testing_start_indexer_paused(true);
-        let dir = std::env::temp_dir().join(format!(
-            "fell-embed-wal-idle-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let real = dir.join("mail.sqlite");
         drop(Store::open(&real).unwrap());
         std::os::unix::fs::symlink("mail.sqlite", dir.join("alias.sqlite")).unwrap();
@@ -1915,7 +1884,6 @@ mod tests {
             Some(real.canonicalize().unwrap().as_path())
         );
         drop(store);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -1923,15 +1891,8 @@ mod tests {
     fn a_missing_shared_path_does_not_open_another_name() {
         let _reset = PauseReset;
         testing_start_indexer_paused(true);
-        let dir = std::env::temp_dir().join(format!(
-            "fell-embed-noxattr-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let real = dir.join("mail.sqlite");
         drop(Store::open(&real).unwrap());
         let alias = dir.join("alias.sqlite");
@@ -1959,7 +1920,6 @@ mod tests {
             "hard link opened without the shared path"
         );
         drop(first);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -1967,15 +1927,8 @@ mod tests {
     fn a_path_published_during_the_lock_gap_is_claimed_again() {
         let _reset = PauseReset;
         testing_start_indexer_paused(true);
-        let dir = std::env::temp_dir().join(format!(
-            "fell-embed-lock-gap-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let real = dir.join("mail.sqlite");
         drop(Store::open(&real).unwrap());
         let alias = dir.join("alias.sqlite");
@@ -1985,7 +1938,6 @@ mod tests {
         // The published path wins. This open must not replace it.
         assert_eq!(store.mailbox_path(), Some(alias.as_path()));
         drop(store);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -2027,15 +1979,8 @@ mod tests {
     fn a_hard_link_joins_the_open_mailbox() {
         let _reset = PauseReset;
         testing_start_indexer_paused(true);
-        let dir = std::env::temp_dir().join(format!(
-            "fell-embed-hard-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let path = dir.join("mail.sqlite");
         let first = Store::open(&path).unwrap();
         wait_until(|| first.embedding_indexer_running());
@@ -2047,22 +1992,14 @@ mod tests {
         assert_eq!(second.mailbox_path(), first.mailbox_path());
         drop(second);
         drop(first);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn drop_does_not_wait_out_the_busy_timeout() {
         let _reset = PauseReset;
         testing_start_indexer_paused(true);
-        let dir = std::env::temp_dir().join(format!(
-            "fell-embed-drop-busy-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let path = dir.join("mail.sqlite");
         let store = Store::open(&path).unwrap();
         wait_until(|| store.embedding_indexer_running());
@@ -2096,7 +2033,6 @@ mod tests {
             elapsed < std::time::Duration::from_secs(2),
             "drop waited {elapsed:?}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -2104,14 +2040,8 @@ mod tests {
     fn a_symlink_and_a_dotdot_path_share_the_embed_lock() {
         let _reset = PauseReset;
         testing_start_indexer_paused(true);
-        let dir = std::env::temp_dir().join(format!(
-            "fell-embed-alias-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         let path = dir.join("mail.sqlite");
         let first = Store::open(&path).unwrap();
@@ -2126,22 +2056,14 @@ mod tests {
         drop(first);
         drop(via_symlink);
         drop(via_dotdot);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_second_open_does_not_start_another_indexer() {
         let _reset = PauseReset;
         testing_start_indexer_paused(true);
-        let dir = std::env::temp_dir().join(format!(
-            "fell-embed-lock-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let path = dir.join("mail.sqlite");
         let first = Store::open(&path).unwrap();
         wait_until(|| first.embedding_indexer_running());
@@ -2167,22 +2089,14 @@ mod tests {
         assert!(!third.embedding_indexer_running());
         drop(second);
         drop(third);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn upsert_survives_a_concurrent_writer_on_wal() {
         let _reset = PauseReset;
         testing_start_indexer_paused(true);
-        let dir = std::env::temp_dir().join(format!(
-            "fell-embed-wal-write-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let path = dir.join("mail.sqlite");
         let store = Store::open(&path).unwrap();
         store.upsert_account(&account("a1")).unwrap();
@@ -2214,20 +2128,12 @@ mod tests {
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         writer.join().unwrap();
         drop(store);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn open_skips_the_indexer_when_the_lock_file_cannot_be_created() {
-        let dir = std::env::temp_dir().join(format!(
-            "fell-embed-bad-lock-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let path = dir.join("mail.sqlite");
         std::fs::create_dir(embed_lock_path(&path)).unwrap();
         let store = Store::open(&path).unwrap();
@@ -2240,7 +2146,6 @@ mod tests {
                 .is_empty()
         );
         drop(store);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2253,15 +2158,8 @@ mod tests {
         }
         let _reset = Reset;
         testing_abort_next_indexer(true);
-        let dir = std::env::temp_dir().join(format!(
-            "fell-embed-release-lock-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let path = dir.join("mail.sqlite");
         let store = Store::open(&path).unwrap();
         let lock_path = embed_lock_path(&path);
@@ -2283,22 +2181,14 @@ mod tests {
         }
         wait_until(|| !store.embedding_indexer_running());
         drop(store);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn writes_do_not_embed_and_reads_do_not_wait() {
         let _reset = PauseReset;
         testing_start_indexer_paused(true);
-        let dir = std::env::temp_dir().join(format!(
-            "fell-embed-pause-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let path = dir.join("mail.sqlite");
         let store = Store::open(&path).unwrap();
         store.upsert_account(&account("a1")).unwrap();
@@ -2320,7 +2210,6 @@ mod tests {
             embed_body("please pay the invoice")
         );
         drop(store);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2395,15 +2284,8 @@ mod tests {
 
     #[test]
     fn reopen_replaces_a_different_model_id() {
-        let dir = std::env::temp_dir().join(format!(
-            "fell-embed-model-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let path = dir.join("mail.sqlite");
         {
             let _reset = PauseReset;
@@ -2426,7 +2308,6 @@ mod tests {
         let store = Store::open(&path).unwrap();
         assert_eq!(wait_indexed(&store, "a1", "m@x"), embed_body("local body"));
         drop(store);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2749,17 +2630,11 @@ mod tests {
         (model, dir)
     }
 
-    fn temp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "fell-embed-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_dir(tag: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("fell-embed-{tag}-"))
+            .tempdir()
+            .unwrap()
     }
 
     #[test]
@@ -2809,7 +2684,8 @@ mod tests {
 
     #[test]
     fn a_model_switch_rewrites_one_batch_at_a_time() {
-        let dir = temp_dir("switch-batch");
+        let temp = temp_dir("switch-batch");
+        let dir = temp.path().to_path_buf();
         let (model, model_dir) = install_tiny(&dir.join("models"));
         let tiny = OnnxEmbedder::load(model, &model_dir).unwrap();
         let store = open(&["a1"]);
@@ -2853,14 +2729,14 @@ mod tests {
             stored(&store, "a1", "m0@x").values,
             tiny.embed("pay invoice 0").unwrap()
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn an_installed_model_rewrites_the_index_on_the_indexer_thread() {
         let _source = SourceReset;
         let _pause = PauseReset;
-        let dir = temp_dir("switch-thread");
+        let temp = temp_dir("switch-thread");
+        let dir = temp.path().to_path_buf();
         let path = dir.join("mail.sqlite");
         let count = INDEX_BATCH * 2 + 3;
         {
@@ -2910,12 +2786,12 @@ mod tests {
             embed_body("pay invoice 0")
         );
         drop(store);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn no_model_on_disk_keeps_the_placeholder_and_creates_nothing() {
-        let dir = temp_dir("no-model");
+        let temp = temp_dir("no-model");
+        let dir = temp.path().to_path_buf();
         let root = dir.join("models");
         let source = EmbedderSource {
             models_root: Some(root.clone()),
@@ -2935,12 +2811,12 @@ mod tests {
         assert_eq!(none.load().unwrap().id(), LocalHashV1.id());
         // Inside these tests the default never points at a real model.
         assert_eq!(EmbedderSource::from_env().models_root, None);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_tampered_model_file_keeps_the_placeholder() {
-        let dir = temp_dir("tampered");
+        let temp = temp_dir("tampered");
+        let dir = temp.path().to_path_buf();
         let root = dir.join("models");
         let (model, model_dir) = install_tiny(&root);
         let source = EmbedderSource {
@@ -2958,7 +2834,6 @@ mod tests {
             ModelError::Checksum { .. }
         ));
         assert_eq!(source.load().unwrap().id(), LocalHashV1.id());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Install `onnx` and `vocab` as a model whose pins match them, so the
@@ -2993,7 +2868,8 @@ mod tests {
 
     #[test]
     fn verified_files_that_do_not_load_are_unavailable_not_the_placeholder() {
-        let dir = temp_dir("unloadable");
+        let temp = temp_dir("unloadable");
+        let dir = temp.path().to_path_buf();
         let root = dir.join("models");
         let model = install_bytes(
             &root,
@@ -3029,14 +2905,14 @@ mod tests {
             load_local_embedder(model, Some(&root)),
             LocalEmbedder::Placeholder(ModelError::Size { .. })
         ));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_model_that_does_not_load_leaves_the_index_alone() {
         let _source = SourceReset;
         let _pause = PauseReset;
-        let dir = temp_dir("unloadable-thread");
+        let temp = temp_dir("unloadable-thread");
+        let dir = temp.path().to_path_buf();
         let path = dir.join("mail.sqlite");
         mailbox_indexed_by_double(&path, 5);
         let root = dir.join("models");
@@ -3057,7 +2933,6 @@ mod tests {
             "a load failure is not a switch to the placeholder"
         );
         drop(store);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3065,7 +2940,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let _source = SourceReset;
         let _pause = PauseReset;
-        let dir = temp_dir("retry-load");
+        let temp = temp_dir("retry-load");
+        let dir = temp.path().to_path_buf();
         let path = dir.join("mail.sqlite");
         mailbox_indexed_by_double(&path, 4);
         let root = dir.join("models");
@@ -3078,7 +2954,6 @@ mod tests {
             "a_model_that_fails_to_load_is_retried_without_reopening",
             readable.then(|| "this user can read a mode 0000 file (root?)".to_string()),
         ) {
-            let _ = std::fs::remove_dir_all(&dir);
             return;
         }
         assert!(matches!(
@@ -3105,7 +2980,6 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         drop(store);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Fails on any body that mentions "poison", and counts those calls.

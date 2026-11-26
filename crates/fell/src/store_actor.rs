@@ -434,22 +434,14 @@ mod tests {
 
     #[test]
     fn a_mailbox_file_starts_loading_search_when_it_opens() {
-        let dir = std::env::temp_dir().join(format!(
-            "fell-warm-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let opened = dir.join("mail.db");
         let (client, ready) = spawn(move || (Store::open(&opened).unwrap(), ()));
         futures::executor::block_on(ready).unwrap();
         let asked = client.call_maintenance(|store| store.testing_search_warm_asked());
         assert!(futures::executor::block_on(asked).unwrap());
         drop(client);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -549,15 +541,8 @@ mod tests {
 
     #[test]
     fn a_slow_search_does_not_hold_up_the_reader() {
-        let dir = std::env::temp_dir().join(format!(
-            "fell-lanes-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let path = dir.join("mail.db");
         let opened = path.clone();
         let (client, ready) = spawn(move || (Store::open(&opened).unwrap(), ()));
@@ -590,20 +575,12 @@ mod tests {
             0
         );
         drop(client);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_background_lane_ends_with_its_clients() {
-        let dir = std::env::temp_dir().join(format!(
-            "fell-lanes-end-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let path = dir.join("mail.db");
         let opened = path.clone();
         let (client, ready) = spawn(move || (Store::open(&opened).unwrap(), ()));
@@ -626,6 +603,5 @@ mod tests {
         // Only this handle is left, so dropping it closes the job channel
         // and the background thread's recv loop ends.
         assert_eq!(Arc::strong_count(&lane), 1);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

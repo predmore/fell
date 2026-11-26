@@ -60,12 +60,8 @@ fn simulate_v5(store: &Store) {
 
 #[test]
 fn a_headless_reader_repairs_cid_roles_and_derived_reads_only_once() {
-    let dir = std::env::temp_dir().join(format!(
-        "fell-cid-upgrade-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    std::fs::create_dir(&dir).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().to_path_buf();
     let path = dir.join("mail.db");
     let account = account();
     let cases = [
@@ -176,7 +172,6 @@ fn a_headless_reader_repairs_cid_roles_and_derived_reads_only_once() {
         assert!(store.missing_bodies(&account.id, 200).unwrap().is_empty());
         assert_eq!(cursor(&store.conn).unwrap(), None);
     }
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -426,12 +421,8 @@ fn a_merge_keeps_the_keeper_refresh_or_inherits_it_with_the_donated_list() {
 
 #[test]
 fn a_list_moved_behind_another_connections_cursor_is_still_repaired() {
-    let dir = std::env::temp_dir().join(format!(
-        "fell-cid-moved-list-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    std::fs::create_dir(&dir).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().to_path_buf();
     let path = dir.join("mail.db");
     let store = Store::open(&path).unwrap();
     let other = Store::open(&path).unwrap();
@@ -485,5 +476,4 @@ fn a_list_moved_behind_another_connections_cursor_is_still_repaired() {
     assert!(store.missing_bodies(&account.id, 10).unwrap().is_empty());
     drop(other);
     drop(store);
-    std::fs::remove_dir_all(dir).unwrap();
 }
