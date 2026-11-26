@@ -120,14 +120,18 @@ impl Fixture {
             config: config(server.addr.port()),
             smtp: unused_smtp(),
         };
-        sync_once(&account, &backend, &store).unwrap();
-        store.set_write_back(&account.id, true).unwrap();
-        Self {
+        let fixture = Self {
             server,
             account,
             backend,
             store,
-        }
+        };
+        let mut config = fixture.account_config();
+        config.name.clone_from(&fixture.account.display_name);
+        fixture.store.configure_connection(&config).unwrap();
+        crate::sync_connection_until(&config, &fixture.store, &mut |_| {}, None, &|| false)
+            .unwrap();
+        fixture
     }
 
     fn thread(&self, folder: &str, subject: &str) -> ThreadId {
@@ -443,6 +447,223 @@ fn archiving_a_withheld_message_rechecks_provisional_parts_and_can_save_them() {
 }
 
 #[test]
+fn reconnecting_with_a_different_greeting_keeps_the_cursor_and_writes() {
+    let fx = Fixture::new();
+    let config = fx.account_config();
+    let account = &fx.account.id;
+    let cursor = fx.store.sync_cursor(account).unwrap().unwrap();
+    fx.store
+        .archive_thread(account, &fx.thread("INBOX", "Alpha"), "INBOX")
+        .unwrap();
+    let queued = fx.store.outbox(account).unwrap();
+    let bytes_before = fx.server.sent.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        bytes_before > 0,
+        "the fixture includes this count in its greeting"
+    );
+    fx.clear_commands();
+    crate::sync_connection_until(&config, &fx.store, &mut |_| {}, None, &|| false).unwrap();
+    assert_eq!(
+        fx.store.sync_cursor(account).unwrap().unwrap().token,
+        cursor.token
+    );
+    assert_eq!(fx.store.outbox(account).unwrap(), queued);
+    assert_eq!(fx.store.held_write_count(account).unwrap(), 0);
+    assert!(
+        fx.commands()
+            .iter()
+            .all(|command| !command.contains("BODY.PEEK[]")),
+        "a new greeting must not trigger a full fetch"
+    );
+    assert_eq!(fx.replay_as_window().sent, 1);
+}
+
+#[test]
+fn endpoint_change_releases_resends_or_discards_held_moves() {
+    for action in ["restore", "resend", "discard", "reset"] {
+        let mut source = state();
+        if action == "restore" {
+            let raw = &mut source.mailboxes[0].messages[0].raw;
+            *raw = String::from_utf8_lossy(raw)
+                .split_inclusive('\n')
+                .filter(|line| !line.starts_with("Message-ID:"))
+                .collect::<String>()
+                .into_bytes();
+        }
+        let fx = Fixture::with(Store::open_in_memory().unwrap(), source);
+        let store = &fx.store;
+        let account = &fx.account.id;
+        let original = fx.account_config();
+        let next_server = TestServer::spawn(state_with(vec![
+            mailbox(
+                "INBOX",
+                "",
+                7,
+                &[(1, "Unrelated"), (91, "Alpha"), (92, "Bravo")],
+            ),
+            mailbox("Archive", "\\Archive", 30, &[]),
+        ]));
+        next_server.use_patient_reads();
+        next_server.writes.lock().unwrap().moves = true;
+        let next = crate::AccountConfig {
+            port: next_server.addr.port(),
+            ..original.clone()
+        };
+        let subject = fx.thread("INBOX", "Alpha");
+        store.archive_thread(account, &subject, "INBOX").unwrap();
+        let original_id = store.outbox(account).unwrap()[0].message_id.clone();
+        store.configure_connection(&next).unwrap();
+        let sync = |config| {
+            crate::sync_connection_until(config, store, &mut |_| {}, None, &|| false).unwrap()
+        };
+        sync(&next);
+        assert_eq!(store.held_write_count(account).unwrap(), 1);
+        assert_eq!(next.replay_outbox(store).unwrap().sent, 0);
+        assert_eq!(fx.subjects("Archive"), ["Alpha"]);
+        match action {
+            "discard" => {
+                assert_eq!(store.discard_held_writes(account).unwrap(), 1);
+                assert!(fx.subjects("Archive").is_empty());
+                assert!(fx.subjects("INBOX").contains(&"Alpha".into()));
+            }
+            "resend" => {
+                assert_eq!(next.resend_held_writes(store).unwrap(), 1);
+                assert_eq!(next.replay_outbox(store).unwrap().sent, 1);
+                let state = next_server.state.lock().unwrap();
+                assert_eq!(
+                    state.mailboxes[0]
+                        .messages
+                        .iter()
+                        .map(|message| message.uid)
+                        .collect::<Vec<_>>(),
+                    [1, 92]
+                );
+                assert_eq!(state.mailboxes[1].messages.len(), 1);
+            }
+            "restore" | "reset" => {
+                if action == "reset" {
+                    fx.server.state.lock().unwrap().mailboxes[0].uidvalidity += 1;
+                }
+                store.configure_connection(&original).unwrap();
+                assert_eq!(
+                    original.replay_outbox(store).unwrap().sent,
+                    usize::from(action == "restore")
+                );
+                assert_eq!(
+                    store.held_write_count(account).unwrap(),
+                    usize::from(action == "reset")
+                );
+                if action == "restore" {
+                    assert!(super::rfc822::is_synthetic_message_id(&original_id));
+                    let restored: String = store.connection().query_row(
+                        "SELECT message_id FROM message_copies WHERE account_id = ?1 AND folder = 'Archive'",
+                        [account.as_str()], |row| row.get(0),
+                    ).unwrap();
+                    assert_eq!(restored, original_id);
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn replay_logs_out_of_resume_session_when_pending_writes_are_in_backoff() {
+    let fx = Fixture::new();
+    let store = &fx.store;
+    let account = &fx.account.id;
+    let original = fx.account_config();
+    store
+        .archive_thread(account, &fx.thread("INBOX", "Alpha"), "INBOX")
+        .unwrap();
+    store
+        .configure_connection(&crate::AccountConfig {
+            port: 1,
+            ..original.clone()
+        })
+        .unwrap();
+    store.configure_connection(&original).unwrap();
+    crate::sync_connection_until(&original, store, &mut |_| {}, None, &|| false).unwrap();
+    store
+        .archive_thread(account, &fx.thread("INBOX", "Bravo"), "INBOX")
+        .unwrap();
+    store
+        .connection()
+        .execute(
+            "UPDATE server_outbox SET retry_unix = ?1 WHERE state = 'pending'",
+            [i64::MAX],
+        )
+        .unwrap();
+    fx.server.writes.lock().unwrap().refuse_select_mailbox = Some("INBOX".into());
+
+    fx.clear_commands();
+    for _ in 0..2 {
+        let report = fx.replay_as_window();
+        assert_eq!(report.waiting, 1);
+        assert_eq!(report.sent, 0);
+        assert!(report.interrupted.is_none());
+        assert_eq!(store.held_write_count(account).unwrap(), 1);
+    }
+    assert_eq!(
+        without_tags(&fx.writes()),
+        [
+            r#"SELECT "INBOX""#,
+            r#"SELECT "Archive""#,
+            r#"SELECT "INBOX""#,
+            r#"SELECT "Archive""#,
+        ]
+    );
+    let commands = without_tags(&fx.commands());
+    assert_eq!(commands.iter().filter(|line| *line == "LOGOUT").count(), 2);
+}
+
+#[test]
+fn resending_uses_the_listed_folder_and_the_current_archive_destination() {
+    let fx = Fixture::with(
+        Store::open_in_memory().unwrap(),
+        state_with(vec![
+            mailbox("INBOX", "", 7, &[(1, "Alpha"), (2, "Bravo")]),
+            mailbox("Old Archive", "\\Archive", 30, &[]),
+            mailbox("Junk", "\\Junk", 31, &[]),
+            mailbox("Spam", "", 32, &[]),
+        ]),
+    );
+    let account = &fx.account.id;
+    fx.store
+        .move_thread(account, &fx.thread("INBOX", "Alpha"), "INBOX", "Spam")
+        .unwrap();
+    fx.store
+        .archive_thread(account, &fx.thread("INBOX", "Bravo"), "INBOX")
+        .unwrap();
+    let next_server = TestServer::spawn(state_with(vec![
+        mailbox("INBOX", "", 40, &[(91, "Alpha"), (92, "Bravo")]),
+        mailbox("Everything", "\\All", 41, &[]),
+        mailbox("Junk", "\\Junk", 42, &[]),
+        mailbox("Spam", "", 43, &[]),
+    ]));
+    next_server.use_patient_reads();
+    next_server.writes.lock().unwrap().moves = true;
+    let (alpha, bravo) = {
+        let state = next_server.state.lock().unwrap();
+        let inbox = &state.mailboxes[0].messages;
+        (inbox[0].raw.clone(), inbox[1].raw.clone())
+    };
+    let next = crate::AccountConfig {
+        port: next_server.addr.port(),
+        ..fx.account_config()
+    };
+    fx.store.configure_connection(&next).unwrap();
+    assert_eq!(fx.store.held_write_count(account).unwrap(), 2);
+    assert_eq!(next.resend_held_writes(&fx.store).unwrap(), 2);
+    assert_eq!(next.replay_outbox(&fx.store).unwrap().sent, 2);
+    let state = next_server.state.lock().unwrap();
+    assert!(state.mailboxes[0].messages.is_empty());
+    assert_eq!(state.mailboxes[1].messages[0].raw, bravo);
+    assert!(state.mailboxes[2].messages.is_empty());
+    assert_eq!(state.mailboxes[3].messages[0].raw, alpha);
+}
+
+#[test]
 fn archive_moves_the_right_uid_and_undo_moves_it_back() {
     let fx = Fixture::new();
     let bravo = fx.thread("INBOX", "Bravo");
@@ -664,7 +885,7 @@ fn a_uidvalidity_change_drops_the_move() {
         inbox.messages[1].uid = 2;
     }
     fx.clear_commands();
-    let report = fx.replay();
+    let report = fx.replay_as_window();
     assert_eq!(report.sent, 0);
     assert_eq!(report.dropped.len(), 1);
     assert_eq!(report.dropped[0].reason, DropReason::FolderReset);
@@ -676,7 +897,7 @@ fn a_uidvalidity_change_drops_the_move() {
     // The local archive stays; nothing is sent again.
     assert_eq!(fx.subjects("Archive"), vec!["Alpha"]);
     fx.clear_commands();
-    assert_eq!(fx.replay(), Default::default());
+    assert_eq!(fx.replay_as_window(), Default::default());
     assert!(fx.commands().is_empty());
 }
 

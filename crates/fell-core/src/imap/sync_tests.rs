@@ -559,14 +559,21 @@ fn second_sync_fetches_only_new_uids() {
 #[test]
 fn uidvalidity_change_refetches_without_duplicating_message_ids() {
     let server = TestServer::spawn(sample_state());
-    let acct = account("a1", BackendKind::Imap);
-    let backend = ImapBackend {
-        account_id: acct.id.clone(),
-        config: config(server.addr.port()),
-        smtp: unused_smtp(),
-    };
+    let mut config = crate::AccountConfig::bridge(
+        "a@example.test",
+        "caleb",
+        crate::PasswordSource::Inline("secret".into()),
+    );
+    config.id = "a1".into();
+    config.backend = BackendKind::Imap;
+    config.port = server.addr.port();
+    config.security = ImapSecurity::Plain;
+    let acct = config.account();
     let store = Store::open_in_memory().unwrap();
-    sync_once(&acct, &backend, &store).unwrap();
+    store.configure_connection(&config).unwrap();
+    let sync =
+        || crate::sync_connection_until(&config, &store, &mut |_| {}, None, &|| false).unwrap();
+    sync();
     let before = store.list_threads(&acct.id).unwrap().len();
     {
         let mut state = server.state.lock().expect("state");
@@ -588,7 +595,7 @@ fn uidvalidity_change_refetches_without_duplicating_message_ids() {
     store
         .snooze_thread(&acct.id, &no_id_thread, 1_900_000_000, "test")
         .unwrap();
-    sync_once(&acct, &backend, &store).unwrap();
+    sync();
     let threads = store.list_threads(&acct.id).unwrap();
     // The message with no Message-ID is keyed by UIDVALIDITY: its new row
     // replaces the old one and takes over its local state. Messages that

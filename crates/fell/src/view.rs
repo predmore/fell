@@ -174,6 +174,44 @@ impl gpui::Global for ExternalCompose {}
 #[derive(Clone, Copy)]
 struct InboxWindow(gpui::AnyWindowHandle);
 
+pub(crate) fn account_replacement_started(
+    inbox: gpui::AnyWindowHandle,
+    old: &fell_core::AccountConfig,
+    cx: &mut App,
+) {
+    let _ = inbox.update(cx, |_, window, cx| {
+        if let Some(root) = window.root::<accounts::AccountWindow>().flatten() {
+            root.update(cx, |view, _| {
+                view.replacement = Some(accounts::Replacement {
+                    old_id: old.id.clone(),
+                    old_email: old.email.clone(),
+                    path: None,
+                });
+            });
+        }
+    });
+}
+
+pub(crate) fn account_replacement_finished(
+    inbox: gpui::AnyWindowHandle,
+    path: Option<std::path::PathBuf>,
+    cx: &mut App,
+) {
+    let _ = inbox.update(cx, |_, window, cx| {
+        if let Some(root) = window.root::<accounts::AccountWindow>().flatten() {
+            root.update(cx, |view, _| {
+                if let Some(path) = path {
+                    if let Some(replacement) = &mut view.replacement {
+                        replacement.path = Some(path);
+                    }
+                } else {
+                    view.replacement = None;
+                }
+            });
+        }
+    });
+}
+
 impl gpui::Global for InboxWindow {}
 
 impl InboxWindow {
@@ -855,6 +893,7 @@ struct Inbox {
     merge_feedback_at: Option<Instant>,
     /// Background sync for the account file. `None` for the demo mailbox.
     sync: Option<SyncHandle>,
+    held_changes: usize,
     retired: bool,
     compose_ready: futures::future::Shared<futures::channel::oneshot::Receiver<()>>,
     account_arrival: Option<Transition>,
@@ -1098,6 +1137,7 @@ impl Inbox {
             regroup_selection: None,
             merge_feedback_at: None,
             sync: None,
+            held_changes: 0,
             retired: false,
             compose_ready: futures::FutureExt::shared(compose_ready),
             account_arrival: None,
@@ -1423,6 +1463,49 @@ impl Inbox {
                     .update(cx, |inbox, cx| {
                         let kind = match event {
                             SyncEvent::Status(kind) => kind,
+                            SyncEvent::HeldChanges(count) => {
+                                if count > inbox.held_changes {
+                                    inbox.session.show_toast(
+                                        format!(
+                                            "{} · Settings → Accounts",
+                                            accounts::held_changes_label(count)
+                                        ),
+                                        true,
+                                    );
+                                }
+                                inbox.held_changes = count;
+                                cx.notify();
+                                return;
+                            }
+                            SyncEvent::HeldAction { result, resend } => {
+                                let (text, error) = match (result, resend) {
+                                    (Ok(0), true) => {
+                                        ("No matching messages found for resend".into(), true)
+                                    }
+                                    (Ok(1), true) => ("1 change queued to resend".into(), false),
+                                    (Ok(count), true) => {
+                                        (format!("{count} changes queued to resend"), false)
+                                    }
+                                    (Ok(1), false) => ("Discarded 1 unsynced change".into(), false),
+                                    (Ok(count), false) => {
+                                        (format!("Discarded {count} unsynced changes"), false)
+                                    }
+                                    (Err(error), _) => (
+                                        format!("Couldn't update unsynced changes · {error}"),
+                                        true,
+                                    ),
+                                };
+                                inbox.session.show_toast(text, error);
+                                inbox.request_threads(
+                                    ReadIntent {
+                                        refresh_open: true,
+                                        ..ReadIntent::default()
+                                    },
+                                    cx,
+                                );
+                                cx.notify();
+                                return;
+                            }
                             SyncEvent::Worker(event) => {
                                 inbox.apply_worker_event(event, cx);
                                 return;

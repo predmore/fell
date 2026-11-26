@@ -954,6 +954,23 @@ pub(crate) fn restore_move_source(
     uidvalidity: u32,
     uid: u32,
 ) -> Result<bool> {
+    restore_move_membership(conn, account, entry, Some((mailbox, uidvalidity, uid)))
+}
+
+pub(crate) fn discard_held_move(
+    conn: &Connection,
+    account: &AccountId,
+    entry: &crate::outbox::OutboxEntry,
+) -> Result<bool> {
+    restore_move_membership(conn, account, entry, None)
+}
+
+fn restore_move_membership(
+    conn: &Connection,
+    account: &AccountId,
+    entry: &crate::outbox::OutboxEntry,
+    verified: Option<(&str, u32, u32)>,
+) -> Result<bool> {
     let id = MessageId(entry.message_id.clone());
     let Some((stored, _)) = find_stored(conn, account, &id)? else {
         return Ok(false);
@@ -979,17 +996,19 @@ pub(crate) fn restore_move_source(
     {
         return Ok(false);
     }
-    link(
-        conn,
-        account,
-        &crate::imap::RemoteCopy {
-            mailbox: crate::imap::escape_mailbox(mailbox),
-            folder: source.clone(),
-            uidvalidity,
-            uid,
-        },
-        &id,
-    )?;
+    if let Some((mailbox, uidvalidity, uid)) = verified {
+        link(
+            conn,
+            account,
+            &crate::imap::RemoteCopy {
+                mailbox: crate::imap::escape_mailbox(mailbox),
+                folder: source.clone(),
+                uidvalidity,
+                uid,
+            },
+            &id,
+        )?;
+    }
     let target = &entry.target_folder;
     let has_target = conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM message_copies
@@ -1003,11 +1022,33 @@ pub(crate) fn restore_move_source(
     if !has_target {
         folders.retain(|folder| !folder.eq_ignore_ascii_case(target));
     }
-    if !folders
-        .iter()
-        .any(|folder| folder.eq_ignore_ascii_case(source))
-    {
-        folders.push(source.clone());
+    let mut live = conn.prepare_cached(
+        "SELECT DISTINCT c.folder FROM message_copies c LEFT JOIN mailbox_views v
+           ON v.account_id = c.account_id AND v.mailbox = c.mailbox
+         WHERE c.account_id = ?1 AND c.message_id = ?2 AND v.mailbox IS NULL",
+    )?;
+    let live = if verified.is_none() {
+        live.query_map(params![account.as_str(), stored.canonical_id], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+    let replacements = if live.is_empty() {
+        std::slice::from_ref(source)
+    } else {
+        &live
+    };
+    let tombstones = crate::actions::tombstoned_folders(conn, account, &stored.canonical_id)?;
+    for folder in replacements {
+        if !folders
+            .iter()
+            .chain(&tombstones)
+            .any(|current| current.eq_ignore_ascii_case(folder))
+        {
+            folders.push(folder.clone());
+        }
     }
     write_folders(conn, account, &stored, &folders)?;
     Ok(true)
@@ -1052,7 +1093,7 @@ fn moving_into(
     let hit: Option<i64> = conn
         .query_row(
             "SELECT 1 FROM server_outbox
-             WHERE account_id = ?1 AND message_id = ?2 AND kind = 'move' AND state = 'pending'
+             WHERE account_id = ?1 AND message_id = ?2 AND kind = 'move' AND state IN ('pending', 'held')
                AND target_folder = ?3 COLLATE NOCASE
              LIMIT 1",
             params![account_id.as_str(), message_id, folder],
@@ -1062,7 +1103,7 @@ fn moving_into(
     Ok(hit.is_some())
 }
 
-pub(super) fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
+pub(crate) fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
     let hit: Option<i64> = conn
         .prepare_cached("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")?
         .query_row(params![name], |row| row.get(0))

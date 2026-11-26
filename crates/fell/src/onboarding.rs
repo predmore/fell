@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
+use fell_core::accounts::FileIdentity;
 use fell_core::credentials::SecretService;
 use fell_core::onboarding::{ConnectionReport, check_connection};
 use fell_core::{AccountConfig, BackendKind, SyncFailureKind, classify_sync_error};
@@ -17,7 +18,7 @@ use gpui::{Context, FocusHandle, KeyDownEvent, Window};
 
 use crate::mailbox;
 use crate::motion::{self, LayerSwap, Motion};
-use crate::setup::save_account;
+use crate::setup::{connection_check_config, save_account};
 use crate::theme::{self, Theme};
 
 use self::form::{Check, Field, Form, Provider, Service, Step, Storage};
@@ -55,6 +56,7 @@ struct FinishedCheck {
     config: AccountConfig,
     result: fell_core::Result<ConnectionReport>,
     retained_mailbox: Option<String>,
+    queued: Option<(usize, usize)>,
 }
 
 pub(crate) struct Onboarding {
@@ -73,6 +75,13 @@ pub(crate) struct Onboarding {
     checked: Option<FinishedCheck>,
     return_to_inbox: Option<gpui::AnyWindowHandle>,
     reconnect: bool,
+    expected: Option<FileIdentity>,
+}
+
+pub(crate) enum SetupTarget {
+    New,
+    Edit(AccountConfig, FileIdentity, (usize, usize)),
+    Reconnect(AccountConfig),
 }
 
 impl Onboarding {
@@ -89,10 +98,24 @@ impl Onboarding {
 
     pub(crate) fn from_inbox(
         inbox: gpui::AnyWindowHandle,
+        target: SetupTarget,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut view = Self::new(window, cx);
+        match target {
+            SetupTarget::New => {}
+            SetupTarget::Edit(config, identity, queued) => {
+                view.form = Form::editing(config);
+                view.form.queued_changes = queued;
+                view.expected = Some(identity);
+                view.select(Control::Field(Field::Username));
+            }
+            SetupTarget::Reconnect(config) => {
+                view.form = Form::reconnecting(config);
+                view.select(Control::Field(Field::Password));
+            }
+        }
         view.return_to_inbox = Some(inbox);
         view
     }
@@ -127,6 +150,7 @@ impl Onboarding {
             checked: None,
             return_to_inbox: None,
             reconnect: false,
+            expected: None,
         }
     }
 
@@ -215,6 +239,7 @@ impl Onboarding {
                 })
                 .chain([Next, Back])
                 .collect(),
+            Step::Connection if self.form.failed_check => vec![Back, Next],
             Step::Connection if self.form.can_retry() => vec![Next, Back, Control::Install],
             Step::Connection if self.form.checks == [Check::Failed; 2] => vec![Back],
             Step::Connection => vec![Next, Back],
@@ -222,7 +247,8 @@ impl Onboarding {
                 Storage::Saving { .. } => vec![Next],
                 _ if self.form.storage.must_reopen() => vec![Next],
                 Storage::ConfirmInline(_) => vec![Back, Next],
-                _ if self.form.storage.inline_available() => vec![Next, Inline, Back],
+                _ if self.form.inline_available() => vec![Back, Inline, Next],
+                Storage::Keyring if self.form.reconnect_to.is_some() => vec![Back, Next],
                 Storage::Keyring if self.form.retained_mailbox.is_some() => {
                     vec![Control::Reconnect, Next, Back]
                 }
@@ -255,6 +281,14 @@ impl Onboarding {
 
     fn back(&mut self, cx: &mut Context<Self>) {
         let before = self.form.step;
+        if before == Step::Connection
+            && self.form.failed_check
+            && let Some(issue) = self.form.issues.first()
+        {
+            self.form.step = issue.field.step();
+            self.change_step(before, Control::Field(issue.field), cx);
+            return;
+        }
         let confirming = matches!(self.form.storage, Storage::ConfirmInline(_));
         self.form.back();
         let control = match (before, self.form.step) {
@@ -300,11 +334,17 @@ impl Onboarding {
                     }
                 }
                 Step::Identity | Step::Servers => self.check(window, cx),
-                Step::Connection if self.form.can_retry() => self.check(window, cx),
-                Step::Connection if self.form.connected() => {
+                Step::Connection if self.form.can_retry() && !self.form.failed_check => {
+                    self.check(window, cx)
+                }
+                Step::Connection if self.form.connected() || self.form.failed_check => {
                     self.form.done();
                     self.feedback.begin_save();
-                    let control = if self.form.retained_mailbox.is_some() {
+                    let control = if self.form.replacement() || self.form.failed_check {
+                        Control::Back
+                    } else if self.form.retained_mailbox.is_some()
+                        && self.form.reconnect_to.is_none()
+                    {
                         Control::Reconnect
                     } else {
                         Control::Next
@@ -320,8 +360,14 @@ impl Onboarding {
                 }
                 _ => {}
             },
+            Control::Back
+                if before == Step::Identity
+                    && (self.form.previous.is_some() || self.form.reconnect_to.is_some()) =>
+            {
+                window.remove_window();
+            }
             Control::Back => self.back(cx),
-            Control::Inline if self.form.storage.inline_available() => {
+            Control::Inline if self.form.inline_available() => {
                 self.form.storage.confirm_inline();
                 self.select(Control::Back);
                 cx.notify();
@@ -374,17 +420,30 @@ impl Onboarding {
         }
         self.change_step(before, Control::Next, cx);
         let attempt = self.form.attempt;
+        let previous = self.form.previous.clone();
         let (progress, mut events) = mpsc::unbounded();
         let work = cx.background_executor().spawn(async move {
-            let result = check_connection(&config, |event| {
-                let _ = progress.unbounded_send(Check::update(event));
-            });
-            let retained_mailbox = result
+            let result = connection_check_config(&config, previous.as_ref(), &SecretService)
+                .and_then(|checked| {
+                    check_connection(&checked, |event| {
+                        let _ = progress.unbounded_send(Check::update(event));
+                    })
+                });
+            let retained_mailbox = previous
+                .is_none()
+                .then(|| {
+                    result
+                        .as_ref()
+                        .ok()
+                        .filter(|report| report.errors().next().is_none())
+                        .and_then(|_| mailbox::retained_mailbox(&config))
+                })
+                .flatten();
+            let queued = previous
                 .as_ref()
-                .ok()
-                .filter(|report| report.errors().next().is_none())
-                .and_then(|_| mailbox::retained_mailbox(&config.email));
-            (config, result, retained_mailbox)
+                .filter(|old| old.same_mailbox(&config) && !old.same_imap_endpoint(&config))
+                .map(mailbox::queued_connection_changes);
+            (config, result, retained_mailbox, queued)
         });
         cx.spawn_in(window, async move |this, cx| {
             while let Some((service, status)) = events.next().await {
@@ -395,7 +454,7 @@ impl Onboarding {
                     }
                 });
             }
-            let (config, result, retained_mailbox) = work.await;
+            let (config, result, retained_mailbox, queued) = work.await;
             let _ = this.update(cx, |view, cx| {
                 if !view.form.accepts_check(attempt) {
                     return;
@@ -411,8 +470,10 @@ impl Onboarding {
                     config,
                     result,
                     retained_mailbox,
+                    queued,
                 };
-                if returning_to_fields
+                if view.form.previous.is_none()
+                    && returning_to_fields
                     && (view.motion.enabled() || view.form.checks == [Check::Failed; 2])
                 {
                     // Paint both final sign-in results before the test page
@@ -430,10 +491,22 @@ impl Onboarding {
     fn finish_check(&mut self, check: FinishedCheck, cx: &mut Context<Self>) {
         if self.form.accepts_check(check.attempt) {
             self.form.retained_mailbox = check.retained_mailbox;
+            if let Some(queued) = check.queued {
+                self.form.queued_changes = queued;
+            }
             let control = self
                 .form
                 .finish_check(check.attempt, &check.config, check.result)
-                .map_or(Control::Next, Control::Field);
+                .map_or_else(
+                    || {
+                        if self.form.failed_check {
+                            Control::Back
+                        } else {
+                            Control::Next
+                        }
+                    },
+                    Control::Field,
+                );
             self.change_step(Step::Connection, control, cx);
         }
     }
@@ -447,40 +520,73 @@ impl Onboarding {
         let reconnect = self
             .reconnect
             .then(|| self.form.retained_mailbox.clone())
-            .flatten();
+            .flatten()
+            .or_else(|| {
+                self.form
+                    .reconnect_to
+                    .as_ref()
+                    .map(|config| config.id.clone())
+            });
+        let previous = self.form.previous.clone();
+        let expected = self.expected;
+        let replacing = self
+            .return_to_inbox
+            .zip(previous.as_ref())
+            .filter(|(_, old)| !old.same_mailbox(&config));
+        if let Some((inbox, old)) = replacing {
+            crate::view::account_replacement_started(inbox, old, cx);
+        }
+        let replacing = replacing.map(|(inbox, _)| inbox);
         let work = cx.background_executor().spawn(async move {
-            let reusing = reconnect.is_some();
-            config.id = reconnect
-                .map_or_else(mailbox::next_account_id, Ok)
-                .map_err(|error| crate::setup::SaveAccountError::File(error.into()))?;
-            save_account(config, inline, &SecretService, |config| {
-                let save = if reusing {
-                    mailbox::AccountSave::Reconnect
+            let save = if let Some(previous) = &previous {
+                if previous.same_mailbox(&config) {
+                    mailbox::AccountSave::Update
                 } else {
-                    mailbox::AccountSave::New
-                };
-                mailbox::stage_account_config(config, save)
-            })
+                    mailbox::AccountSave::ReplaceMailbox
+                }
+            } else if let Some(id) = reconnect {
+                config.id = id;
+                mailbox::AccountSave::Reconnect
+            } else {
+                config.id = mailbox::next_account_id()
+                    .map_err(|error| crate::setup::SaveAccountError::File(error.into()))?;
+                mailbox::AccountSave::New
+            };
+            save_account(
+                config,
+                inline,
+                previous.as_ref(),
+                &SecretService,
+                |config| mailbox::stage_connection_config(config, save, expected),
+            )
         });
-        cx.spawn_in(window, async move |this, cx| {
+        let setup_window = window.window_handle();
+        cx.spawn(async move |this, cx| {
             let result = work.await;
-            let _ = this.update_in(cx, |view, window, cx| match result {
-                Ok(_) => {
-                    let setup = cx.entity();
-                    let previous = view.return_to_inbox.take();
-                    window.defer(cx, move |window, cx| {
-                        if let Some(previous) = previous {
-                            let _ = previous.update(cx, |_, window, _| window.activate_window());
-                            window.remove_window();
-                        } else {
-                            crate::view::finish_onboarding(setup, window, cx);
-                        }
-                    });
-                }
-                Err(error) => {
-                    view.form.storage = Storage::Failed(error);
-                    cx.notify();
-                }
+            if let Some(inbox) = replacing {
+                let path = result.as_ref().ok().cloned();
+                let _ = cx.update(|cx| crate::view::account_replacement_finished(inbox, path, cx));
+            }
+            let _ = setup_window.update(cx, |_, window, cx| {
+                let _ = this.update(cx, |view, cx| match result {
+                    Ok(_) => {
+                        let setup = cx.entity();
+                        let previous = view.return_to_inbox.take();
+                        window.defer(cx, move |window, cx| {
+                            if let Some(previous) = previous {
+                                let _ =
+                                    previous.update(cx, |_, window, _| window.activate_window());
+                                window.remove_window();
+                            } else {
+                                crate::view::finish_onboarding(setup, window, cx);
+                            }
+                        });
+                    }
+                    Err(error) => {
+                        view.form.storage = Storage::Failed(error);
+                        cx.notify();
+                    }
+                });
             });
         })
         .detach();
@@ -516,6 +622,12 @@ impl Onboarding {
                 cx.notify();
             }
             "escape" if self.form.step == Step::Provider && self.return_to_inbox.is_some() => {
+                window.remove_window();
+            }
+            "escape"
+                if self.form.step == Step::Identity
+                    && (self.form.previous.is_some() || self.form.reconnect_to.is_some()) =>
+            {
                 window.remove_window();
             }
             "escape" => self.back(cx),

@@ -153,6 +153,11 @@ mod tests {
                 .insert(key.into(), password.into());
             Ok(())
         }
+
+        fn remove(&self, key: &str) -> std::result::Result<(), KeyringError> {
+            self.passwords.borrow_mut().remove(key);
+            Ok(())
+        }
     }
 
     const EXAMPLE_PASSWORD: &str = "sample-password";

@@ -19,6 +19,7 @@ pub enum KeyringError {
 pub trait PasswordStore {
     fn read(&self, key: &str) -> Result<String, KeyringError>;
     fn store(&self, key: &str, password: &str) -> Result<(), KeyringError>;
+    fn remove(&self, key: &str) -> Result<(), KeyringError>;
 }
 
 /// The default collection of the desktop Secret Service on the session bus.
@@ -76,6 +77,22 @@ mod desktop {
                 .await?;
                 Ok(())
             })
+        }
+
+        fn remove(&self, key: &str) -> Result<(), KeyringError> {
+            async_io::block_on(with_deadline(REQUEST_TIMEOUT, async {
+                let service = Service::new().await?;
+                let Some(collection) = service.with_alias(Service::DEFAULT_COLLECTION).await?
+                else {
+                    return Ok(());
+                };
+                let items = collection.search_items(&attributes(key)).await?;
+                match items.as_slice() {
+                    [] => Ok(()),
+                    [item] => Ok(item.delete(None).await?),
+                    _ => Err(KeyringError::Ambiguous),
+                }
+            }))
         }
     }
 
@@ -172,6 +189,10 @@ impl PasswordStore for SecretService {
     }
 
     fn store(&self, _: &str, _: &str) -> Result<(), KeyringError> {
+        Err(KeyringError::Unavailable { timed_out: false })
+    }
+
+    fn remove(&self, _: &str) -> Result<(), KeyringError> {
         Err(KeyringError::Unavailable { timed_out: false })
     }
 }

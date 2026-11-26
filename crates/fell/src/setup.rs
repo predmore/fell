@@ -14,7 +14,7 @@ use fell_core::{AccountConfig, BackendKind, ImapSecurity, PasswordSource};
 
 use crate::mailbox::{
     AccountFileError, AccountSave, StagedAccountConfig, can_reconnect, load_account_file,
-    next_account_id, stage_account_config,
+    next_account_id, stage_connection_config,
 };
 
 const USAGE: &str = "\
@@ -28,7 +28,7 @@ setup options (anything missing is asked for on a terminal):
   Entered passwords are saved in the desktop keyring by default.
   --imap                       a plain IMAP account instead of Proton Mail Bridge
   --email ADDRESS              the address you send as
-  --replace                    with --id, keep the old mail and use a new ID for a different address
+  --replace                    with --id, keep the old mail and use a new ID for a different mailbox
   --name NAME                  display name
   --username USER              IMAP username (Bridge shows it under the account's mailbox details)
   --password-stdin             read the password from the first line of stdin
@@ -45,28 +45,7 @@ setup options (anything missing is asked for on a terminal):
 
 /// Run `fell account ...`. Returns the process exit code.
 pub fn account_command(args: &[String]) -> i32 {
-    let result = match args.first().map(String::as_str) {
-        Some("setup") => setup(&args[1..]),
-        Some("list") if args.len() == 1 => list(),
-        Some("remove") if args.len() == 2 => remove(&args[1]),
-        Some(cmd @ ("show" | "check")) => match &args[1..] {
-            [help] if matches!(help.as_str(), "--help" | "-h") => {
-                println!("{USAGE}");
-                Ok(())
-            }
-            [] if cmd == "show" => show(None),
-            [] => check(None),
-            [flag, id] if flag == "--id" && cmd == "show" => show(Some(id)),
-            [flag, id] if flag == "--id" => check(Some(id)),
-            _ => Err(format!("Expected {cmd} [--id ID]\n\n{USAGE}")),
-        },
-        Some("--help" | "-h" | "help") | None => {
-            println!("{USAGE}");
-            Ok(())
-        }
-        Some(other) => Err(format!("unknown account command {other:?}\n\n{USAGE}")),
-    };
-    match result {
+    match run_account_command(args) {
         Ok(()) => 0,
         Err(err) => {
             fell_core::diagnostic!(WARN, "Account command failed");
@@ -75,6 +54,59 @@ pub fn account_command(args: &[String]) -> i32 {
             // top-level parser. Anything else (a failed login) exits 1.
             if err.ends_with(USAGE) { 2 } else { 1 }
         }
+    }
+}
+
+fn run_account_command(args: &[String]) -> Result<(), String> {
+    let usage = || {
+        println!("{USAGE}");
+        Ok(())
+    };
+    let recover = || {
+        if let Ok(registry) = Registry::resolve() {
+            crate::credential_recovery::recover(&registry)?;
+        }
+        Ok::<_, String>(())
+    };
+    let validate_account_id =
+        |id: &str| validate_id(id).map_err(|_| format!("Invalid account ID {id:?}"));
+    match args.first().map(String::as_str) {
+        Some("setup") => {
+            let flags = parse_flags(&args[1..])?;
+            if flags.help {
+                return usage();
+            }
+            if let Some(id) = &flags.id {
+                validate_id(id).map_err(|err| format!("{id:?}: {err}"))?;
+            }
+            recover()?;
+            setup(flags)
+        }
+        Some("list") if args.len() == 1 => {
+            recover()?;
+            list()
+        }
+        Some("remove") if args.len() == 2 => {
+            let id = &args[1];
+            validate_account_id(id)?;
+            recover()?;
+            remove(id)
+        }
+        Some(cmd @ ("show" | "check")) => {
+            let id = match &args[1..] {
+                [help] if matches!(help.as_str(), "--help" | "-h") => return usage(),
+                [] => None,
+                [flag, id] if flag == "--id" => {
+                    validate_account_id(id)?;
+                    Some(id.as_str())
+                }
+                _ => return Err(format!("Expected {cmd} [--id ID]\n\n{USAGE}")),
+            };
+            recover()?;
+            if cmd == "show" { show(id) } else { check(id) }
+        }
+        Some("--help" | "-h" | "help") | None => usage(),
+        Some(other) => Err(format!("unknown account command {other:?}\n\n{USAGE}")),
     }
 }
 
@@ -213,25 +245,27 @@ fn choose_smtp(
     Ok(())
 }
 
-fn setup(args: &[String]) -> Result<(), String> {
-    let flags = parse_flags(args)?;
-    if flags.help {
-        println!("{USAGE}");
-        return Ok(());
-    }
+fn setup(flags: Flags) -> Result<(), String> {
     let named = flags.id.is_some();
     let id = match flags.id {
-        Some(id) => {
-            validate_id(&id).map_err(|err| format!("{id:?}: {err}"))?;
-            id
-        }
+        Some(id) => id,
         None => next_account_id()?,
     };
     let tty = io::stdin().is_terminal() && !flags.password_stdin;
+    let (previous, expected) = if named {
+        Registry::resolve()
+            .and_then(|registry| registry.get_with_identity(&fell_core::AccountId(id.clone())))
+            .map_err(|err| err.to_string())?
+    } else {
+        None
+    }
+    .unzip();
     let backend = if flags.imap {
         BackendKind::Imap
     } else {
-        BackendKind::Bridge
+        previous
+            .as_ref()
+            .map_or(BackendKind::Bridge, |old| old.backend)
     };
     if tty && backend == BackendKind::Bridge {
         println!(
@@ -242,56 +276,92 @@ fn setup(args: &[String]) -> Result<(), String> {
 
     let email = match flags.email {
         Some(email) => email,
-        None if tty => prompt("Email address", None)?,
+        None if tty => prompt(
+            "Email address",
+            previous.as_ref().map(|old| old.email.as_str()),
+        )?,
+        None if previous.is_some() => previous.as_ref().unwrap().email.clone(),
         None => return Err("--email is required".into()),
     };
     let name = match flags.name {
         Some(name) => name,
-        None if tty => prompt("Display name (optional)", Some(""))?,
-        None => String::new(),
+        None if tty => prompt(
+            "Display name (optional)",
+            Some(previous.as_ref().map_or("", |old| &old.name)),
+        )?,
+        None => previous
+            .as_ref()
+            .map_or_else(String::new, |old| old.name.clone()),
     };
+    let default_user = previous
+        .as_ref()
+        .filter(|old| old.email.eq_ignore_ascii_case(&email))
+        .map_or(email.as_str(), |old| &old.username);
     let username = match flags.username {
         Some(username) => username,
-        None if tty => prompt("IMAP username", Some(&email))?,
-        None => email.clone(),
+        None if tty => prompt("IMAP username", Some(default_user))?,
+        None => default_user.to_owned(),
     };
     let host = match (flags.host, backend) {
         (Some(host), _) => host,
+        (None, _) if previous.is_some() => previous.as_ref().unwrap().host.clone(),
         (None, BackendKind::Bridge) => "127.0.0.1".into(),
         (None, _) if tty => prompt("IMAP host", None)?,
         (None, _) => return Err("--host is required with --imap".into()),
     };
-    let password = if let Some(command) = flags.password_command {
-        PasswordSource::Command(command)
+    let entered = if let Some(command) = flags.password_command {
+        Some(PasswordSource::Command(command))
     } else if flags.password_stdin {
         let mut line = String::new();
         io::stdin()
             .lock()
             .read_line(&mut line)
             .map_err(|err| format!("read password: {err}"))?;
-        PasswordSource::Inline(line.trim_end_matches(['\r', '\n']).to_string())
+        entered_password(
+            line.trim_end_matches(['\r', '\n']).to_owned(),
+            previous.is_some(),
+            flags.password_inline,
+        )?
     } else if tty {
-        PasswordSource::Inline(prompt_hidden(if backend == BackendKind::Bridge {
+        let password = prompt_hidden(if previous.is_some() {
+            "IMAP password (leave blank to keep unchanged)"
+        } else if backend == BackendKind::Bridge {
             "Bridge IMAP password"
         } else {
             "IMAP password"
-        })?)
+        })?;
+        entered_password(password, previous.is_some(), flags.password_inline)?
+    } else if previous.is_some() {
+        None
     } else {
         return Err("--password-stdin or --password-command is required without a terminal".into());
     };
 
-    let mut config = AccountConfig::bridge(email, username, password);
+    let password_inline = flags.password_inline
+        || entered.is_none()
+            && previous
+                .as_ref()
+                .is_some_and(|old| matches!(old.password, PasswordSource::Inline(_)));
+    let password = entered
+        .clone()
+        .unwrap_or_else(|| previous.as_ref().unwrap().password.clone());
+    let mut config = previous
+        .clone()
+        .unwrap_or_else(|| AccountConfig::bridge(&email, &username, password.clone()));
+    config.email = email;
+    config.username = username;
+    config.password = password;
     config.id = id;
     config.name = name;
     config.backend = backend;
     config.host = host;
-    if backend == BackendKind::Imap {
+    if backend == BackendKind::Imap && previous.as_ref().is_none_or(|old| old.backend != backend) {
         config.security = ImapSecurity::Tls;
         config.port = 993;
     }
     if let Some(security) = flags.security {
         config.security = security;
-        if backend == BackendKind::Imap && flags.port.is_none() {
+        if previous.is_none() && backend == BackendKind::Imap && flags.port.is_none() {
             config.port = if security == ImapSecurity::Tls {
                 993
             } else {
@@ -305,18 +375,38 @@ fn setup(args: &[String]) -> Result<(), String> {
     // Bridge's SMTP is on this machine at a fixed port; only an IMAP
     // account is asked where it sends.
     let ask_smtp = tty && backend == BackendKind::Imap;
-    choose_smtp(&mut config, &flags.smtp, &mut |label, default| {
-        if ask_smtp {
-            prompt(label, Some(default))
-        } else {
-            Ok(default.to_string())
-        }
-    })?;
+    if let Some(old) = &previous {
+        let smtp = old.smtp_config();
+        config.smtp_host = Some(flags.smtp.host.unwrap_or(smtp.host));
+        config.smtp_port = flags.smtp.port.or(Some(smtp.port));
+        config.smtp_security = flags.smtp.security.or(Some(smtp.security));
+    } else {
+        choose_smtp(&mut config, &flags.smtp, &mut |label, default| {
+            if ask_smtp {
+                prompt(label, Some(default))
+            } else {
+                Ok(default.to_string())
+            }
+        })?;
+    }
     config.validate().map_err(|err| err.to_string())?;
+    if let Some(old) = &previous
+        && !old.same_mailbox(&config)
+    {
+        if !flags.replace {
+            return Err("This is a different mailbox. Use --replace to keep the old local mail and start a fresh mailbox.".into());
+        }
+        if entered.is_none() {
+            return Err("Enter a password for the new mailbox.".into());
+        }
+    }
+    if flags.password_inline && entered.is_none() {
+        return Err("--password-inline requires entering a new password".into());
+    }
 
     let reconnect = named
         && tty
-        && can_reconnect(&config.id, &config.email)
+        && can_reconnect(&config)
         && matches!(
             prompt(
                 "Reconnect this account to its existing local mailbox? [y/N]",
@@ -326,8 +416,12 @@ fn setup(args: &[String]) -> Result<(), String> {
             .as_str(),
             "y" | "yes"
         );
-    if !flags.no_check {
-        check_both(&config).map_err(|err| {
+    if flags.no_check {
+        eprintln!("Connection checks skipped. Incorrect settings can prevent sync or sending.");
+    } else {
+        let check = connection_check_config(&config, previous.as_ref(), &SecretService)
+            .map_err(|err| err.to_string())?;
+        check_both(&check).map_err(|err| {
             format!(
                 "{err}\nFix the settings and run setup again, or add --no-check to save anyway."
             )
@@ -340,11 +434,16 @@ fn setup(args: &[String]) -> Result<(), String> {
         _ => AccountSave::New,
     };
     let previous_id = config.id.clone();
+    let queued = previous
+        .as_ref()
+        .filter(|old| old.same_mailbox(&config) && !old.same_imap_endpoint(&config))
+        .map_or(0, |old| crate::mailbox::queued_connection_changes(old).0);
     let path = save_account(
         config,
-        flags.password_inline,
+        password_inline,
+        previous.as_ref(),
         &SecretService,
-        |config| stage_account_config(config, save),
+        |config| stage_connection_config(config, save, expected),
     )
     .map_err(|err| match err {
         SaveAccountError::File(detail) => detail.to_string(),
@@ -358,9 +457,30 @@ fn setup(args: &[String]) -> Result<(), String> {
         .is_some_and(|id| id != previous_id.as_str())
     {
         println!("Kept local mail under {previous_id}.");
+    } else if queued > 0 {
+        let noun = if queued == 1 { "change" } else { "changes" };
+        println!(
+            "{queued} {noun} made on the old server won't sync yet. Review in Settings → Accounts."
+        );
     }
     println!("Saved {} (mode 600). Open Fell to sync.", path.display());
     Ok(())
+}
+
+fn entered_password(
+    password: String,
+    editing: bool,
+    inline: bool,
+) -> Result<Option<PasswordSource>, String> {
+    if !password.is_empty() {
+        Ok(Some(PasswordSource::Inline(password)))
+    } else if inline {
+        Err("--password-inline requires entering a new password".into())
+    } else if editing {
+        Ok(None)
+    } else {
+        Err("Enter a password for the new mailbox.".into())
+    }
 }
 
 #[derive(Debug)]
@@ -373,12 +493,30 @@ pub(crate) enum SaveAccountError {
     },
 }
 
+pub(crate) fn connection_check_config(
+    config: &AccountConfig,
+    previous: Option<&AccountConfig>,
+    keyring: &dyn PasswordStore,
+) -> fell_core::Result<AccountConfig> {
+    let mut check = config.clone();
+    if config.password == PasswordSource::Keyring
+        && let Some(previous) = previous
+    {
+        check.password = PasswordSource::Inline(previous.resolve_password_with(keyring)?);
+    }
+    Ok(check)
+}
+
 pub(crate) fn save_account(
     mut config: AccountConfig,
     password_inline: bool,
+    previous: Option<&AccountConfig>,
     keyring: &dyn PasswordStore,
     stage: impl FnOnce(&mut AccountConfig) -> Result<StagedAccountConfig, AccountFileError>,
 ) -> Result<PathBuf, SaveAccountError> {
+    config
+        .validate()
+        .map_err(|error| SaveAccountError::File(error.to_string().into()))?;
     let keyring_password = match (password_inline, config.password) {
         (false, PasswordSource::Inline(password)) => {
             config.password = PasswordSource::Keyring;
@@ -390,19 +528,95 @@ pub(crate) fn save_account(
         }
     };
     let staged = stage(&mut config).map_err(SaveAccountError::File)?;
-    if let Some(password) = keyring_password {
-        config
-            .store_keyring_password(keyring, &password)
-            .map_err(|err| SaveAccountError::Keyring {
-                detail: err.to_string(),
-                kind: match err {
-                    fell_core::Error::Keyring(kind) => Some(kind),
-                    _ => None,
-                },
-                recovery: connection_recovery(&config, &err),
-            })?;
+    let old_key = previous
+        .filter(|old| old.id == config.id && old.password == PasswordSource::Keyring)
+        .map(AccountConfig::credential_key);
+    let new_key = config.credential_key();
+    let key_error = |err: fell_core::Error| SaveAccountError::Keyring {
+        detail: err.to_string(),
+        kind: match err {
+            fell_core::Error::Keyring(kind) => Some(kind),
+            _ => None,
+        },
+        recovery: connection_recovery(&config, &err),
+    };
+    let password = match (keyring_password, &config.password) {
+        (Some(password), _) => Some(password),
+        (None, PasswordSource::Keyring) if old_key.as_ref() != Some(&new_key) => Some(
+            previous
+                .ok_or_else(|| key_error(fell_core::credentials::KeyringError::Missing.into()))?
+                .resolve_password_with(keyring)
+                .map_err(key_error)?,
+        ),
+        _ => None,
+    };
+    let previous_secret = if password.is_some() && old_key.as_ref() == Some(&new_key) {
+        match keyring.read(&new_key) {
+            Ok(secret) => Some(secret),
+            Err(fell_core::credentials::KeyringError::Missing) => None,
+            Err(error) => return Err(key_error(error.into())),
+        }
+    } else {
+        None
+    };
+    let journal = previous_secret
+        .as_deref()
+        .map(|secret| staged.back_up_credential(&new_key, secret))
+        .transpose()
+        .map_err(SaveAccountError::File)?;
+    let clear_journal = || {
+        if let Some(journal) = &journal
+            && journal.clear().is_err()
+        {
+            fell_core::diagnostic!(WARN, "Could not clear the account credential recovery file");
+        }
+    };
+    let rollback_password = || {
+        let result = match &previous_secret {
+            Some(secret) => keyring.store(&new_key, secret),
+            None => keyring.remove(&new_key),
+        };
+        if result.is_err() {
+            fell_core::diagnostic!(WARN, "Could not roll back the account credential");
+        } else {
+            clear_journal();
+        }
+    };
+    if let Some(password) = &password {
+        if let Err(error) = config.store_keyring_password(keyring, password) {
+            if previous_secret.is_some() {
+                rollback_password();
+            }
+            return Err(key_error(error));
+        }
+        if previous.is_some() {
+            let verified = keyring.read(&new_key).and_then(|saved| {
+                if saved == *password {
+                    Ok(())
+                } else {
+                    Err(fell_core::credentials::KeyringError::Invalid)
+                }
+            });
+            if let Err(error) = verified {
+                rollback_password();
+                return Err(key_error(error.into()));
+            }
+        }
     }
-    staged.publish().map_err(SaveAccountError::File)
+    staged.publish_then(journal.as_ref(), |result, published| {
+        if result.is_ok() {
+            clear_journal();
+            if let Some(old_key) = &old_key
+                && (old_key != &new_key || config.password != PasswordSource::Keyring)
+                && keyring.remove(old_key).is_err()
+            {
+                fell_core::diagnostic!(WARN, "Could not retire the previous account credential");
+            }
+        } else if password.is_some() && !published {
+            rollback_password();
+        }
+        result.map_err(SaveAccountError::File)
+    })
 }
 
 fn list() -> Result<(), String> {
@@ -642,11 +856,7 @@ fn prompt_hidden(label: &str) -> Result<String, String> {
         read_hidden(&mut io::stdin().lock())
     };
     println!();
-    let password = read?;
-    if password.is_empty() {
-        return Err("no password entered".into());
-    }
-    Ok(password)
+    read
 }
 
 /// One line from raw terminal bytes: Enter ends it, Ctrl-C or Ctrl-D
@@ -760,15 +970,49 @@ mod tests {
 
     #[test]
     fn show_and_check_take_help_and_refuse_stray_words() {
-        // Help and usage errors return before any account file is read or
-        // any server is contacted.
+        let Some(root) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let registry = Registry::resolve().unwrap();
+        let accounts = registry.directory();
+        std::fs::create_dir_all(&accounts).unwrap();
+        let state = root.join("state/fell");
+        let journal = crate::credential_recovery::Journal::at(&state, &accounts);
+        journal.record("fixture-key", "fixture-secret").unwrap();
+        journal.mark_published().unwrap().sync_all().unwrap();
+        let path = std::fs::read_dir(state)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+
         for cmd in ["show", "check"] {
             assert_eq!(account_command(&args(&[cmd, "--help"])), 0, "{cmd}");
             assert_eq!(account_command(&args(&[cmd, "--bogus"])), 2, "{cmd}");
+            assert_eq!(
+                account_command(&args(&[cmd, "--id", "../mail"])),
+                1,
+                "{cmd}"
+            );
         }
+        assert_eq!(account_command(&args(&["setup", "--help"])), 0);
         assert_eq!(account_command(&args(&["--bogus"])), 2);
         assert_eq!(account_command(&args(&["setup", "--bogus"])), 2);
         assert_eq!(account_command(&args(&["setup", "--email"])), 2);
+        assert_eq!(account_command(&args(&["setup", "--id", "../mail"])), 1);
+        assert_eq!(account_command(&args(&["list", "unexpected"])), 2);
+        assert_eq!(account_command(&args(&["remove", "../mail"])), 1);
+        assert!(
+            path.exists(),
+            "help and invalid arguments must leave the journal alone"
+        );
+
+        assert_eq!(account_command(&args(&["list"])), 0);
+        assert!(
+            !path.exists(),
+            "a valid account command still recovers the journal"
+        );
     }
 
     #[test]
@@ -803,6 +1047,18 @@ mod tests {
         assert_eq!(read(b"hun\x03ter\n").unwrap_err(), "cancelled");
         assert_eq!(read(b"\x04").unwrap_err(), "cancelled");
         assert_eq!(read(b"no newline").unwrap_err(), "input ended");
+    }
+
+    #[test]
+    fn blank_password_keeps_only_an_existing_password_without_inline_override() {
+        assert_eq!(entered_password(String::new(), true, false).unwrap(), None);
+        for (editing, inline) in [(false, false), (false, true), (true, true)] {
+            assert!(entered_password(String::new(), editing, inline).is_err());
+        }
+        assert_eq!(
+            entered_password(" ".into(), true, true).unwrap(),
+            Some(PasswordSource::Inline(" ".into()))
+        );
     }
 
     #[test]
@@ -885,6 +1141,10 @@ mod tests {
                     Ok(())
                 }
             }
+
+            fn remove(&self, _: &str) -> Result<(), KeyringError> {
+                panic!("this account has no old keyring password")
+            }
         }
 
         let dir = tempfile::tempdir().unwrap();
@@ -902,12 +1162,12 @@ mod tests {
             "mailbox-user",
             PasswordSource::Inline("sample-password".into()),
         );
-        save_account(config.clone(), true, &keyring, stage).unwrap();
+        save_account(config.clone(), true, None, &keyring, stage).unwrap();
         let original = std::fs::read_to_string(&path).unwrap();
         assert_eq!(AccountConfig::parse(&original).unwrap(), config);
         assert_eq!(keyring.writes.get(), 0);
 
-        let err = save_account(config.clone(), false, &keyring, stage).unwrap_err();
+        let err = save_account(config.clone(), false, None, &keyring, stage).unwrap_err();
         assert!(
             matches!(err, SaveAccountError::Keyring { recovery: Some(hint), .. }
             if hint.contains("Unlock your desktop keyring"))
@@ -915,7 +1175,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
 
         keyring.fail.set(false);
-        save_account(config, false, &keyring, stage).unwrap();
+        save_account(config, false, None, &keyring, stage).unwrap();
         let published = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
             AccountConfig::parse(&published).unwrap().password,
@@ -923,6 +1183,194 @@ mod tests {
         );
         assert!(!published.contains("sample-password"));
         assert_eq!(keyring.writes.get(), 2);
+    }
+
+    #[test]
+    fn connection_edit_keeps_a_working_key_across_publication() {
+        use std::cell::{Cell, RefCell};
+        use std::collections::HashMap;
+        use std::os::unix::fs::PermissionsExt;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        use fell_core::credentials::KeyringError;
+
+        #[derive(Default)]
+        struct Keyring {
+            keys: RefCell<HashMap<String, String>>,
+            interrupt_read: Cell<bool>,
+            interrupt_store: Cell<bool>,
+            interrupt_remove: Cell<bool>,
+            new_key: String,
+            refuse_readback: Cell<bool>,
+        }
+
+        impl PasswordStore for Keyring {
+            fn read(&self, key: &str) -> Result<String, KeyringError> {
+                assert!(!(key == self.new_key && self.interrupt_read.get()));
+                if self.refuse_readback.get()
+                    && self
+                        .keys
+                        .borrow()
+                        .get(key)
+                        .is_some_and(|value| value == "edited")
+                {
+                    return Err(KeyringError::Locked);
+                }
+                self.keys
+                    .borrow()
+                    .get(key)
+                    .cloned()
+                    .ok_or(KeyringError::Missing)
+            }
+
+            fn store(&self, key: &str, password: &str) -> Result<(), KeyringError> {
+                self.keys.borrow_mut().insert(key.into(), password.into());
+                assert!(!self.interrupt_store.get());
+                Ok(())
+            }
+
+            fn remove(&self, key: &str) -> Result<(), KeyringError> {
+                assert!(!self.interrupt_remove.get());
+                self.keys.borrow_mut().remove(key);
+                Ok(())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::at(dir.path().join("config"), dir.path().join("mail.db"));
+        let accounts = registry.directory();
+        let path = registry.path("mail").unwrap();
+        let state = accounts.join("state");
+        let journal = crate::credential_recovery::Journal::at(&state, &accounts);
+        let stage = |config: &mut AccountConfig| {
+            crate::mailbox::stage_account_config_at(path.clone(), config, false)
+        };
+        let original = AccountConfig::bridge("a@example.test", "user", PasswordSource::Keyring);
+        stage(&mut original.clone()).unwrap().publish().unwrap();
+        let mut edited = original.clone();
+        edited.smtp_port = Some(2525);
+        let keyring = Keyring {
+            new_key: edited.credential_key(),
+            ..Default::default()
+        };
+        original
+            .store_keyring_password(&keyring, "fixture")
+            .unwrap();
+        let published = || {
+            fell_core::accounts::read(&path, Some("mail"))
+                .unwrap()
+                .unwrap()
+                .0
+        };
+        let save = || save_account(edited.clone(), false, Some(&original), &keyring, stage);
+
+        let mut new_password = original.clone();
+        new_password.password = PasswordSource::Inline("edited".into());
+        keyring.interrupt_store.set(true);
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                save_account(new_password, false, Some(&original), &keyring, stage)
+            }))
+            .is_err()
+        );
+        keyring.interrupt_store.set(false);
+        assert_eq!(
+            published().resolve_password_with(&keyring).unwrap(),
+            "edited"
+        );
+        let backups: Vec<_> = std::fs::read_dir(&state).unwrap().collect();
+        assert_eq!(backups.len(), 1);
+        let backup = backups.into_iter().next().unwrap().unwrap().path();
+        assert_eq!(
+            backup.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        journal.recover(&registry, &keyring).unwrap();
+        assert_eq!(
+            published().resolve_password_with(&keyring).unwrap(),
+            "fixture"
+        );
+        assert!(!backup.exists());
+
+        // Recovery must keep the new key after publication, even if another
+        // account edit has replaced the file while the journal still exists.
+        let staged = stage(&mut original.clone()).unwrap();
+        let key = original.credential_key();
+        let pending = staged.back_up_credential(&key, "fixture").unwrap();
+        keyring.store(&key, "edited").unwrap();
+        staged
+            .publish_then(Some(&pending), |result, _| result)
+            .unwrap();
+        assert!(backup.exists());
+        let mut replacement = original.clone();
+        replacement.name = "Replacement".into();
+        stage(&mut replacement).unwrap().publish().unwrap();
+        assert_eq!(published(), replacement);
+        journal.recover(&registry, &keyring).unwrap();
+        assert_eq!(
+            published().resolve_password_with(&keyring).unwrap(),
+            "edited"
+        );
+        assert!(!backup.exists());
+        stage(&mut original.clone()).unwrap().publish().unwrap();
+        keyring.store(&key, "fixture").unwrap();
+
+        let blocked = dir.path().join("blocked.toml");
+        for mut candidate in [original.clone(), edited.clone()] {
+            candidate.password = PasswordSource::Inline("edited".into());
+            keyring.refuse_readback.set(true);
+            assert!(matches!(
+                save_account(candidate.clone(), false, Some(&original), &keyring, stage),
+                Err(SaveAccountError::Keyring { .. })
+            ));
+            keyring.refuse_readback.set(false);
+            assert_eq!(keyring.keys.borrow().len(), 1);
+            assert_eq!(original.resolve_password_with(&keyring).unwrap(), "fixture");
+
+            let blocked =
+                blocked.with_file_name(candidate.port.to_string() + &candidate.credential_key());
+            assert!(matches!(
+                save_account(candidate, false, Some(&original), &keyring, |config| {
+                    let staged =
+                        crate::mailbox::stage_account_config_at(blocked.clone(), config, true)?;
+                    std::fs::write(&blocked, "another account").unwrap();
+                    Ok(staged)
+                }),
+                Err(SaveAccountError::File(AccountFileError::AlreadyConfigured))
+            ));
+            assert_eq!(published(), original);
+            assert_eq!(keyring.keys.borrow().len(), 1);
+            assert_eq!(original.resolve_password_with(&keyring).unwrap(), "fixture");
+        }
+
+        keyring.interrupt_read.set(true);
+        assert!(catch_unwind(AssertUnwindSafe(save)).is_err());
+        assert_eq!(published(), original);
+        assert_eq!(
+            published().resolve_password_with(&keyring).unwrap(),
+            "fixture"
+        );
+
+        keyring.interrupt_read.set(false);
+        keyring.interrupt_remove.set(true);
+        assert!(catch_unwind(AssertUnwindSafe(save)).is_err());
+        assert_eq!(published(), edited);
+        assert_eq!(
+            published().resolve_password_with(&keyring).unwrap(),
+            "fixture"
+        );
+        assert_eq!(original.resolve_password_with(&keyring).unwrap(), "fixture");
+
+        keyring.interrupt_remove.set(false);
+        save().unwrap();
+        assert_eq!(
+            published().resolve_password_with(&keyring).unwrap(),
+            "fixture"
+        );
+        assert!(matches!(
+            original.resolve_password_with(&keyring),
+            Err(fell_core::Error::Keyring(KeyringError::Missing))
+        ));
     }
 
     fn imap_account(security: ImapSecurity) -> AccountConfig {

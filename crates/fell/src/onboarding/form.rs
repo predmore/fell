@@ -130,6 +130,14 @@ impl Issue {
     }
 
     fn connection(config: &AccountConfig, service: Service, error: &fell_core::Error) -> Self {
+        if matches!(error, fell_core::Error::Keyring(_)) {
+            return Self {
+                field: Field::Password,
+                title: "Couldn’t read the saved password",
+                recovery: connection_recovery(config, error),
+                suggest_starttls: false,
+            };
+        }
         let kind = fell_core::classify_sync_error(error);
         let bridge = config.backend == BackendKind::Bridge;
         let (field, title) = match kind {
@@ -233,6 +241,10 @@ pub(super) struct Form {
     pub storage: Storage,
     pub retained_mailbox: Option<String>,
     pub attempt: u64,
+    pub previous: Option<AccountConfig>,
+    pub reconnect_to: Option<AccountConfig>,
+    pub queued_changes: (usize, usize),
+    pub failed_check: bool,
     email: String,
     name: String,
     username: String,
@@ -252,6 +264,10 @@ impl Default for Form {
             storage: Storage::Keyring,
             retained_mailbox: None,
             attempt: 0,
+            previous: None,
+            reconnect_to: None,
+            queued_changes: (0, 0),
+            failed_check: false,
             email: String::new(),
             name: String::new(),
             username: String::new(),
@@ -263,6 +279,81 @@ impl Default for Form {
 }
 
 impl Form {
+    pub fn reconnecting(config: AccountConfig) -> Self {
+        let mut form = Self::editing(config);
+        form.reconnect_to = form.previous.take();
+        form
+    }
+
+    pub fn editing(config: AccountConfig) -> Self {
+        let smtp = config.smtp_config();
+        Self {
+            step: Step::Identity,
+            provider: if config.backend == BackendKind::Bridge {
+                Provider::Bridge
+            } else {
+                Provider::Custom
+            },
+            email: config.email.clone(),
+            name: config.name.clone(),
+            username: config.username.clone(),
+            servers: [
+                Endpoint::new((&config.host, config.port, config.security)),
+                Endpoint::new((&smtp.host, smtp.port, smtp.security)),
+            ],
+            previous: Some(config),
+            ..Self::default()
+        }
+    }
+
+    pub fn replacement(&self) -> bool {
+        self.previous.as_ref().is_some_and(|old| {
+            let email = self.email.trim();
+            let username = self.username.trim();
+            let username = if username.is_empty() { email } else { username };
+            !old.email.eq_ignore_ascii_case(email) || old.username != username
+        })
+    }
+
+    pub fn password_unchanged(&self) -> bool {
+        self.previous.is_some() && !self.replacement()
+    }
+
+    pub fn held_write_note(&self) -> Option<String> {
+        let imap = &self.servers[Service::Imap as usize];
+        let changes_endpoint = self.previous.as_ref().is_some_and(|old| {
+            !self.replacement()
+                && (!old.host.eq_ignore_ascii_case(imap.host.trim())
+                    || Some(old.port) != port(&imap.port)
+                    || old.security != imap.security)
+        });
+        let (queued, archives) = self.queued_changes;
+        if !changes_endpoint || queued == 0 {
+            return None;
+        }
+        let label = match (queued, queued == archives) {
+            (1, true) => "1 archive".into(),
+            (1, false) => "1 change".into(),
+            (count, true) => format!("{count} archives"),
+            (count, false) => format!("{count} changes"),
+        };
+        Some(format!(
+            "{label} made on the old server won’t sync yet. Review in Accounts."
+        ))
+    }
+
+    pub fn failed_check_warning(&self) -> &'static str {
+        match self.checks {
+            [Check::Connected, _] => "Sending will fail with these settings",
+            [_, Check::Connected] => "Sync will fail with these settings",
+            _ => "Sync and sending will fail with these settings",
+        }
+    }
+
+    pub fn inline_available(&self) -> bool {
+        self.storage.inline_available() && !self.password.is_empty()
+    }
+
     pub fn text(&self, field: Field) -> &str {
         match field {
             Field::Email => &self.email,
@@ -360,7 +451,9 @@ impl Form {
     }
 
     pub fn needs_servers(&self) -> bool {
-        self.provider == Provider::Custom
+        self.previous.is_some()
+            || self.reconnect_to.is_some()
+            || self.provider == Provider::Custom
             || self
                 .issues
                 .iter()
@@ -398,9 +491,13 @@ impl Form {
             self.issues
                 .push(Issue::input(Field::Email, "Enter an email address."));
         }
-        if self.password.is_empty() {
-            self.issues
-                .push(Issue::input(Field::Password, "Enter your mail password."));
+        if self.password.is_empty() && (self.previous.is_none() || self.replacement()) {
+            let title = if self.replacement() {
+                "Enter a password for the new mailbox."
+            } else {
+                "Enter your mail password."
+            };
+            self.issues.push(Issue::input(Field::Password, title));
         }
         !self
             .issues
@@ -452,6 +549,7 @@ impl Form {
         self.attempt = self.attempt.wrapping_add(1);
         self.checks = [Check::Testing, Check::Waiting];
         self.bridge_unreachable = [false; 2];
+        self.failed_check = false;
         self.storage = Storage::Keyring;
         Some(config)
     }
@@ -461,12 +559,24 @@ impl Form {
         let username = self.username.trim();
         let username = if username.is_empty() { email } else { username };
         let [imap, smtp] = &self.servers;
-        let mut config = AccountConfig::bridge(
-            email,
-            username,
-            PasswordSource::Inline(self.password.clone()),
-        );
-        if self.provider != Provider::Bridge {
+        let mut config = self
+            .previous
+            .as_ref()
+            .or(self.reconnect_to.as_ref())
+            .cloned()
+            .unwrap_or_else(|| {
+                AccountConfig::bridge(
+                    email,
+                    username,
+                    PasswordSource::Inline(self.password.clone()),
+                )
+            });
+        if !self.password.is_empty() {
+            config.password = PasswordSource::Inline(self.password.clone());
+        }
+        config.email = email.into();
+        config.username = username.into();
+        if self.provider == Provider::Custom {
             config.backend = BackendKind::Imap;
         }
         config.name = self.name.trim().into();
@@ -508,6 +618,10 @@ impl Form {
                 self.checks = [Check::Failed, Check::Waiting];
                 self.record_check_issue(config, Service::Imap, &error);
             }
+        }
+        if self.previous.is_some() {
+            self.failed_check = !self.connected();
+            return None;
         }
         // Leave both failures on their fields. Visit credentials first if one
         // login failed, otherwise open the relevant server settings.
@@ -551,7 +665,7 @@ impl Form {
     }
 
     pub fn done(&mut self) {
-        if self.step == Step::Connection && self.connected() {
+        if self.step == Step::Connection && (self.connected() || self.failed_check) {
             self.step = Step::Done;
         }
     }
@@ -563,7 +677,12 @@ impl Form {
         {
             return None;
         }
-        let inline = matches!(self.storage, Storage::ConfirmInline(_));
+        let inline = matches!(self.storage, Storage::ConfirmInline(_))
+            || self.password.is_empty()
+                && matches!(
+                    self.previous.as_ref().map(|old| &old.password),
+                    Some(PasswordSource::Inline(_))
+                );
         self.storage = Storage::Saving { inline };
         Some((self.config(), inline))
     }
@@ -576,6 +695,36 @@ fn port(text: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edit_prefills_the_connection_and_requires_explicit_review_after_a_failed_check() {
+        let mut previous =
+            AccountConfig::bridge("mail@example.test", "mailbox", PasswordSource::Keyring);
+        previous.smtp_port = Some(2500);
+        let mut form = Form::editing(previous);
+        assert_eq!(form.text(Field::Username), "mailbox");
+        assert_eq!(form.text(Field::Password), "");
+        assert_eq!(form.text(Field::Port(Service::Smtp)), "2500");
+        form.edit_servers();
+        let changed = form.begin_check().unwrap();
+        assert_eq!(changed.password, PasswordSource::Keyring);
+        assert!(form.begin_save().is_none());
+        form.finish_check(
+            form.attempt,
+            &changed,
+            Ok(ConnectionReport {
+                imap: Ok(1),
+                smtp: Err(fell_core::Error::Backend(
+                    "smtp: server did not answer".into(),
+                )),
+            }),
+        );
+        assert_eq!(form.step, Step::Connection);
+        assert!(form.failed_check);
+        assert!(form.begin_save().is_none());
+        form.done();
+        assert!(form.begin_save().is_some());
+    }
     use fell_core::Error;
 
     #[test]

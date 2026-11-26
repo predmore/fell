@@ -22,6 +22,7 @@ use crate::keymap::KeyId;
 use crate::model::Overlay;
 use crate::model::settings::{self as nav, Availability, Page, Request, Row, Section};
 use crate::motion::{self, Glide, LayerSwap, Motion, SwapFrame, Transition};
+use crate::onboarding::SetupTarget;
 use crate::settings::{self, Edit, Snapshot, Values};
 use crate::{embeddings, mailbox, theme};
 
@@ -121,6 +122,8 @@ struct AccountRow {
     alert: bool,
     active: bool,
     removing: bool,
+    disconnected: bool,
+    held_changes: usize,
     kind: crate::model::settings::AccountRemovalKind,
 }
 
@@ -187,8 +190,15 @@ pub(super) enum CardMode<'a> {
 }
 
 impl AccountRow {
+    fn can_edit_connection(&self) -> bool {
+        !self.removing
+            && !self.disconnected
+            && self.kind == crate::model::settings::AccountRemovalKind::Account
+    }
+
     fn can_remove(&self) -> bool {
         !self.removing
+            && !self.disconnected
             && (self.kind != crate::model::settings::AccountRemovalKind::BrokenFile
                 || self.file_identity.is_some())
     }
@@ -243,7 +253,7 @@ impl View {
         &mut self,
         catalog: &fell_core::accounts::Accounts,
         active: Option<&str>,
-        statuses: &std::collections::HashMap<String, (String, bool)>,
+        statuses: &std::collections::HashMap<String, (String, bool, usize)>,
         removing: impl Fn(&str) -> bool,
     ) -> bool {
         use crate::model::settings::AccountRemovalKind;
@@ -266,15 +276,19 @@ impl View {
                     .is_err_and(|error| error.is_mailbox_link());
                 let (name, email, status, alert) = match &entry.config {
                     Ok(config) => {
-                        let (status, alert) = statuses
+                        let (status, alert, held) = statuses
                             .get(&id)
                             .cloned()
-                            .unwrap_or_else(|| ("Opening mailbox…".into(), false));
+                            .unwrap_or_else(|| ("Opening mailbox…".into(), false, 0));
                         (
                             config.account().display_name,
                             Some(config.email.clone()),
-                            status,
-                            alert,
+                            if held == 0 {
+                                status
+                            } else {
+                                super::accounts::held_changes_label(held)
+                            },
+                            alert || held > 0,
                         )
                     }
                     Err(error) if link_damaged => {
@@ -313,6 +327,7 @@ impl View {
                 };
                 let removing = entry.config.is_ok() && removing(&id);
                 Some(AccountRow {
+                    held_changes: statuses.get(&id).map_or(0, |status| status.2),
                     id,
                     path: entry.path.clone(),
                     file_identity: entry.file_identity,
@@ -327,6 +342,7 @@ impl View {
                     alert: alert && !removing,
                     active,
                     removing,
+                    disconnected: false,
                     kind: if entry.config.is_ok() {
                         AccountRemovalKind::Account
                     } else {
@@ -358,10 +374,27 @@ impl View {
                 alert: !removing(&pending.id),
                 active: false,
                 removing: removing(&pending.id),
+                disconnected: false,
+                held_changes: 0,
                 kind: AccountRemovalKind::Interrupted {
                     can_restore: pending.can_restore,
                 },
             }
+        }));
+        accounts.extend(catalog.disconnected.iter().map(|kept| AccountRow {
+            id: kept.id.clone(),
+            path: kept.path.clone(),
+            file_identity: None,
+            name: kept.email.clone(),
+            email: None,
+            status: "Not connected".into(),
+            link_damaged: false,
+            alert: false,
+            active: false,
+            removing: false,
+            disconnected: true,
+            held_changes: 0,
+            kind: AccountRemovalKind::Account,
         }));
         accounts.sort_by(|a, b| a.path.cmp(&b.path));
         if self.accounts == accounts {
@@ -379,6 +412,8 @@ impl View {
             identity_count: self.identities.len(),
             accounts: self.accounts.len(),
             active_account: self.accounts.iter().position(|account| account.active),
+            kept_accounts: self.accounts.iter().any(|account| account.disconnected),
+            held_changes: self.accounts.iter().any(|account| account.held_changes > 0),
             install_model: matches!(
                 self.model,
                 ModelStatus::Checking | ModelStatus::Missing | ModelStatus::NeedsRepair
@@ -696,7 +731,64 @@ impl Inbox {
                 }
                 self.settings_notice("Could not save settings", true, cx);
             }
-            Request::AccountSetup => self.open_account_setup(cx),
+            Request::AccountSetup => self.open_account_setup(SetupTarget::New, cx),
+            Request::EditConnection(index) => {
+                if let Some(account) = self
+                    .settings_view
+                    .accounts
+                    .get(index)
+                    .filter(|account| account.can_edit_connection())
+                {
+                    let id = fell_core::AccountId(account.id.clone());
+                    let config = cx.background_executor().spawn(async move {
+                        fell_core::accounts::Registry::resolve()
+                            .and_then(|registry| registry.get_with_identity(&id))
+                            .map(|record| {
+                                record.map(|(config, identity)| {
+                                    let queued = mailbox::queued_connection_changes(&config);
+                                    SetupTarget::Edit(config, identity, queued)
+                                })
+                            })
+                    });
+                    cx.spawn(async move |this, cx| {
+                        let config = config.await;
+                        let _ = this.update(cx, |inbox, cx| match config {
+                            Ok(Some(target)) => inbox.open_account_setup(target, cx),
+                            _ => inbox.settings_notice(
+                                "Could not read this account. Review it in Settings.",
+                                true,
+                                cx,
+                            ),
+                        });
+                    })
+                    .detach();
+                }
+            }
+            Request::ReconnectAccount => {
+                if let Some(row) = self
+                    .settings_view
+                    .accounts
+                    .iter()
+                    .find(|row| row.disconnected)
+                {
+                    self.open_reconnect(row.id.clone(), cx);
+                }
+            }
+            Request::HeldChanges { index, resend } => {
+                let accounts = &self.settings_view.accounts;
+                let eligible =
+                    |row: &&AccountRow| row.held_changes > 0 && row.can_edit_connection();
+                if let Some(row) = accounts.get(index).filter(eligible) {
+                    let id = row.id.clone();
+                    if let Some(window) = cx.try_global::<super::InboxWindow>().copied() {
+                        cx.defer(move |cx| {
+                            let _ = window.0.update(cx, |_, window, cx| {
+                                super::accounts::change_held_writes(&id, resend, window, cx);
+                            });
+                        });
+                    }
+                }
+            }
             Request::EditAccount => {
                 if let Some(path) = self
                     .settings_view
@@ -718,6 +810,7 @@ impl Inbox {
                     .filter(|account| !account.removing)
                 {
                     match account.kind {
+                        _ if account.disconnected => self.open_reconnect(account.id, cx),
                         crate::model::settings::AccountRemovalKind::BrokenFile
                             if account.file_identity.is_some() =>
                         {
@@ -812,7 +905,7 @@ impl Inbox {
         }
     }
 
-    fn open_account_setup(&mut self, cx: &mut Context<Self>) {
+    fn open_account_setup(&mut self, target: SetupTarget, cx: &mut Context<Self>) {
         if let Some(handle) = self.settings_view.setup
             && handle
                 .update(cx, |_, window, _| window.activate_window())
@@ -828,7 +921,14 @@ impl Inbox {
                 cx,
             ))),
             titlebar: Some(TitlebarOptions {
-                title: Some("Fell account setup".into()),
+                title: Some(
+                    match &target {
+                        SetupTarget::Edit(..) => "Fell · Edit connection",
+                        SetupTarget::Reconnect(_) => "Fell · Reconnect account",
+                        SetupTarget::New => "Fell account setup",
+                    }
+                    .into(),
+                ),
                 ..Default::default()
             }),
             app_id: Some("dev.predmore.fell".into()),
@@ -838,11 +938,27 @@ impl Inbox {
             return;
         };
         match cx.open_window(options, |window, cx| {
-            cx.new(|cx| crate::onboarding::Onboarding::from_inbox(previous.0, window, cx))
+            cx.new(|cx| crate::onboarding::Onboarding::from_inbox(previous.0, target, window, cx))
         }) {
             Ok(handle) => self.settings_view.setup = Some(handle.into()),
             Err(_) => self.settings_notice("Could not open account setup", true, cx),
         }
+    }
+
+    fn open_reconnect(&mut self, id: String, cx: &mut Context<Self>) {
+        let work = cx.background_executor().spawn(async move {
+            let registry =
+                fell_core::accounts::Registry::resolve().map_err(|err| err.to_string())?;
+            registry.reconnect_config(&mailbox::store_path()?, &id)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |inbox, cx| match result {
+                Ok(config) => inbox.open_account_setup(SetupTarget::Reconnect(config), cx),
+                Err(error) => inbox.settings_notice(error, true, cx),
+            });
+        })
+        .detach();
     }
 
     fn confirm_account_removal(&mut self, index: usize) {
@@ -1538,38 +1654,86 @@ pub(super) fn card(
                         } else {
                             crate::present::display_safe(&account.status)
                         };
+                        let actions =
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(9.))
+                                .when(account.can_edit_connection(), |row| {
+                                    row.child(
+                                        account_button(
+                                            theme,
+                                            "edit-connection",
+                                            "Edit connection · e",
+                                            crate::model::settings::EDIT_CONNECTION_KEY,
+                                            false,
+                                            false,
+                                            live && selected,
+                                            cx,
+                                        )
+                                        .opacity(if selected { 1. } else { 0. }),
+                                    )
+                                })
+                                .when(account.disconnected, |row| {
+                                    row.child(
+                                        account_button(
+                                            theme,
+                                            "reconnect-account",
+                                            "Reconnect",
+                                            KeyId::Enter,
+                                            false,
+                                            false,
+                                            live && selected,
+                                            cx,
+                                        )
+                                        .opacity(if selected { 1. } else { 0. }),
+                                    )
+                                })
+                                .when(account.can_remove(), |row| {
+                                    let button = account_button(
+                                        theme,
+                                        "remove-account",
+                                        match (restore, recover) {
+                                            (true, _) => "Restore",
+                                            (_, true) => "Finish deleting",
+                                            _ => "Remove · d",
+                                        },
+                                        crate::model::settings::REMOVE_ACCOUNT_KEY,
+                                        false,
+                                        !restore,
+                                        live && selected,
+                                        cx,
+                                    );
+                                    row.child(
+                                        button
+                                            .when(broken, |button| {
+                                                button.w(px(BROKEN_FILE_BUTTON_WIDTH)).text_center()
+                                            })
+                                            .opacity(if selected { 1. } else { 0. }),
+                                    )
+                                })
+                                .when(editable_file, |row| {
+                                    row.child(
+                                        trailing(theme, "↗", selected)
+                                            .w(px(BROKEN_FILE_LINK_WIDTH))
+                                            .text_right(),
+                                    )
+                                });
+                        let held = account.held_changes > 0 && account.can_edit_connection();
                         control = control
                             .child(account_label(theme, account, status, selected))
-                            .when(account.can_remove(), |row| {
-                                let button = account_button(
-                                    theme,
-                                    "remove-account",
-                                    match (restore, recover) {
-                                        (true, _) => "Restore",
-                                        (_, true) => "Finish deleting",
-                                        _ => "Remove · d",
-                                    },
-                                    crate::model::settings::REMOVE_ACCOUNT_KEY,
-                                    false,
-                                    !restore,
-                                    live && selected,
-                                    cx,
-                                );
-                                row.child(
-                                    button
-                                        .when(broken, |button| {
-                                            button.w(px(BROKEN_FILE_BUTTON_WIDTH)).text_center()
-                                        })
-                                        .opacity(if selected { 1. } else { 0. }),
-                                )
-                            })
-                            .when(editable_file, |row| {
-                                row.child(
-                                    trailing(theme, "↗", selected)
-                                        .w(px(BROKEN_FILE_LINK_WIDTH))
-                                        .text_right(),
-                                )
-                            });
+                            .child(div().flex_none().flex().flex_col().items_end().gap(px(2.))
+                                .child(actions)
+                                .when(held, |actions| {
+                                    let button = |id, title, key, destructive, cx: &mut Context<Inbox>| {
+                                        account_button(theme, id, title, key, false, destructive, live && selected, cx)
+                                            .py(px(3.))
+                                    };
+                                    actions.child(div().flex().gap(px(9.))
+                                        .opacity(if selected { 1. } else { 0. })
+                                        .child(button("resend-held", "Resend · r", nav::RESEND_CHANGES_KEY, false, cx))
+                                        .child(button("discard-held", "Discard · x", nav::DISCARD_CHANGES_KEY, true, cx)))
+                                }));
                     }
                 } else if let Row::Value(preference) = setting {
                     control = control.py(px(10.));
@@ -1719,7 +1883,13 @@ pub(super) fn card(
                             "›",
                             false,
                         ),
-                        Row::Value(_) | Row::Account(_) | Row::RemoveAccount => unreachable!(),
+                        Row::Value(_)
+                        | Row::Account(_)
+                        | Row::RemoveAccount
+                        | Row::EditConnection
+                        | Row::ReconnectAccount
+                        | Row::ResendChanges
+                        | Row::DiscardChanges => unreachable!(),
                     };
                     let suffix = if info {
                         div()
@@ -2192,12 +2362,12 @@ fn account_button(
         .border_color(rgb(theme.border))
         .text_size(px(12.))
         .whitespace_nowrap()
-        .when(focused, |button| {
-            button
-                .bg(rgb(theme.selection))
-                .text_color(rgb(theme.on_selection))
-        })
-        .when(destructive, |button| button.text_color(rgb(theme.error)))
+        .text_color(rgb(if destructive {
+            theme::account_detail_color(theme.error, theme.selection)
+        } else {
+            theme.on_selection
+        }))
+        .when(focused, |button| button.bg(rgb(theme.selection)))
         .when(live, |button| {
             button.cursor_pointer().on_mouse_down(
                 MouseButton::Left,

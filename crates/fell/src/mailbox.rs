@@ -36,6 +36,11 @@ pub struct Opened {
 
 pub fn startup() -> Startup {
     let registry = Registry::resolve();
+    if let Ok(registry) = &registry
+        && let Err(error) = crate::credential_recovery::recover(registry)
+    {
+        return startup_for(None, false, Some(error.clone()), Err(error));
+    }
     let base = store_path();
     let accounts = registry.as_ref().ok().map(|registry| match &base {
         Ok(base) => registry.load_with_removals(base),
@@ -180,7 +185,7 @@ fn account_id_available(registry: &Registry, base: &Path, id: &str) -> Result<bo
         .map_err(|err| err.to_string())
 }
 
-pub(crate) fn retained_mailbox(email: &str) -> Option<String> {
+pub(crate) fn retained_mailbox(config: &AccountConfig) -> Option<String> {
     let registry = Registry::resolve().ok()?;
     let base = store_path().ok()?;
     let original = accounts::mailbox_owner(&base)
@@ -199,7 +204,7 @@ pub(crate) fn retained_mailbox(email: &str) -> Option<String> {
     let mut candidates: Vec<_> = original
         .into_iter()
         .chain(siblings)
-        .filter(|id| can_reconnect_at(&registry, &base, id, email))
+        .filter(|id| can_reconnect_at(&registry, &base, id, &config.email, &config.username))
         .collect();
     candidates.sort();
     candidates.dedup();
@@ -210,14 +215,53 @@ pub(crate) fn retained_mailbox(email: &str) -> Option<String> {
     }
 }
 
-pub(crate) fn can_reconnect(id: &str, email: &str) -> bool {
+pub(crate) fn can_reconnect(config: &AccountConfig) -> bool {
     Registry::resolve()
         .ok()
         .zip(store_path().ok())
-        .is_some_and(|(registry, base)| can_reconnect_at(&registry, &base, id, email))
+        .is_some_and(|(registry, base)| {
+            can_reconnect_at(
+                &registry,
+                &base,
+                &config.id,
+                &config.email,
+                &config.username,
+            )
+        })
 }
 
-fn can_reconnect_at(registry: &Registry, base: &Path, id: &str, email: &str) -> bool {
+pub(crate) fn queued_connection_changes(config: &AccountConfig) -> (usize, usize) {
+    let read = || -> Option<_> {
+        let path = Registry::resolve()
+            .ok()?
+            .configured_store_path(&store_path().ok()?, config)
+            .ok()?;
+        let store = Store::open_existing(&path).ok()?;
+        let account = AccountId(config.id.clone());
+        let roles = store.folder_roles(&account).ok()?;
+        let count = store.queued_write_count(&account).ok()?;
+        let archives = store
+            .outbox(&account)
+            .ok()?
+            .into_iter()
+            .filter(|row| {
+                row.state == fell_core::OutboxState::Pending
+                    && row.kind == fell_core::OutboxKind::Move
+                    && roles.is(fell_core::FolderRole::Archive, &row.target_folder)
+            })
+            .count();
+        Some((count, archives))
+    };
+    read().unwrap_or_default()
+}
+
+fn can_reconnect_at(
+    registry: &Registry,
+    base: &Path,
+    id: &str,
+    email: &str,
+    username: &str,
+) -> bool {
     registry
         .path(id)
         .is_ok_and(|path| accounts::path_exists(&path).is_ok_and(|exists| !exists))
@@ -226,7 +270,7 @@ fn can_reconnect_at(registry: &Registry, base: &Path, id: &str, email: &str) -> 
                 owner.is_some_and(|(stored_id, stored_email)| {
                     stored_id == id && stored_email.eq_ignore_ascii_case(email)
                 })
-            })
+            }) && Store::matches_imap_login(&path, id, username).unwrap_or(false)
         })
 }
 
@@ -341,14 +385,32 @@ pub(crate) enum AccountSave {
 /// Prepare the file so setup can save its keyring password before publishing
 /// the new config with mode 0600. Dropping the staged file keeps the current
 /// config in place.
+#[cfg(test)]
 pub(crate) fn stage_account_config(
     config: &mut AccountConfig,
     save: AccountSave,
+) -> Result<StagedAccountConfig, AccountFileError> {
+    let expected = Registry::resolve()
+        .and_then(|registry| registry.get_with_identity(&AccountId(config.id.clone())))
+        .map_err(|err| err.to_string())?
+        .map(|(_, identity)| identity);
+    stage_connection_config(config, save, expected)
+}
+
+pub(crate) fn stage_connection_config(
+    config: &mut AccountConfig,
+    save: AccountSave,
+    expected: Option<accounts::FileIdentity>,
 ) -> Result<StagedAccountConfig, AccountFileError> {
     let registry = Registry::resolve().map_err(|err| err.to_string())?;
     registry.migrate().map_err(|err| err.to_string())?;
     let mut path = registry.path(&config.id).map_err(|err| err.to_string())?;
     let lock = lock_account_dir(&path)?;
+    let credential_journal =
+        crate::credential_recovery::Journal::for_accounts(&registry.directory());
+    if let Some(journal) = &credential_journal {
+        journal.recover_locked(&fell_core::credentials::SecretService)?;
+    }
     let base = store_path()?;
     let mailbox = registry
         .store_path(&base, &config.id)
@@ -357,15 +419,34 @@ pub(crate) fn stage_account_config(
     if configured && save == AccountSave::New {
         return Err(AccountFileError::AlreadyConfigured);
     }
+    let current =
+        accounts::read_with_identity(&path, Some(&config.id)).map_err(|err| err.to_string())?;
+    if current.as_ref().map(|(_, _, identity)| *identity) != expected {
+        return Err("The account file changed. Reopen Edit connection and try again.".into());
+    }
     let mut keep = None;
+    let different_owner = accounts::mailbox_owner(&mailbox)
+        .map_err(|err| err.to_string())?
+        .map(|(_, email)| email)
+        .filter(|email| !email.eq_ignore_ascii_case(&config.email))
+        .or_else(|| {
+            current.as_ref().and_then(|(current, _, _)| {
+                (!current.same_mailbox(config)).then(|| current.email.clone())
+            })
+        });
     if save == AccountSave::Reconnect {
-        if !can_reconnect_at(&registry, &base, &config.id, &config.email) {
+        if !can_reconnect_at(
+            &registry,
+            &base,
+            &config.id,
+            &config.email,
+            &config.username,
+        ) {
             return Err("The kept mailbox changed. Review the account and try again.".into());
         }
-    } else if let Some((_, email)) = accounts::mailbox_owner(&mailbox)
-        .map_err(|err| err.to_string())?
-        .filter(|(_, email)| !email.eq_ignore_ascii_case(&config.email))
-    {
+        config.write_back =
+            Store::stored_write_back(&mailbox, &config.id).map_err(|err| err.to_string())?;
+    } else if let Some(email) = different_owner {
         if save != AccountSave::ReplaceMailbox {
             return Err(AccountFileError::MailboxAddressConflict {
                 id: config.id.clone(),
@@ -374,18 +455,29 @@ pub(crate) fn stage_account_config(
         }
         let next = next_account_id_at(&registry, &base)?;
         let previous = std::mem::replace(&mut config.id, next);
-        if configured {
-            let (_, snapshot) = accounts::read(&path, Some(&previous))
-                .map_err(|err| err.to_string())?
-                .ok_or("The account file changed. Review it and try again.")?;
-            keep = Some((previous, snapshot));
+        config.identities.clear();
+        config.folders.clear();
+        config.save_sent = Default::default();
+        config.write_back = false;
+        if let Some((_, snapshot, _)) = &current {
+            keep = Some((previous, snapshot.clone()));
         }
         path = registry.path(&config.id).map_err(|err| err.to_string())?;
         configured = false;
     } else if !configured && accounts::mailbox_exists(&mailbox).map_err(|err| err.to_string())? {
         return Err("This ID has a local mailbox. Choose a new ID or confirm reconnecting the same account.".into());
     }
+    if let Some((previous, _, _)) = &current
+        && accounts::mailbox_exists(&mailbox).map_err(|err| err.to_string())?
+    {
+        fell_core::Store::remember_imap_connection(&mailbox, previous)
+            .map_err(|err| err.to_string())?;
+    }
     let mut staged = stage_account_text_at(path, &config.render(), !configured, lock)?;
+    staged.credential_journal = credential_journal;
+    if configured && let Some((_, snapshot, _)) = &current {
+        staged.backup = Some(stage_account_file(&staged.path, snapshot)?);
+    }
     if let Some((id, snapshot)) = keep {
         staged.keep = Some((registry, base, id, snapshot));
     } else if !configured && save != AccountSave::Reconnect {
@@ -398,53 +490,119 @@ pub(crate) struct StagedAccountConfig {
     path: PathBuf,
     file: tempfile::NamedTempFile,
     first_run: bool,
+    backup: Option<tempfile::NamedTempFile>,
     lock: fs::File,
     original: Option<(Registry, PathBuf, String)>,
     keep: Option<(Registry, PathBuf, String, String)>,
+    credential_journal: Option<crate::credential_recovery::Journal>,
 }
 
 impl StagedAccountConfig {
+    pub(crate) fn back_up_credential(
+        &self,
+        key: &str,
+        previous: &str,
+    ) -> Result<crate::credential_recovery::Journal, AccountFileError> {
+        let journal = self
+            .credential_journal
+            .as_ref()
+            .ok_or("No private state directory for account password recovery.")?;
+        journal
+            .record(key, previous)
+            .map_err(|error| format!("Couldn't back up the account password. {error}"))?;
+        Ok(journal.clone())
+    }
+
     pub(crate) fn publish(self) -> Result<PathBuf, AccountFileError> {
-        let marker = match self.original {
-            Some((registry, base, id)) => registry
-                .initialize_original(&self.lock, &base, &id)
-                .map_err(|err| err.to_string())?,
-            None => None,
-        };
-        let installed = if self.first_run {
-            self.file.persist_noclobber(&self.path)
-        } else {
-            self.file.persist(&self.path)
-        };
-        if let Err(error) = installed {
-            if let Some(marker) = marker {
-                fs::remove_file(&marker)
-                    .and_then(|()| self.lock.sync_all())
-                    .map_err(|err| format!("{}: {err}", marker.display()))?;
+        self.publish_then(None, |result, _| result)
+    }
+
+    pub(crate) fn publish_then<T>(
+        self,
+        journal: Option<&crate::credential_recovery::Journal>,
+        finish: impl FnOnce(Result<PathBuf, AccountFileError>, bool) -> T,
+    ) -> T {
+        let mut published = false;
+        let result = (|| {
+            let marker = match self.original {
+                Some((registry, base, id)) => registry
+                    .initialize_original(&self.lock, &base, &id)
+                    .map_err(|err| err.to_string())?,
+                None => None,
+            };
+            let installed = if self.first_run {
+                self.file.persist_noclobber(&self.path)
+            } else {
+                self.file.persist(&self.path)
+            };
+            if let Err(error) = installed {
+                if let Some(marker) = marker {
+                    fs::remove_file(&marker)
+                        .and_then(|()| self.lock.sync_all())
+                        .map_err(|err| format!("{}: {err}", marker.display()))?;
+                }
+                return Err(
+                    if self.first_run && error.error.kind() == std::io::ErrorKind::AlreadyExists {
+                        AccountFileError::AlreadyConfigured
+                    } else {
+                        format!("{}: {}", self.path.display(), error.error).into()
+                    },
+                );
             }
-            return Err(
-                if self.first_run && error.error.kind() == std::io::ErrorKind::AlreadyExists {
-                    AccountFileError::AlreadyConfigured
-                } else {
-                    format!("{}: {}", self.path.display(), error.error).into()
-                },
-            );
-        }
-        self.lock.sync_all().map_err(|err| err.to_string())?;
-        if let Some((registry, base, id, snapshot)) = self.keep
-            && let Err(error) = registry.keep_for_replacement(&self.lock, &base, &id, &snapshot)
-        {
-            // If disconnect never happened, roll back the new account file.
-            // A completed disconnect leaves the old mailbox available to reconnect.
-            let old = registry.path(&id).map_err(|err| err.to_string())?;
-            if accounts::path_exists(&old).map_err(|err| err.to_string())? {
-                fs::remove_file(&self.path)
-                    .and_then(|()| self.lock.sync_all())
-                    .map_err(|err| format!("{error}; couldn't roll back the new account: {err}"))?;
+            published = true;
+            let journal_dir = self.lock.sync_all().and_then(|()| {
+                journal
+                    .map(crate::credential_recovery::Journal::mark_published)
+                    .transpose()
+            });
+            match journal_dir {
+                Ok(Some(directory)) => {
+                    // The flag is installed. Keep the account and password
+                    // together even if syncing its directory fails.
+                    directory.sync_all().map_err(|err| err.to_string())?;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let rollback = match self.backup {
+                        Some(backup) => backup
+                            .persist(&self.path)
+                            .map(|_| ())
+                            .map_err(|err| err.error),
+                        None if self.first_run => fs::remove_file(&self.path),
+                        None => return Err(error.to_string().into()),
+                    };
+                    rollback.map_err(|err| {
+                        format!("{error}; couldn't restore the account file: {err}")
+                    })?;
+                    published = false;
+                    if let Some(marker) = marker {
+                        fs::remove_file(marker).map_err(|err| err.to_string())?;
+                    }
+                    self.lock.sync_all().map_err(|err| err.to_string())?;
+                    return Err(error.to_string().into());
+                }
             }
-            return Err(error.into());
-        }
-        Ok(self.path)
+            if let Some((registry, base, id, snapshot)) = self.keep
+                && let Err(error) = registry.keep_for_replacement(&self.lock, &base, &id, &snapshot)
+            {
+                // If disconnect never happened, roll back the new account file.
+                // A completed disconnect leaves the old mailbox available to reconnect.
+                let old = registry.path(&id).map_err(|err| err.to_string())?;
+                if accounts::path_exists(&old).map_err(|err| err.to_string())? {
+                    fs::remove_file(&self.path).map_err(|err| {
+                        format!("{error}; couldn't roll back the new account: {err}")
+                    })?;
+                    published = false;
+                    self.lock.sync_all().map_err(|err| err.to_string())?;
+                }
+                return Err(error.into());
+            }
+            Ok(self.path)
+        })();
+        // The registry lock also covers retiring or rolling back the credential.
+        let output = finish(result, published);
+        drop(self.lock);
+        output
     }
 }
 
@@ -455,7 +613,11 @@ pub(crate) fn stage_account_config_at(
     first_run: bool,
 ) -> Result<StagedAccountConfig, AccountFileError> {
     let lock = lock_account_dir(&path)?;
-    stage_account_text_at(path, &config.render(), first_run, lock)
+    let dir = path.parent().expect("account file has a parent directory");
+    let journal = crate::credential_recovery::Journal::at(&dir.join("state"), dir);
+    let mut staged = stage_account_text_at(path, &config.render(), first_run, lock)?;
+    staged.credential_journal = Some(journal);
+    Ok(staged)
 }
 
 /// Import only the addresses the user checked, preserving comments and
@@ -529,8 +691,6 @@ fn stage_account_text_at(
     first_run: bool,
     lock: fs::File,
 ) -> Result<StagedAccountConfig, AccountFileError> {
-    use std::io::Write;
-
     if first_run {
         match path.symlink_metadata() {
             Ok(_) => return Err(AccountFileError::AlreadyConfigured),
@@ -538,20 +698,32 @@ fn stage_account_text_at(
             Err(err) => return Err(format!("{}: {err}", path.display()).into()),
         }
     }
+    let file = stage_account_file(&path, config)?;
+    Ok(StagedAccountConfig {
+        path,
+        file,
+        first_run,
+        backup: None,
+        lock,
+        original: None,
+        keep: None,
+        credential_journal: None,
+    })
+}
+
+fn stage_account_file(
+    path: &Path,
+    config: &str,
+) -> Result<tempfile::NamedTempFile, AccountFileError> {
+    use std::io::Write;
+
     let dir = path.parent().expect("account file has a parent directory");
     let mut file =
         tempfile::NamedTempFile::new_in(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
     file.write_all(config.as_bytes())
         .and_then(|()| file.as_file().sync_all())
         .map_err(|err| format!("{}: {err}", file.path().display()))?;
-    Ok(StagedAccountConfig {
-        path,
-        file,
-        first_run,
-        lock,
-        original: None,
-        keep: None,
-    })
+    Ok(file)
 }
 
 fn fallback(error: String) -> (Store, Opened) {
@@ -576,7 +748,7 @@ fn fallback(error: String) -> (Store, Opened) {
 fn prepare(store: &Store, config: Option<&AccountConfig>, demo: bool) -> fell_core::Result<Opened> {
     if let Some(config) = config {
         let account = config.account();
-        store.configure_account(&account, config.write_back)?;
+        store.configure_connection(config)?;
         return Ok(Opened {
             account,
             sync: SyncKind::Connecting,
@@ -839,10 +1011,7 @@ mod tests {
         let other = registry.mailbox_path(&base, "mail-2").unwrap();
         open_at(&other).unwrap();
         assert_eq!(next_account_id().unwrap(), "mail-3");
-        assert_eq!(
-            retained_mailbox("Kept@example.test").as_deref(),
-            Some("mail")
-        );
+        assert_eq!(retained_mailbox(&config).as_deref(), Some("mail"));
         assert!(stage_account_config(&mut config, AccountSave::Update).is_err());
         config.email = "different@example.test".into();
         assert!(stage_account_config(&mut config, AccountSave::Reconnect).is_err());
@@ -892,6 +1061,7 @@ mod tests {
             .publish()
             .unwrap();
         assert_eq!(registry.get(&old_id).unwrap().unwrap().port, 1234);
+        assert!(old_store.agent_grant(&old_id, "atlas").unwrap().enabled);
         let mut replacement = original.clone();
         replacement.email = "new@example.test".into();
         assert!(matches!(
@@ -930,7 +1100,86 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert!(can_reconnect("work", &original.email));
+        assert!(can_reconnect(&original));
+        let mut wrong_login = original.clone();
+        wrong_login.username = "another-user".into();
+        assert!(!can_reconnect(&wrong_login));
+        assert!(stage_account_config(&mut wrong_login, AccountSave::Reconnect).is_err());
+    }
+
+    #[test]
+    fn changing_only_the_imap_login_keeps_the_original_mailbox_reconnectable() {
+        let Some(_root) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let registry = Registry::resolve().unwrap();
+        let base = store_path().unwrap();
+        let mut old = AccountConfig::bridge(
+            "mail@example.test",
+            "before",
+            fell_core::PasswordSource::Inline("fixture".into()),
+        );
+        old.write_back = true;
+        stage_account_config(&mut old, AccountSave::New)
+            .unwrap()
+            .publish()
+            .unwrap();
+        let previous_path = registry.configured_store_path(&base, &old).unwrap();
+        let store = open_at(&previous_path).unwrap();
+        store.configure_connection(&old).unwrap();
+        rusqlite::Connection::open(&previous_path).unwrap().execute(
+            "INSERT INTO server_outbox (account_id, kind, state, message_id, source_folder, source_mailbox,
+                uidvalidity, uid, target_folder, created_unix)
+             VALUES (?1, 'move', 'pending', 'kept@example.test', 'INBOX', 'INBOX', 1, 2, 'Archive', 0)",
+             [&old.id],
+        ).unwrap();
+
+        let mut edited = old.clone();
+        edited.username = "after".into();
+        let (_, identity) = registry
+            .get_with_identity(&old.account().id)
+            .unwrap()
+            .unwrap();
+        assert!(stage_connection_config(&mut edited, AccountSave::Update, Some(identity)).is_err());
+        let staged =
+            stage_connection_config(&mut edited, AccountSave::ReplaceMailbox, Some(identity))
+                .unwrap();
+        assert_ne!(&edited.id, &old.id);
+        assert_eq!(registry.get(&old.account().id).unwrap(), Some(old.clone()));
+        staged.publish().unwrap();
+        assert_eq!(
+            accounts::mailbox_owner(&previous_path).unwrap(),
+            Some((old.id.clone(), old.email.clone()))
+        );
+        assert_ne!(
+            registry.configured_store_path(&base, &edited).unwrap(),
+            previous_path
+        );
+        assert!(
+            store
+                .configure_connection(&AccountConfig {
+                    id: old.id.clone(),
+                    ..edited.clone()
+                })
+                .is_err()
+        );
+        assert!(can_reconnect(&old));
+        edited.id.clone_from(&old.id);
+        assert!(!can_reconnect(&edited));
+        let kept = registry.load_with_removals(&base).disconnected;
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].email, old.email);
+        let mut reconnect = registry.reconnect_config(&base, &old.id).unwrap();
+        reconnect.password = fell_core::PasswordSource::Inline("reconnected".into());
+        reconnect.write_back = false;
+        stage_account_config(&mut reconnect, AccountSave::Reconnect)
+            .unwrap()
+            .publish()
+            .unwrap();
+        let saved = registry.get(&old.account().id).unwrap().unwrap();
+        assert!(saved.write_back);
+        store.configure_connection(&saved).unwrap();
+        assert_eq!(store.queued_write_count(&old.account().id).unwrap(), 1);
     }
 
     #[test]

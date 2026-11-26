@@ -8,6 +8,7 @@ pub mod render;
 mod attachments;
 pub mod compose_launch;
 mod compose_ui;
+mod credential_recovery;
 pub mod draft_host;
 mod embeddings;
 mod fixtures;

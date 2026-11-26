@@ -48,6 +48,7 @@ use crate::store::Store;
 use crate::{Error, Result};
 
 pub(crate) mod drafts;
+pub(crate) mod endpoint;
 pub(crate) mod flags;
 pub(crate) mod labels;
 
@@ -134,6 +135,12 @@ CREATE INDEX IF NOT EXISTS idx_server_outbox_message ON server_outbox(account_id
 /// Columns added after the tables first shipped on a branch build.
 const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("server_outbox", "keyword_parent", "INTEGER"),
+    ("server_outbox", "held_endpoint", "TEXT"),
+    ("server_outbox", "held_server", "TEXT"),
+    ("server_outbox", "held_from", "TEXT"),
+    ("server_outbox", "held_source_epoch", "INTEGER"),
+    ("server_outbox", "held_target_epoch", "INTEGER"),
+    ("server_outbox", "target_role", "TEXT"),
     (
         "write_back_accounts",
         "generation",
@@ -275,6 +282,8 @@ pub enum OutboxState {
     Dropped,
     /// A server copy Fell left in place. Reported once, then Dropped.
     Abandoned,
+    /// The IMAP endpoint changed. Keep the write and its original UID context.
+    Held,
 }
 
 impl OutboxState {
@@ -284,6 +293,7 @@ impl OutboxState {
             Self::Done => "done",
             Self::Dropped => "dropped",
             Self::Abandoned => "abandoned",
+            Self::Held => "held",
         }
     }
 
@@ -295,6 +305,7 @@ impl OutboxState {
             "done" => Ok(Self::Done),
             "dropped" => Ok(Self::Dropped),
             "abandoned" => Ok(Self::Abandoned),
+            "held" => Ok(Self::Held),
             other => Err(Error::Action(format!("unknown outbox state {other}"))),
         }
     }
@@ -314,6 +325,7 @@ pub struct OutboxEntry {
     pub uid: Option<u32>,
     pub target_folder: String,
     pub target_mailbox: Option<String>,
+    pub(crate) target_role: Option<FolderRole>,
     pub placed_uidvalidity: Option<u32>,
     pub placed_uid: Option<u32>,
     pub attempts: u32,
@@ -420,7 +432,7 @@ const ENTRY_COLS: &str = "id, kind, state, action_id, message_id, source_folder,
     uidvalidity, uid, target_folder, target_mailbox, placed_uidvalidity, placed_uid,
     attempts, retry_unix, error, generation, sent, reverses,
     flag_value, flag_modseq, flag_base, target_uidvalidity, target_uidnext, move_recovery_end,
-    trash_purge_action_id";
+    trash_purge_action_id, target_role";
 
 impl Store {
     /// Turn write-back on or off for the account (`write_back` in
@@ -506,6 +518,31 @@ pub(crate) fn set_write_back_on(
     Ok(())
 }
 
+pub(crate) fn hold_for_endpoint_change(
+    conn: &Connection,
+    account_id: &AccountId,
+    endpoint: Option<&str>,
+    server: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE server_outbox SET state = 'held', held_endpoint = ?2, held_server = ?3,
+             held_from = CASE WHEN kind = 'unflag_trash' OR generation = (
+                 SELECT generation FROM write_back_accounts WHERE account_id = ?1
+             ) THEN state END
+         WHERE account_id = ?1 AND (
+             state IN ('pending', 'abandoned')
+             OR (state = 'dropped' AND kind = 'append_draft' AND append_checks > 0)
+         )",
+        params![account_id.as_str(), endpoint, server],
+    )?;
+    conn.execute(
+        "UPDATE write_back_accounts SET generation = generation + 1, uidplus = NULL,
+             move_missing = 0, uidplus_missing = 0 WHERE account_id = ?1",
+        [account_id.as_str()],
+    )?;
+    Ok(())
+}
+
 pub(crate) fn ensure_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(OUTBOX_SCHEMA)?;
     drafts::ensure_schema(conn)?;
@@ -521,6 +558,16 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<()> {
             conn.execute_batch(&format!(
                 "ALTER TABLE {table} ADD COLUMN {column} {definition}"
             ))?;
+            if column == &"target_role"
+                && crate::store::copies::table_exists(conn, "local_actions")?
+            {
+                conn.execute_batch(
+                    "UPDATE server_outbox SET target_role = 'archive'
+                     WHERE kind = 'move' AND action_id IN (
+                        SELECT id FROM local_actions WHERE kind = 'archive'
+                     );",
+                )?;
+            }
         }
     }
     conn.execute_batch(
@@ -682,7 +729,7 @@ fn complete_append_in(tx: &Connection, entry: &OutboxEntry) -> Result<bool> {
 pub(crate) fn queue_moves(
     conn: &Connection,
     account_id: &AccountId,
-    action_id: i64,
+    action: &crate::LocalAction,
     messages: &[String],
     from: &str,
     to: &str,
@@ -693,6 +740,18 @@ pub(crate) fn queue_moves(
         return Ok(());
     }
     let target = raw_name(conn, account_id, roles, to)?;
+    let target_role = match action.kind {
+        crate::ActionKind::Archive => Some(FolderRole::Archive),
+        crate::ActionKind::Delete => Some(FolderRole::Trash),
+        crate::ActionKind::Spam | crate::ActionKind::NotSpam => {
+            Some(if roles.name(FolderRole::Inbox).eq_ignore_ascii_case(to) {
+                FolderRole::Inbox
+            } else {
+                FolderRole::Junk
+            })
+        }
+        _ => roles.role_of(to),
+    };
     let source = raw_name(conn, account_id, roles, from)?;
     let now = now_unix();
     let generation = generation(conn, account_id)?;
@@ -710,7 +769,7 @@ pub(crate) fn queue_moves(
                 // Sent, but the server did not say where the copy went: a
                 // sync pass records it.
                 OutboxState::Done => !placed && copies.is_empty(),
-                OutboxState::Dropped | OutboxState::Abandoned => false,
+                OutboxState::Dropped | OutboxState::Abandoned | OutboxState::Held => false,
             },
             _ => false,
         };
@@ -719,13 +778,14 @@ pub(crate) fn queue_moves(
                 conn,
                 account_id,
                 &NewRow {
-                    action_id: Some(action_id),
+                    action_id: Some(action.id),
                     message_id,
                     source_folder: from,
                     source_mailbox: Some(&mailbox),
                     copy: Some((uidvalidity, uid)),
                     target_folder: to,
                     target_mailbox: target.as_deref(),
+                    target_role,
                     reverses: None,
                 },
                 now,
@@ -736,13 +796,14 @@ pub(crate) fn queue_moves(
                 conn,
                 account_id,
                 &NewRow {
-                    action_id: Some(action_id),
+                    action_id: Some(action.id),
                     message_id,
                     source_folder: from,
                     source_mailbox: source.as_deref(),
                     copy: None,
                     target_folder: to,
                     target_mailbox: target.as_deref(),
+                    target_role,
                     reverses: None,
                 },
                 now,
@@ -917,6 +978,7 @@ fn queue_reverse_of_unsettled(
             copy: None,
             target_folder: &entry.source_folder,
             target_mailbox: entry.source_mailbox.as_deref(),
+            target_role: None,
             reverses: Some(entry.id),
         },
         now,
@@ -942,6 +1004,7 @@ pub(crate) fn queue_reverse(
             copy,
             target_folder: &entry.source_folder,
             target_mailbox: entry.source_mailbox.as_deref(),
+            target_role: None,
             reverses: None,
         },
         now,
@@ -956,6 +1019,7 @@ struct NewRow<'a> {
     copy: Option<(u32, u32)>,
     target_folder: &'a str,
     target_mailbox: Option<&'a str>,
+    target_role: Option<FolderRole>,
     reverses: Option<i64>,
 }
 
@@ -964,11 +1028,11 @@ fn insert(conn: &Connection, account_id: &AccountId, row: &NewRow<'_>, now: i64)
         "INSERT INTO server_outbox
             (account_id, kind, state, action_id, message_id, source_folder, source_mailbox,
              uidvalidity, uid, target_folder, target_mailbox, created_unix, generation,
-             reverses)
+             reverses, target_role)
          VALUES (?1, ?2, 'pending', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
                  (SELECT COALESCE(MAX(generation), 0) FROM write_back_accounts
                   WHERE account_id = ?1),
-                 ?12)",
+                 ?12, ?13)",
         params![
             account_id.as_str(),
             OutboxKind::Move.as_str(),
@@ -982,6 +1046,7 @@ fn insert(conn: &Connection, account_id: &AccountId, row: &NewRow<'_>, now: i64)
             row.target_mailbox,
             now,
             row.reverses.unwrap_or(0),
+            row.target_role.map(FolderRole::key),
         ],
     )?;
     Ok(())
@@ -1113,6 +1178,7 @@ fn select_entries(
                 (row.get::<_, u32>(22)?, row.get::<_, u32>(23)?),
                 row.get::<_, Option<u32>>(24)?,
                 row.get::<_, Option<i64>>(25)?,
+                row.get::<_, Option<String>>(26)?,
             ),
         ))
     })?;
@@ -1145,6 +1211,7 @@ fn select_entries(
                 target_bound,
                 move_recovery_end,
                 trash_purge_action_id,
+                target_role,
             ),
         ) = row?;
         out.push(OutboxEntry {
@@ -1159,6 +1226,7 @@ fn select_entries(
             uid,
             target_folder,
             target_mailbox,
+            target_role: target_role.as_deref().and_then(FolderRole::from_key),
             placed_uidvalidity,
             placed_uid,
             attempts,
@@ -1187,15 +1255,21 @@ pub(crate) fn unfinished(
     store: &Store,
     account_id: &AccountId,
     write_back: bool,
+    expected: Option<&crate::AccountConfig>,
 ) -> Result<Vec<OutboxEntry>> {
     let tx = crate::store::immediate_transaction(store.connection())?;
+    if let Some(config) = expected
+        && !crate::store::matches_imap_connection(&tx, config)?
+    {
+        return Ok(Vec::new());
+    }
     ensure_schema(&tx)?;
     let allow_writes = i64::from(write_back && enabled(&tx, account_id)?);
     tx.execute(
         "DELETE FROM server_outbox AS settled
          WHERE account_id = ?1 AND state IN ('done', 'dropped') AND settled_unix < ?2
            AND NOT EXISTS (SELECT 1 FROM server_outbox pending
-                           WHERE pending.reverses = settled.id AND pending.state = 'pending')
+                           WHERE pending.reverses = settled.id AND pending.state IN ('pending', 'held'))
            AND NOT (kind = 'append_draft' AND state = 'dropped' AND append_checks > 0 AND generation = ?3)",
         params![account_id.as_str(), now_unix() - KEEP_SETTLED_SECS, generation(&tx, account_id)?],
     )?;

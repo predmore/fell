@@ -150,6 +150,27 @@ pub struct AccountConfig {
 }
 
 impl AccountConfig {
+    pub fn same_mailbox(&self, other: &Self) -> bool {
+        self.email.eq_ignore_ascii_case(&other.email) && self.username == other.username
+    }
+
+    pub fn same_imap_endpoint(&self, other: &Self) -> bool {
+        self.backend == other.backend
+            && self.host.eq_ignore_ascii_case(&other.host)
+            && self.port == other.port
+            && self.security == other.security
+    }
+
+    pub(crate) fn imap_endpoint_key(&self) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            self.backend.as_str(),
+            security_name(self.security),
+            self.port,
+            self.host.to_ascii_lowercase(),
+        )
+    }
+
     pub fn same_except_identities(&self, other: &Self) -> bool {
         let mut current = self.clone();
         current.identities.clone_from(&other.identities);
@@ -627,13 +648,20 @@ impl AccountConfig {
     }
 
     fn backend_with_senders(&self, senders: SmtpSenders) -> Result<Box<dyn MailBackend + Send>> {
+        Ok(self.backend_with_imap(self.imap_config()?, senders))
+    }
+
+    pub(crate) fn backend_with_imap(
+        &self,
+        imap: ImapConfig,
+        senders: SmtpSenders,
+    ) -> Box<dyn MailBackend + Send> {
         let account_id = AccountId(self.id.clone());
-        let imap = self.imap_config()?;
         let smtp = SmtpConfig {
             senders,
             ..self.smtp_config()
         };
-        Ok(match self.backend {
+        match self.backend {
             BackendKind::Imap => Box::new(ImapBackend {
                 account_id,
                 config: imap,
@@ -644,7 +672,7 @@ impl AccountConfig {
                 imap,
                 smtp,
             }),
-        })
+        }
     }
 
     /// Whether a newly sent message should be queued for IMAP APPEND.
@@ -663,19 +691,24 @@ impl AccountConfig {
     /// delete mark and report server copies left in place.
     pub fn replay_outbox(&self, store: &crate::Store) -> Result<crate::ReplayReport> {
         let account_id = AccountId(self.id.clone());
+        if !store.matches_imap_connection(self)? {
+            return Ok(crate::ReplayReport::default());
+        }
         let append_sent = self.append_sent();
-        let report = if crate::outbox::any_due(store, &account_id, self.write_back, append_sent)? {
-            crate::imap::replay_outbox(
-                &self.imap_config()?,
-                &account_id,
-                store,
-                self.write_back,
-                append_sent,
-            )?
+        let report = if crate::outbox::any_due(store, &account_id, self.write_back, append_sent)?
+            || crate::outbox::endpoint::can_resume(store, self)?
+        {
+            crate::imap::replay_account_outbox(self, &account_id, store)?
         } else {
             crate::ReplayReport::default()
         };
         crate::outbox::report_for_status(store, &account_id, report)
+    }
+
+    /// Re-queue held changes whose exact Message-ID exists on this server.
+    /// Returns the number re-queued. The rest stay available to discard.
+    pub fn resend_held_writes(&self, store: &crate::Store) -> Result<usize> {
+        crate::imap::resend_held_writes(self, store)
     }
 
     /// Log in and log out again without reading mail. Returns the number of
@@ -780,7 +813,7 @@ impl AccountConfig {
     /// Bind the credential to both endpoints as well as the local account
     /// identity (the default id `mail` is shared by every account file).
     /// Changing display name or folder settings keeps the same credential.
-    fn credential_key(&self) -> String {
+    pub fn credential_key(&self) -> String {
         let smtp = self.smtp_config();
         let mut hash = Sha256::new();
         for field in [
@@ -801,7 +834,7 @@ impl AccountConfig {
         format!("{:x}", hash.finalize())
     }
 
-    pub(crate) fn resolve_password_with(&self, store: &dyn PasswordStore) -> Result<String> {
+    pub fn resolve_password_with(&self, store: &dyn PasswordStore) -> Result<String> {
         match &self.password {
             PasswordSource::Inline(password) => Ok(password.clone()),
             PasswordSource::Keyring => Ok(store.read(&self.credential_key())?),

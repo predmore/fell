@@ -17,14 +17,16 @@ pub(super) enum Connection {
     Verified,
     BridgeOffline,
     BothFailed,
+    EditFailed,
 }
 
 impl Connection {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Testing,
         Self::Verified,
         Self::BridgeOffline,
         Self::BothFailed,
+        Self::EditFailed,
     ];
 
     pub fn heading(self) -> (&'static str, &'static str) {
@@ -33,6 +35,10 @@ impl Connection {
             Self::Verified => ("Verified", "Both sign-ins work."),
             Self::BridgeOffline => ("Sign-in failed", "Open Bridge and sign in."),
             Self::BothFailed => ("Sign-in failed", "Both sign-ins failed."),
+            Self::EditFailed => (
+                "Connection check failed",
+                "Go back to fix the settings, or review saving anyway.",
+            ),
         }
     }
 }
@@ -112,18 +118,18 @@ impl SaveState {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(super) struct Action {
     pub control: Control,
-    pub label: &'static str,
+    pub label: gpui::SharedString,
     pub enabled: bool,
 }
 
 impl Action {
-    fn new(control: Control, label: &'static str) -> Self {
+    fn new(control: Control, label: impl Into<gpui::SharedString>) -> Self {
         Self {
             control,
-            label,
+            label: label.into(),
             enabled: true,
         }
     }
@@ -145,6 +151,7 @@ impl Connection {
         let (secondary, primary) = match self {
             Self::Testing => (None, Some(next("Testing…").disabled())),
             Self::BothFailed => (None, None),
+            Self::EditFailed => (None, Some(next("Save anyway…"))),
             Self::Verified => (None, Some(next("Continue"))),
             Self::BridgeOffline => (
                 Some(Action::new(Control::Install, "Install Bridge ↗")),
@@ -155,7 +162,7 @@ impl Connection {
     }
 }
 
-fn save_actions(storage: &Storage, retained_mailbox: bool) -> [Option<Action>; 3] {
+fn save_actions(storage: &Storage, form: Option<&Form>) -> [Option<Action>; 3] {
     let back = Action::new(Control::Back, "Back");
     let use_keyring = Action::new(Control::Back, "Use keyring");
     let next = |label| Action::new(Control::Next, label);
@@ -167,17 +174,37 @@ fn save_actions(storage: &Storage, retained_mailbox: bool) -> [Option<Action>; 3
         ],
         Storage::ConfirmInline(_) => [Some(use_keyring), None, Some(next("Save in file"))],
         _ if storage.must_reopen() => [None, None, Some(next("Quit"))],
-        _ if storage.inline_available() => [
+        _ if form.is_some_and(Form::inline_available) => [
             Some(back),
             Some(Action::new(Control::Inline, "Save in file…")),
             Some(next("Retry keyring")),
         ],
-        Storage::Keyring if retained_mailbox => [
+        Storage::Keyring if form.is_some_and(|form| form.reconnect_to.is_some()) => {
+            [Some(back), None, Some(next("Reconnect"))]
+        }
+        Storage::Keyring if form.is_some_and(|form| form.retained_mailbox.is_some()) => [
             Some(back),
             Some(next("Start empty")),
             Some(Action::new(Control::Reconnect, "Reconnect")),
         ],
-        _ => [Some(back), None, Some(next("Save account"))],
+        _ => {
+            if let Some(form) = form.filter(|form| form.replacement()) {
+                let address = crate::present::display_safe(form.text(Field::Email).trim());
+                return [
+                    Some(back),
+                    None,
+                    Some(Action::new(Control::Next, format!("Switch to {address}"))),
+                ];
+            }
+            let label = if form.is_some_and(|form| form.failed_check) {
+                "Save anyway"
+            } else if form.is_some_and(|form| form.previous.is_some()) {
+                "Save changes"
+            } else {
+                "Save account"
+            };
+            [Some(back), None, Some(next(label))]
+        }
     }
 }
 
@@ -251,21 +278,28 @@ impl<T: PartialEq> Change<T> {
     }
 }
 
-impl<T: Copy> Change<T> {
-    pub(super) fn layers(&self) -> Option<(T, [f32; 2], f32)> {
+impl<T> Change<T> {
+    fn layers_ref(&self) -> Option<(&T, [f32; 2], f32)> {
         let (old, _, from) = self.swap.as_ref()?;
         Some(match self.frame.as_ref()? {
             SwapFrame::Leaving(alpha) => {
                 let from = motion::lerp(motion::ARRIVE_FROM, 1., *from);
                 let shown = motion::lerp(motion::ARRIVE_FROM, from, *alpha);
-                (*old, [shown, 0.], 0.)
+                (old, [shown, 0.], 0.)
             }
             SwapFrame::Arriving(progress) => (
-                *old,
+                old,
                 [0., motion::lerp(motion::ARRIVE_FROM, 1., *progress)],
                 *progress,
             ),
         })
+    }
+}
+
+impl<T: Copy> Change<T> {
+    pub(super) fn layers(&self) -> Option<(T, [f32; 2], f32)> {
+        self.layers_ref()
+            .map(|(old, alpha, progress)| (*old, alpha, progress))
     }
 }
 
@@ -336,7 +370,7 @@ pub(in crate::onboarding) struct Feedback {
     pub(super) connection_actions: Actions,
     pub(super) save_actions: Actions,
     pub(super) primary: Option<Action>,
-    primary_label: Change<Option<&'static str>>,
+    primary_label: Change<Option<gpui::SharedString>>,
     pub(super) save_title: Change<&'static str>,
     pub(super) save_subtitle: Change<&'static str>,
     pub(super) save_note: Change<SaveState>,
@@ -406,7 +440,7 @@ impl Feedback {
         for (action, value) in self
             .save_actions
             .iter_mut()
-            .zip(save_actions(&Storage::Keyring, false))
+            .zip(save_actions(&Storage::Keyring, None))
         {
             *action = Change {
                 value,
@@ -460,13 +494,13 @@ impl Feedback {
         }
     }
 
-    pub(super) fn primary_label_frame(
-        &self,
-        label: &'static str,
-        width: impl Fn(&'static str) -> f32,
-    ) -> (&'static str, f32, f32) {
+    pub(super) fn primary_label_frame<'a>(
+        &'a self,
+        label: &'a str,
+        width: impl Fn(&str) -> f32,
+    ) -> (&'a str, f32, f32) {
         let target = width(label);
-        match self.primary_label.layers() {
+        match self.primary_label.layers_ref() {
             Some((Some(old), [out, _], _)) if out > 0. => (old, out, width(old).max(target)),
             Some((Some(old), [_, arrival], progress)) => (
                 label,
@@ -495,6 +529,8 @@ impl Feedback {
         if form.step == Step::Connection {
             let state = if form.connected() {
                 Connection::Verified
+            } else if form.failed_check {
+                Connection::EditFailed
             } else if form.can_retry() {
                 Connection::BridgeOffline
             } else if form.checks == [Check::Failed; 2] {
@@ -525,8 +561,7 @@ impl Feedback {
             self.save_title.replace(title, motion, now);
             self.save_subtitle.replace(subtitle, motion, now);
             self.save_note.replace(state, motion, now);
-            let [back, secondary, next] =
-                save_actions(&form.storage, form.retained_mailbox.is_some());
+            let [back, secondary, next] = save_actions(&form.storage, Some(form));
             primary = next;
             for (action, value) in self.save_actions.iter_mut().zip([back, secondary]) {
                 action.update_optional(value, false, motion, now);
@@ -539,8 +574,8 @@ impl Feedback {
                     .map(|fade| (self.back_amount, fade));
             }
         }
+        let label = primary.as_ref().map(|action| action.label.clone());
         self.primary = primary;
-        let label = primary.map(|action| action.label);
         self.primary_label
             .update(label, motion, now, STEP_OUT, motion::QUICK);
         if self.back_tint.is_some_and(|(_, fade)| !fade.running(now)) {
@@ -636,7 +671,7 @@ mod tests {
         feedback.refresh(&form, Bridge::Checking, motion, now);
         feedback.settle();
         form.step = Step::Connection;
-        let measure = |label| if label == "Testing…" { 90. } else { 140. };
+        let measure = |label: &str| if label == "Testing…" { 90. } else { 140. };
 
         let mut last_width = 140.;
         for elapsed in 0..140 {

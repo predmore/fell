@@ -17,6 +17,14 @@ use crate::model::settings::AccountRemovalKind;
 use crate::model::{Overlay, PickerChoice, SyncKind};
 use crate::motion::{self, Transition};
 
+pub(super) fn held_changes_label(count: usize) -> String {
+    if count == 1 {
+        "1 change not synced".into()
+    } else {
+        format!("{count} changes not synced")
+    }
+}
+
 pub(super) struct AccountWindow {
     active: Entity<Inbox>,
     active_id: Option<String>,
@@ -26,10 +34,17 @@ pub(super) struct AccountWindow {
     preparing_removal: HashSet<String>,
     removing: HashMap<String, (RequestedRemoval, Option<AccountDraftRemoval>)>,
     catalog: Accounts,
+    pub(super) replacement: Option<Replacement>,
     picker_clock: motion::Clock,
     picker_exit: Option<PickerExit>,
     active_changed: (oneshot::Sender<()>, Shared<oneshot::Receiver<()>>),
     _compose_listener: Option<gpui::Task<()>>,
+}
+
+pub(super) struct Replacement {
+    pub old_id: String,
+    pub old_email: String,
+    pub path: Option<PathBuf>,
 }
 
 struct PickerExit {
@@ -86,6 +101,7 @@ impl AccountWindow {
             preparing_removal: HashSet::new(),
             removing: HashMap::new(),
             catalog: Accounts::default(),
+            replacement: None,
             picker_clock: motion::Clock::default(),
             picker_exit: None,
             active_changed: Self::active_signal(),
@@ -251,6 +267,15 @@ impl AccountWindow {
         cx: &mut Context<Self>,
     ) {
         accounts.retain_temporarily_unavailable(&self.catalog);
+        if self.replacement.as_ref().is_some_and(|replacement| {
+            replacement
+                .path
+                .as_ref()
+                .is_none_or(|path| !accounts.entries.iter().any(|entry| &entry.path == path))
+        }) {
+            return;
+        }
+        let replacement = self.replacement.take();
         let changed = self.catalog != accounts;
         if changed {
             let old_configs: Vec<_> = self.catalog.configs().cloned().collect();
@@ -259,8 +284,24 @@ impl AccountWindow {
                     continue;
                 };
                 let current = accounts.configs().find(|config| config.id == old.id);
+                let file_identity = |catalog: &Accounts| {
+                    catalog
+                        .entries
+                        .iter()
+                        .find(|entry| {
+                            entry
+                                .config
+                                .as_ref()
+                                .is_ok_and(|config| config.id == old.id)
+                        })
+                        .and_then(|entry| entry.file_identity)
+                };
                 match current {
-                    Some(current) if old.same_except_identities(current) => {
+                    Some(current)
+                        if old.same_except_identities(current)
+                            && (old.identities != current.identities
+                                || file_identity(&self.catalog) == file_identity(&accounts)) =>
+                    {
                         if old.identities != current.identities {
                             view.update(cx, |inbox, cx| inbox.set_settings_identities(current, cx));
                         }
@@ -323,13 +364,23 @@ impl AccountWindow {
                 )
             });
         let mut switched = false;
-        if self.active_id.is_none() || removed.is_some() {
+        if self.active_id.is_none() || removed.is_some() || replacement.is_some() {
             let usable = |config: &fell_core::AccountConfig| {
                 self.views
                     .get(&config.id)
                     .is_some_and(|view| view.read(cx).session.sync != SyncKind::StoreError)
             };
-            let next = if let Some(path) = preferred {
+            let next = if let Some(path) = replacement
+                .as_ref()
+                .and_then(|replacement| replacement.path.as_deref())
+            {
+                accounts
+                    .entries
+                    .iter()
+                    .find(|entry| entry.path == path)
+                    .and_then(|entry| entry.config.as_ref().ok())
+                    .filter(|config| usable(config))
+            } else if let Some(path) = preferred {
                 super::settings::selected_account_path(&accounts, path, usable)
                     .and_then(|path| accounts.entries.iter().find(|entry| entry.path == path))
                     .and_then(|entry| entry.config.as_ref().ok())
@@ -342,7 +393,19 @@ impl AccountWindow {
             if let Some(next) = next {
                 self.switch(&next.id, window, cx);
                 switched = true;
-            } else if self.active_id.take().is_some() {
+                if let Some(replacement) = &replacement {
+                    self.notice(
+                        format!(
+                            "Switched to {} · {}’s mail stays on this device",
+                            next.email, replacement.old_email
+                        ),
+                        false,
+                        cx,
+                    );
+                }
+            } else if (removed.is_some() || self.active_id.is_none())
+                && self.active_id.take().is_some()
+            {
                 let startup =
                     mailbox::startup_for(None, false, None, Err("No account configured".into()));
                 self.active = cx.new(|cx| Inbox::with_startup(startup, false, Some(window), cx));
@@ -352,6 +415,9 @@ impl AccountWindow {
             }
         }
         if let Some((id, name)) = removed
+            && replacement
+                .as_ref()
+                .is_none_or(|replacement| replacement.old_id != id)
             && accounts.interrupted.iter().all(|pending| pending.id != id)
             && !accounts.entries.iter().any(|entry| {
                 entry
@@ -700,7 +766,8 @@ impl AccountWindow {
             .views
             .iter()
             .map(|(id, view)| {
-                let session = &view.read(cx).session;
+                let inbox = view.read(cx);
+                let session = &inbox.session;
                 let status = match &session.sync {
                     SyncKind::Failed(failure) => (failure.detail.clone(), true),
                     SyncKind::StoreError => (
@@ -725,7 +792,7 @@ impl AccountWindow {
                         false,
                     ),
                 };
-                (id.clone(), status)
+                (id.clone(), (status.0, status.1, inbox.held_changes))
             })
             .collect();
         let error = self
@@ -757,7 +824,7 @@ impl AccountWindow {
     fn set_choices(
         &self,
         view: &Entity<Inbox>,
-        statuses: &HashMap<String, (String, bool)>,
+        statuses: &HashMap<String, (String, bool, usize)>,
         error: Option<&str>,
         catalog_changed: bool,
         cx: &mut App,
@@ -985,6 +1052,15 @@ pub(super) fn active_inbox(window: &Window, cx: &App) -> Option<Entity<Inbox>> {
         .or_else(|| window.root::<Inbox>().flatten())
 }
 
+pub(super) fn change_held_writes(id: &str, resend: bool, window: &Window, cx: &App) {
+    if let Some(root) = window.root::<AccountWindow>().flatten()
+        && let Some(view) = root.read(cx).views.get(id)
+        && let Some(sync) = &view.read(cx).sync
+    {
+        sync.held_changes(resend);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1007,6 +1083,44 @@ mod tests {
             "email = '{id}@example.test'\npassword = 'fixture'\nport = 1\nnotifications = 'off'\n{suffix}"
         )
         .unwrap();
+    }
+
+    #[test]
+    fn accounts_paints_the_active_account_and_its_connection_actions() {
+        use crate::model::settings::{Page, Row, Section};
+
+        let Some(_temp) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let registry = Registry::resolve().unwrap();
+        std::fs::create_dir_all(registry.directory()).unwrap();
+        write_account(&registry, "mail", "");
+        let mut app = TestAppContext::single();
+        let window = app.add_window(|window, cx| {
+            AccountWindow::new(mailbox::startup(), false, None, window, cx)
+        });
+        window
+            .update(&mut app, |view, _, cx| {
+                view.active.update(cx, |inbox, cx| {
+                    inbox.session.overlay = Overlay::Settings;
+                    inbox.session.settings_nav.page = Page::Section(Section::Accounts);
+                    assert_eq!(
+                        inbox.session.settings_nav.availability.active_account,
+                        Some(0)
+                    );
+                    assert_eq!(
+                        inbox.session.settings_nav.rows(Section::Accounts).next(),
+                        Some(Row::Account(0))
+                    );
+                    cx.notify();
+                });
+            })
+            .unwrap();
+        app.update(|cx| {
+            gpui::AnyWindowHandle::from(window)
+                .update(cx, |_, window, cx| window.draw(cx).clear())
+                .unwrap();
+        });
     }
 
     #[test]
@@ -1136,7 +1250,7 @@ mod tests {
             })
             .unwrap();
         app.run_until_parked();
-        window
+        let reloaded = window
             .update(&mut app, |view, _, cx| {
                 let next = &view.views["work"];
                 assert_ne!(next, &old);
@@ -1144,9 +1258,43 @@ mod tests {
                 assert_eq!(next.read(cx).session.account_name, "New work");
                 check_position(next.read(cx));
                 assert!(!view.stopping.contains("work"));
+                next.clone()
             })
             .unwrap();
         assert!(futures::executor::block_on(store.call(|_| ())).is_err());
+
+        // A keyring-only password change publishes a new file with the same
+        // parsed settings. The file identity still has to trigger a reload.
+        let reopened_store = reloaded.read_with(&app, |inbox, _| inbox.store.clone());
+        futures::executor::block_on(reopened_store.call(|_| ())).unwrap();
+        app.run_until_parked();
+        let (mut unchanged, identity) = registry
+            .get_with_identity(&fell_core::AccountId("work".into()))
+            .unwrap()
+            .unwrap();
+        mailbox::stage_connection_config(
+            &mut unchanged,
+            mailbox::AccountSave::Update,
+            Some(identity),
+        )
+        .unwrap()
+        .publish()
+        .unwrap();
+        window
+            .update(&mut app, |view, window, cx| {
+                view.reconcile(&registry, registry.load(), None, window, cx);
+                assert!(reloaded.read(cx).retired);
+                assert!(!view.views.contains_key("work"));
+            })
+            .unwrap();
+        app.run_until_parked();
+        assert!(futures::executor::block_on(reopened_store.call(|_| ())).is_err());
+        window
+            .update(&mut app, |view, _, cx| {
+                assert_ne!(view.active(), reloaded);
+                check_position(view.active.read(cx));
+            })
+            .unwrap();
     }
 
     #[test]

@@ -172,6 +172,7 @@ impl Drop for BatchLimitGuard {
 
 /// Send the account's queued writes ([`crate::outbox`]) on
 /// a separate `SELECT` session.
+#[cfg(test)]
 pub(crate) fn replay_outbox(
     config: &ImapConfig,
     account_id: &AccountId,
@@ -181,6 +182,24 @@ pub(crate) fn replay_outbox(
 ) -> Result<crate::outbox::ReplayReport, Error> {
     write_back::replay_with(config, account_id, store, write_back, append_sent, &|| {})
 }
+
+pub(crate) fn replay_account_outbox(
+    config: &crate::AccountConfig,
+    account_id: &AccountId,
+    store: &crate::Store,
+) -> Result<crate::ReplayReport, Error> {
+    write_back::replay_bound(
+        &config.imap_config()?,
+        account_id,
+        store,
+        config.write_back,
+        config.append_sent(),
+        &|| {},
+        Some(config),
+    )
+}
+
+pub(crate) use write_back::resend_held_writes;
 
 /// Log in, count selectable mailboxes, and log out. Reads no mail.
 pub(crate) fn check_login(config: &ImapConfig) -> Result<usize, Error> {
@@ -278,12 +297,64 @@ pub(crate) fn fetch_imap(
     cursor: Option<&SyncCursor>,
     known: &KnownCopies<'_>,
     keywords: bool,
-    mut persist: impl FnMut(MailboxDelta) -> Result<(), Error>,
+    persist: impl FnMut(MailboxDelta) -> Result<(), Error>,
 ) -> Result<(), Error> {
     if config.username.is_empty() {
         return Err(Error::Backend("imap username is empty".into()));
     }
-    let mut session = session::Session::open(config)?;
+    let session = session::Session::open(config)?;
+    fetch_on(
+        session, account_id, config, cursor, known, keywords, persist,
+    )
+}
+
+pub(crate) struct BoundRead {
+    session: session::Session,
+    config: ImapConfig,
+}
+
+impl BoundRead {
+    pub(crate) fn open(
+        config: &crate::AccountConfig,
+        imap: ImapConfig,
+        store: &crate::Store,
+    ) -> crate::Result<Self> {
+        let session = session::Session::open(&imap)?;
+        store.observe_imap_server(config)?;
+        Ok(Self {
+            session,
+            config: imap,
+        })
+    }
+
+    pub(crate) fn fetch(
+        self,
+        account: &crate::Account,
+        cursor: Option<&SyncCursor>,
+        known: &KnownCopies<'_>,
+        persist: impl FnMut(MailboxDelta) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        fetch_on(
+            self.session,
+            &account.id,
+            &self.config,
+            cursor,
+            known,
+            account.backend_kind == crate::BackendKind::Imap,
+            persist,
+        )
+    }
+}
+
+fn fetch_on(
+    mut session: session::Session,
+    account_id: &AccountId,
+    config: &ImapConfig,
+    cursor: Option<&SyncCursor>,
+    known: &KnownCopies<'_>,
+    keywords: bool,
+    mut persist: impl FnMut(MailboxDelta) -> Result<(), Error>,
+) -> Result<(), Error> {
     let mut mailboxes = session.list_selectable()?;
     mailboxes.sort_by(|left, right| {
         left.decoded
