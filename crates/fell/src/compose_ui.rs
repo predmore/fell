@@ -27,7 +27,7 @@ use smallvec::SmallVec;
 
 use crate::confirmation_from_ui;
 use crate::mailbox::AccountConfigError;
-use crate::motion::{self, Motion, Transition};
+use crate::motion::{self, Glide, Motion, Transition};
 use crate::present::display_safe;
 use crate::reply_check::{ReplyCheck, ReplyChecks};
 
@@ -345,7 +345,9 @@ pub struct ComposeView {
     raw: bool,
     preview: bool,
     quote_open: bool,
+    quote_capped: bool,
     quote_scroll: gpui::ScrollHandle,
+    quote_glide: Option<Glide>,
     focus: FocusHandle,
     leader: bool,
     leader_at: Option<std::time::Instant>,
@@ -478,7 +480,9 @@ impl ComposeView {
             raw: false,
             preview: false,
             quote_open: false,
+            quote_capped: false,
             quote_scroll: gpui::ScrollHandle::new(),
+            quote_glide: None,
             focus: cx.focus_handle(),
             leader: false,
             leader_at: None,
@@ -1038,6 +1042,7 @@ impl ComposeView {
         self.leader = false;
         self.which_visible = false;
         self.quote_open = false;
+        self.quote_glide = None;
         self.status = "".into();
         self.start_on_recipients_if_empty(&snap);
     }
@@ -1618,6 +1623,17 @@ impl ComposeView {
         match self.editor.mode {
             Mode::Insert => self.insert_key(key, typed),
             Mode::Normal if palette_shortcut => self.palette = Some(String::new()),
+            Mode::Normal
+                if self.quote_capped
+                    && !self.preview
+                    && self.quote_open
+                    && event.keystroke.modifiers == gpui::Modifiers::control()
+                    && matches!(key, "d" | "u")
+                    && self.quote_scroll.max_offset().height > px(0.) =>
+            {
+                self.bracket = None;
+                self.page_quote(key == "d");
+            }
             Mode::Normal => self.normal_key(key, typed),
             Mode::Visual => self.visual_key(key),
         }
@@ -2193,9 +2209,10 @@ impl ComposeView {
 impl Render for ComposeView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(frames) = &self.frames {
-            frames
-                .borrow_mut()
-                .render_started(std::time::Instant::now(), self.recipients.animating());
+            frames.borrow_mut().render_started(
+                Instant::now(),
+                self.recipients.animating() || self.quote_glide.is_some(),
+            );
         }
         self.sync_from_hub();
         self.update_recipient_completion(cx);
@@ -2301,6 +2318,21 @@ impl Render for ComposeView {
             .and_then(|theme| theme.ui_family.clone())
             .unwrap_or_else(|| "Liberation Sans".into());
         let wide = window.viewport_size().width > px(640.);
+        self.quote_capped = !wide && self.quote_open && stored_quote(&snap).is_some();
+        if !self.quote_capped {
+            self.quote_glide = None;
+        } else if let Some(glide) = self.quote_glide {
+            let now = Instant::now();
+            let offset = if self.motion.enabled() && glide.running(now) {
+                window.request_animation_frame();
+                glide.value(now)
+            } else {
+                self.quote_glide = None;
+                glide.to
+            };
+            self.quote_scroll
+                .set_offset(gpui::point(px(0.), px(offset)));
+        }
         let recipient_theme = self.look.as_ref().unwrap_or_else(|| {
             crate::theme::builtin_for_compose(matches!(self.theme, ThemeKind::Dark))
         });
@@ -2483,6 +2515,7 @@ impl Render for ComposeView {
                             &snap,
                             colors,
                             (!wide).then(|| window.viewport_size().height * 0.3),
+                            cx,
                         )
                         .map(|quote| quote.flex_shrink_0()),
                     )
@@ -2876,6 +2909,7 @@ impl ComposeView {
         snap: &Snapshot,
         colors: Palette,
         narrow_height: Option<gpui::Pixels>,
+        cx: &mut Context<Self>,
     ) -> Option<gpui::Div> {
         let html = stored_quote(snap)?;
         let what = if snap.forwarded.is_some() {
@@ -2915,6 +2949,9 @@ impl ComposeView {
                             .max_h(height)
                             .overflow_y_scroll()
                             .track_scroll(&self.quote_scroll)
+                            .on_scroll_wheel(cx.listener(|this, _, _, _| {
+                                this.quote_glide = None;
+                            }))
                             .child(quote),
                     )
                     .child(
@@ -2942,16 +2979,37 @@ impl ComposeView {
         Some(block)
     }
 
+    fn page_quote(&mut self, down: bool) {
+        let measured = f32::from(self.quote_scroll.offset().y);
+        let end = self.quote_glide.map_or(measured, |glide| glide.to);
+        let half = f32::from(self.quote_scroll.bounds().size.height) / 2.;
+        let max = f32::from(self.quote_scroll.max_offset().height);
+        let target = (end + if down { -half } else { half }).clamp(-max, 0.);
+        self.quote_glide = Glide::start(
+            &self.motion,
+            measured,
+            target,
+            max,
+            motion::SLIDE,
+            Instant::now(),
+        );
+        if self.quote_glide.is_none() {
+            self.quote_scroll
+                .set_offset(gpui::point(px(0.), px(target)));
+        }
+    }
+
     fn toggle_quote(&mut self) {
         let id = self.draft_id.to_string();
         let quoted = self
             .hub
             .with_session(&id, |session| stored_quote(&session.snapshot()).is_some())
             .unwrap_or(false);
+        self.quote_glide = None;
         if quoted {
             self.quote_open = !self.quote_open;
             if self.quote_open {
-                self.quote_scroll.set_offset(gpui::point(px(0.), px(0.)));
+                self.quote_scroll = gpui::ScrollHandle::new();
             }
             self.status = if self.quote_open {
                 "quote shown"

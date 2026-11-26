@@ -2325,6 +2325,14 @@ impl Session {
                 ..Step::default()
             };
         }
+        if self.settings_nav.page == Page::Bindings
+            && let Some(request) = self.settings_nav.bindings_scroll_edge(key)
+        {
+            return Step {
+                settings: Some(request),
+                ..Step::default()
+            };
+        }
         if matches!(
             self.settings_nav.page,
             Page::Bindings | Page::ConfirmModel { .. }

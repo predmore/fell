@@ -477,8 +477,13 @@ impl View {
     fn scroll_lines(&mut self, lines: i32, motion: Motion, now: Instant) {
         let measured = f32::from(self.scroll.offset().y);
         let end = self.scroll_glide.map_or(measured, |glide| glide.to);
+        self.glide_scroll(end - lines as f32 * 19., motion, now);
+    }
+
+    fn glide_scroll(&mut self, target: f32, motion: Motion, now: Instant) {
+        let measured = f32::from(self.scroll.offset().y);
         let max = f32::from(self.scroll.max_offset().height);
-        let target = (end - lines as f32 * 19.).clamp(-max, 0.);
+        let target = target.clamp(-max, 0.);
         self.scroll_glide = Glide::start(&motion, measured, target, max, motion::SLIDE, now);
         if self.scroll_glide.is_none() {
             self.scroll.set_offset(gpui::point(px(0.), px(target)));
@@ -768,6 +773,18 @@ impl Inbox {
             Request::Scroll(lines) => {
                 self.settings_view
                     .scroll_lines(lines, self.motion.motion, self.motion.clock.now())
+            }
+            Request::ScrollToEdge { bottom } => {
+                let target = if bottom {
+                    -f32::from(self.settings_view.scroll.max_offset().height)
+                } else {
+                    0.
+                };
+                self.settings_view.glide_scroll(
+                    target,
+                    self.motion.motion,
+                    self.motion.clock.now(),
+                );
             }
             Request::ChangeModel { install } => self.change_model(install, cx),
         }
@@ -1308,6 +1325,9 @@ pub(super) fn card_height(nav: &nav::Nav, room: f32, narrow: bool) -> f32 {
                 .map(|row| match row {
                     Row::Account(_) => ACCOUNT_ROW_HEIGHT,
                     Row::EditAccount | Row::ImportIdentities => 45.,
+                    Row::Value(_) if narrow && section == Section::Appearance => {
+                        SECTION_ROW_HEIGHT + 5.
+                    }
                     _ if narrow && matches!(row, Row::Value(_)) => SECTION_ROW_HEIGHT + 8.,
                     _ => SECTION_ROW_HEIGHT,
                 })
@@ -1624,10 +1644,26 @@ pub(super) fn card(
                         )
                         .child(
                             div()
+                                .relative()
                                 .w(value_column_width(preference, theme, window))
                                 .flex_none()
                                 .flex()
                                 .items_center()
+                                .when(selected, |column| {
+                                    column.child(
+                                        div()
+                                            .absolute()
+                                            .inset_0()
+                                            .rounded_full()
+                                            .border_1()
+                                            .border_color(rgb(theme::mix(
+                                                theme.selection,
+                                                theme.on_selection,
+                                                0.15,
+                                            )))
+                                            .opacity(opacity),
+                                    )
+                                })
                                 .child(chevron(theme, index, true, live && selected, opacity, cx))
                                 .child(value)
                                 .child(chevron(theme, index, false, live && selected, opacity, cx)),
@@ -2020,7 +2056,7 @@ pub(super) fn card(
         .child(body.opacity(content_opacity))
         .children(footer)
         .when(binding_edges.0, |card| {
-            card.child(super::help::edge(theme, true, 24.).top(px(HEADER_HEIGHT)))
+            card.child(super::help::edge(theme, true, 32.).top(px(HEADER_HEIGHT)))
         })
         .when(binding_edges.1, |card| {
             card.child(super::help::edge(theme, false, 44.))
@@ -2385,7 +2421,7 @@ fn chevron(
         .flex_none()
         .text_center()
         .text_size(px(12.))
-        .text_color(rgb(theme.dimmed))
+        .text_color(rgb(theme.on_selection_accent))
         .opacity(opacity)
         .when(live, |control| {
             control.on_mouse_down(
