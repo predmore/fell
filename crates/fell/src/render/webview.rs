@@ -965,21 +965,16 @@ mod tests {
         ];
         let mut outliers = Vec::new();
         for (label, width, html) in calibration {
-            let mail = fell_render::WebMail::prepare(&html);
+            let mail = fell_render::WebMail::calibration(&html);
             let extra_width = match label {
                 "inline-styled ESP table" => Some(560),
                 "desktop and mobile pair" | "mobile reveal" | "retail" => Some(680),
                 _ => None,
             };
-            let dark = matches!(
-                label,
-                "mobile reveal" | "hover and compact paragraphs" | "retail" | "ordinary newsletter"
-            )
-            .then_some(("dark", 0x24283b));
-            for (scheme, background) in std::iter::once(("light", 0xffffff)).chain(dark) {
+            for (scheme, background) in [("light", 0xffffff), ("dark", 0x24283b)] {
                 for width in std::iter::once(width).chain(extra_width) {
                     let picture = futures::executor::block_on(render(WebRequest {
-                        html: mail.page(scheme, |_| None),
+                        html: mail.calibration_page(scheme),
                         width,
                         background,
                     }))

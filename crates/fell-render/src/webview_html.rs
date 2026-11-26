@@ -54,6 +54,34 @@ pub struct WebMail {
 
 impl WebMail {
     pub fn prepare(html: &str) -> Self {
+        Self::prepare_with_metrics(html, layout::TextMetrics::DEFAULT)
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn calibration(html: &str) -> Self {
+        Self::prepare_with_metrics(html, layout::TextMetrics::CALIBRATION)
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn calibration_page(&self, scheme: &str) -> String {
+        use base64::Engine;
+        static FONT_CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let css = FONT_CSS.get_or_init(|| {
+            let font = base64::engine::general_purpose::STANDARD.encode(layout::CALIBRATION_FONT);
+            format!(
+                r#"<style>
+                @font-face {{ font-family: FellCalibration; src: url(data:font/ttf;base64,{font}); }}
+                * {{ font-family: FellCalibration !important; font-synthesis: none !important;
+                     font-kerning: none !important; font-variant-ligatures: none !important; }}
+                </style></head>"#,
+            )
+        });
+        self.page(scheme, |_| None).replacen("</head>", css, 1)
+    }
+
+    fn prepare_with_metrics(html: &str, metrics: layout::TextMetrics) -> Self {
         let dom = crate::html::parse_html(html);
         let mut body = String::new();
         let mut images = Vec::new();
@@ -99,7 +127,7 @@ impl WebMail {
         }
         let layout_dom =
             html::parse_html(&format!(r#"<body style="{body_padding}">{body}</body>"#));
-        let layout = layout::Estimate::prepare(&layout_dom);
+        let layout = layout::Estimate::prepare(&layout_dom, metrics);
         Self {
             body,
             body_padding,

@@ -25,21 +25,26 @@ const HEIGHT_ALLOWANCE: f32 = 12.;
 pub(super) struct Estimate(Vec<(i32, Option<Layout>)>);
 
 impl Estimate {
-    pub(super) fn prepare(layout_dom: &scraper::Html) -> Self {
+    pub(super) fn prepare(layout_dom: &scraper::Html, metrics: TextMetrics) -> Self {
         let styles = LayoutStyles::from_document(layout_dom);
         let root = *layout_dom.root_element();
+        let font = Font {
+            size: 16.,
+            line: LineHeight::Normal,
+            metrics,
+        };
         let layouts = if styles.breakpoints.len() <= 8 {
             std::iter::once(1)
                 .chain(styles.breakpoints.iter().copied())
                 .map(|width| {
                     (
                         width,
-                        Layout::from_node(root, &styles, Some(width), Font::BODY, false),
+                        Layout::from_node(root, &styles, Some(width), font, false),
                     )
                 })
                 .collect()
         } else {
-            vec![(1, Layout::from_node(root, &styles, None, Font::BODY, false))]
+            vec![(1, Layout::from_node(root, &styles, None, font, false))]
         };
         Self(layouts)
     }
@@ -869,9 +874,9 @@ impl LineHeight {
         (ratio.is_finite() && ratio >= 0.).then_some(Self::Ratio(ratio))
     }
 
-    fn resolve(self, size: f32) -> f32 {
+    fn resolve(self, size: f32, metrics: TextMetrics) -> f32 {
         match self {
-            Self::Normal => (size * 1.125).ceil(),
+            Self::Normal => (metrics.normal_line)(size),
             Self::Ratio(ratio) => ratio * size,
             Self::Px(pixels) => pixels,
         }
@@ -882,14 +887,10 @@ impl LineHeight {
 struct Font {
     size: f32,
     line: LineHeight,
+    metrics: TextMetrics,
 }
 
 impl Font {
-    const BODY: Self = Self {
-        size: 16.,
-        line: LineHeight::Normal,
-    };
-
     fn for_element(self, name: &str, style: &[Declaration], zero: bool, uncertain: bool) -> Self {
         let scale = match name {
             "h1" => 2.,
@@ -940,11 +941,14 @@ impl Font {
             .and_then(|(_, line)| LineHeight::parse(line, size))
             .unwrap_or(self.line);
         let line = if uncertain {
-            LineHeight::Px(line.resolve(size).max(LineHeight::Normal.resolve(size)))
+            LineHeight::Px(
+                line.resolve(size, self.metrics)
+                    .max((self.metrics.normal_line)(size)),
+            )
         } else {
             line
         };
-        Self { size, line }
+        Self { size, line, ..self }
     }
 }
 
@@ -1016,29 +1020,79 @@ impl Measured {
     }
 }
 
-fn text_width_em(text: &str) -> f32 {
-    // Approximate advances in the browser's default body face.
-    text.split_whitespace()
-        .map(|word| {
-            word.chars()
-                .map(|ch| match ch {
-                    '.' | ',' | '!' | ':' | ';' | '\'' => 0.25,
-                    'i' | 'j' | 'l' | 't' => 0.28,
-                    'f' | 'r' => 0.33,
-                    's' => 0.4,
-                    'a' | 'c' | 'e' | 'z' => 0.45,
-                    'w' => 0.73,
-                    'm' => 0.78,
-                    'M' | 'W' => 0.89,
-                    'A'..='Z' => 0.64,
-                    '\0'..='\x7f' => 0.5,
-                    _ => 1.0,
-                })
-                .sum::<f32>()
-                + 0.25
-        })
-        .sum::<f32>()
-        - 0.25
+#[derive(Clone, Copy)]
+pub(super) struct TextMetrics {
+    advance: fn(char) -> f32,
+    normal_line: fn(f32) -> f32,
+}
+
+impl TextMetrics {
+    pub(super) const DEFAULT: Self = Self {
+        advance: approximate_advance,
+        normal_line: |size| (size * 1.125).ceil(),
+    };
+
+    #[cfg(feature = "test-utils")]
+    pub(super) const CALIBRATION: Self = Self {
+        advance: calibration_advance,
+        normal_line: calibration_line_height,
+    };
+
+    fn width(self, text: &str) -> f32 {
+        let space = (self.advance)(' ');
+        text.split_whitespace()
+            .map(|word| word.chars().map(self.advance).sum::<f32>() + space)
+            .sum::<f32>()
+            - space
+    }
+}
+
+fn approximate_advance(ch: char) -> f32 {
+    match ch {
+        '.' | ',' | '!' | ':' | ';' | '\'' | ' ' => 0.25,
+        'i' | 'j' | 'l' | 't' => 0.28,
+        'f' | 'r' => 0.33,
+        's' => 0.4,
+        'a' | 'c' | 'e' | 'z' => 0.45,
+        'w' => 0.73,
+        'm' => 0.78,
+        'M' | 'W' => 0.89,
+        'A'..='Z' => 0.64,
+        '\0'..='\x7f' => 0.5,
+        _ => 1.0,
+    }
+}
+
+#[cfg(feature = "test-utils")]
+// Renamed Latin and punctuation subset of Liberation Sans Regular, under OFL 1.1.
+pub(super) const CALIBRATION_FONT: &[u8] =
+    include_bytes!("../../fixtures/calibration-font/fell-calibration-sans.ttf");
+
+#[cfg(feature = "test-utils")]
+fn calibration_face() -> &'static ttf_parser::Face<'static> {
+    static FONT: std::sync::OnceLock<ttf_parser::Face<'static>> = std::sync::OnceLock::new();
+    FONT.get_or_init(|| ttf_parser::Face::parse(CALIBRATION_FONT, 0).unwrap())
+}
+
+#[cfg(feature = "test-utils")]
+fn calibration_advance(ch: char) -> f32 {
+    let font = calibration_face();
+    font.glyph_index(ch)
+        .and_then(|glyph| font.glyph_hor_advance(glyph))
+        .map_or_else(
+            || approximate_advance(ch),
+            |advance| f32::from(advance) / f32::from(font.units_per_em()),
+        )
+}
+
+#[cfg(feature = "test-utils")]
+fn calibration_line_height(size: f32) -> f32 {
+    let font = calibration_face();
+    let scale = size / f32::from(font.units_per_em());
+    // WebKit rounds the three font metrics separately for a normal line.
+    (f32::from(font.ascender()) * scale).round()
+        + (f32::from(-font.descender()) * scale).round()
+        + (f32::from(font.line_gap()) * scale).round()
 }
 
 fn css_pixels(value: &str) -> Option<f32> {
@@ -1215,11 +1269,11 @@ impl Layout {
     ) -> Option<Self> {
         let element = match node.value() {
             Node::Text(text) if inherited.size > 0. => {
-                let em = text_width_em(text);
+                let em = inherited.metrics.width(text);
                 return (em > 0.).then_some(Self::Text {
                     em,
                     font: inherited.size,
-                    line: inherited.line.resolve(inherited.size),
+                    line: inherited.line.resolve(inherited.size, inherited.metrics),
                 });
             }
             Node::Element(element) => element,
@@ -1247,7 +1301,7 @@ impl Layout {
         let font = inherited.for_element(name, &style, zero, uncertain);
         if name == "br" {
             return (font.size > 0.).then_some(Self::Break {
-                height: font.line.resolve(font.size),
+                height: font.line.resolve(font.size, font.metrics),
             });
         }
         let length = |property| {
@@ -1355,14 +1409,18 @@ impl Layout {
         {
             match (children.last_mut(), child) {
                 (
-                    Some(Self::Text { em, font, line }),
+                    Some(Self::Text {
+                        em,
+                        font: text_font,
+                        line,
+                    }),
                     Self::Text {
                         em: next,
                         font: next_font,
                         line: next_line,
                     },
-                ) if inline_flow && *font == next_font && *line == next_line => {
-                    *em += 0.25 + next;
+                ) if inline_flow && *text_font == next_font && *line == next_line => {
+                    *em += (font.metrics.advance)(' ') + next;
                 }
                 (Some(Self::Text { .. }), Self::Break { .. }) if inline_flow => {
                     children.push(Self::Break { height: 0. });

@@ -2094,6 +2094,7 @@ dependencies = [
  "scraper",
  "selectors 0.26.0",
  "tendril 0.4.3",
+ "ttf-parser 0.25.1",
  "url",
 ]
 
