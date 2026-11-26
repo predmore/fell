@@ -1107,11 +1107,13 @@ mod tests {
             );
         }
 
-        for width in [490, 500] {
+        // A 490px window has a 432px card. The web view keeps snapshots at
+        // 60% scale or larger, and the newsletter adds its own paper inset.
+        for width in [432, 500] {
             for (newsletter, accepted) in [
                 (600, true),
                 (650, true),
-                (700, true),
+                (700, width != 432),
                 (1200, false),
                 (2400, false),
             ] {

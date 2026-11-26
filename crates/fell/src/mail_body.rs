@@ -1062,6 +1062,34 @@ mod tests {
     }
 
     #[test]
+    fn a_verified_personal_message_uses_native_body_scheduling() {
+        let id = "personal@fell.test";
+        let mut parts = html_parts(
+            "<p>Thursday works for me.</p>",
+            &[("X-Fell-Verified-Sender", "ada@fell.test")],
+        );
+        parts.trusted_sender_delivery = true;
+        let store = store_with(&[mail(id, id, 0, Some(parts))]);
+        let mut view = open(&store, id);
+        let reads = read_bodies_with_latest(
+            &store,
+            &account().id,
+            &mut view,
+            &HashMap::new(),
+            false,
+            |_| None,
+        );
+        assert!(!reads.has_jobs());
+        assert_eq!(view[0].rich, Rich::Pending);
+        let mut loads = BodyLoads::default();
+        loads.accept(reads, &mut BodyCache::default(), &mut view);
+        let load = loads.begin(id).unwrap();
+        let body = job(&store, &view[0], load).unwrap().prepare().body;
+        assert_eq!(body.suggested, fell_render::RenderMode::Native);
+        assert_eq!(body.sender_attestation.as_deref(), Some("ada@fell.test"));
+    }
+
+    #[test]
     fn script_and_remote_content_never_reach_the_document() {
         let body = prepare_html(
             "<p onclick=\"steal()\">Hi <a href=\"javascript:steal()\">there</a></p><script>steal()</script><style>p{background:url(https://track.test/p)}</style><img src=\"https://track.test/pixel.gif\" alt=\"Chart\">",

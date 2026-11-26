@@ -51,6 +51,8 @@ fn web_page(content: &str, scheme: &str, body_css: &str, link_css: &str) -> Stri
   {link_css}
   img[src=""] {{
     background-color: rgba(128, 128, 128, 0.12);
+    box-sizing: border-box;
+    padding: 4px;
     border: 0 !important;
     outline: 0 !important;
     color: color-mix(in srgb, currentColor 65%, gray) !important;
@@ -70,10 +72,22 @@ fn web_page(content: &str, scheme: &str, body_css: &str, link_css: &str) -> Stri
 #[derive(Debug)]
 pub struct WebMail {
     content: String,
-    images: Vec<(usize, String)>,
+    slots: Vec<(usize, Slot)>,
+    has_remote_images: bool,
     layout: layout::Estimate,
     source_bytes: usize,
     mapped_history: bool,
+}
+
+#[derive(Debug)]
+enum Slot {
+    Image(String),
+    HideFold,
+}
+
+struct HistoryStyles<'a> {
+    nodes: &'a HashSet<ego_tree::NodeId>,
+    offsets: Vec<usize>,
 }
 
 impl WebMail {
@@ -115,9 +129,13 @@ impl WebMail {
         folded: Option<&crate::FoldedDocument>,
     ) -> Self {
         let dom = crate::html::parse_html(html);
-        let history = folded
+        let nodes = folded
             .filter(|doc| doc.has_folds())
             .and_then(|doc| history_nodes(&dom, doc));
+        let mut history = nodes.as_ref().map(|nodes| HistoryStyles {
+            nodes,
+            offsets: Vec::new(),
+        });
         let mut content = String::new();
         let mut images = Vec::new();
         // Keep the body's presentation attributes while replacing its wrapper.
@@ -171,7 +189,7 @@ impl WebMail {
             true,
             0,
             Some(&mut images),
-            history.as_ref(),
+            history.as_mut(),
         );
         let layout_dom = html::parse_html(&format!("<body{content}</body>"));
         // Remote background attributes have empty slots in the offline page.
@@ -185,12 +203,27 @@ impl WebMail {
             });
         let layout =
             layout::Estimate::prepare(&layout_dom, metrics, author_background, history.is_some());
+        let has_remote_images = !images.is_empty();
+        let mut slots: Vec<_> = images
+            .into_iter()
+            .map(|(offset, url)| (offset, Slot::Image(url)))
+            .collect();
+        if let Some(history) = history {
+            slots.extend(
+                history
+                    .offsets
+                    .into_iter()
+                    .map(|offset| (offset, Slot::HideFold)),
+            );
+            slots.sort_unstable_by_key(|(offset, _)| *offset);
+        }
         Self {
             content,
-            images,
+            slots,
+            has_remote_images,
             layout,
             source_bytes: html.len(),
-            mapped_history: history.is_some(),
+            mapped_history: nodes.is_some(),
         }
     }
 
@@ -240,7 +273,7 @@ impl WebMail {
     }
 
     pub fn has_remote_images(&self) -> bool {
-        !self.images.is_empty()
+        self.has_remote_images
     }
 
     pub fn image_height_limit(width: f32) -> f32 {
@@ -308,17 +341,24 @@ impl WebMail {
             .unwrap();
         }
         let mut content = String::with_capacity(self.content.len());
-        if self.mapped_history && !self.has_author_colors() && text.is_some() {
+        let collapsed = self.mapped_history && !self.has_author_colors() && text.is_some();
+        if collapsed {
             content.push_str(" data-fell-collapsed");
             link_css.push_str(
                 " body[data-fell-collapsed] [data-fell-folded] { display: none !important; }",
             );
         }
         let mut offset = 0;
-        for (at, url) in &self.images {
+        for (at, slot) in &self.slots {
             content.push_str(&self.content[offset..*at]);
-            if let Some(data) = image(url).filter(|data| data.starts_with("data:image/")) {
-                content.push_str(&escape_attr(&data));
+            match slot {
+                Slot::Image(url) => {
+                    if let Some(data) = image(url).filter(|data| data.starts_with("data:image/")) {
+                        content.push_str(&escape_attr(&data));
+                    }
+                }
+                Slot::HideFold if collapsed => content.push_str(";display:none !important"),
+                Slot::HideFold => {}
             }
             offset = *at;
         }
@@ -344,6 +384,7 @@ fn history_nodes(
     struct Span {
         text: Range<usize>,
         spacing: bool,
+        starts_with_visible_empty: bool,
     }
 
     fn normalized(text: &str) -> impl Iterator<Item = char> + '_ {
@@ -361,6 +402,7 @@ fn history_nodes(
             return false;
         }
         let start = source.len();
+        let mut starts_with_visible_empty = false;
         let spacing = match node.value() {
             Node::Text(text) => {
                 source.extend(normalized(text));
@@ -376,6 +418,16 @@ fn history_nodes(
                     let mut spacing = matches!(element.name(), "br" | "div" | "p" | "span");
                     for child in node.children() {
                         spacing &= measure(child, source, spans, depth + 1);
+                        if let Some(span) = spans.get(&child.id())
+                            && span.text.start == start
+                        {
+                            starts_with_visible_empty |= (span.text.is_empty() && !span.spacing)
+                                || span.starts_with_visible_empty;
+                        }
+                    }
+                    // A marked quote owns even its leading non-text content.
+                    if element.name() == "blockquote" || crate::history::marker(element).is_some() {
+                        starts_with_visible_empty = false;
                     }
                     spacing
                 }
@@ -387,6 +439,7 @@ fn history_nodes(
             Span {
                 text: start..source.len(),
                 spacing,
+                starts_with_visible_empty,
             },
         );
         spacing
@@ -432,6 +485,7 @@ fn history_nodes(
         let Some(Span {
             text: span,
             spacing,
+            starts_with_visible_empty,
         }) = spans.get(&node.id())
         else {
             continue;
@@ -454,7 +508,9 @@ fn history_nodes(
             }
         } else if span.start >= range.start && span.end <= range.end {
             nodes.extend(boundary_spacing.drain(..));
-            nodes.insert(node.id());
+            if span.start > range.start || !starts_with_visible_empty {
+                nodes.insert(node.id());
+            }
         } else if span.start < range.end && span.end > range.start && node.value().is_text() {
             // A source text node can straddle a native history boundary.
             return None;
@@ -485,7 +541,7 @@ fn serialize_children(
     allow_style: bool,
     depth: u32,
     mut images: Option<&mut Vec<(usize, String)>>,
-    history: Option<&HashSet<ego_tree::NodeId>>,
+    mut history: Option<&mut HistoryStyles<'_>>,
 ) {
     for child in node.children() {
         serialize_node(
@@ -495,7 +551,7 @@ fn serialize_children(
             allow_style,
             depth + 1,
             images.as_deref_mut(),
-            history,
+            history.as_deref_mut(),
         );
     }
 }
@@ -507,24 +563,31 @@ fn serialize_node(
     allow_style: bool,
     depth: u32,
     mut images: Option<&mut Vec<(usize, String)>>,
-    history: Option<&HashSet<ego_tree::NodeId>>,
+    mut history: Option<&mut HistoryStyles<'_>>,
 ) {
     if depth >= crate::html::MAX_HTML_DEPTH {
         out.push_str(&escape(&subtree_text(node)));
         return;
     }
-    let folded = history.is_some_and(|nodes| nodes.contains(&node.id()));
+    let folded = history
+        .as_ref()
+        .is_some_and(|history| history.nodes.contains(&node.id()));
     match node.value() {
         scraper::node::Node::Text(text) => {
-            let wrap = folded
-                && !node
-                    .ancestors()
-                    .any(|parent| history.is_some_and(|nodes| nodes.contains(&parent.id())));
-            if wrap {
-                out.push_str("<span data-fell-folded>");
+            let wrap = history.as_mut().filter(|history| {
+                folded
+                    && !node
+                        .ancestors()
+                        .any(|parent| history.nodes.contains(&parent.id()))
+            });
+            let wrapped = wrap.is_some();
+            if let Some(history) = wrap {
+                out.push_str("<span data-fell-folded style=\"");
+                history.offsets.push(out.len());
+                out.push_str("\">");
             }
             out.push_str(&escape(text.deref()));
-            if wrap {
+            if wrapped {
                 out.push_str("</span>");
             }
         }
@@ -575,7 +638,7 @@ fn serialize_node(
                             allow_style,
                             depth + 1,
                             images.as_deref_mut(),
-                            history,
+                            history.as_deref_mut(),
                         );
                     }
                 }
@@ -608,14 +671,28 @@ fn serialize_node(
                 return;
             }
             let prepared_page = images.is_some();
+            // The snapshot has no MIME part provider. Keep the image's layout
+            // and link target while showing the same label as the simple view.
+            let missing_cid = prepared_page
+                && name == "img"
+                && element
+                    .attr("src")
+                    .and_then(|src| src.trim().split_once(':'))
+                    .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("cid"));
             out.push('<');
             out.push_str(name);
             if folded {
                 out.push_str(" data-fell-folded");
             }
+            if missing_cid {
+                out.push_str(" src=\"\" alt=\"Inline image\"");
+            }
+            let mut wrote_style = false;
             for (name_attr, value) in &element.attrs {
                 let attr = name_attr.local.as_ref();
-                if matches!(attr, "data-fell-folded" | "data-fell-collapsed") {
+                if matches!(attr, "data-fell-folded" | "data-fell-collapsed")
+                    || (missing_cid && matches!(attr, "src" | "srcset" | "alt"))
+                {
                     continue;
                 }
                 // Only image attributes and image-valued CSS declarations
@@ -640,10 +717,15 @@ fn serialize_node(
                         let first_slot = slots.len();
                         out.push_str(" style=\"");
                         serialize_css(value, out, Some(slots), escape_attr);
-                        out.push('"');
                         if contains_external_url(value) && contains_external_url(&out[start..]) {
                             out.truncate(start);
                             slots.truncate(first_slot);
+                        } else {
+                            if let Some(history) = history.as_mut().filter(|_| folded) {
+                                history.offsets.push(out.len());
+                            }
+                            out.push('"');
+                            wrote_style = true;
                         }
                         continue;
                     }
@@ -673,6 +755,11 @@ fn serialize_node(
                 out.push_str(&escape_attr(&value));
                 out.push('"');
             }
+            if !wrote_style && let Some(history) = history.as_mut().filter(|_| folded) {
+                out.push_str(" style=\"");
+                history.offsets.push(out.len());
+                out.push('"');
+            }
             out.push('>');
             if !VOID.contains(&name) {
                 let child_style = allow_style && name != "svg" && name != "math";
@@ -684,7 +771,7 @@ fn serialize_node(
                         child_style,
                         depth + 1,
                         images.as_deref_mut(),
-                        history,
+                        history.as_deref_mut(),
                     );
                 }
                 out.push_str("</");
@@ -1589,6 +1676,90 @@ mod tests {
     }
 
     #[test]
+    fn a_leading_nontext_sibling_keeps_the_quote_wrapper_open() {
+        let media =
+            "<a id='link' href='https://harbor.test/map'><img src='cid:map'></a><hr id='rule'>";
+        let quote = "<div class='gmail_quote' id='quote'><div>On Monday, Jo wrote:</div><blockquote>Could you share the pier map?</blockquote></div>";
+        let style = WebTextStyle {
+            family: None,
+            size: 15.,
+            foreground: 0,
+            link: 0,
+            inset: false,
+        };
+        for (contents, wrapper_folds) in [
+            (format!("{media}{quote}"), false),
+            (format!("<div>{media}{quote}</div>"), false),
+            (format!("{quote}{media}"), true),
+        ] {
+            let html =
+                format!("<div>Thursday works for me.</div><div id='wrapper'>{contents}</div>");
+            let folded = crate::fold_history(crate::html_to_document(&html), "Re: Pier map");
+            let mail = WebMail::prepare_with_history(&html, &folded);
+            assert!(mail.mapped_history(), "{html}");
+            let page = html::parse_html(&mail.page_with_style("light", Some(&style), |_| None));
+            for (id, hidden) in [
+                ("wrapper", wrapper_folds),
+                ("quote", true),
+                ("link", wrapper_folds),
+                ("rule", wrapper_folds),
+            ] {
+                let selector = scraper::Selector::parse(&format!("#{id}")).unwrap();
+                let element = page.select(&selector).next().unwrap();
+                assert_eq!(
+                    std::iter::once(element)
+                        .chain(element.ancestors().filter_map(scraper::ElementRef::wrap))
+                        .any(|node| node.attr("data-fell-folded").is_some()),
+                    hidden,
+                    "{id}: {html}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fold_styles_override_mail_on_elements_and_reader_spans() {
+        let style = WebTextStyle {
+            family: None,
+            size: 15.,
+            foreground: 0,
+            link: 0,
+            inset: false,
+        };
+        for (html, selector, original) in [
+            (
+                "<div>Thursday works.</div><blockquote style='display:block !important'>Could you share the pier map?</blockquote>",
+                "blockquote",
+                "display:block !important",
+            ),
+            (
+                "<div>Thursday works.</div><style>span[data-fell-folded] {display:block !important}</style>-- <br>Jo<br>Harbor office<br>harbor.test<div class='gmail_quote'>On Monday, Lee wrote:<blockquote>Could you share the pier map?</blockquote></div>",
+                "span[data-fell-folded]",
+                "",
+            ),
+        ] {
+            let folded = crate::fold_history(crate::html_to_document(html), "Re: Pier map");
+            let mail = WebMail::prepare_with_history(html, &folded);
+            assert!(mail.mapped_history(), "{html}");
+            let selector = scraper::Selector::parse(selector).unwrap();
+            let closed = html::parse_html(&mail.page_with_style("light", Some(&style), |_| None));
+            let open = html::parse_html(&mail.page("light", |_| None));
+            let closed = closed.select(&selector).next().unwrap();
+            let open = open.select(&selector).next().unwrap();
+            assert!(closed.attr("data-fell-folded").is_some());
+            assert!(
+                closed
+                    .attr("style")
+                    .unwrap()
+                    .ends_with("display:none !important")
+            );
+            let style = open.attr("style").unwrap();
+            assert!(style.contains(original), "{style}");
+            assert!(!style.contains("display:none"), "{style}");
+        }
+    }
+
+    #[test]
     fn author_colors_use_light_paper_in_dark_mode() {
         for html in [
             "<body bgcolor='#fff'>Story</body>",
@@ -1868,6 +2039,24 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_cid_uses_the_blocked_tile_without_adding_a_fetch() {
+        let mail = WebMail::prepare(
+            "<img src='CID:map' srcset='cid:other' width='120' height='80' alt='Map'>",
+        );
+        assert!(!mail.has_remote_images());
+        let page = html::parse_html(&mail.page("light", |_| panic!("CID is local")));
+        let image = page
+            .select(&scraper::Selector::parse("img").unwrap())
+            .next()
+            .unwrap();
+        assert_eq!(image.attr("src"), Some(""));
+        assert_eq!(image.attr("srcset"), None);
+        assert_eq!(image.attr("alt"), Some("Inline image"));
+        assert_eq!(image.attr("width"), Some("120"));
+        assert_eq!(image.attr("height"), Some("80"));
+    }
+
+    #[test]
     fn allowing_images_keeps_https_src() {
         let html = r#"<img src="https://cdn.example/a.png" alt="hero"><table><tr><td background="https://cdn.example/bg.png"></td></tr></table><video poster="https://cdn.example/poster.png"></video>"#;
         let clean = sanitize_html(html, true);
@@ -1996,7 +2185,7 @@ mod tests {
             "#local",
             "url(#accent)",
             "https://example.test",
-            "cid:logo",
+            "alt=\"Inline image\"",
             "//AA",
         ] {
             assert!(page.contains(local), "{page}");

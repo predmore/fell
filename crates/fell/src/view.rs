@@ -11308,23 +11308,30 @@ fn web_message_body(
                         .inset_0(),
                     )
                 });
-            let mut card = div().child(folds.columns.card.place(snapshot));
-            let links = if shown.is_colorless() {
-                if body.web.mapped_history() {
-                    card = card.children(html_sections(
+            let colorless = shown.is_colorless();
+            let card = web_column(
+                folds.columns.card.place(snapshot).into_any_element(),
+                if colorless {
+                    &picture.fallback_links
+                } else {
+                    &body.web_links
+                },
+                live,
+                true,
+            );
+            div()
+                .child(card)
+                .when(colorless && body.web.mapped_history(), |card| {
+                    card.children(html_sections(
                         theme,
                         (body, None, true),
                         FoldView { live, ..folds },
                         reveal,
                         markers,
                         cx,
-                    ));
-                }
-                &picture.fallback_links
-            } else {
-                body.web_links.as_slice()
-            };
-            web_column(card.into_any_element(), links, live, true)
+                    ))
+                })
+                .into_any_element()
         }
     };
     let incoming = layer(&web.body, folds.live);

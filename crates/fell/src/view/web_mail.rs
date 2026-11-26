@@ -26,6 +26,7 @@ const THREAD_HOLD: Duration = Duration::from_millis(150);
 const SNAPSHOT_BATCH: Duration = Duration::from_millis(550);
 const RENDERER_EXIT: Duration = Duration::from_millis(60);
 const RENDERER_CHANGE: Duration = Duration::from_millis(140);
+const COLORLESS_CHANGE: Duration = Duration::from_millis(80);
 const PROMPT_ENTER: Duration = Duration::from_millis(80);
 const PROMPT_SWAP: Duration = RENDERER_EXIT.saturating_add(PROMPT_ENTER);
 const RETRY_MINIMUM: Duration = Duration::from_millis(300);
@@ -297,6 +298,8 @@ impl Shown {
                 .min(motion::MAX_STEP);
             let duration = if self.fade_through() {
                 RENDERER_CHANGE
+            } else if self.colorless_change() {
+                COLORLESS_CHANGE
             } else {
                 motion::FADE
             };
@@ -314,6 +317,10 @@ impl Shown {
         })
     }
 
+    fn colorless_change(&self) -> bool {
+        self.body.is_colorless() || self.outgoing.as_ref().is_some_and(Body::is_colorless)
+    }
+
     fn frame(&self, now: Instant) -> Frame {
         let linear = if self.renderer_painted.is_some() {
             0.
@@ -329,12 +336,11 @@ impl Shown {
                     motion::ease_out((linear - exit) / (1. - exit)),
                 ]
             }
-            Some(outgoing) if outgoing.is_colorless() || self.body.is_colorless() => {
-                // Keep one layer fully painted while the matching ink fades.
-                [
-                    1. - motion::ease_out((linear - 0.5) * 2.),
-                    motion::ease_out(linear * 2.),
-                ]
+            Some(_) if self.colorless_change() => {
+                // The rasterizers place much of the same ink on the same
+                // pixels. Compensate for that overlap as the layers blend.
+                let outgoing = (1. - progress) / (1. - 0.7 * progress);
+                [outgoing, progress]
             }
             Some(_) if linear < 1. => [1., progress],
             _ => [0., 1.],
@@ -699,6 +705,17 @@ impl Reader {
         self.cache
             .iter()
             .find(|cached| cached.key.matches_snapshot(key))
+    }
+
+    fn too_wide(&self, key: &Key) -> bool {
+        self.entry(key).map_or_else(
+            || {
+                key.mail
+                    .estimated_height_with_style(key.width as f32, key.text.as_ref())
+                    .is_none()
+            },
+            |entry| entry.too_wide,
+        )
     }
 
     fn image(&self, key: &Key) -> Option<(Snapshot, Key)> {
@@ -1076,7 +1093,7 @@ impl Reader {
             let verified = self.verified(body, key.sender.as_deref());
             let always = verified && self.known_sender(key.sender.as_deref()).1;
             let prompt = if too_wide {
-                None
+                self.image_prompt(&key, false, verified, always)
             } else if retrying {
                 Some(Prompt::Retrying)
             } else {
@@ -1159,9 +1176,6 @@ impl Reader {
     fn image_prompt(&self, key: &Key, web: bool, verified: bool, always: bool) -> Option<Prompt> {
         let has_images = key.mail.has_remote_images();
         let entry = web.then(|| self.entry(key)).flatten();
-        if entry.is_some_and(|cached| cached.too_wide) {
-            return None;
-        }
         if let Some(cached) = entry
             && (cached.picture.is_none() || cached.image_failure.is_some())
         {
@@ -1298,6 +1312,23 @@ impl Inbox {
             ) {
                 self.reader_took_over(self.message_selected());
                 self.motion.conv_glide = None;
+                cx.notify();
+                return;
+            }
+            if self.painted_reader.is_some_and(|reader| {
+                let width = reader.columns.header.width.round().clamp(1., 1600.) as i32;
+                let key =
+                    self.web_mail
+                        .key(message, body, &self.theme, width, self.session.is_open(id));
+                self.web_mail.too_wide(&key)
+            }) {
+                self.session
+                    .show_toast("Too wide for web view at this width", false);
+                self.dismiss_notice_after(
+                    self.session.toast_generation(),
+                    Duration::from_secs(2),
+                    cx,
+                );
                 cx.notify();
                 return;
             }
@@ -1901,7 +1932,7 @@ mod tests {
     }
 
     #[test]
-    fn colorless_switches_fill_the_incoming_layer_before_fading_the_outgoing_one() {
+    fn colorless_switches_fade_both_layers_without_a_gap() {
         let now = Instant::now();
         let motion = Motion::new(true);
         let mut colorless = snapshot();
@@ -1919,20 +1950,16 @@ mod tests {
             shown.renderer_painted.as_ref().unwrap().set(Some(painted));
             shown.start_painted_fade(motion, painted, painted);
             let mut last = [1., 0.];
-            for ms in 1..=120 {
+            for ms in 1..=80 {
                 let [outgoing, incoming] =
                     shown.frame(painted + Duration::from_millis(ms)).body_alpha;
-                if ms <= 60 {
-                    assert_eq!(outgoing, 1., "{ms} ms");
-                }
-                if ms >= 60 {
-                    assert_eq!(incoming, 1., "{ms} ms");
+                if ms < 80 {
+                    assert!(outgoing < 1. && incoming > 0., "{ms} ms");
                 }
                 assert!(outgoing <= last[0] && incoming >= last[1], "{ms} ms");
-                assert!(outgoing + incoming * (1. - outgoing) >= 0.97, "{ms} ms");
                 last = [outgoing, incoming];
             }
-            assert_eq!(shown.frame(painted + motion::FADE).body_alpha, [0., 1.]);
+            assert_eq!(shown.frame(painted + COLORLESS_CHANGE).body_alpha, [0., 1.]);
         }
     }
 
@@ -1991,7 +2018,7 @@ mod tests {
     }
 
     #[test]
-    fn a_too_wide_body_uses_simple_view_without_retry() {
+    fn a_too_wide_body_keeps_its_image_prompt_and_sender_preference() {
         super::super::tests::with_pending_inbox(|inbox, cx| {
             split_view(inbox);
             let message = &inbox.session.messages[0];
@@ -2013,20 +2040,48 @@ mod tests {
                 too_wide: true,
                 image_failure: None,
             });
-            assert!(reader.image_prompt(&key, true, true, false).is_none());
-            let frames = reader.frames(
-                &inbox.session.messages,
-                (Some(0), &[true, true], &HashSet::new()),
-                &inbox.theme,
-                460.,
-                (Motion::new(true), now, now),
-                cx,
-            );
-            let frame = &frames[&message.id];
-            assert!(matches!(frame.body, Body::Native));
-            assert!(matches!(frame.outgoing, Some(Body::Placeholder)));
-            assert!(frame.prompt.is_none());
-            assert_eq!(frame.body_alpha, [1., 0.]);
+            let id = message.id.clone();
+            let address = message.email.clone();
+            inbox.web_mail = reader;
+            let mut columns = super::super::ReaderColumns::split(518.);
+            columns.header.width = 460.;
+            inbox.painted_reader = Some(super::super::ReaderLayout {
+                columns,
+                left: 0.,
+                focus: 1.,
+                message_cursor: 0,
+            });
+            for preference in [true, false] {
+                inbox
+                    .web_mail
+                    .preferences
+                    .insert(address.clone(), (Some(preference), false));
+                for press in [false, true] {
+                    if press {
+                        inbox.html_reading_action(&id, Action::ToggleWebView, cx);
+                        let toast = inbox.session.toast.as_ref().unwrap();
+                        assert_eq!(toast.text, "Too wide for web view at this width");
+                        assert!(toast.hint.is_none());
+                    }
+                    let frames = inbox.web_mail.frames(
+                        &inbox.session.messages,
+                        (Some(0), &[true, true], &HashSet::new()),
+                        &inbox.theme,
+                        460.,
+                        (Motion::new(false), now, now),
+                        cx,
+                    );
+                    let frame = &frames[&id];
+                    assert!(matches!(frame.body, Body::Native));
+                    let prompt = frame.prompt.as_ref().unwrap();
+                    assert!(matches!(prompt.incoming, Some(Prompt::Blocked { .. })));
+                    assert_eq!(prompt.height, 1.);
+                    assert_eq!(
+                        inbox.web_mail.known_sender(Some(&address)).0,
+                        Some(preference)
+                    );
+                }
+            }
         });
     }
 

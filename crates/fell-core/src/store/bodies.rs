@@ -1180,8 +1180,8 @@ pub struct PartKinds {
     pub stamp: PartStamp,
 }
 
-/// The stored rows among `message_ids`, by primary key. The blobs are not
-/// read: SQLite answers `length()` of a column from the record header.
+/// The stored rows among `message_ids`, by primary key. SQLite answers the
+/// HTML and plain text sizes from the record header without reading the blobs.
 pub(super) fn kinds(
     conn: &Connection,
     account_id: &AccountId,
@@ -1190,7 +1190,7 @@ pub(super) fn kinds(
     let mut stmt = conn.prepare_cached(
         "SELECT b.html IS NOT NULL, b.plain IS NOT NULL, coalesce(length(b.html), 0),
                 coalesce(length(b.plain), 0),
-                coalesce(s.stamp, zeroblob(16)), length(b.bulk_headers) > 0
+                coalesce(s.stamp, zeroblob(16)), b.bulk_headers
          FROM message_bodies b LEFT JOIN message_body_stamps s USING (account_id, message_id)
          WHERE b.account_id = ?1 AND b.message_id = ?2",
     )?;
@@ -1200,13 +1200,16 @@ pub(super) fn kinds(
             .query_row(params![account_id.as_str(), id], |row| {
                 let html_bytes: i64 = row.get(2)?;
                 let plain_bytes: i64 = row.get(3)?;
+                let headers: String = row.get(5)?;
                 Ok(PartKinds {
                     html: row.get(0)?,
                     plain: row.get(1)?,
                     html_bytes: html_bytes.max(0) as u64,
                     plain_bytes: plain_bytes.max(0) as u64,
                     stamp: PartStamp(row.get(4)?),
-                    has_delivery_headers: row.get(5)?,
+                    has_delivery_headers: header_records(&headers).any(|(name, _)| {
+                        !name.eq_ignore_ascii_case(crate::message::VERIFIED_SENDER_HEADER)
+                    }),
                 })
             })
             .optional()?;
@@ -1319,13 +1322,14 @@ fn encode_headers(headers: &[(String, String)]) -> String {
         .join("\u{1e}")
 }
 
-fn decode_headers(raw: &str) -> Vec<(String, String)> {
+fn header_records(raw: &str) -> impl Iterator<Item = (&str, &str)> {
     raw.split('\u{1e}')
-        .filter(|record| !record.is_empty())
-        .filter_map(|record| {
-            let (name, value) = record.split_once('\u{1f}')?;
-            Some((name.to_string(), value.to_string()))
-        })
+        .filter_map(|record| record.split_once('\u{1f}'))
+}
+
+fn decode_headers(raw: &str) -> Vec<(String, String)> {
+    header_records(raw)
+        .map(|(name, value)| (name.to_string(), value.to_string()))
         .collect()
 }
 
