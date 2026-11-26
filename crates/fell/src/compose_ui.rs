@@ -210,10 +210,19 @@ impl Editor {
         } else {
             source.split('\n').map(str::to_string).collect()
         };
-        let row = lines
-            .iter()
-            .position(|line| line.contains("Ship the"))
-            .unwrap_or(0);
+        let row = if source.starts_with("```")
+            && markdown_to_doc(source)
+                .blocks
+                .first()
+                .is_some_and(|block| matches!(block.body, BlockBody::Verbatim { .. }))
+        {
+            1
+        } else {
+            lines
+                .iter()
+                .position(|line| line.contains("Ship the"))
+                .unwrap_or(0)
+        };
         let col = 0;
         Self {
             row,
@@ -231,7 +240,16 @@ impl Editor {
     /// body.
     fn cursor_to_end_of_text(&mut self) {
         match self.lines.iter().rposition(|line| !line.trim().is_empty()) {
-            Some(row) => {
+            Some(mut row) => {
+                if self.lines[row].starts_with("```")
+                    && markdown_to_doc(&self.lines[..=row].join("\n"))
+                        .blocks
+                        .last()
+                        .is_some_and(|block| matches!(block.body, BlockBody::Verbatim { .. }))
+                {
+                    // Start inside the text, before the closing fence.
+                    row -= 1;
+                }
                 self.row = row;
                 self.col = self.lines[row].chars().count();
             }
@@ -873,16 +891,7 @@ impl ComposeView {
         }
         if snap.send_requested_by.is_none() {
             // The person's own draft: pick up where the text ends.
-            if let Some(row) = self
-                .editor
-                .lines
-                .iter()
-                .rposition(|line| !line.trim().is_empty())
-            {
-                self.editor.row = row;
-                self.editor.col = self.editor.lines[row].chars().count();
-                self.editor.clamp();
-            }
+            self.editor.cursor_to_end_of_text();
             return;
         }
         // No edits yet: start on the first line of text, so the first view
@@ -4029,6 +4038,7 @@ fn raw_source_block(
     let base_line = text[..start].chars().filter(|ch| *ch == '\n').count();
     let mut line_start = start;
     let mut announced = Vec::new();
+    let verbatim = matches!(block.body, BlockBody::Verbatim { .. });
     // The agent edit being painted: its lines and what they replaced share
     // one tinted block, so no seam of page colour shows between them.
     let mut tint: Option<(gpui::Div, bool)> = None;
@@ -4049,10 +4059,15 @@ fn raw_source_block(
         // Markers fold off the cursor line. A link's URL does too, except
         // on a line an agent changed: a new destination must be seen.
         let tinted = !touching.is_empty();
-        let urls = match (cursor, tinted) {
-            (Some(_), _) => Urls::Source,
-            (None, true) => Urls::Bare,
-            (None, false) => Urls::Fold(links),
+        if verbatim && (offset == 0 || line_end + 1 >= end) && cursor.is_none() && !tinted {
+            line_start = line_end + 1;
+            continue;
+        }
+        let urls = match (verbatim, cursor, tinted) {
+            (true, _, _) => Urls::Verbatim,
+            (false, Some(_), _) => Urls::Source,
+            (false, None, true) => Urls::Bare,
+            (false, None, false) => Urls::Fold(links),
         };
         let painted = raw_line(line, cursor, urls, editor.mode, tinted, paint);
         if !tinted {
@@ -4138,6 +4153,8 @@ fn hunk_block(focused: bool, colors: Palette) -> gpui::Div {
 /// How a source line shows a link's `](url)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Urls {
+    /// The line is literal text and has no Markdown links or markers.
+    Verbatim,
     /// As written: the cursor line and the raw view.
     Source,
     /// The brackets fold like the other markers, and the whole target
@@ -4165,6 +4182,7 @@ fn folds(kind: StyleKind, show_markers: bool, urls: Urls) -> bool {
 fn url_note(label: &str, url_span: &str, urls: Urls) -> Option<String> {
     let href = span_href(url_span)?;
     match urls {
+        Urls::Verbatim => None,
         Urls::Source => idn_place(href).map(|place| format!("({place})")),
         Urls::Bare => Some(format!("({})", ascii_target(href))),
         Urls::Fold(links) => shown_target(&plain_markdown(label), href, links),
@@ -4201,7 +4219,8 @@ fn raw_line(
     tinted: bool,
     paint: &SourcePaint,
 ) -> gpui::Div {
-    if let Some(col) = cursor
+    if urls != Urls::Verbatim
+        && let Some(col) = cursor
         && line.contains("](")
     {
         let styles = line_styles(line);
@@ -4590,7 +4609,15 @@ fn source_pieces(
     colors: Palette,
 ) -> Pieces {
     let quiet = if tinted { colors.fg } else { colors.muted };
-    let styles = line_styles(line);
+    let styles = if urls == Urls::Verbatim && !line.is_empty() {
+        vec![StyleSpan {
+            start: 0,
+            end: line.len(),
+            kind: StyleKind::Plain,
+        }]
+    } else {
+        line_styles(line)
+    };
     if styles.is_empty() {
         let mut pieces = Pieces::default();
         if cursor.is_some() {
@@ -5048,6 +5075,9 @@ fn safe_doc(doc: &StyledDoc) -> StyledDoc {
             BlockBody::Code { text } => BlockBody::Code {
                 text: text_safe(text),
             },
+            BlockBody::Verbatim { text } => BlockBody::Verbatim {
+                text: text_safe(text),
+            },
             BlockBody::Image { alt, src } => BlockBody::Image {
                 alt: text_safe(alt),
                 src: src.clone(),
@@ -5182,6 +5212,11 @@ fn render_block(
             .bg(rgb(colors.panel))
             .p_2()
             .child(text.clone()),
+        BlockBody::Verbatim { text } => text
+            .split('\n')
+            .fold(div().flex().flex_col(), |column, line| {
+                column.child(div().w_full().min_h(px(24.)).child(line.to_string()))
+            }),
         BlockBody::Image { alt, src } => image_block(alt, src, folder, colors),
     }
 }
@@ -7454,6 +7489,17 @@ mod tests {
         empty.row = 1;
         empty.cursor_to_end_of_text();
         assert_eq!((empty.row, empty.col), (0, 0));
+    }
+
+    #[test]
+    fn verbatim_draft_resumes_before_its_closing_fence() {
+        let plain = "use_snake_case\n- item";
+        let body = fell_core::compose::verbatim_markdown(plain);
+        let mut editor = super::Editor::from_body(&body);
+        assert_eq!(editor.lines[editor.row], "use_snake_case");
+        editor.cursor_to_end_of_text();
+        assert_eq!(editor.lines[editor.row], "- item");
+        assert_eq!(editor.col, "- item".len());
     }
 
     /// The text a source line shows with these fold settings, a link's

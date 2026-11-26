@@ -514,7 +514,19 @@ fn push_stat(
 
 pub fn inline_image_paths(body: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let mut rest = body;
+    let mut start = 0;
+    if body.contains(super::markdown::VERBATIM_INFO) {
+        let doc = super::markdown::markdown_to_doc(body);
+        for ((from, to), _) in doc.verbatim_blocks() {
+            append_inline_image_paths(&body[start..from], &mut out);
+            start = to;
+        }
+    }
+    append_inline_image_paths(&body[start..], &mut out);
+    out
+}
+
+fn append_inline_image_paths(mut rest: &str, out: &mut Vec<String>) {
     while let Some(start) = rest.find("![") {
         rest = &rest[start + 2..];
         let Some(split) = rest.find("](") else {
@@ -530,7 +542,6 @@ pub fn inline_image_paths(body: &str) -> Vec<String> {
         }
         rest = &after[end + 1..];
     }
-    out
 }
 
 #[allow(clippy::too_many_arguments)]

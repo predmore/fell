@@ -6,6 +6,15 @@ pub struct StyledDoc {
     pub blocks: Vec<Block>,
 }
 
+impl StyledDoc {
+    pub(super) fn verbatim_blocks(&self) -> impl Iterator<Item = ((usize, usize), &str)> {
+        self.blocks.iter().filter_map(|block| match &block.body {
+            BlockBody::Verbatim { text } => Some((block.source?, text.as_str())),
+            _ => None,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
     /// Byte range in the markdown source. Absent for HTML input.
@@ -30,6 +39,9 @@ pub enum BlockBody {
         blocks: Vec<Block>,
     },
     Code {
+        text: String,
+    },
+    Verbatim {
         text: String,
     },
     Image {
@@ -168,6 +180,24 @@ fn markdown_inlines(inlines: &[fell_render::Inline]) -> String {
     text
 }
 
+pub(super) const VERBATIM_INFO: &str = "fell-plain-text";
+
+/// Keep literal text editable in a Markdown draft. A matching fence line
+/// ends the block, and the newline before that line belongs to the fence.
+pub fn verbatim_markdown(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let used: std::collections::HashSet<usize> = text
+        .split('\n')
+        .filter(|line| line.len() >= 3 && line.bytes().all(|byte| byte == b'`'))
+        .map(str::len)
+        .collect();
+    let length = (3..).find(|length| !used.contains(length)).unwrap();
+    let fence = "`".repeat(length);
+    format!("{fence}{VERBATIM_INFO}\n{text}\n{fence}\n")
+}
+
 fn escape_markdown(text: &str) -> String {
     let mut escaped = String::new();
     for (index, ch) in text.char_indices() {
@@ -231,7 +261,8 @@ pub fn markdown_to_doc(source: &str) -> StyledDoc {
             continue;
         }
         if line.text.starts_with("```") {
-            let (block, next) = take_fence(&lines, index);
+            let (block, next) =
+                take_verbatim(source, &lines, index).unwrap_or_else(|| take_fence(&lines, index));
             blocks.push(block);
             index = next;
             continue;
@@ -626,6 +657,29 @@ fn take_fence(lines: &[SrcLine<'_>], start: usize) -> (Block, usize) {
     )
 }
 
+fn take_verbatim(source: &str, lines: &[SrcLine<'_>], start: usize) -> Option<(Block, usize)> {
+    let first = &lines[start];
+    let fence = first.text.strip_suffix(VERBATIM_INFO)?;
+    if fence.len() < 3 || !fence.bytes().all(|byte| byte == b'`') {
+        return None;
+    }
+    let close = lines[start + 1..]
+        .iter()
+        .position(|line| line.text == fence)?
+        + start
+        + 1;
+    let last = &lines[close];
+    let content = &source[first.end..last.start];
+    let text = content.strip_suffix('\n').unwrap_or(content).to_string();
+    Some((
+        Block {
+            source: Some((first.start, last.end)),
+            body: BlockBody::Verbatim { text },
+        },
+        close + 1,
+    ))
+}
+
 fn take_quote(lines: &[SrcLine<'_>], start: usize) -> (Block, usize) {
     let mut inner = String::new();
     let mut index = start;
@@ -936,6 +990,10 @@ fn block_html(block: &Block) -> String {
         BlockBody::Code { text } => format!(
             "<pre style=\"font-family:ui-monospace,Consolas,monospace;background:#f6f6f6;padding:0.6em\"><code>{}</code></pre>",
             escape(text)
+        ),
+        BlockBody::Verbatim { text } => format!(
+            "<div style=\"white-space:pre-wrap;overflow-wrap:break-word\">{}</div>",
+            escape(text).replace('\n', "<br>")
         ),
         BlockBody::Image { alt, src } => image_html(alt, src),
     }

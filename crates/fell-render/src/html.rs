@@ -2004,7 +2004,7 @@ fn is_signature_delimiter(raw: &str) -> bool {
 /// isolates, zero-width marks, and the joiners newsletters pad a preheader
 /// with. The same set compose's `display_safe` strips. Letters of
 /// right-to-left scripts are kept; only the invisible controls go.
-pub(crate) fn is_invisible(ch: char) -> bool {
+pub fn is_invisible(ch: char) -> bool {
     matches!(
         ch,
         '\u{200B}'..='\u{200F}'

@@ -89,6 +89,28 @@ Setup writes `~/.config/fell/account.toml` (mode 0600) and saves the entered pas
 
 Use `--imap --host imap.example.com` for an IMAP account other than Bridge. Setup also shows where mail is sent (`--smtp-host`, `--smtp-port`, `--smtp-security`; an IMAP account is asked on a terminal) and logs in there without sending anything. `fell account check` tests both logins again. Sync is read-only (`EXAMINE` and `BODY.PEEK`), so nothing changes on the server. `space s` syncs now. When Bridge is down or rejects the login, the status line and the empty inbox say so. `--fixture` opens one stored message so the HTML renderer can be seen. IMAP sync and confirmed SMTP delivery live in `fell-core`. Both ordinary IMAP accounts and Bridge use their configured SMTP settings for sending. The protocol tests use loopback IMAP and SMTP servers. Message bodies are indexed locally with a lexical hash. `fell embeddings install` downloads a small local sentence model (all-MiniLM-L6-v2, 23 MB, Apache-2.0) after showing what it fetches and asking. `fell embeddings status` and `fell embeddings remove` report on it and delete it. With the model installed, search also finds mail close in meaning to the query (hybrid ranking); without it, search is keyword search. The window follows the active Omarchy theme when `~/.local/state/omarchy/current/theme/colors.toml` is present, and otherwise uses the built-in dark or light theme.
 
+### Open a draft from another app
+
+Set Fell as the desktop's default handler for email links with `xdg-mime`.
+
+```sh
+xdg-mime default dev.predmore.fell.desktop x-scheme-handler/mailto
+```
+
+Use a mailto link or start a draft from the terminal.
+
+```sh
+fell 'mailto:team@example.com?subject=Weekly%20notes&body=Here%20is%20the%20agenda.'
+fell compose --to team@example.com --cc editor@example.com \
+  --subject 'Weekly notes' --body 'Here is the agenda.' --attach agenda.pdf
+```
+
+Both forms open the editor. Send from there when the draft is ready. Mailto
+bodies are literal text. `fell compose --body` accepts Markdown. Repeat
+`--to`, `--cc`, `--bcc`, or `--attach` to add more recipients or files.
+Use regular files with direct paths for attachments. The combined limit is
+25 MB across up to 20 files.
+
 ### Settings
 
 Open **Settings** from the command palette or press `Space ,`. Use `j` and `k`

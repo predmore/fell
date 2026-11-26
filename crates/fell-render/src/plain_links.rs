@@ -110,14 +110,28 @@ fn is_percent_escape(bytes: &[u8]) -> bool {
     matches!(bytes, [b'%', a, b, ..] if a.is_ascii_hexdigit() && b.is_ascii_hexdigit())
 }
 
-fn decode_mailto_component(raw: &str) -> Option<Cow<'_, str>> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UriComponentError {
+    InvalidPercentEscape,
+    InvalidUtf8,
+}
+
+/// Decode one layer of percent escapes while keeping literal plus signs.
+/// Callers apply the rules for their specific URI field to the decoded text.
+pub fn decode_uri_component(raw: &str) -> Result<Cow<'_, str>, UriComponentError> {
     if raw
         .match_indices('%')
         .any(|(at, _)| !is_percent_escape(&raw.as_bytes()[at..]))
     {
-        return None;
+        return Err(UriComponentError::InvalidPercentEscape);
     }
-    let decoded = percent_decode_str(raw).decode_utf8().ok()?;
+    percent_decode_str(raw)
+        .decode_utf8()
+        .map_err(|_| UriComponentError::InvalidUtf8)
+}
+
+fn decode_mailto_component(raw: &str) -> Option<Cow<'_, str>> {
+    let decoded = decode_uri_component(raw).ok()?;
     // Reject separators some clients interpret after decoding, and a second
     // layer of escapes whose interpretation would depend on the opener.
     if decoded.contains(['#', '|'])

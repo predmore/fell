@@ -30,11 +30,13 @@ pub use history::{
     Fold, FoldedDocument, Section, fold_history, is_forward_subject, is_quoted_from_line,
 };
 pub use html::{
-    document_from_body, html_has_uneditable_draft_formatting, html_to_document, looks_like_html,
-    plain_to_document,
+    document_from_body, html_has_uneditable_draft_formatting, html_to_document, is_invisible,
+    looks_like_html, plain_to_document,
 };
 pub use markdown::markdown_to_document;
-pub use plain_links::{plain_link_targets, reader_link_target};
+pub use plain_links::{
+    UriComponentError, decode_uri_component, plain_link_targets, reader_link_target,
+};
 pub use typed_list::plain_list_runs;
 pub use webview_html::{
     WebFrame, address_is_blocked, request_is_blocked, request_is_blocked_with, sanitize_html,
