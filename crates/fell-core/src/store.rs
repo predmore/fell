@@ -27,6 +27,7 @@ pub(crate) mod bodies;
 pub(crate) mod copies;
 pub(crate) mod correspondents;
 mod dates;
+mod imap_namespace;
 pub(crate) mod inbox_arrivals;
 pub(crate) mod intents;
 pub(crate) mod keywords;
@@ -826,7 +827,7 @@ impl Store {
         crate::accounts::validate_account_write(&tx, self.db_path(), account)?;
         upsert_account_on(&tx, account)?;
         if let Some(config) = config {
-            bind_imap_connection(&tx, config)?;
+            imap_namespace::bind(&tx, config)?;
         }
         crate::outbox::set_write_back_on(&tx, &account.id, write_back)?;
         tx.commit()?;
@@ -857,6 +858,36 @@ impl Store {
         let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let login = read_meta(&conn, &format!("imap:login:{id}"))?;
         Ok(login.is_none_or(|login| login == username))
+    }
+
+    pub fn stored_write_back(path: &Path, id: &str) -> Result<bool> {
+        let store = Self::open_existing_without_index(path)?;
+        store.write_back(&AccountId(id.into()))
+    }
+
+    pub(crate) fn kept_connection(path: &Path, id: &str) -> Result<crate::AccountConfig> {
+        let store = Self::open_existing_without_index(path)?;
+        let account = store
+            .get_account(&AccountId(id.into()))?
+            .ok_or_else(|| crate::Error::Invalid("The kept mailbox is unavailable.".into()))?;
+        if let Some(text) = read_meta(&store.conn, &format!("reconnect:{id}"))? {
+            return crate::AccountConfig::parse(&text);
+        }
+        let username = read_meta(&store.conn, &format!("imap:login:{id}"))?
+            .unwrap_or_else(|| account.email.clone());
+        let mut config =
+            crate::AccountConfig::bridge(&account.email, &username, crate::PasswordSource::Keyring);
+        config.id = id.into();
+        config.name = account.display_name;
+        config.backend = account.backend_kind;
+        if config.backend == BackendKind::Imap {
+            config.host.clear();
+            config.port = 993;
+            config.security = crate::ImapSecurity::Tls;
+            config.smtp_host = Some(String::new());
+            config.smtp_port = Some(587);
+        }
+        Ok(config)
     }
 
     pub(crate) fn matches_imap_connection(&self, config: &crate::AccountConfig) -> Result<bool> {
@@ -3064,56 +3095,22 @@ fn imap_binding_key(config: &crate::AccountConfig, field: &str) -> String {
     format!("imap:{field}:{}", config.id)
 }
 
+pub(crate) fn save_reconnect_config(
+    conn: &Connection,
+    mut config: crate::AccountConfig,
+) -> Result<()> {
+    config.password = crate::PasswordSource::Keyring;
+    set_meta(conn, &format!("reconnect:{}", config.id), &config.render())
+}
+
 pub(crate) fn matches_imap_connection(
     conn: &Connection,
     config: &crate::AccountConfig,
 ) -> Result<bool> {
     Ok(read_meta(conn, &imap_binding_key(config, "endpoint"))?
-        .is_none_or(|endpoint| endpoint == config.imap_endpoint_key())
+        .is_some_and(|endpoint| endpoint == config.imap_endpoint_key())
         && read_meta(conn, &imap_binding_key(config, "login"))?
-            .is_none_or(|login| login == config.username))
-}
-
-/// Start reading the changed endpoint without reusing the old UID namespace.
-fn bind_imap_connection(conn: &Connection, config: &crate::AccountConfig) -> Result<()> {
-    let login_key = imap_binding_key(config, "login");
-    if read_meta(conn, &login_key)?.is_some_and(|login| login != config.username) {
-        return Err(crate::Error::Invalid(
-            "This local mailbox belongs to a different IMAP login.".into(),
-        ));
-    }
-    set_meta(conn, &login_key, &config.username)?;
-    let endpoint_key = imap_binding_key(config, "endpoint");
-    let endpoint = config.imap_endpoint_key();
-    if read_meta(conn, &endpoint_key)?.is_some_and(|old| old != endpoint) {
-        let id = &config.id;
-        crate::outbox::hold_for_endpoint_change(conn, &AccountId(id.clone()))?;
-        conn.execute("DELETE FROM meta WHERE key = 'cursor:' || ?1", [id])?;
-        for table in [
-            "message_copies",
-            "copy_orphans",
-            "local_flag_intent_copies",
-            "server_draft_copies",
-            "discarded_server_draft_copies",
-            "server_draft_rescans",
-        ] {
-            conn.execute(&format!("DELETE FROM {table} WHERE account_id = ?1"), [id])?;
-        }
-        for table in ["messages", "message_aliases"] {
-            conn.execute(
-                &format!(
-                    "UPDATE {table} SET remote_id = '' WHERE account_id = ?1 AND remote_id <> ''"
-                ),
-                [id],
-            )?;
-        }
-        conn.execute(
-            "UPDATE message_bodies SET structure_copy = NULL
-             WHERE account_id = ?1 AND structure_copy IS NOT NULL",
-            [id],
-        )?;
-    }
-    set_meta(conn, &endpoint_key, &endpoint)
+            .is_some_and(|login| login == config.username))
 }
 
 fn read_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
@@ -5280,6 +5277,39 @@ pub(crate) fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Messag
 #[cfg(test)]
 mod tests {
     #[test]
+    fn adopting_a_file_holds_unbound_legacy_uids() {
+        let store = Store::open_in_memory().unwrap();
+        let mut config = crate::AccountConfig::bridge(
+            "mail@example.test",
+            "mailbox",
+            crate::PasswordSource::Command("exit 1".into()),
+        );
+        config.write_back = true;
+        let account = config.account();
+        store.configure_account(&account, true).unwrap();
+        store.conn.execute(
+            "INSERT INTO server_outbox (account_id, kind, state, message_id, source_folder, source_mailbox,
+              uidvalidity, uid, target_folder, created_unix)
+             VALUES (?1, 'move', 'pending', 'old@example.test', 'INBOX', 'INBOX', 1, 2, 'Archive', 0)",
+            [account.id.as_str()],
+        ).unwrap();
+        assert_eq!(
+            config.replay_outbox(&store).unwrap(),
+            crate::ReplayReport::default()
+        );
+        store.configure_connection(&config).unwrap();
+        let server = store
+            .observe_imap_server(&config, "current file's server")
+            .unwrap();
+        assert_eq!(store.held_write_count(&account.id).unwrap(), 1);
+        assert!(
+            crate::outbox::endpoint::resumable(&store, &config, &server)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn changing_imap_endpoints_holds_queued_moves_in_their_original_uid_namespace() {
         use crate::outbox::OutboxState;
 
@@ -5291,7 +5321,9 @@ mod tests {
         );
         config.write_back = true;
         let account = config.account().id;
+        assert!(!store.matches_imap_connection(&config).unwrap());
         store.configure_connection(&config).unwrap();
+        let old_server = store.observe_imap_server(&config, "first server").unwrap();
         store
             .conn
             .execute(
@@ -5338,7 +5370,25 @@ mod tests {
             crate::ReplayReport::default()
         );
         store.configure_connection(&config).unwrap();
-        assert_eq!(store.outbox(&account).unwrap(), [held]);
+        assert_eq!(store.outbox(&account).unwrap(), [held.clone()]);
+        let different = store
+            .observe_imap_server(&config, "different greeting")
+            .unwrap();
+        assert_ne!(different, old_server);
+        assert!(
+            crate::outbox::endpoint::resumable(&store, &config, &different)
+                .unwrap()
+                .is_empty()
+        );
+        let matching = store.observe_imap_server(&config, "first server").unwrap();
+        let resumable = crate::outbox::endpoint::resumable(&store, &config, &matching).unwrap();
+        assert_eq!(resumable, [held]);
+        crate::outbox::endpoint::resume_verified(&store, &config, &matching, &resumable[0], true)
+            .unwrap();
+        assert_eq!(
+            store.outbox(&account).unwrap()[0].state,
+            OutboxState::Pending
+        );
     }
 
     use super::*;

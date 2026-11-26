@@ -148,6 +148,14 @@ pub struct Accounts {
     pub entries: Vec<Entry>,
     pub error: Option<FileError>,
     pub interrupted: Vec<InterruptedRemoval>,
+    pub disconnected: Vec<DisconnectedMailbox>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisconnectedMailbox {
+    pub id: String,
+    pub email: String,
+    pub path: PathBuf,
 }
 
 impl Accounts {

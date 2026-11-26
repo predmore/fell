@@ -100,12 +100,24 @@ pub(super) fn replay_bound(
     if guard.is_none() && store.db_path().is_some() {
         return Ok(ReplayReport::default());
     }
+    let mut verified = None;
+    if let Some(config_file) = expected
+        && outbox::endpoint::can_resume(store, config_file)?
+    {
+        let mut session = WriteSession::open(config)?;
+        let server = store.observe_imap_server(config_file, &session.fingerprint())?;
+        resume_held(&mut session, store, config_file, &server)?;
+        verified = Some(session);
+    }
     let mut entries = outbox::unfinished(store, account_id, write_back, expected)?;
     if !append_sent {
         entries.retain(|entry| entry.kind != OutboxKind::AppendSent);
     }
     let mut report = ReplayReport::default();
     if entries.is_empty() {
+        if let Some(mut session) = verified {
+            session.logout();
+        }
         return Ok(report);
     }
     let now = outbox::now_unix();
@@ -133,8 +145,18 @@ pub(super) fn replay_bound(
         before_send,
         report: &mut report,
     };
-    let result = match WriteSession::open(config) {
+    let result = match verified.map_or_else(|| WriteSession::open(config), Ok) {
         Ok(mut session) => {
+            if let Some(config) = expected {
+                // An unexpected identity change parks pending rows transactionally.
+                // Reload on the next pass before trying any of those rows.
+                let identity = session.fingerprint();
+                if !store.imap_server_matches(config, &identity)? {
+                    store.observe_imap_server(config, &identity)?;
+                    session.logout();
+                    return Ok(ReplayReport::default());
+                }
+            }
             let result = pass.run(config, &mut session);
             if !matches!(
                 &result,
@@ -195,6 +217,141 @@ pub(super) fn replay_bound(
     }
     report.waiting = entries.len() - settled;
     Ok(report)
+}
+
+fn resume_held(
+    session: &mut WriteSession,
+    store: &Store,
+    config: &crate::AccountConfig,
+    server: &str,
+) -> crate::Result<()> {
+    let mut observed = HashMap::new();
+    for row in outbox::endpoint::resumable(store, config, server)? {
+        let (source_epoch, target_epoch) = outbox::endpoint::resume_epochs(store, &row)?;
+        let source = row.source_mailbox.as_deref().zip(source_epoch);
+        let target = row.target_mailbox.as_deref().zip(target_epoch);
+        if source.is_none() && (row.uid.is_some() || target.is_none()) {
+            continue;
+        }
+        let mut matches = true;
+        let mut checked = true;
+        for (mailbox, expected) in source.into_iter().chain(target) {
+            let validity = match observed.entry(mailbox.to_owned()) {
+                std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let actual = match session.select(mailbox) {
+                        Ok(validity) => Some(validity),
+                        Err(WriteError::Refused(_)) => None,
+                        Err(WriteError::Connection(error)) => return Err(error),
+                    };
+                    *entry.insert(actual)
+                }
+            };
+            checked &= validity.is_some();
+            matches &= validity == Some(expected);
+        }
+        if checked {
+            outbox::endpoint::resume_verified(store, config, server, &row, matches)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn resend_held_writes(
+    config: &crate::AccountConfig,
+    store: &Store,
+) -> crate::Result<usize> {
+    if !config.write_back {
+        return Ok(0);
+    }
+    let guard = store.try_lock_mailbox_operation(".write-back")?;
+    if guard.is_none() && store.db_path().is_some() {
+        return Err(Error::Backend(
+            "Mail changes are already syncing. Try again shortly.".into(),
+        ));
+    }
+    let account = AccountId(config.id.clone());
+    let rows = outbox::endpoint::held(store, &account)?;
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let imap = config.imap_config()?;
+    let mut session = WriteSession::open(&imap)?;
+    store.observe_imap_server(config, &session.fingerprint())?;
+    let listed = session.list()?;
+    let roles = FolderRoles::detect(&listed_mailboxes(&listed), &imap.folder_overrides);
+    let mailbox = |folder: &str| {
+        roles
+            .iter()
+            .find(|role| {
+                role.name.eq_ignore_ascii_case(folder)
+                    || role.role.default_name().eq_ignore_ascii_case(folder)
+            })
+            .map(|role| role.raw.as_str())
+            .or_else(|| {
+                listed
+                    .iter()
+                    .find(|item| item.decoded.eq_ignore_ascii_case(folder))
+                    .map(|item| item.raw.as_str())
+            })
+    };
+    let mut queued = 0;
+    for row in rows {
+        if is_synthetic_message_id(&row.message_id)
+            || row.reverses.is_some()
+            || !matches!(
+                row.kind,
+                OutboxKind::Move | OutboxKind::Seen | OutboxKind::Flagged | OutboxKind::Keyword
+            )
+        {
+            continue;
+        }
+        let Some(source) = mailbox(&row.source_folder) else {
+            continue;
+        };
+        let target = (row.kind == OutboxKind::Move)
+            .then(|| mailbox(&row.target_folder))
+            .flatten();
+        if row.kind == OutboxKind::Move && (target.is_none() || target == Some(source)) {
+            continue;
+        }
+        match locate_for_resend(&mut session, source, &row.message_id) {
+            Ok(Some((validity, uid))) => {
+                queued += usize::from(outbox::endpoint::requeue(
+                    store,
+                    config,
+                    &row,
+                    (source, validity, uid),
+                    target,
+                )?);
+            }
+            Ok(None) | Err(WriteError::Refused(_)) => {}
+            Err(WriteError::Connection(error)) => return Err(error),
+        }
+    }
+    session.logout();
+    Ok(queued)
+}
+
+fn locate_for_resend(
+    session: &mut WriteSession,
+    mailbox: &str,
+    id: &str,
+) -> Result<Option<(u32, u32)>, WriteError> {
+    let validity = session.select(mailbox)?;
+    let candidates = session.search_message_id(id, RECOVERY_UID_LIMIT, None)?;
+    let mut found = None;
+    for batch in candidates.chunks(RECOVERY_HEADER_BATCH) {
+        for (uid, header) in session.uid_fetch_message_ids(batch)? {
+            if batch.binary_search(&uid).is_ok()
+                && copy_message_id(mailbox, validity, uid, &header, false).as_str() == id
+                && found.replace(uid).is_some()
+            {
+                return Ok(None);
+            }
+        }
+    }
+    Ok(found.map(|uid| (validity, uid)))
 }
 
 enum Stop {

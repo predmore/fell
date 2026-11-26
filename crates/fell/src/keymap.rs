@@ -304,6 +304,9 @@ pub const ACTION_SECTIONS: &[(&str, &[Action])] = &[
             Action::Setting(SettingsRow::AccountSetup),
             Action::Setting(SettingsRow::RemoveAccount),
             Action::Setting(SettingsRow::EditConnection),
+            Action::Setting(SettingsRow::ReconnectAccount),
+            Action::Setting(SettingsRow::ResendChanges),
+            Action::Setting(SettingsRow::DiscardChanges),
             Action::Setting(SettingsRow::EditAccount),
             Action::Setting(SettingsRow::ImportIdentities),
             Action::Setting(SettingsRow::EffectiveBindings),
@@ -757,6 +760,14 @@ pub fn palette_items(keymap: &Keymap, query: &str, recent: &[Action]) -> Vec<Pal
 }
 
 pub fn binding_text(keymap: &Keymap, action: Action) -> String {
+    if let Action::Setting(SettingsRow::ResendChanges | SettingsRow::DiscardChanges) = action {
+        let key = if action == Action::Setting(SettingsRow::ResendChanges) {
+            crate::model::settings::RESEND_CHANGES_KEY
+        } else {
+            crate::model::settings::DISCARD_CHANGES_KEY
+        };
+        return format!("{} in Accounts", key_label(key, &keymap.leader_name));
+    }
     if action == Action::Setting(SettingsRow::RemoveAccount) {
         let key = key_label(
             crate::model::settings::REMOVE_ACCOUNT_KEY,

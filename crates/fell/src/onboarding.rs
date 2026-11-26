@@ -56,6 +56,7 @@ struct FinishedCheck {
     config: AccountConfig,
     result: fell_core::Result<ConnectionReport>,
     retained_mailbox: Option<String>,
+    queued: Option<(usize, usize)>,
 }
 
 pub(crate) struct Onboarding {
@@ -77,6 +78,12 @@ pub(crate) struct Onboarding {
     expected: Option<FileIdentity>,
 }
 
+pub(crate) enum SetupTarget {
+    New,
+    Edit(AccountConfig, FileIdentity, (usize, usize)),
+    Reconnect(AccountConfig),
+}
+
 impl Onboarding {
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let view = Self::init(window, cx);
@@ -91,15 +98,23 @@ impl Onboarding {
 
     pub(crate) fn from_inbox(
         inbox: gpui::AnyWindowHandle,
-        previous: Option<(AccountConfig, FileIdentity)>,
+        target: SetupTarget,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut view = Self::new(window, cx);
-        if let Some((config, identity)) = previous {
-            view.form = Form::editing(config);
-            view.expected = Some(identity);
-            view.select(Control::Field(Field::Username));
+        match target {
+            SetupTarget::New => {}
+            SetupTarget::Edit(config, identity, queued) => {
+                view.form = Form::editing(config);
+                view.form.queued_changes = queued;
+                view.expected = Some(identity);
+                view.select(Control::Field(Field::Username));
+            }
+            SetupTarget::Reconnect(config) => {
+                view.form = Form::reconnecting(config);
+                view.select(Control::Field(Field::Password));
+            }
         }
         view.return_to_inbox = Some(inbox);
         view
@@ -232,7 +247,8 @@ impl Onboarding {
                 Storage::Saving { .. } => vec![Next],
                 _ if self.form.storage.must_reopen() => vec![Next],
                 Storage::ConfirmInline(_) => vec![Back, Next],
-                _ if self.form.inline_available() => vec![Next, Inline, Back],
+                _ if self.form.inline_available() => vec![Back, Inline, Next],
+                Storage::Keyring if self.form.reconnect_to.is_some() => vec![Back, Next],
                 Storage::Keyring if self.form.retained_mailbox.is_some() => {
                     vec![Control::Reconnect, Next, Back]
                 }
@@ -326,7 +342,9 @@ impl Onboarding {
                     self.feedback.begin_save();
                     let control = if self.form.replacement() || self.form.failed_check {
                         Control::Back
-                    } else if self.form.retained_mailbox.is_some() {
+                    } else if self.form.retained_mailbox.is_some()
+                        && self.form.reconnect_to.is_none()
+                    {
                         Control::Reconnect
                     } else {
                         Control::Next
@@ -342,7 +360,10 @@ impl Onboarding {
                 }
                 _ => {}
             },
-            Control::Back if before == Step::Identity && self.form.previous.is_some() => {
+            Control::Back
+                if before == Step::Identity
+                    && (self.form.previous.is_some() || self.form.reconnect_to.is_some()) =>
+            {
                 window.remove_window();
             }
             Control::Back => self.back(cx),
@@ -418,7 +439,11 @@ impl Onboarding {
                         .and_then(|_| mailbox::retained_mailbox(&config))
                 })
                 .flatten();
-            (config, result, retained_mailbox)
+            let queued = previous
+                .as_ref()
+                .filter(|old| old.same_mailbox(&config) && !old.same_imap_endpoint(&config))
+                .map(mailbox::queued_connection_changes);
+            (config, result, retained_mailbox, queued)
         });
         cx.spawn_in(window, async move |this, cx| {
             while let Some((service, status)) = events.next().await {
@@ -429,7 +454,7 @@ impl Onboarding {
                     }
                 });
             }
-            let (config, result, retained_mailbox) = work.await;
+            let (config, result, retained_mailbox, queued) = work.await;
             let _ = this.update(cx, |view, cx| {
                 if !view.form.accepts_check(attempt) {
                     return;
@@ -445,6 +470,7 @@ impl Onboarding {
                     config,
                     result,
                     retained_mailbox,
+                    queued,
                 };
                 if view.form.previous.is_none()
                     && returning_to_fields
@@ -465,6 +491,9 @@ impl Onboarding {
     fn finish_check(&mut self, check: FinishedCheck, cx: &mut Context<Self>) {
         if self.form.accepts_check(check.attempt) {
             self.form.retained_mailbox = check.retained_mailbox;
+            if let Some(queued) = check.queued {
+                self.form.queued_changes = queued;
+            }
             let control = self
                 .form
                 .finish_check(check.attempt, &check.config, check.result)
@@ -491,9 +520,23 @@ impl Onboarding {
         let reconnect = self
             .reconnect
             .then(|| self.form.retained_mailbox.clone())
-            .flatten();
+            .flatten()
+            .or_else(|| {
+                self.form
+                    .reconnect_to
+                    .as_ref()
+                    .map(|config| config.id.clone())
+            });
         let previous = self.form.previous.clone();
         let expected = self.expected;
+        let replacing = self
+            .return_to_inbox
+            .zip(previous.as_ref())
+            .filter(|(_, old)| !old.same_mailbox(&config));
+        if let Some((inbox, old)) = replacing {
+            crate::view::account_replacement_started(inbox, old, cx);
+        }
+        let replacing = replacing.map(|(inbox, _)| inbox);
         let work = cx.background_executor().spawn(async move {
             let save = if let Some(previous) = &previous {
                 if previous.same_mailbox(&config) {
@@ -517,25 +560,33 @@ impl Onboarding {
                 |config| mailbox::stage_connection_config(config, save, expected),
             )
         });
-        cx.spawn_in(window, async move |this, cx| {
+        let setup_window = window.window_handle();
+        cx.spawn(async move |this, cx| {
             let result = work.await;
-            let _ = this.update_in(cx, |view, window, cx| match result {
-                Ok(_) => {
-                    let setup = cx.entity();
-                    let previous = view.return_to_inbox.take();
-                    window.defer(cx, move |window, cx| {
-                        if let Some(previous) = previous {
-                            let _ = previous.update(cx, |_, window, _| window.activate_window());
-                            window.remove_window();
-                        } else {
-                            crate::view::finish_onboarding(setup, window, cx);
-                        }
-                    });
-                }
-                Err(error) => {
-                    view.form.storage = Storage::Failed(error);
-                    cx.notify();
-                }
+            if let Some(inbox) = replacing {
+                let path = result.as_ref().ok().cloned();
+                let _ = cx.update(|cx| crate::view::account_replacement_finished(inbox, path, cx));
+            }
+            let _ = setup_window.update(cx, |_, window, cx| {
+                let _ = this.update(cx, |view, cx| match result {
+                    Ok(_) => {
+                        let setup = cx.entity();
+                        let previous = view.return_to_inbox.take();
+                        window.defer(cx, move |window, cx| {
+                            if let Some(previous) = previous {
+                                let _ =
+                                    previous.update(cx, |_, window, _| window.activate_window());
+                                window.remove_window();
+                            } else {
+                                crate::view::finish_onboarding(setup, window, cx);
+                            }
+                        });
+                    }
+                    Err(error) => {
+                        view.form.storage = Storage::Failed(error);
+                        cx.notify();
+                    }
+                });
             });
         })
         .detach();
@@ -573,7 +624,10 @@ impl Onboarding {
             "escape" if self.form.step == Step::Provider && self.return_to_inbox.is_some() => {
                 window.remove_window();
             }
-            "escape" if self.form.step == Step::Identity && self.form.previous.is_some() => {
+            "escape"
+                if self.form.step == Step::Identity
+                    && (self.form.previous.is_some() || self.form.reconnect_to.is_some()) =>
+            {
                 window.remove_window();
             }
             "escape" => self.back(cx),

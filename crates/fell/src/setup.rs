@@ -410,9 +410,10 @@ fn setup(args: &[String]) -> Result<(), String> {
         _ => AccountSave::New,
     };
     let previous_id = config.id.clone();
-    let holds_queued_writes = previous.as_ref().is_some_and(|old| {
-        old.write_back && old.same_mailbox(&config) && !old.same_imap_endpoint(&config)
-    });
+    let queued = previous
+        .as_ref()
+        .filter(|old| old.same_mailbox(&config) && !old.same_imap_endpoint(&config))
+        .map_or(0, |old| crate::mailbox::queued_connection_changes(old).0);
     let path = save_account(
         config,
         password_inline,
@@ -432,8 +433,11 @@ fn setup(args: &[String]) -> Result<(), String> {
         .is_some_and(|id| id != previous_id.as_str())
     {
         println!("Kept local mail under {previous_id}.");
-    } else if holds_queued_writes {
-        println!("Changes queued for the previous IMAP endpoint will stay on this device.");
+    } else if queued > 0 {
+        let noun = if queued == 1 { "change" } else { "changes" };
+        println!(
+            "{queued} {noun} made on the old server won't sync yet. Review in Settings → Accounts."
+        );
     }
     println!("Saved {} (mode 600). Open Fell to sync.", path.display());
     Ok(())

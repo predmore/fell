@@ -118,18 +118,18 @@ impl SaveState {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(super) struct Action {
     pub control: Control,
-    pub label: &'static str,
+    pub label: gpui::SharedString,
     pub enabled: bool,
 }
 
 impl Action {
-    fn new(control: Control, label: &'static str) -> Self {
+    fn new(control: Control, label: impl Into<gpui::SharedString>) -> Self {
         Self {
             control,
-            label,
+            label: label.into(),
             enabled: true,
         }
     }
@@ -179,15 +179,24 @@ fn save_actions(storage: &Storage, form: Option<&Form>) -> [Option<Action>; 3] {
             Some(Action::new(Control::Inline, "Save in file…")),
             Some(next("Retry keyring")),
         ],
+        Storage::Keyring if form.is_some_and(|form| form.reconnect_to.is_some()) => {
+            [Some(back), None, Some(next("Reconnect"))]
+        }
         Storage::Keyring if form.is_some_and(|form| form.retained_mailbox.is_some()) => [
             Some(back),
             Some(next("Start empty")),
             Some(Action::new(Control::Reconnect, "Reconnect")),
         ],
         _ => {
-            let label = if form.is_some_and(Form::replacement) {
-                "Replace account"
-            } else if form.is_some_and(|form| form.failed_check) {
+            if let Some(form) = form.filter(|form| form.replacement()) {
+                let address = crate::present::display_safe(form.text(Field::Email).trim());
+                return [
+                    Some(back),
+                    None,
+                    Some(Action::new(Control::Next, format!("Switch to {address}"))),
+                ];
+            }
+            let label = if form.is_some_and(|form| form.failed_check) {
                 "Save anyway"
             } else if form.is_some_and(|form| form.previous.is_some()) {
                 "Save changes"
@@ -269,21 +278,28 @@ impl<T: PartialEq> Change<T> {
     }
 }
 
-impl<T: Copy> Change<T> {
-    pub(super) fn layers(&self) -> Option<(T, [f32; 2], f32)> {
+impl<T> Change<T> {
+    fn layers_ref(&self) -> Option<(&T, [f32; 2], f32)> {
         let (old, _, from) = self.swap.as_ref()?;
         Some(match self.frame.as_ref()? {
             SwapFrame::Leaving(alpha) => {
                 let from = motion::lerp(motion::ARRIVE_FROM, 1., *from);
                 let shown = motion::lerp(motion::ARRIVE_FROM, from, *alpha);
-                (*old, [shown, 0.], 0.)
+                (old, [shown, 0.], 0.)
             }
             SwapFrame::Arriving(progress) => (
-                *old,
+                old,
                 [0., motion::lerp(motion::ARRIVE_FROM, 1., *progress)],
                 *progress,
             ),
         })
+    }
+}
+
+impl<T: Copy> Change<T> {
+    pub(super) fn layers(&self) -> Option<(T, [f32; 2], f32)> {
+        self.layers_ref()
+            .map(|(old, alpha, progress)| (*old, alpha, progress))
     }
 }
 
@@ -354,7 +370,7 @@ pub(in crate::onboarding) struct Feedback {
     pub(super) connection_actions: Actions,
     pub(super) save_actions: Actions,
     pub(super) primary: Option<Action>,
-    primary_label: Change<Option<&'static str>>,
+    primary_label: Change<Option<gpui::SharedString>>,
     pub(super) save_title: Change<&'static str>,
     pub(super) save_subtitle: Change<&'static str>,
     pub(super) save_note: Change<SaveState>,
@@ -478,13 +494,13 @@ impl Feedback {
         }
     }
 
-    pub(super) fn primary_label_frame(
-        &self,
-        label: &'static str,
-        width: impl Fn(&'static str) -> f32,
-    ) -> (&'static str, f32, f32) {
+    pub(super) fn primary_label_frame<'a>(
+        &'a self,
+        label: &'a str,
+        width: impl Fn(&str) -> f32,
+    ) -> (&'a str, f32, f32) {
         let target = width(label);
-        match self.primary_label.layers() {
+        match self.primary_label.layers_ref() {
             Some((Some(old), [out, _], _)) if out > 0. => (old, out, width(old).max(target)),
             Some((Some(old), [_, arrival], progress)) => (
                 label,
@@ -558,8 +574,8 @@ impl Feedback {
                     .map(|fade| (self.back_amount, fade));
             }
         }
+        let label = primary.as_ref().map(|action| action.label.clone());
         self.primary = primary;
-        let label = primary.map(|action| action.label);
         self.primary_label
             .update(label, motion, now, STEP_OUT, motion::QUICK);
         if self.back_tint.is_some_and(|(_, fade)| !fade.running(now)) {
@@ -655,7 +671,7 @@ mod tests {
         feedback.refresh(&form, Bridge::Checking, motion, now);
         feedback.settle();
         form.step = Step::Connection;
-        let measure = |label| if label == "Testing…" { 90. } else { 140. };
+        let measure = |label: &str| if label == "Testing…" { 90. } else { 140. };
 
         let mut last_width = 140.;
         for elapsed in 0..140 {

@@ -86,6 +86,43 @@ pub fn sync_until(
     arrivals: Option<&mut dyn FnMut(Result<Vec<InboxArrival>>)>,
     stop: &dyn Fn() -> bool,
 ) -> Result<SyncReport> {
+    sync_on(account, backend, store, progress, arrivals, stop, None)
+}
+
+/// Sync an account file using the same authenticated session that verified its server.
+pub fn sync_connection_until(
+    config: &crate::AccountConfig,
+    store: &Store,
+    progress: &mut dyn FnMut(&SyncReport),
+    arrivals: Option<&mut dyn FnMut(Result<Vec<InboxArrival>>)>,
+    stop: &dyn Fn() -> bool,
+) -> Result<SyncReport> {
+    if stop() {
+        return Err(crate::Error::Backend("Sync stopped".into()));
+    }
+    let imap = config.imap_config()?;
+    let session = crate::imap::BoundRead::open(config, imap.clone(), store)?;
+    let backend = config.backend_with_imap(imap, crate::SmtpSenders::AccountFile);
+    sync_on(
+        &config.account(),
+        backend.as_ref(),
+        store,
+        progress,
+        arrivals,
+        stop,
+        Some(session),
+    )
+}
+
+fn sync_on(
+    account: &Account,
+    backend: &dyn MailBackend,
+    store: &Store,
+    progress: &mut dyn FnMut(&SyncReport),
+    arrivals: Option<&mut dyn FnMut(Result<Vec<InboxArrival>>)>,
+    stop: &dyn Fn() -> bool,
+    session: Option<crate::imap::BoundRead>,
+) -> Result<SyncReport> {
     let check = || {
         if stop() {
             Err(crate::Error::Backend("Sync stopped".into()))
@@ -112,7 +149,7 @@ pub fn sync_until(
         check()?;
         store.stored_uids(&account.id, mailbox, uidvalidity, range)
     };
-    backend.sync_changes(cursor.as_ref(), &known, &mut |delta| {
+    let mut persist = |delta: crate::MailboxDelta| {
         check()?;
         let writes = store.apply_sync_delta_observed(&account.id, &delta, observer.as_mut())?;
         report.changed |= writes.changed;
@@ -131,7 +168,12 @@ pub fn sync_until(
             progress(&report);
         }
         Ok(())
-    })?;
+    };
+    if let Some(session) = session {
+        session.fetch(account, cursor.as_ref(), &known, &mut persist)?;
+    } else {
+        backend.sync_changes(cursor.as_ref(), &known, &mut persist)?;
+    }
     check()?;
     // Repair a bounded page of undated mail after a successful sync pass.
     if let Ok(changed) = repair_internal_dates(&account.id, backend, store) {

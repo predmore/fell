@@ -3,6 +3,8 @@ use crate::settings::{Edit, Preference};
 
 pub const REMOVE_ACCOUNT_KEY: KeyId = KeyId::Char('d');
 pub const EDIT_CONNECTION_KEY: KeyId = KeyId::Char('e');
+pub const RESEND_CHANGES_KEY: KeyId = KeyId::Char('r');
+pub const DISCARD_CHANGES_KEY: KeyId = KeyId::Char('x');
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
@@ -60,6 +62,9 @@ impl Section {
                 ImportIdentities,
                 RemoveAccount,
                 EditConnection,
+                ReconnectAccount,
+                ResendChanges,
+                DiscardChanges,
             ],
             Self::Appearance => &[Value(Theme), Value(FontSize), Value(ReduceMotion)],
             Self::Reading => &[Value(ReadDwell)],
@@ -78,6 +83,9 @@ pub enum Row {
     Account(usize),
     RemoveAccount,
     EditConnection,
+    ReconnectAccount,
+    ResendChanges,
+    DiscardChanges,
     EditAccount,
     ImportIdentities,
     EffectiveBindings,
@@ -94,6 +102,9 @@ impl Row {
             Self::Account(_) => "Settings: Open account",
             Self::RemoveAccount => "Settings: Remove account",
             Self::EditConnection => "Settings: Edit connection",
+            Self::ReconnectAccount => "Settings: Reconnect account",
+            Self::ResendChanges => "Settings: Resend unsynced changes",
+            Self::DiscardChanges => "Settings: Discard unsynced changes",
             Self::AccountSetup => "Settings: Add account",
             Self::EditAccount => "Settings: Edit account file",
             Self::ImportIdentities => "Settings: Import sender addresses",
@@ -112,6 +123,8 @@ pub enum Request {
     AccountSetup,
     OpenAccount(usize),
     EditConnection(usize),
+    ReconnectAccount,
+    HeldChanges { index: Option<usize>, resend: bool },
     ConfirmAccountRemoval(usize),
     RemoveAccount { delete: bool },
     EditAccount,
@@ -155,6 +168,8 @@ pub struct Availability {
     pub identity_count: usize,
     pub accounts: usize,
     pub active_account: Option<usize>,
+    pub kept_accounts: bool,
+    pub held_changes: bool,
     pub install_model: bool,
     pub remove_model: bool,
 }
@@ -167,6 +182,8 @@ impl Default for Availability {
             identity_count: 0,
             accounts: 0,
             active_account: None,
+            kept_accounts: false,
+            held_changes: false,
             install_model: true,
             remove_model: false,
         }
@@ -180,6 +197,8 @@ impl Availability {
             Row::Account(index) => index < self.accounts,
             Row::RemoveAccount => self.accounts > 0,
             Row::EditConnection => self.active_account.is_some(),
+            Row::ReconnectAccount => self.kept_accounts,
+            Row::ResendChanges | Row::DiscardChanges => self.held_changes,
             Row::EditAccount => self.edit_account,
             Row::ImportIdentities => self.identity_count > 0,
             Row::InstallModel => self.install_model,

@@ -120,14 +120,18 @@ impl Fixture {
             config: config(server.addr.port()),
             smtp: unused_smtp(),
         };
-        sync_once(&account, &backend, &store).unwrap();
-        store.set_write_back(&account.id, true).unwrap();
-        Self {
+        let fixture = Self {
             server,
             account,
             backend,
             store,
-        }
+        };
+        let mut config = fixture.account_config();
+        config.name.clone_from(&fixture.account.display_name);
+        fixture.store.configure_connection(&config).unwrap();
+        crate::sync_connection_until(&config, &fixture.store, &mut |_| {}, None, &|| false)
+            .unwrap();
+        fixture
     }
 
     fn thread(&self, folder: &str, subject: &str) -> ThreadId {
@@ -440,6 +444,95 @@ fn archiving_a_withheld_message_rechecks_provisional_parts_and_can_save_them() {
         fx.commands().is_empty(),
         "verified cache hit survived the move"
     );
+}
+
+#[test]
+fn endpoint_change_releases_resends_or_discards_held_moves() {
+    for action in ["restore", "resend", "discard", "reset"] {
+        let mut source = state();
+        if action == "restore" {
+            let raw = &mut source.mailboxes[0].messages[0].raw;
+            *raw = String::from_utf8_lossy(raw)
+                .split_inclusive('\n')
+                .filter(|line| !line.starts_with("Message-ID:"))
+                .collect::<String>()
+                .into_bytes();
+        }
+        let fx = Fixture::with(Store::open_in_memory().unwrap(), source);
+        let store = &fx.store;
+        let account = &fx.account.id;
+        let original = fx.account_config();
+        let next_server = TestServer::spawn(state_with(vec![
+            mailbox(
+                "INBOX",
+                "",
+                7,
+                &[(1, "Unrelated"), (91, "Alpha"), (92, "Bravo")],
+            ),
+            mailbox("Archive", "\\Archive", 30, &[]),
+        ]));
+        next_server.use_patient_reads();
+        next_server.writes.lock().unwrap().moves = true;
+        let next = crate::AccountConfig {
+            port: next_server.addr.port(),
+            ..original.clone()
+        };
+        let subject = fx.thread("INBOX", "Alpha");
+        store.archive_thread(account, &subject, "INBOX").unwrap();
+        let original_id = store.outbox(account).unwrap()[0].message_id.clone();
+        store.configure_connection(&next).unwrap();
+        let sync = |config| {
+            crate::sync_connection_until(config, store, &mut |_| {}, None, &|| false).unwrap()
+        };
+        sync(&next);
+        assert_eq!(store.held_write_count(account).unwrap(), 1);
+        assert_eq!(next.replay_outbox(store).unwrap().sent, 0);
+        assert_eq!(fx.subjects("Archive"), ["Alpha"]);
+        match action {
+            "discard" => {
+                assert_eq!(store.discard_held_writes(account).unwrap(), 1);
+                assert!(fx.subjects("Archive").is_empty());
+                assert!(fx.subjects("INBOX").contains(&"Alpha".into()));
+            }
+            "resend" => {
+                assert_eq!(next.resend_held_writes(store).unwrap(), 1);
+                assert_eq!(next.replay_outbox(store).unwrap().sent, 1);
+                let state = next_server.state.lock().unwrap();
+                assert_eq!(
+                    state.mailboxes[0]
+                        .messages
+                        .iter()
+                        .map(|message| message.uid)
+                        .collect::<Vec<_>>(),
+                    [1, 92]
+                );
+                assert_eq!(state.mailboxes[1].messages.len(), 1);
+            }
+            "restore" | "reset" => {
+                if action == "reset" {
+                    fx.server.state.lock().unwrap().mailboxes[0].uidvalidity += 1;
+                }
+                store.configure_connection(&original).unwrap();
+                assert_eq!(
+                    original.replay_outbox(store).unwrap().sent,
+                    usize::from(action == "restore")
+                );
+                assert_eq!(
+                    store.held_write_count(account).unwrap(),
+                    usize::from(action == "reset")
+                );
+                if action == "restore" {
+                    assert!(super::rfc822::is_synthetic_message_id(&original_id));
+                    let restored: String = store.connection().query_row(
+                        "SELECT message_id FROM message_copies WHERE account_id = ?1 AND folder = 'Archive'",
+                        [account.as_str()], |row| row.get(0),
+                    ).unwrap();
+                    assert_eq!(restored, original_id);
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
 }
 
 #[test]

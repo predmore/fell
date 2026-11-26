@@ -225,6 +225,31 @@ pub(crate) fn can_reconnect(config: &AccountConfig) -> bool {
         })
 }
 
+pub(crate) fn queued_connection_changes(config: &AccountConfig) -> (usize, usize) {
+    let read = || -> Option<_> {
+        let path = Registry::resolve()
+            .ok()?
+            .configured_store_path(&store_path().ok()?, config)
+            .ok()?;
+        let store = Store::open_existing(&path).ok()?;
+        let account = AccountId(config.id.clone());
+        let roles = store.folder_roles(&account).ok()?;
+        let count = store.queued_write_count(&account).ok()?;
+        let archives = store
+            .outbox(&account)
+            .ok()?
+            .into_iter()
+            .filter(|row| {
+                row.state == fell_core::OutboxState::Pending
+                    && row.kind == fell_core::OutboxKind::Move
+                    && roles.is(fell_core::FolderRole::Archive, &row.target_folder)
+            })
+            .count();
+        Some((count, archives))
+    };
+    read().unwrap_or_default()
+}
+
 fn can_reconnect_at(
     registry: &Registry,
     base: &Path,
@@ -409,9 +434,8 @@ pub(crate) fn stage_connection_config(
         ) {
             return Err("The kept mailbox changed. Review the account and try again.".into());
         }
-        config.write_back = Store::open_existing_without_index(&mailbox)
-            .and_then(|store| store.write_back(&AccountId(config.id.clone())))
-            .map_err(|err| err.to_string())?;
+        config.write_back =
+            Store::stored_write_back(&mailbox, &config.id).map_err(|err| err.to_string())?;
     } else if let Some(email) = different_owner {
         if save != AccountSave::ReplaceMailbox {
             return Err(AccountFileError::MailboxAddressConflict {
@@ -440,6 +464,9 @@ pub(crate) fn stage_connection_config(
             .map_err(|err| err.to_string())?;
     }
     let mut staged = stage_account_text_at(path, &config.render(), !configured, lock)?;
+    if configured && let Some((_, snapshot, _)) = &current {
+        staged.backup = Some(stage_account_file(&staged.path, snapshot)?);
+    }
     if let Some((id, snapshot)) = keep {
         staged.keep = Some((registry, base, id, snapshot));
     } else if !configured && save != AccountSave::Reconnect {
@@ -452,6 +479,7 @@ pub(crate) struct StagedAccountConfig {
     path: PathBuf,
     file: tempfile::NamedTempFile,
     first_run: bool,
+    backup: Option<tempfile::NamedTempFile>,
     lock: fs::File,
     original: Option<(Registry, PathBuf, String)>,
     keep: Option<(Registry, PathBuf, String, String)>,
@@ -494,7 +522,24 @@ impl StagedAccountConfig {
                 );
             }
             published = true;
-            self.lock.sync_all().map_err(|err| err.to_string())?;
+            if let Err(error) = self.lock.sync_all() {
+                let rollback = match self.backup {
+                    Some(backup) => backup
+                        .persist(&self.path)
+                        .map(|_| ())
+                        .map_err(|err| err.error),
+                    None if self.first_run => fs::remove_file(&self.path),
+                    None => return Err(error.to_string().into()),
+                };
+                rollback
+                    .map_err(|err| format!("{error}; couldn't restore the account file: {err}"))?;
+                published = false;
+                if let Some(marker) = marker {
+                    fs::remove_file(marker).map_err(|err| err.to_string())?;
+                }
+                self.lock.sync_all().map_err(|err| err.to_string())?;
+                return Err(error.to_string().into());
+            }
             if let Some((registry, base, id, snapshot)) = self.keep
                 && let Err(error) = registry.keep_for_replacement(&self.lock, &base, &id, &snapshot)
             {
@@ -600,8 +645,6 @@ fn stage_account_text_at(
     first_run: bool,
     lock: fs::File,
 ) -> Result<StagedAccountConfig, AccountFileError> {
-    use std::io::Write;
-
     if first_run {
         match path.symlink_metadata() {
             Ok(_) => return Err(AccountFileError::AlreadyConfigured),
@@ -609,20 +652,31 @@ fn stage_account_text_at(
             Err(err) => return Err(format!("{}: {err}", path.display()).into()),
         }
     }
+    let file = stage_account_file(&path, config)?;
+    Ok(StagedAccountConfig {
+        path,
+        file,
+        first_run,
+        backup: None,
+        lock,
+        original: None,
+        keep: None,
+    })
+}
+
+fn stage_account_file(
+    path: &Path,
+    config: &str,
+) -> Result<tempfile::NamedTempFile, AccountFileError> {
+    use std::io::Write;
+
     let dir = path.parent().expect("account file has a parent directory");
     let mut file =
         tempfile::NamedTempFile::new_in(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
     file.write_all(config.as_bytes())
         .and_then(|()| file.as_file().sync_all())
         .map_err(|err| format!("{}: {err}", file.path().display()))?;
-    Ok(StagedAccountConfig {
-        path,
-        file,
-        first_run,
-        lock,
-        original: None,
-        keep: None,
-    })
+    Ok(file)
 }
 
 fn fallback(error: String) -> (Store, Opened) {
@@ -1018,6 +1072,7 @@ mod tests {
             "before",
             fell_core::PasswordSource::Inline("fixture".into()),
         );
+        old.write_back = true;
         stage_account_config(&mut old, AccountSave::New)
             .unwrap()
             .publish()
@@ -1025,6 +1080,12 @@ mod tests {
         let previous_path = registry.configured_store_path(&base, &old).unwrap();
         let store = open_at(&previous_path).unwrap();
         store.configure_connection(&old).unwrap();
+        rusqlite::Connection::open(&previous_path).unwrap().execute(
+            "INSERT INTO server_outbox (account_id, kind, state, message_id, source_folder, source_mailbox,
+                uidvalidity, uid, target_folder, created_unix)
+             VALUES (?1, 'move', 'pending', 'kept@example.test', 'INBOX', 'INBOX', 1, 2, 'Archive', 0)",
+             [&old.id],
+        ).unwrap();
 
         let mut edited = old.clone();
         edited.username = "after".into();
@@ -1058,6 +1119,20 @@ mod tests {
         assert!(can_reconnect(&old));
         edited.id.clone_from(&old.id);
         assert!(!can_reconnect(&edited));
+        let kept = registry.load_with_removals(&base).disconnected;
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].email, old.email);
+        let mut reconnect = registry.reconnect_config(&base, &old.id).unwrap();
+        reconnect.password = fell_core::PasswordSource::Inline("reconnected".into());
+        reconnect.write_back = false;
+        stage_account_config(&mut reconnect, AccountSave::Reconnect)
+            .unwrap()
+            .publish()
+            .unwrap();
+        let saved = registry.get(&old.account().id).unwrap().unwrap();
+        assert!(saved.write_back);
+        store.configure_connection(&saved).unwrap();
+        assert_eq!(store.queued_write_count(&old.account().id).unwrap(), 1);
     }
 
     #[test]

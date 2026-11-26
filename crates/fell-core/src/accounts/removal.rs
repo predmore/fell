@@ -6,10 +6,11 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use super::{
-    Accounts, Entry, FileError, FileIdentity, INTERRUPTED_REMOVAL_RECOVERY, LockMode,
-    MAILBOX_OWNER_RECOVERY, MailboxOwnership, OriginalMailbox, Registry, check_live_mailbox,
-    file_identity, inspect_mailbox, mailbox_exists, mailbox_owner, path_exists, publish, read,
-    read_account_contents, real_directory, removal_trash, sibling_mailbox, validate_mailbox,
+    Accounts, DisconnectedMailbox, Entry, FileError, FileIdentity, INTERRUPTED_REMOVAL_RECOVERY,
+    LockMode, MAILBOX_OWNER_RECOVERY, MailboxOwnership, OriginalMailbox, Registry,
+    check_live_mailbox, file_identity, inspect_mailbox, mailbox_exists, mailbox_owner, path_exists,
+    publish, read, read_account_contents, real_directory, removal_trash, sibling_mailbox,
+    validate_mailbox,
 };
 use crate::{AccountId, Store, compose};
 
@@ -36,6 +37,16 @@ pub enum RemovalOutcome {
 }
 
 impl Registry {
+    pub fn reconnect_config(&self, base: &Path, id: &str) -> Result<crate::AccountConfig, String> {
+        let _lock = self.lock_shared().map_err(|err| err.to_string())?;
+        let path = self.path(id).map_err(|err| err.to_string())?;
+        if path_exists(&path).map_err(|err| err.to_string())? {
+            return Err("This account is already connected.".into());
+        }
+        let mailbox = self.store_path(base, id).map_err(|err| err.cli_message())?;
+        Store::kept_connection(&mailbox, id).map_err(|err| err.to_string())
+    }
+
     pub fn load_with_removals(&self, base: &Path) -> Accounts {
         let migration = self.migrate_at(Some(base)).err();
         let lock = self
@@ -134,6 +145,37 @@ impl Registry {
                 can_restore,
             });
         }
+        let kept_siblings = real_directory(&siblings)
+            .and_then(|()| fs::read_dir(&siblings))
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let id = entry.file_name().to_str()?.strip_suffix(".db")?.to_owned();
+                Some((id, entry.path()))
+            });
+        let kept_original = original
+            .as_ref()
+            .map(|(id, _)| (id.clone(), base.to_owned()));
+        for (id, mailbox) in kept_original.into_iter().chain(kept_siblings) {
+            let Ok(path) = self.path(&id) else { continue };
+            if path_exists(&path).unwrap_or(true)
+                || catalog.interrupted.iter().any(|pending| pending.id == id)
+                || !self
+                    .mailbox_path(base, &id)
+                    .is_ok_and(|expected| expected == mailbox)
+            {
+                continue;
+            }
+            if let Ok(Some((owner, email))) = mailbox_owner(&mailbox)
+                && owner == id
+            {
+                catalog
+                    .disconnected
+                    .push(DisconnectedMailbox { id, email, path });
+            }
+        }
+        catalog.disconnected.sort_by(|a, b| a.id.cmp(&b.id));
         drop(lock);
         catalog.interrupted.sort_by(|a, b| a.id.cmp(&b.id));
         for entry in &mut catalog.entries {
@@ -748,6 +790,9 @@ fn keep(
         };
         let tx = crate::store::immediate_transaction(store.connection())
             .map_err(|err| err.to_string())?;
+        let config =
+            super::parse(account, snapshot, Some(id.as_str())).map_err(|err| err.to_string())?;
+        crate::store::save_reconnect_config(&tx, config).map_err(|err| err.to_string())?;
         crate::agent::disable_account_grants_on(&tx, id).map_err(|err| err.to_string())?;
         // Preserve the grant rows and their revisions if disconnect fails.
         disconnect(account, directory).map_err(|err| err.to_string())?;
@@ -786,6 +831,46 @@ fn absent_ok(result: io::Result<()>) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::AgentGrant;
+
+    #[test]
+    fn a_failed_disconnect_preserves_grants_and_their_revisions() {
+        let root = tempfile::tempdir().unwrap();
+        let account = root.path().join("mail.toml");
+        fs::create_dir(&account).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let config = crate::AccountConfig::bridge(
+            "mail@example.test",
+            "user",
+            crate::PasswordSource::Inline("fixture".into()),
+        );
+        let id = config.account().id;
+        store.upsert_account(&config.account()).unwrap();
+        store
+            .set_agent_grant(
+                &id,
+                "atlas",
+                AgentGrant {
+                    enabled: true,
+                    read: true,
+                    triage: false,
+                    draft: false,
+                    annotate: false,
+                },
+            )
+            .unwrap();
+        let before = store.list_agent_grants().unwrap();
+        assert!(
+            keep(
+                &account,
+                &File::open(root.path()).unwrap(),
+                &id,
+                Some(&store),
+                &config.render()
+            )
+            .is_err()
+        );
+        assert_eq!(store.list_agent_grants().unwrap(), before);
+    }
 
     #[test]
     fn removal_waits_for_a_shared_catalog_lock() {

@@ -648,13 +648,20 @@ impl AccountConfig {
     }
 
     fn backend_with_senders(&self, senders: SmtpSenders) -> Result<Box<dyn MailBackend + Send>> {
+        Ok(self.backend_with_imap(self.imap_config()?, senders))
+    }
+
+    pub(crate) fn backend_with_imap(
+        &self,
+        imap: ImapConfig,
+        senders: SmtpSenders,
+    ) -> Box<dyn MailBackend + Send> {
         let account_id = AccountId(self.id.clone());
-        let imap = self.imap_config()?;
         let smtp = SmtpConfig {
             senders,
             ..self.smtp_config()
         };
-        Ok(match self.backend {
+        match self.backend {
             BackendKind::Imap => Box::new(ImapBackend {
                 account_id,
                 config: imap,
@@ -665,7 +672,7 @@ impl AccountConfig {
                 imap,
                 smtp,
             }),
-        })
+        }
     }
 
     /// Whether a newly sent message should be queued for IMAP APPEND.
@@ -688,12 +695,20 @@ impl AccountConfig {
             return Ok(crate::ReplayReport::default());
         }
         let append_sent = self.append_sent();
-        let report = if crate::outbox::any_due(store, &account_id, self.write_back, append_sent)? {
+        let report = if crate::outbox::any_due(store, &account_id, self.write_back, append_sent)?
+            || crate::outbox::endpoint::can_resume(store, self)?
+        {
             crate::imap::replay_account_outbox(self, &account_id, store)?
         } else {
             crate::ReplayReport::default()
         };
         crate::outbox::report_for_status(store, &account_id, report)
+    }
+
+    /// Re-queue held changes whose exact Message-ID exists on this server.
+    /// Returns the number re-queued. The rest stay available to discard.
+    pub fn resend_held_writes(&self, store: &crate::Store) -> Result<usize> {
+        crate::imap::resend_held_writes(self, store)
     }
 
     /// Log in and log out again without reading mail. Returns the number of

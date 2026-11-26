@@ -199,6 +199,8 @@ pub(crate) fn replay_account_outbox(
     )
 }
 
+pub(crate) use write_back::resend_held_writes;
+
 /// Log in, count selectable mailboxes, and log out. Reads no mail.
 pub(crate) fn check_login(config: &ImapConfig) -> Result<usize, Error> {
     if config.username.is_empty() {
@@ -295,12 +297,84 @@ pub(crate) fn fetch_imap(
     cursor: Option<&SyncCursor>,
     known: &KnownCopies<'_>,
     keywords: bool,
-    mut persist: impl FnMut(MailboxDelta) -> Result<(), Error>,
+    persist: impl FnMut(MailboxDelta) -> Result<(), Error>,
 ) -> Result<(), Error> {
     if config.username.is_empty() {
         return Err(Error::Backend("imap username is empty".into()));
     }
-    let mut session = session::Session::open(config)?;
+    let session = session::Session::open(config)?;
+    fetch_on(
+        session, account_id, config, cursor, known, keywords, persist,
+    )
+}
+
+pub(crate) struct BoundRead {
+    session: session::Session,
+    config: ImapConfig,
+    namespace: String,
+}
+
+impl BoundRead {
+    pub(crate) fn open(
+        config: &crate::AccountConfig,
+        imap: ImapConfig,
+        store: &crate::Store,
+    ) -> crate::Result<Self> {
+        let session = session::Session::open(&imap)?;
+        let namespace = store.observe_imap_server(config, &session.fingerprint())?;
+        Ok(Self {
+            session,
+            config: imap,
+            namespace,
+        })
+    }
+
+    pub(crate) fn fetch(
+        self,
+        account: &crate::Account,
+        cursor: Option<&SyncCursor>,
+        known: &KnownCopies<'_>,
+        mut persist: impl FnMut(MailboxDelta) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        let suffix = format!(".{}", self.namespace);
+        fetch_on(
+            self.session,
+            &account.id,
+            &self.config,
+            cursor,
+            known,
+            account.backend_kind == crate::BackendKind::Imap,
+            |mut delta| {
+                // The fallback ID encodes a UID, so it is only unique within this server.
+                let scope = |id: &mut crate::MessageId| {
+                    if rfc822::is_synthetic_message_id(id.as_str()) {
+                        id.0.insert_str(id.0.len() - "@imap.fell".len(), &suffix);
+                    }
+                };
+                for message in &mut delta.messages {
+                    scope(&mut message.headers.message_id);
+                }
+                for link in &mut delta.links {
+                    scope(&mut link.message_id);
+                }
+                for id in &mut delta.too_large {
+                    scope(id);
+                }
+                persist(delta)
+            },
+        )
+    }
+}
+
+fn fetch_on(
+    mut session: session::Session,
+    account_id: &AccountId,
+    config: &ImapConfig,
+    cursor: Option<&SyncCursor>,
+    known: &KnownCopies<'_>,
+    keywords: bool,
+    mut persist: impl FnMut(MailboxDelta) -> Result<(), Error>,
+) -> Result<(), Error> {
     let mut mailboxes = session.list_selectable()?;
     mailboxes.sort_by(|left, right| {
         left.decoded

@@ -48,6 +48,7 @@ use crate::store::Store;
 use crate::{Error, Result};
 
 pub(crate) mod drafts;
+pub(crate) mod endpoint;
 pub(crate) mod flags;
 pub(crate) mod labels;
 
@@ -134,6 +135,11 @@ CREATE INDEX IF NOT EXISTS idx_server_outbox_message ON server_outbox(account_id
 /// Columns added after the tables first shipped on a branch build.
 const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("server_outbox", "keyword_parent", "INTEGER"),
+    ("server_outbox", "held_endpoint", "TEXT"),
+    ("server_outbox", "held_server", "TEXT"),
+    ("server_outbox", "held_from", "TEXT"),
+    ("server_outbox", "held_source_epoch", "INTEGER"),
+    ("server_outbox", "held_target_epoch", "INTEGER"),
     (
         "write_back_accounts",
         "generation",
@@ -510,18 +516,26 @@ pub(crate) fn set_write_back_on(
     Ok(())
 }
 
-pub(crate) fn hold_for_endpoint_change(conn: &Connection, account_id: &AccountId) -> Result<()> {
+pub(crate) fn hold_for_endpoint_change(
+    conn: &Connection,
+    account_id: &AccountId,
+    endpoint: Option<&str>,
+    server: Option<&str>,
+) -> Result<()> {
     conn.execute(
-        "UPDATE write_back_accounts SET generation = generation + 1, uidplus = NULL,
-             move_missing = 0, uidplus_missing = 0 WHERE account_id = ?1",
-        [account_id.as_str()],
-    )?;
-    conn.execute(
-        "UPDATE server_outbox SET state = 'held'
+        "UPDATE server_outbox SET state = 'held', held_endpoint = ?2, held_server = ?3,
+             held_from = CASE WHEN kind = 'unflag_trash' OR generation = (
+                 SELECT generation FROM write_back_accounts WHERE account_id = ?1
+             ) THEN state END
          WHERE account_id = ?1 AND (
              state IN ('pending', 'abandoned')
              OR (state = 'dropped' AND kind = 'append_draft' AND append_checks > 0)
          )",
+        params![account_id.as_str(), endpoint, server],
+    )?;
+    conn.execute(
+        "UPDATE write_back_accounts SET generation = generation + 1, uidplus = NULL,
+             move_missing = 0, uidplus_missing = 0 WHERE account_id = ?1",
         [account_id.as_str()],
     )?;
     Ok(())

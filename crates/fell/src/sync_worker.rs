@@ -23,7 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use fell_core::{
     Account, AccountConfig, BackendKind, DroppedWrite, InboxWait, ReaderBodyFetcher,
     ReplyToBackfill, ReplyToProgress, Store, SyncFailureKind, SyncReport, diagnostic,
-    fetch_missing_bodies, sync_until,
+    fetch_missing_bodies, sync_connection_until,
 };
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 
@@ -66,6 +66,11 @@ pub enum SyncEvent {
     FlagsChanged,
     /// The permanent-delete confirmation may need to change.
     TrashExpungeAvailability(bool),
+    HeldChanges(usize),
+    HeldAction {
+        result: Result<usize, String>,
+        resend: bool,
+    },
     /// Write-back problems to show together in one notice.
     WriteBackNotice {
         dropped: Vec<DroppedWrite>,
@@ -122,6 +127,9 @@ enum Ask {
     Sync,
     /// A local edit was queued for the server: send it now, quietly.
     WriteBack,
+    HeldChanges {
+        resend: bool,
+    },
 }
 
 #[derive(Clone)]
@@ -137,6 +145,10 @@ impl SyncHandle {
     /// Start the next pass now. A pass already running finishes first.
     pub fn sync_now(&self) {
         self.ask(Ask::Sync);
+    }
+
+    pub fn held_changes(&self, resend: bool) {
+        self.ask(Ask::HeldChanges { resend });
     }
 
     /// Send queued writes now, then run a pass, without
@@ -282,6 +294,27 @@ fn run(
     if !refresh_trash_confirmation() {
         return;
     }
+    let mut held = 0;
+    let mut report_held = || {
+        if let Ok(count) = store.held_write_count(&account.id)
+            && std::mem::replace(&mut held, count) != count
+        {
+            return events.unbounded_send(SyncEvent::HeldChanges(count)).is_ok();
+        }
+        true
+    };
+    let handle_ask = |ask| {
+        if let Ask::HeldChanges { resend } = ask {
+            let result = if resend {
+                config.resend_held_writes(&store)
+            } else {
+                store.discard_held_writes(&account.id)
+            }
+            .map_err(|err| err.to_string());
+            let _ = events.unbounded_send(SyncEvent::HeldAction { result, resend });
+        }
+        ask == Ask::Sync
+    };
     loop {
         if stopping() {
             return;
@@ -315,7 +348,7 @@ fn run(
                 return;
             }
         }
-        if !refresh_trash_confirmation() {
+        if !refresh_trash_confirmation() || !report_held() {
             return;
         }
         diagnostic!(DEBUG, "Sync pass started", write_back = config.write_back);
@@ -328,36 +361,33 @@ fn run(
                 queue.committed(arrivals);
             }
         };
-        let result = config.backend().and_then(|backend| {
-            sync_until(
-                &account,
-                backend.as_ref(),
-                &store,
-                &mut |report| {
-                    if report.confirmed_drafts.len() > confirmed {
-                        alive &= events
-                            .unbounded_send(SyncEvent::SendsConfirmed(
-                                report.confirmed_drafts[confirmed..].to_vec(),
-                            ))
-                            .is_ok();
-                        confirmed = report.confirmed_drafts.len();
-                    }
-                    batches += 1;
-                    if batches.is_multiple_of(CHECKPOINT_EVERY) {
-                        let _ = store.checkpoint(false);
-                    }
-                    if let Some(status) = progress.update(report, Instant::now()) {
-                        alive &= refresh_trash_confirmation() && send(status);
-                    }
-                },
-                notifications.map(|_| &mut on_arrivals as &mut dyn FnMut(_)),
-                &stopping,
-            )
-        });
+        let result = sync_connection_until(
+            config,
+            &store,
+            &mut |report| {
+                if report.confirmed_drafts.len() > confirmed {
+                    alive &= events
+                        .unbounded_send(SyncEvent::SendsConfirmed(
+                            report.confirmed_drafts[confirmed..].to_vec(),
+                        ))
+                        .is_ok();
+                    confirmed = report.confirmed_drafts.len();
+                }
+                batches += 1;
+                if batches.is_multiple_of(CHECKPOINT_EVERY) {
+                    let _ = store.checkpoint(false);
+                }
+                if let Some(status) = progress.update(report, Instant::now()) {
+                    alive &= refresh_trash_confirmation() && send(status);
+                }
+            },
+            notifications.map(|_| &mut on_arrivals as &mut dyn FnMut(_)),
+            &stopping,
+        );
         if let Some(queue) = notifications {
             queue.pass_ended();
         }
-        if !alive || stopping() || !refresh_trash_confirmation() {
+        if !alive || stopping() || !refresh_trash_confirmation() || !report_held() {
             return;
         }
         // Fold the log back into the file between passes so readers stay fast.
@@ -430,9 +460,9 @@ fn run(
         });
         match woke {
             Woke::Asked(ask) => {
-                let mut shown = ask == Ask::Sync;
+                let mut shown = handle_ask(ask);
                 while let Ok(more) = wake.try_recv() {
-                    shown |= more == Ask::Sync;
+                    shown |= handle_ask(more);
                 }
                 if shown && !send(SyncKind::Connecting) {
                     return;

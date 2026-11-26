@@ -2324,6 +2324,19 @@ impl Session {
                 ..Step::default()
             };
         }
+        if matches!(
+            key,
+            settings::RESEND_CHANGES_KEY | settings::DISCARD_CHANGES_KEY
+        ) && let Some(Row::Account(index)) = self.settings_nav.row()
+        {
+            return Step {
+                settings: Some(Request::HeldChanges {
+                    index: Some(index),
+                    resend: key == settings::RESEND_CHANGES_KEY,
+                }),
+                ..Step::default()
+            };
+        }
         if let Page::ConfirmModel { install } = self.settings_nav.page
             && matches!(key, KeyId::Char('y' | 'n') | KeyId::Escape)
         {
@@ -2422,6 +2435,11 @@ impl Session {
             ))),
             Row::AccountSetup => Some(Request::AccountSetup),
             Row::Account(index) => Some(Request::OpenAccount(index)),
+            Row::ReconnectAccount => Some(Request::ReconnectAccount),
+            Row::ResendChanges | Row::DiscardChanges => Some(Request::HeldChanges {
+                index: None,
+                resend: row == Row::ResendChanges,
+            }),
             Row::EditConnection => {
                 let index = match self.settings_nav.row() {
                     Some(Row::Account(index)) => Some(index),

@@ -242,6 +242,8 @@ pub(super) struct Form {
     pub retained_mailbox: Option<String>,
     pub attempt: u64,
     pub previous: Option<AccountConfig>,
+    pub reconnect_to: Option<AccountConfig>,
+    pub queued_changes: (usize, usize),
     pub failed_check: bool,
     email: String,
     name: String,
@@ -263,6 +265,8 @@ impl Default for Form {
             retained_mailbox: None,
             attempt: 0,
             previous: None,
+            reconnect_to: None,
+            queued_changes: (0, 0),
             failed_check: false,
             email: String::new(),
             name: String::new(),
@@ -275,6 +279,12 @@ impl Default for Form {
 }
 
 impl Form {
+    pub fn reconnecting(config: AccountConfig) -> Self {
+        let mut form = Self::editing(config);
+        form.reconnect_to = form.previous.take();
+        form
+    }
+
     pub fn editing(config: AccountConfig) -> Self {
         let smtp = config.smtp_config();
         Self {
@@ -305,15 +315,31 @@ impl Form {
         })
     }
 
-    pub fn holds_queued_writes(&self) -> bool {
+    pub fn password_unchanged(&self) -> bool {
+        self.previous.is_some() && !self.replacement()
+    }
+
+    pub fn held_write_note(&self) -> Option<String> {
         let imap = &self.servers[Service::Imap as usize];
-        self.previous.as_ref().is_some_and(|old| {
+        let changes_endpoint = self.previous.as_ref().is_some_and(|old| {
             !self.replacement()
-                && old.write_back
                 && (!old.host.eq_ignore_ascii_case(imap.host.trim())
                     || Some(old.port) != port(&imap.port)
                     || old.security != imap.security)
-        })
+        });
+        let (queued, archives) = self.queued_changes;
+        if !changes_endpoint || queued == 0 {
+            return None;
+        }
+        let label = match (queued, queued == archives) {
+            (1, true) => "1 archive".into(),
+            (1, false) => "1 change".into(),
+            (count, true) => format!("{count} archives"),
+            (count, false) => format!("{count} changes"),
+        };
+        Some(format!(
+            "{label} made on the old server won’t sync yet. Review in Accounts."
+        ))
     }
 
     pub fn failed_check_warning(&self) -> &'static str {
@@ -426,6 +452,7 @@ impl Form {
 
     pub fn needs_servers(&self) -> bool {
         self.previous.is_some()
+            || self.reconnect_to.is_some()
             || self.provider == Provider::Custom
             || self
                 .issues
@@ -532,13 +559,18 @@ impl Form {
         let username = self.username.trim();
         let username = if username.is_empty() { email } else { username };
         let [imap, smtp] = &self.servers;
-        let mut config = self.previous.clone().unwrap_or_else(|| {
-            AccountConfig::bridge(
-                email,
-                username,
-                PasswordSource::Inline(self.password.clone()),
-            )
-        });
+        let mut config = self
+            .previous
+            .as_ref()
+            .or(self.reconnect_to.as_ref())
+            .cloned()
+            .unwrap_or_else(|| {
+                AccountConfig::bridge(
+                    email,
+                    username,
+                    PasswordSource::Inline(self.password.clone()),
+                )
+            });
         if !self.password.is_empty() {
             config.password = PasswordSource::Inline(self.password.clone());
         }

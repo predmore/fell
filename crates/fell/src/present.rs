@@ -1285,6 +1285,18 @@ pub fn fit_notice(text: &str, max_px: f32, measure: impl Fn(&str) -> f32) -> Str
     if measure(text) <= max_px {
         return text.to_string();
     }
+    if let Some((switched, kept)) = text.split_once(" · ")
+        && switched.starts_with("Switched to ")
+        && kept.ends_with("’s mail stays on this device")
+        && measure("…") <= max_px
+    {
+        let compact = format!("{switched} · old mail kept");
+        return if measure(&compact) <= max_px {
+            compact
+        } else {
+            cut_to(&compact, "", "", max_px, &measure)
+        };
+    }
     if text.starts_with("Couldn't remove ") && measure("…") <= max_px {
         return cut_to(text, "", "", max_px, &measure);
     }
@@ -2047,6 +2059,17 @@ mod tests {
         let local = "Server copy stays. Remove here?  ·  20 marked  ·  No undo  ·  y";
         let fitted = fit_notice(local, 37.0, |text| text.chars().count() as f32);
         assert_eq!(fitted, "Server copy stays. Remove here?  ·  y");
+    }
+
+    #[test]
+    fn a_narrow_account_switch_notice_keeps_the_new_address() {
+        let notice = "Switched to briefing@demo.test · robin@demo.test’s mail stays on this device";
+        let width = |text: &str| text.chars().count() as f32;
+        assert_eq!(fit_notice(notice, 85., width), notice);
+        assert_eq!(
+            fit_notice(notice, 50., width),
+            "Switched to briefing@demo.test · old mail kept"
+        );
     }
 
     #[test]

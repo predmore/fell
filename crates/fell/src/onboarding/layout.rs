@@ -237,6 +237,7 @@ impl Onboarding {
             Step::Identity if self.form.previous.is_some() => false,
             Step::Done => self.feedback.save_actions[0]
                 .value
+                .as_ref()
                 .is_some_and(|action| action.label == "Back"),
             _ => true,
         }
@@ -356,7 +357,7 @@ impl Onboarding {
                     ))
                     .child(self.field_box(Field::Username, "Username", username, live, cx))
                     .child(self.field_box(Field::Password, "Password",
-                        if self.form.previous.is_some() { "Unchanged" } else { "" }, live, cx))
+                        if self.form.password_unchanged() { "Unchanged" } else { "" }, live, cx))
                     .child(
                         div()
                             .min_h(px((self.theme.ui_px + 4.) * 3.))
@@ -419,11 +420,12 @@ impl Onboarding {
                     ))
                     .child(
                         self.feedback.save_note.paint(false, |state, _| match state {
+                            SaveState::Ready if self.form.reconnect_to.is_some() =>
+                                self.meta("Fell will reconnect this mailbox and keep its local mail."),
                             SaveState::Ready if self.form.retained_mailbox.is_some() =>
                                 self.meta("Start empty keeps the old mail on this device but doesn't show it."),
-                            SaveState::Ready if self.form.holds_queued_writes() =>
-                                self.meta("Fell keeps queued changes from the previous IMAP endpoint on this device. New changes can sync after Fell refreshes the mailbox."),
-                            SaveState::Ready if self.form.previous.is_some() => div(),
+                            SaveState::Ready if self.form.previous.is_some() =>
+                                self.form.held_write_note().map_or_else(div, |note| self.meta(note)),
                             SaveState::Ready => self.meta("Fell keeps your password in the desktop keyring."),
                             SaveState::SavingKeyring => self.meta("Approve any keyring prompt to continue."),
                             SaveState::ConfirmFile => self.meta(
@@ -458,7 +460,12 @@ impl Onboarding {
                 let reconnect_email = self
                     .form
                     .retained_mailbox
-                    .as_ref()
+                    .as_deref()
+                    .or(self
+                        .form
+                        .reconnect_to
+                        .as_ref()
+                        .map(|config| config.id.as_str()))
                     .map(|_| crate::present::display_safe(self.form.text(Field::Email).trim()));
                 let heading = if self.form.replacement() {
                     let previous = self
@@ -473,7 +480,9 @@ impl Onboarding {
                             "Fell keeps {old}’s local mail for the old login and starts a fresh mailbox for the new login."
                         )
                     } else {
-                        format!("Fell keeps {old}’s local mail and starts {new} fresh.")
+                        format!(
+                            "Fell keeps {old}’s mail on this device. Reconnect it from Settings → Accounts."
+                        )
                     };
                     self.heading("This is a different mailbox", &detail)
                 } else if self.form.previous.is_some() {
@@ -482,7 +491,9 @@ impl Onboarding {
                         "Fell keeps this account’s local mail.",
                     )
                 } else if let Some(email) = &reconnect_email
-                    && (matches!(self.form.storage, super::Storage::Keyring) || self.reconnect)
+                    && (matches!(self.form.storage, super::Storage::Keyring)
+                        || self.reconnect
+                        || self.form.reconnect_to.is_some())
                 {
                     self.reconnect_heading(email)
                 } else {
@@ -643,12 +654,12 @@ impl Onboarding {
             Some(
                 actions[index]
                     .paint(live, |action, live| {
-                        div().children(action.map(|action| {
+                        div().children(action.as_ref().map(|action| {
                             let back = index == 0 && saving;
                             let enabled = action.enabled
                                 && (!back
                                     || !matches!(self.form.storage, super::Storage::Saving { .. }));
-                            self.button(action.control, action.label, live && enabled, cx)
+                            self.button(action.control, &action.label, live && enabled, cx)
                                 .when(back, |button| {
                                     button.text_color(rgb(motion::mix(
                                         self.theme.foreground,
@@ -820,22 +831,27 @@ impl Onboarding {
     }
 
     fn primary_button(&self, window: &Window, live: bool, cx: &Context<Self>) -> Option<Div> {
-        let action = self.feedback.primary?;
+        let action = self.feedback.primary.as_ref()?;
         let mut style = window.text_style();
         if let Some(family) = &self.theme.ui_family {
             style.font_family = family.clone().into();
         }
         style.font_weight = FontWeight::SEMIBOLD;
         let padding = 12.;
-        let width = |label: &'static str| {
+        let width = |label: &str| {
             let run = style.to_run(label.len());
-            let text =
-                window
-                    .text_system()
-                    .shape_line(label.into(), px(self.theme.ui_px), &[run], None);
+            let text = window.text_system().shape_line(
+                label.to_owned().into(),
+                px(self.theme.ui_px),
+                &[run],
+                None,
+            );
             f32::from(text.width).ceil() + 2. * (padding + 1.)
         };
-        let (text, opacity, button_width) = self.feedback.primary_label_frame(action.label, width);
+        let (text, opacity, button_width) = self.feedback.primary_label_frame(&action.label, width);
+        let warning = action.label.starts_with("Save anyway");
+        let button_width =
+            button_width.min((f32::from(window.viewport_size().width) - 145.).max(1.));
         Some(
             div()
                 .absolute()
@@ -848,10 +864,16 @@ impl Onboarding {
                     self.button_shell(
                         action.control,
                         "primary-action",
-                        true,
+                        !warning,
                         (live, action.enabled),
                         cx,
                     )
+                    .when(warning, |button| {
+                        button
+                            .bg(rgb(self.theme.surface))
+                            .text_color(rgb(self.theme.error))
+                            .border_color(rgb(self.theme.border))
+                    })
                     .relative()
                     .w(px(button_width))
                     .h(px(self.theme.ui_px + 18.))
@@ -868,7 +890,7 @@ impl Onboarding {
                             .justify_center()
                             .whitespace_nowrap()
                             .opacity(opacity)
-                            .child(div().flex_none().child(text)),
+                            .child(div().truncate().child(text.to_owned())),
                     ),
                 ),
         )
@@ -890,7 +912,6 @@ impl Onboarding {
             .py_1p5()
             .rounded_md()
             .border_1()
-            .when(control == Control::Back, |el| el.ml(px(-13.)))
             .when(primary, |el| {
                 let (fill, text) = if enabled {
                     (theme.accent, theme.background)
