@@ -9,7 +9,7 @@ fn open_fixture(tag: &str) -> (PathBuf, PartCache, Store) {
     let store = Store::open_for_part_fetch(&root.join("mail.db")).unwrap();
     for id in ["a1", "a2"] {
         store
-            .upsert_account(&Account {
+            .testing_seed_legacy_account(&Account {
                 id: AccountId(id.into()),
                 display_name: id.into(),
                 email: format!("{id}@example.test"),

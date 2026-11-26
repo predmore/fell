@@ -3014,7 +3014,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         for (id, email) in ids {
             store
-                .upsert_account(&Account {
+                .testing_seed_legacy_account(&Account {
                     id: AccountId((*id).into()),
                     display_name: (*id).into(),
                     email: (*email).into(),

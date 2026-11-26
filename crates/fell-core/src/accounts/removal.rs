@@ -304,7 +304,8 @@ impl Registry {
                     if !delete && trash.join("committed").exists() {
                         return Err("Permanently deleting local mail has already started.".into());
                     }
-                    discard_staged_mailbox(&trash, &mailbox).map_err(|err| err.to_string())?;
+                    discard_staged_mailbox(&trash, &mailbox, None)
+                        .map_err(|err| err.to_string())?;
                     clear_trash(&trash).map_err(|err| err.to_string())?;
                     return Ok(RemovalOutcome::Cleared);
                 }
@@ -317,9 +318,9 @@ impl Registry {
                     plan.account,
                 ));
             }
-            let _local = lock_mailbox(&mailbox)?;
+            let local = lock_mailbox(&mailbox)?;
             let staged = staged_file(&trash, &mailbox, "");
-            let _staged = lock_mailbox(&staged)?;
+            let staged_lock = lock_mailbox(&staged)?;
             let committed = path_exists(&trash.join("committed")).map_err(|err| err.to_string())?;
             let snapshot = read_account_contents(&trash.join("account.toml"), Some(id))
                 .map_err(|err| err.cli_message())?;
@@ -342,7 +343,12 @@ impl Registry {
                 validate_mailbox(&mailbox, id, email, true).map_err(|err| err.cli_message())?;
             }
             return if delete {
-                finish(&account, &directory, &mailbox, &trash, &plan)?;
+                let locked = if committed {
+                    staged_lock.as_ref()
+                } else {
+                    staged_lock.as_ref().or(local.as_ref())
+                };
+                finish(&account, &directory, &mailbox, &trash, &plan, locked)?;
                 Ok(RemovalOutcome::Deleted)
             } else {
                 restore(&account, &directory, &mailbox, &trash)
@@ -432,8 +438,14 @@ impl Registry {
         sync_dir(staged.path()).map_err(|err| err.to_string())?;
         fs::rename(staged.path(), &trash).map_err(|err| err.to_string())?;
         sync_dir(parent).map_err(|err| err.to_string())?;
-        let result = finish(&account, &directory, &mailbox, &trash, &plan);
-        drop(locked);
+        let result = finish(
+            &account,
+            &directory,
+            &mailbox,
+            &trash,
+            &plan,
+            locked.as_ref(),
+        );
         result.map(|()| RemovalOutcome::Deleted)
     }
 }
@@ -591,6 +603,7 @@ fn finish(
     mailbox: &Path,
     trash: &Path,
     plan: &Removal,
+    locked: Option<&File>,
 ) -> Result<(), String> {
     let committed = trash.join("committed");
     match committed.symlink_metadata() {
@@ -611,7 +624,7 @@ fn finish(
         }
         Err(err) => return Err(err.to_string()),
     }
-    discard_staged_mailbox(trash, mailbox).map_err(|err| err.to_string())?;
+    discard_staged_mailbox(trash, mailbox, locked).map_err(|err| err.to_string())?;
     absent_ok(fs::remove_file(trash.join("account.toml"))).map_err(|err| err.to_string())?;
     clear_trash(trash).map_err(|err| err.to_string())
 }
@@ -631,9 +644,35 @@ fn only_removal_sidecars(trash: &Path, mailbox: &Path) -> io::Result<bool> {
     Ok(true)
 }
 
-fn discard_staged_mailbox(trash: &Path, mailbox: &Path) -> io::Result<()> {
-    for suffix in MAILBOX_SUFFIXES {
+fn discard_staged_mailbox(trash: &Path, mailbox: &Path, locked: Option<&File>) -> io::Result<()> {
+    let path = staged_file(trash, mailbox, "");
+    let expected = locked
+        .map(|file| file.metadata().map(|meta| (meta.dev(), meta.ino())))
+        .transpose()?;
+    let verify = || {
+        let actual = match path.symlink_metadata() {
+            Ok(meta) => Some((meta.dev(), meta.ino())),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err),
+        };
+        if actual != expected {
+            return Err(io::Error::other(format!(
+                "{} changed during removal. Review it and try again.",
+                path.display(),
+            )));
+        }
+        Ok(())
+    };
+    verify()?;
+    for suffix in MAILBOX_SUFFIXES
+        .into_iter()
+        .filter(|suffix| !suffix.is_empty())
+    {
         absent_ok(fs::remove_file(staged_file(trash, mailbox, suffix)))?;
+    }
+    verify()?;
+    if expected.is_some() {
+        fs::remove_file(path)?;
     }
     Ok(())
 }
@@ -899,7 +938,7 @@ mod tests {
         other.email = "other@example.test".into();
         Store::open(&staged)
             .unwrap()
-            .upsert_account(&other)
+            .testing_seed_legacy_account(&other)
             .unwrap();
         publish(
             &trash,
@@ -924,6 +963,76 @@ mod tests {
         assert!(account.is_file());
         assert_eq!(registry.store_path(&base, "mail").unwrap(), base);
         assert_eq!(mailbox_owner(&base).unwrap().unwrap().1, config.email);
+    }
+
+    #[test]
+    fn an_unreadable_staged_sibling_leaves_the_base_open() {
+        for symlink in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let base = root.path().join("mail.db");
+            let registry = Registry::at(root.path().join("fell"), base.clone());
+            fs::create_dir_all(registry.directory()).unwrap();
+            let text = "email = 'mail@example.test'\npassword = 'fixture'";
+            let config = crate::AccountConfig::parse(text).unwrap();
+            let account = registry.path("mail").unwrap();
+            publish(&registry.directory(), &account, text.as_bytes()).unwrap();
+            Store::open(&base)
+                .unwrap()
+                .upsert_account(&config.account())
+                .unwrap();
+
+            let sibling = sibling_mailbox(&base, "mail");
+            let trash = removal_trash(&sibling);
+            fs::create_dir_all(&trash).unwrap();
+            fs::write(trash.join("plan"), br#"["mail",[]]"#).unwrap();
+            let staged = staged_file(&trash, &sibling, "");
+            if symlink {
+                std::os::unix::fs::symlink(&base, &staged).unwrap();
+            } else {
+                let conn = rusqlite::Connection::open(&staged).unwrap();
+                conn.execute_batch("CREATE TABLE accounts (id TEXT, email TEXT)")
+                    .unwrap();
+                drop(conn);
+                let mut bytes = fs::read(&staged).unwrap();
+                bytes[100] = 0;
+                fs::write(&staged, bytes).unwrap();
+            }
+
+            assert!(inspect_mailbox(&staged, true).is_err());
+            assert_eq!(registry.store_path(&base, "mail").unwrap(), base);
+            assert_eq!(
+                registry.configured_store_path(&base, &config).unwrap(),
+                base
+            );
+            let catalog = registry.load_with_removals(&base);
+            assert_eq!(catalog.default_config(), Some(&config));
+            assert!(catalog.interrupted.is_empty());
+            assert!(staged.symlink_metadata().is_ok());
+        }
+    }
+
+    #[test]
+    fn staged_discard_refuses_a_replacement_for_the_locked_file() {
+        let root = tempfile::tempdir().unwrap();
+        let mailbox = root.path().join("mail.db");
+        let trash = removal_trash(&mailbox);
+        fs::create_dir(&trash).unwrap();
+        let staged = staged_file(&trash, &mailbox, "");
+        let wal = staged_file(&trash, &mailbox, "-wal");
+        fs::write(&staged, "locked mailbox").unwrap();
+        fs::write(&wal, "staged WAL").unwrap();
+        let locked = lock_mailbox(&staged).unwrap().unwrap();
+        let moved = root.path().join("locked.db");
+        fs::rename(&staged, &moved).unwrap();
+        fs::write(&staged, "replacement mailbox").unwrap();
+
+        for lock in [Some(&locked), None] {
+            let error = discard_staged_mailbox(&trash, &mailbox, lock).unwrap_err();
+            assert!(error.to_string().contains("changed during removal"));
+            assert_eq!(fs::read_to_string(&staged).unwrap(), "replacement mailbox");
+            assert_eq!(fs::read_to_string(&moved).unwrap(), "locked mailbox");
+            assert_eq!(fs::read_to_string(&wal).unwrap(), "staged WAL");
+        }
     }
 
     #[test]

@@ -1285,14 +1285,6 @@ impl Inbox {
         }
         self.session.sync = opened.sync;
         self.first_preview.sync_changed(&self.session.sync);
-        if let Some(warning) = opened.warning {
-            self.session.show_toast(warning, false);
-            self.dismiss_notice_after(
-                self.session.toast_generation(),
-                std::time::Duration::from_secs(8),
-                cx,
-            );
-        }
         cx.default_global::<ReplyChecks>()
             .for_account_mut(&self.account_id)
             .start(self.account_id.clone(), sync_with.is_none() || store_failed);

@@ -32,7 +32,6 @@ pub struct Opened {
     pub account: Account,
     pub sync: SyncKind,
     pub error: Option<String>,
-    pub warning: Option<String>,
 }
 
 pub fn startup() -> Startup {
@@ -570,7 +569,6 @@ fn fallback(error: String) -> (Store, Opened) {
             },
             sync: SyncKind::StoreError,
             error: Some(error),
-            warning: None,
         },
     )
 }
@@ -578,14 +576,11 @@ fn fallback(error: String) -> (Store, Opened) {
 fn prepare(store: &Store, config: Option<&AccountConfig>, demo: bool) -> fell_core::Result<Opened> {
     if let Some(config) = config {
         let account = config.account();
-        let retained = store.configure_account(&account, config.write_back)?;
-        let warning =
-            (!retained.is_empty()).then(|| "Kept older local mail, drafts, and outbox".to_owned());
+        store.configure_account(&account, config.write_back)?;
         return Ok(Opened {
             account,
             sync: SyncKind::Connecting,
             error: None,
-            warning,
         });
     }
     let accounts = store.list_accounts()?;
@@ -596,7 +591,6 @@ fn prepare(store: &Store, config: Option<&AccountConfig>, demo: bool) -> fell_co
             account,
             sync: SyncKind::FixtureOffline,
             error: None,
-            warning: None,
         });
     }
     let account = accounts
@@ -614,7 +608,6 @@ fn prepare(store: &Store, config: Option<&AccountConfig>, demo: bool) -> fell_co
         account,
         sync,
         error: None,
-        warning: None,
     })
 }
 
@@ -1111,9 +1104,17 @@ mod tests {
         assert_eq!(opened.sync, SyncKind::FixtureOffline);
         let fixture = opened.account;
         assert!(prepare(&store, None, false).is_err());
-        for id in ["local", "fixture", "demo"] {
-            let mut demo = fixture.clone();
-            demo.id = AccountId(id.into());
+        let config = AccountConfig::bridge(
+            "me@example.test",
+            "me@example.test",
+            fell_core::PasswordSource::Inline("x".into()),
+        );
+        for id in ["local", "fixture", "demo"].map(|id| AccountId(id.into())) {
+            let store = Store::open_in_memory().unwrap();
+            let demo = Account {
+                id,
+                ..fixture.clone()
+            };
             seed_if_empty(&store, &demo).unwrap();
             assert!(!store.list_threads(&demo.id).unwrap().is_empty());
             store
@@ -1123,24 +1124,16 @@ mod tests {
                     fell_core::AgentGrant::enabled(true, true, true),
                 )
                 .unwrap();
-        }
-        let config = AccountConfig::bridge(
-            "me@proton.me",
-            "me@proton.me",
-            fell_core::PasswordSource::Inline("x".into()),
-        );
-        let opened = prepare(&store, Some(&config), true).unwrap();
-        assert_eq!(opened.sync, SyncKind::Connecting);
-        assert!(opened.warning.is_none());
-        let account = opened.account;
-        assert_eq!(account.email, "me@proton.me");
-        assert_eq!(store.list_accounts().unwrap(), [account]);
-        assert!(store.list_agent_grants().unwrap().is_empty());
-        for id in ["local", "fixture", "demo"].map(|id| AccountId(id.into())) {
-            assert!(store.list_threads(&id).unwrap().is_empty());
+            let opened = prepare(&store, Some(&config), true).unwrap();
+            assert_eq!(opened.sync, SyncKind::Connecting);
+            let account = opened.account;
+            assert_eq!(account.email, config.email);
+            assert_eq!(store.list_accounts().unwrap(), [account]);
+            assert!(store.list_agent_grants().unwrap().is_empty());
+            assert!(store.list_threads(&demo.id).unwrap().is_empty());
             assert!(
                 store
-                    .agent_grant(&id, "bot")
+                    .agent_grant(&demo.id, "bot")
                     .unwrap_err()
                     .to_string()
                     .contains("unknown account")
@@ -1149,36 +1142,36 @@ mod tests {
     }
 
     #[test]
-    fn a_reserved_real_account_keeps_the_disk_mailbox_open_on_each_launch() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("mail.db");
-        let legacy = Account {
-            email: "legacy@example.test".into(),
-            ..fixture_account()
-        };
-        let store = Store::open(&path).unwrap();
-        store.upsert_account(&legacy).unwrap();
-        drop(store);
-
+    fn a_reserved_real_account_stays_the_only_owner_on_each_launch() {
         let config = AccountConfig::bridge(
             "configured@example.test",
             "configured@example.test",
             fell_core::PasswordSource::Inline("test".into()),
         );
-        for _ in 0..2 {
+        let fixture = fixture_account();
+        for legacy in [
+            Account {
+                email: "legacy@example.test".into(),
+                ..fixture.clone()
+            },
+            Account {
+                backend_kind: fell_core::BackendKind::Imap,
+                ..fixture
+            },
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("mail.db");
+            Store::open(&path).unwrap().upsert_account(&legacy).unwrap();
             let (store, opened) = open_store(Ok(path.clone()), Some(&config), false);
-            assert_eq!(store.db_path(), Some(path.as_path()));
-            assert_eq!(opened.sync, SyncKind::Connecting);
-            assert!(opened.error.is_none());
+            assert_eq!(opened.sync, SyncKind::StoreError);
+            let error = opened.error.unwrap();
+            assert!(error.contains(legacy.id.as_str()), "{error}");
+            assert!(error.contains(&legacy.email), "{error}");
+            assert!(error.contains(&*path.to_string_lossy()), "{error}");
+            assert!(store.list_accounts().unwrap().is_empty());
             assert_eq!(
-                opened.warning.as_deref(),
-                Some("Kept older local mail, drafts, and outbox")
-            );
-            assert_eq!(opened.account.id, config.account().id);
-            assert!(store.get_account(&opened.account.id).unwrap().is_some());
-            assert_eq!(
-                store.get_account(&legacy.id).unwrap().unwrap().email,
-                legacy.email
+                Store::open(&path).unwrap().list_accounts().unwrap(),
+                [legacy]
             );
         }
     }

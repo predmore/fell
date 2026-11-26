@@ -3918,7 +3918,7 @@ mod tests {
     #[test]
     fn list_agent_grants_reports_scopes_and_the_last_action_per_agent() {
         let (store, acct, thread) = seeded();
-        store.upsert_account(&account("a2")).unwrap();
+        store.testing_seed_legacy_account(&account("a2")).unwrap();
         assert!(store.list_agent_grants().unwrap().is_empty());
         store
             .set_agent_grant(&acct, "bot", AgentGrant::enabled(true, true, true))
@@ -4387,7 +4387,7 @@ mod tests {
     fn labels_stay_inside_the_account() {
         let (store, account_id, thread_id) = seeded();
         let other = account("a2");
-        store.upsert_account(&other).unwrap();
+        store.testing_seed_legacy_account(&other).unwrap();
         store
             .upsert_message(&message(
                 "a2",

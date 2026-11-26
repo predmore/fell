@@ -243,7 +243,7 @@ impl AccountWindow {
         &mut self,
         registry: &Registry,
         accounts: Accounts,
-        preferred: Option<(usize, &Path)>,
+        preferred: Option<&Path>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -325,8 +325,8 @@ impl AccountWindow {
                     .get(&config.id)
                     .is_some_and(|view| view.read(cx).session.sync != SyncKind::StoreError)
             };
-            let next = if let Some((index, path)) = preferred {
-                super::settings::selected_account_path(&accounts, index, path, usable)
+            let next = if let Some(path) = preferred {
+                super::settings::selected_account_path(&accounts, path, usable)
                     .and_then(|path| accounts.entries.iter().find(|entry| entry.path == path))
                     .and_then(|entry| entry.config.as_ref().ok())
             } else {
@@ -608,18 +608,7 @@ impl AccountWindow {
                     result,
                     Ok(Some(RemovalOutcome::Kept | RemovalOutcome::Deleted))
                 ) && view.active_id.as_deref() == Some(id.as_str()))
-                .then(|| {
-                    selection
-                        .as_ref()
-                        .map(|(index, path)| (*index, path.as_path()))
-                        .or_else(|| {
-                            active
-                                .settings_view
-                                .account_position(&path)
-                                .map(|index| (index, path.as_path()))
-                        })
-                        .unwrap_or((0, path.as_path()))
-                });
+                .then_some(path.as_path());
                 if !broken {
                     view.stopping.remove(&id);
                     view.removing.remove(&id);
@@ -1445,10 +1434,13 @@ mod tests {
         let window = app.add_window(|window, cx| {
             AccountWindow::new(mailbox::startup(), false, None, window, cx)
         });
+        // This interrupted row joins the catalog while removal is in progress.
+        let base = mailbox::store_path().unwrap();
+        std::fs::create_dir_all(base.with_extension("accounts").join("000.db.removing")).unwrap();
         for (id, index, next, next_index) in [
-            ("studio", 1, Some("work"), 2),
-            ("work", 2, Some("mail"), 0),
-            ("mail", 0, None, 0),
+            ("studio", 1, Some("work"), 3),
+            ("work", 3, Some("mail"), 1),
+            ("mail", 1, None, 1),
         ] {
             let path = registry.path(id).unwrap();
             let expected = catalog(&registry)

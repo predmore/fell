@@ -131,7 +131,6 @@ pub(super) struct FrozenAccounts {
 
 pub(super) fn selected_account_path<'a>(
     catalog: &'a fell_core::accounts::Accounts,
-    index: usize,
     path: &Path,
     usable: impl Fn(&fell_core::AccountConfig) -> bool,
 ) -> Option<&'a Path> {
@@ -149,7 +148,7 @@ pub(super) fn selected_account_path<'a>(
         .collect();
     paths.sort_unstable();
     paths.dedup();
-    let index = account_index(paths.iter().copied(), index, path)?;
+    let index = paths.partition_point(|candidate| *candidate < path);
     paths[index..]
         .iter()
         .chain(paths[..index].iter().rev())
@@ -433,10 +432,6 @@ impl View {
         .map_or(Row::AccountSetup, Row::Account);
         nav.select_row(row);
         self.scroll_to(nav.selected);
-    }
-
-    pub(super) fn account_position(&self, path: &Path) -> Option<usize> {
-        self.accounts.iter().position(|row| row.path == path)
     }
 
     pub fn scroll_to(&self, row: usize) {

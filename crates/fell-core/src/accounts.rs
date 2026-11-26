@@ -740,7 +740,6 @@ fn original_collision(base: &Path, id: &str) -> Option<FileError> {
                     second.0,
                 ));
             }
-            Err(error) if staged => return Some(error.detail),
             _ => return None,
         };
         if mailbox_owner(base).is_ok_and(|base_owner| {
@@ -869,7 +868,7 @@ fn inspect_mailbox(path: &Path, offline: bool) -> Result<MailboxOwnership, FileE
         if !has_accounts {
             return Ok(MailboxOwnership::Unowned("No accounts table"));
         }
-        read_mailbox_owners(&conn, |_| true)
+        read_mailbox_owners(&conn)
     };
     match query() {
         Err(error) if error.sqlite_error_code() == Some(ErrorCode::NotADatabase) => Ok(
@@ -879,22 +878,16 @@ fn inspect_mailbox(path: &Path, offline: bool) -> Result<MailboxOwnership, FileE
     }
 }
 
-fn read_mailbox_owners(
-    conn: &Connection,
-    include: impl Fn(&str) -> bool,
-) -> rusqlite::Result<MailboxOwnership> {
-    let mut statement = conn.prepare("SELECT id, email FROM accounts")?;
+fn read_mailbox_owners(conn: &Connection) -> rusqlite::Result<MailboxOwnership> {
+    let mut statement = conn.prepare("SELECT id, email FROM accounts LIMIT 2")?;
     let mut rows = statement.query([])?;
     let mut owner = None;
     while let Some(row) = rows.next()? {
-        let id: String = row.get(0)?;
-        if include(&id) {
-            let next = (id, row.get(1)?);
-            if let Some(first) = owner {
-                return Ok(MailboxOwnership::Shared(first, next));
-            }
-            owner = Some(next);
+        let next = (row.get(0)?, row.get(1)?);
+        if let Some(first) = owner {
+            return Ok(MailboxOwnership::Shared(first, next));
         }
+        owner = Some(next);
     }
     Ok(owner.map_or(
         MailboxOwnership::Unowned("The accounts table is empty"),
@@ -902,14 +895,14 @@ fn read_mailbox_owners(
     ))
 }
 
-/// Recheck ownership in the account write transaction. The store has already
-/// initialized its schema, and its demo cleanup handles the reserved rows.
-pub(crate) fn validate_configure_account(
+/// Recheck ownership in the write transaction after schema initialization.
+/// An empty accounts table can accept its first owner through this entry point.
+pub(crate) fn validate_account_write(
     conn: &Connection,
     path: Option<&Path>,
     account: &crate::Account,
 ) -> crate::Result<()> {
-    let owners = read_mailbox_owners(conn, |id| !crate::backend::DEMO_ACCOUNT_IDS.contains(&id))?;
+    let owners = read_mailbox_owners(conn)?;
     if matches!(owners, MailboxOwnership::Unowned(_)) {
         return Ok(());
     }
@@ -1340,7 +1333,7 @@ mod tests {
                         if matches!(leftover, "other id" | "multiple owners") {
                             owner.id = AccountId("other".into());
                         }
-                        store.upsert_account(&owner).unwrap();
+                        store.testing_seed_legacy_account(&owner).unwrap();
                     }
                 }
                 if let Some(metadata) = metadata {

@@ -775,7 +775,7 @@ fn accounts_resolve_to_the_only_one_or_ask() {
     let ctx = Ctx::new();
     Store::open(ctx.store())
         .unwrap()
-        .upsert_account(&account("work"))
+        .testing_seed_legacy_account(&account("work"))
         .unwrap();
     let err = ctx
         .run(&["fell-mcp", "add", "codex"], "", false)
@@ -1107,12 +1107,11 @@ fn help_mentions_that_there_is_no_send_tool() {
 
 #[test]
 fn serve_reports_a_removed_account_before_listening() {
-    let ctx = Ctx::new();
+    let ctx = Ctx::empty();
     let path = ctx.store();
     let store = Store::open(&path).unwrap();
-    let mut account = store.list_accounts().unwrap().pop().unwrap();
+    let mut account = account("demo");
     account.email = fell_core::DEMO_MAILBOX_ADDRESS.into();
-    account.backend_kind = fell_core::BackendKind::Bridge;
     store.upsert_account(&account).unwrap();
     store
         .set_agent_grant(&account.id, "bot", AgentGrant::enabled(true, false, false))
