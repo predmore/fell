@@ -32,6 +32,7 @@ const MEASURED_HEIGHTS: usize = 4 * CACHE_SIZE;
 const PROMPT_HEIGHT: f32 = 30.;
 const PROMPT_GAP: f32 = 8.;
 const COMPACT_PROMPT_WIDTH: f32 = 560.;
+const COMPACT_FAILURE_WIDTH: f32 = 480.;
 
 #[derive(Default)]
 pub(super) struct Reader {
@@ -59,6 +60,7 @@ struct MeasuredHeight {
     mail: Weak<WebMail>,
     width: i32,
     images: bool,
+    ui_family: Option<String>,
     height: f32,
 }
 
@@ -67,6 +69,7 @@ impl MeasuredHeight {
         self.id == key.id
             && self.width == key.width
             && self.images == key.images
+            && self.ui_family == key.ui_family
             && Weak::ptr_eq(&self.mail, &Arc::downgrade(&key.mail))
     }
 }
@@ -79,6 +82,7 @@ struct Key {
     width: i32,
     scheme: &'static str,
     background: u32,
+    ui_family: Option<String>,
     images: bool,
 }
 
@@ -95,6 +99,7 @@ impl Key {
             && self.width == other.width
             && self.scheme == other.scheme
             && self.background == other.background
+            && self.ui_family == other.ui_family
     }
 }
 
@@ -545,20 +550,19 @@ impl Reader {
             && (self.once(message, body)
                 || self.verified(body, sender.as_deref())
                     && self.known_sender(sender.as_deref()).1);
-        // Bulk layouts commonly specify light table backgrounds and inherit
-        // the text color. Keep those colors readable in a dark inbox.
-        let light_paper = body.suggested == RenderMode::Web;
+        let scheme = if theme.is_light() { "light" } else { "dark" };
+        let (scheme, background) = body.web.appearance(scheme, theme.surface);
         Key {
             id: message.id.clone(),
             sender,
             mail: body.web.clone(),
             width,
-            scheme: if light_paper || theme.is_light() {
-                "light"
-            } else {
-                "dark"
-            },
-            background: if light_paper { 0xffffff } else { theme.surface },
+            scheme,
+            background,
+            ui_family: theme
+                .ui_family
+                .clone()
+                .filter(|_| !body.web.has_author_colors()),
             images,
         }
     }
@@ -756,13 +760,22 @@ impl Reader {
             let (html, image_failure) = cx
                 .background_spawn(async move {
                     if fetch.images {
-                        let (html, result) =
-                            remote_images::inline_page(&fetch.mail, fetch.scheme, || {
-                                permission.load(Ordering::Acquire)
-                            });
+                        let (html, result) = remote_images::inline_page(
+                            &fetch.mail,
+                            fetch.scheme,
+                            fetch.ui_family.as_deref(),
+                            || permission.load(Ordering::Acquire),
+                        );
                         (html, result.err())
                     } else {
-                        (fetch.mail.page(fetch.scheme, |_| None), None)
+                        (
+                            fetch.mail.page_with_font(
+                                fetch.scheme,
+                                fetch.ui_family.as_deref(),
+                                |_| None,
+                            ),
+                            None,
+                        )
                     }
                 })
                 .await;
@@ -945,6 +958,7 @@ impl Reader {
                         mail: Arc::downgrade(&key.mail),
                         width: key.width,
                         images: key.images,
+                        ui_family: key.ui_family.clone(),
                         height,
                     });
                 }
@@ -1364,7 +1378,7 @@ fn prompt_layer(
         } => (
             failure.as_ref().map_or_else(
                 || "Couldn’t render web view · showing simple view".into(),
-                |failure| failure.label(width < COMPACT_PROMPT_WIDTH).into(),
+                |failure| failure.label(width < COMPACT_FAILURE_WIDTH).into(),
             ),
             failure
                 .as_ref()
@@ -1609,6 +1623,7 @@ mod tests {
             width: 440,
             scheme: "light",
             background: 0xffffff,
+            ui_family: None,
             images: false,
         };
         let second_key = Key {
@@ -1791,6 +1806,7 @@ mod tests {
             width: 640,
             scheme: "light",
             background: 0xffffff,
+            ui_family: None,
             images: false,
         };
         let allowed = Key {
@@ -1826,6 +1842,7 @@ mod tests {
             width: 460,
             scheme: "light",
             background: 0xffffff,
+            ui_family: None,
             images: false,
         };
         let mut reader = Reader::default();
@@ -1892,6 +1909,7 @@ mod tests {
             width: 460,
             scheme: "light",
             background: 0xffffff,
+            ui_family: None,
             images: false,
         };
         let mut reader = Reader::default();

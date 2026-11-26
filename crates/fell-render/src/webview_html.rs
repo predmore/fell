@@ -9,7 +9,7 @@ mod layout;
 pub(crate) use layout::LayoutStyles;
 use layout::style_applies;
 
-fn web_page(body: &str, scheme: &str, body_padding: &str) -> String {
+fn web_page(body: &str, scheme: &str, body_attrs: &str, body_css: &str) -> String {
     format!(
         r#"<!DOCTYPE html>
 <html>
@@ -22,7 +22,7 @@ fn web_page(body: &str, scheme: &str, body_padding: &str) -> String {
 <style>
   html, body {{ margin: 0; padding: 0; }}
   table, img {{ max-width: 100%; }}
-  body {{ overflow-wrap: anywhere; }}
+  body {{ overflow-wrap: anywhere; {body_css} }}
   img[src=""] {{
     background-color: rgba(128, 128, 128, 0.12);
     border: 0 !important;
@@ -34,7 +34,7 @@ fn web_page(body: &str, scheme: &str, body_padding: &str) -> String {
   img {{ height: auto; object-fit: contain; }}
 </style>
 </head>
-<body style="{body_padding}">{body}</body>
+<body{body_attrs}>{body}</body>
 </html>"#,
         scheme = scheme,
         body = body,
@@ -46,7 +46,7 @@ fn web_page(body: &str, scheme: &str, body_padding: &str) -> String {
 #[derive(Debug)]
 pub struct WebMail {
     body: String,
-    body_padding: String,
+    body_attrs: String,
     images: Vec<(usize, String)>,
     layout: layout::Estimate,
     source_bytes: usize,
@@ -93,44 +93,38 @@ impl WebMail {
             0,
             Some(&mut images),
         );
-        // Estimate the same wrapper insets that the snapshot will paint.
-        let mut body_padding = String::new();
-        if let Some(style) = dom
+        // Keep the body's presentation attributes while replacing its wrapper.
+        let mut body_attrs = String::new();
+        if let Some(element) = dom
             .root_element()
             .children()
             .filter_map(scraper::ElementRef::wrap)
             .find(|element| element.value().name() == "body")
-            .and_then(|body| body.attr("style"))
         {
-            for rule in style.split(';') {
-                if rule.split_once(':').is_some_and(|(name, _)| {
-                    [
-                        "padding",
-                        "padding-top",
-                        "padding-right",
-                        "padding-bottom",
-                        "padding-left",
-                        "padding-block",
-                        "padding-block-start",
-                        "padding-block-end",
-                        "padding-inline",
-                        "padding-inline-start",
-                        "padding-inline-end",
-                    ]
-                    .iter()
-                    .any(|property| name.trim().eq_ignore_ascii_case(property))
-                }) {
-                    serialize_css(rule, &mut body_padding, None, escape_attr);
-                    body_padding.push(';');
+            use std::fmt::Write;
+            for name in ["id", "class", "bgcolor", "text", "link", "vlink", "alink"] {
+                if let Some(value) = element.attr(name) {
+                    write!(body_attrs, " {name}=\"{}\"", escape_attr(value)).unwrap();
                 }
             }
+            body_attrs.push_str(" style=\"");
+            for rule in html::style_declarations(element.value()) {
+                if layout::is_padding(&rule.name) || layout::is_color_property(&rule.name) {
+                    write!(body_attrs, "{}:", rule.name).unwrap();
+                    serialize_css(&rule.value, &mut body_attrs, None, escape_attr);
+                    if rule.important {
+                        body_attrs.push_str(" !important");
+                    }
+                    body_attrs.push(';');
+                }
+            }
+            body_attrs.push('"');
         }
-        let layout_dom =
-            html::parse_html(&format!(r#"<body style="{body_padding}">{body}</body>"#));
+        let layout_dom = html::parse_html(&format!("<body{body_attrs}>{body}</body>"));
         let layout = layout::Estimate::prepare(&layout_dom, metrics);
         Self {
             body,
-            body_padding,
+            body_attrs,
             images,
             layout,
             source_bytes: html.len(),
@@ -145,6 +139,18 @@ impl WebMail {
         self.layout.height(width, Self::image_height_limit(width))
     }
 
+    pub fn has_author_colors(&self) -> bool {
+        self.layout.author_colors
+    }
+
+    pub fn appearance<'a>(&self, scheme: &'a str, surface: u32) -> (&'a str, u32) {
+        if self.has_author_colors() {
+            ("light", 0xffffff)
+        } else {
+            (scheme, surface)
+        }
+    }
+
     pub fn has_remote_images(&self) -> bool {
         !self.images.is_empty()
     }
@@ -153,7 +159,41 @@ impl WebMail {
         1.5 * width
     }
 
-    pub fn page(&self, scheme: &str, mut image: impl FnMut(&str) -> Option<String>) -> String {
+    pub fn page(&self, scheme: &str, image: impl FnMut(&str) -> Option<String>) -> String {
+        self.page_with_font(scheme, None, image)
+    }
+
+    pub fn page_with_font(
+        &self,
+        scheme: &str,
+        ui_family: Option<&str>,
+        mut image: impl FnMut(&str) -> Option<String>,
+    ) -> String {
+        use std::fmt::Write;
+        let mut body_css = String::new();
+        if !self.has_author_colors() {
+            body_css.push_str("font-family: ");
+            if let Some(family) = ui_family {
+                cssparser::serialize_string(&family.replace('<', "\u{fffd}"), &mut body_css)
+                    .unwrap();
+                body_css.push_str(", ");
+            }
+            write!(
+                body_css,
+                "system-ui, sans-serif; line-height: {};",
+                layout::BODY_LINE_HEIGHT
+            )
+            .unwrap();
+        }
+        if self.layout.native_body_inset {
+            write!(
+                body_css,
+                " padding: {}px {}px;",
+                layout::BODY_PAD_Y,
+                layout::BODY_PAD_X
+            )
+            .unwrap();
+        }
         let mut body = String::with_capacity(self.body.len());
         let mut offset = 0;
         for (at, url) in &self.images {
@@ -164,7 +204,12 @@ impl WebMail {
             offset = *at;
         }
         body.push_str(&self.body[offset..]);
-        web_page(&body, scheme, &self.body_padding)
+        web_page(
+            &body,
+            self.appearance(scheme, 0).0,
+            &self.body_attrs,
+            &body_css,
+        )
     }
 }
 
@@ -1173,6 +1218,51 @@ fn escape_attr(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn author_colors_use_light_paper_in_dark_mode() {
+        for html in [
+            "<body bgcolor='#fff'>Story</body>",
+            "<body style='color:#555'>Story</body>",
+            "<table bgcolor='#fff'><tr><td>Story</td></tr></table>",
+            "<p style='background:#fff'>Story</p>",
+            "<style>@media (max-width:600px){p, a:hover {color: #555}}</style><p>Story</p>",
+            "<font color='#555'>Story</font>",
+        ] {
+            let mail = WebMail::prepare(html);
+            assert_eq!(
+                mail.appearance("dark", 0x24283b),
+                ("light", 0xffffff),
+                "{html}"
+            );
+            let page = mail.page("dark", |_| None);
+            assert!(
+                page.contains(r#"name="color-scheme" content="light""#),
+                "{html}"
+            );
+            assert!(!page.contains("padding: 12px 14px"));
+        }
+    }
+
+    #[test]
+    fn colorless_mail_uses_the_ui_font_and_respects_author_insets() {
+        let plain = WebMail::prepare("<div>Booked.</div>");
+        let page = plain.page_with_font("dark", Some("Inter"), |_| None);
+        assert_eq!(plain.appearance("dark", 0x24283b), ("dark", 0x24283b));
+        assert!(page.contains(r#"font-family: "Inter", system-ui, sans-serif"#));
+        assert!(page.contains("padding: 12px 14px"));
+        for html in [
+            "<body style='padding-top:6px'><div>Booked.</div></body>",
+            "<style>.note, td {padding-top:6px}</style><body class='note'><div>Booked.</div></body>",
+        ] {
+            let mail = WebMail::prepare(html);
+            assert!(!mail.page("dark", |_| None).contains("padding: 12px 14px"));
+            assert_eq!(
+                plain.estimated_height(440.) - mail.estimated_height(440.),
+                18.
+            );
+        }
+    }
 
     #[test]
     fn webview_html_strips_script_and_remote_images() {

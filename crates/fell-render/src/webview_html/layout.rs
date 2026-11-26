@@ -21,17 +21,50 @@ const MAX_ESTIMATED_HEIGHT: f32 = 8_192.;
 // Allow for font metrics and line rounding across WebKit installations.
 const HEIGHT_ALLOWANCE: f32 = 12.;
 
+pub(super) const BODY_PAD_X: f32 = 14.;
+pub(super) const BODY_PAD_Y: f32 = 12.;
+pub(super) const BODY_LINE_HEIGHT: f32 = 1.125;
+
 #[derive(Debug)]
-pub(super) struct Estimate(Vec<(i32, Option<Layout>)>);
+pub(super) struct Estimate {
+    layouts: Vec<(i32, Option<Layout>)>,
+    pub author_colors: bool,
+    pub native_body_inset: bool,
+}
 
 impl Estimate {
     pub(super) fn prepare(layout_dom: &scraper::Html, metrics: TextMetrics) -> Self {
-        let styles = LayoutStyles::from_document(layout_dom);
+        let mut styles = LayoutStyles::from_document(layout_dom);
+        let elements = layout_dom
+            .root_element()
+            .descendants()
+            .filter_map(scraper::ElementRef::wrap);
+        let author_colors = styles.author_colors
+            || elements.clone().any(|node| {
+                let element = node.value();
+                element.attr("bgcolor").is_some()
+                    || element.attr("color").is_some()
+                    || element.name() == "body"
+                        && ["text", "link", "vlink", "alink"]
+                            .iter()
+                            .any(|attr| element.attr(attr).is_some())
+                    || html::style_declarations(element).iter().any(sets_color)
+            });
+        let native_body_inset = !author_colors
+            && elements
+                .filter(|node| node.value().name() == "body")
+                .all(|body| !styles.has_body_padding(body));
+        styles.native_body_inset = native_body_inset;
         let root = *layout_dom.root_element();
         let font = Font {
             size: 16.,
-            line: LineHeight::Normal,
+            line: if author_colors {
+                LineHeight::Normal
+            } else {
+                LineHeight::Ratio(BODY_LINE_HEIGHT)
+            },
             metrics,
+            serif: false,
         };
         let layouts = if styles.breakpoints.len() <= 8 {
             std::iter::once(1)
@@ -46,18 +79,27 @@ impl Estimate {
         } else {
             vec![(1, Layout::from_node(root, &styles, None, font, false))]
         };
-        Self(layouts)
+        Self {
+            layouts,
+            author_colors,
+            native_body_inset,
+        }
     }
 
     pub(super) fn height(&self, width: f32, image_limit: f32) -> f32 {
+        let width = width.max(1.);
         let index = self
-            .0
+            .layouts
             .partition_point(|(min, _)| *min <= width.round() as i32);
-        (self.0[index.saturating_sub(1)]
+        (self.layouts[index.saturating_sub(1)]
             .1
             .as_ref()
             .map_or(0., |layout| {
-                layout.measure(width, image_limit).outer_height()
+                // Media queries and the image cap use the pane's viewport. A
+                // full-document snapshot also includes any horizontal overflow,
+                // and the reader scales that wider surface back to the pane.
+                let outer_width = width.max(layout.overflow_width(width));
+                layout.measure(outer_width, image_limit).outer_height() * width / outer_width
             })
             + HEIGHT_ALLOWANCE)
             .min(MAX_ESTIMATED_HEIGHT)
@@ -188,6 +230,9 @@ impl Selector {
                         })
                     });
                     if state == Ok(true) {
+                        // The caller delimits this parser at the next top-level
+                        // comma. Consume the rest of just this selector.
+                        while input.next().is_ok() {}
                         return Self::AtRestInactive;
                     }
                     if separated {
@@ -433,6 +478,8 @@ pub(crate) struct LayoutStyles {
     incomplete: bool,
     breakpoints: Vec<i32>,
     order: usize,
+    author_colors: bool,
+    native_body_inset: bool,
 }
 
 struct LayoutRules<'a> {
@@ -506,11 +553,7 @@ impl<'i> QualifiedRuleParser<'i> for LayoutRules<'_> {
         &mut self,
         input: &mut Parser<'i, 't>,
     ) -> Result<Self::Prelude, ParseError<'i, ()>> {
-        input.parse_comma_separated(|input| {
-            let selector = Selector::parse(input);
-            while input.next().is_ok() {}
-            Ok(selector)
-        })
+        input.parse_comma_separated(|selector| Ok(Selector::parse(selector)))
     }
 
     fn parse_block<'t>(
@@ -519,7 +562,17 @@ impl<'i> QualifiedRuleParser<'i> for LayoutRules<'_> {
         _: &ParserState,
         input: &mut Parser<'i, 't>,
     ) -> Result<(), ParseError<'i, ()>> {
+        let start = input.state();
         let declarations = html::parse_stylesheet_declarations(input);
+        if !self.styles.author_colors {
+            self.styles.author_colors = match &declarations {
+                Ok(declarations) => declarations.iter().any(sets_color),
+                Err(_) => {
+                    input.reset(&start);
+                    html::parse_declarations(input).iter().any(sets_color)
+                }
+            };
+        }
         let uncertain = self.uncertain
             || declarations
                 .as_ref()
@@ -618,6 +671,18 @@ impl LayoutStyles {
 
     pub(crate) fn declarations(&self, node: scraper::ElementRef<'_>) -> Vec<Declaration> {
         self.cascade(node, None).0
+    }
+
+    fn has_body_padding(&self, body: scraper::ElementRef<'_>) -> bool {
+        let has_padding =
+            |declarations: &[Declaration]| declarations.iter().any(|rule| is_padding(&rule.name));
+        has_padding(&html::style_declarations(body.value()))
+            || self
+                .indexed
+                .values()
+                .flatten()
+                .chain(&self.unindexed)
+                .any(|rule| rule.selector.matches(body) && has_padding(&rule.declarations))
     }
 
     fn cascade(
@@ -819,6 +884,34 @@ fn neutral(declaration: &Declaration) -> bool {
         )
 }
 
+pub(super) fn is_padding(property: &str) -> bool {
+    matches!(
+        property,
+        "padding"
+            | "padding-top"
+            | "padding-right"
+            | "padding-bottom"
+            | "padding-left"
+            | "padding-block"
+            | "padding-block-start"
+            | "padding-block-end"
+            | "padding-inline"
+            | "padding-inline-start"
+            | "padding-inline-end"
+    )
+}
+
+pub(super) fn is_color_property(property: &str) -> bool {
+    matches!(
+        property,
+        "color" | "background" | "background-color" | "-webkit-text-fill-color"
+    )
+}
+
+fn sets_color(declaration: &Declaration) -> bool {
+    is_color_property(&declaration.name)
+}
+
 #[derive(Clone, Copy, Debug)]
 enum Length {
     Px(f32),
@@ -888,6 +981,7 @@ struct Font {
     size: f32,
     line: LineHeight,
     metrics: TextMetrics,
+    serif: bool,
 }
 
 impl Font {
@@ -903,6 +997,7 @@ impl Font {
         let default = self.size * scale;
         let mut size: Option<(bool, Option<Length>)> = None;
         let mut line: Option<(bool, &str)> = None;
+        let mut family: Option<(bool, &str)> = None;
         for declaration in style {
             let important = declaration.important;
             match declaration.name.as_str() {
@@ -912,13 +1007,19 @@ impl Font {
                 "line-height" if line.is_none_or(|(important, _)| !important) || important => {
                     line = Some((important, declaration.value.as_str()));
                 }
+                "font-family" if family.is_none_or(|(important, _)| !important) || important => {
+                    family = Some((important, declaration.value.as_str()));
+                }
                 "font" => {
-                    if let Some((font_size, height)) = shorthand_font(&declaration.value) {
+                    if let Some((font_size, height, names)) = shorthand_font(&declaration.value) {
                         if important || size.is_none_or(|(important, _)| !important) {
                             size = Some((important, Some(font_size)));
                         }
                         if important || line.is_none_or(|(important, _)| !important) {
                             line = Some((important, height));
+                        }
+                        if important || family.is_none_or(|(important, _)| !important) {
+                            family = Some((important, names));
                         }
                     }
                 }
@@ -948,7 +1049,21 @@ impl Font {
         } else {
             line
         };
-        Self { size, line, ..self }
+        let serif = family.map_or(self.serif, |(_, names)| serif_family(names));
+        Self {
+            size,
+            line,
+            serif,
+            ..self
+        }
+    }
+
+    fn advance(self) -> fn(char) -> f32 {
+        if self.serif {
+            self.metrics.serif_advance
+        } else {
+            self.metrics.advance
+        }
     }
 }
 
@@ -1023,31 +1138,42 @@ impl Measured {
 #[derive(Clone, Copy)]
 pub(super) struct TextMetrics {
     advance: fn(char) -> f32,
+    serif_advance: fn(char) -> f32,
     normal_line: fn(f32) -> f32,
 }
 
 impl TextMetrics {
     pub(super) const DEFAULT: Self = Self {
-        advance: approximate_advance,
+        advance: sans_advance,
+        serif_advance,
         normal_line: |size| (size * 1.125).ceil(),
     };
 
     #[cfg(feature = "test-utils")]
     pub(super) const CALIBRATION: Self = Self {
         advance: calibration_advance,
+        serif_advance: calibration_advance,
         normal_line: calibration_line_height,
     };
+}
 
-    fn width(self, text: &str) -> f32 {
-        let space = (self.advance)(' ');
-        text.split_whitespace()
-            .map(|word| word.chars().map(self.advance).sum::<f32>() + space)
-            .sum::<f32>()
-            - space
+fn sans_advance(ch: char) -> f32 {
+    match ch {
+        '\'' | 'i' | 'j' | 'l' => 0.22,
+        '.' | ',' | '!' | ':' | ';' | ' ' | 'f' | 't' | 'I' => 0.28,
+        'r' | '-' | '(' | ')' => 0.33,
+        'a' | 'b' | 'd' | 'e' | 'g' | 'h' | 'n' | 'o' | 'p' | 'q' | 'u' | '0'..='9' => 0.56,
+        'w' | 'C' | 'D' | 'H' | 'N' | 'R' | 'U' => 0.72,
+        'G' | 'O' | 'Q' => 0.78,
+        'm' | 'M' => 0.83,
+        'W' => 0.94,
+        'A'..='Z' => 0.67,
+        '\0'..='\x7f' => 0.5,
+        _ => 1.0,
     }
 }
 
-fn approximate_advance(ch: char) -> f32 {
+fn serif_advance(ch: char) -> f32 {
     match ch {
         '.' | ',' | '!' | ':' | ';' | '\'' | ' ' => 0.25,
         'i' | 'j' | 'l' | 't' => 0.28,
@@ -1094,7 +1220,7 @@ fn calibration_advance(ch: char) -> f32 {
         .map(ch)
         .and_then(|glyph| glyphs.advance_width(glyph))
         .map_or_else(
-            || approximate_advance(ch),
+            || sans_advance(ch),
             |advance| advance / f32::from(calibration_metrics().units_per_em),
         )
 }
@@ -1190,17 +1316,35 @@ fn box_edges(style: &[Declaration], property: &str) -> [Option<Length>; 4] {
     edges.map(|edge| edge.map(|(_, length)| length))
 }
 
-fn shorthand_font(value: &str) -> Option<(Length, &str)> {
-    let mut words = value.split_ascii_whitespace().peekable();
-    while let Some(word) = words.next() {
+fn shorthand_font(mut value: &str) -> Option<(Length, &str, &str)> {
+    while let Some((word, rest)) = value.trim_start().split_once(char::is_whitespace) {
         let (size, line) = word.split_once('/').unwrap_or((word, "normal"));
         if let Some(size) = Length::parse(size)
-            && words.peek().is_some()
+            && !rest.trim().is_empty()
         {
-            return Some((size, line));
+            return Some((size, line, rest));
         }
+        value = rest;
     }
     None
+}
+
+fn serif_family(names: &str) -> bool {
+    let first = names
+        .split(',')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_matches(['\'', '"']);
+    [
+        "serif",
+        "Georgia",
+        "Times New Roman",
+        "Times",
+        "Liberation Serif",
+    ]
+    .iter()
+    .any(|name| first.eq_ignore_ascii_case(name))
 }
 
 fn border_length(value: &str) -> Option<f32> {
@@ -1283,7 +1427,13 @@ impl Layout {
     ) -> Option<Self> {
         let element = match node.value() {
             Node::Text(text) if inherited.size > 0. => {
-                let em = inherited.metrics.width(text);
+                let advance = inherited.advance();
+                let space = advance(' ');
+                let em = text
+                    .split_whitespace()
+                    .map(|word| word.chars().map(advance).sum::<f32>() + space)
+                    .sum::<f32>()
+                    - space;
                 return (em > 0.).then_some(Self::Text {
                     em,
                     font: inherited.size,
@@ -1330,7 +1480,17 @@ impl Layout {
         let margin = box_edges(&style, "margin");
         let border = border_edges(&style);
         let cell = matches!(name, "td" | "th");
-        let padding = padding.map(|edge| edge.unwrap_or(Length::Px(if cell { 1. } else { 0. })));
+        let default_padding = if name == "body" && styles.native_body_inset {
+            [
+                Length::Px(BODY_PAD_Y),
+                Length::Px(BODY_PAD_X),
+                Length::Px(BODY_PAD_Y),
+                Length::Px(BODY_PAD_X),
+            ]
+        } else {
+            [Length::Px(if cell { 1. } else { 0. }); 4]
+        };
+        let padding = std::array::from_fn(|edge| padding[edge].unwrap_or(default_padding[edge]));
         let default_margin = match name {
             "h1" => font.size * 0.67,
             "h2" => font.size * 0.83,
@@ -1434,7 +1594,7 @@ impl Layout {
                         line: next_line,
                     },
                 ) if inline_flow && *text_font == next_font && *line == next_line => {
-                    *em += (font.metrics.advance)(' ') + next;
+                    *em += font.advance()(' ') + next;
                 }
                 (Some(Self::Text { .. }), Self::Break { .. }) if inline_flow => {
                     children.push(Self::Break { height: 0. });
@@ -1503,15 +1663,21 @@ impl Layout {
         Some(Self::Flow(Box::new(Flow {
             children,
             kind,
-            width: html::declared_value(&style, "width")
-                .and_then(Length::parse)
-                .or_else(|| {
+            width: match html::declared_value(&style, "width") {
+                Some(width) => Length::parse(width),
+                None if matches!(
+                    name,
+                    "table" | "td" | "th" | "col" | "colgroup" | "hr" | "svg"
+                ) =>
+                {
                     element.attr("width").and_then(|width| {
                         html_pixels(width)
                             .map(Length::Px)
                             .or_else(|| Length::parse(width))
                     })
-                }),
+                }
+                None => None,
+            },
             min_width: html::declared_value(&style, "min-width").and_then(Length::parse),
             max_width: html::declared_value(&style, "max-width").and_then(Length::parse),
             font: font.size,
@@ -1524,6 +1690,13 @@ impl Layout {
             min_height,
             max_height,
         })))
+    }
+
+    fn overflow_width(&self, width: f32) -> f32 {
+        match self {
+            Self::Flow(flow) => flow.overflow_width(width),
+            _ => 0., // The wrapper fits images and wraps otherwise unbreakable text.
+        }
     }
 
     fn measure(&self, width: f32, image_limit: f32) -> Measured {
@@ -1643,6 +1816,69 @@ fn authored_gap(
 }
 
 impl Flow {
+    fn fixed_cell_width(child: &Layout, width: f32) -> Option<f32> {
+        let Layout::Flow(cell) = child else {
+            return None;
+        };
+        (cell.kind == FlowKind::Cell
+            && (matches!(cell.width, Some(Length::Px(_)))
+                || matches!(cell.min_width, Some(Length::Px(_)))))
+        .then(|| {
+            let (_, required, edges) = cell.horizontal_size(width);
+            required + edges
+        })
+    }
+
+    fn horizontal_size(&self, width: f32) -> (f32, f32, f32) {
+        let [_, right, _, left] = insets(self.padding, self.border, width, self.font);
+        let margins =
+            self.margin[1].resolve(width, self.font) + self.margin[3].resolve(width, self.font);
+        let inset = left + right;
+        let natural = (width - inset - margins).max(1.);
+        let declared = |hint: Length| {
+            (hint.resolve(width, self.font) - if self.border_box { inset } else { 0. }).max(0.)
+        };
+        let maximum = self.max_width.map_or(f32::INFINITY, declared);
+        let minimum = self.min_width.map_or(0., declared);
+        let preferred = self
+            .width
+            .map_or(natural, declared)
+            .min(maximum)
+            .max(minimum);
+        let required = match self.width {
+            Some(Length::Px(_)) => preferred,
+            _ => minimum,
+        };
+        (preferred, required, inset + margins)
+    }
+
+    fn overflow_width(&self, width: f32) -> f32 {
+        let (preferred, required, edges) = self.horizontal_size(width);
+        let spacing = if self.kind == FlowKind::Table {
+            2. * self.gap[1].resolve(preferred, self.font)
+        } else {
+            0.
+        };
+        let space = (preferred - spacing).max(1.);
+        let children = if self.kind == FlowKind::TableRow
+            && self
+                .children
+                .iter()
+                .any(|child| matches!(child, Layout::Flow(cell) if cell.kind == FlowKind::Cell))
+        {
+            self.children
+                .iter()
+                .map(|child| child.overflow_width(space / self.children.len() as f32))
+                .sum()
+        } else {
+            self.children
+                .iter()
+                .map(|child| child.overflow_width(space))
+                .fold(0., f32::max)
+        };
+        required.max(children + spacing) + edges
+    }
+
     fn inline_lines(&self, width: f32, image_limit: f32) -> impl Iterator<Item = Measured> + '_ {
         let mut children = self.children.iter().peekable();
         std::iter::from_fn(move || {
@@ -1714,11 +1950,24 @@ impl Flow {
                 let count = self.children.len();
                 let width = (available - column_gap * count.saturating_sub(1) as f32).max(1.);
                 let preferred: f32 = self.children.iter().map(Layout::inline_width).sum();
+                let equal = width / count.max(1) as f32;
+                let fixed_width = |child| Self::fixed_cell_width(child, equal);
+                let (fixed_count, fixed_total) = if self.kind == FlowKind::TableRow {
+                    self.children
+                        .iter()
+                        .filter_map(fixed_width)
+                        .fold((0, 0.), |(count, total), width| (count + 1, total + width))
+                } else {
+                    (0, 0.)
+                };
+                let fluid_width = ((width - fixed_total)
+                    / count.saturating_sub(fixed_count).max(1) as f32)
+                    .max(1.);
                 self.children
                     .iter()
                     .map(|child| {
                         let share = if self.kind == FlowKind::TableRow {
-                            width / count as f32
+                            fixed_width(child).unwrap_or(fluid_width)
                         } else if preferred > width {
                             width * child.inline_width() / preferred
                         } else {
@@ -1805,7 +2054,46 @@ fn descendant_dimensions_win_by_specificity() {
         "<style>.wrap .hero{height:280px}.hero{height:20px}</style>",
         r#"<div class="wrap"><div class="hero"></div></div>"#,
     ));
-    assert_eq!(mail.estimated_height(440.), 280. + HEIGHT_ALLOWANCE);
+    assert_eq!(
+        mail.estimated_height(440.),
+        280. + HEIGHT_ALLOWANCE + 2. * BODY_PAD_Y
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn grouped_resets_and_idle_selectors_keep_their_declarations() {
+    let body = r#"<h1>Heading</h1><table cellspacing="0"><tr><td><p>Story</p></td></tr></table><div class="card"></div>"#;
+    let estimate =
+        |css: &str| WebMail::prepare(&format!("<style>{css}</style>{body}")).estimated_height(440.);
+    let expected = estimate("p{margin:0} h1{margin:0} td{margin:0} .card{height:400px}");
+    assert!((450. ..500.).contains(&expected));
+    for card in [
+        ".card, .card:hover",
+        ".card:focus > p, .card",
+        ":is(.card,article), .card:hover",
+    ] {
+        let grouped = format!("p, h1, td {{ margin: 0 }} {card} {{ height: 400px }}");
+        assert_eq!(estimate(&grouped), expected, "{grouped}");
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn fixed_table_widths_are_measured_before_scaling_to_the_pane() {
+    let body = r#"<body style="color:#222"><table cellpadding="0" cellspacing="0" {table}>
+        <tr><td {cell}><div style="height:420px">Story</div></td></tr></table></body>"#;
+    for (table, cell, outer_width) in [
+        ("width='600'", "", 600.),
+        ("style='width:600px'", "", 600.),
+        ("style='min-width:600px'", "", 600.),
+        ("", "style='width:598px'", 600.),
+        ("style='width:600px;max-width:100%'", "", 480.),
+    ] {
+        let mail = WebMail::prepare(&body.replace("{table}", table).replace("{cell}", cell));
+        let expected = 422. * 480. / outer_width + HEIGHT_ALLOWANCE;
+        assert_eq!(mail.estimated_height(480.), expected, "{table} {cell}");
+    }
 }
 
 #[cfg(test)]
@@ -1821,11 +2109,11 @@ fn structural_selectors_and_negated_hover_apply_at_rest() {
     ));
     assert_eq!(
         mail.estimated_height(440.),
-        280. + 40. + 99. + 300. + HEIGHT_ALLOWANCE
+        280. + 40. + 99. + 300. + HEIGHT_ALLOWANCE + 2. * BODY_PAD_Y
     );
     assert_eq!(
         mail.estimated_height(360.),
-        120. + 40. + 99. + 300. + HEIGHT_ALLOWANCE
+        120. + 40. + 99. + 300. + HEIGHT_ALLOWANCE + 2. * BODY_PAD_Y
     );
 }
 
@@ -1841,11 +2129,11 @@ fn inline_blocks_share_height_until_they_wrap() {
     ));
     assert_eq!(
         mail.estimated_height(600.),
-        100. + 65. + 65. + HEIGHT_ALLOWANCE
+        100. + 65. + 65. + HEIGHT_ALLOWANCE + 2. * BODY_PAD_Y
     );
     assert_eq!(
         mail.estimated_height(360.),
-        100. + 3. * 65. + HEIGHT_ALLOWANCE
+        100. + 3. * 65. + HEIGHT_ALLOWANCE + 2. * BODY_PAD_Y
     );
 }
 
@@ -1882,8 +2170,14 @@ fn height_estimates_cap_image_hints_and_total_layout() {
     );
     let mail =
         WebMail::prepare(r#"<img width="600" height="200000" src="https://example.test/large">"#);
-    assert_eq!(mail.estimated_height(440.), 660. + HEIGHT_ALLOWANCE);
-    assert_eq!(mail.estimated_height(300.), 450. + HEIGHT_ALLOWANCE);
+    assert_eq!(
+        mail.estimated_height(440.),
+        660. + HEIGHT_ALLOWANCE + 2. * BODY_PAD_Y
+    );
+    assert_eq!(
+        mail.estimated_height(300.),
+        450. + HEIGHT_ALLOWANCE + 2. * BODY_PAD_Y
+    );
     assert_eq!(
         WebMail::prepare(&"<p>Another line</p>".repeat(500)).estimated_height(440.),
         MAX_ESTIMATED_HEIGHT
@@ -1923,7 +2217,7 @@ fn height_estimates_respect_stylesheets_escapes_and_clipped_height() {
         <aside class="clipped">{hidden}</aside>
         <aside style="max-height:10px;overflow:hidden">{hidden}</aside>"#
     );
-    assert_eq!(WebMail::prepare(&html).estimated_height(440.), 82.);
+    assert_eq!(WebMail::prepare(&html).estimated_height(440.), 106.);
 }
 
 #[cfg(test)]
@@ -1995,7 +2289,7 @@ fn web_style_media_is_shared_by_the_estimator_and_the_page() {
     assert!(page.contains(r#"<style media="(min-width: 1px)">.box {height:100px}"#));
     assert!(page.contains("padding-block:8px"));
     assert!(page.contains("margin-block:10px"));
-    assert_eq!(mail.estimated_height(440.), 148.);
+    assert_eq!(mail.estimated_height(440.), 172.);
 }
 
 #[cfg(test)]
@@ -2004,7 +2298,7 @@ fn height_estimates_keep_author_reveals_and_spacer_boxes() {
     let reveal = WebMail::prepare(
         r#"<style>.show {display:block !important}</style><div class="show" hidden>Story</div>"#,
     );
-    assert_eq!(reveal.estimated_height(440.), 30.);
+    assert_eq!(reveal.estimated_height(440.), 54.);
 
     let mail = WebMail::prepare(concat!(
         "<style>.show {display:block !important}</style>",

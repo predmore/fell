@@ -94,8 +94,11 @@ impl Reader {
             .round()
             .clamp(1., 1600.) as i32;
         let palette = self.theme.palette();
+        let (scheme, background) = self
+            .web_mail
+            .appearance(palette.scheme(), palette.background);
         let allowed = self.model.remote_images_allowed();
-        let key = web.then_some((width, palette.scheme(), allowed));
+        let key = web.then_some((width, scheme, allowed));
         if self.web_key == key {
             return;
         }
@@ -116,19 +119,19 @@ impl Reader {
             let html = cx
                 .background_spawn(async move {
                     if allowed {
-                        remote_images::inline_page(&mail, scheme, || {
+                        remote_images::inline_page(&mail, scheme, Some("Inter"), || {
                             permission.load(Ordering::Acquire)
                         })
                         .0
                     } else {
-                        mail.page(scheme, |_| None)
+                        mail.page_with_font(scheme, Some("Inter"), |_| None)
                     }
                 })
                 .await;
             let image = webview::render(webview::WebRequest {
                 html,
                 width,
-                background: palette.background,
+                background,
             })
             .await;
             let _ = this.update(cx, |reader, cx| {

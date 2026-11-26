@@ -188,11 +188,19 @@ fn visible_top(view: Bounds<Pixels>, offset: Pixels, item: Bounds<Pixels>) -> Op
         .then(|| top - view.top())
 }
 
-fn continuation_offset(mapped: Pixels, headings: impl Iterator<Item = Pixels>) -> Pixels {
-    headings
-        .filter(|heading| *heading <= mapped)
-        .max_by(|a, b| f32::from(*a).total_cmp(&f32::from(*b)))
-        .unwrap_or_else(|| (mapped - px(24.)).max(px(0.)))
+fn continuation_landing(
+    view: Bounds<Pixels>,
+    body: Bounds<Pixels>,
+    mapped: Pixels,
+    headings: impl Iterator<Item = Pixels>,
+) -> Pixels {
+    let fallback = (mapped - px(24.)).max(px(0.));
+    let into_body = headings
+        .filter(|heading| *heading >= fallback && *heading <= mapped + view.size.height)
+        .min_by(|a, b| f32::from(*a).total_cmp(&f32::from(*b)))
+        .unwrap_or(fallback);
+    // The scroll area's bounds start after the subject and any pinned header.
+    offset_to_hold(view, body, px(8.) - into_body)
 }
 
 fn offset_to_hold(view: Bounds<Pixels>, item: Bounds<Pixels>, y: Pixels) -> Pixels {
@@ -456,13 +464,14 @@ impl gpui::Element for LandingHold {
             offset.y = match (&self.continuation, self.y) {
                 (Some(continuation), _) => {
                     let headings = continuation.headings.borrow();
-                    let into_body = continuation_offset(
+                    continuation_landing(
+                        bounds,
+                        item,
                         item.size.height * continuation.fraction,
                         headings.iter().filter_map(|slot| {
                             Some(window.layout_bounds(slot.get()?).top() - item.top())
                         }),
-                    );
-                    offset_to_hold(bounds, item, -into_body)
+                    )
                 }
                 (_, Some(y)) => {
                     let headers: smallvec::SmallVec<[_; 16]> = self
@@ -582,18 +591,32 @@ mod tests {
     }
 
     #[test]
-    fn continuation_places_the_mapped_body_position_one_line_below_the_viewport_top() {
+    fn continuation_chooses_the_first_nearby_section() {
         let view = vertical_bounds(100., 600.);
         let body = vertical_bounds(250., 12_000.);
-        let mapped = body.size.height * (8_192. / 16_384.);
-        let into_body = continuation_offset(mapped, std::iter::empty());
-        assert_eq!(into_body, px(5_976.));
-        assert_eq!(offset_to_hold(view, body, -into_body), px(-6_126.));
-        assert_eq!(continuation_offset(px(9.), std::iter::empty()), px(0.));
-        assert_eq!(
-            continuation_offset(mapped, [px(4800.), px(6200.), px(5850.)].into_iter()),
-            px(5850.),
-        );
+        let headings = [5_850., 6_450., 6_080.].into_iter().map(px);
+        let offset = continuation_landing(view, body, px(6_000.), headings);
+        assert_eq!(body.top() + px(6_080.) + offset, view.top() + px(8.));
+    }
+
+    #[test]
+    fn continuation_uses_the_mapped_position_when_headings_are_far_away() {
+        let view = vertical_bounds(100., 600.);
+        let body = vertical_bounds(250., 12_000.);
+        for headings in [vec![px(0.)], vec![px(0.), px(6_601.)]] {
+            let offset = continuation_landing(view, body, px(6_000.), headings.into_iter());
+            assert_eq!(body.top() + px(5_976.) + offset, view.top() + px(8.));
+        }
+    }
+
+    #[test]
+    fn continuation_aligns_below_the_subject_at_its_laid_out_height() {
+        let body = vertical_bounds(250., 12_000.);
+        for subject in [vertical_bounds(30., 68.), vertical_bounds(30., 104.)] {
+            let view = vertical_bounds(f32::from(subject.bottom()), 600.);
+            let offset = continuation_landing(view, body, px(6_000.), [px(5_980.)].into_iter());
+            assert_eq!(body.top() + px(5_980.) + offset, subject.bottom() + px(8.));
+        }
     }
 
     #[test]

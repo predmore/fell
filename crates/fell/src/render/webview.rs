@@ -957,19 +957,57 @@ mod tests {
                 r#"<article><h1 style="margin:0 0 12px">A walk along the lake</h1>{}</article>"#,
                 "<p>On Saturday the first ferry left the harbor just after sunrise. The new footpath now follows the water from the boat landing to the old railway bridge.</p>".repeat(18),
             )),
+            ("fixed-width article", 493, include_str!("../../../fell-render/fixtures/web-fixed-article.html").into()),
+            ("SendGrid", 493, include_str!("../../../fell-render/fixtures/web-sendgrid.html").into()),
+            ("ESP grouped reset", 530, String::from(concat!(
+                "<style>body, table, td { margin:0; padding:0 } p, h1, td { margin:0 } ",
+                ".card, .card:hover { height:400px } .card:hover { display:none }</style>",
+                r#"<table width="600" cellspacing="0" style="background:#e7e2d8"><tr><td class="card">"#,
+                "<h1>Northwind Notes</h1><p>The week the river slowed</p></td></tr></table>",
+            ))),
+            ("mobile reveal with padded columns", 432, String::from(concat!(
+                "<style>.column { display:inline-block; width:47%; height:65px; background:#dcece5; ",
+                "vertical-align:top; box-sizing:border-box; padding:8px } .mobile { display:none } ",
+                "@media (max-width:600px) { .column { display:block; width:100% } ",
+                ".mobile { display:block!important; max-height:none!important; overflow:visible!important; ",
+                "font-size:16px!important; background:#f3e3ab; padding:8px } }</style>",
+                r#"<article style="background:#f2ecdd;color:#243e43;padding:24px">"#,
+                r#"<h1 style="font:30px Georgia;margin:0 0 12px">The short crossing</h1>"#,
+                r#"<div class="mobile" style="display:none;max-height:0;overflow:hidden;font-size:0">"#,
+                "On this screen: the next ferry leaves from the east pier.</div>",
+                r#"<p style="margin:14px 0">The ferry runs on the hour from sunrise.</p>"#,
+                r#"<div class="column">East pier<br>From 7:00</div>"#,
+                r#"<div class="column">West pier<br>From 7:30</div></article>"#,
+            ))),
         ];
+        // Also check the production metrics on machines with the stock fonts.
+        // The bundled font keeps the default CI measurements reproducible.
+        let system_fonts = std::env::var_os("FELL_CALIBRATION_SYSTEM_FONTS").is_some();
         let mut outliers = Vec::new();
         for (label, width, html) in calibration {
-            let mail = fell_render::WebMail::calibration(&html);
-            let extra_width = match label {
-                "inline-styled ESP table" => Some(560),
-                "desktop and mobile pair" | "mobile reveal" | "retail" => Some(680),
-                _ => None,
+            let mail = if system_fonts {
+                fell_render::WebMail::prepare(&html)
+            } else {
+                fell_render::WebMail::calibration(&html)
+            };
+            let extra_widths: &[i32] = match label {
+                "inline-styled ESP table" => &[560],
+                "desktop and mobile pair" => &[680],
+                "mobile reveal" => &[432, 490, 680],
+                "mobile reveal with padded columns" => &[490, 680],
+                "retail" => &[530, 680, 960],
+                "fixed-width article" | "SendGrid" => &[435, 472, 530, 960],
+                _ => &[],
             };
             for (scheme, background) in [("light", 0xffffff), ("dark", 0x24283b)] {
-                for width in std::iter::once(width).chain(extra_width) {
+                let (_, background) = mail.appearance(scheme, background);
+                for width in std::iter::once(width).chain(extra_widths.iter().copied()) {
                     let picture = futures::executor::block_on(render(WebRequest {
-                        html: mail.calibration_page(scheme),
+                        html: if system_fonts {
+                            mail.page(scheme, |_| None)
+                        } else {
+                            mail.calibration_page(scheme)
+                        },
                         width,
                         background,
                     }))
@@ -1002,18 +1040,48 @@ mod tests {
             "outside the 0–25px allowance: {outliers:?}"
         );
 
-        let dark = fell_render::WebMail::prepare(
-            r#"<div style="width:300px;height:90px;background:#7a163f">News</div>"#,
+        let dark_mail = |html| {
+            let mail = fell_render::WebMail::prepare(html);
+            let (scheme, background) = mail.appearance("dark", 0x24283b);
+            let picture = futures::executor::block_on(render(WebRequest {
+                html: mail.page_with_font(scheme, Some("Inter"), |_| None),
+                width: 440,
+                background,
+            }))
+            .unwrap()
+            .expect("WebKit painted mail in dark mode");
+            assert!(mail.estimated_height(440.) >= picture.height * 440. / picture.width);
+            picture
+        };
+        let paper = dark_mail(concat!(
+            r##"<table width="600" bgcolor="#ffffff"><tr><td style="font:bold 24px sans-serif">"##,
+            r#"<div>News from the harbor</div><div style="color:#555">The ferry is open</div>"#,
+            r#"<div style="background:#e7e2d8"><a href="https://example.test">Timetable</a></div></td></tr></table>"#,
+        ));
+        for (text, background) in [
+            ([0, 0, 0], [255; 3]),
+            ([0x55; 3], [255; 3]),
+            ([0, 0, 0xee], [0xe7, 0xe2, 0xd8]),
+        ] {
+            assert!(
+                contains_display_color(&paper, text),
+                "missing text color {text:?}"
+            );
+            assert!(contains_display_color(&paper, background));
+            let rgb = |[r, g, b]: [u8; 3]| u32::from_be_bytes([0, r, g, b]);
+            assert!(crate::theme::contrast(rgb(text), rgb(background)) >= 4.5);
+        }
+        let personal = dark_mail("<div>Booked. The hall opens at noon.</div>");
+        assert!(contains_display_color(&personal, [0x24, 0x28, 0x3b]));
+        let pixels = personal.image.as_bytes(0).unwrap().as_chunks::<4>().0;
+        let width = personal.width as usize;
+        let surface = [0x3b, 0x28, 0x24, 255];
+        assert!(pixels[..12 * width].iter().all(|pixel| *pixel == surface));
+        assert!(
+            pixels
+                .chunks_exact(width)
+                .all(|row| row[..14].iter().all(|pixel| *pixel == surface))
         );
-        let picture = futures::executor::block_on(render(WebRequest {
-            html: dark.page("dark", |_| None),
-            width: 440,
-            background: 0x24283b,
-        }))
-        .unwrap()
-        .expect("WebKit painted narrow dark mail");
-        assert!(contains_display_color(&picture, [0x24, 0x28, 0x3b]));
-        assert!(contains_display_color(&picture, [0x7a, 0x16, 0x3f]));
 
         let hero = fell_render::WebMail::prepare(
             r#"<div style="height:1000px;background:#7a163f">A tall hero</div>"#,

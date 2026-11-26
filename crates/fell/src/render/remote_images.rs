@@ -26,6 +26,7 @@ pub(crate) enum Failure {
     Response,
     NotFound,
     Format,
+    Damaged,
     Limit,
     PageLimit,
 }
@@ -36,13 +37,13 @@ impl Failure {
             Self::Unreachable(_) if compact => "Couldn’t reach server".into(),
             Self::Unreachable(host) => format!("Couldn’t reach {host}"),
             Self::TimedOut if compact => "Timed out".into(),
-            Self::TimedOut => "Image server timed out".into(),
+            Self::TimedOut => "Image timed out".into(),
             Self::NotFound => "Image not found".into(),
             Self::Response if compact => "Server error".into(),
-            Self::Format if compact => "Unsupported format".into(),
             Self::Address => "Image address blocked".into(),
             Self::Response => "Image server didn’t return an image".into(),
-            Self::Format => "Unsupported or damaged image".into(),
+            Self::Format => "Unsupported format".into(),
+            Self::Damaged => "Damaged image".into(),
             Self::Limit => "Image too large".into(),
             Self::PageLimit => "Download limit reached".into(),
         }
@@ -64,9 +65,14 @@ impl UnavailableImages {
     pub(crate) fn label(&self, compact: bool) -> String {
         let noun = if self.count == 1 { "image" } else { "images" };
         match (&self.first, self.count) {
-            (Failure::Limit | Failure::PageLimit | Failure::NotFound | Failure::TimedOut, 1) => {
-                self.first.label(compact)
-            }
+            (
+                Failure::Limit
+                | Failure::PageLimit
+                | Failure::NotFound
+                | Failure::TimedOut
+                | Failure::Damaged,
+                1,
+            ) => self.first.label(compact),
             _ => format!(
                 "{} {noun} unavailable · {}",
                 self.count,
@@ -83,6 +89,7 @@ impl UnavailableImages {
 pub(crate) fn inline_page(
     mail: &fell_render::WebMail,
     scheme: &str,
+    ui_family: Option<&str>,
     allowed: impl Fn() -> bool,
 ) -> (String, Result<(), UnavailableImages>) {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
@@ -90,6 +97,7 @@ pub(crate) fn inline_page(
     inline_page_with(
         mail,
         scheme,
+        ui_family,
         PAGE_BYTES,
         deadline,
         &allowed,
@@ -109,6 +117,7 @@ pub(crate) fn inline_page(
 fn inline_page_with(
     mail: &fell_render::WebMail,
     scheme: &str,
+    ui_family: Option<&str>,
     mut remaining: usize,
     deadline: Instant,
     allowed: impl Fn() -> bool,
@@ -131,7 +140,7 @@ fn inline_page_with(
         failure.retryable |= retryable;
         None
     };
-    let html = mail.page(scheme, |url| {
+    let html = mail.page_with_font(scheme, ui_family, |url| {
         if !allowed() {
             return None;
         }
@@ -314,15 +323,15 @@ fn fetch(
 
 fn check_raster(bytes: &[u8], format: image::ImageFormat) -> Result<(), Failure> {
     if image::guess_format(bytes).ok() != Some(format) {
-        return Err(Failure::Format);
+        return Err(Failure::Damaged);
     }
     let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
     reader.limits(super::native::image_limits());
     match reader.into_dimensions() {
-        Ok((0, _) | (_, 0)) => Err(Failure::Format),
+        Ok((0, _) | (_, 0)) => Err(Failure::Damaged),
         Ok((width, height)) if super::native::raster_allowed(width, height) => Ok(()),
         Ok(_) | Err(image::ImageError::Limits(_)) => Err(Failure::Limit),
-        Err(_) => Err(Failure::Format),
+        Err(_) => Err(Failure::Damaged),
     }
 }
 
@@ -334,6 +343,21 @@ mod tests {
     use std::net::{Ipv4Addr, TcpListener, TcpStream};
 
     const HOST: &str = "images.example.test";
+
+    #[test]
+    fn single_damaged_and_timed_out_images_have_short_labels() {
+        let first = check_raster(b"bad PNG", image::ImageFormat::Png).unwrap_err();
+        let mut failure = UnavailableImages {
+            first,
+            count: 1,
+            retryable: true,
+        };
+        assert_eq!(failure.label(true), "Damaged image");
+        assert_eq!(failure.label(false), "Damaged image");
+        failure.first = Failure::TimedOut;
+        assert_eq!(failure.label(true), "Timed out");
+        assert_eq!(failure.label(false), "Image timed out");
+    }
 
     #[test]
     fn excessive_dimensions_report_the_image_size_limit() {
@@ -583,6 +607,7 @@ mod tests {
             let (_, result) = inline_page_with(
                 &mail,
                 "light",
+                None,
                 PAGE_BYTES,
                 deadline,
                 || true,
@@ -638,6 +663,7 @@ mod tests {
             let (page, result) = inline_page_with(
                 &mail,
                 "light",
+                None,
                 PAGE_BYTES,
                 Instant::now() + PAGE_TIME,
                 || true,
@@ -674,6 +700,7 @@ mod tests {
         let (page, result) = inline_page_with(
             &mail,
             "light",
+            None,
             data.len(),
             Instant::now() + PAGE_TIME,
             || true,
@@ -708,6 +735,7 @@ mod tests {
         let (page, result) = inline_page_with(
             &mail,
             "light",
+            None,
             PAGE_BYTES,
             Instant::now() + PAGE_TIME,
             || true,
@@ -758,6 +786,7 @@ mod tests {
         let (_, result) = inline_page_with(
             &mail,
             "light",
+            None,
             PAGE_BYTES,
             Instant::now() + PAGE_TIME,
             || true,
