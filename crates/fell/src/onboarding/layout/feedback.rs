@@ -163,7 +163,7 @@ impl Connection {
     }
 }
 
-fn save_actions(storage: &Storage) -> [Option<Action>; 3] {
+fn save_actions(storage: &Storage, retained_mailbox: bool) -> [Option<Action>; 3] {
     let back = Action::new(Control::Back, "Back");
     let use_keyring = Action::new(Control::Back, "Use keyring");
     let next = |label| Action::new(Control::Next, label);
@@ -176,6 +176,7 @@ fn save_actions(storage: &Storage) -> [Option<Action>; 3] {
         Storage::ConfirmInline(_) => [Some(use_keyring), None, Some(next("Save in file"))],
         _ if storage.must_reopen() => [None, None, Some(next("Quit"))],
         _ if storage.inline_available() => [Some(back), None, Some(next("Retry keyring"))],
+        Storage::Keyring if retained_mailbox => [Some(back), None, Some(next("New mailbox"))],
         _ => [Some(back), None, Some(next("Save account"))],
     }
 }
@@ -405,7 +406,7 @@ impl Feedback {
         for (action, value) in self
             .save_actions
             .iter_mut()
-            .zip(save_actions(&Storage::Keyring))
+            .zip(save_actions(&Storage::Keyring, false))
         {
             *action = Change {
                 value,
@@ -524,7 +525,8 @@ impl Feedback {
             self.save_title.replace(title, motion, now);
             self.save_subtitle.replace(subtitle, motion, now);
             self.save_note.replace(state, motion, now);
-            let [back, secondary, next] = save_actions(&form.storage);
+            let [back, secondary, next] =
+                save_actions(&form.storage, form.retained_mailbox.is_some());
             primary = next;
             for (action, value) in self.save_actions.iter_mut().zip([back, secondary]) {
                 action.update_optional(value, false, motion, now);

@@ -143,24 +143,82 @@ pub(crate) fn next_account_id() -> Result<String, String> {
     let registry = Registry::resolve().map_err(|err| err.to_string())?;
     registry.migrate().map_err(|err| err.to_string())?;
     let base = store_path()?;
+    next_account_id_at(&registry, &base)
+}
+
+fn next_account_id_at(registry: &Registry, base: &Path) -> Result<String, String> {
     for number in 1.. {
         let id = if number == 1 {
             "mail".into()
         } else {
             format!("mail-{number}")
         };
-        let path = registry.path(&id).map_err(|err| err.to_string())?;
-        let mailbox = registry
-            .mailbox_path(&base, &id)
-            .map_err(|err| err.to_string())?;
-        if path.symlink_metadata().is_err()
-            && registry.store_path(&base, &id).is_ok()
-            && (number == 1 || !mailbox.exists())
-        {
+        if account_id_available(registry, base, &id)? {
             return Ok(id);
         }
     }
     unreachable!()
+}
+
+fn account_id_available(registry: &Registry, base: &Path, id: &str) -> Result<bool, String> {
+    let path = registry.path(id).map_err(|err| err.to_string())?;
+    if accounts::path_exists(&path).map_err(|err| err.to_string())? {
+        return Ok(false);
+    }
+    registry
+        .mailbox_reserved(base, id)
+        .map(|reserved| !reserved)
+        .map_err(|err| err.to_string())
+}
+
+pub(crate) fn retained_mailbox(email: &str) -> Option<String> {
+    let registry = Registry::resolve().ok()?;
+    let base = store_path().ok()?;
+    let original = accounts::mailbox_owner(&base)
+        .ok()
+        .flatten()
+        .map(|(id, _)| id);
+    let siblings = fs::read_dir(base.with_extension("accounts"))
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name();
+            Some(name.to_str()?.strip_suffix(".db")?.to_owned())
+        });
+    // Offer an unambiguous match only. The user can name a specific ID in
+    // the CLI when they have kept multiple mailboxes with the same address.
+    let mut candidates: Vec<_> = original
+        .into_iter()
+        .chain(siblings)
+        .filter(|id| can_reconnect_at(&registry, &base, id, email))
+        .collect();
+    candidates.sort();
+    candidates.dedup();
+    if candidates.len() == 1 {
+        candidates.pop()
+    } else {
+        None
+    }
+}
+
+pub(crate) fn can_reconnect(id: &str, email: &str) -> bool {
+    Registry::resolve()
+        .ok()
+        .zip(store_path().ok())
+        .is_some_and(|(registry, base)| can_reconnect_at(&registry, &base, id, email))
+}
+
+fn can_reconnect_at(registry: &Registry, base: &Path, id: &str, email: &str) -> bool {
+    registry
+        .path(id)
+        .is_ok_and(|path| accounts::path_exists(&path).is_ok_and(|exists| !exists))
+        && registry.store_path(base, id).is_ok_and(|path| {
+            accounts::mailbox_owner(&path).is_ok_and(|owner| {
+                owner.is_some_and(|(stored_id, stored_email)| {
+                    stored_id == id && stored_email.eq_ignore_ascii_case(email)
+                })
+            })
+        })
 }
 
 #[cfg(test)]
@@ -256,30 +314,34 @@ impl std::fmt::Display for AccountFileError {
 /// config in place.
 pub(crate) fn stage_account_config(
     config: &AccountConfig,
-) -> Result<StagedAccountConfig, AccountFileError> {
-    stage_config(config, false)
-}
-
-pub(crate) fn stage_new_account_config(
-    config: &AccountConfig,
-) -> Result<StagedAccountConfig, AccountFileError> {
-    stage_config(config, true)
-}
-
-fn stage_config(
-    config: &AccountConfig,
-    first_run: bool,
+    replace: bool,
+    reconnect: bool,
 ) -> Result<StagedAccountConfig, AccountFileError> {
     let registry = Registry::resolve().map_err(|err| err.to_string())?;
     registry.migrate().map_err(|err| err.to_string())?;
     let path = registry.path(&config.id).map_err(|err| err.to_string())?;
     let lock = lock_account_dir(&path)?;
-    if let Ok(base) = store_path() {
+    let base = store_path()?;
+    let mailbox = registry
+        .store_path(&base, &config.id)
+        .map_err(|err| err.to_string())?;
+    let configured = accounts::path_exists(&path).map_err(|err| err.to_string())?;
+    if configured && !replace {
+        return Err(AccountFileError::AlreadyConfigured);
+    }
+    if reconnect {
+        if !can_reconnect_at(&registry, &base, &config.id, &config.email) {
+            return Err("The kept mailbox changed. Review the account and try again.".into());
+        }
+    } else if !configured {
+        if accounts::mailbox_exists(&mailbox).map_err(|err| err.to_string())? {
+            return Err("This ID has a local mailbox. Choose a new ID or confirm reconnecting the same account.".into());
+        }
         registry
-            .store_path(&base, &config.id)
+            .initialize_original(&lock, &base, &config.id)
             .map_err(|err| err.to_string())?;
     }
-    stage_account_text_at(path, &config.render(), first_run, lock)
+    stage_account_text_at(path, &config.render(), !configured, lock)
 }
 
 pub(crate) struct StagedAccountConfig {
@@ -303,6 +365,7 @@ impl StagedAccountConfig {
                 format!("{}: {}", self.path.display(), err.error).into()
             }
         })?;
+        self._lock.sync_all().map_err(|err| err.to_string())?;
         Ok(self.path)
     }
 }
@@ -642,6 +705,79 @@ pub fn save_split(split: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_setup_records_the_original_id_with_a_broken_legacy_file() {
+        let Some(_root) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        use std::io::Write;
+
+        let registry = Registry::resolve().unwrap();
+        fs::create_dir_all(registry.directory()).unwrap();
+        let legacy = registry.directory().parent().unwrap().join("account.toml");
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&legacy)
+            .unwrap()
+            .write_all(b"invalid = [")
+            .unwrap();
+        let mut config = AccountConfig::bridge(
+            "first@example.test",
+            "first@example.test",
+            fell_core::PasswordSource::Inline("fixture".into()),
+        );
+        config.id = "first".into();
+        stage_account_config(&config, false, false)
+            .unwrap()
+            .publish()
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(registry.directory().join(".original-id")).unwrap(),
+            "first"
+        );
+        let base = store_path().unwrap();
+        assert_eq!(registry.store_path(&base, "first").unwrap(), base);
+        assert_eq!(fs::read_to_string(legacy).unwrap(), "invalid = [");
+    }
+
+    #[test]
+    fn kept_mailboxes_require_explicit_reconnect_and_matching_email() {
+        let Some(_root) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let registry = Registry::resolve().unwrap();
+        let base = store_path().unwrap();
+        let mut config = AccountConfig::bridge(
+            "kept@example.test",
+            "kept@example.test",
+            fell_core::PasswordSource::Inline("fixture".into()),
+        );
+        open_at(&base)
+            .unwrap()
+            .upsert_account(&config.account())
+            .unwrap();
+        let other = registry.mailbox_path(&base, "mail-2").unwrap();
+        open_at(&other).unwrap();
+        assert_eq!(next_account_id().unwrap(), "mail-3");
+        assert_eq!(
+            retained_mailbox("Kept@example.test").as_deref(),
+            Some("mail")
+        );
+        assert!(stage_account_config(&config, true, false).is_err());
+        config.email = "different@example.test".into();
+        assert!(stage_account_config(&config, true, true).is_err());
+        assert!(!registry.path("mail").unwrap().exists());
+        config.email = "kept@example.test".into();
+        stage_account_config(&config, true, true)
+            .unwrap()
+            .publish()
+            .unwrap();
+        assert!(registry.path("mail").unwrap().is_file());
+        assert_eq!(registry.store_path(&base, "mail").unwrap(), base);
+    }
 
     #[test]
     fn config_permissions_are_repaired_without_chmodding_parents_or_symlinks() {

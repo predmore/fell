@@ -5,6 +5,8 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use rusqlite::{Connection, OpenFlags};
+
 use crate::{AccountConfig, AccountId};
 
 mod removal;
@@ -47,13 +49,13 @@ impl FileError {
 
     fn access(path: &Path, error: io::Error) -> Self {
         Self::new(
-            format!("{}: {error}", path.display()),
+            format!("{}: {error}", file_name(path)),
             "Restore read access to the account file.",
         )
     }
 
     pub fn reason(&self, path: &Path) -> &str {
-        let path = path.to_string_lossy();
+        let path = file_name(path);
         self.detail
             .strip_prefix(path.as_ref())
             .and_then(|rest| rest.strip_prefix(": ").or_else(|| rest.strip_prefix(' ')))
@@ -218,9 +220,7 @@ impl Registry {
             Err(error) => accounts.error = Some(FileError::access(&dir, error)),
         }
         let legacy = self.config.join("account.toml");
-        if accounts.error.is_none()
-            && let Err(error) = read(&legacy, None)
-        {
+        if let Err(error) = read(&legacy, None) {
             accounts.entries.push(Entry {
                 file_identity: legacy.symlink_metadata().ok().map(file_identity),
                 path: legacy,
@@ -262,15 +262,39 @@ impl Registry {
     }
 
     pub fn mailbox_path(&self, base: &Path, id: &str) -> Result<PathBuf, FileError> {
-        self.path(id)?;
-        Ok(if id == self.original_id()? {
-            base.to_owned()
-        } else {
-            base.with_extension("accounts").join(format!("{id}.db"))
-        })
+        let (path, backup) = self.mailbox_location(base, id)?;
+        if let Some(backup) = backup {
+            verify_backup(base, &backup, id)?;
+        }
+        Ok(path)
     }
 
-    fn original_id(&self) -> Result<String, FileError> {
+    pub fn mailbox_reserved(&self, base: &Path, id: &str) -> Result<bool, FileError> {
+        let (path, backup) = self.mailbox_location(base, id)?;
+        if backup.is_some_and(|backup| verify_backup(base, &backup, id).is_err()) {
+            return Ok(true);
+        }
+        mailbox_exists(&path).map_err(|err| FileError::access(&path, err))
+    }
+
+    fn mailbox_location(
+        &self,
+        base: &Path,
+        id: &str,
+    ) -> Result<(PathBuf, Option<PathBuf>), FileError> {
+        self.path(id)?;
+        if let Some((original, backup)) = self.original_id(base)?
+            && id == original
+        {
+            return Ok((base.to_owned(), backup));
+        }
+        Ok((
+            base.with_extension("accounts").join(format!("{id}.db")),
+            None,
+        ))
+    }
+
+    fn original_id(&self, base: &Path) -> Result<Option<(String, Option<PathBuf>)>, FileError> {
         if let Err(err) = real_directory(&self.config)
             && err.kind() != io::ErrorKind::NotFound
         {
@@ -285,20 +309,67 @@ impl Registry {
             Err(err) => return Err(FileError::access(&self.directory(), err)),
         }
         let original = match self.original_marker() {
-            Ok(Some(id)) => id,
+            Ok(Some(id)) => Some((id, None)),
             marker => {
                 let backup = self.config.join("account.toml.bak");
                 match backup.symlink_metadata() {
-                    Ok(_) => read(&backup, None)?.ok_or_else(|| missing(&backup))?.0.id,
-                    Err(err) if err.kind() == io::ErrorKind::NotFound => match legacy? {
-                        Some((config, _)) => config.id,
-                        None => marker?.unwrap_or_else(|| DEFAULT_ID.into()),
+                    Ok(_) => {
+                        let id = read(&backup, None)?.ok_or_else(|| missing(&backup))?.0.id;
+                        Some((id, Some(backup)))
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => match legacy {
+                        Ok(Some((config, _))) => Some((config.id, None)),
+                        Ok(None) => {
+                            marker?;
+                            let sibling = base.with_extension("accounts").join("mail.db");
+                            (!mailbox_exists(&sibling)
+                                .map_err(|err| FileError::access(&sibling, err))?)
+                            .then(|| (DEFAULT_ID.into(), None))
+                        }
+                        Err(_) => {
+                            marker?;
+                            // Older registries could have opened mail.db before
+                            // writing a marker. Only the mailbox itself can
+                            // establish ownership when the legacy file is broken.
+                            removal::mailbox_has_owner(base, DEFAULT_ID)
+                                .then(|| (DEFAULT_ID.into(), None))
+                        }
                     },
                     Err(err) => return Err(FileError::access(&backup, err)),
                 }
             }
         };
         Ok(original)
+    }
+
+    /// Record the first account's route before publishing its config. The
+    /// caller holds the exclusive account directory lock.
+    pub fn initialize_original(
+        &self,
+        directory: &File,
+        base: &Path,
+        id: &str,
+    ) -> Result<(), FileError> {
+        self.path(id)?;
+        let dir = self.directory();
+        let marker = dir.join(".original-id");
+        let initialize = || -> io::Result<()> {
+            if path_exists(&marker)?
+                || path_exists(&self.config.join("account.toml.bak"))?
+                || mailbox_exists(base)?
+            {
+                return Ok(());
+            }
+            for entry in fs::read_dir(&dir)? {
+                if entry?.path().extension().is_some_and(|ext| ext == "toml") {
+                    return Ok(());
+                }
+            }
+            publish(&dir, &marker, id.as_bytes())?;
+            directory.sync_all()?;
+            File::open(&self.config)?.sync_all()
+        };
+        initialize().map_err(|err| FileError::access(&marker, err))
     }
 
     fn original_marker(&self) -> Result<Option<String>, FileError> {
@@ -318,7 +389,7 @@ impl Registry {
             .map_err(|err| FileError::access(&marker, err))?;
         validate_id(&value).map_err(|err| {
             FileError::new(
-                format!("{}: {err}", marker.display()),
+                format!("{}: {err}", file_name(&marker)),
                 "Restore the original account ID.",
             )
         })?;
@@ -345,20 +416,13 @@ impl Registry {
             Err(error) => return Err(FileError::access(&legacy, error)),
         }
         let dir = self.directory();
-        if real_directory(&dir).is_ok()
-            && matches!(self.original_marker(), Ok(Some(_)))
-            && read(&legacy, None).is_err()
-        {
+        if read(&legacy, None).is_err() {
             return Ok(());
         }
         let lock = open_account_directory(&dir).map_err(|err| FileError::access(&dir, err))?;
         lock.try_lock()
             .map_err(|err| FileError::access(&dir, err.into()))?;
-        let legacy_config = match read(&legacy, None) {
-            Err(_) if matches!(self.original_marker(), Ok(Some(_))) => return Ok(()),
-            result => result?,
-        };
-        let Some((config, text)) = legacy_config else {
+        let Ok(Some((config, text))) = read(&legacy, None) else {
             return Ok(());
         };
         let target = self.path(&config.id)?;
@@ -377,6 +441,62 @@ impl Registry {
             File::open(&self.config)?.sync_all()
         };
         write().map_err(|err| FileError::access(&legacy, err))
+    }
+}
+
+fn file_name(path: &Path) -> std::borrow::Cow<'_, str> {
+    path.file_name().unwrap_or_default().to_string_lossy()
+}
+
+pub fn path_exists(path: &Path) -> io::Result<bool> {
+    match path.symlink_metadata() {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+/// Include sidecars and interrupted removal directories when reserving IDs.
+pub fn mailbox_exists(path: &Path) -> io::Result<bool> {
+    if path_exists(&removal_trash(path))? {
+        return Ok(true);
+    }
+    for suffix in removal::MAILBOX_SUFFIXES {
+        if path_exists(&removal::mailbox_file(path, suffix))? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Inspect ownership without creating a store, modifying its schema or
+/// starting its workers. Only a mailbox with a single owner can be reused.
+pub fn mailbox_owner(path: &Path) -> rusqlite::Result<Option<(String, String)>> {
+    if !path.symlink_metadata().is_ok_and(|meta| meta.is_file()) {
+        return Ok(None);
+    }
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    let conn = Connection::open_with_flags(path, flags)?;
+    let mut statement = conn.prepare("SELECT id, email FROM accounts LIMIT 2")?;
+    let mut rows = statement.query([])?;
+    let owner = match rows.next()? {
+        Some(row) => Some((row.get(0)?, row.get(1)?)),
+        None => return Ok(None),
+    };
+    Ok(if rows.next()?.is_none() { owner } else { None })
+}
+
+fn verify_backup(base: &Path, backup: &Path, id: &str) -> Result<(), FileError> {
+    if removal::verify_mailbox_owner(base, id) {
+        Ok(())
+    } else {
+        Err(FileError::new(
+            format!(
+                "{}: Account ID does not match the local mailbox",
+                file_name(backup)
+            ),
+            "Restore the original account ID from a verified account file.",
+        ))
     }
 }
 
@@ -441,7 +561,7 @@ fn publish(dir: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 pub fn missing(path: &Path) -> FileError {
     FileError::new(
-        format!("{} does not exist", path.display()),
+        format!("{} does not exist", file_name(path)),
         "Run fell account setup.",
     )
 }
@@ -450,7 +570,7 @@ pub fn missing(path: &Path) -> FileError {
 pub fn read(path: &Path, id: Option<&str>) -> Result<Option<(AccountConfig, String)>, FileError> {
     if id.is_some_and(|id| path.file_stem().and_then(|stem| stem.to_str()) != Some(id)) {
         return Err(FileError::new(
-            format!("{} is not this account’s file", path.display()),
+            format!("{} is not this account’s file", file_name(path)),
             "Fix the settings in the account file.",
         ));
     }
@@ -479,7 +599,7 @@ pub fn read(path: &Path, id: Option<&str>) -> Result<Option<(AccountConfig, Stri
         return Err(FileError::new(
             format!(
                 "{} must be a private regular file (mode 600)",
-                path.display()
+                file_name(path)
             ),
             "Set account file permissions to 600.",
         ));
@@ -493,7 +613,7 @@ pub fn read(path: &Path, id: Option<&str>) -> Result<Option<(AccountConfig, Stri
 pub fn parse(path: &Path, text: &str, id: Option<&str>) -> Result<AccountConfig, FileError> {
     let invalid = |detail| {
         FileError::new(
-            format!("{}: {detail}", path.display()),
+            format!("{}: {detail}", file_name(path)),
             "Fix the settings in the account file.",
         )
     };
@@ -659,6 +779,69 @@ mod tests {
         assert_eq!(registry.store_path(&base, "personal").unwrap(), base);
         assert_ne!(registry.store_path(&base, "work").unwrap(), base);
         assert_eq!(fs::read_to_string(legacy).unwrap(), "invalid = [");
+    }
+
+    #[test]
+    fn a_markerless_registry_routes_around_a_broken_legacy_file() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("fell");
+        let registry = Registry::at(config.clone());
+        let legacy = config.join("account.toml");
+        let base = root.path().join("mail.db");
+        write_private(&legacy, "invalid = [");
+        for id in ["mail", "work"] {
+            write_private(
+                &registry.path(id).unwrap(),
+                "email = 'synthetic@example.test'\npassword = 'fixture'\n",
+            );
+            assert_eq!(
+                registry.store_path(&base, id).unwrap(),
+                base.with_extension("accounts").join(format!("{id}.db"))
+            );
+        }
+        let catalog = registry.load_with_removals(&base);
+        assert!(catalog.error.is_none());
+        assert_eq!(catalog.configs().count(), 2);
+        let broken = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.path == legacy)
+            .unwrap();
+        let error = broken.config.as_ref().unwrap_err();
+        assert!(error.detail.starts_with("account.toml:"));
+        assert!(!error.detail.contains(&*config.to_string_lossy()));
+        assert_eq!(fs::read_to_string(legacy).unwrap(), "invalid = [");
+    }
+
+    #[test]
+    fn a_backup_id_must_match_the_mailbox_before_binding_or_removal() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("fell");
+        let registry = Registry::at(config.clone());
+        let base = root.path().join("mail.db");
+        let verified = "id = 'personal'\nemail = 'personal@example.test'\npassword = 'fixture'\n";
+        write_private(&config.join("account.toml.bak"), verified);
+        write_private(&registry.path("personal").unwrap(), verified);
+        write_private(
+            &registry.path("work").unwrap(),
+            "email = 'work@example.test'\npassword = 'fixture'\n",
+        );
+        let db = crate::Store::open(&base).unwrap();
+        let mut owner = AccountConfig::parse(verified).unwrap().account();
+        owner.id = AccountId("other".into());
+        db.upsert_account(&owner).unwrap();
+        drop(db);
+        assert!(registry.store_path(&base, "personal").is_err());
+        assert!(registry.remove(&base, "personal", true).is_err());
+        assert!(base.is_file());
+        assert_ne!(registry.store_path(&base, "work").unwrap(), base);
+        let catalog = registry.load_with_removals(&base);
+        assert_eq!(
+            catalog.configs().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            ["work"]
+        );
+        let error = catalog.entries[0].config.as_ref().unwrap_err();
+        assert!(error.detail.starts_with("account.toml.bak:"));
     }
 
     #[test]

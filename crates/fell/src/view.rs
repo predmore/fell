@@ -689,6 +689,13 @@ const ROW_PX: f32 = 68.0;
 const LONG_GLIDE_PX: f32 = 4.0 * ROW_PX;
 
 const FIRST_PREVIEW_WAIT: Duration = Duration::from_millis(1500);
+const ACCOUNT_SWITCH_ENTER_QUIET: Duration = Duration::from_millis(250);
+const ACCOUNT_READER_WAIT: Duration = Duration::from_millis(150);
+
+enum AccountReaderArrival {
+    Waiting(Instant),
+    Fading(Transition),
+}
 
 #[derive(Default, PartialEq, Eq)]
 enum FirstPreview {
@@ -817,6 +824,7 @@ struct Inbox {
     retired: bool,
     compose_ready: futures::future::Shared<futures::channel::oneshot::Receiver<()>>,
     account_arrival: Option<Transition>,
+    account_reader_arrival: Option<AccountReaderArrival>,
     ignore_enter_until: Option<Instant>,
     /// Visible label rows as they looked in the last list prepaint.
     painted_label_rows: Vec<LeavingRow>,
@@ -1051,6 +1059,7 @@ impl Inbox {
             retired: false,
             compose_ready: futures::FutureExt::shared(compose_ready),
             account_arrival: None,
+            account_reader_arrival: None,
             ignore_enter_until: None,
             painted_label_rows: Vec::new(),
             leaving_rows: None,
@@ -1128,6 +1137,52 @@ impl Inbox {
             1.0,
             motion::progress(self.account_arrival.as_ref(), now),
         )
+    }
+
+    fn start_account_arrival(&mut self, real: Instant) {
+        self.motion.clock.idle();
+        let now = self.motion.clock.now_at(real);
+        self.account_arrival = self.motion.motion.start(motion::FADE, now);
+        self.account_reader_arrival = self.account_arrival.map(|fade| {
+            if self.account_reader_ready() {
+                AccountReaderArrival::Fading(fade)
+            } else {
+                AccountReaderArrival::Waiting(real + ACCOUNT_READER_WAIT)
+            }
+        });
+    }
+
+    fn account_reader_ready(&self) -> bool {
+        !self.session.loading
+            && self.open_thread == self.session.cursor_id
+            && !self.session.cursor_awaits_body()
+            && self
+                .session
+                .messages
+                .get(self.session.message_cursor)
+                .is_none_or(|message| !self.body_loads.awaiting(&message.id))
+    }
+
+    fn account_reader_opacity(&mut self, real: Instant, now: Instant) -> Option<f32> {
+        if let Some(AccountReaderArrival::Waiting(until)) = self.account_reader_arrival
+            && (real >= until || self.account_reader_ready())
+        {
+            self.account_reader_arrival = self
+                .motion
+                .motion
+                .start(motion::FADE, now)
+                .map(AccountReaderArrival::Fading);
+        }
+        match self.account_reader_arrival {
+            Some(AccountReaderArrival::Waiting(_)) => Some(motion::ARRIVE_FROM),
+            Some(AccountReaderArrival::Fading(fade)) if fade.running(now) => {
+                Some(motion::lerp(motion::ARRIVE_FROM, 1.0, fade.progress(now)))
+            }
+            _ => {
+                self.account_reader_arrival = None;
+                None
+            }
+        }
     }
 
     fn refresh_reply_checks(&self, ids: Vec<fell_core::MessageId>, cx: &mut Context<Self>) {
@@ -4470,7 +4525,7 @@ impl Inbox {
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let started = Instant::now();
         if key_from(&event.keystroke) == Some(KeyId::Enter)
-            && (event.is_held || self.ignore_enter_until.is_some_and(|until| started < until))
+            && self.swallow_switch_enter(started, event.is_held)
         {
             cx.stop_propagation();
             return;
@@ -4529,6 +4584,7 @@ impl Inbox {
         }
         // Input never waits on an animation.
         self.account_arrival = None;
+        self.account_reader_arrival = None;
         self.settle_motion();
         self.regroup_motion = None;
         self.regroup_selection = None;
@@ -4585,8 +4641,14 @@ impl Inbox {
         if let Some((trace, started)) = trace {
             trace.key(started, step.action.map_or("Inbox input", Action::label));
         }
-        self.apply_step(step, before, cx);
+        self.apply_step_with_input(step, before, key == KeyId::Enter, cx);
         cx.stop_propagation();
+    }
+
+    fn swallow_switch_enter(&mut self, now: Instant, held: bool) -> bool {
+        let armed = self.ignore_enter_until.is_some_and(|until| now < until);
+        self.ignore_enter_until = armed.then(|| now + ACCOUNT_SWITCH_ENTER_QUIET);
+        held || armed
     }
 
     /// Where the reader was before a key or action: [`Inbox::apply_step`]
@@ -4607,6 +4669,16 @@ impl Inbox {
     }
 
     fn apply_step(&mut self, step: Step, before: StepBefore, cx: &mut Context<Self>) {
+        self.apply_step_with_input(step, before, false, cx);
+    }
+
+    fn apply_step_with_input(
+        &mut self,
+        step: Step,
+        before: StepBefore,
+        confirmed_with_enter: bool,
+        cx: &mut Context<Self>,
+    ) {
         let StepBefore {
             message: message_before,
             thread: thread_before,
@@ -4622,9 +4694,9 @@ impl Inbox {
             && let Some(window) = cx.try_global::<InboxWindow>().copied()
         {
             cx.defer(move |cx| {
-                let _ = window
-                    .0
-                    .update(cx, |_, window, cx| accounts::switch(&id, window, cx));
+                let _ = window.0.update(cx, |_, window, cx| {
+                    accounts::switch(&id, confirmed_with_enter, window, cx)
+                });
             });
         }
         if pane_before != Pane::Conversation && self.session.pane == Pane::Conversation {
@@ -4787,11 +4859,12 @@ impl Inbox {
         if let Some(mode) = step.notification_mode {
             self.settings_request(
                 crate::model::settings::Request::Save(crate::settings::Edit::Notifications(mode)),
+                false,
                 cx,
             );
         }
         if let Some(request) = step.settings {
-            self.settings_request(request, cx);
+            self.settings_request(request, confirmed_with_enter, cx);
         }
         if self.session.overlay == Overlay::Settings {
             self.validate_settings_step(cx);
@@ -5723,6 +5796,7 @@ impl Render for Inbox {
             .take()
             .filter(|motion| motion.running(now));
         let conv = ConvFrame {
+            account_opacity: self.account_reader_opacity(real, now),
             syncing: self.pending_bodies.downloading(&self.session.sync),
             missing_fade: self.pending_bodies.fade(now),
             feedback,
@@ -5803,6 +5877,7 @@ impl Render for Inbox {
         self.account_arrival = self.account_arrival.filter(|fade| fade.running(now));
         let animating = self.motion.tick(now)
             | self.account_arrival.is_some_and(|fade| fade.running(now))
+            | conv.account_opacity.is_some()
             | link_fading
             | waiting_for_resize
             | self.note_view.running()
@@ -6163,6 +6238,7 @@ struct ListContent {
 /// What the conversation's bodies show this frame beyond the session.
 #[derive(Default)]
 struct ConvFrame {
+    account_opacity: Option<f32>,
     agent_note: Option<agent_notes::NoteFrame>,
     pin: Option<agent_notes::PinnedFrame>,
     note_details_only: bool,
@@ -6554,7 +6630,7 @@ fn shell(
                                         ))
                                     },
                                 );
-                            return row.child(pane.opacity(account_opacity));
+                            return row.child(pane.opacity(conv.account_opacity.unwrap_or(1.)));
                         }
                         row.child(entering(
                             conversation(
@@ -6569,8 +6645,7 @@ fn shell(
                                 &conv,
                                 window,
                                 cx,
-                            )
-                            .opacity(account_opacity),
+                            ),
                             conv_entry,
                         ))
                     },
@@ -9468,7 +9543,12 @@ fn conversation(
         None => (subject, session.messages.as_slice(), 1.0),
     };
     let live = Live(live.0 && leaving.is_none());
-    let arrival = leaving.map_or_else(|| motion.arrival(now), |(reader, _)| reader.arrival);
+    // A cold account and its first thread can arrive together. Share their
+    // lower opacity so two fades do not multiply into an almost empty frame.
+    let arrival = leaving.map_or_else(
+        || motion.arrival(now).min(frame.account_opacity.unwrap_or(1.)),
+        |(reader, _)| reader.arrival,
+    );
     let chip_probe = (live.0 && frame.reveal_attachment).then(LayoutSlot::default);
     let hold = frame
         .anchor

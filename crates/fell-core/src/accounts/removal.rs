@@ -6,7 +6,8 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use super::{
-    Accounts, FileIdentity, Registry, file_identity, publish, read, real_directory, removal_trash,
+    Accounts, Entry, FileIdentity, Registry, file_identity, mailbox_owner, path_exists, publish,
+    read, real_directory, removal_trash, verify_backup,
 };
 use crate::{AccountId, Store, compose};
 
@@ -35,7 +36,33 @@ pub enum RemovalOutcome {
 impl Registry {
     pub fn load_with_removals(&self, base: &Path) -> Accounts {
         let mut catalog = self.load();
-        let original = self.original_id().ok().map(|id| (id, removal_trash(base)));
+        let original = self
+            .original_id(base)
+            .ok()
+            .flatten()
+            .and_then(|(id, backup)| {
+                if let Some(backup) = backup
+                    && let Err(error) = verify_backup(base, &backup, &id)
+                {
+                    let config = self.directory().join(format!("{id}.toml"));
+                    if let Some(entry) = catalog
+                        .entries
+                        .iter_mut()
+                        .find(|entry| entry.path == config)
+                    {
+                        entry.config = Err(error);
+                        entry.file_identity = None;
+                    } else {
+                        catalog.entries.push(Entry {
+                            path: backup,
+                            config: Err(error),
+                            file_identity: None,
+                        });
+                    }
+                    return None;
+                }
+                Some((id, removal_trash(base)))
+            });
         let siblings = base.with_extension("accounts");
         let paths = real_directory(&siblings)
             .and_then(|()| fs::read_dir(&siblings))
@@ -306,9 +333,9 @@ fn read_plan(trash: &Path) -> io::Result<Removal> {
     })
 }
 
-const MAILBOX_SUFFIXES: [&str; 5] = ["-wal", "-shm", "-journal", ".embed.lock", ""];
+pub(super) const MAILBOX_SUFFIXES: [&str; 5] = ["-wal", "-shm", "-journal", ".embed.lock", ""];
 
-fn mailbox_file(mailbox: &Path, suffix: &str) -> PathBuf {
+pub(super) fn mailbox_file(mailbox: &Path, suffix: &str) -> PathBuf {
     let mut path = mailbox.as_os_str().to_os_string();
     path.push(suffix);
     PathBuf::from(path)
@@ -320,6 +347,40 @@ fn staged_file(trash: &Path, mailbox: &Path, suffix: &str) -> PathBuf {
             .file_name()
             .expect("mailbox file name"),
     )
+}
+
+pub(super) fn mailbox_has_owner(base: &Path, id: &str) -> bool {
+    let trash = removal_trash(base);
+    mailbox_owner(base).is_ok_and(|owner| owner.is_some_and(|(owner, _)| owner == id))
+        || real_directory(&trash).is_ok()
+            && read_plan(&trash).is_ok_and(|plan| plan.account == id)
+            && verify_mailbox_owner(base, id)
+}
+
+pub(super) fn verify_mailbox_owner(base: &Path, id: &str) -> bool {
+    let verify = || -> io::Result<bool> {
+        let trash = removal_trash(base);
+        let staged = if path_exists(&trash)? {
+            real_directory(&trash)?;
+            let plan = read_plan(&trash)?;
+            if plan.account != id {
+                return Ok(false);
+            }
+            Some(staged_file(&trash, base, ""))
+        } else {
+            None
+        };
+        for path in std::iter::once(base).chain(staged.as_deref()) {
+            if path_exists(path)?
+                && !mailbox_owner(path)
+                    .is_ok_and(|owner| owner.is_some_and(|(owner, _)| owner == id))
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    };
+    verify().unwrap_or(false)
 }
 
 fn move_mailbox(mailbox: &Path, trash: &Path, restoring: bool) -> io::Result<()> {

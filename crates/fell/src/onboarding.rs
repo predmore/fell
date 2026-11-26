@@ -15,7 +15,7 @@ use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::{Context, FocusHandle, KeyDownEvent, Window};
 
-use crate::mailbox::stage_new_account_config;
+use crate::mailbox;
 use crate::motion::{self, LayerSwap, Motion};
 use crate::setup::save_account;
 use crate::theme::{self, Theme};
@@ -39,6 +39,7 @@ enum Control {
     Next,
     Back,
     Inline,
+    Reconnect,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -53,6 +54,7 @@ struct FinishedCheck {
     attempt: u64,
     config: AccountConfig,
     result: fell_core::Result<ConnectionReport>,
+    retained_mailbox: Option<String>,
 }
 
 pub(crate) struct Onboarding {
@@ -70,7 +72,7 @@ pub(crate) struct Onboarding {
     check_started: Instant,
     checked: Option<FinishedCheck>,
     return_to_inbox: Option<gpui::AnyWindowHandle>,
-    account_id: String,
+    reconnect: bool,
 }
 
 impl Onboarding {
@@ -87,13 +89,11 @@ impl Onboarding {
 
     pub(crate) fn from_inbox(
         inbox: gpui::AnyWindowHandle,
-        account_id: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut view = Self::new(window, cx);
         view.return_to_inbox = Some(inbox);
-        view.account_id = account_id;
         view
     }
 
@@ -126,7 +126,7 @@ impl Onboarding {
             check_started: Instant::now(),
             checked: None,
             return_to_inbox: None,
-            account_id: fell_core::accounts::DEFAULT_ID.into(),
+            reconnect: false,
         }
     }
 
@@ -223,6 +223,9 @@ impl Onboarding {
                 _ if self.form.storage.must_reopen() => vec![Next],
                 Storage::ConfirmInline(_) => vec![Back, Next],
                 _ if self.form.storage.inline_available() => vec![Next, Inline, Back],
+                Storage::Keyring if self.form.retained_mailbox.is_some() => {
+                    vec![Next, Control::Reconnect, Back]
+                }
                 _ => vec![Next, Back],
             },
         }
@@ -304,7 +307,12 @@ impl Onboarding {
                     self.change_step(before, Control::Next, cx);
                 }
                 Step::Done if self.form.storage.must_reopen() => cx.quit(),
-                Step::Done => self.save(window, cx),
+                Step::Done => {
+                    if matches!(self.form.storage, Storage::Keyring) {
+                        self.reconnect = false;
+                    }
+                    self.save(window, cx);
+                }
                 _ => {}
             },
             Control::Back => self.back(cx),
@@ -314,6 +322,14 @@ impl Onboarding {
                 cx.notify();
             }
             Control::Inline => {}
+            Control::Reconnect
+                if matches!(self.form.storage, Storage::Keyring)
+                    && self.form.retained_mailbox.is_some() =>
+            {
+                self.reconnect = true;
+                self.save(window, cx);
+            }
+            Control::Reconnect => {}
         }
     }
 
@@ -358,7 +374,12 @@ impl Onboarding {
             let result = check_connection(&config, |event| {
                 let _ = progress.unbounded_send(Check::update(event));
             });
-            (config, result)
+            let retained_mailbox = result
+                .as_ref()
+                .ok()
+                .filter(|report| report.errors().next().is_none())
+                .and_then(|_| mailbox::retained_mailbox(&config.email));
+            (config, result, retained_mailbox)
         });
         cx.spawn_in(window, async move |this, cx| {
             while let Some((service, status)) = events.next().await {
@@ -369,7 +390,7 @@ impl Onboarding {
                     }
                 });
             }
-            let (config, result) = work.await;
+            let (config, result, retained_mailbox) = work.await;
             let _ = this.update(cx, |view, cx| {
                 if !view.form.accepts_check(attempt) {
                     return;
@@ -384,6 +405,7 @@ impl Onboarding {
                     attempt,
                     config,
                     result,
+                    retained_mailbox,
                 };
                 if returning_to_fields
                     && (view.motion.enabled() || view.form.checks == [Check::Failed; 2])
@@ -402,6 +424,7 @@ impl Onboarding {
 
     fn finish_check(&mut self, check: FinishedCheck, cx: &mut Context<Self>) {
         if self.form.accepts_check(check.attempt) {
+            self.form.retained_mailbox = check.retained_mailbox;
             let control = self
                 .form
                 .finish_check(check.attempt, &check.config, check.result)
@@ -416,9 +439,18 @@ impl Onboarding {
         };
         self.select(Control::Next);
         cx.notify();
-        config.id = self.account_id.clone();
+        let reconnect = self
+            .reconnect
+            .then(|| self.form.retained_mailbox.clone())
+            .flatten();
         let work = cx.background_executor().spawn(async move {
-            save_account(config, inline, &SecretService, stage_new_account_config)
+            let reusing = reconnect.is_some();
+            config.id = reconnect
+                .map_or_else(mailbox::next_account_id, Ok)
+                .map_err(|error| crate::setup::SaveAccountError::File(error.into()))?;
+            save_account(config, inline, &SecretService, |config| {
+                mailbox::stage_account_config(config, false, reusing)
+            })
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = work.await;

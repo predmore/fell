@@ -404,6 +404,10 @@ impl Onboarding {
                     )
                     .child(
                         self.feedback.save_note.paint(false, |state, _| match state {
+                            SaveState::Ready if self.form.retained_mailbox.is_some() => column()
+                                .gap_2()
+                                .child(self.meta("Fell found a kept mailbox for this address. Reconnect to resume using its local mail."))
+                                .child(div().child(self.button(Control::Reconnect, "Reconnect existing mailbox", live && matches!(self.form.storage, super::Storage::Keyring), cx))),
                             SaveState::Ready => self.meta("Fell keeps your password in the desktop keyring."),
                             SaveState::SavingKeyring => self.meta("Approve any keyring prompt to continue."),
                             SaveState::ConfirmFile => self.meta(

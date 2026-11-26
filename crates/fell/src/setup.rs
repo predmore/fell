@@ -7,13 +7,14 @@
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 
-use fell_core::accounts::{DEFAULT_ID, Registry, validate_id};
+use fell_core::accounts::{Registry, validate_id};
 use fell_core::credentials::{PasswordStore, SecretService};
 use fell_core::onboarding::{ConnectionProgress, check_connection, connection_recovery};
 use fell_core::{AccountConfig, BackendKind, ImapSecurity, PasswordSource};
 
 use crate::mailbox::{
-    AccountFileError, StagedAccountConfig, load_account_file, stage_account_config,
+    AccountFileError, StagedAccountConfig, can_reconnect, load_account_file, next_account_id,
+    stage_account_config,
 };
 
 const USAGE: &str = "\
@@ -212,8 +213,14 @@ fn setup(args: &[String]) -> Result<(), String> {
         println!("{USAGE}");
         return Ok(());
     }
-    let id = flags.id.as_deref().unwrap_or(DEFAULT_ID);
-    validate_id(id).map_err(|err| format!("{id:?}: {err}"))?;
+    let replace = flags.id.is_some();
+    let id = match flags.id {
+        Some(id) => {
+            validate_id(&id).map_err(|err| format!("{id:?}: {err}"))?;
+            id
+        }
+        None => next_account_id()?,
+    };
     let tty = io::stdin().is_terminal() && !flags.password_stdin;
     let backend = if flags.imap {
         BackendKind::Imap
@@ -268,7 +275,7 @@ fn setup(args: &[String]) -> Result<(), String> {
     };
 
     let mut config = AccountConfig::bridge(email, username, password);
-    config.id = id.to_owned();
+    config.id = id;
     config.name = name;
     config.backend = backend;
     config.host = host;
@@ -301,6 +308,18 @@ fn setup(args: &[String]) -> Result<(), String> {
     })?;
     config.validate().map_err(|err| err.to_string())?;
 
+    let reconnect = replace
+        && tty
+        && can_reconnect(&config.id, &config.email)
+        && matches!(
+            prompt(
+                "Reconnect this account to its existing local mailbox? [y/N]",
+                Some("")
+            )?
+            .to_ascii_lowercase()
+            .as_str(),
+            "y" | "yes"
+        );
     if !flags.no_check {
         check_both(&config).map_err(|err| {
             format!(
@@ -312,7 +331,7 @@ fn setup(args: &[String]) -> Result<(), String> {
         config,
         flags.password_inline,
         &SecretService,
-        stage_account_config,
+        |config| stage_account_config(config, replace, reconnect),
     )
     .map_err(|err| match err {
         SaveAccountError::File(detail) => detail.to_string(),
@@ -426,7 +445,9 @@ fn remove(id: &str) -> Result<(), String> {
     {
         registry.remove_broken_file(
             &path,
-            entry.file_identity.ok_or("The account file changed.")?,
+            entry
+                .file_identity
+                .ok_or_else(|| entry.config.as_ref().unwrap_err().to_string())?,
         )?;
         println!("Deleted {id}.toml.");
         return Ok(());
@@ -442,17 +463,23 @@ fn remove(id: &str) -> Result<(), String> {
     let outcome = if let Some(pending) = pending {
         let Some(delete) = recovery_choice(terminal, pending.can_restore, |question| {
             prompt(question, Some(""))
-        })? else {
-            return Err(format!("Delete interrupted for {name}. Choose an action on a terminal or in Settings → Accounts."));
+        })?
+        else {
+            return Err(format!(
+                "Delete interrupted for {name}. Choose an action on a terminal or in Settings → Accounts."
+            ));
         };
         registry.recover_removal(&base, id, delete, expected)?
     } else {
         let delete = store.is_file()
             && terminal
             && matches!(
-                prompt("Delete the local mail, drafts and grants for this account? [y/N]", Some(""))?
-                    .to_ascii_lowercase()
-                    .as_str(),
+                prompt(
+                    "Delete the local mail, drafts and grants for this account? [y/N]",
+                    Some("")
+                )?
+                .to_ascii_lowercase()
+                .as_str(),
                 "y" | "yes"
             );
         registry.remove_if_unchanged(&base, id, delete, expected)?

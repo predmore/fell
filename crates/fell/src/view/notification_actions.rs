@@ -86,7 +86,7 @@ impl Inbox {
                     ) && let Some(inbox) = this.upgrade()
                     {
                         let id = inbox.read(cx).account_id.clone();
-                        super::accounts::switch(id.as_str(), window, cx);
+                        super::accounts::switch(id.as_str(), false, window, cx);
                     }
                     this.update(cx, |inbox, cx| {
                         inbox.notification_action(invoked, window, cx)

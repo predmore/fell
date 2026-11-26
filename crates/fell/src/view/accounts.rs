@@ -8,7 +8,7 @@ use fell_core::accounts::{Accounts, FileIdentity, Registry, RemovalOutcome};
 use futures::{FutureExt as _, StreamExt as _, channel::oneshot, future::Shared};
 use gpui::{App, Context, Entity, IntoElement, Render, Window, div, prelude::*, rgb};
 
-use super::{ExternalCompose, Inbox, InboxWindow, Onboarding, mailbox};
+use super::{ExternalCompose, FontOpt, Inbox, InboxWindow, Onboarding, mailbox};
 use crate::inbox_motion::Layer;
 use crate::model::settings::AccountRemovalKind;
 use crate::model::{Overlay, PickerChoice, SyncKind};
@@ -20,6 +20,7 @@ pub(super) struct AccountWindow {
     views: HashMap<String, Entity<Inbox>>,
     stopping: HashSet<String>,
     reloading: HashMap<String, Entity<Inbox>>,
+    removing: HashMap<String, RequestedRemoval>,
     catalog: Accounts,
     picker_clock: motion::Clock,
     picker_exit: Option<(Entity<Inbox>, Layer, Option<f32>, Transition)>,
@@ -27,6 +28,7 @@ pub(super) struct AccountWindow {
     _compose_listener: Option<gpui::Task<()>>,
 }
 
+#[derive(Clone)]
 pub(super) struct RequestedRemoval {
     pub kind: AccountRemovalKind,
     pub path: PathBuf,
@@ -69,6 +71,7 @@ impl AccountWindow {
             views,
             stopping: HashSet::new(),
             reloading: HashMap::new(),
+            removing: HashMap::new(),
             catalog: Accounts::default(),
             picker_clock: motion::Clock::default(),
             picker_exit: None,
@@ -375,10 +378,17 @@ impl AccountWindow {
         let broken = remove
             .as_ref()
             .is_some_and(|request| request.kind == AccountRemovalKind::BrokenFile);
-        if !broken && !self.stopping.insert(id.to_owned()) {
-            return;
+        if !broken {
+            if let Some(request) = remove.as_ref() {
+                self.removing
+                    .entry(id.to_owned())
+                    .or_insert_with(|| request.clone());
+                self.update_choices(false, cx);
+            }
+            if !self.stopping.insert(id.to_owned()) {
+                return;
+            }
         }
-        let removing_active = !broken && remove.is_some() && self.active_id.as_deref() == Some(id);
         let account = fell_core::AccountId(id.to_owned());
         let hub = cx
             .try_global::<crate::draft_host::AgentDrafts>()
@@ -436,18 +446,41 @@ impl AccountWindow {
         let registry = registry.clone();
         let id = id.to_owned();
         cx.spawn_in(window, async move |this, cx| {
+            let (request, removing_active) = if broken {
+                (remove.expect("broken removal has a request"), false)
+            } else {
+                let read = registry.clone();
+                let catalog = cx
+                    .background_executor()
+                    .spawn(async move {
+                        if let Some(parts) = parts {
+                            parts.stop();
+                        }
+                        for worker in workers {
+                            let _ = worker.join();
+                        }
+                        catalog(&read)
+                    })
+                    .await;
+                let Ok(Some(pending)) = this.update_in(cx, |view, window, cx| {
+                    if let Some(request) = view.removing.get(&id) {
+                        return Some((request.clone(), view.active_id.as_deref() == Some(&id)));
+                    }
+                    view.stopping.remove(&id);
+                    view.reconcile(&registry, catalog, window, cx);
+                    None
+                }) else {
+                    return;
+                };
+                pending
+            };
             let read = registry.clone();
             let retired = id.clone();
+            let name = request.name.clone();
             let (result, catalog) = cx
                 .background_executor()
                 .spawn(async move {
-                    if let Some(parts) = parts {
-                        parts.stop();
-                    }
-                    for worker in workers {
-                        let _ = worker.join();
-                    }
-                    let result = remove.map(|request| {
+                    let result = {
                         let run = || {
                             if request.kind == AccountRemovalKind::BrokenFile {
                                 read.remove_broken_file(
@@ -478,49 +511,48 @@ impl AccountWindow {
                             }
                             .map(Some)
                         };
-                        (request.name.clone(), run())
-                    });
+                        run()
+                    };
                     (result, catalog(&read))
                 })
                 .await;
             let _ = this.update_in(cx, |view, window, cx| {
                 if !broken {
                     view.stopping.remove(&id);
+                    view.removing.remove(&id);
                 }
                 view.reconcile(&registry, catalog, window, cx);
-                if let Some((name, result)) = result {
-                    let message = match result {
-                        Ok(Some(outcome @ (RemovalOutcome::Kept | RemovalOutcome::Deleted))) => {
-                            let removed = if removing_active && view.active_id.is_some() {
-                                let next = &view.active.read(cx).session.account_name;
-                                format!("Removed {name} · showing {next}")
-                            } else {
-                                format!("Removed {name}")
-                            };
-                            let action = if outcome == RemovalOutcome::Kept {
-                                "kept"
-                            } else {
-                                "deleted"
-                            };
-                            format!("{removed} · local mail {action}")
-                        }
-                        Ok(Some(RemovalOutcome::Restored { connected: true })) => {
-                            format!("Restored local mail for {name}")
-                        }
-                        Ok(Some(RemovalOutcome::Restored { connected: false })) => {
-                            format!("Restored local mail for {name} · account disconnected")
-                        }
-                        Ok(Some(RemovalOutcome::Cleared)) => {
-                            format!("Cleared interrupted deletion for {name}")
-                        }
-                        Ok(None) => format!("Deleted {name}"),
-                        Err(err) => {
-                            view.notice(format!("Couldn't finish account action. {err}"), true, cx);
-                            return;
-                        }
-                    };
-                    view.notice(message, false, cx);
-                }
+                let message = match result {
+                    Ok(Some(outcome @ (RemovalOutcome::Kept | RemovalOutcome::Deleted))) => {
+                        let removed = if removing_active && view.active_id.is_some() {
+                            let next = &view.active.read(cx).session.account_name;
+                            format!("Removed {name} · showing {next}")
+                        } else {
+                            format!("Removed {name}")
+                        };
+                        let action = if outcome == RemovalOutcome::Kept {
+                            "kept"
+                        } else {
+                            "deleted"
+                        };
+                        format!("{removed} · local mail {action}")
+                    }
+                    Ok(Some(RemovalOutcome::Restored { connected: true })) => {
+                        format!("Restored {name} · account and local mail")
+                    }
+                    Ok(Some(RemovalOutcome::Restored { connected: false })) => {
+                        format!("Restored local mail for {name} · account disconnected")
+                    }
+                    Ok(Some(RemovalOutcome::Cleared)) => {
+                        format!("Cleared interrupted deletion for {name}")
+                    }
+                    Ok(None) => format!("Deleted {name}"),
+                    Err(err) => {
+                        view.notice(format!("Couldn't finish account action. {err}"), true, cx);
+                        return;
+                    }
+                };
+                view.notice(message, false, cx);
             });
         })
         .detach();
@@ -645,6 +677,7 @@ impl AccountWindow {
                 &self.catalog,
                 current.map(String::as_str),
                 statuses,
+                |id| self.removing.contains_key(id),
             ) || catalog_changed
             {
                 inbox.refresh_settings_availability();
@@ -654,6 +687,16 @@ impl AccountWindow {
     }
 
     pub fn switch(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.switch_with_input(id, false, window, cx);
+    }
+
+    fn switch_with_input(
+        &mut self,
+        id: &str,
+        confirmed_with_enter: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.active_id.as_deref() == Some(id) && self.views.get(id) == Some(&self.active) {
             return;
         }
@@ -663,6 +706,8 @@ impl AccountWindow {
             self.picker_clock.idle();
             let fade_now = self.picker_clock.now();
             self.picker_exit = outgoing.update(cx, |inbox, _| {
+                let now = inbox.motion.clock.now();
+                let layer = inbox.motion.settle_account_switch(&inbox.session, now);
                 inbox.session.cancel_read_delay();
                 if inbox.session.overlay != Overlay::None {
                     inbox.session.dismiss_overlay();
@@ -671,10 +716,8 @@ impl AccountWindow {
                 if let Some(queue) = &inbox.notifications {
                     queue.set_viewing(false);
                 }
-                let now = inbox.motion.clock.now();
-                let picker = inbox.motion.settle_account_switch(now);
                 let fade = inbox.motion.motion.start(motion::FADE, fade_now);
-                picker
+                layer
                     .zip(fade)
                     .map(|((layer, height), fade)| (outgoing.clone(), layer, height, fade))
             });
@@ -684,12 +727,9 @@ impl AccountWindow {
             self.active.update(cx, |inbox, cx| {
                 inbox.frames = frames;
                 inbox.notification_window_activation(window, cx);
-                inbox.ignore_enter_until = Some(Instant::now() + Duration::from_millis(150));
-                inbox.motion.clock.idle();
-                inbox.account_arrival = inbox
-                    .motion
-                    .motion
-                    .start(motion::FADE, inbox.motion.clock.now());
+                inbox.ignore_enter_until = confirmed_with_enter
+                    .then(|| Instant::now() + super::ACCOUNT_SWITCH_ENTER_QUIET);
+                inbox.start_account_arrival(Instant::now());
                 cx.notify();
             });
             self.focus(window, cx);
@@ -714,7 +754,12 @@ impl Render for AccountWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let picker_opacity = self.picker_opacity(Instant::now());
         let theme = &self.active.read(cx).theme;
-        let background = theme.background;
+        let (background, foreground, ui_px, ui_family) = (
+            theme.background,
+            theme.foreground,
+            theme.ui_px,
+            theme.ui_family.clone(),
+        );
         let picker = self.picker_exit.as_mut().zip(picker_opacity).map(
             |((outgoing, layer, height, _), opacity)| {
                 let entity = cx.entity().downgrade();
@@ -723,11 +768,34 @@ impl Render for AccountWindow {
                 });
                 outgoing.update(cx, |inbox, cx| {
                     layer.swap(&mut inbox.session);
+                    let height = height.map(|height| motion::snap(height, window.scale_factor()));
+                    let settings = (inbox.session.overlay == Overlay::Settings).then(|| {
+                        super::settings::card(
+                            &inbox.theme,
+                            &inbox.session,
+                            &inbox.settings_view,
+                            false,
+                            (
+                                height.unwrap_or_else(|| {
+                                    super::settings::card_height(
+                                        &inbox.session.settings_nav,
+                                        f32::from(window.viewport_size().height)
+                                            - super::CARD_TOP_PX
+                                            - 16.,
+                                        f32::from(window.viewport_size().width) < 500.,
+                                    )
+                                }),
+                                window,
+                            ),
+                            inbox.motion.clock.now(),
+                            cx,
+                        )
+                    });
                     let picker = super::overlay(
                         &inbox.theme,
                         &inbox.session,
                         (opacity, 0.0),
-                        *height,
+                        height,
                         false,
                         (0.0, super::CARD_TOP_PX),
                         &inbox.palette_scroll,
@@ -740,7 +808,7 @@ impl Render for AccountWindow {
                             merge_feedback: 0.0,
                         },
                         None,
-                        None,
+                        settings,
                         window,
                         cx,
                     );
@@ -753,14 +821,19 @@ impl Render for AccountWindow {
             .relative()
             .size_full()
             .bg(rgb(background))
+            .text_color(rgb(foreground))
+            .text_size(gpui::px(ui_px))
+            .font_family_opt(ui_family)
             .child(self.active.clone())
             .children(picker)
     }
 }
 
-pub(super) fn switch(id: &str, window: &mut Window, cx: &mut App) {
+pub(super) fn switch(id: &str, confirmed_with_enter: bool, window: &mut Window, cx: &mut App) {
     if let Some(root) = window.root::<AccountWindow>().flatten() {
-        root.update(cx, |view, cx| view.switch(id, window, cx));
+        root.update(cx, |view, cx| {
+            view.switch_with_input(id, confirmed_with_enter, window, cx)
+        });
     }
 }
 
@@ -1022,6 +1095,128 @@ mod tests {
                 })
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn account_switch_guards_only_enter_and_extends_the_quiet_period() {
+        let Some(_temp) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let registry = Registry::resolve().unwrap();
+        std::fs::create_dir_all(registry.directory()).unwrap();
+        write_account(&registry, "mail", "");
+        write_account(&registry, "work", "");
+        let mut app = TestAppContext::single();
+        let window = app.add_window(|window, cx| {
+            AccountWindow::new(mailbox::startup(), false, None, window, cx)
+        });
+        window
+            .update(&mut app, |view, window, cx| {
+                let original = view.active();
+                original.update(cx, |inbox, _| {
+                    inbox.motion.motion = motion::Motion::new(true);
+                    inbox.session.overlay = Overlay::Settings;
+                    inbox.session.settings_nav.page = crate::model::settings::Page::Section(
+                        crate::model::settings::Section::Accounts,
+                    );
+                });
+                view.switch_with_input("work", true, window, cx);
+                let at = Instant::now();
+                assert!(view.picker_opacity(at).unwrap() > 0.9);
+                for millis in [20, 40, 60, 80, 100] {
+                    assert!(
+                        view.picker_opacity(at + Duration::from_millis(millis))
+                            .is_some()
+                    );
+                }
+                assert!(view.picker_opacity(at + motion::FADE).is_none());
+                view.active().update(cx, |inbox, _| {
+                    for millis in [10, 115, 240, 370, 530] {
+                        assert!(
+                            inbox.swallow_switch_enter(at + Duration::from_millis(millis), false)
+                        );
+                    }
+                    let deliberate = at + Duration::from_millis(800);
+                    assert!(!inbox.swallow_switch_enter(deliberate, false));
+                    assert!(inbox.swallow_switch_enter(deliberate, true));
+                });
+                view.switch("mail", window, cx);
+                original.update(cx, |inbox, _| {
+                    assert!(!inbox.swallow_switch_enter(at, false));
+                });
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn a_confirmed_removal_waiting_on_reload_runs_before_reopening() {
+        let Some(_temp) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let registry = Registry::resolve().unwrap();
+        std::fs::create_dir_all(registry.directory()).unwrap();
+        write_account(&registry, "mail", "");
+        write_account(&registry, "work", "");
+        let mut app = TestAppContext::single();
+        let window = app.add_window(|window, cx| {
+            AccountWindow::new(mailbox::startup(), false, None, window, cx)
+        });
+        let (entered, wait) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let job = window
+            .update(&mut app, |view, _, cx| {
+                view.views["work"].read(cx).store.call(move |_| {
+                    entered.send(()).unwrap();
+                    blocked.recv().unwrap();
+                })
+            })
+            .unwrap();
+        wait.recv_timeout(Duration::from_secs(5)).unwrap();
+        write_account(&registry, "work", "name = 'New work'");
+        let catalog = registry.load();
+        let path = registry.path("work").unwrap();
+        let expected = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.path == path)
+            .unwrap()
+            .file_identity;
+        window
+            .update(&mut app, |view, window, cx| {
+                view.reconcile(&registry, catalog, window, cx);
+                assert!(view.stopping.contains("work"));
+                view.retire(
+                    "work",
+                    &registry,
+                    Some(RequestedRemoval {
+                        kind: AccountRemovalKind::Account,
+                        path: path.clone(),
+                        expected,
+                        delete: false,
+                        name: "New work".into(),
+                    }),
+                    false,
+                    window,
+                    cx,
+                );
+                assert!(view.removing.contains_key("work"));
+                assert!(!view.views.contains_key("work"));
+                assert!(path.is_file());
+            })
+            .unwrap();
+        release.send(()).unwrap();
+        futures::executor::block_on(job).unwrap();
+        app.run_until_parked();
+        window
+            .update(&mut app, |view, _, _| {
+                assert!(!view.stopping.contains("work"));
+                assert!(!view.removing.contains_key("work"));
+                assert!(!view.views.contains_key("work"));
+            })
+            .unwrap();
+        assert!(!path.exists());
+        let base = mailbox::store_path().unwrap();
+        assert!(registry.store_path(&base, "work").unwrap().is_file());
     }
 
     #[test]

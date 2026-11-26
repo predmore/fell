@@ -119,7 +119,16 @@ struct AccountRow {
     status: String,
     alert: bool,
     active: bool,
+    removing: bool,
     kind: crate::model::settings::AccountRemovalKind,
+}
+
+impl AccountRow {
+    fn can_remove(&self) -> bool {
+        !self.removing
+            && (self.kind != crate::model::settings::AccountRemovalKind::BrokenFile
+                || self.file_identity.is_some())
+    }
 }
 
 struct IdentityCandidate {
@@ -172,6 +181,7 @@ impl View {
         catalog: &fell_core::accounts::Accounts,
         active: Option<&str>,
         statuses: &std::collections::HashMap<String, (String, bool)>,
+        removing: impl Fn(&str) -> bool,
     ) -> bool {
         use crate::model::settings::AccountRemovalKind;
 
@@ -207,15 +217,21 @@ impl View {
                         true,
                     ),
                 };
+                let removing = entry.config.is_ok() && removing(&id);
                 Some(AccountRow {
                     id,
                     path: entry.path.clone(),
                     file_identity: entry.file_identity,
                     name,
                     email,
-                    status,
-                    alert,
+                    status: if removing {
+                        "Removing…".into()
+                    } else {
+                        status
+                    },
+                    alert: alert && !removing,
                     active,
+                    removing,
                     kind: if entry.config.is_ok() {
                         AccountRemovalKind::Account
                     } else {
@@ -237,9 +253,15 @@ impl View {
                 email: entry
                     .and_then(|entry| entry.config.as_ref().ok())
                     .map(|config| config.email.clone()),
-                status: "Delete interrupted".into(),
-                alert: true,
+                status: if removing(&pending.id) {
+                    "Recovering…"
+                } else {
+                    "Delete interrupted"
+                }
+                .into(),
+                alert: !removing(&pending.id),
                 active: false,
+                removing: removing(&pending.id),
                 kind: AccountRemovalKind::Interrupted {
                     can_restore: pending.can_restore,
                 },
@@ -504,7 +526,12 @@ impl Inbox {
         cx.notify();
     }
 
-    pub(super) fn settings_request(&mut self, request: Request, cx: &mut Context<Self>) {
+    pub(super) fn settings_request(
+        &mut self,
+        request: Request,
+        confirmed_with_enter: bool,
+        cx: &mut Context<Self>,
+    ) {
         match request {
             Request::Save(edit) => {
                 if let Some(edits) = &self.settings_view.edits
@@ -526,7 +553,13 @@ impl Inbox {
                 }
             }
             Request::OpenAccount(index) => {
-                if let Some(account) = self.settings_view.accounts.get(index).cloned() {
+                if let Some(account) = self
+                    .settings_view
+                    .accounts
+                    .get(index)
+                    .cloned()
+                    .filter(|account| !account.removing)
+                {
                     match account.kind {
                         crate::model::settings::AccountRemovalKind::BrokenFile => {
                             self.open_account_editor(account.path, cx);
@@ -535,8 +568,7 @@ impl Inbox {
                             self.confirm_account_removal(index);
                         }
                         crate::model::settings::AccountRemovalKind::Account if !account.active => {
-                            self.session.dismiss_overlay();
-                            self.account_action(account.id, None, cx);
+                            self.account_action(account.id, None, confirmed_with_enter, cx);
                         }
                         _ => {}
                     }
@@ -544,13 +576,12 @@ impl Inbox {
             }
             Request::ConfirmAccountRemoval(index) => self.confirm_account_removal(index),
             Request::RemoveAccount { delete } => {
-                if let Some(target) = self.settings_view.removal.take() {
+                if let Some(target) = self.settings_view.removal.clone() {
                     if self.settings_view.accounts.iter().any(|account| {
                         account.path == target.path
                             && account.file_identity == target.file_identity
                             && account.kind == target.kind
                     }) {
-                        self.session.dismiss_overlay();
                         let removal = super::accounts::RequestedRemoval {
                             kind: target.kind,
                             path: target.path,
@@ -558,7 +589,7 @@ impl Inbox {
                             delete,
                             name: target.name,
                         };
-                        self.account_action(target.id, Some(removal), cx);
+                        self.account_action(target.id, Some(removal), false, cx);
                     } else {
                         self.settings_notice(
                             "The account file changed. Select the account again.",
@@ -635,17 +666,8 @@ impl Inbox {
         let Some(previous) = cx.try_global::<super::InboxWindow>().copied() else {
             return;
         };
-        let account_id = match mailbox::next_account_id() {
-            Ok(id) => id,
-            Err(error) => {
-                self.settings_notice(error, true, cx);
-                return;
-            }
-        };
         match cx.open_window(options, |window, cx| {
-            cx.new(|cx| {
-                crate::onboarding::Onboarding::from_inbox(previous.0, account_id, window, cx)
-            })
+            cx.new(|cx| crate::onboarding::Onboarding::from_inbox(previous.0, window, cx))
         }) {
             Ok(handle) => self.settings_view.setup = Some(handle.into()),
             Err(_) => self.settings_notice("Could not open account setup", true, cx),
@@ -653,12 +675,19 @@ impl Inbox {
     }
 
     fn confirm_account_removal(&mut self, index: usize) {
-        self.settings_view.removal = self.settings_view.accounts.get(index).cloned();
-        if let Some(target) = &self.settings_view.removal {
+        if let Some(target) = self
+            .settings_view
+            .accounts
+            .get(index)
+            .filter(|row| row.can_remove())
+        {
             self.session.settings_nav.page = Page::ConfirmAccountRemoval {
                 delete: false,
                 kind: target.kind,
             };
+            self.settings_view.removal = Some(target.clone());
+        } else {
+            self.session.settings_nav.page = Page::Section(Section::Accounts);
         }
     }
 
@@ -666,13 +695,14 @@ impl Inbox {
         &self,
         id: String,
         remove: Option<super::accounts::RequestedRemoval>,
+        confirmed_with_enter: bool,
         cx: &mut Context<Self>,
     ) {
         if let Some(window) = cx.try_global::<super::InboxWindow>().copied() {
             cx.defer(move |cx| {
                 let _ = window.0.update(cx, |_, window, cx| match remove {
                     Some(removal) => super::accounts::remove(&id, removal, window, cx),
-                    None => super::accounts::switch(&id, window, cx),
+                    None => super::accounts::switch(&id, confirmed_with_enter, window, cx),
                 });
             });
         }
@@ -1236,26 +1266,30 @@ pub(super) fn card(
                 let mut control = row(theme, index, selected, live, height, cx);
                 if let Row::Account(account) = setting {
                     if let Some(account) = view.accounts.get(account) {
+                        let restore = matches!(
+                            account.kind,
+                            AccountRemovalKind::Interrupted { can_restore: true }
+                        );
+                        let recover =
+                            matches!(account.kind, AccountRemovalKind::Interrupted { .. });
                         control = control
                             .child(account_label(theme, account, selected))
-                            .when(selected, |row| {
-                                row.child(account_button(
+                            .when(account.can_remove(), |row| {
+                                let button = account_button(
                                     theme,
                                     "remove-account",
-                                    if matches!(
-                                        account.kind,
-                                        AccountRemovalKind::Interrupted { .. }
-                                    ) {
-                                        "Recover"
-                                    } else {
-                                        "Remove · d"
+                                    match (restore, recover) {
+                                        (true, _) => "Restore",
+                                        (_, true) => "Finish deleting",
+                                        _ => "Remove · d",
                                     },
                                     crate::model::settings::REMOVE_ACCOUNT_KEY,
                                     false,
-                                    true,
-                                    live,
+                                    !restore,
+                                    live && selected,
                                     cx,
-                                ))
+                                );
+                                row.child(button.opacity(if selected { 1. } else { 0. }))
                             })
                             .when(account.kind == AccountRemovalKind::BrokenFile, |row| {
                                 row.child(trailing(theme, "↗", selected))
@@ -1749,6 +1783,8 @@ fn account_label(theme: &theme::Theme, account: &AccountRow, selected: bool) -> 
     div()
         .flex_1()
         .min_w_0()
+        .flex()
+        .flex_col()
         .child(
             div()
                 .truncate()

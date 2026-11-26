@@ -570,17 +570,26 @@ impl InboxMotion {
         }
     }
 
-    /// The window owns the outgoing account picker once its inbox goes away.
-    pub fn settle_account_switch(&mut self, now: Instant) -> Option<(Layer, Option<f32>)> {
+    /// The window owns the outgoing account picker or Settings card once
+    /// its inbox goes away.
+    pub fn settle_account_switch(
+        &mut self,
+        session: &Session,
+        now: Instant,
+    ) -> Option<(Layer, Option<f32>)> {
         let card = self.card_height(now);
-        let picker = self
-            .overlay_out
-            .take()
-            .map(|(layer, _)| layer)
-            .or_else(|| self.last_layer.take())
-            .filter(|layer| {
-                layer.overlay == Overlay::Folders && layer.folder_intent == FolderIntent::Account
-            });
+        let closing = self.overlay_out.take();
+        let layer = if session.overlay == Overlay::Settings {
+            Some(Layer::of(session, Overlay::Settings, 1.0))
+        } else {
+            closing
+                .map(|(layer, _)| layer)
+                .or_else(|| self.last_layer.take())
+                .filter(|layer| {
+                    layer.overlay == Overlay::Folders
+                        && layer.folder_intent == FolderIntent::Account
+                })
+        };
         self.last_layer = None;
         self.last_overlay = Overlay::None;
         self.last_which = false;
@@ -590,7 +599,7 @@ impl InboxMotion {
         self.which_out = None;
         self.card_to = None;
         self.card_glide = None;
-        picker.map(|layer| (layer, card))
+        layer.map(|layer| (layer, card))
     }
 
     pub fn reading_progress(&self, now: Instant) -> f32 {
