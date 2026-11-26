@@ -421,17 +421,33 @@ fn registry_store(
         )));
     }
     let config = match id {
-        Some(id) => registry
-            .get(&AccountId(id.into()))
-            .map_err(|err| CliError::new(err.to_string()))?
-            .ok_or_else(|| CliError::new(format!("unknown account {id}")))?,
+        Some(id) => {
+            let configured = registry
+                .get(&AccountId(id.into()))
+                .map_err(|err| CliError::new(err.cli_message()))?;
+            let Some(config) = configured else {
+                registry
+                    .store_path(base, id)
+                    .map_err(|err| CliError::new(err.cli_message()))?;
+                return Err(CliError::new(format!("unknown account {id}")));
+            };
+            config
+        }
         None => accounts.default_config().cloned().ok_or_else(|| {
-            CliError::new("No readable account configuration. Try `fell account list`.")
+            let damage = accounts
+                .entries
+                .iter()
+                .filter_map(|entry| entry.config.as_ref().err())
+                .find(|error| error.is_mailbox_link());
+            CliError::new(damage.map_or_else(
+                || "No readable account configuration. Try `fell account list`.".into(),
+                fell_core::accounts::FileError::cli_message,
+            ))
         })?,
     };
     registry
-        .store_path(base, &config.id)
-        .map_err(|err| CliError::new(err.to_string()))
+        .configured_store_path(base, &config)
+        .map_err(|err| CliError::new(err.cli_message()))
 }
 
 // Explicit paths keep the standalone and shared-store behavior. A registry
@@ -448,17 +464,24 @@ fn grant_stores(opts: &Opts, io: &Io<'_>) -> Result<Vec<GrantStore>, CliError> {
         let mut stores = Vec::new();
         let mut found = opts.account.is_none();
         for entry in catalog.entries {
-            if entry.path.parent() != Some(directory.as_path()) {
-                continue;
-            }
-            let Some(id) = entry.path.file_stem().and_then(|name| name.to_str()) else {
+            let id = entry.path.file_stem().and_then(|name| name.to_str());
+            let Some(id) = id.filter(|id| {
+                entry.path.parent() == Some(directory.as_path())
+                    && fell_core::accounts::validate_id(id).is_ok()
+            }) else {
+                if opts.account.is_none()
+                    && let Err(error) = &entry.config
+                    && error.is_mailbox_link()
+                {
+                    let name = entry.damaged_link_name().or(id).unwrap_or("mailbox");
+                    stores.push(Err((name.to_owned(), CliError::new(error.cli_message()))));
+                }
                 continue;
             };
-            if fell_core::accounts::validate_id(id).is_err()
-                || opts
-                    .account
-                    .as_deref()
-                    .is_some_and(|selected| selected != id)
+            if opts
+                .account
+                .as_deref()
+                .is_some_and(|selected| selected != id)
                 || catalog.interrupted.iter().any(|pending| pending.id == id)
             {
                 continue;
@@ -468,10 +491,14 @@ fn grant_stores(opts: &Opts, io: &Io<'_>) -> Result<Vec<GrantStore>, CliError> {
                 |_| id.to_owned(),
                 |config| format!("{} ({id})", config.account().display_name),
             );
-            let path = match registry.store_path(base, id) {
+            let path = match entry.config.as_ref() {
+                Ok(config) => registry.configured_store_path(base, config),
+                Err(_) => registry.store_path(base, id),
+            };
+            let path = match path {
                 Ok(path) => path,
                 Err(err) => {
-                    stores.push(Err((name, CliError::new(err.to_string()))));
+                    stores.push(Err((name, CliError::new(err.cli_message()))));
                     continue;
                 }
             };
@@ -495,14 +522,14 @@ fn grant_stores(opts: &Opts, io: &Io<'_>) -> Result<Vec<GrantStore>, CliError> {
             found = true;
             stores.push(Err((
                 format!("{} ({})", pending.name, pending.id),
-                CliError::new("Deletion interrupted"),
+                CliError::new("Deletion interrupted. Open Fell Settings → Accounts to recover it."),
             )));
         }
-        if !found {
-            return Err(CliError::new(format!(
-                "unknown account {}",
-                opts.account.as_deref().unwrap_or_default()
-            )));
+        if !found && let Some(id) = &opts.account {
+            registry
+                .store_path(base, id)
+                .map_err(|err| CliError::new(err.cli_message()))?;
+            return Err(CliError::new(format!("unknown account {id}")));
         }
         return Ok(stores);
     }

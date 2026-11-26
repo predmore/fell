@@ -1,7 +1,7 @@
 //! Keep each mailbox and its view open so switching only changes the shown view.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use fell_core::accounts::{Accounts, FileIdentity, Registry, RemovalOutcome};
@@ -119,7 +119,7 @@ impl AccountWindow {
                 let reload = catalog.configs().any(|current| current.id == config.id);
                 view.retire(&config.id, &registry, None, reload, window, cx);
             }
-            view.reconcile(&registry, catalog, window, cx);
+            view.reconcile(&registry, catalog, None, window, cx);
             view.watch(registry, window, cx);
         }
         view
@@ -150,7 +150,7 @@ impl AccountWindow {
                     .await;
                 if this
                     .update_in(cx, |view, window, cx| {
-                        view.reconcile(&registry, accounts, window, cx);
+                        view.reconcile(&registry, accounts, None, window, cx);
                     })
                     .is_err()
                 {
@@ -243,6 +243,7 @@ impl AccountWindow {
         &mut self,
         registry: &Registry,
         accounts: Accounts,
+        preferred: Option<&Path>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -319,8 +320,11 @@ impl AccountWindow {
             });
         let mut switched = false;
         if self.active_id.is_none() || removed.is_some() {
-            let next = accounts
-                .default_config()
+            let next = preferred
+                .and_then(|path| accounts.entries.iter().find(|entry| entry.path == path))
+                .and_then(|entry| entry.config.as_ref().ok())
+                .filter(|config| self.views.contains_key(&config.id))
+                .or_else(|| accounts.default_config())
                 .filter(|config| self.views.contains_key(&config.id))
                 .or_else(|| {
                     accounts
@@ -538,7 +542,7 @@ impl AccountWindow {
                         ));
                     }
                     view.stopping.remove(&id);
-                    view.reconcile(&registry, catalog, window, cx);
+                    view.reconcile(&registry, catalog, None, window, cx);
                     None
                 }) else {
                     return;
@@ -548,6 +552,7 @@ impl AccountWindow {
             let read = registry.clone();
             let retired = id.clone();
             let name = request.name.clone();
+            let path = request.path.clone();
             let (result, catalog) = cx
                 .background_executor()
                 .spawn(async move {
@@ -595,6 +600,26 @@ impl AccountWindow {
                         .account_selection(&active.session.settings_nav)
                 })
                 .flatten();
+                let preferred = (matches!(
+                    result,
+                    Ok(Some(RemovalOutcome::Kept | RemovalOutcome::Deleted))
+                ) && view.active_id.as_deref() == Some(id.as_str()))
+                .then(|| {
+                    selection
+                        .as_ref()
+                        .map(|(index, path)| (*index, path.as_path()))
+                        .or_else(|| {
+                            active
+                                .settings_view
+                                .account_position(&path)
+                                .map(|index| (index, path.as_path()))
+                        })
+                        .and_then(|(index, path)| {
+                            super::settings::selected_account_path(&catalog, index, path)
+                        })
+                        .map(Path::to_owned)
+                })
+                .flatten();
                 if !broken {
                     view.stopping.remove(&id);
                     view.removing.remove(&id);
@@ -602,7 +627,7 @@ impl AccountWindow {
                         view.reloading.remove(&id);
                     }
                 }
-                view.reconcile(&registry, catalog, window, cx);
+                view.reconcile(&registry, catalog, preferred.as_deref(), window, cx);
                 if let Some(selection) = selection {
                     view.active.update(cx, |inbox, cx| {
                         inbox.session.overlay = Overlay::Settings;
@@ -639,7 +664,7 @@ impl AccountWindow {
                     Ok(None) => format!("Deleted {name}"),
                     Err(err) => {
                         let hint = if err.contains("Close Fell and any fell-mcp sessions") {
-                            "Close other Fell or fell-mcp sessions using this account and try again"
+                            "close other Fell or fell-mcp sessions, then retry"
                         } else {
                             err.as_str()
                         };
@@ -1032,7 +1057,7 @@ mod tests {
         .unwrap();
         window
             .update(&mut app, |view, window, cx| {
-                view.reconcile(&registry, registry.load(), window, cx);
+                view.reconcile(&registry, registry.load(), None, window, cx);
                 assert_eq!(view.active(), old);
                 assert!(view.stopping.is_empty());
                 check_position(old.read(cx));
@@ -1043,7 +1068,7 @@ mod tests {
         write_account(&registry, "work", "name = 'New work'");
         window
             .update(&mut app, |view, window, cx| {
-                view.reconcile(&registry, registry.load(), window, cx);
+                view.reconcile(&registry, registry.load(), None, window, cx);
                 assert!(view.stopping.contains("work"));
                 assert!(!view.views.contains_key("work"));
                 assert!(old.read(cx).retired);
@@ -1281,12 +1306,17 @@ mod tests {
 
     #[test]
     fn the_switch_enter_guard_expires_with_slow_frames() {
-        let start = Instant::now();
-        let mut guard = super::super::AccountSwitchEnterGuard::new(start);
-        for millis in (0..=600).step_by(50) {
-            guard.frame(start + Duration::from_millis(millis));
+        for interval in [50, 100] {
+            let start = Instant::now();
+            let mut guard = super::super::AccountSwitchEnterGuard::new(start);
+            for millis in (0..=600).step_by(interval) {
+                guard.frame(start + Duration::from_millis(millis));
+            }
+            assert!(
+                !guard.armed(start + Duration::from_millis(600)),
+                "{interval} ms frames"
+            );
         }
-        assert!(!guard.armed(start + Duration::from_millis(600)));
     }
 
     #[test]
@@ -1383,6 +1413,66 @@ mod tests {
     }
 
     #[test]
+    fn deleting_the_active_account_opens_the_neighbour_selected_in_settings() {
+        use crate::model::settings::{Page, Row, Section};
+
+        let Some(_root) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let registry = Registry::resolve().unwrap();
+        std::fs::create_dir_all(registry.directory()).unwrap();
+        for id in ["mail", "studio", "work"] {
+            write_account(&registry, id, "");
+        }
+        let mut app = TestAppContext::single();
+        let window = app.add_window(|window, cx| {
+            AccountWindow::new(mailbox::startup(), false, None, window, cx)
+        });
+        let path = registry.path("studio").unwrap();
+        let expected = catalog(&registry)
+            .entries
+            .into_iter()
+            .find(|entry| entry.path == path)
+            .unwrap()
+            .file_identity;
+        window
+            .update(&mut app, |view, window, cx| {
+                view.switch("studio", window, cx);
+                view.active.update(cx, |inbox, _| {
+                    inbox.session.overlay = Overlay::Settings;
+                    inbox.session.settings_nav.page = Page::Section(Section::Accounts);
+                    inbox.session.settings_nav.select_row(Row::Account(1));
+                });
+                view.request_removal(
+                    "studio",
+                    &registry,
+                    RequestedRemoval {
+                        kind: AccountRemovalKind::Account,
+                        path: path.clone(),
+                        expected,
+                        delete: true,
+                        name: "Studio".into(),
+                    },
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+        app.run_until_parked();
+        window
+            .update(&mut app, |view, _, cx| {
+                assert_eq!(view.active_id.as_deref(), Some("work"));
+                let inbox = view.active.read(cx);
+                let selection = inbox
+                    .settings_view
+                    .account_selection(&inbox.session.settings_nav);
+                assert_eq!(selection, Some((1, registry.path("work").unwrap())));
+            })
+            .unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn a_confirmed_removal_waiting_on_reload_runs_before_reopening() {
         let Some(_temp) = fell_core::test_support::in_isolated_process() else {
             return;
@@ -1423,7 +1513,7 @@ mod tests {
             .file_identity;
         window
             .update(&mut app, |view, window, cx| {
-                view.reconcile(&registry, catalog, window, cx);
+                view.reconcile(&registry, catalog, None, window, cx);
                 assert!(view.stopping.contains("work"));
                 view.request_removal(
                     "work",
@@ -1509,7 +1599,7 @@ mod tests {
             .unwrap();
         window
             .update(&mut app, |view, window, cx| {
-                view.reconcile(&registry, registry.load(), window, cx);
+                view.reconcile(&registry, registry.load(), None, window, cx);
                 assert_eq!(view.active_id.as_deref(), Some("work"));
             })
             .unwrap();

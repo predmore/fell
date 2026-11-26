@@ -5,7 +5,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, ErrorCode, OpenFlags};
 
 use crate::{AccountConfig, AccountId};
 
@@ -13,7 +13,9 @@ mod removal;
 pub use removal::{InterruptedRemoval, RemovalOutcome};
 
 pub const DEFAULT_ID: &str = "mail";
+pub const MAILBOX_LINK_DAMAGED: &str = "Mailbox link damaged";
 pub const MAILBOX_LINK_RECOVERY: &str = "Restore account.toml.bak or accounts/.original-id";
+pub const MAILBOX_ADDRESS_RECOVERY: &str = "Use the same address or open Fell Settings → Accounts, choose Keep local mail, then Add account.";
 pub type FileIdentity = (u64, u64, i64, i64);
 
 pub fn validate_id(id: &str) -> Result<(), &'static str> {
@@ -70,6 +72,19 @@ impl FileError {
     pub fn is_mailbox_link(&self) -> bool {
         self.recovery == MAILBOX_LINK_RECOVERY
     }
+
+    pub fn cli_message(&self) -> String {
+        if self.is_mailbox_link() {
+            format!(
+                "{MAILBOX_LINK_DAMAGED} · {} · {}",
+                self.recovery, self.detail
+            )
+        } else if self.recovery == MAILBOX_ADDRESS_RECOVERY {
+            format!("{} · {}", self.detail, self.recovery)
+        } else {
+            self.to_string()
+        }
+    }
 }
 
 impl std::fmt::Display for FileError {
@@ -82,8 +97,15 @@ impl std::fmt::Display for FileError {
 pub struct Entry {
     pub path: PathBuf,
     pub config: Result<AccountConfig, FileError>,
+    pub(crate) damaged_link_name: Option<String>,
     /// A replacement with identical settings can still replace a removed account.
     pub file_identity: Option<FileIdentity>,
+}
+
+impl Entry {
+    pub fn damaged_link_name(&self) -> Option<&str> {
+        self.damaged_link_name.as_deref()
+    }
 }
 
 enum OriginalMailbox {
@@ -248,6 +270,7 @@ impl Registry {
                     accounts.entries.push(Entry {
                         path,
                         config,
+                        damaged_link_name: None,
                         file_identity,
                     });
                 }
@@ -261,6 +284,7 @@ impl Registry {
                 file_identity: legacy.symlink_metadata().ok().map(file_identity),
                 path: legacy,
                 config: Err(error),
+                damaged_link_name: None,
             });
         }
         accounts.entries.sort_by(|a, b| a.path.cmp(&b.path));
@@ -292,6 +316,29 @@ impl Registry {
             return Err(FileError::new(
                 format!("Removal of {id} is in progress"),
                 "Open Settings → Accounts to restore local mail or finish deleting.",
+            ));
+        }
+        Ok(path)
+    }
+
+    pub fn configured_store_path(
+        &self,
+        base: &Path,
+        config: &AccountConfig,
+    ) -> Result<PathBuf, FileError> {
+        let path = self.store_path(base, &config.id)?;
+        let owner = mailbox_owner(&path).map_err(|err| {
+            FileError::new(
+                format!("{}: {err}", file_name(&path)),
+                "Check the local mailbox.",
+            )
+        })?;
+        if let Some((_, email)) = owner
+            && !email.eq_ignore_ascii_case(&config.email)
+        {
+            return Err(FileError::new(
+                format!("{} already holds mail for {email}", config.id),
+                MAILBOX_ADDRESS_RECOVERY,
             ));
         }
         Ok(path)
@@ -370,18 +417,28 @@ impl Registry {
             Err(error) => Some((backup, error)),
             Ok(None) => {
                 if let Ok(Some((config, text))) = legacy {
-                    // A repaired legacy file does not replace a mailbox already
-                    // in use under the newer layout.
                     let sibling = sibling_mailbox(base, &config.id);
-                    if mailbox_exists(&sibling).map_err(|err| FileError::access(&sibling, err))? {
+                    let target = self.path(&config.id)?;
+                    let target_exists =
+                        path_exists(&target).map_err(|err| FileError::access(&target, err))?;
+                    let current = read(&target, Some(&config.id)).ok().flatten();
+                    let target_conflicts = target_exists
+                        && current.as_ref().is_none_or(|(_, current)| *current != text);
+                    let sibling_exists =
+                        mailbox_exists(&sibling).map_err(|err| FileError::access(&sibling, err))?;
+                    // A repaired legacy file cannot take over an established
+                    // per-account route. Ownerless leftovers cannot establish one.
+                    let different_address = current.as_ref().is_some_and(|(current, _)| {
+                        !current.email.eq_ignore_ascii_case(&config.email)
+                    });
+                    if sibling_exists
+                        && (!removal::mailbox_has_owner(base, &config.id)
+                            || (different_address
+                                && matches!(sibling_conflicts(base, &config.id), Ok(true))))
+                    {
                         return Ok(None);
                     }
-                    let target = self.path(&config.id)?;
-                    if path_exists(&target).map_err(|err| FileError::access(&target, err))?
-                        && !read(&target, Some(&config.id)).is_ok_and(|existing| {
-                            existing.is_some_and(|(_, current)| current == text)
-                        })
-                    {
+                    if target_conflicts {
                         return Ok(Some(OriginalMailbox::Unavailable {
                             id: config.id,
                             path: self.config.join("account.toml"),
@@ -390,12 +447,14 @@ impl Registry {
                             ),
                         }));
                     }
-                    return Ok(Some(OriginalMailbox::Known {
-                        id: config.id,
-                        backup: None,
-                    }));
+                    return Ok(Some(check_original_collision(
+                        base,
+                        config.id,
+                        self.config.join("account.toml"),
+                        None,
+                    )));
                 }
-                marker_error.map(|error| (marker, error))
+                marker_error.map(|error| (marker.clone(), error))
             }
         };
         if let Some((path, error)) = metadata_error {
@@ -420,28 +479,44 @@ impl Registry {
         }
         Ok(self
             .infer_original_mailbox(base, legacy.is_err())?
-            .then(|| OriginalMailbox::Known {
-                id: DEFAULT_ID.into(),
-                backup: None,
-            }))
+            .map(|id| check_original_collision(base, id, marker, None)))
     }
 
-    fn infer_original_mailbox(&self, base: &Path, broken_legacy: bool) -> Result<bool, FileError> {
-        let sibling = sibling_mailbox(base, DEFAULT_ID);
-        if mailbox_exists(&sibling).map_err(|err| FileError::access(&sibling, err))? {
-            return Ok(false);
-        }
-        if broken_legacy {
-            let dir = self.directory();
-            if has_account_file(&dir).map_err(|err| FileError::access(&dir, err))? {
-                return Ok(false);
+    fn infer_original_mailbox(
+        &self,
+        base: &Path,
+        broken_legacy: bool,
+    ) -> Result<Option<String>, FileError> {
+        let owner = mailbox_owner(base)
+            .ok()
+            .flatten()
+            .filter(|(id, _)| validate_id(id).is_ok());
+        let dir = self.directory();
+        if broken_legacy && has_account_file(&dir).map_err(|err| FileError::access(&dir, err))? {
+            // A readable account file for the same address can corroborate
+            // the base owner when the legacy file is damaged.
+            let Some((id, email)) = owner else {
+                return Ok(None);
+            };
+            let path = self.path(&id)?;
+            if !read(&path, Some(&id)).is_ok_and(|config| {
+                config.is_some_and(|(config, _)| email.eq_ignore_ascii_case(&config.email))
+            }) {
+                return Ok(None);
             }
+            return Ok(Some(id));
         }
-        Ok(
-            (!broken_legacy
-                && !mailbox_exists(base).map_err(|err| FileError::access(base, err))?)
-                || removal::mailbox_has_owner(base, DEFAULT_ID),
-        )
+        if let Some(id) = owner
+            .map(|(id, _)| id)
+            .or_else(|| removal::staged_mailbox_id(base))
+        {
+            return Ok(Some(id));
+        }
+        let sibling = sibling_mailbox(base, DEFAULT_ID);
+        let fresh = !broken_legacy
+            && !mailbox_exists(base).map_err(|err| FileError::access(base, err))?
+            && !mailbox_exists(&sibling).map_err(|err| FileError::access(&sibling, err))?;
+        Ok(fresh.then(|| DEFAULT_ID.into()))
     }
 
     /// Record the first account's route immediately before publishing its
@@ -559,7 +634,11 @@ impl Registry {
                 return Err(io::Error::other("account.toml.bak already exists"));
             }
             let base = base.ok_or_else(|| io::Error::other("No local mailbox path"))?;
-            if mailbox_exists(&sibling_mailbox(base, &config.id))?
+            let sibling = sibling_mailbox(base, &config.id);
+            if (mailbox_exists(&sibling)?
+                && (!removal::mailbox_has_owner(base, &config.id)
+                    || sibling_conflicts(base, &config.id)
+                        .map_err(|err| io::Error::other(err.to_string()))?))
                 || (path_exists(&target)? && !path_exists(&marker)?)
             {
                 return Err(io::Error::other(
@@ -580,22 +659,17 @@ impl Registry {
         if let Err(error) = write() {
             // Keep an installed backup and config if the final fsync failed.
             // Roll back only files this attempt published.
-            let target_cleanup = if created_target && !backed_up {
-                fs::remove_file(&target)
-            } else {
-                Ok(())
-            };
-            let marker_cleanup = if created_marker {
-                fs::remove_file(&marker)
-            } else {
-                Ok(())
-            };
-            if created_marker || created_target {
+            if !backed_up && (created_target || created_marker) {
+                let target_cleanup = created_target.then(|| fs::remove_file(&target));
+                let marker_cleanup = created_marker.then(|| fs::remove_file(&marker));
                 let synced = lock.sync_all();
-                target_cleanup
-                    .and(marker_cleanup)
-                    .and(synced)
-                    .map_err(|err| FileError::access(&legacy, err))?;
+                if let Some(cleanup_error) = [target_cleanup, marker_cleanup, Some(synced)]
+                    .into_iter()
+                    .flatten()
+                    .find_map(Result::err)
+                {
+                    return Err(FileError::access(&legacy, cleanup_error));
+                }
             }
             return Err(FileError::access(&legacy, error));
         }
@@ -613,21 +687,43 @@ fn check_original_collision(
     path: PathBuf,
     backup: Option<PathBuf>,
 ) -> OriginalMailbox {
-    let sibling = sibling_mailbox(base, &id);
-    if !matches!(mailbox_exists(&sibling), Ok(false))
-        && !matches!(
-            (mailbox_owner(base), mailbox_owner(&sibling)),
-            (Ok(Some((base_id, base_email))), Ok(Some((sibling_id, sibling_email))))
-                if base_id == id && base_id == sibling_id && base_email.eq_ignore_ascii_case(&sibling_email)
-        )
-    {
-        let error = FileError::mailbox_link(format!(
-            "{}: The original and per-account mailboxes have conflicting ownership",
-            file_name(&path)
-        ));
-        return OriginalMailbox::Unavailable { id, path, error };
+    match sibling_conflicts(base, &id) {
+        Ok(false) => OriginalMailbox::Known { id, backup },
+        Ok(true) => {
+            let error = FileError::mailbox_link(format!(
+                "{}: The original and per-account mailboxes have conflicting ownership",
+                file_name(&path)
+            ));
+            OriginalMailbox::Unavailable { id, path, error }
+        }
+        Err(error) => OriginalMailbox::Unavailable { id, path, error },
     }
-    OriginalMailbox::Known { id, backup }
+}
+
+fn sibling_conflicts(base: &Path, id: &str) -> Result<bool, FileError> {
+    let sibling = sibling_mailbox(base, id);
+    let trash = removal_trash(&sibling);
+    // Keep an interrupted deletion recoverable even when its database has
+    // already moved out of the live path.
+    if path_exists(&trash).map_err(|err| FileError::access(&trash, err))? {
+        return Ok(true);
+    }
+    let Some(conn) = mailbox_accounts(&sibling)
+        .map_err(|err| FileError::mailbox_link(format!("{}: {err}", file_name(&sibling))))?
+    else {
+        return Ok(false);
+    };
+    let base_owner = mailbox_owner(base).ok().flatten();
+    let (base_id, base_email) = match base_owner.as_ref() {
+        Some((base_id, email)) if base_id == id => (Some(base_id.as_str()), Some(email.as_str())),
+        _ => (None, None),
+    };
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM accounts WHERE id IS NOT ?1 OR email IS NOT ?2 COLLATE NOCASE)",
+        (base_id, base_email),
+        |row| row.get(0),
+    )
+    .map_err(|err| FileError::mailbox_link(format!("{}: {err}", file_name(&sibling))))
 }
 
 fn has_account_file(dir: &Path) -> io::Result<bool> {
@@ -673,11 +769,9 @@ pub fn mailbox_exists(path: &Path) -> io::Result<bool> {
 /// Inspect ownership without creating a store, modifying its schema or
 /// starting its workers. Only a mailbox with a single owner can be reused.
 pub fn mailbox_owner(path: &Path) -> rusqlite::Result<Option<(String, String)>> {
-    if !path.symlink_metadata().is_ok_and(|meta| meta.is_file()) {
+    let Some(conn) = mailbox_accounts(path)? else {
         return Ok(None);
-    }
-    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW;
-    let conn = Connection::open_with_flags(path, flags)?;
+    };
     let mut statement = conn.prepare("SELECT id, email FROM accounts LIMIT 2")?;
     let mut rows = statement.query([])?;
     let owner = match rows.next()? {
@@ -685,6 +779,26 @@ pub fn mailbox_owner(path: &Path) -> rusqlite::Result<Option<(String, String)>> 
         None => return Ok(None),
     };
     Ok(if rows.next()?.is_none() { owner } else { None })
+}
+
+fn mailbox_accounts(path: &Path) -> rusqlite::Result<Option<Connection>> {
+    if !path.symlink_metadata().is_ok_and(|meta| meta.is_file()) {
+        return Ok(None);
+    }
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    let open = || -> rusqlite::Result<Option<Connection>> {
+        let conn = Connection::open_with_flags(path, flags)?;
+        let has_accounts: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'accounts')",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(has_accounts.then_some(conn))
+    };
+    match open() {
+        Err(error) if error.sqlite_error_code() == Some(ErrorCode::NotADatabase) => Ok(None),
+        other => other,
+    }
 }
 
 fn verify_backup(base: &Path, backup: &Path, id: &str) -> Result<(), FileError> {
@@ -965,6 +1079,128 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_target_cleanup_still_rolls_back_the_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("fell");
+        let base = root.path().join("mail.db");
+        let registry = Registry::at(config.clone(), base.clone());
+        let target = registry.path("mail").unwrap();
+        let marker = registry.directory().join(".original-id");
+        write_private(
+            &config.join("account.toml"),
+            "email = 'original@example.test'\npassword = 'fixture'\n",
+        );
+        let failure = registry
+            .migrate_with(
+                Some(&base),
+                || Ok(()),
+                || {
+                    fs::rename(&target, config.join("published.toml")).unwrap();
+                    fs::create_dir(&target).unwrap();
+                    fs::create_dir(config.join("account.toml.bak")).unwrap();
+                },
+            )
+            .unwrap_err();
+        assert!(failure.detail.contains("Is a directory"));
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn an_owned_base_mailbox_ignores_ownerless_siblings_and_rejects_other_owners() {
+        let text = "email = 'original@example.test'\npassword = 'fixture'\n";
+        let original = AccountConfig::parse(text).unwrap().account();
+        for metadata in [
+            None,
+            Some("accounts/.original-id"),
+            Some("account.toml"),
+            Some("account.toml.bak"),
+        ] {
+            for leftover in [
+                "zero bytes",
+                "schema",
+                "sidecar",
+                "not sqlite",
+                "same owner",
+                "other email",
+                "other id",
+                "multiple owners",
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let config = root.path().join("fell");
+                let base = root.path().join("mail.db");
+                let registry = Registry::at(config.clone(), base.clone());
+                let sibling = sibling_mailbox(&base, "mail");
+                fs::create_dir_all(sibling.parent().unwrap()).unwrap();
+                crate::Store::open(&base)
+                    .unwrap()
+                    .upsert_account(&original)
+                    .unwrap();
+                match leftover {
+                    "zero bytes" => fs::write(&sibling, []).unwrap(),
+                    "sidecar" => fs::write(removal::mailbox_file(&sibling, "-wal"), []).unwrap(),
+                    "not sqlite" => {
+                        fs::write(&sibling, "not a SQLite database".repeat(10)).unwrap()
+                    }
+                    "schema" => drop(crate::Store::open(&sibling).unwrap()),
+                    _ => {
+                        let store = crate::Store::open(&sibling).unwrap();
+                        let mut owner = original.clone();
+                        if leftover == "same owner" {
+                            owner.email = owner.email.to_ascii_uppercase();
+                        }
+                        if leftover == "other email" {
+                            owner.email = "other@example.test".into();
+                        }
+                        if leftover == "multiple owners" {
+                            store.upsert_account(&owner).unwrap();
+                        }
+                        if matches!(leftover, "other id" | "multiple owners") {
+                            owner.id = AccountId("other".into());
+                        }
+                        store.upsert_account(&owner).unwrap();
+                    }
+                }
+                if let Some(metadata) = metadata {
+                    write_private(
+                        &config.join(metadata),
+                        if metadata.ends_with(".original-id") {
+                            "mail"
+                        } else {
+                            text
+                        },
+                    );
+                }
+                if metadata != Some("account.toml") {
+                    write_private(&registry.path("mail").unwrap(), text);
+                }
+                let route = registry.store_path(&base, "mail");
+                if matches!(leftover, "other email" | "other id" | "multiple owners") {
+                    assert!(
+                        route.unwrap_err().is_mailbox_link(),
+                        "{metadata:?} / {leftover}"
+                    );
+                    assert!(
+                        registry
+                            .load_with_removals(&base)
+                            .default_config()
+                            .is_none()
+                    );
+                } else {
+                    assert_eq!(route.unwrap(), base, "{metadata:?} / {leftover}");
+                    let catalog = registry.load_with_removals(&base);
+                    assert!(catalog.error.is_none(), "{metadata:?} / {leftover}");
+                    assert_eq!(catalog.default_config().unwrap().id, "mail");
+                    assert_eq!(registry.store_path(&base, "mail").unwrap(), base);
+                }
+                assert_eq!(
+                    mailbox_owner(&base).unwrap(),
+                    Some((original.id.0.clone(), original.email.clone()))
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_lost_or_invalid_marker_uses_the_migration_backup() {
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join("fell");
@@ -1042,13 +1278,14 @@ mod tests {
             for id in ["mail", "work"] {
                 write_private(
                     &registry.path(id).unwrap(),
-                    "email = 'synthetic@example.test'\npassword = 'fixture'\n",
+                    "name = 'Harbor Desk'\nemail = 'synthetic@example.test'\npassword = 'fixture'\n",
                 );
             }
             let catalog = registry.load_with_removals(&base);
             assert_eq!(catalog.default_config().unwrap().id, "work");
             let entry = &catalog.entries[0];
             assert_eq!(entry.path, registry.path("mail").unwrap());
+            assert_eq!(entry.damaged_link_name(), Some("Harbor Desk"));
             assert!(entry.config.as_ref().unwrap_err().is_mailbox_link());
             assert!(entry.file_identity.is_none());
         }

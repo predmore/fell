@@ -129,6 +129,41 @@ pub(super) struct FrozenAccounts {
     scroll: ScrollHandle,
 }
 
+pub(super) fn selected_account_path<'a>(
+    catalog: &'a fell_core::accounts::Accounts,
+    index: usize,
+    path: &Path,
+) -> Option<&'a Path> {
+    let mut paths: Vec<_> = catalog
+        .entries
+        .iter()
+        .map(|entry| entry.path.as_path())
+        .filter(|path| path.file_stem().is_some())
+        .chain(
+            catalog
+                .interrupted
+                .iter()
+                .map(|pending| pending.path.as_path()),
+        )
+        .collect();
+    paths.sort_unstable();
+    paths.dedup();
+    account_index(paths.iter().copied(), index, path).map(|index| paths[index])
+}
+
+fn account_index<'a>(
+    mut paths: impl ExactSizeIterator<Item = &'a Path>,
+    index: usize,
+    path: &Path,
+) -> Option<usize> {
+    let last = paths.len().checked_sub(1)?;
+    Some(
+        paths
+            .position(|candidate| candidate == path)
+            .unwrap_or(index.min(last)),
+    )
+}
+
 pub(super) enum CardMode<'a> {
     Live,
     Leaving,
@@ -226,12 +261,19 @@ impl View {
                             alert,
                         )
                     }
-                    Err(error) if link_damaged => (
-                        "Mailbox link damaged".into(),
-                        None,
-                        error.detail.lines().next().unwrap_or_default().into(),
-                        true,
-                    ),
+                    Err(error) if link_damaged => {
+                        use fell_core::accounts::MAILBOX_LINK_DAMAGED;
+                        let title = entry.damaged_link_name().map_or_else(
+                            || MAILBOX_LINK_DAMAGED.into(),
+                            |name| format!("{name} · {MAILBOX_LINK_DAMAGED}"),
+                        );
+                        (
+                            title,
+                            None,
+                            error.detail.lines().next().unwrap_or_default().into(),
+                            true,
+                        )
+                    }
                     Err(error) => (
                         entry.path.file_name()?.to_string_lossy().into_owned(),
                         None,
@@ -352,18 +394,18 @@ impl View {
         nav: &mut crate::model::settings::Nav,
         (index, path): (usize, PathBuf),
     ) {
-        let row = if self.accounts.is_empty() {
-            Row::AccountSetup
-        } else {
-            Row::Account(
-                self.accounts
-                    .iter()
-                    .position(|account| account.path == path)
-                    .unwrap_or_else(|| index.min(self.accounts.len() - 1)),
-            )
-        };
+        let row = account_index(
+            self.accounts.iter().map(|row| row.path.as_path()),
+            index,
+            &path,
+        )
+        .map_or(Row::AccountSetup, Row::Account);
         nav.select_row(row);
         self.scroll_to(nav.selected);
+    }
+
+    pub(super) fn account_position(&self, path: &Path) -> Option<usize> {
+        self.accounts.iter().position(|row| row.path == path)
     }
 
     pub fn scroll_to(&self, row: usize) {

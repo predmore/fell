@@ -454,7 +454,12 @@ impl Onboarding {
                 .map_or_else(mailbox::next_account_id, Ok)
                 .map_err(|error| crate::setup::SaveAccountError::File(error.into()))?;
             save_account(config, inline, &SecretService, |config| {
-                mailbox::stage_account_config(config, false, reusing)
+                let save = if reusing {
+                    mailbox::AccountSave::Reconnect
+                } else {
+                    mailbox::AccountSave::New
+                };
+                mailbox::stage_account_config(config, save)
             })
         });
         cx.spawn_in(window, async move |this, cx| {

@@ -506,11 +506,12 @@ fn registry_grants_cover_secondary_stores_and_disconnect_live_sessions() {
             "email = '{id}@example.test'\npassword = 'fixture'"
         )
         .unwrap();
+        let config = registry.get(&AccountId(id.into())).unwrap().unwrap();
         let db = registry.store_path(&ctx.store(), id).unwrap();
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
         Store::open(db)
             .unwrap()
-            .upsert_account(&account(id))
+            .upsert_account(&config.account())
             .unwrap();
     }
     ctx.registry = Some(registry.clone());

@@ -104,8 +104,8 @@ pub fn open_registered_store(
             return Err("The account file changed while opening the mailbox.".into());
         }
         let current = registry
-            .store_path(&store_path()?, &config.id)
-            .map_err(|err| err.to_string())?;
+            .configured_store_path(&store_path()?, config)
+            .map_err(|err| err.cli_message())?;
         if path.as_ref().is_ok_and(|path| *path != current) {
             return Err("The mailbox link changed while opening the account.".into());
         }
@@ -242,11 +242,15 @@ pub(crate) fn send_account_config(
         return Ok(None);
     }
     let registry = Registry::resolve()?;
-    registry.get(account)?.map(Some).ok_or_else(|| {
+    let config = registry.get(account)?.ok_or_else(|| {
         registry
             .path(account.as_str())
             .map_or_else(|err| err, |path| accounts::missing(&path))
-    })
+    })?;
+    if let Ok(base) = store_path() {
+        registry.configured_store_path(&base, &config)?;
+    }
+    Ok(Some(config))
 }
 
 #[cfg(test)]
@@ -292,6 +296,7 @@ pub fn load_account_file(id: Option<&str>) -> Result<(PathBuf, AccountConfig), S
 #[derive(Debug)]
 pub(crate) enum AccountFileError {
     AlreadyConfigured,
+    MailboxAddressConflict { id: String, email: String },
     Write(String),
 }
 
@@ -313,40 +318,74 @@ impl std::fmt::Display for AccountFileError {
             Self::AlreadyConfigured => {
                 f.write_str("An account is already configured. Reopen Fell to use it.")
             }
+            Self::MailboxAddressConflict { id, email } => write!(
+                f,
+                "{id} already holds mail for {email} · run with --replace to start an empty mailbox, or use the same address"
+            ),
             Self::Write(detail) => f.write_str(detail),
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AccountSave {
+    New,
+    Update,
+    Reconnect,
+    ReplaceMailbox,
 }
 
 /// Prepare the file so setup can save its keyring password before publishing
 /// the new config with mode 0600. Dropping the staged file keeps the current
 /// config in place.
 pub(crate) fn stage_account_config(
-    config: &AccountConfig,
-    replace: bool,
-    reconnect: bool,
+    config: &mut AccountConfig,
+    save: AccountSave,
 ) -> Result<StagedAccountConfig, AccountFileError> {
     let registry = Registry::resolve().map_err(|err| err.to_string())?;
     registry.migrate().map_err(|err| err.to_string())?;
-    let path = registry.path(&config.id).map_err(|err| err.to_string())?;
+    let mut path = registry.path(&config.id).map_err(|err| err.to_string())?;
     let lock = lock_account_dir(&path)?;
     let base = store_path()?;
     let mailbox = registry
         .store_path(&base, &config.id)
         .map_err(|err| err.to_string())?;
-    let configured = accounts::path_exists(&path).map_err(|err| err.to_string())?;
-    if configured && !replace {
+    let mut configured = accounts::path_exists(&path).map_err(|err| err.to_string())?;
+    if configured && save == AccountSave::New {
         return Err(AccountFileError::AlreadyConfigured);
     }
-    if reconnect {
+    let mut keep = None;
+    if save == AccountSave::Reconnect {
         if !can_reconnect_at(&registry, &base, &config.id, &config.email) {
             return Err("The kept mailbox changed. Review the account and try again.".into());
         }
+    } else if let Some((_, email)) = accounts::mailbox_owner(&mailbox)
+        .map_err(|err| err.to_string())?
+        .filter(|(_, email)| !email.eq_ignore_ascii_case(&config.email))
+    {
+        if save != AccountSave::ReplaceMailbox {
+            return Err(AccountFileError::MailboxAddressConflict {
+                id: config.id.clone(),
+                email,
+            });
+        }
+        let next = next_account_id_at(&registry, &base)?;
+        let previous = std::mem::replace(&mut config.id, next);
+        if configured {
+            let (_, snapshot) = accounts::read(&path, Some(&previous))
+                .map_err(|err| err.to_string())?
+                .ok_or("The account file changed. Review it and try again.")?;
+            keep = Some((previous, snapshot));
+        }
+        path = registry.path(&config.id).map_err(|err| err.to_string())?;
+        configured = false;
     } else if !configured && accounts::mailbox_exists(&mailbox).map_err(|err| err.to_string())? {
         return Err("This ID has a local mailbox. Choose a new ID or confirm reconnecting the same account.".into());
     }
     let mut staged = stage_account_text_at(path, &config.render(), !configured, lock)?;
-    if !configured && !reconnect {
+    if let Some((id, snapshot)) = keep {
+        staged.keep = Some((registry, base, id, snapshot));
+    } else if !configured && save != AccountSave::Reconnect {
         staged.original = Some((registry, base, config.id.clone()));
     }
     Ok(staged)
@@ -358,6 +397,7 @@ pub(crate) struct StagedAccountConfig {
     first_run: bool,
     lock: fs::File,
     original: Option<(Registry, PathBuf, String)>,
+    keep: Option<(Registry, PathBuf, String, String)>,
 }
 
 impl StagedAccountConfig {
@@ -388,6 +428,19 @@ impl StagedAccountConfig {
             );
         }
         self.lock.sync_all().map_err(|err| err.to_string())?;
+        if let Some((registry, base, id, snapshot)) = self.keep
+            && let Err(error) = registry.keep_for_replacement(&self.lock, &base, &id, &snapshot)
+        {
+            // If disconnect never happened, roll back the new account file.
+            // A completed disconnect leaves the old mailbox available to reconnect.
+            let old = registry.path(&id).map_err(|err| err.to_string())?;
+            if accounts::path_exists(&old).map_err(|err| err.to_string())? {
+                fs::remove_file(&self.path)
+                    .and_then(|()| self.lock.sync_all())
+                    .map_err(|err| format!("{error}; couldn't roll back the new account: {err}"))?;
+            }
+            return Err(error.into());
+        }
         Ok(self.path)
     }
 }
@@ -494,6 +547,7 @@ fn stage_account_text_at(
         first_run,
         lock,
         original: None,
+        keep: None,
     })
 }
 
@@ -754,12 +808,12 @@ mod tests {
         );
         config.id = "first".into();
         let marker = registry.directory().join(".original-id");
-        let staged = stage_account_config(&config, false, false).unwrap();
+        let staged = stage_account_config(&mut config, AccountSave::New).unwrap();
         assert!(!marker.exists());
         drop(staged);
         assert!(!marker.exists());
         assert!(!registry.path("first").unwrap().exists());
-        stage_account_config(&config, false, false)
+        stage_account_config(&mut config, AccountSave::New)
             .unwrap()
             .publish()
             .unwrap();
@@ -792,17 +846,94 @@ mod tests {
             retained_mailbox("Kept@example.test").as_deref(),
             Some("mail")
         );
-        assert!(stage_account_config(&config, true, false).is_err());
+        assert!(stage_account_config(&mut config, AccountSave::Update).is_err());
         config.email = "different@example.test".into();
-        assert!(stage_account_config(&config, true, true).is_err());
+        assert!(stage_account_config(&mut config, AccountSave::Reconnect).is_err());
         assert!(!registry.path("mail").unwrap().exists());
         config.email = "kept@example.test".into();
-        stage_account_config(&config, true, true)
+        stage_account_config(&mut config, AccountSave::Reconnect)
             .unwrap()
             .publish()
             .unwrap();
         assert!(registry.path("mail").unwrap().is_file());
         assert_eq!(registry.store_path(&base, "mail").unwrap(), base);
+    }
+
+    #[test]
+    fn replacing_a_configured_address_keeps_the_old_mailbox_under_its_id() {
+        let Some(_root) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let registry = Registry::resolve().unwrap();
+        let base = store_path().unwrap();
+        let mut original = AccountConfig::bridge(
+            "old@example.test",
+            "test-user",
+            fell_core::PasswordSource::Inline("fixture".into()),
+        );
+        original.id = "work".into();
+        let old_path = stage_account_config(&mut original, AccountSave::New)
+            .unwrap()
+            .publish()
+            .unwrap();
+        let old_mailbox = registry.store_path(&base, "work").unwrap();
+        let old_store = open_at(&old_mailbox).unwrap();
+        let old_id = AccountId("work".into());
+        old_store.upsert_account(&original.account()).unwrap();
+        old_store
+            .set_agent_grant(
+                &old_id,
+                "atlas",
+                fell_core::AgentGrant::enabled(true, false, false),
+            )
+            .unwrap();
+        let mut update = original.clone();
+        update.port = 1234;
+        update.email = "OLD@example.test".into();
+        stage_account_config(&mut update, AccountSave::Update)
+            .unwrap()
+            .publish()
+            .unwrap();
+        assert_eq!(registry.get(&old_id).unwrap().unwrap().port, 1234);
+        let mut replacement = original.clone();
+        replacement.email = "new@example.test".into();
+        assert!(matches!(
+            stage_account_config(&mut replacement, AccountSave::Update),
+            Err(AccountFileError::MailboxAddressConflict { id, email })
+                if id == "work" && email == "old@example.test"
+        ));
+        assert!(
+            old_store
+                .configure_account(&replacement.account(), false)
+                .is_err()
+        );
+        assert!(old_path.is_file());
+        let mut cancelled = replacement.clone();
+        drop(stage_account_config(&mut cancelled, AccountSave::ReplaceMailbox).unwrap());
+        assert!(old_path.is_file());
+        let new_path = stage_account_config(&mut replacement, AccountSave::ReplaceMailbox)
+            .unwrap()
+            .publish()
+            .unwrap();
+        assert_ne!(replacement.id, "work");
+        assert!(!old_path.exists());
+        assert!(new_path.is_file());
+        let new_mailbox = registry.store_path(&base, &replacement.id).unwrap();
+        assert_ne!(old_mailbox, new_mailbox);
+        assert!(!new_mailbox.exists());
+        assert_eq!(
+            old_store.get_account(&old_id).unwrap().unwrap(),
+            original.account()
+        );
+        assert!(!old_store.agent_grant(&old_id, "atlas").unwrap().enabled);
+        assert!(
+            open_at(&new_mailbox)
+                .unwrap()
+                .list_accounts()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(can_reconnect("work", &original.email));
     }
 
     #[test]

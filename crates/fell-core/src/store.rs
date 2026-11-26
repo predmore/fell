@@ -793,6 +793,22 @@ impl Store {
             )));
         }
         let tx = immediate_transaction(&self.conn)?;
+        let email: Option<String> = tx
+            .query_row(
+                "SELECT email FROM accounts WHERE id = ?1",
+                [account.id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(email) = email
+            && !email.eq_ignore_ascii_case(&account.email)
+        {
+            return Err(crate::Error::Invalid(format!(
+                "{} already holds mail for {email} · {}",
+                account.id.as_str(),
+                crate::accounts::MAILBOX_ADDRESS_RECOVERY,
+            )));
+        }
         crate::outbox::ensure_schema(&tx)?;
         let mut retained = Vec::new();
         for id in crate::backend::DEMO_ACCOUNT_IDS {

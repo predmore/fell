@@ -13,8 +13,8 @@ use fell_core::onboarding::{ConnectionProgress, check_connection, connection_rec
 use fell_core::{AccountConfig, BackendKind, ImapSecurity, PasswordSource};
 
 use crate::mailbox::{
-    AccountFileError, StagedAccountConfig, can_reconnect, load_account_file, next_account_id,
-    stage_account_config,
+    AccountFileError, AccountSave, StagedAccountConfig, can_reconnect, load_account_file,
+    next_account_id, stage_account_config,
 };
 
 const USAGE: &str = "\
@@ -28,6 +28,7 @@ setup options (anything missing is asked for on a terminal):
   Entered passwords are saved in the desktop keyring by default.
   --imap                       a plain IMAP account instead of Proton Mail Bridge
   --email ADDRESS              the address you send as
+  --replace                    with --id, keep the old mail and use a new ID for a different address
   --name NAME                  display name
   --username USER              IMAP username (Bridge shows it under the account's mailbox details)
   --password-stdin             read the password from the first line of stdin
@@ -92,6 +93,7 @@ struct Flags {
     security: Option<ImapSecurity>,
     smtp: SmtpFlags,
     no_check: bool,
+    replace: bool,
     help: bool,
 }
 
@@ -129,12 +131,16 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
                 flags.smtp.security = Some(security("--smtp-security", &value("--smtp-security")?)?)
             }
             "--no-check" => flags.no_check = true,
+            "--replace" => flags.replace = true,
             "--help" | "-h" => flags.help = true,
             other => return Err(format!("unknown option {other:?}\n\n{USAGE}")),
         }
     }
     if flags.password_stdin && flags.password_command.is_some() {
         return Err("use --password-stdin or --password-command, not both".into());
+    }
+    if flags.replace && flags.id.is_none() {
+        return Err(format!("--replace requires --id\n\n{USAGE}"));
     }
     if flags.password_inline && flags.password_command.is_some() {
         return Err("use --password-inline or --password-command, not both".into());
@@ -213,7 +219,7 @@ fn setup(args: &[String]) -> Result<(), String> {
         println!("{USAGE}");
         return Ok(());
     }
-    let replace = flags.id.is_some();
+    let named = flags.id.is_some();
     let id = match flags.id {
         Some(id) => {
             validate_id(&id).map_err(|err| format!("{id:?}: {err}"))?;
@@ -308,7 +314,7 @@ fn setup(args: &[String]) -> Result<(), String> {
     })?;
     config.validate().map_err(|err| err.to_string())?;
 
-    let reconnect = replace
+    let reconnect = named
         && tty
         && can_reconnect(&config.id, &config.email)
         && matches!(
@@ -327,11 +333,18 @@ fn setup(args: &[String]) -> Result<(), String> {
             )
         })?;
     }
+    let save = match (reconnect, flags.replace, named) {
+        (true, _, _) => AccountSave::Reconnect,
+        (_, true, _) => AccountSave::ReplaceMailbox,
+        (_, _, true) => AccountSave::Update,
+        _ => AccountSave::New,
+    };
+    let previous_id = config.id.clone();
     let path = save_account(
         config,
         flags.password_inline,
         &SecretService,
-        |config| stage_account_config(config, replace, reconnect),
+        |config| stage_account_config(config, save),
     )
     .map_err(|err| match err {
         SaveAccountError::File(detail) => detail.to_string(),
@@ -340,6 +353,12 @@ fn setup(args: &[String]) -> Result<(), String> {
             format!("{detail}\n{recovery}\nUse --password-inline or --password-command to choose a different password source.")
         }
     })?;
+    if path
+        .file_stem()
+        .is_some_and(|id| id != previous_id.as_str())
+    {
+        println!("Kept local mail under {previous_id}.");
+    }
     println!("Saved {} (mode 600). Open Fell to sync.", path.display());
     Ok(())
 }
@@ -358,7 +377,7 @@ pub(crate) fn save_account(
     mut config: AccountConfig,
     password_inline: bool,
     keyring: &dyn PasswordStore,
-    stage: impl FnOnce(&AccountConfig) -> Result<StagedAccountConfig, AccountFileError>,
+    stage: impl FnOnce(&mut AccountConfig) -> Result<StagedAccountConfig, AccountFileError>,
 ) -> Result<PathBuf, SaveAccountError> {
     let keyring_password = match (password_inline, config.password) {
         (false, PasswordSource::Inline(password)) => {
@@ -370,7 +389,7 @@ pub(crate) fn save_account(
             None
         }
     };
-    let staged = stage(&config).map_err(SaveAccountError::File)?;
+    let staged = stage(&mut config).map_err(SaveAccountError::File)?;
     if let Some(password) = keyring_password {
         config
             .store_keyring_password(keyring, &password)
@@ -396,7 +415,7 @@ fn list() -> Result<(), String> {
         println!("No accounts configured.");
     }
     if let Some(error) = accounts.error {
-        eprintln!("{error}");
+        eprintln!("{}", error.cli_message());
     }
     for entry in accounts.entries {
         if accounts
@@ -409,13 +428,17 @@ fn list() -> Result<(), String> {
         match entry.config {
             Ok(config) => println!("{}\t{}", config.id, config.email),
             Err(error) => println!(
-                "{}\t{error}",
-                entry.path.file_stem().unwrap_or_default().to_string_lossy()
+                "{}\t{}",
+                entry.path.file_stem().unwrap_or_default().to_string_lossy(),
+                error.cli_message(),
             ),
         }
     }
     for pending in accounts.interrupted {
-        println!("{}\t{} · Deletion interrupted", pending.id, pending.name);
+        println!(
+            "{}\t{} · Deletion interrupted. Open Fell Settings → Accounts to recover it.",
+            pending.id, pending.name
+        );
     }
     Ok(())
 }
@@ -504,7 +527,9 @@ fn recovery_choice(
     mut ask: impl FnMut(&str) -> Result<String, String>,
 ) -> Result<Option<bool>, String> {
     if !terminal {
-        return Err("Deletion interrupted. Open Settings → Accounts or run this command in a terminal to recover it.".into());
+        return Err(format!(
+            "{name} · Deletion interrupted. Open Fell Settings → Accounts or run this command in a terminal to recover it."
+        ));
     }
     let restore = if can_restore { "[r] Restore · " } else { "" };
     let question =
@@ -696,7 +721,7 @@ mod tests {
     fn interrupted_removal_requires_an_explicit_terminal_choice() {
         assert_eq!(
             recovery_choice(false, true, "Field Desk", |_| panic!()).unwrap_err(),
-            "Deletion interrupted. Open Settings → Accounts or run this command in a terminal to recover it."
+            "Field Desk · Deletion interrupted. Open Fell Settings → Accounts or run this command in a terminal to recover it."
         );
         for answer in ["", "n", "yes", "r", "R"] {
             for can_restore in [false, true] {
@@ -864,7 +889,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("account.toml");
-        let stage = |config: &AccountConfig| {
+        let stage = |config: &mut AccountConfig| {
             crate::mailbox::stage_account_config_at(path.clone(), config, false)
         };
         let keyring = FakeKeyring {

@@ -87,6 +87,10 @@ impl SaveState {
                         "An account is already configured",
                         Some("Quit and reopen Fell to use it."),
                     ),
+                    SaveAccountError::File(AccountFileError::MailboxAddressConflict { .. }) => (
+                        "This mailbox belongs to a different address",
+                        Some(fell_core::accounts::MAILBOX_ADDRESS_RECOVERY),
+                    ),
                     SaveAccountError::File(AccountFileError::Write(detail)) => {
                         ("Couldn’t save the account file", Some(detail.as_str()))
                     }

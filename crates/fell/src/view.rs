@@ -690,6 +690,7 @@ const LONG_GLIDE_PX: f32 = 4.0 * ROW_PX;
 
 const FIRST_PREVIEW_WAIT: Duration = Duration::from_millis(1500);
 const ACCOUNT_SWITCH_ENTER_QUIET: Duration = Duration::from_millis(250);
+const ACCOUNT_SWITCH_ENTER_MAX_FRAME: Duration = Duration::from_millis(120);
 const ACCOUNT_SWITCH_ENTER_LIMIT: Duration = Duration::from_secs(1);
 const ACCOUNT_READER_WAIT: Duration = Duration::from_millis(150);
 
@@ -713,7 +714,9 @@ impl AccountSwitchEnterGuard {
         // clear the guard ahead of key events queued while the UI stalled.
         if let Some(last) = self.last_frame.replace(now) {
             let elapsed = now.saturating_duration_since(last);
-            self.remaining = self.remaining.saturating_sub(elapsed.min(motion::MAX_STEP));
+            self.remaining = self
+                .remaining
+                .saturating_sub(elapsed.min(ACCOUNT_SWITCH_ENTER_MAX_FRAME));
         }
         self.armed(now)
     }

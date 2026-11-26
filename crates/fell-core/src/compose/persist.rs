@@ -1312,7 +1312,24 @@ pub(crate) fn remove_draft_workspaces(
         Err(err) => Err(err.to_string()),
     };
     for id in ids {
-        let folder = workspace::draft_folder(id)?;
+        let Ok(folder) = workspace::draft_folder(id) else {
+            crate::diagnostic!(
+                WARN,
+                "Skipped a draft with an invalid ID during account removal"
+            );
+            continue;
+        };
+        let control = workspace::control_dir(&folder);
+        if [&folder, &control]
+            .into_iter()
+            .any(|path| path.symlink_metadata().is_ok_and(|meta| !meta.is_dir()))
+        {
+            crate::diagnostic!(
+                WARN,
+                "Skipped a draft workspace that is not a directory during account removal"
+            );
+            continue;
+        }
         let index = compose_index_file(id).ok_or("No compose index directory")?;
         let other_store = indexed_store(&index).ok().is_some_and(|path| {
             std::path::absolute(path).ok() != std::path::absolute(mailbox).ok()
@@ -1321,7 +1338,7 @@ pub(crate) fn remove_draft_workspaces(
             continue;
         }
         missing_ok(std::fs::remove_dir_all(&folder))?;
-        missing_ok(std::fs::remove_dir_all(workspace::control_dir(&folder)))?;
+        missing_ok(std::fs::remove_dir_all(control))?;
         if let Some(root) = folder.parent() {
             missing_ok(std::fs::File::open(root).and_then(|dir| dir.sync_all()))?;
         }

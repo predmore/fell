@@ -72,12 +72,25 @@ impl Registry {
                     .iter_mut()
                     .find(|entry| entry.path == config)
                 {
+                    entry.damaged_link_name = entry
+                        .config
+                        .as_ref()
+                        .ok()
+                        .map(|config| config.account().display_name);
                     entry.config = Err(error);
                     entry.file_identity = None;
                 } else {
+                    let damaged_link_name = path
+                        .extension()
+                        .is_some_and(|ext| ext == "toml")
+                        .then(|| read(&path, None).ok().flatten())
+                        .flatten()
+                        .filter(|(config, _)| config.id == id)
+                        .map(|(config, _)| config.account().display_name);
                     catalog.entries.push(Entry {
                         path,
                         config: Err(error),
+                        damaged_link_name,
                         file_identity: None,
                     });
                 }
@@ -169,6 +182,26 @@ impl Registry {
     /// mailbox stays closed until removal resumes using that directory.
     pub fn remove(&self, base: &Path, id: &str, delete: bool) -> Result<RemovalOutcome, String> {
         self.remove_impl(base, id, delete, None, false)
+    }
+
+    /// Disconnect a mailbox while the caller holds the exclusive registry
+    /// lock, preserving its ID so its mail and drafts can be reconnected.
+    pub fn keep_for_replacement(
+        &self,
+        directory: &File,
+        base: &Path,
+        id: &str,
+        snapshot: &str,
+    ) -> Result<(), String> {
+        let account = self.path(id).map_err(|err| err.to_string())?;
+        let mailbox = self.store_path(base, id).map_err(|err| err.to_string())?;
+        if !read(&account, Some(id))
+            .is_ok_and(|current| current.is_some_and(|(_, text)| text == snapshot))
+        {
+            return Err("The account file changed. Review it and try again.".into());
+        }
+        let store = Store::open_existing_without_index(&mailbox).map_err(|err| err.to_string())?;
+        keep(&account, directory, &AccountId(id.into()), Some(&store))
     }
 
     pub fn remove_if_unchanged(
@@ -285,12 +318,7 @@ impl Registry {
             Err(err) => return Err(err.to_string()),
         };
         if !delete {
-            if let Some(store) = store {
-                store
-                    .disable_account_grants(&id)
-                    .map_err(|err| err.to_string())?;
-            }
-            disconnect(&account, &directory).map_err(|err| err.to_string())?;
+            keep(&account, &directory, &id, store.as_ref())?;
             return Ok(RemovalOutcome::Kept);
         }
 
@@ -515,12 +543,21 @@ fn finish(
 ) -> Result<(), String> {
     let committed = trash.join("committed");
     match committed.symlink_metadata() {
-        Ok(_) => {}
+        Ok(_) => {
+            // Older Fell versions committed before cleaning up drafts.
+            if compose::remove_draft_workspaces(&plan.drafts, &plan.account, mailbox).is_err() {
+                crate::diagnostic!(
+                    WARN,
+                    "Skipped draft cleanup for a committed mailbox deletion"
+                );
+            }
+        }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             move_mailbox(mailbox, trash, false).map_err(|err| err.to_string())?;
             disconnect(account, directory).map_err(|err| err.to_string())?;
-            // The next step can unlink drafts or SQLite files. Persist the
-            // point of no return before it touches either.
+            // If draft cleanup fails, leave SQLite intact so Restore can
+            // recover the mailbox and its saved drafts.
+            compose::remove_draft_workspaces(&plan.drafts, &plan.account, mailbox)?;
             File::create_new(&committed)
                 .and_then(|file| file.sync_all())
                 .and_then(|()| sync_dir(trash))
@@ -528,7 +565,6 @@ fn finish(
         }
         Err(err) => return Err(err.to_string()),
     }
-    compose::remove_draft_workspaces(&plan.drafts, &plan.account, mailbox)?;
     for suffix in MAILBOX_SUFFIXES {
         absent_ok(fs::remove_file(staged_file(trash, mailbox, suffix)))
             .map_err(|err| err.to_string())?;
@@ -548,6 +584,20 @@ fn clear_trash(trash: &Path) -> io::Result<()> {
 fn disconnect(account: &Path, directory: &File) -> io::Result<()> {
     absent_ok(fs::remove_file(account))?;
     directory.sync_all()
+}
+
+fn keep(
+    account: &Path,
+    directory: &File,
+    id: &AccountId,
+    store: Option<&Store>,
+) -> Result<(), String> {
+    if let Some(store) = store {
+        store
+            .disable_account_grants(id)
+            .map_err(|err| err.to_string())?;
+    }
+    disconnect(account, directory).map_err(|err| err.to_string())
 }
 
 fn sync_dir(path: &Path) -> io::Result<()> {
@@ -738,5 +788,49 @@ mod tests {
             RemovalOutcome::Deleted
         );
         assert!(!trash.exists());
+    }
+
+    #[test]
+    fn failed_draft_cleanup_leaves_the_staged_mailbox_restorable() {
+        let Some(root) = crate::test_support::in_isolated_process() else {
+            return;
+        };
+        let registry = Registry::resolve().unwrap();
+        let base = root.join("mail.db");
+        let account = registry.path("work").unwrap();
+        let mailbox = registry.mailbox_path(&base, "work").unwrap();
+        let trash = removal_trash(&mailbox);
+        fs::create_dir_all(registry.directory()).unwrap();
+        fs::create_dir_all(&trash).unwrap();
+        let config = "email = 'work@example.test'\npassword = 'fixture'\n";
+        publish(&trash, &trash.join("account.toml"), config.as_bytes()).unwrap();
+        let owner = crate::AccountConfig::parse_for(config, "work")
+            .unwrap()
+            .account();
+        Store::open(staged_file(&trash, &mailbox, ""))
+            .unwrap()
+            .upsert_account(&owner)
+            .unwrap();
+        fs::write(trash.join("plan"), br#"["work",["../invalid","cblocked"]]"#).unwrap();
+        // A directory in place of an index file makes cleanup fail after the
+        // invalid ID is skipped, regardless of the effective user's privileges.
+        fs::create_dir_all(root.join("data/compose-stores/cblocked")).unwrap();
+        let failure = registry
+            .recover_removal(&base, "work", true, None)
+            .unwrap_err();
+        assert!(failure.contains("Is a directory"), "{failure}");
+        assert!(!trash.join("committed").exists());
+        assert!(registry.load_with_removals(&base).interrupted[0].can_restore);
+        assert_eq!(
+            registry
+                .recover_removal(&base, "work", false, None)
+                .unwrap(),
+            RemovalOutcome::Restored { connected: true }
+        );
+        assert_eq!(fs::read_to_string(account).unwrap(), config);
+        assert_eq!(
+            mailbox_owner(&mailbox).unwrap(),
+            Some((owner.id.0, owner.email))
+        );
     }
 }
