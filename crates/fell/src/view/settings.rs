@@ -97,6 +97,7 @@ pub(super) struct View {
     page_fade: Option<Transition>,
     server: Option<String>,
     identities: Vec<Identity>,
+    identity_read: Option<gpui::Task<()>>,
     identity_candidates: Option<Result<Vec<IdentityCandidate>, String>>,
     importing_identities: bool,
     setup: Option<gpui::AnyWindowHandle>,
@@ -151,6 +152,7 @@ impl View {
             identities: account
                 .map(AccountConfig::compose_identities)
                 .unwrap_or_default(),
+            identity_read: None,
             identity_candidates: None,
             importing_identities: false,
             setup: None,
@@ -331,6 +333,7 @@ impl Inbox {
                 if this
                     .update(cx, |inbox, cx| {
                         inbox.apply_settings(snapshot, theme, motion, cx);
+                        inbox.refresh_settings_identities(cx);
                         if let Some(error) = save_error {
                             inbox.settings_notice(
                                 format!("Could not save settings · {error}"),
@@ -524,6 +527,31 @@ impl Inbox {
         .detach();
     }
 
+    pub(super) fn refresh_settings_identities(&mut self, cx: &mut Context<Self>) {
+        if self.session.overlay != Overlay::Settings
+            || self.session.settings_nav.page != Page::Section(Section::Accounts)
+        {
+            return;
+        }
+        let account = self.account_id.clone();
+        let read = cx.background_executor().spawn(async move {
+            mailbox::send_account_config(&account)
+                .map(|config| config.map_or_else(Vec::new, |config| config.compose_identities()))
+        });
+        self.settings_view.identity_read = Some(cx.spawn(async move |this, cx| {
+            let result = read.await;
+            let _ = this.update(cx, |inbox, cx| {
+                if let Ok(identities) = result
+                    && inbox.settings_view.identities != identities
+                {
+                    inbox.settings_view.identities = identities;
+                    inbox.refresh_settings_availability();
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
     fn read_identity_candidates(&mut self, cx: &mut Context<Self>) {
         self.settings_view.identity_candidates = None;
         let account = self.account_id.clone();
@@ -600,6 +628,7 @@ impl Inbox {
                 inbox.settings_view.importing_identities = false;
                 match result {
                     Ok(config) => {
+                        inbox.settings_view.identity_read = None;
                         inbox.settings_view.identities = config.compose_identities();
                         inbox.refresh_settings_availability();
                         if inbox.session.settings_nav.page == Page::IdentityImport {
@@ -837,7 +866,7 @@ const ACCOUNT_SUMMARY_HEIGHT: f32 = 80.;
 const BODY_PADDING: f32 = 16.;
 const BINDING_ROW_HEIGHT: f32 = 39.;
 const MAX_BINDING_ROWS: f32 = 9.;
-const IDENTITY_ROW_HEIGHT: f32 = 40.;
+const IDENTITY_ROW_HEIGHT: f32 = 48.;
 const INDEX_FOOTER_HEIGHT: f32 = 21.;
 const SEARCH_SUMMARY_HEIGHT: f32 = 70.;
 const VALUE_TEXT_SIZE: f32 = 13.;
@@ -879,7 +908,7 @@ pub(super) fn card_height(nav: &nav::Nav, room: f32, narrow: bool) -> f32 {
         }
         Page::ConfirmModel { install: true } if narrow => 445.,
         Page::ConfirmModel { .. } => 370.,
-        Page::IdentityImport => 44. + (nav.identity_candidates + 1) as f32 * IDENTITY_ROW_HEIGHT,
+        Page::IdentityImport => 54. + (nav.identity_candidates + 1) as f32 * IDENTITY_ROW_HEIGHT,
         Page::Bindings => unreachable!(),
     };
     (HEADER_HEIGHT + rows + 18.).min(room.max(120.))
@@ -1197,11 +1226,20 @@ pub(super) fn card(
                             .child(row_label(
                                 theme,
                                 crate::present::display_safe(label),
-                                secondary.map(crate::present::display_safe),
+                                Some(
+                                    secondary
+                                        .map_or_else(String::new, crate::present::display_safe),
+                                ),
                                 false,
                             ))
                             .when(index == 0, |row| {
-                                row.child(trailing(theme, "Default", false))
+                                row.child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(12.))
+                                        .text_color(rgb(theme.dimmed))
+                                        .child("Default"),
+                                )
                             }),
                     );
                 }
@@ -1320,8 +1358,23 @@ pub(super) fn card(
         }
         Page::IdentityImport => match &view.identity_candidates {
             Some(Ok(candidates)) if !candidates.is_empty() => {
+                body = body.child(
+                    div()
+                        .px(px(10.)).py(px(6.))
+                        .text_size(px(12.)).line_height(px(17.))
+                        .text_color(rgb(theme.dimmed))
+                        .child("Found in mail delivered to this account. Selected addresses are added to account.toml."),
+                );
                 for (index, candidate) in candidates.iter().enumerate() {
                     let label = crate::present::display_safe(&candidate.address);
+                    let focused = selected == index;
+                    let mark = if focused {
+                        theme.on_selection
+                    } else if candidate.selected {
+                        theme.accent
+                    } else {
+                        theme.dimmed
+                    };
                     body = body.child(
                         row(
                             theme,
@@ -1331,11 +1384,26 @@ pub(super) fn card(
                             IDENTITY_ROW_HEIGHT,
                             cx,
                         )
-                        .child(row_label(theme, label, None::<&str>, selected == index))
-                        .child(trailing(
+                        .child(
+                            div()
+                                .flex_none()
+                                .size(px(16.))
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(rgb(mark))
+                                .text_color(rgb(mark))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(12.))
+                                .line_height(px(14.))
+                                .when(candidate.selected, |box_| box_.child("✓")),
+                        )
+                        .child(row_label(
                             theme,
-                            if candidate.selected { "✓" } else { "□" },
-                            selected == index,
+                            label,
+                            None::<&str>,
+                            focused,
                         )),
                     );
                 }

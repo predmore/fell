@@ -52,6 +52,7 @@ pub use server::{
     DraftSaveStatus, SERVER_DRAFT_SAVE_FAILED, SERVER_DRAFT_SAVE_RETRYING, SaveReceipt,
     server_draft_open_notice,
 };
+pub(crate) use session::signature_range;
 pub use session::{
     AddressView, AttachmentView, DraftSession, HunkView, ReplyContext, SendLock, SentCopy,
     Snapshot, signature_block,

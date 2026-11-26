@@ -850,8 +850,9 @@ impl Inbox {
             }
         })
         .detach();
-        cx.observe_window_activation(window, |_, window, cx| {
+        cx.observe_window_activation(window, |this, window, cx| {
             if window.is_window_active() {
+                this.refresh_settings_identities(cx);
                 cx.notify();
             }
         })
@@ -4713,6 +4714,7 @@ impl Inbox {
             let page = self.session.settings_nav.page;
             if settings_page != Some(page) {
                 self.settings_view.reset_scroll();
+                self.refresh_settings_identities(cx);
             }
             if matches!(
                 page,

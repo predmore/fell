@@ -56,6 +56,13 @@ struct Palette {
     hunk: u32,
     /// The focused agent edit: a stronger tint than the others.
     hunk_focus: u32,
+    signature: bool,
+}
+
+impl Palette {
+    fn strong(self) -> FontWeight {
+        FontWeight(if self.signature { 600. } else { 700. })
+    }
 }
 
 fn palette(kind: ThemeKind) -> Palette {
@@ -75,6 +82,7 @@ fn palette(kind: ThemeKind) -> Palette {
             rule: 0x6e675f,
             hunk: 0x243044,
             hunk_focus: 0x2e3f5c,
+            signature: false,
         },
         ThemeKind::Light => Palette {
             bg: 0xf7f5f2,
@@ -91,6 +99,7 @@ fn palette(kind: ThemeKind) -> Palette {
             rule: 0x8f877e,
             hunk: 0xe7eef8,
             hunk_focus: 0xd3e0f2,
+            signature: false,
         },
     }
 }
@@ -132,6 +141,7 @@ fn palette_from_theme(theme: &crate::theme::Theme) -> Palette {
         rule: theme.border,
         hunk,
         hunk_focus,
+        signature: false,
     }
 }
 
@@ -341,6 +351,7 @@ pub struct ComposeView {
     which_visible: bool,
     palette: Option<String>,
     from_picker: Option<identity::Picker>,
+    identity_display: identity::Display,
     status: SharedString,
     sent: bool,
     /// The draft whose send is talking to the server. Another send of it
@@ -473,6 +484,7 @@ impl ComposeView {
             which_visible: false,
             palette: None,
             from_picker: None,
+            identity_display: identity::Display::default(),
             status: "".into(),
             sent: false,
             sending: None,
@@ -1020,6 +1032,7 @@ impl ComposeView {
         self.send_panel = SendPanel::Summary;
         self.palette = None;
         self.from_picker = None;
+        self.identity_display = identity::Display::default();
         self.leader = false;
         self.which_visible = false;
         self.quote_open = false;
@@ -1481,6 +1494,7 @@ impl ComposeView {
         self.editor.count = 0;
         self.bracket = None;
         self.touched = true;
+        self.identity_display.settle();
         cx.notify();
     }
 
@@ -1490,6 +1504,7 @@ impl ComposeView {
             return;
         }
         self.touched = true;
+        self.identity_display.settle();
         let key = compose_key(&event.keystroke);
         let key = key.as_str();
         if self.send_panel != SendPanel::Summary {
@@ -2213,27 +2228,63 @@ impl Render for ComposeView {
             }
         }
         window.focus(&self.focus);
-        let (mut snap, mut lock, reply_check) = self
-            .hub
-            .with_session(self.draft_id.as_ref(), |session| {
-                let snap = session.snapshot();
-                let check = snap.reply_to_unverified.then(|| {
-                    if snap
-                        .reply_context
-                        .as_ref()
-                        .is_some_and(|parent| parent.reply_to.is_some())
-                    {
-                        ReplyCheck::Verified
-                    } else if let Some(parent) = snap.in_reply_to.as_deref() {
-                        cx.global::<ReplyChecks>()
-                            .for_draft(session.account_id(), parent)
-                    } else {
-                        ReplyCheck::Waiting
-                    }
+        let (mut snap, mut lock, reply_check, can_pick_from, default_from, managed_signature) =
+            self.hub
+                .with_session(self.draft_id.as_ref(), |session| {
+                    let snap = session.snapshot();
+                    let check = snap.reply_to_unverified.then(|| {
+                        if snap
+                            .reply_context
+                            .as_ref()
+                            .is_some_and(|parent| parent.reply_to.is_some())
+                        {
+                            ReplyCheck::Verified
+                        } else if let Some(parent) = snap.in_reply_to.as_deref() {
+                            cx.global::<ReplyChecks>()
+                                .for_draft(session.account_id(), parent)
+                        } else {
+                            ReplyCheck::Waiting
+                        }
+                    });
+                    let lock = session.send_lock();
+                    let can_pick = lock.is_none() && identity::can_pick(session, &snap.from);
+                    let default = session.identities().first().is_none_or(|identity| {
+                        fell_core::compose::email_of(&snap.from)
+                            .is_some_and(|email| identity.address.eq_ignore_ascii_case(&email))
+                    });
+                    (
+                        snap,
+                        lock,
+                        check,
+                        can_pick,
+                        default,
+                        session.managed_signature().map(str::to_owned),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    (
+                        empty_snapshot(self.draft_id.as_ref()),
+                        None,
+                        None,
+                        false,
+                        true,
+                        None,
+                    )
                 });
-                (snap, session.send_lock(), check)
+        if self.identity_display.update(
+            &snap.from,
+            default_from,
+            managed_signature,
+            &snap.body,
+            self.motion,
+            window,
+        ) {
+            cx.spawn(async |this, cx| {
+                cx.background_executor().timer(identity::NOTICE_HOLD).await;
+                let _ = this.update(cx, |_, cx| cx.notify());
             })
-            .unwrap_or_else(|| (empty_snapshot(self.draft_id.as_ref()), None, None));
+            .detach();
+        }
         // The inbox gets a chance to lay out the reply before we close.
         // Keep the in-flight footer until it takes over.
         if self.close_on_send
@@ -2298,7 +2349,7 @@ impl Render for ComposeView {
             Mode::Visual => "visual",
         };
         // The mode word says it all; how to change mode is not news.
-        let hint: SharedString = if idle_status(&self.status) {
+        let mut hint: SharedString = if idle_status(&self.status) {
             self.recipient_errors
                 .iter()
                 .flatten()
@@ -2308,6 +2359,13 @@ impl Render for ComposeView {
         } else {
             self.status.clone()
         };
+        let notice_opacity = self
+            .identity_display
+            .kept_opacity(self.motion, window)
+            .filter(|_| idle_status(&hint));
+        if notice_opacity.is_some() {
+            hint = identity::KEPT_SIGNATURE.into();
+        }
         let header_matches = self.header_matches(&snap);
         let save_exit = &mut self.draft_save_exit;
         let motion = self.motion;
@@ -2348,13 +2406,7 @@ impl Render for ComposeView {
             .look
             .as_ref()
             .and_then(|theme| theme.mono_family.clone());
-        let can_pick_from = lock.is_none()
-            && self
-                .hub
-                .with_session(self.draft_id.as_ref(), |session| {
-                    identity::can_pick(session, &snap.from)
-                })
-                .unwrap_or(false);
+        let from_label = self.identity_display.label(recipient_theme);
         let from_picker = self.identity_picker_view(recipient_theme, window, cx);
         let feedback = feedback.map(|feedback| {
             send_feedback_view(feedback, self.send_panel, &self.send_detail_scroll, colors)
@@ -2395,7 +2447,16 @@ impl Render for ComposeView {
                     .size_0(),
                 )
             })
-            .child(header(&snap, colors, can_pick_from, cx).flex_shrink_0())
+            .child(
+                header(
+                    &snap,
+                    from_label,
+                    colors,
+                    can_pick_from && lock.is_none(),
+                    cx,
+                )
+                .flex_shrink_0(),
+            )
             // Everything between the header and the Attachments divider:
             // the HTML preview panel covers exactly this, so it never ends
             // partway into a row below.
@@ -2440,6 +2501,7 @@ impl Render for ComposeView {
                     ComposeStatus {
                         mode,
                         note: &hint,
+                        notice_opacity,
                         draft_save,
                         invalid_recipients: self.recipient_errors.iter().any(Option::is_some),
                     },
@@ -2705,38 +2767,39 @@ impl ComposeView {
         family: &str,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let body = if !self.raw && self.field != Field::Body {
-            let key = StyledBodyKey {
-                draft_id: self.draft_id.clone(),
-                revision: snap.revision,
-                hunk: self.focused_hunk,
-                colors,
-                family: family.to_owned(),
-                text_px: self.ui_px,
-            };
-            if self
-                .styled_cache
-                .as_ref()
-                .is_none_or(|(previous, _)| *previous != key)
-            {
-                let compose = cx.weak_entity();
-                let view = cx.new(|_| CachedStyledBody {
-                    compose,
+        let body =
+            if !self.raw && self.field != Field::Body && self.identity_display.footer().is_none() {
+                let key = StyledBodyKey {
+                    draft_id: self.draft_id.clone(),
+                    revision: snap.revision,
+                    hunk: self.focused_hunk,
                     colors,
                     family: family.to_owned(),
-                });
-                self.styled_cache = Some((key, view));
-            }
-            let view = self.styled_cache.as_ref().unwrap().1.clone();
-            let mut style = div().flex_1().min_h_0().min_w_0();
-            gpui::AnyView::from(view)
-                .cached(style.style().clone())
-                .into_any_element()
-        } else {
-            self.styled_cache = None;
-            self.body_area(snap, colors, window, family, cx)
-                .into_any_element()
-        };
+                    text_px: self.ui_px,
+                };
+                if self
+                    .styled_cache
+                    .as_ref()
+                    .is_none_or(|(previous, _)| *previous != key)
+                {
+                    let compose = cx.weak_entity();
+                    let view = cx.new(|_| CachedStyledBody {
+                        compose,
+                        colors,
+                        family: family.to_owned(),
+                    });
+                    self.styled_cache = Some((key, view));
+                }
+                let view = self.styled_cache.as_ref().unwrap().1.clone();
+                let mut style = div().flex_1().min_h_0().min_w_0();
+                gpui::AnyView::from(view)
+                    .cached(style.style().clone())
+                    .into_any_element()
+            } else {
+                self.styled_cache = None;
+                self.body_area(snap, colors, window, family, cx)
+                    .into_any_element()
+            };
         let mut column = div()
             .flex()
             .flex_col()
@@ -2785,6 +2848,7 @@ impl ComposeView {
             view: cx.weak_entity(),
             row: self.editor.row,
             window,
+            signature_swap: self.identity_display.footer(),
         };
         div()
             .id("compose-body")
@@ -3265,6 +3329,7 @@ impl PreparedSend {
 
 fn header(
     snap: &Snapshot,
+    from_label: gpui::Div,
     colors: Palette,
     can_pick_from: bool,
     cx: &mut Context<ComposeView>,
@@ -3314,12 +3379,7 @@ fn header(
                             cx.notify();
                         }))
                 })
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .child(format!("From {}", crate::present::display_safe(&snap.from))),
-                )
+                .child(from_label)
                 .when(can_pick_from, |from| {
                     from.child(div().flex_none().child("⌄"))
                 }),
@@ -3960,18 +4020,25 @@ fn styled_body(
     was_lines: &dyn Fn(&str) -> Vec<String>,
 ) -> gpui::Div {
     let text = editor.text();
-    let doc = markdown_to_doc(&text);
+    // Keep the normal block painter for a footer under agent review, so its
+    // changed text and the previous version stay visible together.
+    let (signature, body_end) = signature_start(editor)
+        .map(|row| (row, cursor_byte(&text, row, 0)))
+        .filter(|&(_, start)| hunks.iter().all(|(_, end, _, _)| *end <= start))
+        .map_or((None, text.len()), |(row, start)| (Some(row), start));
+    let doc = markdown_to_doc(&text[..body_end]);
     let mut column = div().flex().flex_col();
     let mut previous: Option<&BlockBody> = None;
-    let items: Vec<BodyItem> = if editor.caret_hidden {
-        // Typing goes to a header field: every block shows styled, with
-        // no caret line, so there is one caret on screen.
-        (0..doc.blocks.len())
-            .map(|index| BodyItem::Block { index, raw: false })
-            .collect()
-    } else {
-        body_layout(&text, editor.row, editor.col, &doc)
-    };
+    let items: Vec<BodyItem> =
+        if editor.caret_hidden || signature.is_some_and(|row| editor.row >= row) {
+            // Typing goes to a header field: every block shows styled, with
+            // no caret line, so there is one caret on screen.
+            (0..doc.blocks.len())
+                .map(|index| BodyItem::Block { index, raw: false })
+                .collect()
+        } else {
+            body_layout(&text, editor.row, editor.col, &doc)
+        };
     for (index, item) in items.into_iter().enumerate() {
         let (body, mut painted) = match item {
             BodyItem::CaretRow => (None, cursor_line_row(editor, paint)),
@@ -4013,7 +4080,7 @@ fn styled_body(
         previous = body;
         column = column.child(painted);
     }
-    column
+    column.children(signature_view(editor, signature, Some(links), paint))
 }
 
 /// One row of the styled body, top to bottom.
@@ -4094,7 +4161,11 @@ fn cursor_line_row(editor: &Editor, paint: &SourcePaint) -> gpui::Div {
 
 fn raw_body(editor: &Editor, paint: &SourcePaint) -> gpui::Div {
     let mut column = div().flex().flex_col().font_family("monospace");
-    for (index, line) in editor.lines.iter().enumerate() {
+    let signature = signature_start(editor);
+    for (index, line) in editor.lines[..signature.unwrap_or(editor.lines.len())]
+        .iter()
+        .enumerate()
+    {
         let cursor = !editor.caret_hidden && index == editor.row;
         column = column.child(raw_line(
             line,
@@ -4105,7 +4176,82 @@ fn raw_body(editor: &Editor, paint: &SourcePaint) -> gpui::Div {
             paint,
         ));
     }
-    column
+    column.children(signature_view(editor, signature, None, paint))
+}
+
+fn signature_start(editor: &Editor) -> Option<usize> {
+    editor
+        .lines
+        .iter()
+        .rposition(|line| line == identity::SIGNATURE_SEPARATOR)
+}
+
+fn signature_view(
+    editor: &Editor,
+    start: Option<usize>,
+    links: Option<Links>,
+    paint: &SourcePaint,
+) -> Option<gpui::AnyElement> {
+    let mut footer_paint = SourcePaint {
+        font: paint.font.clone(),
+        view: paint.view.clone(),
+        ..*paint
+    };
+    footer_paint.colors.signature = true;
+    footer_paint.colors.fg = paint.colors.dim;
+    footer_paint.colors.accent = paint.colors.dim;
+    let rows = |lines: &mut dyn Iterator<Item = &str>, start: Option<usize>| {
+        let mut footer = div()
+            .flex()
+            .flex_col()
+            .pt(px(8.))
+            .line_height(footer_paint.line_height());
+        for (offset, line) in lines.enumerate() {
+            let cursor = start
+                .filter(|&row| !editor.caret_hidden && row + offset == editor.row)
+                .map(|_| editor.col);
+            let urls = match (cursor, links) {
+                (None, Some(links)) => Urls::Fold(links),
+                _ => Urls::Source,
+            };
+            footer = footer.child(raw_line(
+                line,
+                cursor,
+                urls,
+                editor.mode,
+                false,
+                &footer_paint,
+            ));
+        }
+        footer
+    };
+    let current = start.map(|start| {
+        rows(
+            &mut editor.lines[start..].iter().map(String::as_str),
+            Some(start),
+        )
+    });
+    if let Some((old, progress)) = paint.signature_swap {
+        let old = if old.is_empty() {
+            div()
+        } else {
+            rows(&mut old.lines(), None)
+        };
+        let width =
+            (paint.window.viewport_size().width - paint.window.rem_size() * 2.5).max(px(1.));
+        Some(crate::view::disclosure::layered(
+            f32::from(width),
+            [
+                old.into_any_element(),
+                current.unwrap_or_else(div).into_any_element(),
+            ],
+            [1. - progress, progress],
+            progress,
+            [true; 2],
+        ))
+    } else {
+        current.map(IntoElement::into_any_element)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4305,6 +4451,17 @@ struct SourcePaint<'a> {
     view: gpui::WeakEntity<ComposeView>,
     row: usize,
     window: &'a Window,
+    signature_swap: Option<(&'a str, f32)>,
+}
+
+impl SourcePaint<'_> {
+    fn line_height(&self) -> gpui::Pixels {
+        if self.colors.signature {
+            px((20. * self.text_px / 15.).round())
+        } else {
+            px(24.)
+        }
+    }
 }
 
 /// One source line. On an agent edit's `tinted` background, a link's URL
@@ -4331,7 +4488,7 @@ fn raw_line(
         .flex_row()
         .flex_wrap()
         .w_full()
-        .min_h(px(24.))
+        .min_h(paint.line_height())
         .items_center();
     let colors = paint.colors;
     source_pieces(
@@ -4397,7 +4554,7 @@ fn focused_link_text(
             }
             let mut font = font.clone();
             match kind {
-                StyleKind::Strong => font.weight = FontWeight(700.),
+                StyleKind::Strong => font.weight = colors.strong(),
                 StyleKind::Em => font.style = gpui::FontStyle::Italic,
                 StyleKind::Code => font.family = "monospace".into(),
                 _ => {}
@@ -4612,7 +4769,7 @@ fn focused_link_line(
         .flex_col()
         .w_full()
         .min_w(px(0.))
-        .min_h(px(24.))
+        .min_h(paint.line_height())
         .cursor_text()
         .when(flat_wrap, |row| row.whitespace_nowrap())
         .on_mouse_down(gpui::MouseButton::Left, move |event, _, cx| {
@@ -4759,7 +4916,7 @@ fn source_pieces(
             continue;
         }
         let weight = match span.kind {
-            StyleKind::Strong => FontWeight(700.),
+            StyleKind::Strong => colors.strong(),
             _ => FontWeight(400.),
         };
         let source = Source {
@@ -5923,6 +6080,7 @@ fn idle_status(status: &str) -> bool {
 struct ComposeStatus<'a> {
     mode: &'a str,
     note: &'a str,
+    notice_opacity: Option<f32>,
     draft_save: Option<(DraftSaveStatus, f32)>,
     invalid_recipients: bool,
 }
@@ -5954,6 +6112,7 @@ fn status_bar(
     let ComposeStatus {
         mode,
         note,
+        notice_opacity,
         draft_save,
         invalid_recipients,
     } = status;
@@ -5999,7 +6158,7 @@ fn status_bar(
         Some((DraftSaveStatus::Server, alpha)) => ("saved to Drafts", colors.dim, alpha),
         Some((status, alpha)) => (status.warning().unwrap_or_default(), colors.error, alpha),
         None if idle => ("", colors.fg, 1.),
-        None => (note, colors.fg, 1.),
+        None => notice_opacity.map_or((note, colors.fg, 1.), |alpha| (note, colors.dim, alpha)),
     };
     let warning = saved.is_some_and(|(status, _)| status.warning().is_some());
     let message_measure = if warning { measure_warning } else { measure };

@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use fell_core::{Identity, compose::DraftSession};
 use gpui::{
@@ -9,9 +9,185 @@ use gpui::{
 use super::ComposeView;
 use crate::{keymap, motion, present, theme};
 
+pub(super) const KEPT_SIGNATURE: &str = "Kept your edited signature";
+pub(super) const SIGNATURE_SEPARATOR: &str = "-- ";
+pub(super) const NOTICE_HOLD: Duration = Duration::from_millis(2500);
+
+#[derive(Default)]
+pub(super) struct Display {
+    current: Sender,
+    managed: Option<String>,
+    fade: Option<SenderFade>,
+    progress: f32,
+    kept_since: Option<Instant>,
+}
+
+#[derive(Default)]
+struct Sender {
+    name: Option<String>,
+    address: String,
+    other_than_default: bool,
+}
+
+struct SenderFade {
+    from: Sender,
+    footer: Option<String>,
+    transition: motion::Transition,
+}
+
+impl Display {
+    pub(super) fn update(
+        &mut self,
+        from: &str,
+        default: bool,
+        managed: Option<String>,
+        body: &str,
+        motion: motion::Motion,
+        window: &mut Window,
+    ) -> bool {
+        let now = Instant::now();
+        let (name, address) =
+            fell_core::compose::mailbox_parts(from).unwrap_or_else(|| (None, from.to_string()));
+        let address = present::display_safe(&address);
+        let name = name.map(|name| present::display_safe(&name));
+        let changed_address = !self.current.address.is_empty()
+            && !self.current.address.eq_ignore_ascii_case(&address);
+        let changed = self.current.address != address || self.current.name != name;
+        if changed {
+            let previous = std::mem::replace(
+                &mut self.current,
+                Sender {
+                    name,
+                    address,
+                    other_than_default: !default,
+                },
+            );
+            self.fade = motion
+                .start(motion::FADE, now)
+                .filter(|_| !previous.address.is_empty())
+                .map(|transition| {
+                    let footer = if managed.is_some() && managed != self.managed {
+                        self.managed.take()
+                    } else {
+                        None
+                    };
+                    SenderFade {
+                        from: previous,
+                        footer,
+                        transition,
+                    }
+                });
+        }
+        self.current.other_than_default = !default;
+        self.managed = managed;
+        self.fade = self
+            .fade
+            .take()
+            .filter(|fade| motion.enabled() && fade.transition.running(now));
+        self.progress = self.fade.as_ref().map_or(1., |fade| {
+            window.request_animation_frame();
+            fade.transition.progress(now)
+        });
+
+        let kept = changed_address
+            && self.managed.is_none()
+            && body.lines().any(|line| line == SIGNATURE_SEPARATOR);
+        if kept {
+            self.kept_since = Some(now);
+        }
+        kept
+    }
+
+    pub(super) fn settle(&mut self) {
+        self.fade = None;
+        self.progress = 1.;
+    }
+
+    pub(super) fn kept_opacity(
+        &mut self,
+        motion: motion::Motion,
+        window: &mut Window,
+    ) -> Option<f32> {
+        let started = self.kept_since?;
+        let now = Instant::now();
+        if now < started + motion::FADE && motion.enabled() {
+            window.request_animation_frame();
+            return Some(motion::Transition::new(started, motion::FADE).progress(now));
+        }
+        let leave = started + NOTICE_HOLD;
+        if now < leave {
+            return Some(1.);
+        }
+        if now < leave + motion::FADE && motion.enabled() {
+            window.request_animation_frame();
+            return Some(motion::Transition::new(leave, motion::FADE).remaining(now));
+        }
+        self.kept_since = None;
+        None
+    }
+
+    pub(super) fn footer(&self) -> Option<(&str, f32)> {
+        self.fade
+            .as_ref()?
+            .footer
+            .as_deref()
+            .map(|footer| (footer, self.progress))
+    }
+
+    pub(super) fn label(&self, theme: &theme::Theme) -> gpui::Div {
+        div()
+            .relative()
+            .flex_1()
+            .min_w_0()
+            .child(sender_label(&self.current, theme).opacity(self.progress))
+            .children(self.fade.as_ref().map(|fade| {
+                sender_label(&fade.from, theme)
+                    .absolute()
+                    .inset_0()
+                    .opacity(1. - self.progress)
+            }))
+    }
+}
+
+fn sender_label(sender: &Sender, theme: &theme::Theme) -> gpui::Div {
+    let dim = theme.dimmed;
+    let name_color = if sender.other_than_default {
+        theme.foreground
+    } else {
+        dim
+    };
+    div()
+        .flex()
+        .items_baseline()
+        .justify_end()
+        .min_w_0()
+        .gap(px(8.))
+        .child(div().flex_none().text_color(rgb(dim)).child("From"))
+        .children(sender.name.as_ref().map(|name| {
+            div()
+                .max_w(gpui::relative(0.45))
+                .truncate()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(name_color))
+                .child(name.clone())
+        }))
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .text_color(rgb(if sender.name.is_some() {
+                    dim
+                } else {
+                    name_color
+                }))
+                .child(sender.address.clone()),
+        )
+}
+
 pub(super) struct Picker {
     choices: Vec<Identity>,
     current: Option<String>,
+    received: Option<String>,
     query: String,
     selected: usize,
     scroll: ScrollHandle,
@@ -49,14 +225,27 @@ pub(super) fn can_pick(session: &DraftSession, from: &str) -> bool {
 
 impl ComposeView {
     pub(super) fn open_identity_picker(&mut self) {
-        let Some((choices, current)) = self
+        let Some((choices, current, received)) = self
             .hub
             .with_session(self.draft_id.as_ref(), |session| {
                 let from = &session.fields().from;
                 (session.send_lock().is_none() && can_pick(session, from)).then(|| {
+                    let choices = session.identities();
+                    let received = session.reply_context().and_then(|parent| {
+                        parent
+                            .arrived_via
+                            .iter()
+                            .find(|address| {
+                                choices
+                                    .iter()
+                                    .any(|identity| identity.address.eq_ignore_ascii_case(address))
+                            })
+                            .cloned()
+                    });
                     (
-                        session.identities().to_vec(),
+                        choices.to_vec(),
                         fell_core::compose::email_of(from),
+                        received,
                     )
                 })
             })
@@ -78,6 +267,7 @@ impl ComposeView {
         self.from_picker = Some(Picker {
             choices,
             current,
+            received,
             selected,
             scroll,
             query: String::new(),
@@ -172,7 +362,9 @@ impl ComposeView {
         if progress < 1. || picker.closing {
             window.request_animation_frame();
         }
-        let width = (f32::from(window.viewport_size().width) - 24.).clamp(0., 460.);
+        let viewport_width = f32::from(window.viewport_size().width);
+        let narrow = viewport_width < 520.;
+        let width = (viewport_width - 32.).clamp(0., 460.);
         let height = f32::from(window.viewport_size().height);
         let matches = picker.matches();
         let card =
@@ -236,6 +428,9 @@ impl ComposeView {
                             let current = picker.current.as_ref().is_some_and(|current| {
                                 identity.address.eq_ignore_ascii_case(current)
                             });
+                            let received = picker.received.as_ref().is_some_and(|received| {
+                                identity.address.eq_ignore_ascii_case(received)
+                            });
                             let name = present::display_safe(&identity.name);
                             let address = present::display_safe(&identity.address);
                             let option = identity.clone();
@@ -287,6 +482,15 @@ impl ComposeView {
                                                 .child(address),
                                         ),
                                 )
+                                .when(received, |row| {
+                                    row.child(
+                                        div()
+                                            .flex_none()
+                                            .text_size(px(12.))
+                                            .text_color(rgb(theme.dimmed))
+                                            .child("received here"),
+                                    )
+                                })
                                 .when(current, |row| row.child(div().flex_none().child("✓")))
                         })),
                 );
@@ -297,9 +501,11 @@ impl ComposeView {
                 .bottom_0()
                 .left_0()
                 .right_0()
-                .pt(px(68. - 4. * (1. - progress)))
+                .pt(px(44. - 4. * (1. - progress)))
+                .pr(px(if narrow { 0. } else { 16. }))
                 .flex()
-                .justify_center()
+                .when(narrow, |layer| layer.justify_center())
+                .when(!narrow, |layer| layer.justify_end())
                 .items_start()
                 .when(picker.active(), |layer| {
                     layer.occlude().on_mouse_down(

@@ -116,7 +116,8 @@ pub(crate) fn draft_message_id(raw: &[u8]) -> Option<String> {
 
 /// Read the draft's editable plain part and decoded files from the same MIME.
 pub(crate) fn parse_draft(
-    account: &crate::Account,
+    account: &AccountId,
+    identities: &[crate::Identity],
     id: &str,
     raw: &[u8],
 ) -> crate::Result<crate::compose::StoredCompose> {
@@ -149,8 +150,17 @@ pub(crate) fn parse_draft(
             })
             .collect()
     };
+    let from = address_list(parsed.from());
+    let identity = match from.as_slice() {
+        [sender] => identities
+            .iter()
+            .find(|identity| identity.address.eq_ignore_ascii_case(&sender.email)),
+        _ => None,
+    }
+    .or_else(|| identities.first())
+    .expect("the account supplies its default compose identity");
     let fields = DraftFields {
-        from: crate::compose::configured_from(&account.display_name, &account.email),
+        from: identity.from_header(),
         to: addresses(parsed.to()),
         cc: addresses(parsed.cc()),
         bcc: addresses(parsed.bcc()),
@@ -172,6 +182,19 @@ pub(crate) fn parse_draft(
         text
     } else {
         String::new()
+    };
+    let signature = crate::compose::signature_block(identity);
+    let managed_signature = if signature.is_empty() {
+        None
+    } else {
+        if !body.ends_with('\n')
+            && crate::compose::signature_range(&body, signature.trim_end_matches('\n')).is_some()
+        {
+            body.push('\n');
+        }
+        crate::compose::signature_range(&body, &signature)
+            .is_some()
+            .then_some(signature)
     };
     let references = parsed
         .references()
@@ -213,12 +236,15 @@ pub(crate) fn parse_draft(
     }
     Ok(StoredCompose {
         id: id.to_string(),
-        account_id: account.id.clone(),
+        account_id: account.clone(),
         fields,
         body,
         files,
-        identities: vec![account.email.clone()],
-        managed_signature: None,
+        identities: identities
+            .iter()
+            .map(|identity| identity.address.clone())
+            .collect(),
+        managed_signature,
         owner: String::new(),
         reply: ReplyParts {
             references,
@@ -1031,6 +1057,44 @@ pub(crate) fn snippet(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::account::AccountId;
+
+    #[test]
+    fn imported_signature_is_managed_only_if_its_configured_text_matches() {
+        let identities = [
+            crate::Identity {
+                address: "primary@example.test".into(),
+                name: "Primary".into(),
+                signature: Some("Primary footer".into()),
+            },
+            crate::Identity {
+                address: "studio@example.test".into(),
+                name: "Studio".into(),
+                signature: Some("Studio footer".into()),
+            },
+        ];
+        let parse = |address: &str, signature: &str| {
+            let raw = format!("From: Phone <{address}>\r\n\r\nNote\r\n\r\n-- \r\n{signature}");
+            parse_draft(
+                &AccountId("fixture".into()),
+                &identities,
+                "phone",
+                raw.as_bytes(),
+            )
+            .unwrap()
+        };
+        let edited = parse("Studio@Example.Test", "Edited footer");
+        assert_eq!(edited.fields.from, "Studio <studio@example.test>");
+        assert!(edited.managed_signature.is_none());
+        let unknown = parse("unknown@example.test", "Studio footer");
+        assert_eq!(unknown.fields.from, "Primary <primary@example.test>");
+        assert!(unknown.managed_signature.is_none());
+        let untouched = parse("Studio@Example.Test", "Studio footer");
+        assert_eq!(
+            untouched.managed_signature.as_deref(),
+            Some("-- \nStudio footer\n")
+        );
+        assert!(untouched.body.ends_with("-- \nStudio footer\n"));
+    }
 
     #[test]
     fn html_only_draft_text_keeps_ordered_list_styles() {

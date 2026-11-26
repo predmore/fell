@@ -902,7 +902,8 @@ impl Store {
     ) -> Result<Option<super::ReplyContext>> {
         self.conn
             .query_row(
-                "SELECT m.from_name, m.from_email, m.subject, m.date_unix, m.reply_to_line
+                "SELECT m.from_name, m.from_email, m.subject, m.date_unix, m.reply_to_line,
+                        m.arrived_via
                  FROM messages m
                  WHERE m.account_id = ?1 AND (
                      m.message_id = ?2 OR m.message_id IN (
@@ -921,6 +922,7 @@ impl Store {
                             .filter(|name| !name.trim().is_empty())
                             .unwrap_or_else(|| email.clone()),
                         sender_email: email,
+                        arrived_via: crate::store::split_field(&row.get::<_, String>(5)?),
                         reply_to: crate::message::decode_reply_to(&reply_to).map(|addresses| {
                             addresses
                                 .into_iter()

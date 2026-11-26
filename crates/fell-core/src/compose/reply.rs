@@ -63,7 +63,8 @@ pub const MAX_REFERENCES: usize = 20;
 const MAX_ID_LEN: usize = 250;
 
 /// Start a `kind` answer to `parent` from `from`, with the quote's dates in
-/// UTC. `own` holds the person's own addresses, which a reply never sends to.
+/// UTC. `own` starts with the account address and includes any aliases to
+/// exclude when adding the original recipients.
 /// `roles` are the account's folder roles, which say whether `parent` is a
 /// Sent copy.
 pub fn start_reply(
@@ -200,7 +201,6 @@ pub fn own_addresses(parent: &Message, account_email: &str, roles: &FolderRoles)
     if in_sent(parent, roles) {
         own.push(parent.headers.from.email.trim().to_string());
     }
-    own.retain(|email| !email.is_empty());
     own
 }
 
@@ -216,9 +216,9 @@ fn in_sent(message: &Message, roles: &FolderRoles) -> bool {
 /// To and Cc for a reply to `parent`. To is Reply-To when the message has
 /// one, else the sender. Reply all adds the other To recipients to To and
 /// keeps Cc as Cc. When incoming mail's Reply-To is unverified, the person
-/// chooses all recipients. The person's own addresses (`own`) and repeats are left
-/// out. A reply to the person's own message (from one of `own`, or a copy
-/// in the Sent folder `roles` name) goes to whoever it went to.
+/// chooses all recipients. `own` starts with the account address, followed by
+/// aliases to exclude from the original recipients. A message from the account
+/// address or with a copy in Sent is answered to its original recipients.
 pub fn reply_recipients(
     parent: &Message,
     own: &[String],
@@ -242,40 +242,43 @@ fn route_reply(
     all: bool,
     roles: &FolderRoles,
 ) -> ReplyRecipients {
+    let from_me = in_sent(parent, roles)
+        || own.first().is_some_and(|account| {
+            let account = account.trim();
+            !account.is_empty() && account.eq_ignore_ascii_case(parent.headers.from.email.trim())
+        });
     let own: HashSet<String> = own
         .iter()
         .map(|email| email.trim().to_lowercase())
         .collect();
     let mine = |address: &Address| own.contains(&address.email.trim().to_lowercase());
-    let from_me = mine(&parent.headers.from) || in_sent(parent, roles);
     if !from_me && parent.reply_to.is_none() {
         return ReplyRecipients {
             withheld: true,
             ..ReplyRecipients::default()
         };
     }
-    let primary: Vec<&Address> = if from_me {
-        parent.to.iter().collect()
-    } else if let Some(addresses) = parent.reply_to.as_ref().filter(|list| !list.is_empty()) {
-        addresses.iter().collect()
-    } else {
-        vec![&parent.headers.from]
-    };
     let mut seen = HashSet::new();
-    let mut take = |addresses: Vec<&Address>| -> Vec<String> {
+    let mut take = |addresses: &[Address], exclude_own: bool| -> Vec<String> {
         addresses
-            .into_iter()
-            .filter(|address| !address.email.trim().is_empty() && !mine(address))
+            .iter()
+            .filter(|address| !address.email.trim().is_empty() && !(exclude_own && mine(address)))
             .filter(|address| seen.insert(address.email.trim().to_lowercase()))
             .map(format_address)
             .collect()
     };
-    let mut to = take(primary);
+    let mut to = if from_me {
+        take(&parent.to, true)
+    } else if let Some(addresses) = parent.reply_to.as_ref().filter(|list| !list.is_empty()) {
+        take(addresses, true)
+    } else {
+        take(std::slice::from_ref(&parent.headers.from), false)
+    };
     if all && !from_me {
-        to.extend(take(parent.to.iter().collect()));
+        to.extend(take(&parent.to, true));
     }
     let cc = if all {
-        take(parent.cc.iter().collect())
+        take(&parent.cc, true)
     } else {
         Vec::new()
     };
@@ -785,6 +788,24 @@ mod tests {
         let (to, cc) = reply_recipients(&message, &own, true, &FolderRoles::default());
         assert_eq!(to, vec!["Maya <maya@x>"]);
         assert!(!cc.iter().chain(&to).any(|line| line.contains("pm.me")));
+    }
+
+    #[test]
+    fn an_incoming_alias_sender_does_not_route_the_reply_to_its_recipients() {
+        let mut message = parent();
+        message.headers.from = address(None, "alias@pm.me");
+        message.to = vec![address(None, "victim@example.com")];
+        message.cc = vec![address(None, "other-alias@pm.me")];
+        message.arrived_via = vec!["alias@pm.me".into()];
+        let roles = FolderRoles::default();
+        let mut own = own_addresses(&message, "jon@example.com", &roles);
+        own.push("other-alias@pm.me".into());
+        let (to, cc) = reply_recipients(&message, &own, false, &roles);
+        assert_eq!(to, ["alias@pm.me"]);
+        assert!(cc.is_empty());
+        let (to, cc) = reply_recipients(&message, &own, true, &roles);
+        assert_eq!(to, ["alias@pm.me", "victim@example.com"]);
+        assert!(cc.is_empty());
     }
 
     #[test]

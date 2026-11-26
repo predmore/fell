@@ -4,6 +4,7 @@
 //! flat account keys and `[[identities]]` tables are understood. Unknown
 //! keys are errors. The top-level email remains the default sender. Give
 //! it an identity table to set its signature.
+//! Signatures support up to 2,000 characters and 30 lines of Markdown.
 //!
 //! ```toml
 //! backend = "bridge"            # "bridge" or "imap"
@@ -393,6 +394,13 @@ impl AccountConfig {
         if self.email.is_empty() {
             return Err(invalid("email is empty"));
         }
+        let valid_phrase = |name: &str| {
+            let header = crate::compose::configured_from(name, "placeholder@example.test");
+            !header.contains("=?")
+        };
+        if !valid_phrase(&self.name) {
+            return Err(invalid("account name must be plain display text"));
+        }
         let mut addresses = std::collections::HashSet::new();
         for identity in &self.identities {
             if !Identity::valid_address(&identity.address) {
@@ -401,14 +409,24 @@ impl AccountConfig {
             if !addresses.insert(identity.address.to_ascii_lowercase()) {
                 return Err(invalid("identity address is set twice"));
             }
-            if identity.name.chars().any(char::is_control) || identity.name.contains(['<', '>']) {
+            if identity.name.chars().any(char::is_control)
+                || identity.name.contains(['<', '>'])
+                || !valid_phrase(&identity.name)
+            {
                 return Err(invalid("identity name must be plain display text"));
             }
-            if identity.signature.as_ref().is_some_and(|text| {
-                text.chars()
-                    .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\t'))
-            }) {
-                return Err(invalid("identity signature contains a control character"));
+            if let Some(text) = &identity.signature {
+                if text.chars().take(2_001).count() > 2_000 || text.lines().take(31).count() > 30 {
+                    return Err(invalid(
+                        "identity signature exceeds 2,000 characters or 30 lines",
+                    ));
+                }
+                let without_tabs = text.replace('\t', "");
+                if crate::notes::display_safe(&without_tabs, true) != without_tabs {
+                    return Err(invalid(
+                        "identity signature contains a control or format character",
+                    ));
+                }
             }
         }
         if self.username.is_empty() {
@@ -695,7 +713,12 @@ impl AccountConfig {
             .ok_or(crate::Error::DraftNoLongerInFolder)?;
         let raw = crate::imap::part_fetch::fetch_draft(&self.imap_config()?, source)?
             .ok_or(crate::Error::DraftUnavailable)?;
-        let draft = crate::imap::rfc822::parse_draft(&account, draft_id, &raw)?;
+        let draft = crate::imap::rfc822::parse_draft(
+            &account.id,
+            &self.compose_identities(),
+            draft_id,
+            &raw,
+        )?;
         let message_id = crate::imap::rfc822::draft_message_id(&raw);
         store.import_server_draft(&copy, &draft, message_id.as_deref())
     }
@@ -1082,6 +1105,8 @@ signature = "Primary signature"
             "[[identities]]\naddress = \"alias@example.com\"\naddress = \"other@example.com\"",
             "[[identities]]\naddress = \"alias@example.com\"\n[[identities]]\naddress = \"Alias@example.com\"",
             "[[identities]]\naddress = \"alias@example.com\"\nname = \"Line\\nbreak\"",
+            "[[identities]]\naddress = \"alias@example.com\"\nname = '=?UTF-8?Q?PayPal?='",
+            "[[identities]]\naddress = \"alias@example.com\"\nname = '=\u{200b}?UTF-8?Q?PayPal?='",
         ] {
             assert!(
                 AccountConfig::parse(&format!("{base}{invalid}")).is_err(),
@@ -1094,6 +1119,28 @@ signature = "Primary signature"
             legacy.compose_identities()[0].from_header(),
             "primary@example.com"
         );
+    }
+
+    #[test]
+    fn compose_signatures_have_footer_limits_and_reject_invisible_formatting() {
+        let settings = "email = 'primary@example.com'\npassword = 'test'\n";
+        let parse = |signature: &str| {
+            AccountConfig::parse(&format!(
+                "{settings}[[identities]]\naddress = 'alias@example.com'\nsignature = {signature:?}\n"
+            ))
+        };
+        assert!(parse(&"é".repeat(2_000)).is_ok());
+        assert!(parse(&"é".repeat(2_001)).is_err());
+        assert!(parse(&"line\n".repeat(30)).is_ok());
+        assert!(parse(&"line\n".repeat(31)).is_err());
+        for character in ['\u{202e}', '\u{200b}'] {
+            let error = AccountConfig::parse(&format!(
+                "{settings}[[identities]]\naddress = 'alias@example.com'\nsignature = 'Studio{character}'\n"
+            ))
+            .unwrap_err();
+            assert!(error.to_string().contains("control or format character"));
+        }
+        assert!(AccountConfig::parse(&format!("{settings}name = '=?UTF-8?Q?PayPal?='")).is_err());
     }
 
     #[test]

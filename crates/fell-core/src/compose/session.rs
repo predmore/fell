@@ -160,6 +160,7 @@ pub struct ReplyContext {
     pub sender: String,
     /// The sender's address, shown when the reply goes somewhere else.
     pub sender_email: String,
+    pub arrived_via: Vec<String>,
     /// Where the original asked replies to go, lowercased. `None` means
     /// the original's Reply-To is unverified.
     pub reply_to: Option<Vec<String>>,
@@ -518,22 +519,22 @@ impl DraftSession {
         );
         session.identities = stored.identities.into_iter().map(address_only).collect();
         let previous_from = stored.fields.from;
-        let changed_from = session.fields.from != previous_from;
-        let verified = changed_from
-            .then(|| {
-                crate::account_config::configured_sender(&session.account_id, &session.fields.from)
-            })
-            .flatten();
-        if changed_from && verified.is_none() {
-            session.fields.from = previous_from;
-            session
-                .notices
-                .push("from is not one of your addresses; the edit was ignored".into());
-        }
+        let verified =
+            crate::account_config::configured_sender(&session.account_id, &session.fields.from);
         session.managed_signature = stored.managed_signature;
         session.check_signature();
         if let Some(identity) = verified {
-            session.swap_signature(&identity);
+            if email_of(&previous_from) != email_of(&session.fields.from) {
+                session.swap_signature(&identity);
+            }
+            session.fields.from = identity.from_header();
+        } else if session.fields.from != previous_from {
+            session.fields.from =
+                crate::account_config::configured_sender(&session.account_id, &previous_from)
+                    .map_or(previous_from, |identity| identity.from_header());
+            session
+                .notices
+                .push("from is not one of your addresses; the edit was ignored".into());
         }
         session.owner = stored.owner;
         session.locked_reply = stored.fields.in_reply_to.clone();
@@ -839,6 +840,14 @@ impl DraftSession {
 
     pub fn identities(&self) -> &[Identity] {
         &self.identities
+    }
+
+    pub fn managed_signature(&self) -> Option<&str> {
+        self.managed_signature.as_deref()
+    }
+
+    pub fn reply_context(&self) -> Option<&ReplyContext> {
+        self.reply_context.as_ref()
     }
 
     pub fn set_identities(&mut self, identities: Vec<Identity>) -> bool {
@@ -1808,7 +1817,10 @@ impl DraftSession {
 
     fn adopt_parsed(&mut self, parsed: ParsedDraft, identity: Option<Identity>) {
         let mut fields = parsed.fields;
-        if fields.from != self.fields.from && identity.is_none() {
+        let changed_address = email_of(&fields.from) != email_of(&self.fields.from);
+        if let Some(identity) = &identity {
+            fields.from = identity.from_header();
+        } else if fields.from != self.fields.from {
             fields.from.clone_from(&self.fields.from);
             self.notices
                 .push("from is not one of your addresses; the edit was ignored".into());
@@ -1821,7 +1833,7 @@ impl DraftSession {
         self.fields = fields;
         self.body = parsed.body;
         self.check_signature();
-        if let Some(identity) = identity {
+        if let Some(identity) = identity.filter(|_| changed_address) {
             self.swap_signature(&identity);
         }
         self.issues = parsed.issues;
@@ -1910,9 +1922,9 @@ fn address_only(address: String) -> Identity {
 }
 
 /// The exact generated text must still be the final lines of the body.
-fn signature_range(body: &str, block: &str) -> Option<std::ops::Range<usize>> {
+pub(crate) fn signature_range(body: &str, block: &str) -> Option<std::ops::Range<usize>> {
     let start = body.strip_suffix(block)?.len();
-    (start > 0 && body[..start].ends_with('\n')).then_some(start..body.len())
+    (start == 0 || body[..start].ends_with('\n')).then_some(start..body.len())
 }
 
 pub fn signature_block(identity: &Identity) -> String {
@@ -2101,7 +2113,7 @@ mod tests {
         let Some(isolated) = crate::test_support::in_isolated_process() else {
             return;
         };
-        let (_root, mut session) = temp_session("Letter\n");
+        let (root, mut session) = temp_session("Letter\n");
         // The usual test session uses a reserved demo id.
         session.account_id = AccountId("mail".into());
         let old = "from: jon@example.com";
@@ -2124,15 +2136,43 @@ mod tests {
         fs::create_dir_all(&config).unwrap();
         let path = config.join("account.toml");
         fs::write(&path, format!(
-            "id = {:?}\nemail = \"jon@example.com\"\npassword = \"test\"\n[[identities]]\naddress = \"other@example.com\"\n",
+            "id = {:?}\nemail = \"jon@example.com\"\npassword = \"test\"\n[[identities]]\naddress = \"other@example.com\"\nname = \"Studio\"\n",
             session.account_id().as_str()
         )).unwrap();
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let forged = r#"from: '"=?UTF-8?Q?PayPal?=" <other@example.com>'"#;
+        let canonical = r#"from: "Studio <other@example.com>""#;
         session
             .edit_as_agent(session.revision(), old, forged)
             .unwrap();
-        assert_eq!(session.fields().from, "other@example.com");
+        assert_eq!(session.fields().from, "Studio <other@example.com>");
+        session.merge_disk(&session.serialize().replacen(canonical, forged, 1));
+        assert_eq!(session.fields().from, "Studio <other@example.com>");
+        session.merge_disk(&session.serialize().replacen(canonical, old, 1));
+        assert_eq!(session.fields().from, "jon@example.com");
+
+        let db = root.join("mail.db");
+        let store = crate::Store::open(&db).unwrap();
+        store
+            .upsert_account(&crate::Account {
+                id: session.account_id().clone(),
+                email: "jon@example.com".into(),
+                display_name: String::new(),
+                backend_kind: crate::BackendKind::Bridge,
+            })
+            .unwrap();
+        session.bind_store(&db);
+        session.flush().unwrap();
+        fs::write(
+            session.folder().join("draft.md"),
+            session.serialize().replacen(old, forged, 1),
+        )
+        .unwrap();
+        let reopened =
+            DraftSession::open_with_store(session.folder(), session.account_id().clone(), &store)
+                .unwrap();
+        assert_eq!(reopened.fields().from, "Studio <other@example.com>");
     }
 
     #[test]

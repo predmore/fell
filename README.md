@@ -154,7 +154,9 @@ archive it from a notice, the confirmation offers **Undo** for five seconds.
 Add one `[[identities]]` table per address at the end of `account.toml`.
 Use an entry for the account's top-level `email` to give that default
 address a signature. `name` and `signature` are optional. Write line
-breaks in a Markdown signature as `\n`.
+breaks in a Markdown signature as `\n`. Fell accepts up to 2,000
+characters and 30 lines per signature, with tabs and line breaks allowed.
+Names use plain display text.
 
 ```toml
 [[identities]]
@@ -173,7 +175,7 @@ through, then check To and Cc, then use the default. Choose another
 sender with **Ctrl-f** from a compose header, **Space c f** from normal
 mode, or **Choose From** in the compose palette. A signature is editable
 Markdown. Changing From replaces the generated signature while it is
-untouched.
+untouched and keeps any edits you made to it.
 
 ### Sent mail
 
