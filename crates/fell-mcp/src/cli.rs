@@ -427,15 +427,21 @@ fn registry_store(
 
 // Explicit paths keep the standalone and shared-store behavior. A registry
 // operation visits account files even if a sibling configuration is broken.
-fn grant_stores(opts: &Opts, io: &Io<'_>) -> Result<Vec<(Option<AccountId>, Store)>, CliError> {
+type GrantStore = Result<(Option<AccountId>, Store), (String, CliError)>;
+
+fn grant_stores(opts: &Opts, io: &Io<'_>) -> Result<Vec<GrantStore>, CliError> {
     if opts.store.is_none()
         && let (Some(registry), Some(base)) = (&io.registry, &io.default_store)
         && registry.directory().exists()
     {
-        let catalog = registry.load();
+        let catalog = registry.load_with_removals(base);
+        let directory = registry.directory();
         let mut stores = Vec::new();
         let mut found = opts.account.is_none();
         for entry in catalog.entries {
+            if entry.path.parent() != Some(directory.as_path()) {
+                continue;
+            }
             let Some(id) = entry.path.file_stem().and_then(|name| name.to_str()) else {
                 continue;
             };
@@ -444,16 +450,44 @@ fn grant_stores(opts: &Opts, io: &Io<'_>) -> Result<Vec<(Option<AccountId>, Stor
                     .account
                     .as_deref()
                     .is_some_and(|selected| selected != id)
+                || catalog.interrupted.iter().any(|pending| pending.id == id)
             {
                 continue;
             }
             found = true;
-            let path = registry
-                .store_path(base, id)
-                .map_err(|err| CliError::new(err.to_string()))?;
-            if path.is_file() || opts.account.is_some() {
-                stores.push((Some(AccountId(id.to_owned())), open_store_at(&path, io)?.1));
+            let name = entry.config.as_ref().map_or_else(
+                |_| id.to_owned(),
+                |config| format!("{} ({id})", config.account().display_name),
+            );
+            let path = match registry.store_path(base, id) {
+                Ok(path) => path,
+                Err(err) => {
+                    stores.push(Err((name, CliError::new(err.to_string()))));
+                    continue;
+                }
+            };
+            if opts.account.is_none()
+                && path
+                    .symlink_metadata()
+                    .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound)
+            {
+                continue;
             }
+            stores.push(
+                open_store_at(&path, io)
+                    .map(|(_, store)| (Some(AccountId(id.to_owned())), store))
+                    .map_err(|error| (name, error)),
+            );
+        }
+        for pending in catalog.interrupted {
+            if opts.account.as_ref().is_some_and(|id| id != &pending.id) {
+                continue;
+            }
+            found = true;
+            stores.push(Err((
+                format!("{} ({})", pending.name, pending.id),
+                CliError::new("Delete interrupted"),
+            )));
         }
         if !found {
             return Err(CliError::new(format!(
@@ -463,10 +497,10 @@ fn grant_stores(opts: &Opts, io: &Io<'_>) -> Result<Vec<(Option<AccountId>, Stor
         }
         return Ok(stores);
     }
-    Ok(vec![(
+    Ok(vec![Ok((
         opts.account.clone().map(AccountId),
         open_store(opts, io)?.1,
-    )])
+    ))])
 }
 
 fn grant_rows(store: &Store, account: Option<&AccountId>) -> Result<Vec<AgentSummary>, CliError> {
@@ -826,13 +860,26 @@ fn ago(now: i64, then: i64) -> String {
 
 fn list(opts: &Opts, io: &mut Io<'_>) -> Result<(), CliError> {
     let mut rows = Vec::new();
-    for (account, store) in grant_stores(opts, io)? {
-        rows.extend(grant_rows(&store, account.as_ref())?);
+    let mut incomplete = false;
+    for entry in grant_stores(opts, io)? {
+        match entry.and_then(|(account, store)| {
+            grant_rows(&store, account.as_ref())
+                .map_err(|err| (grant_account_name(account.as_ref()), err))
+        }) {
+            Ok(grants) => rows.extend(grants),
+            Err((name, err)) => {
+                writeln!(io.err, "Skipped {name}. {err}")?;
+                incomplete = true;
+            }
+        }
     }
     rows.sort_by(|a, b| {
         (&a.agent_id, a.account_id.as_str()).cmp(&(&b.agent_id, b.account_id.as_str()))
     });
     if rows.is_empty() {
+        if incomplete {
+            return Err(CliError::new("Could not list every account's grants."));
+        }
         writeln!(
             io.out,
             "No agents yet. Connect one with `{} add HARNESS`.",
@@ -872,7 +919,15 @@ fn list(opts: &Opts, io: &mut Io<'_>) -> Result<(), CliError> {
             w2 = widths[2],
         )?;
     }
-    Ok(())
+    if incomplete {
+        Err(CliError::new("Could not list every account's grants."))
+    } else {
+        Ok(())
+    }
+}
+
+fn grant_account_name(account: Option<&AccountId>) -> String {
+    account.map_or_else(|| "mailbox".into(), |id| id.0.clone())
 }
 
 fn grant(opts: &Opts, io: &mut Io<'_>) -> Result<(), CliError> {
@@ -906,26 +961,64 @@ fn revoke(opts: &Opts, io: &mut Io<'_>) -> Result<(), CliError> {
     let agent = opts.agent.as_deref().unwrap_or_default();
     let mut found = false;
     let mut revoked = Vec::new();
-    for (account, store) in grant_stores(opts, io)? {
+    let mut incomplete = false;
+    for entry in grant_stores(opts, io)? {
+        let (account, store) = match entry {
+            Ok(store) => store,
+            Err((name, err)) => {
+                writeln!(io.err, "Skipped {name}. {err}")?;
+                incomplete = true;
+                continue;
+            }
+        };
+        let targets;
         if let Some(id) = opts.account.as_ref() {
-            let id = AccountId(id.clone());
-            store
-                .set_agent_grant(&id, agent, AgentGrant::DISABLED)
-                .map_err(store_err)?;
-            revoked.push(id.0);
-            continue;
+            targets = vec![AccountId(id.clone())];
+        } else {
+            let rows = match grant_rows(&store, account.as_ref()) {
+                Ok(rows) => rows,
+                Err(err) => {
+                    writeln!(
+                        io.err,
+                        "Skipped {}. {err}",
+                        grant_account_name(account.as_ref())
+                    )?;
+                    incomplete = true;
+                    continue;
+                }
+            };
+            targets = rows
+                .into_iter()
+                .filter_map(|row| {
+                    if row.agent_id != agent {
+                        return None;
+                    }
+                    found = true;
+                    row.grant.enabled.then_some(row.account_id)
+                })
+                .collect();
         }
-        for row in grant_rows(&store, account.as_ref())? {
-            if row.agent_id == agent {
-                found = true;
-                if row.grant.enabled {
-                    store
-                        .set_agent_grant(&row.account_id, agent, AgentGrant::DISABLED)
-                        .map_err(store_err)?;
-                    revoked.push(row.account_id.0);
+        for id in targets {
+            match store.set_agent_grant(&id, agent, AgentGrant::DISABLED) {
+                Ok(()) => revoked.push(id.0),
+                Err(err) => {
+                    writeln!(io.err, "Skipped {}. {}", id.as_str(), store_err(err))?;
+                    incomplete = true;
                 }
             }
         }
+    }
+    if !revoked.is_empty() {
+        writeln!(
+            io.err,
+            "Revoked {agent} on {}. Running sessions get no tools from their next call.",
+            revoked.join(", ")
+        )?;
+    }
+    if incomplete {
+        return Err(CliError::new(format!(
+            "Could not revoke {agent} on every account."
+        )));
     }
     if revoked.is_empty() {
         if found {
@@ -937,11 +1030,6 @@ fn revoke(opts: &Opts, io: &mut Io<'_>) -> Result<(), CliError> {
             self_command(io)
         )));
     }
-    writeln!(
-        io.err,
-        "Revoked {agent} on {}. Running sessions get no tools from their next call.",
-        revoked.join(", ")
-    )?;
     Ok(())
 }
 

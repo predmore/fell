@@ -580,6 +580,27 @@ fn registry_grants_cover_secondary_stores_and_disconnect_live_sessions() {
     .result
     .unwrap();
     assert!(tools(&mut session) > 0);
+    let mail = registry.store_path(&ctx.store(), "mail").unwrap();
+    let blocked = mail.with_file_name("mail.db.removing");
+    std::fs::create_dir(&blocked).unwrap();
+    let listing = ctx.run(&["fell-mcp", "list"], "", false);
+    assert!(listing.result.is_err());
+    assert!(listing.err.contains("mail@example.test (mail)"));
+    assert!(
+        listing
+            .out
+            .lines()
+            .any(|line| line.starts_with("atlas") && line.contains("work"))
+    );
+    let revoked = ctx.run(&["fell-mcp", "revoke", "atlas"], "", false);
+    assert!(revoked.result.is_err());
+    assert!(revoked.err.contains("Revoked atlas on work"));
+    assert!(revoked.err.contains("mail@example.test (mail)"));
+    assert_eq!(tools(&mut session), 0);
+    registry
+        .recover_removal(&ctx.store(), "mail", true, None)
+        .unwrap();
+
     registry.remove(&ctx.store(), "work", false).unwrap();
     assert_eq!(tools(&mut session), 0);
     let listing = ctx.run(&["fell-mcp", "list"], "", false);

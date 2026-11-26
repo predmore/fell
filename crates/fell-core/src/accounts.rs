@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use crate::{AccountConfig, AccountId};
 
 mod removal;
+pub use removal::{InterruptedRemoval, RemovalOutcome};
 
 pub const DEFAULT_ID: &str = "mail";
 pub type FileIdentity = (u64, u64, i64, i64);
@@ -78,14 +79,23 @@ pub struct Entry {
 pub struct Accounts {
     pub entries: Vec<Entry>,
     pub error: Option<FileError>,
+    pub interrupted: Vec<InterruptedRemoval>,
 }
 
 impl Accounts {
-    pub fn default_config(&self) -> Option<&AccountConfig> {
-        let mut valid = self
-            .entries
+    pub fn configs(&self) -> impl Iterator<Item = &AccountConfig> {
+        self.entries
             .iter()
-            .filter_map(|entry| entry.config.as_ref().ok());
+            .filter_map(|entry| entry.config.as_ref().ok())
+            .filter(|config| {
+                self.interrupted
+                    .iter()
+                    .all(|pending| pending.id != config.id)
+            })
+    }
+
+    pub fn default_config(&self) -> Option<&AccountConfig> {
+        let mut valid = self.configs();
         let first = valid.next()?;
         if first.id == DEFAULT_ID {
             return Some(first);
@@ -98,7 +108,7 @@ impl Accounts {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty() && self.error.is_none()
+        self.entries.is_empty() && self.interrupted.is_empty() && self.error.is_none()
     }
 }
 
@@ -253,6 +263,14 @@ impl Registry {
 
     pub fn mailbox_path(&self, base: &Path, id: &str) -> Result<PathBuf, FileError> {
         self.path(id)?;
+        Ok(if id == self.original_id()? {
+            base.to_owned()
+        } else {
+            base.with_extension("accounts").join(format!("{id}.db"))
+        })
+    }
+
+    fn original_id(&self) -> Result<String, FileError> {
         // Read the source first. If migration has already renamed it, the
         // durable marker must be visible before any migrated file is visible.
         let legacy = read(&self.config.join("account.toml"), None);
@@ -275,11 +293,7 @@ impl Registry {
                 }
             }
         };
-        Ok(if id == original {
-            base.to_owned()
-        } else {
-            base.with_extension("accounts").join(format!("{id}.db"))
-        })
+        Ok(original)
     }
 
     fn original_marker(&self) -> Result<Option<String>, FileError> {
