@@ -709,9 +709,10 @@ impl Inbox {
                     .filter(|account| account.can_edit_connection())
                 {
                     let id = fell_core::AccountId(account.id.clone());
-                    let config = cx
-                        .background_executor()
-                        .spawn(async move { mailbox::send_account_config(&id) });
+                    let config = cx.background_executor().spawn(async move {
+                        fell_core::accounts::Registry::resolve()
+                            .and_then(|registry| registry.get_with_identity(&id))
+                    });
                     cx.spawn(async move |this, cx| {
                         let config = config.await;
                         let _ = this.update(cx, |inbox, cx| match config {
@@ -841,7 +842,11 @@ impl Inbox {
         }
     }
 
-    fn open_account_setup(&mut self, config: Option<AccountConfig>, cx: &mut Context<Self>) {
+    fn open_account_setup(
+        &mut self,
+        config: Option<(AccountConfig, fell_core::accounts::FileIdentity)>,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(handle) = self.settings_view.setup
             && handle
                 .update(cx, |_, window, _| window.activate_window())

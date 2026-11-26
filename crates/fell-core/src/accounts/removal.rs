@@ -352,7 +352,8 @@ impl Registry {
             let staged_lock = lock_mailbox(&staged)?;
             let committed = path_exists(&trash.join("committed")).map_err(|err| err.to_string())?;
             let snapshot = read_account_contents(&trash.join("account.toml"), Some(id))
-                .map_err(|err| err.cli_message())?;
+                .map_err(|err| err.cli_message())?
+                .map(|(config, text, _)| (config, text));
             let current = if committed && snapshot.is_some() {
                 None
             } else {

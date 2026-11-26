@@ -1152,7 +1152,7 @@ mod tests {
             })
             .unwrap();
         app.run_until_parked();
-        window
+        let reloaded = window
             .update(&mut app, |view, _, cx| {
                 let next = &view.views["work"];
                 assert_ne!(next, &old);
@@ -1160,9 +1160,39 @@ mod tests {
                 assert_eq!(next.read(cx).session.account_name, "New work");
                 check_position(next.read(cx));
                 assert!(!view.stopping.contains("work"));
+                next.clone()
             })
             .unwrap();
         assert!(futures::executor::block_on(store.call(|_| ())).is_err());
+
+        // A keyring-only password change publishes a new file with the same
+        // parsed settings. The file identity still has to trigger a reload.
+        let (mut unchanged, identity) = registry
+            .get_with_identity(&fell_core::AccountId("work".into()))
+            .unwrap()
+            .unwrap();
+        mailbox::stage_connection_config(
+            &mut unchanged,
+            mailbox::AccountSave::Update,
+            Some(identity),
+        )
+        .unwrap()
+        .publish()
+        .unwrap();
+        window
+            .update(&mut app, |view, window, cx| {
+                view.reconcile(&registry, registry.load(), None, window, cx);
+                assert!(reloaded.read(cx).retired);
+                assert!(!view.views.contains_key("work"));
+            })
+            .unwrap();
+        app.run_until_parked();
+        window
+            .update(&mut app, |view, _, cx| {
+                assert_ne!(view.active(), reloaded);
+                check_position(view.active.read(cx));
+            })
+            .unwrap();
     }
 
     #[test]

@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
+use fell_core::accounts::FileIdentity;
 use fell_core::credentials::SecretService;
 use fell_core::onboarding::{ConnectionReport, check_connection};
 use fell_core::{AccountConfig, BackendKind, SyncFailureKind, classify_sync_error};
@@ -73,6 +74,7 @@ pub(crate) struct Onboarding {
     checked: Option<FinishedCheck>,
     return_to_inbox: Option<gpui::AnyWindowHandle>,
     reconnect: bool,
+    expected: Option<FileIdentity>,
 }
 
 impl Onboarding {
@@ -89,13 +91,14 @@ impl Onboarding {
 
     pub(crate) fn from_inbox(
         inbox: gpui::AnyWindowHandle,
-        previous: Option<AccountConfig>,
+        previous: Option<(AccountConfig, FileIdentity)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut view = Self::new(window, cx);
-        if let Some(config) = previous {
+        if let Some((config, identity)) = previous {
             view.form = Form::editing(config);
+            view.expected = Some(identity);
             view.select(Control::Field(Field::Username));
         }
         view.return_to_inbox = Some(inbox);
@@ -132,6 +135,7 @@ impl Onboarding {
             checked: None,
             return_to_inbox: None,
             reconnect: false,
+            expected: None,
         }
     }
 
@@ -489,6 +493,7 @@ impl Onboarding {
             .then(|| self.form.retained_mailbox.clone())
             .flatten();
         let previous = self.form.previous.clone();
+        let expected = self.expected;
         let work = cx.background_executor().spawn(async move {
             let save = if let Some(previous) = &previous {
                 if previous.same_mailbox(&config) {
@@ -509,7 +514,7 @@ impl Onboarding {
                 inline,
                 previous.as_ref(),
                 &SecretService,
-                |config| mailbox::stage_connection_config(config, save, previous.as_ref()),
+                |config| mailbox::stage_connection_config(config, save, expected),
             )
         });
         cx.spawn_in(window, async move |this, cx| {

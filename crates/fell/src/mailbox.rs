@@ -360,13 +360,17 @@ pub(crate) fn stage_account_config(
     config: &mut AccountConfig,
     save: AccountSave,
 ) -> Result<StagedAccountConfig, AccountFileError> {
-    stage_connection_config(config, save, None)
+    let expected = Registry::resolve()
+        .and_then(|registry| registry.get_with_identity(&AccountId(config.id.clone())))
+        .map_err(|err| err.to_string())?
+        .map(|(_, identity)| identity);
+    stage_connection_config(config, save, expected)
 }
 
 pub(crate) fn stage_connection_config(
     config: &mut AccountConfig,
     save: AccountSave,
-    expected: Option<&AccountConfig>,
+    expected: Option<accounts::FileIdentity>,
 ) -> Result<StagedAccountConfig, AccountFileError> {
     let registry = Registry::resolve().map_err(|err| err.to_string())?;
     registry.migrate().map_err(|err| err.to_string())?;
@@ -380,12 +384,9 @@ pub(crate) fn stage_connection_config(
     if configured && save == AccountSave::New {
         return Err(AccountFileError::AlreadyConfigured);
     }
-    let current = accounts::read(&path, Some(&config.id)).map_err(|err| err.to_string())?;
-    if let Some(expected) = expected
-        && current
-            .as_ref()
-            .is_none_or(|(current, _)| current != expected)
-    {
+    let current =
+        accounts::read_with_identity(&path, Some(&config.id)).map_err(|err| err.to_string())?;
+    if current.as_ref().map(|(_, _, identity)| *identity) != expected {
         return Err("The account file changed. Reopen Edit connection and try again.".into());
     }
     let mut keep = None;
@@ -394,7 +395,7 @@ pub(crate) fn stage_connection_config(
         .map(|(_, email)| email)
         .filter(|email| !email.eq_ignore_ascii_case(&config.email))
         .or_else(|| {
-            current.as_ref().and_then(|(current, _)| {
+            current.as_ref().and_then(|(current, _, _)| {
                 (!current.same_mailbox(config)).then(|| current.email.clone())
             })
         });
@@ -417,7 +418,7 @@ pub(crate) fn stage_connection_config(
         }
         let next = next_account_id_at(&registry, &base)?;
         let previous = std::mem::replace(&mut config.id, next);
-        if let Some((_, snapshot)) = &current {
+        if let Some((_, snapshot, _)) = &current {
             keep = Some((previous, snapshot.clone()));
         }
         path = registry.path(&config.id).map_err(|err| err.to_string())?;
@@ -425,7 +426,7 @@ pub(crate) fn stage_connection_config(
     } else if !configured && accounts::mailbox_exists(&mailbox).map_err(|err| err.to_string())? {
         return Err("This ID has a local mailbox. Choose a new ID or confirm reconnecting the same account.".into());
     }
-    if let Some((previous, _)) = &current
+    if let Some((previous, _, _)) = &current
         && accounts::mailbox_exists(&mailbox).map_err(|err| err.to_string())?
     {
         fell_core::Store::remember_imap_connection(&mailbox, previous)
@@ -630,8 +631,7 @@ fn fallback(error: String) -> (Store, Opened) {
 fn prepare(store: &Store, config: Option<&AccountConfig>, demo: bool) -> fell_core::Result<Opened> {
     if let Some(config) = config {
         let account = config.account();
-        store.bind_imap_connection(config)?;
-        store.configure_account(&account, config.write_back)?;
+        store.configure_connection(config)?;
         return Ok(Opened {
             account,
             sync: SyncKind::Connecting,
@@ -944,6 +944,7 @@ mod tests {
             .publish()
             .unwrap();
         assert_eq!(registry.get(&old_id).unwrap().unwrap().port, 1234);
+        assert!(old_store.agent_grant(&old_id, "atlas").unwrap().enabled);
         let mut replacement = original.clone();
         replacement.email = "new@example.test".into();
         assert!(matches!(
@@ -983,6 +984,64 @@ mod tests {
                 .is_empty()
         );
         assert!(can_reconnect(&original));
+        let mut wrong_login = original.clone();
+        wrong_login.username = "another-user".into();
+        assert!(!can_reconnect(&wrong_login));
+        assert!(stage_account_config(&mut wrong_login, AccountSave::Reconnect).is_err());
+    }
+
+    #[test]
+    fn changing_only_the_imap_login_keeps_the_original_mailbox_reconnectable() {
+        let Some(_root) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let registry = Registry::resolve().unwrap();
+        let base = store_path().unwrap();
+        let mut old = AccountConfig::bridge(
+            "mail@example.test",
+            "before",
+            fell_core::PasswordSource::Inline("fixture".into()),
+        );
+        stage_account_config(&mut old, AccountSave::New)
+            .unwrap()
+            .publish()
+            .unwrap();
+        let previous_path = registry.configured_store_path(&base, &old).unwrap();
+        let store = open_at(&previous_path).unwrap();
+        store.configure_connection(&old).unwrap();
+
+        let mut edited = old.clone();
+        edited.username = "after".into();
+        let (_, identity) = registry
+            .get_with_identity(&old.account().id)
+            .unwrap()
+            .unwrap();
+        assert!(stage_connection_config(&mut edited, AccountSave::Update, Some(identity)).is_err());
+        let staged =
+            stage_connection_config(&mut edited, AccountSave::ReplaceMailbox, Some(identity))
+                .unwrap();
+        assert_ne!(&edited.id, &old.id);
+        assert_eq!(registry.get(&old.account().id).unwrap(), Some(old.clone()));
+        staged.publish().unwrap();
+        assert_eq!(
+            accounts::mailbox_owner(&previous_path).unwrap(),
+            Some((old.id.clone(), old.email.clone()))
+        );
+        assert_ne!(
+            registry.configured_store_path(&base, &edited).unwrap(),
+            previous_path
+        );
+        assert!(
+            store
+                .configure_connection(&AccountConfig {
+                    id: old.id.clone(),
+                    ..edited.clone()
+                })
+                .is_err()
+        );
+        assert!(can_reconnect(&old));
+        edited.id.clone_from(&old.id);
+        assert!(!can_reconnect(&edited));
     }
 
     #[test]

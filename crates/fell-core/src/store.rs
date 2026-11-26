@@ -790,6 +790,19 @@ impl Store {
     /// Install a configured account and retire the in-process demo mailbox
     /// in the same transaction. Demo grants never follow the new account.
     pub fn configure_account(&self, account: &Account, write_back: bool) -> Result<()> {
+        self.configure(account, write_back, None)
+    }
+
+    pub fn configure_connection(&self, config: &crate::AccountConfig) -> Result<()> {
+        self.configure(&config.account(), config.write_back, Some(config))
+    }
+
+    fn configure(
+        &self,
+        account: &Account,
+        write_back: bool,
+        config: Option<&crate::AccountConfig>,
+    ) -> Result<()> {
         if crate::is_demo_account(&account.id) {
             return Err(crate::Error::Invalid(format!(
                 "Account ID {:?} is reserved for demo mail",
@@ -812,6 +825,9 @@ impl Store {
         }
         crate::accounts::validate_account_write(&tx, self.db_path(), account)?;
         upsert_account_on(&tx, account)?;
+        if let Some(config) = config {
+            bind_imap_connection(&tx, config)?;
+        }
         crate::outbox::set_write_back_on(&tx, &account.id, write_back)?;
         tx.commit()?;
         self.seal_private_files()?;
@@ -843,49 +859,10 @@ impl Store {
         Ok(login.is_none_or(|login| login == username))
     }
 
-    /// Start reading the configured endpoint without reusing another
-    /// endpoint's UID checkpoints. Park the outbox for reconciliation.
-    pub fn bind_imap_connection(&self, config: &crate::AccountConfig) -> Result<()> {
-        let tx = immediate_transaction(&self.conn)?;
-        let login_key = imap_binding_key(config, "login");
-        if read_meta(&tx, &login_key)?.is_some_and(|login| login != config.username) {
-            return Err(crate::Error::Invalid(
-                "This local mailbox belongs to a different IMAP login.".into(),
-            ));
-        }
-        set_meta(&tx, &login_key, &config.username)?;
-        let endpoint_key = imap_binding_key(config, "endpoint");
-        let endpoint = config.imap_endpoint_key();
-        if read_meta(&tx, &endpoint_key)?.is_some_and(|old| old != endpoint) {
-            let id = &config.id;
-            set_meta(&tx, &imap_binding_key(config, "write-back-paused"), "1")?;
-            tx.execute("DELETE FROM meta WHERE key = 'cursor:' || ?1", [id])?;
-            for table in [
-                "message_copies",
-                "copy_orphans",
-                "server_draft_copies",
-                "discarded_server_draft_copies",
-                "server_draft_rescans",
-            ] {
-                tx.execute(&format!("DELETE FROM {table} WHERE account_id = ?1"), [id])?;
-            }
-            for table in ["messages", "message_aliases"] {
-                tx.execute(
-                    &format!("UPDATE {table} SET remote_id = '' WHERE account_id = ?1"),
-                    [id],
-                )?;
-            }
-        }
-        set_meta(&tx, &endpoint_key, &endpoint)?;
-        tx.commit()
-    }
-
-    pub fn imap_write_back_paused(&self, config: &crate::AccountConfig) -> Result<bool> {
-        let key = imap_binding_key(config, "endpoint");
+    pub(crate) fn matches_imap_endpoint(&self, config: &crate::AccountConfig) -> Result<bool> {
         Ok(
-            read_meta(&self.conn, &imap_binding_key(config, "write-back-paused"))?.is_some()
-                || read_meta(&self.conn, &key)?
-                    .is_some_and(|endpoint| endpoint != config.imap_endpoint_key()),
+            read_meta(&self.conn, &imap_binding_key(config, "endpoint"))?
+                .is_none_or(|endpoint| endpoint == config.imap_endpoint_key()),
         )
     }
 
@@ -3090,6 +3067,48 @@ fn imap_binding_key(config: &crate::AccountConfig, field: &str) -> String {
     format!("imap:{field}:{}", config.id)
 }
 
+/// Start reading the changed endpoint without reusing the old UID namespace.
+fn bind_imap_connection(conn: &Connection, config: &crate::AccountConfig) -> Result<()> {
+    let login_key = imap_binding_key(config, "login");
+    if read_meta(conn, &login_key)?.is_some_and(|login| login != config.username) {
+        return Err(crate::Error::Invalid(
+            "This local mailbox belongs to a different IMAP login.".into(),
+        ));
+    }
+    set_meta(conn, &login_key, &config.username)?;
+    let endpoint_key = imap_binding_key(config, "endpoint");
+    let endpoint = config.imap_endpoint_key();
+    if read_meta(conn, &endpoint_key)?.is_some_and(|old| old != endpoint) {
+        let id = &config.id;
+        crate::outbox::hold_for_endpoint_change(conn, &AccountId(id.clone()))?;
+        conn.execute("DELETE FROM meta WHERE key = 'cursor:' || ?1", [id])?;
+        for table in [
+            "message_copies",
+            "copy_orphans",
+            "local_flag_intent_copies",
+            "server_draft_copies",
+            "discarded_server_draft_copies",
+            "server_draft_rescans",
+        ] {
+            conn.execute(&format!("DELETE FROM {table} WHERE account_id = ?1"), [id])?;
+        }
+        for table in ["messages", "message_aliases"] {
+            conn.execute(
+                &format!(
+                    "UPDATE {table} SET remote_id = '' WHERE account_id = ?1 AND remote_id <> ''"
+                ),
+                [id],
+            )?;
+        }
+        conn.execute(
+            "UPDATE message_bodies SET structure_copy = NULL
+             WHERE account_id = ?1 AND structure_copy IS NOT NULL",
+            [id],
+        )?;
+    }
+    set_meta(conn, &endpoint_key, &endpoint)
+}
+
 fn read_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
     Ok(conn
         .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
@@ -5253,6 +5272,65 @@ pub(crate) fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Messag
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn changing_imap_endpoints_holds_queued_moves_in_their_original_uid_namespace() {
+        use crate::outbox::OutboxState;
+
+        let store = Store::open_in_memory().unwrap();
+        let mut config = crate::AccountConfig::bridge(
+            "mail@example.test",
+            "mailbox",
+            crate::PasswordSource::Command("exit 1".into()),
+        );
+        config.write_back = true;
+        let account = config.account().id;
+        store.configure_connection(&config).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO server_outbox
+             (account_id, kind, state, message_id, source_folder, source_mailbox,
+              uidvalidity, uid, target_folder, created_unix)
+             VALUES (?1, 'move', 'pending', 'id@example.test', 'INBOX', 'INBOX',
+                     42, 17, 'Archive', 0)",
+                [account.as_str()],
+            )
+            .unwrap();
+        let original = store.outbox(&account).unwrap().pop().unwrap();
+        set_sync_cursor_on(
+            &store.conn,
+            &account,
+            &crate::SyncCursor {
+                account_key: account.0.clone(),
+                token: "old-cursor".into(),
+            },
+        )
+        .unwrap();
+        let mut edited = config.clone();
+        edited.smtp_port = Some(2525);
+        store.configure_connection(&edited).unwrap();
+        assert_eq!(store.outbox(&account).unwrap(), [original.clone()]);
+        assert!(store.sync_cursor(&account).unwrap().is_some());
+
+        edited.port += 1;
+        assert_eq!(
+            edited.replay_outbox(&store).unwrap(),
+            crate::ReplayReport::default()
+        );
+        store.configure_connection(&edited).unwrap();
+        let mut held = original;
+        held.state = OutboxState::Held;
+        assert_eq!(store.outbox(&account).unwrap(), [held.clone()]);
+        assert!(store.sync_cursor(&account).unwrap().is_none());
+        assert!(store.write_back(&account).unwrap());
+        assert_eq!(
+            edited.replay_outbox(&store).unwrap(),
+            crate::ReplayReport::default()
+        );
+        store.configure_connection(&config).unwrap();
+        assert_eq!(store.outbox(&account).unwrap(), [held]);
+    }
+
     use super::*;
     use crate::MailboxDelta;
     use crate::backend::SyncCursor;

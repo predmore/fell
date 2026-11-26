@@ -154,6 +154,13 @@ impl AccountConfig {
         self.email.eq_ignore_ascii_case(&other.email) && self.username == other.username
     }
 
+    pub fn same_imap_endpoint(&self, other: &Self) -> bool {
+        self.backend == other.backend
+            && self.host.eq_ignore_ascii_case(&other.host)
+            && self.port == other.port
+            && self.security == other.security
+    }
+
     pub(crate) fn imap_endpoint_key(&self) -> String {
         format!(
             "{}:{}:{}:{}",
@@ -677,7 +684,7 @@ impl AccountConfig {
     /// delete mark and report server copies left in place.
     pub fn replay_outbox(&self, store: &crate::Store) -> Result<crate::ReplayReport> {
         let account_id = AccountId(self.id.clone());
-        if store.imap_write_back_paused(self)? {
+        if !store.matches_imap_endpoint(self)? {
             return Ok(crate::ReplayReport::default());
         }
         let append_sent = self.append_sent();

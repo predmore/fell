@@ -275,6 +275,8 @@ pub enum OutboxState {
     Dropped,
     /// A server copy Fell left in place. Reported once, then Dropped.
     Abandoned,
+    /// The IMAP endpoint changed. Keep the write and its original UID context.
+    Held,
 }
 
 impl OutboxState {
@@ -284,6 +286,7 @@ impl OutboxState {
             Self::Done => "done",
             Self::Dropped => "dropped",
             Self::Abandoned => "abandoned",
+            Self::Held => "held",
         }
     }
 
@@ -295,6 +298,7 @@ impl OutboxState {
             "done" => Ok(Self::Done),
             "dropped" => Ok(Self::Dropped),
             "abandoned" => Ok(Self::Abandoned),
+            "held" => Ok(Self::Held),
             other => Err(Error::Action(format!("unknown outbox state {other}"))),
         }
     }
@@ -476,7 +480,7 @@ pub(crate) fn set_write_back_on(
          ON CONFLICT(account_id) DO UPDATE SET enabled = excluded.enabled",
         params![account_id.as_str(), i64::from(enabled)],
     )?;
-    if !enabled && !connection_paused(conn, account_id)? {
+    if !enabled {
         if was_on {
             conn.execute(
                 "UPDATE write_back_accounts SET generation = generation + 1
@@ -503,6 +507,23 @@ pub(crate) fn set_write_back_on(
             params![account_id.as_str()],
         )?;
     }
+    Ok(())
+}
+
+pub(crate) fn hold_for_endpoint_change(conn: &Connection, account_id: &AccountId) -> Result<()> {
+    conn.execute(
+        "UPDATE write_back_accounts SET generation = generation + 1, uidplus = NULL,
+             move_missing = 0, uidplus_missing = 0 WHERE account_id = ?1",
+        [account_id.as_str()],
+    )?;
+    conn.execute(
+        "UPDATE server_outbox SET state = 'held'
+         WHERE account_id = ?1 AND (
+             state IN ('pending', 'abandoned')
+             OR (state = 'dropped' AND kind = 'append_draft' AND append_checks > 0)
+         )",
+        [account_id.as_str()],
+    )?;
     Ok(())
 }
 
@@ -563,15 +584,7 @@ fn enabled(conn: &Connection, account_id: &AccountId) -> Result<bool> {
             |row| row.get(0),
         )
         .optional()?;
-    Ok(enabled.is_some_and(|value| value != 0) && !connection_paused(conn, account_id)?)
-}
-
-fn connection_paused(conn: &Connection, account_id: &AccountId) -> Result<bool> {
-    Ok(conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM meta WHERE key = 'imap:write-back-paused:' || ?1)",
-        [account_id.as_str()],
-        |row| row.get(0),
-    )?)
+    Ok(enabled.is_some_and(|value| value != 0))
 }
 
 /// Queue the Bcc-free SMTP bytes, even if the local row could not be saved.
@@ -718,7 +731,7 @@ pub(crate) fn queue_moves(
                 // Sent, but the server did not say where the copy went: a
                 // sync pass records it.
                 OutboxState::Done => !placed && copies.is_empty(),
-                OutboxState::Dropped | OutboxState::Abandoned => false,
+                OutboxState::Dropped | OutboxState::Abandoned | OutboxState::Held => false,
             },
             _ => false,
         };
@@ -1203,7 +1216,7 @@ pub(crate) fn unfinished(
         "DELETE FROM server_outbox AS settled
          WHERE account_id = ?1 AND state IN ('done', 'dropped') AND settled_unix < ?2
            AND NOT EXISTS (SELECT 1 FROM server_outbox pending
-                           WHERE pending.reverses = settled.id AND pending.state = 'pending')
+                           WHERE pending.reverses = settled.id AND pending.state IN ('pending', 'held'))
            AND NOT (kind = 'append_draft' AND state = 'dropped' AND append_checks > 0 AND generation = ?3)",
         params![account_id.as_str(), now_unix() - KEEP_SETTLED_SECS, generation(&tx, account_id)?],
     )?;

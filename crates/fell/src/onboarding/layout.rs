@@ -260,7 +260,11 @@ impl Onboarding {
 
     fn progress(&self) -> Div {
         let theme = &self.theme;
-        let step = self.form.step.number();
+        let step = if self.form.previous.is_some() && self.form.step == Step::Identity {
+            1
+        } else {
+            self.form.step.number()
+        };
         div()
             .flex()
             .flex_col()
@@ -330,11 +334,7 @@ impl Onboarding {
                 };
                 let password_note = self.feedback.password.paint(false, |issue, _| {
                     issue.as_ref().map_or_else(
-                        || self.meta(if self.form.previous.is_some() {
-                            "Leave blank to keep the saved password."
-                        } else {
-                            self.form.provider.password_hint()
-                        }),
+                        || if self.form.previous.is_some() { div() } else { self.meta(self.form.provider.password_hint()) },
                         |issue| self.field_issue(issue),
                     )
                 });
@@ -417,8 +417,8 @@ impl Onboarding {
                         self.feedback.save_note.paint(false, |state, _| match state {
                             SaveState::Ready if self.form.retained_mailbox.is_some() =>
                                 self.meta("Start empty keeps the old mail on this device but doesn't show it."),
-                            SaveState::Ready if self.form.pauses_write_back() =>
-                                self.meta("Fell keeps queued server changes on this device and pauses write-back after the IMAP endpoint changes."),
+                            SaveState::Ready if self.form.holds_queued_writes() =>
+                                self.meta("Fell keeps queued changes from the previous IMAP endpoint on this device. New changes can sync after Fell refreshes the mailbox."),
                             SaveState::Ready if self.form.previous.is_some() => div(),
                             SaveState::Ready => self.meta("Fell keeps your password in the desktop keyring."),
                             SaveState::SavingKeyring => self.meta("Approve any keyring prompt to continue."),
@@ -428,7 +428,7 @@ impl Onboarding {
                             SaveState::Failed { title, detail } => self.error(title, detail.as_deref()),
                         }).min_h(px((self.theme.ui_px + 4.) * 5.)),
                     ).when(self.form.failed_check, |column| column.child(
-                        self.error("Sync will fail with these settings", Some("You can return to Edit connection to fix them.")),
+                        self.error(self.form.failed_check_warning(), Some("You can return to Edit connection to fix them.")),
                     )),
                 [None, None],
             ),

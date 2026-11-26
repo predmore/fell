@@ -305,7 +305,7 @@ impl Form {
         })
     }
 
-    pub fn pauses_write_back(&self) -> bool {
+    pub fn holds_queued_writes(&self) -> bool {
         let imap = &self.servers[Service::Imap as usize];
         self.previous.as_ref().is_some_and(|old| {
             !self.replacement()
@@ -314,6 +314,14 @@ impl Form {
                     || Some(old.port) != port(&imap.port)
                     || old.security != imap.security)
         })
+    }
+
+    pub fn failed_check_warning(&self) -> &'static str {
+        match self.checks {
+            [Check::Connected, _] => "Sending will fail with these settings",
+            [_, Check::Connected] => "Sync will fail with these settings",
+            _ => "Sync and sending will fail with these settings",
+        }
     }
 
     pub fn inline_available(&self) -> bool {
@@ -658,6 +666,36 @@ fn port(text: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edit_prefills_the_connection_and_requires_explicit_review_after_a_failed_check() {
+        let mut previous =
+            AccountConfig::bridge("mail@example.test", "mailbox", PasswordSource::Keyring);
+        previous.smtp_port = Some(2500);
+        let mut form = Form::editing(previous);
+        assert_eq!(form.text(Field::Username), "mailbox");
+        assert_eq!(form.text(Field::Password), "");
+        assert_eq!(form.text(Field::Port(Service::Smtp)), "2500");
+        form.edit_servers();
+        let changed = form.begin_check().unwrap();
+        assert_eq!(changed.password, PasswordSource::Keyring);
+        assert!(form.begin_save().is_none());
+        form.finish_check(
+            form.attempt,
+            &changed,
+            Ok(ConnectionReport {
+                imap: Ok(1),
+                smtp: Err(fell_core::Error::Backend(
+                    "smtp: server did not answer".into(),
+                )),
+            }),
+        );
+        assert_eq!(form.step, Step::Connection);
+        assert!(form.failed_check);
+        assert!(form.begin_save().is_none());
+        form.done();
+        assert!(form.begin_save().is_some());
+    }
     use fell_core::Error;
 
     #[test]

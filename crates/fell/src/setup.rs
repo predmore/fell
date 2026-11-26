@@ -228,13 +228,14 @@ fn setup(args: &[String]) -> Result<(), String> {
         None => next_account_id()?,
     };
     let tty = io::stdin().is_terminal() && !flags.password_stdin;
-    let previous = if named {
+    let (previous, expected) = if named {
         Registry::resolve()
-            .and_then(|registry| registry.get(&fell_core::AccountId(id.clone())))
+            .and_then(|registry| registry.get_with_identity(&fell_core::AccountId(id.clone())))
             .map_err(|err| err.to_string())?
     } else {
         None
-    };
+    }
+    .unzip();
     let backend = if flags.imap {
         BackendKind::Imap
     } else {
@@ -394,7 +395,7 @@ fn setup(args: &[String]) -> Result<(), String> {
             "y" | "yes"
         );
     if flags.no_check {
-        eprintln!("Connection checks skipped. If these settings are wrong, mail will not sync.");
+        eprintln!("Connection checks skipped. Incorrect settings can prevent sync or sending.");
     } else {
         let check = connection_check_config(&config, previous.as_ref(), &SecretService)
             .map_err(|err| err.to_string())?;
@@ -411,12 +412,15 @@ fn setup(args: &[String]) -> Result<(), String> {
         _ => AccountSave::New,
     };
     let previous_id = config.id.clone();
+    let holds_queued_writes = previous.as_ref().is_some_and(|old| {
+        old.write_back && old.same_mailbox(&config) && !old.same_imap_endpoint(&config)
+    });
     let path = save_account(
         config,
         password_inline,
         previous.as_ref(),
         &SecretService,
-        |config| stage_connection_config(config, save, previous.as_ref()),
+        |config| stage_connection_config(config, save, expected),
     )
     .map_err(|err| match err {
         SaveAccountError::File(detail) => detail.to_string(),
@@ -430,6 +434,8 @@ fn setup(args: &[String]) -> Result<(), String> {
         .is_some_and(|id| id != previous_id.as_str())
     {
         println!("Kept local mail under {previous_id}.");
+    } else if holds_queued_writes {
+        println!("Changes queued for the previous IMAP endpoint will stay on this device.");
     }
     println!("Saved {} (mode 600). Open Fell to sync.", path.display());
     Ok(())
@@ -1044,6 +1050,98 @@ mod tests {
         );
         assert!(!published.contains("sample-password"));
         assert_eq!(keyring.writes.get(), 2);
+    }
+
+    #[test]
+    fn connection_edit_keeps_a_working_key_across_publication() {
+        use std::cell::{Cell, RefCell};
+        use std::collections::HashMap;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        use fell_core::credentials::KeyringError;
+
+        #[derive(Default)]
+        struct Keyring {
+            keys: RefCell<HashMap<String, String>>,
+            interrupt_read: Cell<bool>,
+            interrupt_remove: Cell<bool>,
+            new_key: String,
+        }
+
+        impl PasswordStore for Keyring {
+            fn read(&self, key: &str) -> Result<String, KeyringError> {
+                assert!(!(key == self.new_key && self.interrupt_read.get()));
+                self.keys
+                    .borrow()
+                    .get(key)
+                    .cloned()
+                    .ok_or(KeyringError::Missing)
+            }
+
+            fn store(&self, key: &str, password: &str) -> Result<(), KeyringError> {
+                self.keys.borrow_mut().insert(key.into(), password.into());
+                Ok(())
+            }
+
+            fn remove(&self, key: &str) -> Result<(), KeyringError> {
+                assert!(!self.interrupt_remove.get());
+                self.keys.borrow_mut().remove(key);
+                Ok(())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mail.toml");
+        let stage = |config: &mut AccountConfig| {
+            crate::mailbox::stage_account_config_at(path.clone(), config, false)
+        };
+        let original = AccountConfig::bridge("a@example.test", "user", PasswordSource::Keyring);
+        stage(&mut original.clone()).unwrap().publish().unwrap();
+        let mut edited = original.clone();
+        edited.smtp_port = Some(2525);
+        let keyring = Keyring {
+            new_key: edited.credential_key(),
+            ..Default::default()
+        };
+        original
+            .store_keyring_password(&keyring, "fixture")
+            .unwrap();
+        let published = || {
+            fell_core::accounts::read(&path, Some("mail"))
+                .unwrap()
+                .unwrap()
+                .0
+        };
+        let save = || save_account(edited.clone(), false, Some(&original), &keyring, stage);
+
+        keyring.interrupt_read.set(true);
+        assert!(catch_unwind(AssertUnwindSafe(save)).is_err());
+        assert_eq!(published(), original);
+        assert_eq!(
+            published().resolve_password_with(&keyring).unwrap(),
+            "fixture"
+        );
+
+        keyring.interrupt_read.set(false);
+        keyring.interrupt_remove.set(true);
+        assert!(catch_unwind(AssertUnwindSafe(save)).is_err());
+        assert_eq!(published(), edited);
+        assert_eq!(
+            published().resolve_password_with(&keyring).unwrap(),
+            "fixture"
+        );
+        assert_eq!(original.resolve_password_with(&keyring).unwrap(), "fixture");
+
+        keyring.interrupt_remove.set(false);
+        save().unwrap();
+        assert_eq!(
+            published().resolve_password_with(&keyring).unwrap(),
+            "fixture"
+        );
+        assert!(matches!(
+            original.resolve_password_with(&keyring),
+            Err(fell_core::Error::Keyring(KeyringError::Missing))
+        ));
     }
 
     fn imap_account(security: ImapSecurity) -> AccountConfig {

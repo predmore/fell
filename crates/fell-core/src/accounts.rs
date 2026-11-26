@@ -419,6 +419,14 @@ impl Registry {
 
     /// Read only the requested account so a broken sibling cannot block it.
     pub fn get(&self, id: &AccountId) -> Result<Option<AccountConfig>, FileError> {
+        self.get_with_identity(id)
+            .map(|account| account.map(|(config, _)| config))
+    }
+
+    pub fn get_with_identity(
+        &self,
+        id: &AccountId,
+    ) -> Result<Option<(AccountConfig, FileIdentity)>, FileError> {
         let path = self.path(id.as_str())?;
         let migration = self.migrate();
         match real_directory(&self.config) {
@@ -428,8 +436,8 @@ impl Registry {
             }
             Err(error) => return Err(FileError::access(&self.config, error)),
         }
-        match read(&path, Some(id.as_str()))? {
-            Some((config, _)) => Ok(Some(config)),
+        match read_with_identity(&path, Some(id.as_str()))? {
+            Some((config, _, identity)) => Ok(Some((config, identity))),
             None => migration.map(|()| None),
         }
     }
@@ -1194,6 +1202,13 @@ pub fn missing(path: &Path) -> FileError {
 
 /// Read from one descriptor and reject special files and exposed passwords.
 pub fn read(path: &Path, id: Option<&str>) -> Result<Option<(AccountConfig, String)>, FileError> {
+    read_with_identity(path, id).map(|account| account.map(|(config, text, _)| (config, text)))
+}
+
+pub fn read_with_identity(
+    path: &Path,
+    id: Option<&str>,
+) -> Result<Option<(AccountConfig, String, FileIdentity)>, FileError> {
     if id.is_some_and(|id| path.file_stem().and_then(|stem| stem.to_str()) != Some(id)) {
         return Err(FileError::new(
             format!("{} is not this account’s file", file_name(path)),
@@ -1215,7 +1230,7 @@ pub fn read(path: &Path, id: Option<&str>) -> Result<Option<(AccountConfig, Stri
 fn read_account_contents(
     path: &Path,
     id: Option<&str>,
-) -> Result<Option<(AccountConfig, String)>, FileError> {
+) -> Result<Option<(AccountConfig, String, FileIdentity)>, FileError> {
     let mut file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -1240,7 +1255,7 @@ fn read_account_contents(
     let mut text = String::new();
     file.read_to_string(&mut text)
         .map_err(|err| FileError::access(path, err))?;
-    Ok(Some((parse(path, &text, id)?, text)))
+    Ok(Some((parse(path, &text, id)?, text, file_identity(meta))))
 }
 
 pub fn parse(path: &Path, text: &str, id: Option<&str>) -> Result<AccountConfig, FileError> {
