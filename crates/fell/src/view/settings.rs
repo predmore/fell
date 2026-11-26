@@ -515,6 +515,9 @@ impl View {
     pub fn settle(&mut self) {
         self.fade = None;
         self.page_fade = None;
+        if let Some((_, _, glide)) = &mut self.held_actions {
+            *glide = None;
+        }
     }
 
     fn scroll_lines(&mut self, lines: i32, motion: Motion, now: Instant) {
