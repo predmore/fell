@@ -146,7 +146,7 @@ impl Registry {
     /// all SQLite files into a durable staging directory. If interrupted, the
     /// mailbox stays closed until removal resumes using that directory.
     pub fn remove(&self, base: &Path, id: &str, delete: bool) -> Result<RemovalOutcome, String> {
-        self.remove_if_unchanged(base, id, delete, None)
+        self.remove_impl(base, id, delete, None, false)
     }
 
     pub fn remove_if_unchanged(
@@ -156,7 +156,9 @@ impl Registry {
         delete: bool,
         expected: Option<FileIdentity>,
     ) -> Result<RemovalOutcome, String> {
-        self.remove_impl(base, id, delete, expected, false)
+        let expected =
+            expected.ok_or("Couldn't verify the account file. Select the account again.")?;
+        self.remove_impl(base, id, delete, Some(expected), false)
     }
 
     pub fn recover_removal(
@@ -181,7 +183,14 @@ impl Registry {
         let directory = self.lock().map_err(|err| err.to_string())?;
         let account = self.path(id).map_err(|err| err.to_string())?;
         let mailbox = self.mailbox_path(base, id).map_err(|err| err.to_string())?;
-        if expected.is_some() && account.symlink_metadata().ok().map(file_identity) != expected {
+        let changed = match expected {
+            Some(expected) => account.symlink_metadata().ok().map(file_identity) != Some(expected),
+            None if recovery_only => !account
+                .symlink_metadata()
+                .is_err_and(|error| error.kind() == io::ErrorKind::NotFound),
+            None => false,
+        };
+        if changed {
             return Err("The account file changed. Select the account again.".into());
         }
         let trash = removal_trash(&mailbox);

@@ -272,10 +272,8 @@ fn run(
     let mut snippets_repaired = false;
     let mut previous_trash_expunge = None;
     let mut refresh_trash_confirmation = || {
-        if !config.write_back {
-            return true;
-        }
-        let available = store.trash_expunge_available(&account.id).unwrap_or(false);
+        let available =
+            config.write_back && store.trash_expunge_available(&account.id).unwrap_or(false);
         previous_trash_expunge.replace(available) == Some(available)
             || events
                 .unbounded_send(SyncEvent::TrashExpungeAvailability(available))

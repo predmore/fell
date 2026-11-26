@@ -351,7 +351,7 @@ impl AccountWindow {
         }) {
             self.notice(
                 format!(
-                    "Delete interrupted for {} · Settings → Accounts",
+                    "Deletion interrupted for {} · Settings → Accounts",
                     pending.name
                 ),
                 true,

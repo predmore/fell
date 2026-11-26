@@ -597,8 +597,14 @@ fn registry_grants_cover_secondary_stores_and_disconnect_live_sessions() {
     assert!(revoked.err.contains("Revoked atlas on work"));
     assert!(revoked.err.contains("mail@example.test (mail)"));
     assert_eq!(tools(&mut session), 0);
+    let entry = registry
+        .load()
+        .entries
+        .into_iter()
+        .find(|entry| entry.path == registry.path("mail").unwrap())
+        .unwrap();
     registry
-        .recover_removal(&ctx.store(), "mail", true, None)
+        .recover_removal(&ctx.store(), "mail", true, entry.file_identity)
         .unwrap();
 
     registry.remove(&ctx.store(), "work", false).unwrap();

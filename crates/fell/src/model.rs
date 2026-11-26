@@ -605,6 +605,9 @@ impl Session {
     pub fn reset_after_account_reload(&mut self) {
         self.fetch = None;
         self.pending = None;
+        self.trash_expunge_available = false;
+        self.withdraw_purge();
+        self.purge_ready = None;
         self.cancel_read_delay();
         self.worker_outages.clear();
     }
@@ -5505,6 +5508,35 @@ mod tests {
         session.on_key(KeyId::Char('#'), 4);
         assert!(session.clear_toast_if(session.toast_generation()));
         assert!(!session.on_key(KeyId::Char('y'), 4).purge);
+    }
+
+    #[test]
+    fn reloading_an_account_withdraws_server_purge_and_allows_local_purge() {
+        let mut session = session();
+        session.folder = "Trash".into();
+        session.cursor_id = Some("a".into());
+        session.set_trash_expunge_available(true);
+        session.on_key(KeyId::Char('#'), 4);
+        session.reset_after_account_reload();
+        assert!(session.toast.is_none());
+        assert!(!session.on_key(KeyId::Char('y'), 4).purge);
+
+        session.set_trash_expunge_available(true);
+        session.on_key(KeyId::Char('#'), 4);
+        assert!(session.on_key(KeyId::Char('y'), 4).purge);
+        session.reset_after_account_reload();
+        assert_eq!(session.take_purge(), None);
+        session.on_key(KeyId::Char('#'), 4);
+        assert!(
+            session
+                .toast
+                .as_ref()
+                .unwrap()
+                .text
+                .starts_with("Server copy stays.")
+        );
+        assert!(session.on_key(KeyId::Char('y'), 4).purge);
+        assert_eq!(session.take_purge(), Some((vec!["a".into()], false)));
     }
 
     #[test]

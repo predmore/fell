@@ -415,7 +415,7 @@ fn list() -> Result<(), String> {
         }
     }
     for pending in accounts.interrupted {
-        println!("{}\t{} · Delete interrupted", pending.id, pending.name);
+        println!("{}\t{} · Deletion interrupted", pending.id, pending.name);
     }
     Ok(())
 }
@@ -461,13 +461,12 @@ fn remove(id: &str) -> Result<(), String> {
     let terminal = io::stdin().is_terminal();
     let expected = entry.and_then(|entry| entry.file_identity);
     let outcome = if let Some(pending) = pending {
-        let Some(delete) = recovery_choice(terminal, pending.can_restore, |question| {
+        let Some(delete) = recovery_choice(terminal, pending.can_restore, &name, |question| {
             prompt(question, Some(""))
         })?
         else {
-            return Err(format!(
-                "Delete interrupted for {name}. Choose an action on a terminal or in Settings → Accounts."
-            ));
+            println!("Left the interrupted deletion as is.");
+            return Ok(());
         };
         registry.recover_removal(&base, id, delete, expected)?
     } else {
@@ -487,11 +486,13 @@ fn remove(id: &str) -> Result<(), String> {
     match outcome {
         RemovalOutcome::Kept => println!("Removed {name}. Local mail kept."),
         RemovalOutcome::Deleted => println!("Removed {name}. Local mail deleted."),
-        RemovalOutcome::Restored { connected: true } => println!("Restored local mail for {name}."),
-        RemovalOutcome::Restored { connected: false } => {
-            println!("Restored local mail for {name}. The account is disconnected.")
+        RemovalOutcome::Restored { connected: true } => {
+            println!("Restored {name} · account and local mail")
         }
-        RemovalOutcome::Cleared => println!("Cleared the interrupted removal for {name}."),
+        RemovalOutcome::Restored { connected: false } => {
+            println!("Restored local mail for {name} · account disconnected")
+        }
+        RemovalOutcome::Cleared => println!("Cleared interrupted deletion for {name}"),
     }
     Ok(())
 }
@@ -499,21 +500,24 @@ fn remove(id: &str) -> Result<(), String> {
 fn recovery_choice(
     terminal: bool,
     can_restore: bool,
-    ask: impl FnOnce(&str) -> Result<String, String>,
+    name: &str,
+    mut ask: impl FnMut(&str) -> Result<String, String>,
 ) -> Result<Option<bool>, String> {
     if !terminal {
         return Ok(None);
     }
-    let question = if can_restore {
-        "Interrupted deletion. [r] Restore, [f] Finish deleting, or Enter to leave as is"
-    } else {
-        "Interrupted deletion. [f] Finish deleting, or Enter to leave as is"
-    };
-    Ok(match ask(question)?.to_ascii_lowercase().as_str() {
-        "r" if can_restore => Some(false),
-        "f" => Some(true),
-        _ => None,
-    })
+    let restore = if can_restore { "[r] Restore · " } else { "" };
+    let question = format!(
+        "{name}: deletion was interrupted. {restore}[f] Finish deleting · Enter to leave it"
+    );
+    match ask(&question)?.to_ascii_lowercase().as_str() {
+        "r" if can_restore => Ok(Some(false)),
+        "f" => {
+            let answer = ask(&format!("Delete {name}'s local mail for good? [y/N]"))?;
+            Ok(matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes").then_some(true))
+        }
+        _ => Ok(None),
+    }
 }
 
 fn show(id: Option<&str>) -> Result<(), String> {
@@ -691,19 +695,38 @@ mod tests {
 
     #[test]
     fn interrupted_removal_requires_an_explicit_terminal_choice() {
-        assert_eq!(recovery_choice(false, true, |_| panic!()).unwrap(), None);
-        for answer in ["", "n", "yes", "r", "R", "f", "F"] {
+        assert_eq!(
+            recovery_choice(false, true, "Field Desk", |_| panic!()).unwrap(),
+            None
+        );
+        for answer in ["", "n", "yes", "r", "R"] {
             for can_restore in [false, true] {
                 let expected = match answer {
                     "r" | "R" if can_restore => Some(false),
-                    "f" | "F" => Some(true),
                     _ => None,
                 };
                 assert_eq!(
-                    recovery_choice(true, can_restore, |_| Ok(answer.into())).unwrap(),
+                    recovery_choice(true, can_restore, "Field Desk", |question| {
+                        assert!(question.starts_with("Field Desk: deletion was interrupted."));
+                        assert_eq!(question.contains("[r] Restore"), can_restore);
+                        Ok(answer.into())
+                    })
+                    .unwrap(),
                     expected
                 );
             }
+        }
+        for (answer, expected) in [("", None), ("n", None), ("y", Some(true))] {
+            let mut answers = ["f", answer].into_iter();
+            let choice = recovery_choice(true, true, "Field Desk", |question| {
+                let answer = answers.next().unwrap();
+                if answer != "f" {
+                    assert_eq!(question, "Delete Field Desk's local mail for good? [y/N]");
+                }
+                Ok(answer.into())
+            });
+            assert_eq!(choice.unwrap(), expected);
+            assert!(answers.next().is_none());
         }
     }
 

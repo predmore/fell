@@ -256,7 +256,7 @@ impl View {
                 status: if removing(&pending.id) {
                     "Recovering…"
                 } else {
-                    "Delete interrupted"
+                    "Deletion interrupted"
                 }
                 .into(),
                 alert: !removing(&pending.id),
@@ -1162,7 +1162,7 @@ pub(super) fn card(
         Page::ConfirmAccountRemoval {
             delete: false,
             kind: AccountRemovalKind::Interrupted { .. },
-        } => "Delete interrupted".into(),
+        } => "Deletion interrupted".into(),
         Page::ConfirmAccountRemoval {
             delete: true,
             kind: AccountRemovalKind::Interrupted { .. },

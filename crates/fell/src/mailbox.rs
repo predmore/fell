@@ -337,18 +337,20 @@ pub(crate) fn stage_account_config(
         if accounts::mailbox_exists(&mailbox).map_err(|err| err.to_string())? {
             return Err("This ID has a local mailbox. Choose a new ID or confirm reconnecting the same account.".into());
         }
-        registry
-            .initialize_original(&lock, &base, &config.id)
-            .map_err(|err| err.to_string())?;
     }
-    stage_account_text_at(path, &config.render(), !configured, lock)
+    let mut staged = stage_account_text_at(path, &config.render(), !configured, lock)?;
+    if !configured && !reconnect {
+        staged.original = Some((registry, base, config.id.clone()));
+    }
+    Ok(staged)
 }
 
 pub(crate) struct StagedAccountConfig {
     path: PathBuf,
     file: tempfile::NamedTempFile,
     first_run: bool,
-    _lock: fs::File,
+    lock: fs::File,
+    original: Option<(Registry, PathBuf, String)>,
 }
 
 impl StagedAccountConfig {
@@ -365,7 +367,12 @@ impl StagedAccountConfig {
                 format!("{}: {}", self.path.display(), err.error).into()
             }
         })?;
-        self._lock.sync_all().map_err(|err| err.to_string())?;
+        if let Some((registry, base, id)) = self.original {
+            registry
+                .initialize_original(&self.lock, &base, &id)
+                .map_err(|err| err.to_string())?;
+        }
+        self.lock.sync_all().map_err(|err| err.to_string())?;
         Ok(self.path)
     }
 }
@@ -470,7 +477,8 @@ fn stage_account_text_at(
         path,
         file,
         first_run,
-        _lock: lock,
+        lock,
+        original: None,
     })
 }
 
@@ -730,14 +738,17 @@ mod tests {
             fell_core::PasswordSource::Inline("fixture".into()),
         );
         config.id = "first".into();
+        let marker = registry.directory().join(".original-id");
+        let staged = stage_account_config(&config, false, false).unwrap();
+        assert!(!marker.exists());
+        drop(staged);
+        assert!(!marker.exists());
+        assert!(!registry.path("first").unwrap().exists());
         stage_account_config(&config, false, false)
             .unwrap()
             .publish()
             .unwrap();
-        assert_eq!(
-            fs::read_to_string(registry.directory().join(".original-id")).unwrap(),
-            "first"
-        );
+        assert_eq!(fs::read_to_string(marker).unwrap(), "first");
         let base = store_path().unwrap();
         assert_eq!(registry.store_path(&base, "first").unwrap(), base);
         assert_eq!(fs::read_to_string(legacy).unwrap(), "invalid = [");

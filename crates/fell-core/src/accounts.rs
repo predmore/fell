@@ -319,19 +319,9 @@ impl Registry {
                     }
                     Err(err) if err.kind() == io::ErrorKind::NotFound => match legacy {
                         Ok(Some((config, _))) => Some((config.id, None)),
-                        Ok(None) => {
+                        legacy => {
                             marker?;
-                            let sibling = base.with_extension("accounts").join("mail.db");
-                            (!mailbox_exists(&sibling)
-                                .map_err(|err| FileError::access(&sibling, err))?)
-                            .then(|| (DEFAULT_ID.into(), None))
-                        }
-                        Err(_) => {
-                            marker?;
-                            // Older registries could have opened mail.db before
-                            // writing a marker. Only the mailbox itself can
-                            // establish ownership when the legacy file is broken.
-                            removal::mailbox_has_owner(base, DEFAULT_ID)
+                            self.infer_original_mailbox(base, legacy.is_err())?
                                 .then(|| (DEFAULT_ID.into(), None))
                         }
                     },
@@ -342,28 +332,42 @@ impl Registry {
         Ok(original)
     }
 
-    /// Record the first account's route before publishing its config. The
-    /// caller holds the exclusive account directory lock.
+    fn infer_original_mailbox(&self, base: &Path, broken_legacy: bool) -> Result<bool, FileError> {
+        let sibling = base.with_extension("accounts").join("mail.db");
+        if mailbox_exists(&sibling).map_err(|err| FileError::access(&sibling, err))? {
+            return Ok(false);
+        }
+        if broken_legacy {
+            let dir = self.directory();
+            if has_account_file(&dir, None).map_err(|err| FileError::access(&dir, err))? {
+                return Ok(false);
+            }
+        }
+        Ok(
+            (!broken_legacy
+                && !mailbox_exists(base).map_err(|err| FileError::access(base, err))?)
+                || removal::mailbox_has_owner(base, DEFAULT_ID),
+        )
+    }
+
+    /// Record the first account's route once its config has been published.
+    /// The caller holds the exclusive account directory lock.
     pub fn initialize_original(
         &self,
         directory: &File,
         base: &Path,
         id: &str,
     ) -> Result<(), FileError> {
-        self.path(id)?;
+        let account = self.path(id)?;
         let dir = self.directory();
         let marker = dir.join(".original-id");
         let initialize = || -> io::Result<()> {
             if path_exists(&marker)?
                 || path_exists(&self.config.join("account.toml.bak"))?
                 || mailbox_exists(base)?
+                || has_account_file(&dir, Some(&account))?
             {
                 return Ok(());
-            }
-            for entry in fs::read_dir(&dir)? {
-                if entry?.path().extension().is_some_and(|ext| ext == "toml") {
-                    return Ok(());
-                }
             }
             publish(&dir, &marker, id.as_bytes())?;
             directory.sync_all()?;
@@ -442,6 +446,21 @@ impl Registry {
         };
         write().map_err(|err| FileError::access(&legacy, err))
     }
+}
+
+fn has_account_file(dir: &Path, except: Option<&Path>) -> io::Result<bool> {
+    let files = match fs::read_dir(dir) {
+        Ok(files) => files,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
+    for entry in files {
+        let path = entry?.path();
+        if path.extension().is_some_and(|ext| ext == "toml") && Some(path.as_path()) != except {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn file_name(path: &Path) -> std::borrow::Cow<'_, str> {
@@ -788,6 +807,17 @@ mod tests {
         let registry = Registry::at(config.clone());
         let legacy = config.join("account.toml");
         let base = root.path().join("mail.db");
+        let live = base.with_extension("accounts").join("mail.db");
+        for (path, email) in [(&base, "old@example.test"), (&live, "live@example.test")] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let db = crate::Store::open(path).unwrap();
+            let config = AccountConfig::bridge(
+                email,
+                email,
+                crate::PasswordSource::Inline("fixture".into()),
+            );
+            db.upsert_account(&config.account()).unwrap();
+        }
         write_private(&legacy, "invalid = [");
         for id in ["mail", "work"] {
             write_private(
@@ -811,6 +841,38 @@ mod tests {
         assert!(error.detail.starts_with("account.toml:"));
         assert!(!error.detail.contains(&*config.to_string_lossy()));
         assert_eq!(fs::read_to_string(legacy).unwrap(), "invalid = [");
+        assert!(
+            registry
+                .remove_if_unchanged(&base, "mail", true, None)
+                .is_err()
+        );
+        assert!(registry.recover_removal(&base, "mail", true, None).is_err());
+        assert!(live.is_file());
+        assert_eq!(mailbox_owner(&base).unwrap().unwrap().1, "old@example.test");
+    }
+
+    #[test]
+    fn a_missing_legacy_config_does_not_rebind_a_base_db_with_another_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = Registry::at(root.path().join("fell"));
+        let base = root.path().join("mail.db");
+        let mut original = AccountConfig::bridge(
+            "other@example.test",
+            "other@example.test",
+            crate::PasswordSource::Inline("fixture".into()),
+        );
+        original.id = "other".into();
+        let db = crate::Store::open(&base).unwrap();
+        db.upsert_account(&original.account()).unwrap();
+        drop(db);
+        write_private(
+            &registry.path("mail").unwrap(),
+            "email = 'mail@example.test'\npassword = 'fixture'\n",
+        );
+        assert_eq!(
+            registry.store_path(&base, "mail").unwrap(),
+            base.with_extension("accounts").join("mail.db")
+        );
     }
 
     #[test]
