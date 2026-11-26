@@ -478,6 +478,9 @@ fn run(
                                     resending.extend(rows);
                                     continue;
                                 }
+                                // An earlier Resend is still replaying; its
+                                // outcome is reported when those rows finish.
+                                Ok(_) if !resending.is_empty() => continue,
                                 Ok(_) => Ok(0),
                                 Err(error) => Err(error),
                             }
