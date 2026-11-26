@@ -253,7 +253,22 @@ fn wait_for_images(widget: &webkit2gtk::WebView, active: Active, token: gtk::gio
                     context.getImageData(0, 0, 1, 1);
                 }
             }
-            return 1;
+            // Keep the padding along the last visible flow of the email.
+            // A nested table or footer can supply it instead of the body.
+            const limit = 64;
+            let bottom = parseFloat(getComputedStyle(document.documentElement).paddingBottom) || 0;
+            for (let node = document.body; node && bottom < limit;) {
+                bottom += parseFloat(getComputedStyle(node).paddingBottom) || 0;
+                let child = node.lastElementChild;
+                while (child) {
+                    const style = getComputedStyle(child);
+                    if (style.position !== 'absolute' && style.position !== 'fixed' &&
+                        style.visibility !== 'hidden' && child.getBoundingClientRect().height > 0) break;
+                    child = child.previousElementSibling;
+                }
+                node = child;
+            }
+            return 1 + Math.ceil(Math.min(limit, bottom));
         })();
     "#;
     if token.is_cancelled() {
@@ -278,9 +293,10 @@ fn wait_for_images(widget: &webkit2gtk::WebView, active: Active, token: gtk::gio
                         wait_for_images(&view, active, token);
                     });
                 }
-                Some(1) => {
+                Some(ready) if ready > 0 => {
+                    let bottom_padding = (ready - 1) as u32;
                     glib::timeout_add_local_once(PAINT_SETTLE, move || {
-                        capture(&view, active, token, true);
+                        capture(&view, active, token, bottom_padding, true);
                     });
                 }
                 _ => cancel(&active),
@@ -293,6 +309,7 @@ fn capture(
     widget: &webkit2gtk::WebView,
     active: Active,
     token: gtk::gio::Cancellable,
+    bottom_padding: u32,
     retry: bool,
 ) {
     if token.is_cancelled() {
@@ -307,7 +324,10 @@ fn capture(
             if token.is_cancelled() {
                 return;
             }
-            match result.ok().and_then(surface_image) {
+            match result
+                .ok()
+                .and_then(|surface| surface_image(surface, bottom_padding))
+            {
                 Some(image) => {
                     if let Some(load) = active.borrow_mut().take() {
                         let _ = load.reply.send(image);
@@ -315,7 +335,7 @@ fn capture(
                 }
                 None if retry => {
                     glib::timeout_add_local_once(PAINT_SETTLE, move || {
-                        capture(&view, active, token, false);
+                        capture(&view, active, token, bottom_padding, false);
                     });
                 }
                 None => cancel(&active),
@@ -443,7 +463,7 @@ fn install_filter(widget: &webkit2gtk::WebView) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
-fn surface_image(surface: gtk::cairo::Surface) -> Option<Snapshot> {
+fn surface_image(surface: gtk::cairo::Surface, bottom_padding: u32) -> Option<Snapshot> {
     let mut image = gtk::cairo::ImageSurface::try_from(surface).ok()?;
     image.flush();
     let width = image.width();
@@ -496,7 +516,8 @@ fn surface_image(surface: gtk::cairo::Surface) -> Option<Snapshot> {
             *r = ((u16::from(*r) * 255) / alpha) as u8;
         }
     }
-    let dst_h = super::native::trim_uniform_bottom(&bgra, dst_w, dst_h).clamp(1, dst_h);
+    let keep = 12_u32.max(bottom_padding) * dst_h / height;
+    let dst_h = super::native::trim_uniform_bottom(&bgra, dst_w, dst_h, keep).clamp(1, dst_h);
     bgra.truncate(dst_w as usize * dst_h as usize * 4);
     let pixels = image::RgbaImage::from_raw(dst_w, dst_h, bgra)?;
     Some(Snapshot {
@@ -732,6 +753,23 @@ mod tests {
         })).expect("paint after the lazy image decodes");
         assert!(contains_display_color(&picture, [0xd1, 0x63, 0x26]));
         assert!(contains_display_color(&picture, [0x25, 0x79, 0x9d]));
+
+        let padded = |padding| {
+            let mail = fell_render::WebMail::prepare(&format!(
+                r#"<body style="padding-bottom:{padding}px"><div style="height:96px">Padding probe</div></body>"#,
+            ));
+            futures::executor::block_on(render(WebRequest {
+                html: mail.page("light", |_| None),
+                width: 360,
+                background: 0xffffff,
+            }))
+            .expect("WebKit drew the white text page")
+            .height
+        };
+        let default = padded(0);
+        assert_eq!(padded(24) - default, 12.);
+        assert_eq!(padded(400) - default, 52.);
+        eprintln!("white text page drew with its 24px bottom padding, capped at 64px");
 
         let blank = futures::executor::block_on(render(WebRequest {
             html: "<!doctype html><style>body { height: 240px; }</style>".into(),

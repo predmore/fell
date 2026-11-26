@@ -2941,11 +2941,8 @@ fn image_el(
 }
 
 /// Drop trailing rows that are a flat page color, so a short newsletter
-/// does not keep the empty viewport under the card. A short run of that
-/// color stays, matching the page's own top inset. The pane below the
-/// snapshot is painted the same color, so the page still fills the window.
-pub(crate) fn trim_uniform_bottom(rgba: &[u8], width: u32, height: u32) -> u32 {
-    const KEEP_FLAT_ROWS: usize = 12;
+/// does not keep the empty viewport under the card. Keep the page's inset.
+pub(crate) fn trim_uniform_bottom(rgba: &[u8], width: u32, height: u32, keep: u32) -> u32 {
     let row_bytes = width as usize * 4;
     if row_bytes == 0 || height == 0 || rgba.len() < row_bytes * height as usize {
         return height;
@@ -2962,7 +2959,7 @@ pub(crate) fn trim_uniform_bottom(rgba: &[u8], width: u32, height: u32) -> u32 {
         return height;
     }
     let flat = height as usize - rows;
-    (rows + flat.min(KEEP_FLAT_ROWS)) as u32
+    (rows + flat.min(keep as usize)) as u32
 }
 
 fn row_is_flat(row: &[u8]) -> bool {
@@ -4427,9 +4424,10 @@ mod decode_tests {
                 rgba[i + 3] = 255;
             }
         }
-        assert_eq!(trim_uniform_bottom(&rgba, width, height), 22);
+        assert_eq!(trim_uniform_bottom(&rgba, width, height, 12), 22);
+        assert_eq!(trim_uniform_bottom(&rgba, width, height, 24), 34);
         let short = &rgba[..width as usize * 18 * 4];
-        assert_eq!(trim_uniform_bottom(short, width, 18), 18);
+        assert_eq!(trim_uniform_bottom(short, width, 18, 12), 18);
         let mut tall = vec![0u8; width as usize * 200 * 4];
         tall[..rgba.len()].copy_from_slice(&rgba);
         for y in 40..200 {
@@ -4441,7 +4439,7 @@ mod decode_tests {
                 tall[i + 3] = 255;
             }
         }
-        assert_eq!(trim_uniform_bottom(&tall, width, 200), 22);
+        assert_eq!(trim_uniform_bottom(&tall, width, 200, 12), 22);
     }
 
     #[test]

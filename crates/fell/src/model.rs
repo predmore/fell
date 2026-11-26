@@ -5193,7 +5193,7 @@ mod tests {
         assert!(!session.threads[1].starred);
         // Both are in the palette with their keys.
         let palette = session.palette();
-        for (label, key) in [("Mark unread or read", "U"), ("Star or unstar", "s")] {
+        for (label, key) in [("Mark unread or read", "⇧U"), ("Star or unstar", "s")] {
             let item = palette.iter().find(|item| item.label == label).unwrap();
             assert_eq!(item.binding, key);
         }

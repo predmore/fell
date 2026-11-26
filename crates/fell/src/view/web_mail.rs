@@ -25,6 +25,8 @@ const CACHE_SIZE: usize = 12;
 const THREAD_HOLD: Duration = Duration::from_millis(150);
 const SNAPSHOT_BATCH: Duration = Duration::from_millis(550);
 const MEASURED_HEIGHTS: usize = 4 * CACHE_SIZE;
+const PROMPT_HEIGHT: f32 = 30.;
+const PROMPT_GAP: f32 = 8.;
 
 #[derive(Default)]
 pub(super) struct Reader {
@@ -120,7 +122,9 @@ struct Shown {
     prompt: Option<Prompt>,
     outgoing_prompts: Vec<(Prompt, f32)>,
     prompt_from: f32,
+    prompt_height_from: f32,
     prompt_fade: Option<Transition>,
+    retrying: bool,
     reserves_tag: bool,
     image_consent: bool,
 }
@@ -130,11 +134,14 @@ impl Shown {
         mail: Weak<WebMail>,
         image: Option<Snapshot>,
         waiting: bool,
+        stored: bool,
         prompt: Option<Prompt>,
     ) -> Self {
         let body = image.map_or(
             if waiting {
                 Body::Placeholder
+            } else if stored {
+                Body::StoredText
             } else {
                 Body::Native
             },
@@ -152,7 +159,9 @@ impl Shown {
             prompt,
             outgoing_prompts: Vec::new(),
             prompt_from: 0.,
+            prompt_height_from: 0.,
             prompt_fade: None,
+            retrying: false,
             reserves_tag: false,
             image_consent: false,
         }
@@ -180,8 +189,9 @@ impl Shown {
         if self.prompt != prompt {
             // A quick download can finish before its loading label has faded in.
             // Continue from the opacities on screen when that happens.
-            let prior = std::mem::replace(&mut self.prompt, prompt);
             let progress = motion::progress(self.prompt_fade.as_ref(), now);
+            self.prompt_height_from = self.prompt_height(progress);
+            let prior = std::mem::replace(&mut self.prompt, prompt);
             let fade = motion.start(motion::FADE, now);
             for (_, alpha) in &mut self.outgoing_prompts {
                 *alpha *= 1.0 - progress;
@@ -198,6 +208,10 @@ impl Shown {
                 }
                 *alpha > 0.0
             });
+            if self.prompt == Some(Prompt::Retrying) {
+                self.prompt_from = 1.;
+                self.outgoing_prompts.clear();
+            }
             self.prompt_fade = fade;
         }
         if !motion.enabled() || self.prompt_fade.is_none_or(|fade| !fade.running(now)) {
@@ -206,29 +220,40 @@ impl Shown {
         }
     }
 
+    fn prompt_height(&self, progress: f32) -> f32 {
+        motion::lerp(
+            self.prompt_height_from,
+            f32::from(u8::from(self.prompt.is_some())),
+            progress,
+        )
+    }
+
     fn frame(&self, now: Instant) -> Frame {
         let progress = motion::progress(self.fade.as_ref(), now);
+        let height_progress = self
+            .fade
+            .map_or(1., |fade| motion::ease_out_quad(fade.linear(now)));
         let current_tag = f32::from(u8::from(self.body.is_web()));
         let previous_tag = self
             .outgoing
             .as_ref()
             .map_or(current_tag, |body| f32::from(u8::from(body.is_web())));
+        let prompt_progress = motion::progress(self.prompt_fade.as_ref(), now);
         Frame {
             body: self.body.clone(),
             outgoing: self.outgoing.clone(),
             progress,
-            prompt: self.prompt.clone().map(|incoming| {
-                let progress = motion::progress(self.prompt_fade.as_ref(), now);
-                PromptFrame {
-                    incoming,
-                    incoming_alpha: motion::lerp(self.prompt_from, 1.0, progress),
-                    outgoing: self
-                        .outgoing_prompts
-                        .iter()
-                        .map(|(label, alpha)| (label.clone(), alpha * (1.0 - progress)))
-                        .collect(),
-                    progress,
-                }
+            height_progress,
+            prompt: (self.prompt.is_some() || self.prompt_fade.is_some()).then(|| PromptFrame {
+                incoming: self.prompt.clone(),
+                incoming_alpha: motion::lerp(self.prompt_from, 1.0, prompt_progress),
+                outgoing: self
+                    .outgoing_prompts
+                    .iter()
+                    .map(|(label, alpha)| (label.clone(), alpha * (1.0 - prompt_progress)))
+                    .collect(),
+                height: self.prompt_height(prompt_progress),
+                progress: prompt_progress,
             }),
             web_tag: self
                 .reserves_tag
@@ -250,6 +275,7 @@ impl Shown {
 #[derive(Clone)]
 pub(super) enum Body {
     Placeholder,
+    StoredText,
     Native,
     Web(Snapshot),
 }
@@ -257,7 +283,9 @@ pub(super) enum Body {
 impl Body {
     fn same_as(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Placeholder, Self::Placeholder) | (Self::Native, Self::Native) => true,
+            (Self::Placeholder, Self::Placeholder)
+            | (Self::StoredText, Self::StoredText)
+            | (Self::Native, Self::Native) => true,
             (Self::Web(a), Self::Web(b)) => a.image.id == b.image.id,
             _ => false,
         }
@@ -272,6 +300,7 @@ pub(super) struct Frame {
     pub body: Body,
     pub outgoing: Option<Body>,
     pub progress: f32,
+    pub height_progress: f32,
     pub prompt: Option<PromptFrame>,
     pub web_tag: Option<f32>,
     pub height: Option<Rc<Cell<Option<f32>>>>,
@@ -281,12 +310,16 @@ pub(super) struct Frame {
 }
 
 impl Frame {
+    pub(super) fn body_animating(&self) -> bool {
+        self.height_progress < 1.0
+    }
+
     pub(super) fn owns_body(&self) -> bool {
         !matches!(self.body, Body::Native) || self.outgoing.is_some()
     }
 
     pub(super) fn animating(&self) -> bool {
-        self.progress < 1.0
+        self.body_animating()
             || self
                 .prompt
                 .as_ref()
@@ -295,9 +328,10 @@ impl Frame {
 }
 
 pub(super) struct PromptFrame {
-    incoming: Prompt,
+    incoming: Option<Prompt>,
     incoming_alpha: f32,
     outgoing: Vec<(Prompt, f32)>,
+    height: f32,
     progress: f32,
 }
 
@@ -307,6 +341,7 @@ enum Prompt {
         verified: bool,
     },
     Loading,
+    Retrying,
     AllowedOnce,
     AllowedSender,
     Native {
@@ -678,12 +713,22 @@ impl Reader {
                 .collect();
         };
         let width = width.round().clamp(1., 1600.) as i32;
+        let mut native_keys = Vec::new();
         let mut queue: Vec<_> = messages
             .iter()
             .enumerate()
             .filter(|(_, message)| message.expanded)
             .filter_map(|(index, message)| {
-                let key = self.snapshot_key(message, theme, width)?;
+                let Rich::Html(body) = &message.rich else {
+                    return None;
+                };
+                let key = self.key(message, body, theme, width);
+                if !self.prefers_web(&key.id, key.sender.as_deref(), body) {
+                    if self.once(message, body) {
+                        native_keys.push(key);
+                    }
+                    return None;
+                }
                 Some((
                     index != cursor,
                     !visible.get(index).copied().unwrap_or(false),
@@ -693,7 +738,7 @@ impl Reader {
             })
             .collect();
         queue.sort_by_key(|(other, unseen, index, _)| (*other, *unseen, *index));
-        let keys: Vec<_> = queue.into_iter().map(|(_, _, _, key)| key).collect();
+        let mut keys: Vec<_> = queue.into_iter().map(|(_, _, _, key)| key).collect();
         self.request_snapshot(&keys, cx);
         if let Some(open) = &mut self.opening
             && !open.has_layout
@@ -754,14 +799,15 @@ impl Reader {
                 .opening
                 .as_ref()
                 .is_some_and(|open| open.cards.contains(&key.id));
-            let failed = web
-                && self
-                    .entry(&key)
-                    .is_some_and(|entry| entry.picture.is_none());
-            let image = (web && !failed && !grouped)
+            let entry = web.then(|| self.entry(&key)).flatten();
+            let failed = entry.is_some_and(|entry| entry.picture.is_none());
+            let retrying = web && entry.is_none() && self.retrying(&key);
+            let image = (web && !failed && !grouped && !retrying)
                 .then(|| self.image(&key))
                 .flatten();
-            let wait = web && !failed && key.mail.source_bytes() <= webview::LARGE_HTML_BYTES;
+            let large = key.mail.source_bytes() > webview::LARGE_HTML_BYTES;
+            let wait = web && !failed && !large;
+            let stored = web && !failed && large;
             let placeholder_height = (wait && image.is_none()).then(|| {
                 self.measured
                     .iter()
@@ -778,7 +824,7 @@ impl Reader {
             let mail = Arc::downgrade(&key.mail);
             let initial = || {
                 let picture = image.as_ref().map(|(image, _)| image.clone());
-                Shown::new(mail.clone(), picture, wait, prompt.clone())
+                Shown::new(mail.clone(), picture, wait, stored, prompt.clone())
             };
             let shown = self
                 .shown
@@ -797,14 +843,14 @@ impl Reader {
                 })
             {
                 shown.body.clone()
-            } else if wait {
+            } else if (wait || stored) && !matches!(shown.body, Body::Native) {
                 shown.picture_key = None;
                 // The current native card can fade directly into its first
                 // snapshot when the reader explicitly switches renderers.
-                if matches!(shown.body, Body::Native) {
-                    Body::Native
-                } else {
+                if wait {
                     Body::Placeholder
+                } else {
+                    Body::StoredText
                 }
             } else {
                 shown.picture_key = None;
@@ -814,10 +860,13 @@ impl Reader {
                 shown.placeholder_height = height;
             }
             shown.update(next, prompt, web, motion, now);
+            shown.retrying = retrying;
             shown.image_consent = key.images;
             frames.insert(message.id.clone(), shown.frame(now));
         }
         self.shown.retain(|id, _| frames.contains_key(id));
+        // Keep a one-time snapshot eligible for reuse while its card is native.
+        keys.extend(native_keys);
         self.prune_cache(&keys, |image| cx.drop_image(image, None));
         frames
     }
@@ -835,6 +884,9 @@ impl Reader {
                 failure: cached.picture.as_ref().and(cached.image_failure.clone()),
             });
         }
+        if web && entry.is_none() && self.retrying(key) {
+            return Some(Prompt::Retrying);
+        }
         has_images.then(|| {
             if !key.images {
                 Prompt::Blocked { verified }
@@ -847,6 +899,14 @@ impl Reader {
             } else {
                 Prompt::AllowedOnce
             }
+        })
+    }
+
+    fn retrying(&self, key: &Key) -> bool {
+        self.shown.get(&key.id).is_some_and(|shown| {
+            shown.retrying
+                && shown.image_consent == key.images
+                && Weak::ptr_eq(&shown.mail, &Arc::downgrade(&key.mail))
         })
     }
 }
@@ -864,6 +924,21 @@ pub(super) fn reading_key_target(session: &Session) -> Option<&str> {
 }
 
 impl Inbox {
+    fn click_image_prompt(&mut self, id: &str, action: Action, cx: &mut Context<Self>) {
+        if !self.search_conversation_live() || self.open_thread != self.session.cursor_id {
+            return;
+        }
+        if let Some(index) = self
+            .session
+            .messages
+            .iter()
+            .position(|m| m.id == id && m.expanded)
+        {
+            self.focus_message(index);
+            self.html_reading_action(id, action, cx);
+        }
+    }
+
     pub(super) fn html_reading_key_action(&mut self, action: Action, cx: &mut Context<Self>) {
         if (self.session.pane == Pane::Conversation || self.conv_layout_current)
             && let Some(id) = reading_key_target(&self.session).map(str::to_owned)
@@ -892,15 +967,17 @@ impl Inbox {
         };
         let sender = sender_address(&message.email);
         if action == Action::AllowMessageImages
-            && let Some(Prompt::Unavailable { images, .. }) = self
-                .web_mail
-                .shown
-                .get(id)
-                .and_then(|shown| shown.prompt.as_ref())
+            && let Some(shown) = self.web_mail.shown.get_mut(id)
         {
-            self.web_mail.retry_images(id, *images);
-            cx.notify();
-            return;
+            if shown.retrying {
+                return;
+            }
+            if let Some(Prompt::Unavailable { images, .. }) = shown.prompt {
+                shown.retrying = true;
+                self.web_mail.retry_images(id, images);
+                cx.notify();
+                return;
+            }
         }
         if action != Action::ToggleWebView
             && action != Action::BlockSenderImages
@@ -1006,8 +1083,9 @@ pub(super) fn prompt(
             message_id.to_owned(),
         )))
         .relative()
-        .h(px(30.))
-        .mb(px(8.))
+        .h(px(PROMPT_HEIGHT * frame.height))
+        .mb(px(PROMPT_GAP * frame.height))
+        .overflow_hidden()
         .bg(rgb(theme.recipient_surface))
         .rounded_sm()
         .children(
@@ -1021,18 +1099,11 @@ pub(super) fn prompt(
                         .opacity(*alpha)
                 }),
         )
-        .child(
-            prompt_layer(
-                &frame.incoming,
-                theme,
-                message_id,
-                (live, target_keys),
-                width,
-                cx,
-            )
-            .id("incoming-prompt")
-            .opacity(frame.incoming_alpha),
-        )
+        .children(frame.incoming.as_ref().map(|incoming| {
+            prompt_layer(incoming, theme, message_id, (live, target_keys), width, cx)
+                .id("incoming-prompt")
+                .opacity(frame.incoming_alpha)
+        }))
         .into_any_element()
 }
 
@@ -1056,6 +1127,7 @@ fn prompt_layer(
             verified.then_some(("Always allow", Action::AllowSenderImages)),
         ),
         Prompt::Loading => ("Loading remote images…".into(), None, None),
+        Prompt::Retrying => ("Retrying…".into(), None, None),
         Prompt::AllowedOnce => ("Remote images allowed for this message".into(), None, None),
         Prompt::AllowedSender => (
             "Remote images allowed for this sender".into(),
@@ -1105,7 +1177,10 @@ fn prompt_layer(
             _ => label,
         };
         div()
-            .id(action.label())
+            .id(ElementId::from((
+                ElementId::from(action.label()),
+                message_id.to_owned(),
+            )))
             .flex_none()
             .flex()
             .items_center()
@@ -1113,29 +1188,19 @@ fn prompt_layer(
             .px(px(6.))
             .rounded_sm()
             .font_weight(FontWeight::MEDIUM)
-            .text_color(rgb(theme.accent))
+            .text_color(rgb(crate::theme::ensure_all(
+                theme.accent,
+                &[theme.recipient_surface, theme.background],
+                4.6,
+            )))
             .when(live, |button| {
                 let message_id = message_id.to_owned();
                 button
                     .cursor_pointer()
                     .hover(|style| style.bg(rgb(theme.background)))
                     .on_click(cx.listener(move |inbox, _, window: &mut Window, cx| {
-                        if !inbox.search_conversation_live()
-                            || inbox.open_thread != inbox.session.cursor_id
-                        {
-                            return;
-                        }
-                        let Some(index) = inbox
-                            .session
-                            .messages
-                            .iter()
-                            .position(|message| message.id == message_id && message.expanded)
-                        else {
-                            return;
-                        };
                         window.focus(&inbox.focus);
-                        inbox.focus_message(index);
-                        inbox.html_reading_action(&message_id, action, cx);
+                        inbox.click_image_prompt(&message_id, action, cx);
                     }))
             })
             .children((!label.is_empty()).then_some(label))
@@ -1341,7 +1406,7 @@ mod tests {
             assert!(matches!(frames["older"].body, Body::Native));
             assert!(matches!(
                 frames["older"].prompt.as_ref().unwrap().incoming,
-                Prompt::Unavailable { images: false, .. }
+                Some(Prompt::Unavailable { images: false, .. })
             ));
         });
         let keys = [key.clone()];
@@ -1369,7 +1434,13 @@ mod tests {
         let held = snapshot();
         reader.shown.insert(
             key.id.clone(),
-            Shown::new(Arc::downgrade(&key.mail), Some(held.clone()), false, None),
+            Shown::new(
+                Arc::downgrade(&key.mail),
+                Some(held.clone()),
+                false,
+                false,
+                None,
+            ),
         );
         reader.cache.push_back(Cached {
             key: key.clone(),
@@ -1394,7 +1465,7 @@ mod tests {
 
     #[test]
     fn an_expanded_native_body_crossfades_from_its_painted_height() {
-        let mut shown = Shown::new(Weak::new(), None, false, None);
+        let mut shown = Shown::new(Weak::new(), None, false, false, None);
         shown.height.set(Some(350.));
         let now = Instant::now();
         shown.update(Body::Web(snapshot()), None, true, Motion::new(true), now);
@@ -1409,7 +1480,7 @@ mod tests {
     #[test]
     fn a_fast_download_fades_from_the_current_prompt_mix() {
         let blocked = Prompt::Blocked { verified: false };
-        let mut shown = Shown::new(Weak::new(), None, true, Some(blocked.clone()));
+        let mut shown = Shown::new(Weak::new(), None, true, false, Some(blocked.clone()));
         let now = Instant::now();
         let motion = Motion::new(true);
         shown.update(Body::Placeholder, Some(Prompt::Loading), true, motion, now);
@@ -1428,5 +1499,117 @@ mod tests {
         assert_eq!(allowed.outgoing[0].1, loading.outgoing[0].1);
         assert!(allowed.outgoing[1].0 == Prompt::Loading);
         assert_eq!(allowed.outgoing[1].1, loading.incoming_alpha);
+    }
+
+    #[test]
+    fn a_failure_reveals_the_prompt_and_retry_keeps_its_height() {
+        let now = Instant::now();
+        let motion = Motion::new(true);
+        let mut shown = Shown::new(Weak::new(), None, true, false, None);
+        shown.update(
+            Body::Native,
+            Some(Prompt::Unavailable {
+                verified: false,
+                always: false,
+                images: false,
+                failure: None,
+            }),
+            true,
+            motion,
+            now,
+        );
+        let start = shown.frame(now).prompt.unwrap();
+        let mid = shown.frame(now + motion::FADE / 3).prompt.unwrap();
+        assert_eq!(start.height, 0.);
+        assert!(mid.height > 0. && mid.height < 1.);
+        assert_eq!(mid.incoming_alpha, mid.height);
+
+        let retry = now + motion::FADE;
+        shown.update(Body::Native, Some(Prompt::Retrying), true, motion, retry);
+        let frame = shown.frame(retry).prompt.unwrap();
+        assert_eq!(frame.height, 1.);
+        assert_eq!(frame.incoming_alpha, 1.);
+        assert!(matches!(frame.incoming, Some(Prompt::Retrying)));
+    }
+
+    #[test]
+    fn a_prompt_click_finds_its_card_after_an_insertion() {
+        super::super::tests::with_pending_inbox(|inbox, cx| {
+            split_view(inbox);
+            let [first, second] = inbox.session.messages.as_slice() else {
+                panic!("two messages")
+            };
+            let target = second.id.clone();
+            let mut inserted = first.clone();
+            inserted.id = "inserted".into();
+            inserted.email = "inserted@example.test".into();
+            for message in [first, second] {
+                let Rich::Html(body) = &message.rich else {
+                    panic!("HTML fixture")
+                };
+                let key = inbox.web_mail.key(message, body, &inbox.theme, 440);
+                assert!(matches!(
+                    inbox.web_mail.image_prompt(&key, false, true, false),
+                    Some(Prompt::Blocked { .. })
+                ));
+            }
+            inbox.session.messages.insert(0, inserted);
+            inbox.click_image_prompt(&target, Action::AllowMessageImages, cx);
+            assert_eq!(inbox.session.message_cursor, 2);
+            assert!(inbox.web_mail.allowed_once.contains_key(&target));
+            assert_eq!(inbox.web_mail.allowed_once.len(), 1);
+        });
+    }
+
+    #[test]
+    fn native_round_trip_keeps_the_one_time_snapshot_under_cache_pressure() {
+        super::super::tests::with_pending_inbox(|inbox, cx| {
+            split_view(inbox);
+            inbox.html_reading_action("newer", Action::AllowMessageImages, cx);
+            let message = &inbox.session.messages[1];
+            let Rich::Html(body) = &message.rich else {
+                panic!("HTML fixture")
+            };
+            let key = inbox.web_mail.key(message, body, &inbox.theme, 440);
+            assert!(key.images);
+            let image = snapshot();
+            inbox.web_mail.cache.push_back(Cached {
+                key: key.clone(),
+                picture: Some(image.clone()),
+                image_failure: None,
+            });
+            for n in 0..CACHE_SIZE {
+                let key = Key {
+                    id: n.to_string(),
+                    ..key.clone()
+                };
+                inbox.web_mail.cache.push_back(Cached {
+                    key,
+                    picture: None,
+                    image_failure: None,
+                });
+            }
+            for expect_web in [false, true] {
+                inbox.html_reading_action("newer", Action::ToggleWebView, cx);
+                let frames = inbox.web_mail.frames(
+                    &inbox.session.messages,
+                    (Some(1), &[true, true]),
+                    &inbox.theme,
+                    440.,
+                    (Motion::new(false), Instant::now()),
+                    cx,
+                );
+                assert_eq!(
+                    matches!(&frames["newer"].body, Body::Web(shown) if shown.image.id == image.image.id),
+                    expect_web
+                );
+                assert!(
+                    inbox
+                        .web_mail
+                        .next_snapshot(std::slice::from_ref(&key))
+                        .is_none()
+                );
+            }
+        });
     }
 }

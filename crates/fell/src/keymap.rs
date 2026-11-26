@@ -833,7 +833,7 @@ pub fn binding_text(keymap: &Keymap, action: Action) -> String {
 
 pub fn key_label(key: KeyId, leader_name: &str) -> String {
     match key {
-        KeyId::Char('I') => "⇧I".into(),
+        KeyId::Char(ch) if ch.is_ascii_uppercase() => format!("⇧{ch}"),
         KeyId::Char(ch) => ch.to_string(),
         KeyId::Space => "space".into(),
         KeyId::Leader => leader_name.to_string(),
@@ -1179,10 +1179,10 @@ mod tests {
     #[test]
     fn r_shift_r_and_f_answer_and_the_palette_lists_them() {
         let keymap = Keymap::default();
-        for (key, action, label) in [
-            ('r', Action::Reply, "Reply"),
-            ('R', Action::ReplyAll, "Reply all"),
-            ('f', Action::Forward, "Forward"),
+        for (key, binding, action, label) in [
+            ('r', "r", Action::Reply, "Reply"),
+            ('R', "⇧R", Action::ReplyAll, "Reply all"),
+            ('f', "f", Action::Forward, "Forward"),
         ] {
             assert_eq!(
                 match_seq(&keymap, &[KeyId::Char(key)]),
@@ -1192,7 +1192,7 @@ mod tests {
                 .into_iter()
                 .find(|item| item.action == action)
                 .expect("in the palette");
-            assert_eq!(item.binding, key.to_string());
+            assert_eq!(item.binding, binding);
             assert_eq!(item.label, label);
         }
         assert_eq!(

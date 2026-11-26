@@ -2,11 +2,18 @@
 
 use gpui::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, Edges, Element, ElementId,
-    GlobalElementId, InspectorElementId, IntoElement, LayoutId, ParentElement, Pixels, Size, Style,
-    Styled, Window, div, px, size,
+    GlobalElementId, InspectorElementId, IntoElement, LayoutId, ParentElement, Pixels,
+    ScrollHandle, Size, Style, Styled, Window, div, px, size,
 };
 
 use crate::motion;
+
+pub(super) fn follow_scroll_end(scroll: &ScrollHandle) {
+    let end = scroll.max_offset().height;
+    if end > px(0.) && crate::scroll_anchor::clamped_offset(scroll) <= -end + px(0.5) {
+        scroll.scroll_to_bottom();
+    }
+}
 
 /// Reserve the current height in the thread stack and clip the full card
 /// to it while the newly arrived body grows into view.
@@ -140,13 +147,20 @@ pub(crate) fn reflow(
 pub(super) fn crossfade(
     width: f32,
     progress: f32,
+    height_progress: f32,
     from_height: Option<f32>,
     layers: [AnyElement; 2],
     fade_out_by: Option<f32>,
     native_fill: Option<u32>,
 ) -> AnyElement {
     let outgoing = fade_out_by.map_or(1.0, |end| (1.0 - progress / motion::ease_out(end)).max(0.0));
-    let mut fade = layer_pair(width, layers, [outgoing, progress], progress, [true; 2]);
+    let mut fade = layer_pair(
+        width,
+        layers,
+        [outgoing, progress],
+        height_progress,
+        [true; 2],
+    );
     fade.from_height = from_height;
     fade.native_fill = native_fill;
     fade.into_any_element()
@@ -307,7 +321,7 @@ impl Element for Layered {
                     gpui::point(bounds.left(), bounds.top() + *incoming_height),
                     size(bounds.size.width, bounds.size.height - *incoming_height),
                 );
-                let fill = gpui::Hsla::from(gpui::rgb(fill)).opacity(self.height);
+                let fill = gpui::Hsla::from(gpui::rgb(fill)).opacity(self.alpha[1]);
                 window.paint_quad(gpui::fill(tail, fill));
             }
             if self.alpha[index] > 0.0 {
@@ -324,7 +338,8 @@ impl Element for Layered {
 
 #[cfg(test)]
 mod tests {
-    use super::disclosure_opacities;
+    use super::*;
+    use gpui::{InteractiveElement, StatefulInteractiveElement};
 
     #[test]
     fn a_disclosure_fades_through_before_the_other_layer_appears() {
@@ -333,5 +348,80 @@ mod tests {
         assert_eq!(disclosure_opacities(0.5), (0.0, 0.0));
         assert_eq!(disclosure_opacities(0.75), (0.0, 0.5));
         assert_eq!(disclosure_opacities(1.0), (0.0, 1.0));
+    }
+
+    #[test]
+    fn a_bottom_scroll_follows_the_height_drawn_on_each_frame_of_a_body_fade() {
+        struct BodyFade {
+            scroll: ScrollHandle,
+            from: f32,
+            to: f32,
+            time: f32,
+        }
+
+        impl gpui::Render for BodyFade {
+            fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+                div()
+                    .id("body-fade-scroll")
+                    .w(px(400.))
+                    .h(px(320.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
+                    .child(div().h(px(400.)))
+                    .child(crossfade(
+                        400.,
+                        motion::ease_out(self.time),
+                        motion::ease_out_quad(self.time),
+                        Some(self.from),
+                        [
+                            div().h(px(self.from)).into_any_element(),
+                            div().h(px(self.to)).into_any_element(),
+                        ],
+                        Some(0.35),
+                        None,
+                    ))
+            }
+        }
+
+        let mut app = gpui::TestAppContext::single();
+        let scroll = ScrollHandle::new();
+        let (view, cx) = app.add_window_view(|_, _| BodyFade {
+            scroll: scroll.clone(),
+            from: 260.,
+            to: 86.,
+            time: 0.,
+        });
+        let mut draw = |from, to, time| {
+            view.update(cx, |fade, cx| {
+                fade.from = from;
+                fade.to = to;
+                fade.time = time;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            f32::from(scroll.offset().y)
+        };
+        draw(260., 86., 0.);
+        scroll.scroll_to_bottom();
+        let initial = draw(260., 86., 0.);
+        for (from, to) in [(260., 86.), (86., 260.)] {
+            let mut previous = f32::from(scroll.offset().y);
+            for frame in 0..=12 {
+                let time = frame as f32 / 12.;
+                follow_scroll_end(&scroll);
+                let offset = draw(from, to, time);
+                let expected = 320. - 400. - motion::lerp(from, to, motion::ease_out_quad(time));
+                assert!(
+                    (offset - expected).abs() < 1.,
+                    "frame {frame}: {offset} vs {expected}"
+                );
+                assert!(
+                    (offset - previous).abs() < 30.,
+                    "frame {frame}: {offset} from {previous}"
+                );
+                previous = offset;
+            }
+        }
+        assert_eq!(f32::from(scroll.offset().y), initial);
     }
 }

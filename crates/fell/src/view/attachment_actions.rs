@@ -507,7 +507,7 @@ mod tests {
                     assert_eq!(notice.text, "Couldn't save “route.txt”");
                     assert_eq!(
                         notice.hint.as_ref().unwrap(),
-                        &("space a R".into(), " to retry")
+                        &("space a ⇧R".into(), " to retry")
                     );
                     assert!(notice.details);
                     assert_eq!(

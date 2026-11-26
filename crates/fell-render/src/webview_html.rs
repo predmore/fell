@@ -5,7 +5,7 @@ use cssparser::{Delimiter, ParseError, Parser, ParserInput, Token};
 
 const MAX_ESTIMATED_HEIGHT: f32 = 8_192.;
 
-fn web_page(body: &str, scheme: &str) -> String {
+fn web_page(body: &str, scheme: &str, body_padding: &str) -> String {
     format!(
         r#"<!DOCTYPE html>
 <html>
@@ -30,7 +30,7 @@ fn web_page(body: &str, scheme: &str) -> String {
   img {{ object-fit: contain; }}
 </style>
 </head>
-<body>{body}</body>
+<body style="{body_padding}">{body}</body>
 </html>"#,
         scheme = scheme,
         body = body,
@@ -42,6 +42,7 @@ fn web_page(body: &str, scheme: &str) -> String {
 #[derive(Debug)]
 pub struct WebMail {
     body: String,
+    body_padding: String,
     images: Vec<(usize, String)>,
     layout: Option<Layout>,
     source_bytes: usize,
@@ -63,8 +64,35 @@ impl WebMail {
         let mut layout_dom = crate::html::parse_html(&body);
         crate::html::prune_hidden(&mut layout_dom);
         let layout = Layout::from_node(*layout_dom.root_element());
+        // The surrounding document is ours. Carry over the email body's
+        // padding so the snapshot can honor its bottom inset.
+        let mut body_padding = String::new();
+        if let Some(style) = dom
+            .root_element()
+            .children()
+            .filter_map(scraper::ElementRef::wrap)
+            .find(|element| element.value().name() == "body")
+            .and_then(|body| body.attr("style"))
+        {
+            for rule in style.split(';') {
+                if rule.split_once(':').is_some_and(|(name, _)| {
+                    [
+                        "padding",
+                        "padding-bottom",
+                        "padding-block",
+                        "padding-block-end",
+                    ]
+                    .iter()
+                    .any(|property| name.trim().eq_ignore_ascii_case(property))
+                }) {
+                    serialize_css(rule, &mut body_padding, None, escape_attr);
+                    body_padding.push(';');
+                }
+            }
+        }
         Self {
             body,
+            body_padding,
             images,
             layout,
             source_bytes: html.len(),
@@ -99,7 +127,7 @@ impl WebMail {
             offset = *at;
         }
         body.push_str(&self.body[offset..]);
-        web_page(&body, scheme)
+        web_page(&body, scheme, &self.body_padding)
     }
 }
 
