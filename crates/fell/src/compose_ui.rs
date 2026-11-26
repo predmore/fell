@@ -6317,7 +6317,7 @@ fn shown_target(text: &str, href: &str, links: Links) -> Option<String> {
                 .peekable();
             (idn_place(href).is_some()
                 || (links == Links::Host && places.peek().is_none())
-                || label_misleads(places, href))
+                || place_mismatch(places, place_of_href(href).as_ref(), without_www))
             .then(|| format!("({})", link_host(href)))
         }
     }
@@ -6327,9 +6327,9 @@ fn shown_target(text: &str, href: &str, links: Links) -> Option<String> {
 /// of a `mailto:`, or else the whole target.
 fn link_host(href: &str) -> String {
     match place_of_href(href) {
-        Some(Place::Host(host)) => host,
+        Some(Place::Host(host)) => without_www(&host).to_owned(),
         Some(Place::Mail { address, .. }) => address,
-        None => ascii_target(href),
+        Some(Place::UserInfo) | None => ascii_target(href),
     }
 }
 
@@ -6400,19 +6400,21 @@ fn mail_addresses(url: &url::Url) -> Option<Vec<String>> {
 /// A place a label or a link names: a host, or a mail address.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Place {
-    /// Lowercase, `xn--` form, without a leading `www.`.
+    /// Lowercase ASCII form, including the `www.` label if present.
     Host(String),
     Mail {
         address: String,
         domain: String,
     },
+    /// A URL label with credentials can give the impression of another host.
+    UserInfo,
 }
 
 impl Place {
-    fn domain(&self) -> &str {
+    fn domain(&self) -> Option<&str> {
         match self {
-            Place::Host(host) => host,
-            Place::Mail { domain, .. } => domain,
+            Place::Host(host) | Place::Mail { domain: host, .. } => Some(host),
+            Place::UserInfo => None,
         }
     }
 }
@@ -6425,10 +6427,8 @@ fn ascii_domain(host: &str) -> Option<String> {
     Some(host.strip_suffix('.').unwrap_or(host).to_string())
 }
 
-/// The ASCII (`xn--`) lowercase form of a host, without `www.`.
-fn ascii_host(host: &str) -> Option<String> {
-    let host = ascii_domain(host)?;
-    Some(host.strip_prefix("www.").unwrap_or(&host).to_string())
+fn without_www(host: &str) -> &str {
+    host.strip_prefix("www.").unwrap_or(host)
 }
 
 fn place_of_href(href: &str) -> Option<Place> {
@@ -6437,14 +6437,14 @@ fn place_of_href(href: &str) -> Option<Place> {
         // More than one address reads as none of them alone.
         let (_, domain) = addresses.last()?.rsplit_once('@')?;
         return Some(Place::Mail {
-            domain: domain.strip_prefix("www.").unwrap_or(domain).to_string(),
+            domain: domain.to_string(),
             address: addresses.join(","),
         });
     }
     if url.scheme().eq_ignore_ascii_case("mailto") {
         return None;
     }
-    ascii_host(url.host_str()?).map(Place::Host)
+    ascii_domain(url.host_str()?).map(Place::Host)
 }
 
 /// The place one word of a label reads as, if it reads as one at all:
@@ -6463,25 +6463,29 @@ fn place_of_word(word: &str, links: Links) -> Option<Place> {
     let word = word.trim_matches(|ch| !word_char(ch));
     let lower = word.to_lowercase();
     let lower = lower.strip_prefix("mailto:").unwrap_or(&lower);
-    if lower.contains("://") {
+    if let Some((_, rest)) = lower.split_once("://") {
         let url = url::Url::parse(lower).ok()?;
-        return url.host_str().and_then(ascii_host).map(Place::Host);
+        // The parser can discard an empty userinfo marker, but it is still
+        // present in the label the reader sees.
+        let authority = rest.split(['/', '\\', '?', '#']).next().unwrap_or_default();
+        if authority.contains('@') || !url.username().is_empty() || url.password().is_some() {
+            return Some(Place::UserInfo);
+        }
+        return url.host_str().and_then(ascii_domain).map(Place::Host);
     }
     if let Some((local, domain)) = lower.rsplit_once('@')
         && !local.is_empty()
     {
-        let domain = dotted_name(domain.strip_suffix('.').unwrap_or(domain))?;
-        let address = format!("{local}@{}", ascii_domain(domain)?);
-        return Some(Place::Mail {
-            address,
-            domain: ascii_host(domain)?,
-        });
+        let domain = domain.split(['?', '#']).next()?;
+        let domain = ascii_domain(dotted_name(domain.strip_suffix('.').unwrap_or(domain))?)?;
+        let address = format!("{local}@{domain}");
+        return Some(Place::Mail { address, domain });
     }
     let name = lower.split(['/', '?', '#']).next()?;
     let name = without_port(name);
     // `paypal.com./login` names paypal.com: the root's dot is no part of it.
     let name = name.strip_suffix('.').unwrap_or(name);
-    ascii_host(dotted_name(name)?).map(Place::Host)
+    ascii_domain(dotted_name(name)?).map(Place::Host)
 }
 
 fn without_port(name: &str) -> &str {
@@ -6541,14 +6545,75 @@ fn dotted_name(name: &str) -> Option<&str> {
     (parts.len() >= 2 && parts.iter().all(|part| !part.is_empty()) && letters).then_some(name)
 }
 
-/// Whether a word of the label reads as an address that is not where the
-/// link goes: "Sign in at paypal.com" to another host.
-fn label_misleads(mut places: impl Iterator<Item = Place>, href: &str) -> bool {
-    let target = place_of_href(href);
-    places.any(|place| match (&target, &place) {
-        (None, _) => true,
+/// The destination to show in the reader and whether the label names
+/// another registrable domain or mailbox.
+pub(crate) fn reader_link_destination(text: &str, href: &str) -> Option<(String, bool)> {
+    let target = place_of_href(href)?;
+    let words = text.split_whitespace();
+    let mismatch = if let Place::Mail { address, .. } = &target {
+        let places = words.flat_map(reader_mailto_word_places).filter(|place| {
+            !matches!(place, Place::Mail { address: word, .. }
+                if address.split(',').any(|recipient| recipient == word))
+        });
+        place_mismatch(places, Some(&target), registrable_domain)
+    } else {
+        let places = words.filter_map(|word| place_of_word(word, Links::Label));
+        place_mismatch(places, Some(&target), registrable_domain)
+    };
+    let destination = match target {
+        Place::Host(host) => host,
+        Place::Mail { address, .. } => address,
+        Place::UserInfo => return None,
+    };
+    Some((destination, mismatch))
+}
+
+/// Read both the mailboxes and any destinations visible in the query.
+fn reader_mailto_word_places(word: &str) -> impl Iterator<Item = Place> {
+    let mailbox_path = |path: &str| path.contains('@') && !path.contains("://");
+    let (path, query) = if let Some(query) = word.strip_prefix(['?', '&']) {
+        ("", query)
+    } else {
+        word.split_once('?')
+            .filter(|(path, _)| mailbox_path(path))
+            .unwrap_or((word, ""))
+    };
+    let split_recipients = mailbox_path(path);
+    let recipients = path.split(move |ch| split_recipients && ch == ',');
+    let fields = query
+        .split('&')
+        .map(|field| field.split_once('=').map_or(field, |(_, value)| value));
+    recipients.chain(fields).filter_map(move |word| {
+        if mailbox_path(word) {
+            // Match the launcher's mailbox spelling, including encoded local parts.
+            let mailbox = word
+                .get(.."mailto:".len())
+                .filter(|prefix| prefix.eq_ignore_ascii_case("mailto:"))
+                .map_or(word, |prefix| &word[prefix.len()..]);
+            if let Some(target) = fell_render::reader_link_target(&format!("mailto:{mailbox}")) {
+                return place_of_href(&target);
+            }
+        }
+        place_of_word(word, Links::Label)
+    })
+}
+
+fn registrable_domain(host: &str) -> &str {
+    if host.parse::<std::net::Ipv4Addr>().is_ok() || host.starts_with('[') {
+        return host;
+    }
+    psl::domain_str(host).unwrap_or(host)
+}
+
+fn place_mismatch(
+    mut places: impl Iterator<Item = Place>,
+    target: Option<&Place>,
+    domain: impl Fn(&str) -> &str,
+) -> bool {
+    places.any(|place| match (target, &place) {
+        (None, _) | (_, Place::UserInfo) => true,
         (Some(Place::Mail { address, .. }), Place::Mail { address: word, .. }) => address != word,
-        (Some(target), place) => target.domain() != place.domain(),
+        (Some(target), place) => target.domain().map(&domain) != place.domain().map(&domain),
     })
 }
 
@@ -7672,6 +7737,57 @@ mod tests {
         assert_eq!(
             shown_target("write to ada", "mailto:ada@example.com", Links::Host).as_deref(),
             Some("(ada@example.com)")
+        );
+    }
+
+    #[test]
+    fn reader_flags_a_different_registrable_domain_or_mailbox() {
+        use super::reader_link_destination;
+
+        for (label, href, mismatch) in [
+            ("Click here", "https://example.test/", false),
+            (
+                "https://example.test/build",
+                "https://example.test/build?utm_source=mail",
+                false,
+            ),
+            ("https://example.test", "https://example.test/", false),
+            ("http://example.test", "https://example.test", false),
+            ("github.test", "https://email.github.test", false),
+            ("updates.example.test", "https://mirror.example.test", false),
+            ("https://paypal.test", "https://paypal.test.evil.test", true),
+            (
+                "https://paypal.com@evil.test",
+                "https://evil.test/login",
+                true,
+            ),
+            (
+                "https://:paypal.com@evil.test",
+                "https://evil.test/login",
+                true,
+            ),
+            ("https://@evil.test", "https://evil.test/login", true),
+            ("https://evil.test/@paypal.com", "https://evil.test/", false),
+            ("paypal.test", "https://paypal.test.evil.test", true),
+            ("paypal.co.uk", "https://evil.co.uk", true),
+            ("www.github.io", "https://other.github.io", true),
+            ("192.0.2.1", "https://192.0.2.2", true),
+            (
+                "mailto:help@example.test",
+                "mailto:help@example.test?subject=Build",
+                false,
+            ),
+            ("help@example.test", "mailto:sales@example.test", true),
+        ] {
+            assert_eq!(
+                reader_link_destination(label, href).unwrap().1,
+                mismatch,
+                "{label} → {href}"
+            );
+        }
+        assert_eq!(
+            reader_link_destination("Click here", "https://www.example.test/"),
+            Some(("www.example.test".into(), false))
         );
     }
 

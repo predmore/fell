@@ -240,7 +240,7 @@ fn plain_paragraphs(body: &str, blocks: &mut Vec<Block>) {
             if index > 0 {
                 inlines.push(Inline::LineBreak);
             }
-            inlines.push(Inline::Text(line.to_string()));
+            inlines.extend(crate::plain_links::plain_link_inlines(line));
         }
         blocks.push(Block::Paragraph { inlines });
     }
@@ -1976,11 +1976,14 @@ pub(crate) fn safe_href(href: &str) -> String {
     let Some((scheme, _)) = cleaned.split_once(':') else {
         return String::new();
     };
-    let scheme = scheme.to_ascii_lowercase();
-    if matches!(scheme.as_str(), "http" | "https" | "mailto") {
-        cleaned
-    } else {
-        String::new()
+    match scheme.to_ascii_lowercase().as_str() {
+        "http" | "https" => cleaned,
+        // Parse the original address and query before URL cleanup strips line breaks.
+        "mailto" => href
+            .split_once(':')
+            .and_then(|(_, rest)| crate::plain_links::canonical_mailto(rest))
+            .unwrap_or_default(),
+        _ => String::new(),
     }
 }
 
@@ -2001,7 +2004,7 @@ fn is_signature_delimiter(raw: &str) -> bool {
 /// isolates, zero-width marks, and the joiners newsletters pad a preheader
 /// with. The same set compose's `display_safe` strips. Letters of
 /// right-to-left scripts are kept; only the invisible controls go.
-fn is_invisible(ch: char) -> bool {
+pub(crate) fn is_invisible(ch: char) -> bool {
     matches!(
         ch,
         '\u{200B}'..='\u{200F}'

@@ -51,6 +51,7 @@ pub enum Action {
     Reply,
     ReplyAll,
     Forward,
+    FocusLinks,
     FocusAttachments,
     PreviousAttachment,
     NextAttachment,
@@ -74,6 +75,8 @@ pub enum Action {
     Delete,
     Spam,
     Undo,
+    SplitThread,
+    MergeThreads,
     SyncNow,
     Notifications(NotificationMode),
     ToggleSelect,
@@ -122,6 +125,7 @@ impl Action {
             Self::Reply => "Reply",
             Self::ReplyAll => "Reply all",
             Self::Forward => "Forward",
+            Self::FocusLinks => "Focus message links",
             Self::FocusAttachments => "Focus attachments",
             Self::PreviousAttachment => "Previous attachment",
             Self::NextAttachment => "Next attachment",
@@ -145,6 +149,8 @@ impl Action {
             Self::Delete => "Delete",
             Self::Spam => "Spam / not spam",
             Self::Undo => "Undo",
+            Self::SplitThread => "Split at message",
+            Self::MergeThreads => "Merge conversations",
             Self::SyncNow => "Sync now",
             Self::Notifications(NotificationMode::On) => "Notifications: Show sender and subject",
             Self::Notifications(NotificationMode::Private) => {
@@ -201,6 +207,7 @@ const ALL_ACTIONS: &[Action] = &[
     Action::Reply,
     Action::ReplyAll,
     Action::Forward,
+    Action::FocusLinks,
     Action::FocusAttachments,
     Action::PreviousAttachment,
     Action::NextAttachment,
@@ -224,6 +231,8 @@ const ALL_ACTIONS: &[Action] = &[
     Action::Delete,
     Action::Spam,
     Action::Undo,
+    Action::SplitThread,
+    Action::MergeThreads,
     Action::SyncNow,
     Action::Notifications(NotificationMode::On),
     Action::Notifications(NotificationMode::Private),
@@ -367,6 +376,7 @@ fn default_bindings() -> Vec<Binding> {
     bind(&[KeyId::Char('r')], Action::Reply, None);
     bind(&[KeyId::Char('R')], Action::ReplyAll, None);
     bind(&[KeyId::Char('f')], Action::Forward, None);
+    bind(&[KeyId::Tab], Action::FocusLinks, None);
     bind(&[KeyId::Char('a')], Action::FocusAttachments, None);
     bind(&[KeyId::Char('S')], Action::SaveAttachment, None);
     bind(&[KeyId::Char('m')], Action::Move, None);
@@ -389,6 +399,13 @@ fn default_bindings() -> Vec<Binding> {
     bind(&[KeyId::Char('#')], Action::Delete, None);
     bind(&[KeyId::Char('!')], Action::Spam, None);
     bind(&[KeyId::Char('u')], Action::Undo, None);
+    for (key, action) in [('s', Action::SplitThread), ('m', Action::MergeThreads)] {
+        bind(
+            &[KeyId::Leader, KeyId::Char('c'), KeyId::Char(key)],
+            action,
+            Some("Conversations"),
+        );
+    }
     bind(&[KeyId::Char('x')], Action::ToggleSelect, None);
     bind(&[KeyId::Char('V')], Action::Visual, None);
     bind(&[KeyId::Char('z')], Action::FullWidth, None);

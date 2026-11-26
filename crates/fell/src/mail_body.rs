@@ -440,6 +440,10 @@ impl BodyLoads {
         self.wanted.clear();
     }
 
+    pub fn awaiting(&self, id: &str) -> bool {
+        self.wanted.contains_key(id)
+    }
+
     pub fn begin(&mut self, id: &str) -> Option<BodyLoad> {
         let stamp = *self.wanted.get(id)?;
         if self.active.contains_key(id) {
@@ -491,8 +495,18 @@ pub fn palette(theme: &Theme) -> Palette {
 /// The palette for opened history: its text is the dimmed colour, as the
 /// plain-text quote is.
 pub fn history_palette(theme: &Theme) -> Palette {
+    let subdued = mix(theme.accent, theme.dimmed, 0.35);
+    let accent = if [theme.background, theme.surface]
+        .into_iter()
+        .all(|surface| crate::theme::contrast(subdued, surface) >= 4.5)
+    {
+        subdued
+    } else {
+        theme.accent
+    };
     Palette {
         foreground: theme.dimmed,
+        accent,
         ..palette(theme)
     }
 }

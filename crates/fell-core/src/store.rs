@@ -21,7 +21,7 @@ use crate::search::{
     IndexedText, SearchHit, SearchOptions, SearchResults, fts5_phrase, sync_terms,
     terms_for_indexed,
 };
-use crate::threading::{ThreadId, resolve_thread_id};
+use crate::threading::ThreadId;
 
 pub(crate) mod bodies;
 pub(crate) mod copies;
@@ -37,7 +37,7 @@ pub(crate) use sent::retry_sent_write;
 pub(crate) mod sent_bcc;
 mod sent_echo_repair;
 mod summaries;
-mod threads;
+pub(crate) mod threads;
 pub(crate) mod triage;
 pub use triage::{MUTED, SNOOZED};
 pub(crate) mod views;
@@ -48,6 +48,7 @@ pub use intents::PendingFlags;
 pub(crate) use summaries::folder_names as message_folder_names;
 pub(crate) use summaries::label_names;
 pub use summaries::{FolderPage, FolderSpan, ListFilter, ListKey, ListSource, ThreadList};
+pub use threads::{MergeCandidate, ThreadEditOutcome};
 
 #[derive(Clone, Debug, Default)]
 pub struct ThreadLabels {
@@ -1108,13 +1109,17 @@ impl Store {
         Ok(())
     }
 
-    fn rethread_written(&self, conn: &Connection, account_id: &AccountId) -> Result<()> {
+    fn rethread_written(
+        &self,
+        conn: &Connection,
+        account_id: &AccountId,
+    ) -> Result<HashMap<MessageId, ThreadId>> {
         #[cfg(test)]
         if self.full_rethread.get() {
             threads::index_queued_subjects(conn)?;
-            threads::rethread_all(conn, account_id)?;
+            let header_parents = threads::rethread_all(conn, account_id)?;
             conn.execute_batch("DELETE FROM thread_dirty_rows; DELETE FROM thread_dirty_ids;")?;
-            return Ok(());
+            return Ok(header_parents);
         }
         threads::rethread_dirty(conn, account_id)
     }
@@ -3127,9 +3132,7 @@ fn insert_arrival(
 
 fn insert_new(conn: &Connection, message: &Message, fingerprint: &str) -> Result<ThreadId> {
     let account_id = &message.account_id;
-    let thread_id = resolve_thread_id(&message.headers, |parent| {
-        thread_id_for_message_id(conn, account_id, parent)
-    })?;
+    let thread_id = threads::initial_thread(conn, account_id, &message.headers)?;
     let references = references_header(&message.headers);
     let mut folders = union_tokens("", &message.folders, false);
     if message.archived {
@@ -3282,9 +3285,7 @@ fn write_kept(
         .filter(|id| !id.is_empty())
         .map(MessageId::new);
     headers.references = parse_references(&references);
-    let thread_id = resolve_thread_id(&headers, |parent| {
-        thread_id_for_message_id(conn, &message.account_id, parent)
-    })?;
+    let thread_id = threads::initial_thread(conn, &message.account_id, &headers)?;
     // Duplicate copies union arrival folders and labels. Archive and snooze are
     // local triage, so a later copy must not clear them, and INBOX stays off
     // while the message is archived.
@@ -4013,6 +4014,7 @@ fn take_local_state(
             into.canonical_id
         ],
     )?;
+    threads::retarget_override(conn, account_id, &from.canonical_id, &into.canonical_id)?;
     sync_terms(conn, account_id.as_str(), &old_terms, &new_terms)?;
     Ok(())
 }

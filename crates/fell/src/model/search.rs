@@ -633,9 +633,11 @@ impl Session {
     }
 
     pub fn accept_search_suggestion(&mut self) -> Step {
-        let Some(search) = self.search.as_mut() else {
-            return Step::default();
-        };
+        self.try_accept_search_suggestion().unwrap_or_default()
+    }
+
+    pub(super) fn try_accept_search_suggestion(&mut self) -> Option<Step> {
+        let search = self.search.as_mut()?;
         if !matches!(search.suggestions.get(search.suggestion_index),
             Some(Suggestion::Correspondent(_)) if search.editing)
             && search.results_current()
@@ -669,14 +671,14 @@ impl Session {
                 search.caret = end;
             }
         } else {
-            return Step::default();
+            return None;
         }
         let submitted = !search.editing;
         let step = self.search_changed();
         if submitted {
             self.remember_search();
         }
-        step
+        Some(step)
     }
 
     /// Swap out the old data so the view can release large result sets off
@@ -1467,6 +1469,20 @@ mod tests {
         assert!(session.on_key(KeyId::Enter, 10).search_request);
         assert_eq!(session.search.as_ref().unwrap().query, "invoice");
         assert!(!session.search_editing());
+    }
+
+    #[test]
+    fn tab_enters_links_from_a_committed_search_without_a_suggestion() {
+        let mut session = session();
+        session.on_key(KeyId::Char('/'), 10);
+        session.type_search("invoice");
+        land(&mut session, reply(vec![row_hit("one", "m1")], None));
+        session.on_key(KeyId::Enter, 10);
+        assert_eq!(session.pane, super::Pane::List);
+
+        let step = session.on_key(KeyId::Tab, 10);
+        assert_eq!(step.action, Some(crate::keymap::Action::FocusLinks));
+        assert_eq!(session.pane, super::Pane::Conversation);
     }
 
     #[test]

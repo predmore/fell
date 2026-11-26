@@ -22,7 +22,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use super::{immediate_transaction, load_aliases, parse_references};
+use super::{Store, immediate_transaction, load_aliases, parse_references};
 use crate::Result;
 use crate::account::AccountId;
 use crate::message::{Address, MessageHeaders, MessageId, decode_addresses};
@@ -30,6 +30,11 @@ use crate::threading::{
     SUBJECT_WINDOW_SECS, ThreadId, header_parent_thread_id, resolve_thread_id, subject_is_generic,
     thread_subject,
 };
+
+mod manual;
+pub(super) use manual::retarget_override;
+pub(crate) use manual::{ACTION_SCHEMA, undo};
+pub use manual::{MergeCandidate, ThreadEditOutcome};
 
 /// Tables behind [`rethread_dirty`]. Safe to run on every open.
 const THREAD_INDEX_TABLES: &str = r#"
@@ -61,6 +66,17 @@ CREATE TABLE IF NOT EXISTS thread_dirty_subjects (
     date_unix INTEGER NOT NULL,
     PRIMARY KEY (account_id, subject_key, date_unix)
 ) WITHOUT ROWID;
+
+-- No message foreign key: a decision must survive a row disappearing
+-- and the same Message-ID coming back from sync.
+CREATE TABLE IF NOT EXISTS thread_overrides (
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    message_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    PRIMARY KEY (account_id, message_id)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_thread_overrides_thread
+    ON thread_overrides(account_id, thread_id);
 
 CREATE TABLE IF NOT EXISTS thread_dirty_rows (
     rowid INTEGER PRIMARY KEY
@@ -334,17 +350,13 @@ fn index_subject(
 /// The thread a reply with no stored header parent joins by subject: the
 /// latest message in the window with the same subject whose sender and the
 /// reply's sender appear in each other's participants.
-fn subject_parent(
-    conn: &Connection,
-    account: &str,
-    row: &ThreadingRow,
-) -> Result<Option<ThreadId>> {
+fn subject_parent(conn: &Connection, account: &str, row: &ThreadingRow) -> Result<Option<Parent>> {
     let (key, reply) = thread_subject(&row.headers.subject);
     if !reply || subject_is_generic(&key) {
         return Ok(None);
     }
     let mut stmt = conn.prepare_cached(
-        "SELECT m.thread_id, m.from_email, m.to_line, m.cc_line
+        "SELECT m.message_id, m.thread_id, m.from_email, m.to_line, m.cc_line
          FROM subject_index s
          JOIN messages m ON m.rowid = s.message_rowid
          WHERE s.account_id = ?1 AND s.subject_key = ?2
@@ -360,10 +372,9 @@ fn subject_parent(
         row.rowid
     ])?;
     while let Some(candidate) = rows.next()? {
-        let thread: String = candidate.get(0)?;
-        let from = candidate.get::<_, String>(1)?.to_ascii_lowercase();
-        let to: String = candidate.get(2)?;
-        let cc: String = candidate.get(3)?;
+        let from = candidate.get::<_, String>(2)?.to_ascii_lowercase();
+        let to: String = candidate.get(3)?;
+        let cc: String = candidate.get(4)?;
         let theirs = participants(&from, &to, &cc);
         if !theirs.contains(&row.from) || !row.participants.contains(&from) {
             continue;
@@ -378,7 +389,7 @@ fn subject_parent(
         {
             continue;
         }
-        return Ok(Some(ThreadId(thread)));
+        return Ok(Some(read_parent(candidate)?));
     }
     Ok(None)
 }
@@ -424,7 +435,11 @@ fn index_refs(
 /// Re-resolve the rows `account_id`'s writes queued since the last pass, and
 /// the stored replies that name a queued Message-ID. Clears that account's
 /// queue. Other accounts' queued rows wait for their own pass.
-pub(super) fn rethread_dirty(conn: &Connection, account_id: &AccountId) -> Result<()> {
+/// Returns header parents placed by active manual edits.
+pub(super) fn rethread_dirty(
+    conn: &Connection,
+    account_id: &AccountId,
+) -> Result<HashMap<MessageId, ThreadId>> {
     let account = account_id.as_str();
     let dirty = {
         let mut stmt = conn.prepare_cached(
@@ -521,36 +536,30 @@ pub(super) fn rethread_dirty(conn: &Connection, account_id: &AccountId) -> Resul
         }
     }
     if affected.is_empty() {
-        return Ok(());
+        return Ok(HashMap::new());
     }
 
-    let rows = {
-        let mut stmt = conn.prepare_cached(&format!(
-            "SELECT {THREADING_COLS} FROM messages WHERE rowid = ?1 AND account_id = ?2"
-        ))?;
-        let mut out = Vec::with_capacity(affected.len());
-        for rowid in &affected {
-            if let Some(row) = stmt
-                .query_row(params![rowid, account], threading_row)
-                .optional()?
-            {
-                out.push(row);
-            }
-        }
-        out
-    };
+    let manual = ManualThreads::load(conn, account)?;
+    let mut rows = manual.apply(conn, account, affected_rows(conn, account, &affected)?)?;
+    let descendants = manual_descendants(conn, account, &manual, &rows)?;
+    if !descendants.is_empty() {
+        let added: BTreeSet<_> = descendants.difference(&affected).copied().collect();
+        rows.extend(manual.apply(conn, account, affected_rows(conn, account, &added)?)?);
+        rows.sort_unstable_by_key(|row| row.rowid);
+    }
+    let header_parents = manual.place_header_parents(conn, account, &mut rows)?;
 
     let mut parents: HashMap<MessageId, Option<ThreadId>> = HashMap::new();
     let mut lookup = |parent: &MessageId| -> Result<Option<ThreadId>> {
         if let Some(found) = parents.get(parent) {
             return Ok(found.clone());
         }
-        let found = stored_thread(conn, account, parent.as_str())?;
+        let found = stored_parent(conn, account, parent)?.map(|parent| parent.thread);
         parents.insert(parent.clone(), found.clone());
         Ok(found)
     };
-    let edges = thread_edges(&rows, &mut lookup, &mut |row| {
-        subject_parent(conn, account, row)
+    let edges = thread_edges(&rows, &manual, &mut lookup, &mut |row| {
+        Ok(subject_parent(conn, account, row)?.map(|parent| parent.thread))
     })?;
 
     let mut union = ThreadUnion::default();
@@ -564,7 +573,7 @@ pub(super) fn rethread_dirty(conn: &Connection, account_id: &AccountId) -> Resul
         }
     }
     for (member, preferred) in &edges {
-        union.union_prefer(member, preferred);
+        union.union_prefer(member, preferred, &manual);
     }
     let nodes: Vec<String> = edge_nodes(&edges).map(str::to_string).collect();
     relabel(
@@ -572,7 +581,81 @@ pub(super) fn rethread_dirty(conn: &Connection, account_id: &AccountId) -> Resul
         account_id,
         &mut union,
         nodes.iter().map(String::as_str),
-    )
+    )?;
+    Ok(header_parents)
+}
+
+fn affected_rows(
+    conn: &Connection,
+    account: &str,
+    affected: &BTreeSet<i64>,
+) -> Result<Vec<ThreadingRow>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {THREADING_COLS} FROM messages WHERE rowid = ?1 AND account_id = ?2"
+    ))?;
+    let mut rows = Vec::with_capacity(affected.len());
+    for rowid in affected {
+        if let Some(row) = stmt
+            .query_row(params![rowid, account], threading_row)
+            .optional()?
+        {
+            rows.push(row);
+        }
+    }
+    Ok(rows)
+}
+
+/// Only manually routed rows can carry replies beyond the ordinary dirty
+/// set. Walk their indexed references and subject windows in one query.
+/// UNION visits each row at most once even for cyclical headers.
+fn manual_descendants(
+    conn: &Connection,
+    account: &str,
+    manual: &ManualThreads,
+    rows: &[ThreadingRow],
+) -> Result<BTreeSet<i64>> {
+    let mut seeds = rows
+        .iter()
+        .filter(|row| manual.pinned(row.thread_id.as_str()))
+        .peekable();
+    if seeds.peek().is_none() {
+        return Ok(BTreeSet::new());
+    }
+    let seeds: Vec<_> = seeds.map(|row| row.rowid).collect();
+    let mut stmt = conn.prepare_cached(
+        "WITH RECURSIVE reachable(rowid) AS (
+             SELECT value FROM json_each(?2)
+             UNION
+             SELECT r.child_rowid FROM reachable d
+             JOIN messages m ON m.rowid = d.rowid
+             JOIN message_refs r ON r.account_id = ?1 AND r.ref_id = m.message_id
+             UNION
+             SELECT r.child_rowid FROM reachable d
+             JOIN messages m ON m.rowid = d.rowid
+             JOIN message_aliases a ON a.account_id = ?1 AND a.canonical_message_id = m.message_id
+             JOIN message_refs r ON r.account_id = ?1 AND r.ref_id = a.message_id
+             UNION
+             SELECT later.message_rowid FROM reachable d
+             JOIN subject_index s ON s.message_rowid = d.rowid
+             JOIN subject_index later ON later.account_id = s.account_id
+               AND later.subject_key = s.subject_key
+               AND later.date_unix BETWEEN s.date_unix AND s.date_unix + ?3
+             JOIN messages m ON m.rowid = later.message_rowid
+             WHERE (m.in_reply_to IS NULL OR m.in_reply_to = '') AND m.references_header = ''
+               AND (m.proton_conversation_id IS NULL OR trim(m.proton_conversation_id) = '')
+         )
+         SELECT rowid FROM reachable",
+    )?;
+    Ok(stmt
+        .query_map(
+            params![
+                account,
+                serde_json::json!(seeds).to_string(),
+                SUBJECT_WINDOW_SECS
+            ],
+            |row| row.get(0),
+        )?
+        .collect::<rusqlite::Result<_>>()?)
 }
 
 /// Index the subjects of queued rows without resolving anything. The test
@@ -600,26 +683,284 @@ pub(super) fn index_queued_subjects(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// The thread a stored parent wears, the way [`rethread_all`] reads it: an
-/// alias whose canonical row is stored wins over a row with that id.
-fn stored_thread(conn: &Connection, account: &str, id: &str) -> Result<Option<ThreadId>> {
-    let via_alias: Option<String> = conn
+struct Parent {
+    id: MessageId,
+    thread: ThreadId,
+}
+
+fn read_parent(row: &rusqlite::Row<'_>) -> rusqlite::Result<Parent> {
+    Ok(Parent {
+        id: MessageId(row.get(0)?),
+        thread: ThreadId(row.get(1)?),
+    })
+}
+
+/// An alias whose canonical row is stored wins over a row with that id.
+fn stored_parent(conn: &Connection, account: &str, id: &MessageId) -> Result<Option<Parent>> {
+    let via_alias = conn
         .prepare_cached(
-            "SELECT m.thread_id FROM message_aliases a
+            "SELECT m.message_id, m.thread_id FROM message_aliases a
              JOIN messages m
                ON m.account_id = a.account_id AND m.message_id = a.canonical_message_id
              WHERE a.account_id = ?1 AND a.message_id = ?2",
         )?
-        .query_row(params![account, id], |row| row.get(0))
+        .query_row(params![account, id.as_str()], read_parent)
         .optional()?;
     if via_alias.is_some() {
-        return Ok(via_alias.map(ThreadId));
+        return Ok(via_alias);
     }
-    let direct: Option<String> = conn
-        .prepare_cached("SELECT thread_id FROM messages WHERE account_id = ?1 AND message_id = ?2")?
-        .query_row(params![account, id], |row| row.get(0))
-        .optional()?;
-    Ok(direct.map(ThreadId))
+    Ok(conn
+        .prepare_cached(
+            "SELECT message_id, thread_id FROM messages WHERE account_id = ?1 AND message_id = ?2",
+        )?
+        .query_row(params![account, id.as_str()], read_parent)
+        .optional()?)
+}
+
+fn header_parent(conn: &Connection, account: &str, row: &ThreadingRow) -> Result<Option<Parent>> {
+    for id in row.headers.parent_ids() {
+        if let Some(parent) = stored_parent(conn, account, id)? {
+            return Ok(Some(parent));
+        }
+    }
+    Ok(None)
+}
+
+fn direct_parent(conn: &Connection, account: &str, row: &ThreadingRow) -> Result<Option<Parent>> {
+    if let Some(parent) = header_parent(conn, account, row)? {
+        return Ok(Some(parent));
+    }
+    if subject_eligible(&row.headers) {
+        return subject_parent(conn, account, row);
+    }
+    Ok(None)
+}
+
+fn has_proton(headers: &MessageHeaders) -> bool {
+    headers
+        .proton_conversation_id
+        .as_deref()
+        .is_some_and(|id| !id.trim().is_empty())
+}
+
+fn subject_eligible(headers: &MessageHeaders) -> bool {
+    headers.parent_ids().next().is_none() && !has_proton(headers)
+}
+
+impl Store {
+    /// Recompute which messages have a same-thread subject parent from the
+    /// stored headers and participants, using the resolver's own predicate.
+    pub fn thread_subject_joins(
+        &self,
+        account: &AccountId,
+        thread: &ThreadId,
+    ) -> Result<HashSet<MessageId>> {
+        let mut joined = HashSet::new();
+        for row in rows_in_thread(&self.conn, account, thread)? {
+            if subject_eligible(&row.headers)
+                && subject_parent(&self.conn, account.as_str(), &row)?
+                    .is_some_and(|parent| parent.thread == *thread)
+            {
+                joined.insert(row.headers.message_id);
+            }
+        }
+        Ok(joined)
+    }
+}
+
+/// Assign before inserting or updating so no sibling in the batch sees an
+/// overridden message temporarily wearing its automatic thread id.
+pub(super) fn initial_thread(
+    conn: &Connection,
+    account: &AccountId,
+    headers: &MessageHeaders,
+) -> Result<ThreadId> {
+    if let Some(thread) = stored_override(conn, account.as_str(), &headers.message_id)? {
+        return Ok(thread);
+    }
+    resolve_thread_id(headers, |parent| {
+        super::thread_id_for_message_id(conn, account, parent)
+    })
+}
+
+fn stored_override(conn: &Connection, account: &str, id: &MessageId) -> Result<Option<ThreadId>> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT thread_id FROM (
+             SELECT thread_id, 0 AS priority, message_id FROM thread_overrides
+             WHERE account_id = ?1 AND message_id = ?2
+             UNION ALL
+             SELECT o.thread_id, 1, a.message_id FROM message_aliases a JOIN thread_overrides o
+               ON o.account_id = a.account_id AND o.message_id = a.message_id
+             WHERE a.account_id = ?1 AND a.canonical_message_id = ?2
+         ) ORDER BY priority, message_id LIMIT 1",
+        )?
+        .query_row(params![account, id.as_str()], |row| {
+            row.get::<_, String>(0).map(ThreadId)
+        })
+        .optional()?)
+}
+
+#[derive(Default)]
+struct ManualThreads {
+    overrides: HashMap<MessageId, ThreadId>,
+    pinned: HashSet<String>,
+}
+
+impl ManualThreads {
+    fn load(conn: &Connection, account: &str) -> Result<Self> {
+        let mut stmt = conn.prepare_cached(
+            "SELECT message_id, thread_id FROM thread_overrides WHERE account_id = ?1",
+        )?;
+        let mut rows = stmt.query([account])?;
+        let mut manual = Self::default();
+        while let Some(row) = rows.next()? {
+            let thread = ThreadId(row.get(1)?);
+            manual.pinned.insert(thread.0.clone());
+            manual.overrides.insert(MessageId(row.get(0)?), thread);
+        }
+        if !manual.overrides.is_empty() {
+            let mut stmt = conn.prepare_cached(
+                "SELECT a.canonical_message_id, o.thread_id
+                 FROM thread_overrides o JOIN message_aliases a
+                   ON a.account_id = o.account_id AND a.message_id = o.message_id
+                 WHERE o.account_id = ?1 ORDER BY a.message_id",
+            )?;
+            let mut rows = stmt.query([account])?;
+            while let Some(row) = rows.next()? {
+                manual
+                    .overrides
+                    .entry(MessageId(row.get(0)?))
+                    .or_insert(ThreadId(row.get(1)?));
+            }
+        }
+        Ok(manual)
+    }
+
+    fn apply(
+        &self,
+        conn: &Connection,
+        account: &str,
+        mut rows: Vec<ThreadingRow>,
+    ) -> Result<Vec<ThreadingRow>> {
+        if self.overrides.is_empty() {
+            return Ok(rows);
+        }
+        let mut resolved = HashMap::new();
+        let mut read = conn.prepare_cached(&format!(
+            "SELECT {THREADING_COLS} FROM messages WHERE account_id = ?1 AND message_id = ?2"
+        ))?;
+        for row in &mut rows {
+            let destination = self.destination(conn, account, row, &mut read, &mut resolved)?;
+            if let Some(thread) = destination
+                && row.thread_id != thread
+            {
+                conn.prepare_cached(
+                    "UPDATE messages SET thread_id = ?1 WHERE account_id = ?2 AND rowid = ?3",
+                )?
+                .execute(params![thread.as_str(), account, row.rowid])?;
+                row.thread_id = thread;
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Follow real message identities to the first explicitly placed ancestor.
+    /// A new reply can follow a manual group even when Proton still reports
+    /// its old id. Moving a reply never takes its previous group along.
+    fn destination(
+        &self,
+        conn: &Connection,
+        account: &str,
+        first: &ThreadingRow,
+        read: &mut rusqlite::Statement<'_>,
+        resolved: &mut HashMap<MessageId, Option<ThreadId>>,
+    ) -> Result<Option<ThreadId>> {
+        if self.overrides.is_empty() {
+            return Ok(None);
+        }
+        let mut ancestors = Vec::new();
+        let mut next = None;
+        let destination = loop {
+            let row = next.as_ref().unwrap_or(first);
+            let id = &row.headers.message_id;
+            if let Some(thread) = self.overrides.get(id) {
+                break Some(thread.clone());
+            }
+            if let Some(known) = resolved.get(id) {
+                break known.clone();
+            }
+            // Mark the row as visited before walking on. A cycle with no
+            // explicit ancestor is resolved by the ordinary union pass.
+            resolved.insert(id.clone(), None);
+            ancestors.push(id.clone());
+            let Some(parent) = direct_parent(conn, account, row)? else {
+                break None;
+            };
+            next = read
+                .query_row(params![account, parent.id.as_str()], threading_row)
+                .optional()?;
+            if next.is_none() {
+                break None;
+            }
+        };
+        for id in ancestors {
+            resolved.insert(id, destination.clone());
+        }
+        Ok(destination)
+    }
+
+    fn pinned(&self, thread: &str) -> bool {
+        self.pinned.contains(thread)
+    }
+
+    /// An explicitly placed child can claim a late header parent. Move the
+    /// canonical message alone, leaving its previous thread's other rows.
+    /// Include parents that already occupy their child's manual destination.
+    fn place_header_parents(
+        &self,
+        conn: &Connection,
+        account: &str,
+        rows: &mut [ThreadingRow],
+    ) -> Result<HashMap<MessageId, ThreadId>> {
+        let mut placed = HashMap::new();
+        for row in rows
+            .iter()
+            .filter(|row| self.overrides.contains_key(&row.headers.message_id))
+        {
+            if let Some(parent) = header_parent(conn, account, row)?
+                && (parent.thread == row.thread_id || !self.pinned(parent.thread.as_str()))
+            {
+                if parent.thread != row.thread_id {
+                    set_member_thread(conn, account, &parent.id, &row.thread_id)?;
+                }
+                placed.insert(parent.id, row.thread_id.clone());
+            }
+        }
+        if !placed.is_empty() {
+            for row in rows {
+                if let Some(thread) = placed.get(&row.headers.message_id)
+                    && row.thread_id != *thread
+                {
+                    row.thread_id = thread.clone();
+                }
+            }
+        }
+        Ok(placed)
+    }
+}
+
+fn set_member_thread(
+    conn: &Connection,
+    account: &str,
+    id: &MessageId,
+    thread: &ThreadId,
+) -> Result<()> {
+    conn.prepare_cached(
+        "UPDATE messages SET thread_id = ?1 WHERE account_id = ?2 AND message_id = ?3 AND thread_id != ?1",
+    )?
+    .execute(params![thread.as_str(), account, id.as_str()])?;
+    Ok(())
 }
 
 /// Re-resolve thread ids for an account in one in-memory pass.
@@ -628,11 +969,17 @@ fn stored_thread(conn: &Connection, account: &str, id: &str) -> Result<Option<Th
 /// stay apart. Non-proton merges keep the earliest already-assigned id.
 /// Reads every row in the account, so only upgrades call it; writes use
 /// [`rethread_dirty`].
-pub(super) fn rethread_all(conn: &Connection, account_id: &AccountId) -> Result<()> {
-    let rows = load_threading_rows(conn, account_id)?;
+pub(super) fn rethread_all(
+    conn: &Connection,
+    account_id: &AccountId,
+) -> Result<HashMap<MessageId, ThreadId>> {
+    let account = account_id.as_str();
+    let manual = ManualThreads::load(conn, account)?;
+    let mut rows = manual.apply(conn, account, load_threading_rows(conn, account_id)?)?;
     if rows.is_empty() {
-        return Ok(());
+        return Ok(HashMap::new());
     }
+    let header_parents = manual.place_header_parents(conn, account, &mut rows)?;
 
     let mut by_message: HashMap<MessageId, ThreadId> = rows
         .iter()
@@ -648,14 +995,14 @@ pub(super) fn rethread_all(conn: &Connection, account_id: &AccountId) -> Result<
     for row in &rows {
         union.note(row.thread_id.as_str(), row.rowid);
     }
-    let account = account_id.as_str();
     let edges = thread_edges(
         &rows,
+        &manual,
         &mut |parent| Ok(by_message.get(parent).cloned()),
-        &mut |row| subject_parent(conn, account, row),
+        &mut |row| Ok(subject_parent(conn, account, row)?.map(|parent| parent.thread)),
     )?;
     for (member, preferred) in &edges {
-        union.union_prefer(member, preferred);
+        union.union_prefer(member, preferred, &manual);
     }
     let nodes: Vec<String> = rows.iter().map(|row| row.thread_id.0.clone()).collect();
     relabel(
@@ -663,7 +1010,8 @@ pub(super) fn rethread_all(conn: &Connection, account_id: &AccountId) -> Result<
         account_id,
         &mut union,
         nodes.iter().map(String::as_str),
-    )
+    )?;
+    Ok(header_parents)
 }
 
 /// Merges to apply, in row order: each row's thread onto the thread its
@@ -673,30 +1021,28 @@ pub(super) fn rethread_all(conn: &Connection, account_id: &AccountId) -> Result<
 /// subject (see [`subject_parent`]).
 fn thread_edges(
     rows: &[ThreadingRow],
+    manual: &ManualThreads,
     lookup: &mut dyn FnMut(&MessageId) -> Result<Option<ThreadId>>,
     by_subject: &mut dyn FnMut(&ThreadingRow) -> Result<Option<ThreadId>>,
 ) -> Result<Vec<(String, String)>> {
     let mut edges = Vec::with_capacity(rows.len() * 2);
     for row in rows {
-        let onto = resolve_thread_id(&row.headers, &mut *lookup)?;
+        if manual.pinned(row.thread_id.as_str()) {
+            continue;
+        }
         let header = header_parent_thread_id(&row.headers, &mut *lookup)?;
+        let onto = resolve_thread_id(&row.headers, &mut *lookup)?;
+        if manual.pinned(onto.as_str()) {
+            continue;
+        }
         edges.push((row.thread_id.0.clone(), onto.0.clone()));
-        let proton = row
-            .headers
-            .proton_conversation_id
-            .as_deref()
-            .is_some_and(|id| !id.trim().is_empty());
-        // A reply that names any parent waits for that parent instead: a
-        // subject join cannot be undone when the real parent arrives later.
-        let headerless = row.headers.parent_ids().next().is_none();
-        match header {
-            Some(header) => edges.push((header.0, onto.0)),
-            None if !proton && headerless => {
-                if let Some(original) = by_subject(row)? {
-                    edges.push((row.thread_id.0.clone(), original.0));
-                }
-            }
-            None => {}
+        if let Some(header) = header.filter(|parent| !manual.pinned(parent.as_str())) {
+            edges.push((header.0, onto.0));
+        } else if subject_eligible(&row.headers)
+            && let Some(original) =
+                by_subject(row)?.filter(|parent| !manual.pinned(parent.as_str()))
+        {
+            edges.push((row.thread_id.0.clone(), original.0));
         }
     }
     Ok(edges)
@@ -788,6 +1134,20 @@ fn load_threading_rows(conn: &Connection, account_id: &AccountId) -> Result<Vec<
         .map_err(Into::into)
 }
 
+fn rows_in_thread(
+    conn: &Connection,
+    account: &AccountId,
+    thread: &ThreadId,
+) -> Result<Vec<ThreadingRow>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {THREADING_COLS} FROM messages WHERE account_id = ?1 AND thread_id = ?2
+         ORDER BY date_unix, rowid"
+    ))?;
+    Ok(stmt
+        .query_map(params![account.as_str(), thread.as_str()], threading_row)?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
 #[derive(Default)]
 struct ThreadUnion {
     parent: HashMap<String, String>,
@@ -827,10 +1187,13 @@ impl ThreadUnion {
     /// Two different `proton:` roots stay apart. A proton root absorbs a
     /// non-proton one. Otherwise the earliest already-assigned id wins, so a
     /// caller that saved the first id still lists the messages.
-    fn union_prefer(&mut self, member: &str, preferred: &str) {
+    fn union_prefer(&mut self, member: &str, preferred: &str, manual: &ManualThreads) {
         let member_root = self.find(member);
         let preferred_root = self.find(preferred);
         if member_root == preferred_root {
+            return;
+        }
+        if manual.pinned(&member_root) || manual.pinned(&preferred_root) {
             return;
         }
         let member_proton = member_root.starts_with("proton:");
@@ -866,6 +1229,13 @@ mod tests {
     use crate::backend::MailboxDelta;
     use crate::message::{Message, RemoteId};
     use crate::store::Store;
+
+    fn applied(outcome: Result<ThreadEditOutcome>) -> ThreadId {
+        match outcome.unwrap() {
+            ThreadEditOutcome::Applied(thread) => thread,
+            ThreadEditOutcome::AlreadyGrouped(thread) => panic!("no manual edit for {thread:?}"),
+        }
+    }
 
     /// Small deterministic generator so failures replay from the seed.
     struct Rng(u64);
@@ -945,12 +1315,15 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
     enum Op {
         Batch(Vec<Message>),
         Delete(String),
         /// Move this message's thread to Trash from its first folder; from
         /// Trash, delete it for good.
         Trash(String),
+        Split(String),
+        Merge([String; 3]),
         Undo,
     }
 
@@ -1069,6 +1442,14 @@ mod tests {
             if rng.chance(15) {
                 ops.push(Op::Trash(made[rng.below(made.len())].clone()));
             }
+            if rng.chance(45) {
+                ops.push(Op::Split(made[rng.below(made.len())].clone()));
+            }
+            if rng.chance(45) {
+                ops.push(Op::Merge(std::array::from_fn(|_| {
+                    made[rng.below(made.len())].clone()
+                })));
+            }
             if rng.chance(10) {
                 ops.push(Op::Undo);
             }
@@ -1123,6 +1504,20 @@ mod tests {
                     let _ = store.delete_thread(&account.id, &ThreadId(thread), folder);
                 }
             }
+            Op::Split(id) => {
+                let id = MessageId::new(id);
+                let _ = store.split_thread(&account.id, &id);
+            }
+            Op::Merge(ids) => {
+                let mut threads = ids.iter().filter_map(|id| {
+                    store
+                        .thread_for_message(&account.id, &MessageId::new(id))
+                        .unwrap()
+                });
+                if let Some(target) = threads.next() {
+                    let _ = store.merge_threads(&account.id, &threads.collect::<Vec<_>>(), &target);
+                }
+            }
             Op::Undo => {
                 let _ = store.undo(&account.id);
             }
@@ -1141,10 +1536,16 @@ mod tests {
             for (step, op) in scenario(seed).iter().enumerate() {
                 run(&incremental, op);
                 run(&full, op);
-                assert_eq!(
-                    threads_of(&incremental),
-                    threads_of(&full),
-                    "seed {seed}, step {step}"
+                let left = threads_of(&incremental);
+                let right = threads_of(&full);
+                let differences: Vec<_> = left.iter().zip(&right).filter(|(a, b)| a != b).collect();
+                let operation = match op {
+                    Op::Batch(rows) => format!("batch of {}", rows.len()),
+                    other => format!("{other:?}"),
+                };
+                assert!(
+                    left == right,
+                    "seed {seed}, step {step} ({operation}): {differences:?}"
                 );
             }
             // A trailing delete is queued, not yet resolved. Resolve it the
@@ -1157,6 +1558,770 @@ mod tests {
             rethread_all(&incremental.conn, &account().id).unwrap();
             assert_eq!(threads_of(&incremental), settled, "seed {seed} fixed point");
         }
+    }
+
+    #[test]
+    fn merge_candidates_choose_topic_and_people_before_newer_mail() {
+        let store = Store::open_in_memory().unwrap();
+        let account = account();
+        store.upsert_account(&account).unwrap();
+        let mail = |id: &str, author, subject: &str, date| {
+            let mut mail = message(id, None, &[], None, "INBOX", author, id, date, None);
+            mail.headers.subject = subject.into();
+            store.upsert_message(&mail).unwrap()
+        };
+        let source = mail("source@x", "a@x", "Re: Warehouse access checklist", 100);
+        let topic = mail("topic@x", "b@x", "Warehouse access checklist", 200);
+        let person = mail("person@x", "a@x", "Drawings for the workshop", 300);
+        let latest = mail("latest@x", "c@x", "Items on sale today", 400);
+        let candidates = store
+            .merge_candidates(
+                &account.id,
+                std::slice::from_ref(&source.0),
+                "",
+                &account.email,
+            )
+            .unwrap();
+        assert_eq!(
+            candidates
+                .into_iter()
+                .map(|row| row.thread)
+                .collect::<Vec<_>>(),
+            [topic.clone(), person.clone(), latest]
+        );
+        for index in 0..30 {
+            mail(
+                &format!("recent-{index}@x"),
+                "c@x",
+                "Newer mail",
+                500 + index,
+            );
+        }
+        let recent = store
+            .merge_candidates(&account.id, &[source.0], "", &account.email)
+            .unwrap();
+        assert_eq!(recent.len(), 32);
+        assert_eq!(recent[0].thread, person);
+        assert!(recent.iter().all(|row| row.thread != topic));
+    }
+
+    #[test]
+    fn merge_search_prefers_subject_word_starts_then_names_then_addresses() {
+        let store = Store::open_in_memory().unwrap();
+        let acct = account();
+        store.upsert_account(&acct).unwrap();
+        let mail = |id, subject: &str, name: &str, email, date| {
+            let mut mail = message(id, None, &[], None, "INBOX", email, id, date, None);
+            mail.headers.subject = subject.into();
+            mail.headers.from.name = Some(name.into());
+            store.upsert_message(&mail).unwrap()
+        };
+        let subject = mail("s@x", "Checklist:Northpine", "Ada", "a@x", 100);
+        let name = mail("n@x", "Delivery update", "Northpine", "b@x", 200);
+        let address = mail("a@x", "Dispatch", "Ada", "northpine@x", 300);
+        let partial = mail("p@x", "Oldnorthpine", "Ada", "a@x", 400);
+        assert_eq!(
+            store
+                .merge_candidates(&acct.id, &[], "north", &acct.email)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.thread)
+                .collect::<Vec<_>>(),
+            [subject, name, address, partial],
+        );
+        assert!(
+            store
+                .merge_candidates(&acct.id, &[], "north*", &acct.email)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn late_header_parents_follow_both_sides_of_a_split() {
+        for whole_account in [false, true] {
+            let store = Store::open_in_memory().unwrap();
+            store.full_rethread.set(whole_account);
+            let account = account();
+            store.upsert_account(&account).unwrap();
+            let mail = |id, parent, proton, date| {
+                message(id, parent, &[], proton, "INBOX", "a@x", id, date, None)
+            };
+            let retained = store
+                .upsert_message(&mail(
+                    "retained@x",
+                    Some("parent-a@x"),
+                    Some("old".into()),
+                    200,
+                ))
+                .unwrap();
+            store
+                .upsert_message(&mail(
+                    "detached@x",
+                    Some("parent-b@x"),
+                    Some("old".into()),
+                    300,
+                ))
+                .unwrap();
+            let detached = applied(store.split_thread(&account.id, &MessageId::new("detached@x")));
+            let parents = Op::Batch(vec![
+                mail("parent-a@x", None, None, 100),
+                mail("parent-b@x", None, Some("lookup".into()), 110),
+            ]);
+            run(&store, &parents);
+            assert_eq!(
+                store
+                    .thread_for_message(&account.id, &MessageId::new("parent-a@x"))
+                    .unwrap(),
+                Some(retained)
+            );
+            assert_eq!(
+                store
+                    .thread_for_message(&account.id, &MessageId::new("parent-b@x"))
+                    .unwrap(),
+                Some(detached)
+            );
+        }
+    }
+
+    #[test]
+    fn split_moves_only_the_header_parent_and_undo_resolves_its_proton_key() {
+        for whole_account in [false, true] {
+            let store = Store::open_in_memory().unwrap();
+            store.full_rethread.set(whole_account);
+            let acct = account();
+            store.upsert_account(&acct).unwrap();
+            let mail = |id, parent, proton: &str, date| {
+                message(
+                    id,
+                    parent,
+                    &[],
+                    Some(proton.into()),
+                    "INBOX",
+                    "a@x",
+                    id,
+                    date,
+                    None,
+                )
+            };
+            run(
+                &store,
+                &Op::Batch(vec![
+                    mail("s@x", None, "team", 110),
+                    mail("r@x", None, "old", 200),
+                    mail("c@x", Some("p@x"), "old", 210),
+                ]),
+            );
+            let detached = applied(store.split_thread(&acct.id, &MessageId::new("c@x")));
+            store
+                .upsert_message(&mail("p@x", None, "team", 100))
+                .unwrap();
+            let thread = |id| {
+                store
+                    .thread_for_message(&acct.id, &MessageId::new(id))
+                    .unwrap()
+                    .unwrap()
+            };
+            assert_eq!(thread("p@x"), detached);
+            assert_eq!(thread("s@x"), ThreadId::proton("team"));
+            assert_eq!(thread("r@x"), ThreadId::proton("old"));
+            store.undo(&acct.id).unwrap();
+            assert_eq!(thread("p@x"), ThreadId::proton("team"));
+            assert_eq!(thread("s@x"), ThreadId::proton("team"));
+            assert_eq!(thread("c@x"), ThreadId::proton("old"));
+            assert_eq!(thread("r@x"), ThreadId::proton("old"));
+        }
+    }
+
+    #[test]
+    fn manual_edits_use_membership_after_queued_rethreading() {
+        let store = Store::open_in_memory().unwrap();
+        let acct = account();
+        store.upsert_account(&acct).unwrap();
+        let mail = |id, date| message(id, None, &[], None, "INBOX", "a@x", id, date, None);
+        run(
+            &store,
+            &Op::Batch(vec![mail("a@x", 100), mail("b@x", 200), mail("c@x", 300)]),
+        );
+        let thread = |id| {
+            store
+                .thread_for_message(&acct.id, &MessageId::new(id))
+                .unwrap()
+                .unwrap()
+        };
+        store
+            .conn
+            .execute(
+                "UPDATE messages SET in_reply_to = 'a@x' WHERE message_id = 'b@x'",
+                [],
+            )
+            .unwrap();
+        let detached = applied(store.split_thread(&acct.id, &MessageId::new("b@x")));
+        assert_eq!(thread("b@x"), detached);
+        store.undo(&acct.id).unwrap();
+        let stale_source = thread("c@x");
+        let destination = store.upsert_message(&mail("target@x", 400)).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE messages SET in_reply_to = 'a@x' WHERE message_id = 'c@x'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            applied(store.merge_threads(&acct.id, &[stale_source], &destination)),
+            destination
+        );
+        for id in ["a@x", "b@x", "c@x"] {
+            assert_eq!(thread(id), destination);
+        }
+        assert_eq!(
+            store.thread_manual_merges(&acct.id, &destination).unwrap(),
+            ["a@x", "b@x", "c@x"]
+                .map(MessageId::new)
+                .into_iter()
+                .collect(),
+        );
+    }
+
+    #[test]
+    fn merge_returns_the_survivor_when_queued_rethreading_already_joined_the_selection() {
+        for whole_account in [false, true] {
+            let (store, acct, threads) = queued_conversation_join(whole_account);
+            let [survivor, target, source] = &threads;
+            assert_eq!(
+                store
+                    .merge_threads(&acct.id, std::slice::from_ref(source), target)
+                    .unwrap(),
+                ThreadEditOutcome::AlreadyGrouped(survivor.clone())
+            );
+            assert_automatic_join(&store, &acct.id, &threads);
+        }
+    }
+
+    #[test]
+    fn split_returns_the_survivor_when_queued_rethreading_leaves_no_other_branch() {
+        for whole_account in [false, true] {
+            let (store, acct, threads) = queued_conversation_join(whole_account);
+            assert_eq!(
+                store
+                    .split_thread(&acct.id, &MessageId::new("b@x"))
+                    .unwrap(),
+                ThreadEditOutcome::AlreadyGrouped(threads[0].clone())
+            );
+            assert_automatic_join(&store, &acct.id, &threads);
+        }
+    }
+
+    fn queued_conversation_join(whole_account: bool) -> (Store, Account, [ThreadId; 3]) {
+        let store = Store::open_in_memory().unwrap();
+        store.full_rethread.set(whole_account);
+        let acct = account();
+        store.upsert_account(&acct).unwrap();
+        crate::actions::ensure_action_schema(&store.conn).unwrap();
+        let mail = |id, date| message(id, None, &[], None, "INBOX", "a@x", id, date, None);
+        let threads = [("a@x", 100), ("b@x", 200), ("c@x", 300)]
+            .map(|(id, date)| store.upsert_message(&mail(id, date)).unwrap());
+        // The replies join b, but a's earlier thread ID survives the join.
+        store
+            .conn
+            .execute(
+                "UPDATE messages SET in_reply_to = 'b@x' WHERE message_id IN ('a@x', 'c@x')",
+                [],
+            )
+            .unwrap();
+        (store, acct, threads)
+    }
+
+    fn assert_automatic_join(store: &Store, account: &AccountId, threads: &[ThreadId; 3]) {
+        let [survivor, target, source] = threads;
+        assert_eq!(store.thread_messages(account, survivor).unwrap().len(), 3);
+        assert_eq!(
+            store
+                .threading_list_key(account, survivor, "INBOX", None)
+                .unwrap()
+                .unwrap()
+                .thread_id,
+            *survivor
+        );
+        for replaced in [target, source] {
+            assert!(
+                store
+                    .threading_list_key(account, replaced, "INBOX", None)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let (dirty, actions): (i64, i64) = store
+            .conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM thread_dirty_rows), (SELECT COUNT(*) FROM local_actions)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(dirty, 0);
+        assert_eq!(actions, 0);
+    }
+
+    #[test]
+    fn an_unrelated_subject_chain_does_not_expand_the_manual_dirty_set() {
+        let store = Store::open_in_memory().unwrap();
+        let account = account();
+        store.upsert_account(&account).unwrap();
+        let mail = |id: &str, date| {
+            let mut mail = message(id, None, &[], None, "INBOX", "a@x", id, date, None);
+            mail.headers.subject = "Re: Repeated billing alerts".into();
+            mail
+        };
+        let rows: Vec<_> = (0..40)
+            .map(|index| mail(&format!("alert-{index}@x"), index * 20 * 86_400))
+            .collect();
+        run(&store, &Op::Batch(rows));
+        let source = store
+            .upsert_message(&message(
+                "source@x",
+                None,
+                &[],
+                None,
+                "INBOX",
+                "b@x",
+                "one",
+                100,
+                None,
+            ))
+            .unwrap();
+        let target = store
+            .upsert_message(&message(
+                "target@x",
+                None,
+                &[],
+                None,
+                "INBOX",
+                "b@x",
+                "two",
+                200,
+                None,
+            ))
+            .unwrap();
+        store
+            .merge_threads(&account.id, &[source], &target)
+            .unwrap();
+
+        let sql =
+            format!("SELECT {THREADING_COLS} FROM messages WHERE rowid = ?1 AND account_id = ?2");
+        let row_read_steps = || {
+            store
+                .conn
+                .prepare_cached(&sql)
+                .unwrap()
+                .reset_status(rusqlite::StatementStatus::VmStep)
+        };
+        row_read_steps();
+        store.conn.execute(
+            "INSERT INTO thread_dirty_rows SELECT rowid FROM messages WHERE message_id = 'alert-0@x'",
+            [],
+        ).unwrap();
+        rethread_dirty(&store.conn, &account.id).unwrap();
+        let steps = row_read_steps();
+        assert!(
+            (1..150).contains(&steps),
+            "dirty row reads used {steps} SQLite instructions"
+        );
+    }
+
+    #[test]
+    fn splitting_a_subject_branch_survives_resync_and_whole_account_rethread() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("mail.db");
+        let store = Store::open(&path).unwrap();
+        let mailbox = account();
+        let account = mailbox.id.clone();
+        store.upsert_account(&mailbox).unwrap();
+        let root = message(
+            "root@x",
+            None,
+            &[],
+            None,
+            "INBOX",
+            "ada@x",
+            "root",
+            100,
+            None,
+        );
+        let mut reply = message(
+            "reply@x",
+            None,
+            &[],
+            None,
+            "INBOX",
+            "tessa@x",
+            "reply",
+            200,
+            None,
+        );
+        let mut root = root;
+        root.headers.subject = "Equipment inventory".into();
+        root.to = vec![Address {
+            name: None,
+            email: "tessa@x".into(),
+        }];
+        reply.headers.subject = "Re: Equipment inventory".into();
+        reply.to = vec![Address {
+            name: None,
+            email: "ada@x".into(),
+        }];
+        reply.labels.push("inventory".into());
+        reply.starred = true;
+        reply.snooze_until = Some(1_893_456_000);
+        let child = message(
+            "child@x",
+            Some("reply@x"),
+            &[],
+            None,
+            "Sent",
+            "ada@x",
+            "child",
+            300,
+            None,
+        );
+        let sibling = message(
+            "sibling@x",
+            Some("root@x"),
+            &[],
+            None,
+            "INBOX",
+            "ada@x",
+            "sibling",
+            350,
+            None,
+        );
+        let copies = Op::Batch(vec![root, reply, child, sibling]);
+        run(&store, &copies);
+        let id = MessageId::new("reply@x");
+        let original = store.thread_for_message(&account, &id).unwrap().unwrap();
+        assert_eq!(
+            store.thread_subject_joins(&account, &original).unwrap(),
+            HashSet::from([id.clone()])
+        );
+        let detached = applied(store.split_thread(&account, &id));
+        assert_eq!(store.thread_messages(&account, &original).unwrap().len(), 2);
+        assert!(
+            store
+                .thread_subject_joins(&account, &detached)
+                .unwrap()
+                .is_empty()
+        );
+
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        run(&store, &copies);
+        let late = message(
+            "late@x",
+            Some("child@x"),
+            &[],
+            None,
+            "INBOX",
+            "ada@x",
+            "late",
+            400,
+            None,
+        );
+        run(&store, &Op::Batch(vec![late]));
+        rethread_all(&store.conn, &account).unwrap();
+        let separated = store.thread_messages(&account, &detached).unwrap();
+        assert_eq!(separated.len(), 3);
+        let reply = &separated[0];
+        assert_eq!(reply.headers.message_id, id);
+        assert!(reply.starred);
+        assert_eq!(reply.snooze_until, Some(1_893_456_000));
+        assert_eq!(reply.labels, ["inventory"]);
+
+        assert_eq!(
+            store.undo(&account).unwrap().kind,
+            crate::ActionKind::SplitThread
+        );
+        assert!(
+            store
+                .thread_messages(&account, &detached)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.thread_messages(&account, &original).unwrap().len(), 5);
+        assert_eq!(
+            store.thread_subject_joins(&account, &original).unwrap(),
+            HashSet::from([id])
+        );
+    }
+
+    #[test]
+    fn merging_proton_conversations_keeps_the_chosen_key_and_undo_routes_new_replies() {
+        let store = Store::open_in_memory().unwrap();
+        let mailbox = account();
+        let account = mailbox.id.clone();
+        store.upsert_account(&mailbox).unwrap();
+        let a = message(
+            "a@x",
+            None,
+            &[],
+            Some("one".into()),
+            "INBOX",
+            "a@x",
+            "first",
+            100,
+            None,
+        );
+        let b = message(
+            "b@x",
+            None,
+            &[],
+            Some("two".into()),
+            "INBOX",
+            "b@x",
+            "second",
+            200,
+            None,
+        );
+        run(&store, &Op::Batch(vec![a.clone(), b.clone()]));
+        let source = ThreadId::proton("one");
+        let target = ThreadId::proton("two");
+        store
+            .merge_threads(&account, std::slice::from_ref(&source), &target)
+            .unwrap();
+        let reply = |id, parent, proton: &str, date| {
+            message(
+                id,
+                Some(parent),
+                &[],
+                Some(proton.into()),
+                "Sent",
+                "a@x",
+                id,
+                date,
+                None,
+            )
+        };
+        run(
+            &store,
+            &Op::Batch(vec![
+                a,
+                b,
+                reply("reply@x", "a@x", "two", 300),
+                reply("later@x", "reply@x", "three", 310),
+                reply("target-reply@x", "b@x", "three", 320),
+            ]),
+        );
+        rethread_all(&store.conn, &account).unwrap();
+        assert_eq!(store.thread_messages(&account, &target).unwrap().len(), 5);
+        assert!(store.thread_messages(&account, &source).unwrap().is_empty());
+        store.undo(&account).unwrap();
+        assert_eq!(store.thread_messages(&account, &target).unwrap().len(), 2);
+        assert_eq!(store.thread_messages(&account, &source).unwrap().len(), 3);
+        assert!(
+            store
+                .thread_messages(&account, &ThreadId::proton("three"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn undoing_a_merge_routes_late_replies_away_from_a_still_pinned_destination() {
+        for earlier_split in [false, true] {
+            let store = Store::open_in_memory().unwrap();
+            let acct = account();
+            store.upsert_account(&acct).unwrap();
+            let mail = |id, parent, proton: &str, date| {
+                message(
+                    id,
+                    parent,
+                    &[],
+                    Some(proton.into()),
+                    "INBOX",
+                    "a@x",
+                    id,
+                    date,
+                    None,
+                )
+            };
+            let target = store
+                .upsert_message(&mail("team@x", None, "team", 100))
+                .unwrap();
+            let first = store
+                .upsert_message(&mail(
+                    "first@x",
+                    None,
+                    if earlier_split { "team" } else { "one" },
+                    200,
+                ))
+                .unwrap();
+            let first = if earlier_split {
+                applied(store.split_thread(&acct.id, &MessageId::new("first@x")))
+            } else {
+                applied(store.merge_threads(&acct.id, &[first], &target))
+            };
+            let second = store
+                .upsert_message(&mail("second@x", None, "two", 300))
+                .unwrap();
+            store
+                .merge_threads(&acct.id, std::slice::from_ref(&second), &target)
+                .unwrap();
+            let reply = mail("reply@x", Some("second@x"), "team", 400);
+            assert_eq!(store.upsert_message(&reply).unwrap(), target);
+            let team_reply = mail("team-reply@x", Some("team@x"), "team", 500);
+            assert_eq!(store.upsert_message(&team_reply).unwrap(), target);
+
+            assert_eq!(
+                store.undo(&acct.id).unwrap().kind,
+                crate::ActionKind::MergeThreads
+            );
+            let thread = |id| {
+                store
+                    .thread_for_message(&acct.id, &MessageId::new(id))
+                    .unwrap()
+                    .unwrap()
+            };
+            assert_eq!(thread("first@x"), first);
+            assert_eq!(thread("second@x"), second);
+            assert_eq!(thread("reply@x"), second);
+            assert_eq!(thread("team-reply@x"), target);
+            assert!(
+                stored_override(&store.conn, acct.id.as_str(), &reply.headers.message_id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn undoing_a_split_routes_late_replies_filed_under_a_new_proton_key() {
+        let store = Store::open_in_memory().unwrap();
+        let acct = account();
+        store.upsert_account(&acct).unwrap();
+        let mail = |id, parent, proton: &str, date| {
+            message(
+                id,
+                parent,
+                &[],
+                Some(proton.into()),
+                "INBOX",
+                "a@x",
+                id,
+                date,
+                None,
+            )
+        };
+        let team = store
+            .upsert_message(&mail("a@x", None, "team", 100))
+            .unwrap();
+        store
+            .upsert_message(&mail("b@x", Some("a@x"), "team", 200))
+            .unwrap();
+        let detached = applied(store.split_thread(&acct.id, &MessageId::new("b@x")));
+        let reply = mail("reply@x", Some("b@x"), "fresh", 300);
+        assert_eq!(store.upsert_message(&reply).unwrap(), detached);
+        let later = mail("later@x", Some("reply@x"), "fresher", 400);
+        assert_eq!(store.upsert_message(&later).unwrap(), detached);
+
+        assert_eq!(
+            store.undo(&acct.id).unwrap().kind,
+            crate::ActionKind::SplitThread
+        );
+        assert_eq!(store.thread_messages(&acct.id, &team).unwrap().len(), 4);
+        assert!(
+            store
+                .thread_messages(&acct.id, &detached)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            stored_override(&store.conn, acct.id.as_str(), &reply.headers.message_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn merging_notes_and_undo_restore_both_histories() {
+        let store = Store::open_in_memory().unwrap();
+        let mailbox = account();
+        let account = mailbox.id.clone();
+        store.upsert_account(&mailbox).unwrap();
+        store
+            .set_agent_grant(
+                &account,
+                "planner",
+                crate::AgentGrant::enabled(true, false, false).with_annotation(true),
+            )
+            .unwrap();
+        let source = store
+            .upsert_message(&message(
+                "source@x",
+                None,
+                &[],
+                None,
+                "INBOX",
+                "a@x",
+                "source",
+                100,
+                None,
+            ))
+            .unwrap();
+        let target = store
+            .upsert_message(&message(
+                "target@x",
+                None,
+                &[],
+                None,
+                "INBOX",
+                "b@x",
+                "target",
+                200,
+                None,
+            ))
+            .unwrap();
+        let original = store
+            .annotate_thread(
+                &account,
+                &target,
+                "planner",
+                Some("Target note"),
+                &[],
+                "Review",
+            )
+            .unwrap();
+        let newer = store
+            .annotate_thread(
+                &account,
+                &source,
+                "planner",
+                Some("Source note"),
+                &["reply".into()],
+                "Review",
+            )
+            .unwrap();
+        store.see_thread_note(&account, newer.id).unwrap();
+
+        store
+            .merge_threads(&account, std::slice::from_ref(&source), &target)
+            .unwrap();
+        assert!(store.thread_notes(&account, &source).unwrap().is_empty());
+        let notes = store.thread_notes(&account, &target).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].id, newer.id);
+        assert!(notes[0].seen);
+        assert_eq!(
+            store.undo(&account).unwrap().kind,
+            crate::ActionKind::MergeThreads
+        );
+        assert_eq!(
+            store.thread_notes(&account, &target).unwrap()[0].id,
+            original.id
+        );
+        assert_eq!(
+            store.thread_notes(&account, &source).unwrap()[0].id,
+            newer.id
+        );
     }
 
     #[test]
