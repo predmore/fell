@@ -849,7 +849,8 @@ mod tests {
             huge.estimated_height(440.),
         );
 
-        let newsletter = fell_render::WebMail::prepare(
+        let calibration = [
+            ("inline-styled ESP table", 493, String::from(
             r#"<style>.masthead {display:flex;gap:12px}</style>
             <table role="presentation" width="100%" cellspacing="0" style="background:#f3f0e8;color:#263950">
             <tr><td style="padding:20px 22px 16px;font:14px sans-serif">
@@ -862,35 +863,94 @@ mod tests {
             <td style="padding-top:8px"><img src="https://cdn.example.test/pier" width="156" height="64"></td>
             <td style="padding-top:8px"><img src="https://cdn.example.test/library" width="156" height="64"></td>
             </tr></table></td></tr></table>"#,
-        );
-        for width in [493, 560] {
-            let picture = estimate_covers_snapshot("newsletter", &newsletter, width);
-            assert!(
-                (0. ..=25.).contains(&(newsletter.estimated_height(width as f32) - picture.height))
-            );
+            )),
+            ("mobile reveal", 360, String::from(concat!(
+                "<style>@media (max-width:600px) { .mobile { display:block !important; ",
+                "visibility:visible !important; font-size:16px !important; ",
+                "max-height:none !important; overflow:visible !important; background:#7a163f; } }</style>",
+                r#"<div class="mobile" style="display:none;visibility:hidden;font-size:0;max-height:0;overflow:hidden">"#,
+                "Mobile dispatch<br>Edition 42</div>",
+            ))),
+            ("spacer cells and body padding", 440, String::from(concat!(
+                r#"<style media="print">.show {display:none !important}</style>"#,
+                r#"<style media="screen">.show {display:block !important;background:#7a163f}</style>"#,
+                r#"<body style="padding-block:8px 12px"><div hidden class="show">Visible in web view</div>"#,
+                r#"<table><tr height="32"><td height="24" style="font-size:0"></td></tr></table>"#,
+                r#"<div style="min-height:86px;border-block-start:3px solid;border-block-end:5px solid;"#,
+                r#"padding-block:4px 8px;margin-block:7px 9px;background:#3f167a">Spacer</div></body>"#,
+            ))),
+            ("hero and padded sections", 440, format!(
+                r#"<style>
+                  div.hero#lead {{height:280px;background:#7a163f}}
+                  td.section {{padding:2em 20px;text-align:center}}
+                  section.picture {{padding-top:50%;background:#eeede1}}
+                </style>
+                <div class="hero" id="lead">Along the river</div>
+                <section class="picture">The park in autumn</section>
+                <table width="100%" role="presentation" cellspacing="0">{}</table>"#,
+                r#"<tr><td class="section" style="background:#eeede1">This week by the lake</td></tr>"#.repeat(4),
+            )),
+            ("column flex masthead", 440, String::from(concat!(
+                r#"<div style="display:flex;flex-direction:column;gap:16px;row-gap:18px;padding:12px;background:#eeede1">"#,
+                r#"<div style="height:75px">The Lakeside Dispatch</div>"#,
+                r#"<div style="height:75px">Issue 42</div>"#,
+                r#"<div style="height:110px;border-block:6px solid">The river in autumn</div></div>"#,
+            ))),
+            ("desktop and mobile pair", 440, String::from(concat!(
+                r#"<style>.mobile {display:none} .desktop {height:320px;background:#3f167a}
+                @media screen and (max-width:600px) {.desktop {display:none} .mobile {display:block;height:234px;background:#7a163f}}
+                @media all and (min-width:601px) {.mobile {display:none}}</style>"#,
+                r#"<div class="desktop">Desktop edition</div><div class="mobile">Mobile edition</div>"#,
+            ))),
+            ("hover and compact paragraphs", 440, format!(
+                r#"<style>p {{margin:0}} a:hover {{display:none}} img {{border:0}}</style>{}"#,
+                r#"<p style="text-align:left;font-family:serif;font-weight:normal"><a href="https://example.test">Around town</a> this week.</p>"#.repeat(8),
+            )),
+            ("long article", 440, format!(
+                r#"<article><h1 style="margin:0 0 12px">A walk along the lake</h1>{}</article>"#,
+                "<p>On Saturday the first ferry left the harbor just after sunrise. The new footpath now follows the water from the boat landing to the old railway bridge.</p>".repeat(18),
+            )),
+        ];
+        let mut outliers = Vec::new();
+        for (label, width, html) in calibration {
+            let mail = fell_render::WebMail::prepare(&html);
+            let extra_width = match label {
+                "inline-styled ESP table" => Some(560),
+                "desktop and mobile pair" => Some(680),
+                _ => None,
+            };
+            for width in std::iter::once(width).chain(extra_width) {
+                let picture = futures::executor::block_on(render(WebRequest {
+                    html: mail.page("light", |_| None),
+                    width,
+                    background: 0xffffff,
+                }))
+                .unwrap_or_else(|| panic!("WebKit painted {label}"));
+                let estimate = mail.estimated_height(width as f32);
+                let painted = picture.height * width as f32 / picture.width;
+                let delta = estimate - painted;
+                eprintln!(
+                    "calibration | {label} | {width} | {estimate:.1} | {painted:.1} | {delta:+.1}"
+                );
+                if !(0. ..=25.).contains(&delta) {
+                    outliers.push((label, width, delta));
+                }
+                if matches!(label, "mobile reveal" | "desktop and mobile pair") {
+                    assert_eq!(
+                        contains_display_color(&picture, [0x7a, 0x16, 0x3f]),
+                        width < 600
+                    );
+                    assert_eq!(
+                        contains_display_color(&picture, [0x3f, 0x16, 0x7a]),
+                        width > 600
+                    );
+                }
+            }
         }
-
-        let mobile = fell_render::WebMail::prepare(concat!(
-            "<style>@media (max-width:600px) { .mobile { display:block !important; ",
-            "visibility:visible !important; font-size:16px !important; ",
-            "max-height:none !important; overflow:visible !important; background:#7a163f; } }</style>",
-            r#"<div class="mobile" style="display:none;visibility:hidden;font-size:0;max-height:0;overflow:hidden">"#,
-            "Mobile dispatch<br>Edition 42</div>",
-        ));
-        let picture = estimate_covers_snapshot("mobile media reveal", &mobile, 360);
-        assert!(contains_display_color(&picture, [0x7a, 0x16, 0x3f]));
-
-        let spacer = fell_render::WebMail::prepare(concat!(
-            r#"<style media="print">.show {display:none !important}</style>"#,
-            r#"<style media="screen">.show {display:block !important;background:#7a163f}</style>"#,
-            r#"<body style="padding-block:8px 12px"><div hidden class="show">Visible in web view</div>"#,
-            r#"<table><tr height="32"><td height="24" style="font-size:0"></td></tr></table>"#,
-            r#"<div style="min-height:86px;border-top:3px solid;border-bottom:5px solid;"#,
-            r#"padding-block:4px 8px;margin-block:7px 9px;background:#3f167a">Spacer</div></body>"#,
-        ));
-        let picture = estimate_covers_snapshot("spacer cells and hidden override", &spacer, 440);
-        assert!(contains_display_color(&picture, [0x7a, 0x16, 0x3f]));
-        assert!(contains_display_color(&picture, [0x3f, 0x16, 0x7a]));
+        assert!(
+            outliers.is_empty(),
+            "outside the 0–25px allowance: {outliers:?}"
+        );
 
         let hero = fell_render::WebMail::prepare(
             r#"<div style="height:1000px;background:#7a163f">A tall hero</div>"#,
@@ -905,6 +965,8 @@ mod tests {
         );
         let picture = estimate_covers_snapshot("clipped page with a uniform tail", &tall, 440);
         assert!(picture.clipped);
+        assert!(picture.document_height >= 200_000.);
+        assert_eq!(picture.last_row_color, 0xffffff);
         assert_eq!(picture.height, SNAPSHOT_HEIGHT_LIMIT as f32);
         assert!(contains_display_color(&picture, [0x7a, 0x16, 0x3f]));
         assert!(!contains_display_color(&picture, [0x3f, 0x16, 0x7a]));

@@ -267,7 +267,7 @@ fn separate_flex_items(dom: &mut Html) {
         .root_element()
         .descendants()
         .filter(|node| {
-            let Some(element) = node.value().as_element() else {
+            let Some(element) = scraper::ElementRef::wrap(*node) else {
                 return false;
             };
             matches!(

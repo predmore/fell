@@ -608,8 +608,15 @@ impl Reader {
         true
     }
 
+    fn clear_native_override(&mut self, id: &str) {
+        self.show_native_for.remove(id);
+        if let Some(shown) = self.shown.get_mut(id) {
+            shown.continue_at = None;
+        }
+    }
+
     fn show_web_for(&mut self, id: String, sender: Option<String>, body: &HtmlBody) {
-        self.show_native_for.remove(&id);
+        self.clear_native_override(&id);
         self.show_images_for
             .retain(|_, (_, mail)| mail.strong_count() > 0);
         self.show_images_for
@@ -1151,7 +1158,7 @@ impl Inbox {
             }
             let next = !self.web_mail.prefers_web(id, sender.as_deref(), body);
             self.web_mail.show_images_for.remove(id);
-            self.web_mail.show_native_for.remove(id);
+            self.web_mail.clear_native_override(id);
             if let Some(sender) = sender {
                 self.web_mail
                     .preferences

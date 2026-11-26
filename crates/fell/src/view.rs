@@ -2944,7 +2944,7 @@ impl Inbox {
                     .await;
             }
             let _ = this.update(cx, |inbox, cx| {
-                inbox.receive_conversation(id, generation, result, cx)
+                inbox.receive_conversation(id, generation, opened_at, result, cx)
             });
         })
         .detach();
@@ -2954,6 +2954,7 @@ impl Inbox {
         &mut self,
         id: String,
         generation: u64,
+        opened_at: Instant,
         result: Result<Option<ConversationRead>, String>,
         cx: &mut Context<Self>,
     ) {
@@ -10176,8 +10177,15 @@ fn conversation(
                     note.into_iter().chain(messages),
                     scroll,
                     hold,
-                    chip_probe,
-                    frame.web.values().find_map(|web| web.continuation.clone()),
+                    frame
+                        .web
+                        .values()
+                        .find_map(|web| {
+                            web.continuation
+                                .clone()
+                                .map(|(fraction, probe)| BodyLanding::Continuation(fraction, probe))
+                        })
+                        .or_else(|| chip_probe.map(BodyLanding::Attachment)),
                     padding.map(|padding| padding.viewport),
                     arrival,
                     frame.frames.clone(),
@@ -10200,12 +10208,16 @@ fn expanded_card_fill(theme: &Theme, focus: f32) -> u32 {
     )
 }
 
+enum BodyLanding {
+    Attachment(LayoutSlot),
+    Continuation(f32, LayoutSlot),
+}
+
 fn conversation_body(
     children: impl IntoIterator<Item = gpui::AnyElement>,
     scroll: Option<ScrollHandle>,
     hold: Option<MessageProbes>,
-    chip_probe: Option<LayoutSlot>,
-    continuation: Option<(f32, LayoutSlot)>,
+    landing: Option<BodyLanding>,
     preview_viewport: Option<gpui::Pixels>,
     arrival: f32,
     frames: Option<SharedFrameLog>,
@@ -10236,14 +10248,12 @@ fn conversation_body(
         .when(arrival < 1.0, |body| body.opacity(arrival))
         .children(children)
         .into_any_element();
-    match (scroll, hold, chip_probe, continuation) {
-        (Some(scroll), _, _, Some((fraction, probe))) => {
+    match (scroll, hold, landing) {
+        (Some(scroll), _, Some(BodyLanding::Continuation(fraction, probe))) => {
             LandingHold::continue_body(body, scroll, probe, fraction, frames).into_any_element()
         }
-        (Some(scroll), Some(hold), _, _) => {
-            hold.hold(body, scroll, bottom, frames).into_any_element()
-        }
-        (Some(scroll), _, Some(probe), _) => {
+        (Some(scroll), Some(hold), _) => hold.hold(body, scroll, bottom, frames).into_any_element(),
+        (Some(scroll), _, Some(BodyLanding::Attachment(probe))) => {
             LandingHold::reveal(body, scroll, probe, frames).into_any_element()
         }
         _ => body,
@@ -14598,7 +14608,13 @@ mod tests {
     fn pending_bodies_fade_when_the_conversation_read_fails() {
         with_pending_inbox(|inbox, cx| {
             let id = inbox.open_thread.clone().unwrap();
-            inbox.receive_conversation(id, 1, Err("failed to read thread".into()), cx);
+            inbox.receive_conversation(
+                id,
+                1,
+                Instant::now(),
+                Err("failed to read thread".into()),
+                cx,
+            );
             assert!(
                 inbox
                     .pending_bodies
@@ -14621,7 +14637,7 @@ mod tests {
                 reads: Default::default(),
                 matches: None,
             };
-            inbox.receive_conversation(id, 1, Ok(Some(reply)), cx);
+            inbox.receive_conversation(id, 1, Instant::now(), Ok(Some(reply)), cx);
             assert!(inbox.pending_bodies.downloading(&inbox.session.sync));
             assert!(
                 inbox
@@ -14638,7 +14654,7 @@ mod tests {
                 reads: Default::default(),
                 matches: None,
             };
-            inbox.receive_conversation(id, 1, Ok(Some(reply)), cx);
+            inbox.receive_conversation(id, 1, Instant::now(), Ok(Some(reply)), cx);
             let now = inbox.motion.clock.now();
             inbox.apply_body_refresh(now);
         });
@@ -14722,6 +14738,7 @@ mod tests {
             inbox.receive_conversation(
                 row.id,
                 before + 1,
+                Instant::now(),
                 Ok(Some(super::ConversationRead {
                     notes: None,
                     latest_note: None,
@@ -14855,6 +14872,7 @@ mod tests {
                 inbox.receive_conversation(
                     row.id.clone(),
                     read,
+                    Instant::now(),
                     Ok(Some(super::ConversationRead {
                         notes: None,
                         latest_note: None,
@@ -15355,7 +15373,6 @@ mod tests {
                                 cards,
                                 Some(case.scroll.clone()),
                                 Some(probes),
-                                None,
                                 None,
                                 padding.map(|padding| padding.viewport),
                                 1.,
