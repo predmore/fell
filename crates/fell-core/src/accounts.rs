@@ -271,6 +271,11 @@ impl Registry {
     }
 
     fn original_id(&self) -> Result<String, FileError> {
+        if let Err(err) = real_directory(&self.config)
+            && err.kind() != io::ErrorKind::NotFound
+        {
+            return Err(FileError::access(&self.config, err));
+        }
         // Read the source first. If migration has already renamed it, the
         // durable marker must be visible before any migrated file is visible.
         let legacy = read(&self.config.join("account.toml"), None);
@@ -340,6 +345,12 @@ impl Registry {
             Err(error) => return Err(FileError::access(&legacy, error)),
         }
         let dir = self.directory();
+        if real_directory(&dir).is_ok()
+            && matches!(self.original_marker(), Ok(Some(_)))
+            && read(&legacy, None).is_err()
+        {
+            return Ok(());
+        }
         let lock = open_account_directory(&dir).map_err(|err| FileError::access(&dir, err))?;
         lock.try_lock()
             .map_err(|err| FileError::access(&dir, err.into()))?;

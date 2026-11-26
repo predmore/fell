@@ -324,6 +324,7 @@ impl AccountWindow {
             }
         }
         if let Some((id, name)) = removed
+            && accounts.interrupted.iter().all(|pending| pending.id != id)
             && !accounts.entries.iter().any(|entry| {
                 entry
                     .path
@@ -338,6 +339,21 @@ impl AccountWindow {
                 format!("Removed {name}")
             };
             self.notice(message, false, cx);
+        }
+        if let Some(pending) = accounts.interrupted.iter().find(|pending| {
+            self.catalog
+                .interrupted
+                .iter()
+                .all(|old| old.id != pending.id)
+        }) {
+            self.notice(
+                format!(
+                    "Delete interrupted for {} · Settings → Accounts",
+                    pending.name
+                ),
+                true,
+                cx,
+            );
         }
 
         self.catalog = accounts;
@@ -388,6 +404,9 @@ impl AccountWindow {
             }
             view.update(cx, |inbox, _| {
                 inbox.retired = true;
+                if let Some(queue) = &inbox.notifications {
+                    queue.set_viewing(false);
+                }
                 parts = Some(inbox.attachment_fetcher.clone());
                 inbox.draft_home = None;
                 inbox.reader_bodies.active = None;

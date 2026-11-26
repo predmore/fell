@@ -64,9 +64,10 @@ impl Registry {
             };
             let plan = read_plan(&trash).ok();
             let config = catalog.configs().find(|config| config.id == id);
-            let name = config
-                .map(|config| config.account().display_name)
-                .or_else(|| plan.as_ref().and_then(|plan| plan.name.clone()))
+            let name = plan
+                .as_ref()
+                .and_then(|plan| plan.name.clone())
+                .or_else(|| config.map(|config| config.account().display_name))
                 .unwrap_or_else(|| id.clone());
             let can_restore = plan.is_some_and(|plan| plan.account == id)
                 && trash
@@ -181,6 +182,18 @@ impl Registry {
             };
             if plan.account != id {
                 return Err("The mailbox removal directory belongs to another account.".into());
+            }
+            if trash
+                .join("committed")
+                .symlink_metadata()
+                .is_err_and(|err| err.kind() == io::ErrorKind::NotFound)
+                && let Some((_, snapshot)) =
+                    read(&trash.join("account.toml"), None).map_err(|err| err.to_string())?
+                && let Some((_, current)) =
+                    read(&account, Some(id)).map_err(|err| err.to_string())?
+                && snapshot != current
+            {
+                return Err("The account file differs from the one saved before deletion. Move it aside before recovering local mail.".into());
             }
             let _local = lock_mailbox(&mailbox)?;
             let _staged = lock_mailbox(&staged_file(&trash, &mailbox, ""))?;
