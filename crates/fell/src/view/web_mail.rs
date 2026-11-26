@@ -23,7 +23,7 @@ use crate::render::webview::{self, Snapshot, WebRequest};
 
 const CACHE_SIZE: usize = 12;
 const THREAD_HOLD: Duration = Duration::from_millis(150);
-const SNAPSHOT_BATCH: Duration = Duration::from_millis(420);
+const SNAPSHOT_BATCH: Duration = Duration::from_millis(550);
 const MEASURED_HEIGHTS: usize = 4 * CACHE_SIZE;
 
 #[derive(Default)]
@@ -43,6 +43,7 @@ pub(super) struct Reader {
 struct Opening {
     started: Instant,
     cards: HashSet<String>,
+    has_layout: bool,
 }
 
 struct MeasuredHeight {
@@ -363,6 +364,7 @@ impl Reader {
         self.opening = Some(Opening {
             started: now,
             cards,
+            has_layout: false,
         });
         cx.spawn(async move |this, cx| {
             let executor = cx.background_executor().clone();
@@ -693,6 +695,21 @@ impl Reader {
         queue.sort_by_key(|(other, unseen, index, _)| (*other, *unseen, *index));
         let keys: Vec<_> = queue.into_iter().map(|(_, _, _, key)| key).collect();
         self.request_snapshot(&keys, cx);
+        if let Some(open) = &mut self.opening
+            && !open.has_layout
+            && visible.contains(&true)
+        {
+            open.has_layout = true;
+            open.cards.retain(|id| {
+                messages
+                    .iter()
+                    .zip(visible)
+                    .enumerate()
+                    .any(|(index, (message, visible))| {
+                        *id == message.id && (*visible || index == cursor)
+                    })
+            });
+        }
         if self.opening.as_ref().is_some_and(|open| {
             now.saturating_duration_since(open.started) >= SNAPSHOT_BATCH
                 || keys
@@ -1071,7 +1088,14 @@ fn prompt_layer(
     let button = |(label, action): (&'static str, Action), cx: &mut Context<Inbox>| {
         let key = target_keys
             .filter(|_| action != Action::BlockSenderImages)
-            .map(|keys| keymap::binding_text(keys, action))
+            .and_then(|keys| {
+                let bindings = keys.bindings_for(action);
+                let binding = bindings
+                    .iter()
+                    .find(|binding| binding.keys.len() == 1)
+                    .or(bindings.first())?;
+                Some(keymap::prefix_text(&binding.keys, &keys.leader_name))
+            })
             .filter(|key| !key.is_empty());
         let label = match (action, width, key.is_some()) {
             (Action::AllowMessageImages, width, _) if width < 420. && label == "Load images" => {
@@ -1288,6 +1312,36 @@ mod tests {
                 ..
             })
         ));
+        super::super::tests::with_pending_inbox(|inbox, cx| {
+            split_view(inbox);
+            let message = &inbox.session.messages[0];
+            let Rich::Html(body) = &message.rich else {
+                panic!("HTML fixture")
+            };
+            let mut reader = Reader::default();
+            let key = reader.key(message, body, &inbox.theme, 460);
+            reader
+                .preferences
+                .insert(message.email.clone(), (Some(true), false));
+            reader.cache.push_back(Cached {
+                key,
+                picture: None,
+                image_failure: None,
+            });
+            let frames = reader.frames(
+                &inbox.session.messages,
+                (Some(0), &[true, true]),
+                &inbox.theme,
+                460.,
+                (Motion::new(true), Instant::now()),
+                cx,
+            );
+            assert!(matches!(frames["older"].body, Body::Native));
+            assert!(matches!(
+                frames["older"].prompt.as_ref().unwrap().incoming,
+                Prompt::Unavailable { images: false, .. }
+            ));
+        });
         let keys = [key.clone()];
         assert!(reader.next_snapshot(&keys).is_none());
         reader.retry_images(&key.id, false);

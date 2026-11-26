@@ -231,19 +231,30 @@ fn schedule_capture(widget: &webkit2gtk::WebView, active: &Active) {
 
 #[allow(deprecated)] // run_javascript_in_world is available on WebKitGTK 2.38.
 fn wait_for_images(widget: &webkit2gtk::WebView, active: Active, token: gtk::gio::Cancellable) {
+    // Offscreen documents can leave img.decode() promises pending until a
+    // visible paint. Wait for resource completion and force rasterization
+    // with a canvas read before giving the document a chance to paint.
     const READY: &str = r#"
-        if (globalThis.fellImagesReady === undefined) {
+        (() => {
             const images = Array.from(document.images).filter(image =>
-                /^data:image\//i.test(image.currentSrc || image.getAttribute('src') || ''));
-            globalThis.fellImagesReady = images.length === 0 ? 1 : 0;
-            if (images.length !== 0) {
-                for (const image of images) image.loading = 'eager';
-                Promise.all(images.map(image => image.decode())).then(
-                    () => { globalThis.fellImagesReady = 1; },
-                    () => { globalThis.fellImagesReady = -1; });
+                /^data:image\/(?:png|jpe?g|gif|webp|avif|bmp|x-icon|vnd\.microsoft\.icon)[;,]/i
+                    .test(image.currentSrc || image.getAttribute('src') || ''));
+            for (const image of images) {
+                if (image.loading === 'lazy') image.loading = 'eager';
             }
-        }
-        globalThis.fellImagesReady;
+            if (images.some(image => !image.complete)) return 0;
+            if (images.some(image => image.naturalWidth === 0)) return -1;
+            if (images.length > 0) {
+                const canvas = document.createElement('canvas');
+                canvas.width = canvas.height = 1;
+                const context = canvas.getContext('2d');
+                for (const image of images) {
+                    context.drawImage(image, 0, 0);
+                    context.getImageData(0, 0, 1, 1);
+                }
+            }
+            return 1;
+        })();
     "#;
     if token.is_cancelled() {
         return;
