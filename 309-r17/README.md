@@ -2,9 +2,22 @@
 
 ## Switching views with `w`
 
-The built-in **Re: Pier lanterns** mail was opened in a nested 960 × 760 Sway session. Each
-lossless capture contains simple → web → simple. The 60 Hz files include both settled
-states and the wait for the first WebKit snapshot.
+The built-in **Re: Pier lanterns** mail was captured in nested Sway at 960 × 760
+and 490 × 760. Fold-row y is the top of its vertical rule. Card-bottom y is the
+first background pixel below the card. Both coordinates match exactly across
+simple and web view.
+
+| Window width | Theme | Simple | Web | Fold-row y in both | Card-bottom y in both |
+| --- | --- | --- | --- | --- | --- |
+| 960 px | Tokyo Night | [PNG](ink-dark-simple.png) | [PNG](ink-dark-web.png) | 303 px | 347 px |
+| 960 px | Catppuccin Latte | [PNG](ink-light-simple.png) | [PNG](ink-light-web.png) | 303 px | 347 px |
+| 490 px | Tokyo Night | [PNG](ink-dark-simple-490.png) | [PNG](ink-dark-web-490.png) | 303 px | 347 px |
+| 490 px | Catppuccin Latte | [PNG](ink-light-simple-490.png) | [PNG](ink-light-web-490.png) | 303 px | 347 px |
+
+### Motion recordings from round 17
+
+Each 960 × 760 lossless capture contains simple → web → simple. The 60 Hz
+files include both settled states and the wait for the first WebKit snapshot.
 
 Ink is the sum of absolute RGB luma differences from the card fill over the same
 224 × 120 px crop of the three open reply lines. The floor is 97% of the weaker
@@ -14,10 +27,10 @@ ink during the fades.
 
 ![Per-frame ink for Tokyo Night and Catppuccin Latte](ink-per-frame.png)
 
-| Theme | Simple | Web | Recording | Frame data |
-| --- | --- | --- | --- | --- |
-| Tokyo Night | [PNG](ink-dark-simple.png) | [PNG](ink-dark-web.png) | [MP4](ink-dark.mp4) | [CSV](ink-dark.csv) |
-| Catppuccin Latte | [PNG](ink-light-simple.png) | [PNG](ink-light-web.png) | [MP4](ink-light.mp4) | [CSV](ink-light.csv) |
+| Theme | Recording | Frame data |
+| --- | --- | --- |
+| Tokyo Night | [MP4](ink-dark.mp4) | [CSV](ink-dark.csv) |
+| Catppuccin Latte | [MP4](ink-light.mp4) | [CSV](ink-light.csv) |
 
 [Round 16 captures](../309-r16/README.md)
 
