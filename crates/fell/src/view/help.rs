@@ -168,6 +168,14 @@ pub(super) struct Layout {
 }
 
 impl Layout {
+    /// The clip keeps the banner's gap only while part of it is in view, so a
+    /// resting row past the banner fills the clip flush at both edges. The
+    /// card keeps its height, and the spare space becomes bottom padding.
+    fn clip_height(&self, offset: f32) -> f32 {
+        let gap_bottom = self.detail_rows as f32 * self.row + self.detail_gap;
+        self.page as f32 * self.row + (gap_bottom - offset).clamp(0., self.detail_gap)
+    }
+
     fn last_offset(&self) -> f32 {
         scroll_px(
             self.total - self.page,
@@ -301,9 +309,10 @@ fn card(
     let page_height = layout.page as f32 * layout.row;
     let body = page_height + layout.detail_gap;
     let last = layout.last_offset();
+    let clip = layout.clip_height(offset);
     let action_offset = offset - layout.detail_gap;
     let action_start = ((action_offset / layout.row).floor() as usize).max(layout.detail_rows);
-    let end = ((action_offset + page_height) / layout.row).ceil() as usize;
+    let end = ((action_offset + clip) / layout.row).ceil() as usize;
     div()
         .w(px(layout.width))
         .h(px(layout.header + body + 2. * INSET + 2.))
@@ -353,7 +362,7 @@ fn card(
                         .top(px(INSET))
                         .left(px(LEFT))
                         .right(px(RIGHT))
-                        .h(px(body))
+                        .h(px(clip))
                         .overflow_hidden()
                         .children((offset < layout.detail_rows as f32 * layout.row).then(|| {
                             div()
@@ -409,20 +418,20 @@ fn card(
                 )
                 .when(last > 0., |viewport| {
                     // This gutter is reserved at every scroll position.
-                    let thumb = thumb_height(body, layout.page, layout.total, theme.ui_px);
+                    let thumb = thumb_height(clip, layout.page, layout.total, theme.ui_px);
                     viewport.child(
                         div()
                             .absolute()
                             .right(px(9.))
                             .top(px(INSET))
                             .w(px(4.))
-                            .h(px(body))
+                            .h(px(clip))
                             .rounded_full()
                             .bg(rgb(theme.border))
                             .child(
                                 div()
                                     .absolute()
-                                    .top(px((body - thumb) * (offset / last)))
+                                    .top(px((clip - thumb) * (offset / last)))
                                     .w_full()
                                     .h(px(thumb))
                                     .rounded_full()
@@ -627,6 +636,28 @@ mod tests {
         scroll.scroll(scroll.last as isize, &Motion::new(false), end);
         scroll.advance(&layout, end);
         assert_eq!(scroll.drawn, scroll.last as f32 * layout.row + DETAIL_GAP);
+    }
+
+    #[test]
+    fn resting_rows_fill_the_clip_after_the_detail_banner_leaves() {
+        let layout = Layout::measure(
+            15.,
+            gpui::size(px(520.), px(720.)),
+            &Keymap::default(),
+            Some(("A full detail line".into(), true)),
+            |_, _| 1,
+        );
+        let page = layout.page as f32 * layout.row;
+        let content = layout.total as f32 * layout.row + DETAIL_GAP;
+        assert_eq!(layout.clip_height(0.), page + DETAIL_GAP);
+        let last = layout.total - layout.page;
+        for target in layout.detail_rows..=last {
+            let offset = scroll_px(target, layout.row, layout.detail_rows, DETAIL_GAP);
+            assert_eq!(layout.clip_height(offset), page, "{target}");
+            assert!(offset + page <= content, "{target}");
+        }
+        let bottom = layout.last_offset();
+        assert_eq!(bottom + layout.clip_height(bottom), content);
     }
 
     #[test]
