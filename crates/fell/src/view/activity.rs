@@ -683,7 +683,11 @@ impl Footer {
             blocker_notice(blocker, now, false)
         } else if activity.load_failed && !activity.page.entries.is_empty() {
             "Could not load agent activity".into()
-        } else if activity.pending && activity.loading_slow && !activity.page.entries.is_empty() {
+        } else if activity.pending
+            && activity.loading_slow
+            && activity.loading_page
+            && !activity.page.entries.is_empty()
+        {
             "Loading activity…".into()
         } else {
             entry
@@ -1213,6 +1217,25 @@ mod tests {
         activity.loading_slow = true;
         frame.frame(&activity, &motion, now);
         assert_eq!(button_strength(&frame), [0., 0., 0.]);
+    }
+
+    #[test]
+    fn a_slow_undo_keeps_the_footer_time_instead_of_saying_loading() {
+        let mut activity = bulk_activity();
+        let now = now_unix();
+        let time = Footer::of(&activity, now).text.text;
+        assert!(activity.undo().is_none());
+        assert!(activity.confirm(true).is_some());
+        assert!(activity.pending && !activity.loading_page);
+        activity.loading_slow = true;
+        assert_eq!(Footer::of(&activity, now).text.text, time);
+
+        activity.pending = false;
+        activity.loading_slow = false;
+        assert!(activity.page(true).is_some());
+        assert!(activity.pending && activity.loading_page);
+        activity.loading_slow = true;
+        assert_eq!(Footer::of(&activity, now).text.text, "Loading activity…");
     }
 
     #[test]

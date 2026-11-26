@@ -60,6 +60,9 @@ pub struct Activity {
     pub pending: bool,
     pub pending_bulk_undo: Option<i64>,
     pub loading_slow: bool,
+    /// The pending request fetches a page (not an undo), so a slow one may
+    /// say the list is loading.
+    pub loading_page: bool,
     pub load_failed: bool,
     pub confirmation: Option<Confirmation>,
     pub blocker_notice: Option<ActivityBlocker>,
@@ -97,6 +100,7 @@ impl Activity {
             } => Some(*id),
             _ => None,
         };
+        self.loading_page = matches!(request, Request::Load { .. });
         self.loading_slow = false;
         self.generation = self.generation.wrapping_add(1);
         request
