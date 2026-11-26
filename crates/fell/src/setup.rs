@@ -437,26 +437,24 @@ fn remove(id: &str) -> Result<(), String> {
     if pending.is_none() && entry.is_none() {
         return Err(format!("No account file for {id:?}"));
     }
-    let question = if pending.is_some() {
-        "Finish deleting local mail and drafts? [y/N]"
-    } else {
-        "Delete the local mail, drafts and grants for this account? [y/N]"
-    };
-    let delete = (pending.is_some() || store.is_file())
-        && io::stdin().is_terminal()
-        && matches!(
-            prompt(question, Some(""))?.to_ascii_lowercase().as_str(),
-            "y" | "yes"
-        );
+    let terminal = io::stdin().is_terminal();
     let expected = entry.and_then(|entry| entry.file_identity);
     let outcome = if let Some(pending) = pending {
-        if !delete && !pending.can_restore {
-            return Err(format!(
-                "Delete interrupted for {name}. Confirm Finish deleting in Settings → Accounts."
-            ));
-        }
+        let Some(delete) = recovery_choice(terminal, pending.can_restore, |question| {
+            prompt(question, Some(""))
+        })? else {
+            return Err(format!("Delete interrupted for {name}. Choose an action on a terminal or in Settings → Accounts."));
+        };
         registry.recover_removal(&base, id, delete, expected)?
     } else {
+        let delete = store.is_file()
+            && terminal
+            && matches!(
+                prompt("Delete the local mail, drafts and grants for this account? [y/N]", Some(""))?
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "y" | "yes"
+            );
         registry.remove_if_unchanged(&base, id, delete, expected)?
     };
     match outcome {
@@ -469,6 +467,26 @@ fn remove(id: &str) -> Result<(), String> {
         RemovalOutcome::Cleared => println!("Cleared the interrupted removal for {name}."),
     }
     Ok(())
+}
+
+fn recovery_choice(
+    terminal: bool,
+    can_restore: bool,
+    ask: impl FnOnce(&str) -> Result<String, String>,
+) -> Result<Option<bool>, String> {
+    if !terminal {
+        return Ok(None);
+    }
+    let question = if can_restore {
+        "Interrupted deletion. [r] Restore, [f] Finish deleting, or Enter to leave as is"
+    } else {
+        "Interrupted deletion. [f] Finish deleting, or Enter to leave as is"
+    };
+    Ok(match ask(question)?.to_ascii_lowercase().as_str() {
+        "r" if can_restore => Some(false),
+        "f" => Some(true),
+        _ => None,
+    })
 }
 
 fn show(id: Option<&str>) -> Result<(), String> {
@@ -643,6 +661,24 @@ impl Drop for QuietTerminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupted_removal_requires_an_explicit_terminal_choice() {
+        assert_eq!(recovery_choice(false, true, |_| panic!()).unwrap(), None);
+        for answer in ["", "n", "yes", "r", "R", "f", "F"] {
+            for can_restore in [false, true] {
+                let expected = match answer {
+                    "r" | "R" if can_restore => Some(false),
+                    "f" | "F" => Some(true),
+                    _ => None,
+                };
+                assert_eq!(
+                    recovery_choice(true, can_restore, |_| Ok(answer.into())).unwrap(),
+                    expected
+                );
+            }
+        }
+    }
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|arg| arg.to_string()).collect()
