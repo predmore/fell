@@ -40,5 +40,5 @@ pub use plain_links::{
 pub use typed_list::plain_list_runs;
 pub use webview_html::{
     WEB_SNAPSHOT_WIDTH_LIMIT, WebMail, WebTextStyle, address_is_blocked, reader_line_height,
-    sanitize_html, strip_remote_css_urls, targets_private_network,
+    reader_paragraph_gap, sanitize_html, strip_remote_css_urls, targets_private_network,
 };

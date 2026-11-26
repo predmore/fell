@@ -86,6 +86,7 @@ struct Key {
     background: Option<u32>,
     text: Option<WebTextStyle>,
     images: bool,
+    folds_open: bool,
 }
 
 impl PartialEq for Key {
@@ -96,12 +97,23 @@ impl PartialEq for Key {
 
 impl Key {
     fn same_page(&self, other: &Self) -> bool {
+        self.folds_open == other.folds_open && self.same_raster(other)
+    }
+
+    fn same_raster(&self, other: &Self) -> bool {
+        // Once history has been mapped, its native disclosure sits outside
+        // the raster. Opening it can use the same page without a new capture.
         self.id == other.id
             && Arc::ptr_eq(&self.mail, &other.mail)
             && self.width == other.width
             && self.scheme == other.scheme
             && self.background == other.background
             && self.text == other.text
+            && (self.folds_open == other.folds_open || self.mail.mapped_history())
+    }
+
+    fn matches_snapshot(&self, other: &Self) -> bool {
+        self.images == other.images && self.same_raster(other)
     }
 }
 
@@ -316,6 +328,10 @@ impl Shown {
                     (1. - linear / exit).max(0.),
                     motion::ease_out((linear - exit) / (1. - exit)),
                 ]
+            }
+            Some(outgoing) if outgoing.is_colorless() || self.body.is_colorless() => {
+                let blend = motion::ease_out((linear - 0.5) * 2.);
+                [1. - blend, blend]
             }
             Some(_) if linear < 1. => [1., progress],
             _ => [0., 1.],
@@ -557,7 +573,14 @@ impl Reader {
             .is_some_and(|(_, mail)| Weak::ptr_eq(mail, &Arc::downgrade(&body.web)))
     }
 
-    fn key(&self, message: &ConvMessage, body: &HtmlBody, theme: &Theme, width: i32) -> Key {
+    fn key(
+        &self,
+        message: &ConvMessage,
+        body: &HtmlBody,
+        theme: &Theme,
+        width: i32,
+        folds_open: bool,
+    ) -> Key {
         let sender = sender_address(&message.email);
         let images = body.web.has_remote_images()
             && (self.once(message, body)
@@ -577,11 +600,23 @@ impl Reader {
                 family: theme.ui_family.clone(),
                 size: theme.ui_px,
                 foreground: theme.foreground,
-                link: theme.accent,
+                link: crate::theme::ensure_all(
+                    theme.accent,
+                    &[theme.background, theme.surface],
+                    4.6,
+                ),
                 inset: body.suggested == RenderMode::Web,
             }),
             images,
+            folds_open: background.is_none() && folds_open && body.folded.has_folds(),
         }
+    }
+
+    fn can_snapshot(body: &HtmlBody, folds_open: bool) -> bool {
+        folds_open
+            || !body.folded.has_folds()
+            || body.web.has_author_colors()
+            || body.web.mapped_history()
     }
 
     fn prefers_web(&self, id: &str, sender: Option<&str>, body: &HtmlBody) -> bool {
@@ -658,7 +693,9 @@ impl Reader {
     }
 
     fn entry(&self, key: &Key) -> Option<&Cached> {
-        self.cache.iter().find(|cached| &cached.key == key)
+        self.cache
+            .iter()
+            .find(|cached| cached.key.matches_snapshot(key))
     }
 
     fn image(&self, key: &Key) -> Option<(Snapshot, Key)> {
@@ -670,7 +707,7 @@ impl Reader {
                     return None;
                 }
                 self.cache.iter().find_map(|cached| {
-                    if !cached.key.images && cached.key.same_page(key) {
+                    if !cached.key.images && cached.key.same_raster(key) {
                         Some((cached.picture.clone()?, cached.key.clone()))
                     } else {
                         None
@@ -713,7 +750,7 @@ impl Reader {
         });
         while self.cache.len() > CACHE_SIZE {
             let evict = self.cache.iter().position(|cached| {
-                !wanted.contains(&cached.key)
+                !wanted.iter().any(|key| key.matches_snapshot(&cached.key))
                     && cached.picture.as_ref().is_none_or(|picture| {
                         !self.shown.values().any(|shown| shown.holds(&picture.image))
                     })
@@ -757,7 +794,7 @@ impl Reader {
         if self
             .pending
             .as_ref()
-            .is_some_and(|pending| pending.key == key)
+            .is_some_and(|pending| pending.key.matches_snapshot(&key))
         {
             return;
         }
@@ -840,8 +877,8 @@ impl Reader {
         let Rich::Html(body) = &message.rich else {
             return None;
         };
-        self.prefers_message_web(message)
-            .then(|| self.key(message, body, theme, width))
+        (self.prefers_message_web(message) && Self::can_snapshot(body, false))
+            .then(|| self.key(message, body, theme, width, false))
     }
 
     pub(super) fn prefetch(
@@ -881,7 +918,7 @@ impl Reader {
     pub(super) fn frames(
         &mut self,
         messages: &[ConvMessage],
-        (cursor, visible): (Option<usize>, &[bool]),
+        (cursor, visible, folds_open): (Option<usize>, &[bool], &HashSet<String>),
         theme: &Theme,
         width: f32,
         (motion, now, real): (Motion, Instant, Instant),
@@ -907,8 +944,11 @@ impl Reader {
                 let Rich::Html(body) = &message.rich else {
                     return None;
                 };
-                let key = self.key(message, body, theme, width);
-                if !self.prefers_web(&key.id, key.sender.as_deref(), body) {
+                let open = folds_open.contains(&message.id);
+                let key = self.key(message, body, theme, width, open);
+                if !Self::can_snapshot(body, open)
+                    || !self.prefers_web(&key.id, key.sender.as_deref(), body)
+                {
                     if self.once(message, body) {
                         native_keys.push(key);
                     }
@@ -986,8 +1026,10 @@ impl Reader {
             let Rich::Html(body) = &message.rich else {
                 continue;
             };
-            let key = self.key(message, body, theme, width);
-            let web = self.prefers_web(&key.id, key.sender.as_deref(), body);
+            let open = folds_open.contains(&message.id);
+            let key = self.key(message, body, theme, width, open);
+            let web = Self::can_snapshot(body, open)
+                && self.prefers_web(&key.id, key.sender.as_deref(), body);
             let grouped = self
                 .opening
                 .as_ref()
@@ -1049,13 +1091,28 @@ impl Reader {
             if !Weak::ptr_eq(&shown.mail, &mail) {
                 *shown = initial();
             }
+            if !key.mail.mapped_history()
+                && shown
+                    .picture_key
+                    .as_ref()
+                    .is_some_and(|prior| prior.folds_open && !key.folds_open)
+            {
+                // Use the native disclosure while the new page is prepared.
+                // In particular, closing a fold immediately retires its ink.
+                shown.body = Body::Native;
+                shown.picture_key = None;
+                shown.outgoing = None;
+                shown.fade = None;
+                shown.renderer_painted = None;
+                shown.from_height = None;
+            }
             let next = if let Some((image, picture_key)) = image {
                 shown.picture_key = Some(picture_key);
                 Body::Web(image)
             } else if web
                 && !failed
                 && shown.picture_key.as_ref().is_some_and(|picture| {
-                    picture.same_page(&key) && (!picture.images || key.images)
+                    picture.same_raster(&key) && (!picture.images || key.images)
                 })
             {
                 shown.body.clone()
@@ -1612,6 +1669,7 @@ mod tests {
             document_height: 1.,
             last_row_color: Some(0),
             links: Arc::default(),
+            fallback_links: Arc::default(),
         }
     }
 
@@ -1652,6 +1710,7 @@ mod tests {
             scheme: "light",
             background: Some(0xffffff),
             text: None,
+            folds_open: false,
             images: false,
         };
         let second_key = Key {
@@ -1838,7 +1897,7 @@ mod tests {
     }
 
     #[test]
-    fn colorless_switches_and_placeholder_fallback_keep_the_outgoing_layer() {
+    fn colorless_switches_ease_out_the_outgoing_layer_after_the_midpoint() {
         let now = Instant::now();
         let motion = Motion::new(true);
         let mut colorless = snapshot();
@@ -1846,7 +1905,6 @@ mod tests {
         for (from, to) in [
             (Body::Native, Body::Web(colorless.clone())),
             (Body::Web(colorless), Body::Native),
-            (Body::Placeholder, Body::Native),
         ] {
             let mut shown = Shown::new(Weak::new(), None, false, false, None);
             shown.body = from;
@@ -1856,14 +1914,76 @@ mod tests {
             assert_eq!(shown.frame(painted).body_alpha, [1., 0.]);
             shown.renderer_painted.as_ref().unwrap().set(Some(painted));
             shown.start_painted_fade(motion, painted, painted);
-            for ms in 1..120 {
+            for ms in 1..=60 {
+                assert_eq!(
+                    shown.frame(painted + Duration::from_millis(ms)).body_alpha,
+                    [1., 0.]
+                );
+            }
+            let mut last = 1.;
+            for ms in 61..120 {
                 let [outgoing, incoming] =
                     shown.frame(painted + Duration::from_millis(ms)).body_alpha;
-                assert_eq!(outgoing, 1.);
-                assert!(incoming > 0. && incoming <= 1.);
+                assert!(outgoing <= last && outgoing >= 0.);
+                assert_eq!(outgoing + incoming, 1.);
+                last = outgoing;
             }
             assert_eq!(shown.frame(painted + motion::FADE).body_alpha, [0., 1.]);
         }
+    }
+
+    #[test]
+    fn opening_and_closing_native_history_reuses_the_compact_web_raster() {
+        super::super::tests::with_pending_inbox(|inbox, cx| {
+            split_view(inbox);
+            let mut message = inbox.session.messages[0].clone();
+            message.email = "mira@harbor.test".into();
+            message.expanded = true;
+            let body = Arc::new(crate::mail_body::prepare_html(
+                include_str!("../../../fell-render/fixtures/web-gmail-reply.html"),
+                &[("Subject".into(), "Re: Pier lanterns".into())],
+            ));
+            message.rich = Rich::Html(body.clone());
+            let id = message.id.clone();
+            inbox.session.messages = vec![message];
+            let message = &inbox.session.messages[0];
+            let reader = &mut inbox.web_mail;
+            reader
+                .preferences
+                .insert(sender_address(&message.email).unwrap(), (Some(true), false));
+            let closed = reader.key(message, &body, &inbox.theme, 440, false);
+            let open = reader.key(message, &body, &inbox.theme, 440, true);
+            assert!(!open.same_page(&closed));
+            assert!(open.matches_snapshot(&closed));
+            let picture = Snapshot {
+                last_row_color: None,
+                ..snapshot()
+            };
+            let image_id = picture.image.id;
+            reader.cache.push_back(Cached {
+                key: closed,
+                picture: Some(picture),
+                too_wide: false,
+                image_failure: None,
+            });
+            for open in [false, true, false] {
+                assert_eq!(inbox.session.is_open(&id), open);
+                let now = Instant::now();
+                let frames = reader.frames(
+                    &inbox.session.messages,
+                    (Some(0), &[true], &inbox.session.quotes_open),
+                    &inbox.theme,
+                    440.,
+                    (Motion::new(false), now, now),
+                    cx,
+                );
+                assert!(
+                    matches!(&frames[&id].body, Body::Web(picture) if picture.image.id == image_id)
+                );
+                assert!(reader.pending.is_none());
+                inbox.session.toggle_quotes(0);
+            }
+        });
     }
 
     #[test]
@@ -1878,7 +1998,7 @@ mod tests {
             reader
                 .preferences
                 .insert(message.email.clone(), (Some(true), false));
-            let key = reader.key(message, body, &inbox.theme, 460);
+            let key = reader.key(message, body, &inbox.theme, 460, false);
             let now = Instant::now();
             let old = Shown::new(Arc::downgrade(&key.mail), None, true, false, None);
             old.height.set(Some(115.));
@@ -1892,7 +2012,7 @@ mod tests {
             assert!(reader.image_prompt(&key, true, true, false).is_none());
             let frames = reader.frames(
                 &inbox.session.messages,
-                (Some(0), &[true, true]),
+                (Some(0), &[true, true], &HashSet::new()),
                 &inbox.theme,
                 460.,
                 (Motion::new(true), now, now),
@@ -1916,6 +2036,7 @@ mod tests {
             scheme: "light",
             background: Some(0xffffff),
             text: None,
+            folds_open: false,
             images: false,
         };
         let allowed = Key {
@@ -1954,6 +2075,7 @@ mod tests {
             scheme: "light",
             background: Some(0xffffff),
             text: None,
+            folds_open: false,
             images: false,
         };
         let mut reader = Reader::default();
@@ -1978,7 +2100,7 @@ mod tests {
                 panic!("HTML fixture")
             };
             let mut reader = Reader::default();
-            let key = reader.key(message, body, &inbox.theme, 460);
+            let key = reader.key(message, body, &inbox.theme, 460, false);
             reader
                 .preferences
                 .insert(message.email.clone(), (Some(true), false));
@@ -1991,7 +2113,7 @@ mod tests {
             let now = Instant::now();
             let frames = reader.frames(
                 &inbox.session.messages,
-                (Some(0), &[true, true]),
+                (Some(0), &[true, true], &HashSet::new()),
                 &inbox.theme,
                 460.,
                 (Motion::new(true), now, now),
@@ -2023,6 +2145,7 @@ mod tests {
             scheme: "light",
             background: Some(0xffffff),
             text: None,
+            folds_open: false,
             images: false,
         };
         let mut reader = Reader::default();
@@ -2195,7 +2318,7 @@ mod tests {
                 let Rich::Html(body) = &message.rich else {
                     panic!("HTML fixture")
                 };
-                let key = inbox.web_mail.key(message, body, &inbox.theme, 440);
+                let key = inbox.web_mail.key(message, body, &inbox.theme, 440, false);
                 assert!(matches!(
                     inbox.web_mail.image_prompt(&key, false, true, false),
                     Some(Prompt::Blocked { .. })
@@ -2218,7 +2341,7 @@ mod tests {
             let Rich::Html(body) = &message.rich else {
                 panic!("HTML fixture")
             };
-            let key = inbox.web_mail.key(message, body, &inbox.theme, 440);
+            let key = inbox.web_mail.key(message, body, &inbox.theme, 440, false);
             assert!(key.images);
             let image = snapshot();
             inbox.web_mail.cache.push_back(Cached {
@@ -2244,7 +2367,7 @@ mod tests {
                 let now = Instant::now();
                 let frames = inbox.web_mail.frames(
                     &inbox.session.messages,
-                    (Some(1), &[true, true]),
+                    (Some(1), &[true, true], &HashSet::new()),
                     &inbox.theme,
                     440.,
                     (Motion::new(false), now, now),

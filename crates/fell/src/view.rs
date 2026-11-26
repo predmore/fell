@@ -6052,6 +6052,7 @@ impl Render for Inbox {
                 (
                     (reader_current && preview_current).then_some(self.session.message_cursor),
                     &visible,
+                    &self.session.quotes_open,
                 ),
                 &self.theme,
                 reader.columns.header.width,
@@ -11215,31 +11216,33 @@ fn web_message_body(
     let reveal = frame.disclosures().quotes.get(&message.id).copied();
     let colorless =
         web.body.is_colorless() || web.outgoing.as_ref().is_some_and(Body::is_colorless);
-    let web_column = |card: gpui::AnyElement, live, showing_links: bool| {
-        div()
-            .child(card)
-            .when(!body.web_links.is_empty(), |pane| {
-                let palette = mail_body::palette(theme);
-                pane.child(
-                    div()
-                        .mt(px(7.))
-                        .when(!showing_links, |links| links.opacity(0.))
-                        .child(crate::render::blocks_column_spaced(
-                            &body.web_links,
-                            &palette,
-                            false,
-                            &body.gallery,
-                            folds.columns.blocks(folds.fill).with_links(live),
-                            3.0,
-                            markers,
-                        )),
-                )
-            })
-            .into_any_element()
-    };
+    let web_column =
+        |card: gpui::AnyElement, links: &[fell_render::Block], live, showing_links: bool| {
+            div()
+                .child(card)
+                .when(!links.is_empty(), |pane| {
+                    let palette = mail_body::palette(theme);
+                    pane.child(
+                        div()
+                            .mt(px(7.))
+                            .when(!showing_links, |links| links.opacity(0.))
+                            .child(crate::render::blocks_column_spaced(
+                                links,
+                                &palette,
+                                false,
+                                &body.gallery,
+                                folds.columns.blocks(folds.fill).with_links(live),
+                                3.0,
+                                markers,
+                            )),
+                    )
+                })
+                .into_any_element()
+        };
     let mut layer = |shown: &Body, live| match shown {
         Body::Placeholder => web_column(
             web_placeholder(theme, message, folds.columns, web.placeholder_height),
+            &body.web_links,
             false,
             false,
         ),
@@ -11258,7 +11261,7 @@ fn web_message_body(
                 .when(!colorless, |native| native.bg(rgb(folds.fill)))
                 .children(html_sections(
                     theme,
-                    (body, web.continuation.as_ref()),
+                    (body, web.continuation.as_ref(), false),
                     FoldView { live, ..folds },
                     reveal,
                     markers,
@@ -11299,11 +11302,23 @@ fn web_message_body(
                         .inset_0(),
                     )
                 });
-            web_column(
-                folds.columns.card.place(snapshot).into_any_element(),
-                live,
-                true,
-            )
+            let mut card = div().child(folds.columns.card.place(snapshot));
+            let links = if shown.is_colorless() {
+                if body.web.mapped_history() {
+                    card = card.children(html_sections(
+                        theme,
+                        (body, None, true),
+                        FoldView { live, ..folds },
+                        reveal,
+                        markers,
+                        cx,
+                    ));
+                }
+                &picture.fallback_links
+            } else {
+                body.web_links.as_slice()
+            };
+            web_column(card.into_any_element(), links, live, true)
         }
     };
     let incoming = layer(&web.body, folds.live);
@@ -11365,7 +11380,7 @@ fn stored_message_body(
             .opacity(alpha)
             .children(html_sections(
                 theme,
-                (body, None),
+                (body, None, false),
                 folds,
                 reveal,
                 markers,
@@ -11529,7 +11544,7 @@ fn plain_message_body(
 /// painted; quoted history and the signature fold to one line until `q`.
 fn html_sections(
     theme: &Theme,
-    (body, continuation): (&HtmlBody, Option<&Continuation>),
+    (body, continuation, only_folds): (&HtmlBody, Option<&Continuation>, bool),
     folds: FoldView,
     reveal: Option<f32>,
     markers: &crate::render::ListMarkerFont,
@@ -11550,6 +11565,7 @@ fn html_sections(
         .sections
         .iter()
         .enumerate()
+        .filter(|(_, section)| !only_folds || section.fold.is_some())
         .map(|(at, section)| {
             let rtl = body.rtl.get(at).copied().unwrap_or(false);
             let blocks = folded.blocks(section);
@@ -11587,7 +11603,7 @@ fn html_sections(
                             folds.image_consent,
                             &body.gallery,
                             layout,
-                            (crate::render::BLOCK_GAP, continuation),
+                            (fell_render::reader_paragraph_gap(theme.ui_px), continuation),
                             &top_level_markers,
                         )
                         .line_height(line),
@@ -11787,6 +11803,8 @@ fn fold_section(
         || {
             summary
                 .place(folded_line(theme, &label, folds, cx))
+                // Keep the gap inside the measured row across renderer swaps.
+                .pb(px(FOLD_GAP_PX))
                 .into_any_element()
         },
         || {
@@ -11818,7 +11836,6 @@ fn folded_line(
     let accent = theme.accent;
     history_rule(div(), label.rtl, rule)
         .h(px(FOLD_ROW_PX - FOLD_GAP_PX))
-        .mb(px(FOLD_GAP_PX))
         .flex()
         .items_center()
         .truncate()

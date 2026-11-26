@@ -133,7 +133,6 @@ pub fn prepare_html(html: &str, headers_in: &[(String, String)]) -> HtmlBody {
     }
     let prepared = prepare(html, &headers);
     let suggested = prepared.suggested;
-    let web = Arc::new(fell_render::WebMail::prepare(&prepared.source_html));
     let sender_attestation = headers.get("X-Fell-Verified-Sender").map(str::to_owned);
     let folded = if headers.is_bulk() {
         FoldedDocument::unfolded(prepared.document)
@@ -143,6 +142,10 @@ pub fn prepare_html(html: &str, headers_in: &[(String, String)]) -> HtmlBody {
             headers.get("Subject").unwrap_or_default(),
         )
     };
+    let web = Arc::new(fell_render::WebMail::prepare_with_history(
+        &prepared.source_html,
+        &folded,
+    ));
     // Built after folding: the gallery keys images by their bytes' address.
     let gallery = ImageGallery::from_document(&folded.document);
     let texts: Vec<String> = folded
@@ -168,7 +171,11 @@ pub fn prepare_html(html: &str, headers_in: &[(String, String)]) -> HtmlBody {
         .iter()
         .map(|text| crate::render::is_right_to_left(text))
         .collect();
-    let web_links = web_link_blocks(&folded.document.blocks, web.has_author_colors());
+    let web_links = if web.has_author_colors() {
+        web_link_blocks(&folded.document.blocks)
+    } else {
+        Vec::new()
+    };
     HtmlBody {
         folded,
         suggested,
@@ -181,9 +188,8 @@ pub fn prepare_html(html: &str, headers_in: &[(String, String)]) -> HtmlBody {
     }
 }
 
-// Snapshots with author colors keep a native link list. Colorless snapshots
-// place text controls over the ink, and keep a row for image-only destinations.
-fn web_link_blocks(blocks: &[fell_render::Block], include_text: bool) -> Vec<fell_render::Block> {
+// Snapshots with author colors keep a native link list.
+fn web_link_blocks(blocks: &[fell_render::Block]) -> Vec<fell_render::Block> {
     use fell_render::{Block, Inline};
 
     let mut links = Vec::new();
@@ -191,21 +197,18 @@ fn web_link_blocks(blocks: &[fell_render::Block], include_text: bool) -> Vec<fel
     let single = links.len() == 1;
     links
         .into_iter()
-        .filter_map(|link| {
+        .map(|link| {
             let label = if let Some(text) = link.text {
-                if !include_text {
-                    return None;
-                }
                 if single { "Open link".into() } else { text }
             } else {
                 link.alt.unwrap_or_else(|| "Open link".into())
             };
-            Some(Block::Paragraph {
+            Block::Paragraph {
                 inlines: vec![Inline::Link {
                     href: link.href,
                     children: vec![Inline::Text(label)],
                 }],
-            })
+            }
         })
         .collect()
 }
@@ -691,7 +694,7 @@ mod tests {
             r#"<a href="https://example.test">Harbor office</a>
                 <a href="https://example.test">Office hours</a>"#,
         );
-        let links = super::web_link_blocks(&doc.blocks, true);
+        let links = super::web_link_blocks(&doc.blocks);
         assert_eq!(
             fell_render::StyledDocument::blocks_text(&links),
             "Open link"
@@ -708,15 +711,10 @@ mod tests {
             <a href="https://example.test/ferry"><img src="https://example.test/ferry2.png" alt="Duplicate"></a>
             <a href="https://example.test/harbor"><img src="https://example.test/harbor.png"></a></p>"#;
         let doc = fell_render::prepare(html, &Default::default()).document;
-        let links = super::web_link_blocks(&doc.blocks, true);
+        let links = super::web_link_blocks(&doc.blocks);
         assert_eq!(
             fell_render::StyledDocument::blocks_text(&links),
             "The route\nShops\nFerry timetable\nOpen link"
-        );
-        let colorless = super::web_link_blocks(&doc.blocks, false);
-        assert_eq!(
-            fell_render::StyledDocument::blocks_text(&colorless),
-            "Ferry timetable\nOpen link"
         );
     }
 

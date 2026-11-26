@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::{Deref, Range};
 
@@ -67,17 +68,22 @@ pub struct WebMail {
     images: Vec<(usize, String)>,
     layout: layout::Estimate,
     source_bytes: usize,
+    mapped_history: bool,
 }
 
 impl WebMail {
     pub fn prepare(html: &str) -> Self {
-        Self::prepare_with_metrics(html, layout::TextMetrics::DEFAULT)
+        Self::prepare_with_metrics(html, layout::TextMetrics::DEFAULT, None)
+    }
+
+    pub fn prepare_with_history(html: &str, folded: &crate::FoldedDocument) -> Self {
+        Self::prepare_with_metrics(html, layout::TextMetrics::DEFAULT, Some(folded))
     }
 
     #[cfg(feature = "test-utils")]
     #[doc(hidden)]
     pub fn calibration(html: &str) -> Self {
-        Self::prepare_with_metrics(html, layout::TextMetrics::CALIBRATION)
+        Self::prepare_with_metrics(html, layout::TextMetrics::CALIBRATION, None)
     }
 
     #[cfg(feature = "test-utils")]
@@ -98,8 +104,15 @@ impl WebMail {
         self.page(scheme, |_| None).replacen("</head>", css, 1)
     }
 
-    fn prepare_with_metrics(html: &str, metrics: layout::TextMetrics) -> Self {
+    fn prepare_with_metrics(
+        html: &str,
+        metrics: layout::TextMetrics,
+        folded: Option<&crate::FoldedDocument>,
+    ) -> Self {
         let dom = crate::html::parse_html(html);
+        let history = folded
+            .filter(|doc| doc.has_folds())
+            .and_then(|doc| history_nodes(&dom, doc));
         let mut content = String::new();
         let mut images = Vec::new();
         // Keep the body's presentation attributes while replacing its wrapper.
@@ -153,6 +166,7 @@ impl WebMail {
             true,
             0,
             Some(&mut images),
+            history.as_ref(),
         );
         let layout_dom = html::parse_html(&format!("<body{content}</body>"));
         // Remote background attributes have empty slots in the offline page.
@@ -170,7 +184,12 @@ impl WebMail {
             images,
             layout,
             source_bytes: html.len(),
+            mapped_history: history.is_some(),
         }
+    }
+
+    pub fn mapped_history(&self) -> bool {
+        self.mapped_history
     }
 
     pub fn source_bytes(&self) -> usize {
@@ -253,7 +272,16 @@ impl WebMail {
             .unwrap();
             if let Some(text) = text {
                 write!(body_css, " color: #{:06x};", text.foreground).unwrap();
-                write!(link_css, "a:any-link {{ color: #{:06x}; }}", text.link).unwrap();
+                write!(
+                    link_css,
+                    "a:any-link {{ color: #{:06x}; }}
+                     div:has(> br:only-child) {{ min-height: {}px; }}
+                     p:empty {{ min-height: {}px; margin: 0; }}",
+                    text.link,
+                    reader_paragraph_gap(text.size),
+                    reader_paragraph_gap(text.size),
+                )
+                .unwrap();
             }
         }
         if self.body_inset(text) {
@@ -268,12 +296,18 @@ impl WebMail {
         } else if self.layout.native_body_inset && text.is_some() {
             write!(
                 body_css,
-                " padding-bottom: {}px;",
-                layout::READER_BOTTOM_PAD
+                " padding-top: 1px; padding-bottom: {}px;",
+                layout::READER_BOTTOM_PAD - 1.
             )
             .unwrap();
         }
         let mut content = String::with_capacity(self.content.len());
+        if self.mapped_history && !self.has_author_colors() && text.is_some() {
+            content.push_str(" data-fell-collapsed");
+            link_css.push_str(
+                " body[data-fell-collapsed] [data-fell-folded] { display: none !important; }",
+            );
+        }
         let mut offset = 0;
         for (at, url) in &self.images {
             content.push_str(&self.content[offset..*at]);
@@ -287,6 +321,104 @@ impl WebMail {
     }
 }
 
+/// The native paragraph break takes the space of one blank mail line.
+pub fn reader_paragraph_gap(size: f32) -> f32 {
+    24. * size / layout::BODY_FONT_SIZE
+}
+
+/// Reconcile native history with the source before hiding any of the author's
+/// DOM. In particular, quotes answered in place and short signatures stay open.
+fn history_nodes(
+    dom: &scraper::Html,
+    folded: &crate::FoldedDocument,
+) -> Option<HashSet<ego_tree::NodeId>> {
+    use scraper::node::Node;
+    type SourceNode<'a> = ego_tree::NodeRef<'a, Node>;
+
+    fn normalized(text: &str) -> impl Iterator<Item = char> + '_ {
+        text.chars()
+            .filter(|ch| !ch.is_whitespace() && !html::is_invisible(*ch))
+    }
+
+    fn measure(
+        node: SourceNode<'_>,
+        source: &mut String,
+        spans: &mut HashMap<ego_tree::NodeId, Range<usize>>,
+        depth: u32,
+    ) {
+        if depth >= html::MAX_HTML_DEPTH {
+            return;
+        }
+        let start = source.len();
+        match node.value() {
+            Node::Text(text) => source.extend(normalized(text)),
+            Node::Element(element) => match element.name() {
+                "style" | "script" | "head" | "title" | "template" => return,
+                "img" => source.extend(normalized(element.attr("alt").unwrap_or_default())),
+                _ => {
+                    for child in node.children() {
+                        measure(child, source, spans, depth + 1);
+                    }
+                }
+            },
+            _ => return,
+        }
+        spans.insert(node.id(), start..source.len());
+    }
+
+    let body = dom.root_element().children().find(|node| {
+        node.value()
+            .as_element()
+            .is_some_and(|element| element.name() == "body")
+    })?;
+    let mut source = String::new();
+    let mut spans = HashMap::new();
+    measure(body, &mut source, &mut spans, 0);
+    let mut at = 0;
+    let mut hidden: Vec<Range<usize>> = Vec::new();
+    for section in &folded.sections {
+        let text = crate::StyledDocument::blocks_text(folded.blocks(section));
+        let text: String = normalized(&text).collect();
+        let start = at;
+        let rest = &source[at..];
+        let skip_signature_delimiter = matches!(
+            section.fold,
+            Some(crate::Fold::Signature | crate::Fold::SignatureAndQuote)
+        ) || section.quiet;
+        if skip_signature_delimiter && !rest.starts_with(&text) && rest.starts_with("--") {
+            at += 2;
+        }
+        if !source[at..].starts_with(&text) {
+            return None;
+        }
+        at += text.len();
+        if section.fold.is_some() && start < at {
+            hidden.push(start..at);
+        }
+    }
+    if at != source.len() || hidden.is_empty() {
+        return None;
+    }
+
+    let mut nodes = HashSet::new();
+    for node in body.descendants().skip(1) {
+        let Some(span) = spans.get(&node.id()) else {
+            continue;
+        };
+        let index = hidden.partition_point(|range| range.end < span.start);
+        let Some(range) = hidden.get(index).filter(|range| range.start <= span.end) else {
+            continue;
+        };
+        if span.start >= range.start && span.end <= range.end {
+            nodes.insert(node.id());
+        } else if span.start < range.end && span.end > range.start && node.value().is_text() {
+            // A source text node can straddle a native history boundary.
+            return None;
+        }
+    }
+    Some(nodes)
+}
+
 pub fn sanitize_html(html: &str, allow_remote_images: bool) -> String {
     let dom = crate::html::parse_html(html);
     let mut out = String::new();
@@ -296,6 +428,7 @@ pub fn sanitize_html(html: &str, allow_remote_images: bool) -> String {
         allow_remote_images,
         true,
         0,
+        None,
         None,
     );
     out
@@ -308,6 +441,7 @@ fn serialize_children(
     allow_style: bool,
     depth: u32,
     mut images: Option<&mut Vec<(usize, String)>>,
+    history: Option<&HashSet<ego_tree::NodeId>>,
 ) {
     for child in node.children() {
         serialize_node(
@@ -317,6 +451,7 @@ fn serialize_children(
             allow_style,
             depth + 1,
             images.as_deref_mut(),
+            history,
         );
     }
 }
@@ -328,13 +463,28 @@ fn serialize_node(
     allow_style: bool,
     depth: u32,
     mut images: Option<&mut Vec<(usize, String)>>,
+    history: Option<&HashSet<ego_tree::NodeId>>,
 ) {
     if depth >= crate::html::MAX_HTML_DEPTH {
         out.push_str(&escape(&subtree_text(node)));
         return;
     }
+    let folded = history.is_some_and(|nodes| nodes.contains(&node.id()));
     match node.value() {
-        scraper::node::Node::Text(text) => out.push_str(&escape(text.deref())),
+        scraper::node::Node::Text(text) => {
+            let wrap = folded
+                && !text.trim().is_empty()
+                && !node
+                    .ancestors()
+                    .any(|parent| history.is_some_and(|nodes| nodes.contains(&parent.id())));
+            if wrap {
+                out.push_str("<span data-fell-folded>");
+            }
+            out.push_str(&escape(text.deref()));
+            if wrap {
+                out.push_str("</span>");
+            }
+        }
         scraper::node::Node::Element(element) => {
             let name = element.name();
             if name == "iframe" {
@@ -349,6 +499,7 @@ fn serialize_node(
                     allow_style,
                     depth,
                     images,
+                    None,
                 );
                 return;
             }
@@ -381,6 +532,7 @@ fn serialize_node(
                             allow_style,
                             depth + 1,
                             images.as_deref_mut(),
+                            history,
                         );
                     }
                 }
@@ -415,8 +567,14 @@ fn serialize_node(
             let prepared_page = images.is_some();
             out.push('<');
             out.push_str(name);
+            if folded {
+                out.push_str(" data-fell-folded");
+            }
             for (name_attr, value) in &element.attrs {
                 let attr = name_attr.local.as_ref();
+                if matches!(attr, "data-fell-folded" | "data-fell-collapsed") {
+                    continue;
+                }
                 // Only image attributes and image-valued CSS declarations
                 // may enter the fetch list.
                 if let Some(slots) = images.as_deref_mut() {
@@ -483,6 +641,7 @@ fn serialize_node(
                         child_style,
                         depth + 1,
                         images.as_deref_mut(),
+                        history,
                     );
                 }
                 out.push_str("</");

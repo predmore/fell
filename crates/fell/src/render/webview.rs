@@ -31,6 +31,7 @@ pub(crate) struct Snapshot {
     pub document_height: f32,
     pub last_row_color: Option<u32>,
     pub links: Arc<[WebLink]>,
+    pub fallback_links: Arc<[fell_render::Block]>,
 }
 
 #[derive(serde::Deserialize)]
@@ -234,13 +235,14 @@ fn run(rx: glib::Receiver<()>, queue: Arc<JobQueue>) -> Result<(), Box<dyn std::
         styles.remove_all_style_sheets();
         let image_limit = fell_render::WebMail::image_height_limit(width as f32);
         let root = background.map_or_else(
-            || "background-color: transparent; --fell-snapshot-links: 1".into(),
+            || "background-color: transparent".into(),
             |color| format!("background-color: #{color:06x}"),
         );
         styles.add_style_sheet(&UserStyleSheet::new(
             &format!(
                 ":root {{ {root}; }}
                  img {{ min-height: 0 !important; max-height: {image_limit}px !important; }}
+                 body[data-fell-collapsed] [data-fell-folded] {{ display: none !important; }}
                  html::-webkit-scrollbar {{ display: none; }}"
             ),
             UserContentInjectedFrames::TopFrame,
@@ -323,20 +325,28 @@ fn schedule_capture(widget: &webkit2gtk::WebView, active: &Active) {
         load.settling = true;
         load.cancel.clone()
     };
-    wait_for_images(widget, active.clone(), token);
+    wait_for_images(widget, active.clone(), token, None);
 }
 
 #[allow(deprecated)] // run_javascript_in_world is available on WebKitGTK 2.38.
-fn wait_for_images(widget: &webkit2gtk::WebView, active: Active, token: gtk::gio::Cancellable) {
+fn wait_for_images(
+    widget: &webkit2gtk::WebView,
+    active: Active,
+    token: gtk::gio::Cancellable,
+    capture_height: Option<i32>,
+) {
     // Offscreen documents can leave img.decode() promises pending until a
     // visible paint. Wait for resource completion and force rasterization
     // with a canvas read before giving the document a chance to paint.
     const READY: &str = r#"
-        ((viewportWidth) => {
+        ((requestedWidth, requestedHeight, collectLinks) => {
             // WebKit may see the previous GTK allocation until the resize
             // reaches its process. Wait for this job's CSS viewport.
             const root = document.documentElement;
-            if (root.clientWidth !== viewportWidth) return 0;
+            const viewportWidth = window.innerWidth;
+            const viewportHeight = window.innerHeight;
+            if (Math.abs(viewportWidth - requestedWidth) > 2 ||
+                Math.abs(viewportHeight - requestedHeight) > 2) return 0;
             const all = Array.from(document.images);
             const images = all.filter(image =>
                 /^data:image\/(?:png|jpe?g|gif|webp|avif|bmp|x-icon|vnd\.microsoft\.icon)[;,]/i
@@ -375,17 +385,51 @@ fn wait_for_images(widget: &webkit2gtk::WebView, active: Active, token: gtk::gio
                 ? Math.max(0, Math.min(14, Math.round(inset), __WIDTH_LIMIT__ - width))
                 : 0;
             const links = [];
-            if (getComputedStyle(root).getPropertyValue('--fell-snapshot-links').trim() === '1') {
+            if (collectLinks) {
+                const visible = element => {
+                    if (getComputedStyle(element).visibility !== 'visible') return false;
+                    for (; element; element = element.parentElement) {
+                        if (Number(getComputedStyle(element).opacity) <= 0) return false;
+                    }
+                    return true;
+                };
                 for (const anchor of body.querySelectorAll('a[href]')) {
-                    if (links.length >= 512) break;
+                    if (anchor.closest('body[data-fell-collapsed] [data-fell-folded]')) continue;
                     const href = anchor.getAttribute('href');
-                    const label = anchor.innerText?.trim();
-                    if (!label || !href || href.length > 4096) continue;
-                    const rects = Array.from(anchor.getClientRects())
-                        .filter(rect => rect.width > 0 && rect.height > 0)
-                        .slice(0, 64)
-                        .map(rect => [rect.x, rect.y, rect.width, rect.height]);
-                    if (rects.length) links.push({href, label: label.slice(0, 1024), rects});
+                    if (!href || href.length > 4096) continue;
+                    const text = anchor.innerText?.trim();
+                    const images = anchor.querySelectorAll('img');
+                    const label = text || Array.from(images).find(image => image.alt.trim())?.alt.trim()
+                        || anchor.textContent.trim() || 'Open link';
+                    const rects = [];
+                    const append = candidate => {
+                        for (const rect of candidate.getClientRects()) {
+                            const left = Math.max(0, rect.left);
+                            const top = Math.max(0, rect.top);
+                            const right = Math.min(viewportWidth, rect.right);
+                            const bottom = Math.min(viewportHeight, rect.bottom);
+                            if (left >= right || top >= bottom) continue;
+                            const hit = document.elementFromPoint((left + right) / 2, (top + bottom) / 2);
+                            if (!hit || !anchor.contains(hit) || !visible(hit)) continue;
+                            rects.push([left, top, right - left, bottom - top]);
+                            if (rects.length === 64) break;
+                        }
+                    };
+                    if (links.length < 512 && visible(anchor)) {
+                        const walker = document.createTreeWalker(anchor, NodeFilter.SHOW_TEXT);
+                        const range = document.createRange();
+                        while (rects.length < 64 && walker.nextNode()) {
+                            const node = walker.currentNode;
+                            if (!node.data.trim() || !visible(node.parentElement)) continue;
+                            range.selectNodeContents(node);
+                            append(range);
+                        }
+                        for (const image of images) {
+                            if (rects.length === 64) break;
+                            if (visible(image)) append(image);
+                        }
+                    }
+                    links.push({href, label: label.slice(0, 1024), rects});
                 }
             }
             return {height, scroll_width: width, viewport_width: viewportWidth, gutter, links};
@@ -402,7 +446,16 @@ fn wait_for_images(widget: &webkit2gtk::WebView, active: Active, token: gtk::gio
         )
     });
     let view = widget.clone();
-    let ready = format!("{ready}({})", view.width_request());
+    let colorless = active
+        .borrow()
+        .as_ref()
+        .is_some_and(|load| load.background.is_none());
+    let collect_links = colorless && capture_height.is_some();
+    let height = capture_height.unwrap_or(UNLAID_HEIGHT);
+    let ready = format!(
+        "{ready}({}, {height}, {collect_links})",
+        view.width_request()
+    );
     widget.run_javascript_in_world(
         &ready,
         "fell-snapshot",
@@ -418,7 +471,7 @@ fn wait_for_images(widget: &webkit2gtk::WebView, active: Active, token: gtk::gio
             if value.is_number() {
                 if value.to_int32() == 0 {
                     glib::timeout_add_local_once(PAINT_SETTLE, move || {
-                        wait_for_images(&view, active, token);
+                        wait_for_images(&view, active, token, capture_height);
                     });
                 } else {
                     stop_load(&active, Err(RenderError::TooWide));
@@ -432,13 +485,22 @@ fn wait_for_images(widget: &webkit2gtk::WebView, active: Active, token: gtk::gio
                 stop_load(&active, Ok(None));
                 return;
             };
-            let region = if document.height > SNAPSHOT_HEIGHT_LIMIT
-                && let Some(window) = view.toplevel().and_downcast::<gtk::Window>()
-            {
-                // A full-document surface can exceed Cairo's size limit.
-                let width = view.allocated_width();
-                view.set_size_request(width, SNAPSHOT_HEIGHT_LIMIT);
-                window.resize(width, SNAPSHOT_HEIGHT_LIMIT);
+            let limit = SNAPSHOT_HEIGHT_LIMIT;
+            let clipped = document.height > limit;
+            let needs_viewport = capture_height.is_none() && (colorless || clipped)
+                || clipped && capture_height != Some(limit);
+            if needs_viewport && let Some(window) = view.toplevel().and_downcast::<gtk::Window>() {
+                // Hit testing requires a laid-out viewport. For tall mail
+                // its height also caps the surface Cairo has to allocate.
+                let height = document.height.clamp(UNLAID_HEIGHT, limit);
+                view.set_size_request(view.width_request(), height);
+                window.resize(view.width_request(), height);
+                glib::timeout_add_local_once(PAINT_SETTLE, move || {
+                    wait_for_images(&view, active, token, Some(height));
+                });
+                return;
+            }
+            let region = if clipped {
                 webkit2gtk::SnapshotRegion::Visible
             } else {
                 webkit2gtk::SnapshotRegion::FullDocument
@@ -704,6 +766,8 @@ fn surface_image(
         background
     };
     let pixels = image::RgbaImage::from_raw(dst_w, dst_h, bgra)?;
+    let scale = pixel_scale * dst_w as f32 / source_width as f32;
+    let (links, fallback_links) = snapshot_links(&document.links, scale, dst_w, dst_h);
     Some(Snapshot {
         image: Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(
             pixels
@@ -713,32 +777,65 @@ fn surface_image(
         clipped,
         document_height: document.height as f32,
         last_row_color,
-        links: if background.is_none() {
-            let scale = pixel_scale * dst_w as f32 / source_width as f32;
-            document
-                .links
-                .iter()
-                .filter_map(|link| {
-                    let href = fell_render::reader_link_target(&link.href)?;
-                    let rects = link
-                        .rects
-                        .iter()
-                        .map(|&[x, y, w, h]| [x * scale, y * scale, w * scale, h * scale])
-                        .filter(|&[x, y, w, h]| {
-                            x < dst_w as f32 && y < dst_h as f32 && x + w > 0. && y + h > 0.
-                        })
-                        .collect::<Vec<_>>();
-                    (!rects.is_empty()).then(|| WebLink {
-                        href,
-                        label: link.label.clone(),
-                        rects,
-                    })
-                })
-                .collect()
-        } else {
-            Arc::default()
-        },
+        links: links.into(),
+        fallback_links: fallback_links.into(),
     })
+}
+
+fn snapshot_links(
+    measured: &[WebLink],
+    scale: f32,
+    width: u32,
+    height: u32,
+) -> (Vec<WebLink>, Vec<fell_render::Block>) {
+    use fell_render::{Block, Inline};
+
+    let mut positioned = Vec::new();
+    let mut dropped = Vec::new();
+    for link in measured {
+        let Some(href) = fell_render::reader_link_target(&link.href) else {
+            continue;
+        };
+        let rects = link
+            .rects
+            .iter()
+            .filter_map(|&[x, y, w, h]| {
+                let (x, y) = (x * scale, y * scale);
+                let w = (w * scale).min(width as f32 - x);
+                let h = (h * scale).min(height as f32 - y);
+                (w > 0. && h > 0.).then_some([x, y, w, h])
+            })
+            .collect::<Vec<_>>();
+        let link = WebLink {
+            href,
+            label: link.label.clone(),
+            rects,
+        };
+        if link.rects.is_empty() {
+            dropped.push(link);
+        } else {
+            positioned.push(link);
+        }
+    }
+    let destination = |href: &str| {
+        let (scheme, rest) = href.split_once(':').expect("validated link");
+        format!("{}:{rest}", scheme.to_ascii_lowercase())
+    };
+    let mut seen: std::collections::HashSet<_> = positioned
+        .iter()
+        .map(|link| destination(&link.href))
+        .collect();
+    let fallback = dropped
+        .into_iter()
+        .filter(|link| seen.insert(destination(&link.href)))
+        .map(|link| Block::Paragraph {
+            inlines: vec![Inline::Link {
+                href: link.href,
+                children: vec![Inline::Text(link.label)],
+            }],
+        })
+        .collect();
+    (positioned, fallback)
 }
 
 #[cfg(test)]
@@ -1255,6 +1352,9 @@ mod tests {
                 .all(|row| row[..14].iter().all(|pixel| *pixel == surface))
         );
 
+        check_colorless_links();
+        check_gmail_reply();
+
         let hero = fell_render::WebMail::prepare(
             r#"<div style="height:1000px;background:#7a163f">A tall hero</div>"#,
         );
@@ -1313,5 +1413,137 @@ mod tests {
             blank.unwrap().is_none(),
             "a uniform capture is a failed snapshot"
         );
+    }
+
+    fn colorless_snapshot(html: String, width: i32) -> Snapshot {
+        futures::executor::block_on(render(WebRequest {
+            html,
+            width,
+            background: None,
+        }))
+        .unwrap()
+        .expect("the colourless page produced a snapshot")
+    }
+
+    fn check_colorless_links() {
+        let mail = fell_render::WebMail::prepare(concat!(
+            "<style>:root { --fell-snapshot-links: 0 !important; }</style>",
+            "<div style='position:relative;z-index:0'>",
+            "<a href='https://example.test/invisible' style='opacity:0;position:absolute;inset:0'>Open</a>",
+            "<p>See you Thursday.</p></div>",
+            "<div style='opacity:0'><a href='https://example.test/ancestor'>Transparent ancestor</a></div>",
+            "<a href='https://example.test/descendant'><span style='opacity:0'>Transparent label</span></a>",
+            "<a href='https://example.test/hidden' style='visibility:hidden'>Hidden link</a>",
+            "<div style='position:relative'><a href='https://example.test/covered'>Covered link</a>",
+            "<span style='position:absolute;inset:0;z-index:1'>See you Thursday.</span></div>",
+            "<p><a href='https://example.test/shown' data-fell-folded>Visible link</a></p>",
+            "<a href='https://example.test/map'><img src='https://example.test/image' width='80' height='40' alt='Map'></a>",
+            "<p><a href='https://example.test/map' style='visibility:hidden'>Duplicate</a></p>",
+        ));
+        assert!(!mail.has_author_colors());
+        let picture = colorless_snapshot(mail.page("light", |_| None), 440);
+        let targets: Vec<_> = picture
+            .links
+            .iter()
+            .map(|link| link.href.as_str())
+            .collect();
+        assert_eq!(
+            targets,
+            ["https://example.test/shown", "https://example.test/map"]
+        );
+        let [[_, _, w, h]] = picture.links[1].rects.as_slice() else {
+            panic!("image rectangle")
+        };
+        assert_eq!((*w, *h), (80., 40.));
+        assert_eq!(
+            fell_render::StyledDocument::blocks_text(&picture.fallback_links),
+            "Open\nTransparent ancestor\nTransparent label\nHidden link\nCovered link"
+        );
+        let destinations: Vec<_> = picture
+            .fallback_links
+            .iter()
+            .map(|block| {
+                let fell_render::Block::Paragraph { inlines } = block else {
+                    panic!("link row")
+                };
+                let [fell_render::Inline::Link { href, .. }] = inlines.as_slice() else {
+                    panic!("link")
+                };
+                href.rsplit_once('/').unwrap().1
+            })
+            .collect();
+        assert_eq!(
+            destinations,
+            ["invisible", "ancestor", "descendant", "hidden", "covered"]
+        );
+
+        let tall = fell_render::WebMail::prepare(concat!(
+            "<div style='height:20000px'>First line</div>",
+            "<a href='https://example.test/fixed' style='position:fixed;bottom:28px'>Fixed link</a>",
+            "<a href='https://example.test/vh' style='position:absolute;top:50vh'>Viewport link</a>",
+            "<a href='https://example.test/below'>Below the capture</a>",
+        ));
+        let picture = colorless_snapshot(tall.page("light", |_| None), 440);
+        assert!(picture.clipped);
+        assert_eq!(picture.links.len(), 2);
+        let fixed = picture.links[0].rects[0];
+        assert!(
+            (fixed[1] + fixed[3] - (picture.height - 28.)).abs() <= 2.,
+            "{fixed:?}"
+        );
+        let vh = picture.links[1].rects[0];
+        assert!((vh[1] - picture.height * 0.5).abs() <= 2., "{vh:?}");
+        assert_eq!(
+            fell_render::StyledDocument::blocks_text(&picture.fallback_links),
+            "Below the capture"
+        );
+
+        let gutter = colorless_snapshot(
+            concat!(
+                "<!doctype html><style>",
+                "html { overflow-y:scroll; }",
+                "html::-webkit-scrollbar { display:block !important; width:24px; }",
+                "body { margin:0; }",
+                "a { position:absolute; right:0; top:10px; }",
+                "</style><div style='height:200px'>Scrollbar probe</div>",
+                "<a href='https://example.test/right'>Right edge</a>",
+            )
+            .into(),
+            440,
+        );
+        let [x, _, w, _] = gutter.links[0].rects[0];
+        assert_eq!(x + w, 416., "the scrollbar takes 24px of client width");
+    }
+
+    fn check_gmail_reply() {
+        let reply = include_str!("../../../fell-render/fixtures/web-gmail-reply.html");
+        let body = crate::mail_body::prepare_html(
+            reply,
+            &[("Subject".into(), "Re: Pier lanterns".into())],
+        );
+        assert!(!body.web.has_author_colors());
+        assert!(body.web.mapped_history());
+        assert_eq!(body.folded.sections.len(), 2);
+        assert_eq!(
+            body.folded.sections[1].fold,
+            Some(fell_render::Fold::SignatureAndQuote)
+        );
+        for (scheme, fg, accent) in [("dark", 0xa9b1d6, 0x7aa2f7), ("light", 0x4c4f69, 0x1758ad)] {
+            for width in [440, 490, 960] {
+                let style = fell_render::WebTextStyle {
+                    family: Some("Inter".into()),
+                    size: 15.,
+                    foreground: fg,
+                    link: accent,
+                    inset: false,
+                };
+                let closed = colorless_snapshot(
+                    body.web.page_with_style(scheme, Some(&style), |_| None),
+                    width,
+                );
+                assert_eq!(closed.height, 3. * 22. + 2. * 24. + 8.);
+                assert!(closed.links.is_empty() && closed.fallback_links.is_empty());
+            }
+        }
     }
 }
