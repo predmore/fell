@@ -16,6 +16,12 @@ pub const DEFAULT_ID: &str = "mail";
 pub const MAILBOX_LINK_DAMAGED: &str = "Mailbox link damaged";
 pub const MAILBOX_LINK_RECOVERY: &str = "Restore account.toml.bak or accounts/.original-id";
 pub const MAILBOX_ADDRESS_RECOVERY: &str = "Use the same address or open Fell Settings → Accounts, choose Keep local mail, then Add account.";
+const MAILBOX_OWNER_RECOVERY: &str =
+    "Restore the account that owns this mailbox, or move the file aside before using this ID.";
+const MAILBOX_READ_RECOVERY: &str =
+    "Check the file and close other programs using it. Restore a mailbox backup if it is damaged.";
+const INTERRUPTED_REMOVAL_RECOVERY: &str =
+    "Open Settings → Accounts to restore local mail or finish deleting.";
 pub type FileIdentity = (u64, u64, i64, i64);
 
 pub fn validate_id(id: &str) -> Result<(), &'static str> {
@@ -79,7 +85,13 @@ impl FileError {
                 "{MAILBOX_LINK_DAMAGED} · {} · {}",
                 self.recovery, self.detail
             )
-        } else if self.recovery == MAILBOX_ADDRESS_RECOVERY {
+        } else if matches!(
+            self.recovery,
+            MAILBOX_ADDRESS_RECOVERY
+                | MAILBOX_OWNER_RECOVERY
+                | MAILBOX_READ_RECOVERY
+                | INTERRUPTED_REMOVAL_RECOVERY
+        ) {
             format!("{} · {}", self.detail, self.recovery)
         } else {
             self.to_string()
@@ -222,6 +234,29 @@ impl Registry {
         Ok(lock)
     }
 
+    /// First open creates the schema before installing the owner. Hold the
+    /// exclusive registry lock across both steps so readers see a complete mailbox.
+    pub fn lock_for_mailbox_open(&self, base: &Path, id: &str) -> Result<File, FileError> {
+        let lock = self.lock_shared()?;
+        let path = self.mailbox_path(base, id)?;
+        match path.symlink_metadata() {
+            Ok(meta) if meta.len() != 0 => return Ok(lock),
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(FileError::new(
+                    format!("{}: {err}", path.display()),
+                    MAILBOX_READ_RECOVERY,
+                ));
+            }
+        }
+        lock.unlock()
+            .and_then(|()| lock.lock())
+            .map_err(|err| FileError::access(&self.directory(), err))?;
+        // The caller rechecks the account and route after acquiring this lock.
+        Ok(lock)
+    }
+
     pub fn path(&self, id: &str) -> Result<PathBuf, FileError> {
         validate_id(id)
             .map_err(|recovery| FileError::new(format!("Invalid account ID {id:?}"), recovery))?;
@@ -311,13 +346,22 @@ impl Registry {
     /// Use the existing mailbox for the original account, including old
     /// configs that set a custom ID. Every other account has its own DB.
     pub fn store_path(&self, base: &Path, id: &str) -> Result<PathBuf, FileError> {
-        let path = self.mailbox_path(base, id)?;
-        if removal_trash(&path).symlink_metadata().is_ok() {
-            return Err(FileError::new(
-                format!("Removal of {id} is in progress"),
-                "Open Settings → Accounts to restore local mail or finish deleting.",
-            ));
-        }
+        let account = self.path(id)?;
+        let config = read(&account, Some(id)).ok().flatten();
+        let (path, backup) = self.mailbox_location(base, id)?;
+        let legacy = self.config.join("account.toml");
+        let config = config.or_else(|| {
+            (path == base)
+                .then(|| read(&legacy, None).ok().flatten())
+                .flatten()
+                .filter(|(config, _)| config.id == id)
+        });
+        check_live_mailbox(
+            &path,
+            id,
+            config.as_ref().map(|(c, _)| c.email.as_str()),
+            backup.as_deref(),
+        )?;
         Ok(path)
     }
 
@@ -326,36 +370,24 @@ impl Registry {
         base: &Path,
         config: &AccountConfig,
     ) -> Result<PathBuf, FileError> {
-        let path = self.store_path(base, &config.id)?;
-        let owner = mailbox_owner(&path).map_err(|err| {
-            FileError::new(
-                format!("{}: {err}", file_name(&path)),
-                "Check the local mailbox.",
-            )
-        })?;
-        if let Some((_, email)) = owner
-            && !email.eq_ignore_ascii_case(&config.email)
-        {
-            return Err(FileError::new(
-                format!("{} already holds mail for {email}", config.id),
-                MAILBOX_ADDRESS_RECOVERY,
-            ));
-        }
+        let (path, backup) = self.mailbox_location(base, &config.id)?;
+        check_live_mailbox(&path, &config.id, Some(&config.email), backup.as_deref())?;
         Ok(path)
     }
 
+    /// Locate a candidate for reservation and recovery, without authorizing an open.
     pub fn mailbox_path(&self, base: &Path, id: &str) -> Result<PathBuf, FileError> {
-        let (path, backup) = self.mailbox_location(base, id)?;
-        if let Some(backup) = backup {
-            verify_backup(base, &backup, id)?;
-        }
-        Ok(path)
+        self.mailbox_location(base, id).map(|(path, _)| path)
     }
 
     pub fn mailbox_reserved(&self, base: &Path, id: &str) -> Result<bool, FileError> {
         match self.mailbox_path(base, id) {
             Ok(path) => mailbox_exists(&path).map_err(|err| FileError::access(&path, err)),
-            Err(error) if error.is_mailbox_link() => Ok(true),
+            Err(error)
+                if error.is_mailbox_link() || error.recovery == INTERRUPTED_REMOVAL_RECOVERY =>
+            {
+                Ok(true)
+            }
             Err(error) => Err(error),
         }
     }
@@ -424,17 +456,16 @@ impl Registry {
                     let current = read(&target, Some(&config.id)).ok().flatten();
                     let target_conflicts = target_exists
                         && current.as_ref().is_none_or(|(_, current)| *current != text);
-                    let sibling_exists =
-                        mailbox_exists(&sibling).map_err(|err| FileError::access(&sibling, err))?;
+                    let sibling_owned = has_classified_owner(&sibling);
                     // A repaired legacy file cannot take over an established
                     // per-account route. Ownerless leftovers cannot establish one.
                     let different_address = current.as_ref().is_some_and(|(current, _)| {
                         !current.email.eq_ignore_ascii_case(&config.email)
                     });
-                    if sibling_exists
+                    if sibling_owned
                         && (!removal::mailbox_has_owner(base, &config.id)
                             || (different_address
-                                && matches!(sibling_conflicts(base, &config.id), Ok(true))))
+                                && original_collision(base, &config.id).is_some()))
                     {
                         return Ok(None);
                     }
@@ -513,10 +544,8 @@ impl Registry {
             return Ok(Some(id));
         }
         let sibling = sibling_mailbox(base, DEFAULT_ID);
-        let fresh = !broken_legacy
-            && !mailbox_exists(base).map_err(|err| FileError::access(base, err))?
-            && !mailbox_exists(&sibling).map_err(|err| FileError::access(&sibling, err))?;
-        Ok(fresh.then(|| DEFAULT_ID.into()))
+        let use_base = !broken_legacy && matches!(mailbox_exists(&sibling), Ok(false));
+        Ok(use_base.then(|| DEFAULT_ID.into()))
     }
 
     /// Record the first account's route immediately before publishing its
@@ -635,10 +664,9 @@ impl Registry {
             }
             let base = base.ok_or_else(|| io::Error::other("No local mailbox path"))?;
             let sibling = sibling_mailbox(base, &config.id);
-            if (mailbox_exists(&sibling)?
+            if (has_classified_owner(&sibling)
                 && (!removal::mailbox_has_owner(base, &config.id)
-                    || sibling_conflicts(base, &config.id)
-                        .map_err(|err| io::Error::other(err.to_string()))?))
+                    || original_collision(base, &config.id).is_some()))
                 || (path_exists(&target)? && !path_exists(&marker)?)
             {
                 return Err(io::Error::other(
@@ -687,43 +715,63 @@ fn check_original_collision(
     path: PathBuf,
     backup: Option<PathBuf>,
 ) -> OriginalMailbox {
-    match sibling_conflicts(base, &id) {
-        Ok(false) => OriginalMailbox::Known { id, backup },
-        Ok(true) => {
-            let error = FileError::mailbox_link(format!(
-                "{}: The original and per-account mailboxes have conflicting ownership",
-                file_name(&path)
-            ));
-            OriginalMailbox::Unavailable { id, path, error }
-        }
-        Err(error) => OriginalMailbox::Unavailable { id, path, error },
+    match original_collision(base, &id) {
+        Some(error) => OriginalMailbox::Unavailable { id, path, error },
+        None => OriginalMailbox::Known { id, backup },
     }
 }
 
-fn sibling_conflicts(base: &Path, id: &str) -> Result<bool, FileError> {
+fn original_collision(base: &Path, id: &str) -> Option<FileError> {
+    // Recovery of the actual base mailbox takes precedence over leftovers.
+    if path_exists(&removal_trash(base)).unwrap_or(false) {
+        return None;
+    }
     let sibling = sibling_mailbox(base, id);
     let trash = removal_trash(&sibling);
-    // Keep an interrupted deletion recoverable even when its database has
-    // already moved out of the live path.
-    if path_exists(&trash).map_err(|err| FileError::access(&trash, err))? {
-        return Ok(true);
+    let staged = removal::staged_file(&trash, &sibling, "");
+    let conflict = |path: &Path, staged: bool| {
+        let owner = match inspect_mailbox(path, staged) {
+            Ok(MailboxOwnership::Owned(owner)) => owner,
+            Ok(MailboxOwnership::Shared(first, second)) => {
+                return Some(format!(
+                    "{} has multiple owners: {} and {}",
+                    path.display(),
+                    first.0,
+                    second.0,
+                ));
+            }
+            Err(error) if staged => return Some(error.detail),
+            _ => return None,
+        };
+        if mailbox_owner(base).is_ok_and(|base_owner| {
+            base_owner.is_some_and(|(base_id, base_email)| {
+                base_id == id && base_id == owner.0 && base_email.eq_ignore_ascii_case(&owner.1)
+            })
+        }) {
+            return None;
+        }
+        Some(format!(
+            "{} belongs to account {:?} ({}) and conflicts with {}",
+            path.display(),
+            owner.0,
+            owner.1,
+            base.display()
+        ))
+    };
+    if let Some(detail) = conflict(&staged, true) {
+        return Some(FileError::new(
+            format!("Interrupted removal for {id}: {detail}"),
+            INTERRUPTED_REMOVAL_RECOVERY,
+        ));
     }
-    let Some(conn) = mailbox_accounts(&sibling)
-        .map_err(|err| FileError::mailbox_link(format!("{}: {err}", file_name(&sibling))))?
-    else {
-        return Ok(false);
-    };
-    let base_owner = mailbox_owner(base).ok().flatten();
-    let (base_id, base_email) = match base_owner.as_ref() {
-        Some((base_id, email)) if base_id == id => (Some(base_id.as_str()), Some(email.as_str())),
-        _ => (None, None),
-    };
-    conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM accounts WHERE id IS NOT ?1 OR email IS NOT ?2 COLLATE NOCASE)",
-        (base_id, base_email),
-        |row| row.get(0),
+    conflict(&sibling, false).map(FileError::mailbox_link)
+}
+
+fn has_classified_owner(path: &Path) -> bool {
+    matches!(
+        inspect_mailbox(path, false),
+        Ok(MailboxOwnership::Owned(_) | MailboxOwnership::Shared(..))
     )
-    .map_err(|err| FileError::mailbox_link(format!("{}: {err}", file_name(&sibling))))
 }
 
 fn has_account_file(dir: &Path) -> io::Result<bool> {
@@ -766,50 +814,178 @@ pub fn mailbox_exists(path: &Path) -> io::Result<bool> {
     Ok(false)
 }
 
-/// Inspect ownership without creating a store, modifying its schema or
-/// starting its workers. Only a mailbox with a single owner can be reused.
-pub fn mailbox_owner(path: &Path) -> rusqlite::Result<Option<(String, String)>> {
-    let Some(conn) = mailbox_accounts(path)? else {
-        return Ok(None);
-    };
-    let mut statement = conn.prepare("SELECT id, email FROM accounts LIMIT 2")?;
-    let mut rows = statement.query([])?;
-    let owner = match rows.next()? {
-        Some(row) => Some((row.get(0)?, row.get(1)?)),
-        None => return Ok(None),
-    };
-    Ok(if rows.next()?.is_none() { owner } else { None })
+type Owner = (String, String);
+
+enum MailboxOwnership {
+    New,
+    Unowned(&'static str),
+    Owned(Owner),
+    Shared(Owner, Owner),
 }
 
-fn mailbox_accounts(path: &Path) -> rusqlite::Result<Option<Connection>> {
-    if !path.symlink_metadata().is_ok_and(|meta| meta.is_file()) {
-        return Ok(None);
+/// Inspect ownership without opening a store or modifying its schema.
+pub fn mailbox_owner(path: &Path) -> Result<Option<(String, String)>, FileError> {
+    Ok(match inspect_mailbox(path, false)? {
+        MailboxOwnership::Owned(owner) => Some(owner),
+        _ => None,
+    })
+}
+
+fn inspect_mailbox(path: &Path, offline: bool) -> Result<MailboxOwnership, FileError> {
+    let unavailable = |detail: &str| {
+        FileError::new(
+            format!("{}: {detail}", path.display()),
+            MAILBOX_READ_RECOVERY,
+        )
+    };
+    match path.symlink_metadata() {
+        Ok(meta) if !meta.is_file() => {
+            return Err(unavailable("Expected a regular mailbox file"));
+        }
+        Ok(meta) if meta.len() == 0 => return Ok(MailboxOwnership::New),
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(MailboxOwnership::New),
+        Err(err) => return Err(unavailable(&err.to_string())),
     }
+
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW;
-    let open = || -> rusqlite::Result<Option<Connection>> {
-        let conn = Connection::open_with_flags(path, flags)?;
+    let query = || -> rusqlite::Result<MailboxOwnership> {
+        let conn = if offline {
+            // Removal excludes store writers. SQLite's exclusive locking mode
+            // keeps the WAL index in memory, and unix-none lets the read-only
+            // connection use that mode without modifying the staged files.
+            let conn = Connection::open_with_flags_and_vfs(path, flags, "unix-none")?;
+            conn.execute_batch("PRAGMA locking_mode = EXCLUSIVE")?;
+            conn
+        } else {
+            Connection::open_with_flags(path, flags)?
+        };
+        conn.busy_timeout(std::time::Duration::from_millis(50))?;
         let has_accounts: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'accounts')",
             [],
             |row| row.get(0),
         )?;
-        Ok(has_accounts.then_some(conn))
+        if !has_accounts {
+            return Ok(MailboxOwnership::Unowned("No accounts table"));
+        }
+        read_mailbox_owners(&conn, |_| true)
     };
-    match open() {
-        Err(error) if error.sqlite_error_code() == Some(ErrorCode::NotADatabase) => Ok(None),
-        other => other,
+    match query() {
+        Err(error) if error.sqlite_error_code() == Some(ErrorCode::NotADatabase) => Ok(
+            MailboxOwnership::Unowned("The file is not a SQLite database"),
+        ),
+        result => result.map_err(|err| unavailable(&err.to_string())),
     }
 }
 
-fn verify_backup(base: &Path, backup: &Path, id: &str) -> Result<(), FileError> {
-    if removal::verify_mailbox_owner(base, id) {
-        Ok(())
-    } else {
-        Err(FileError::mailbox_link(format!(
-            "{}: Account ID does not match the local mailbox",
-            file_name(backup)
-        )))
+fn read_mailbox_owners(
+    conn: &Connection,
+    include: impl Fn(&str) -> bool,
+) -> rusqlite::Result<MailboxOwnership> {
+    let mut statement = conn.prepare("SELECT id, email FROM accounts")?;
+    let mut rows = statement.query([])?;
+    let mut owner = None;
+    while let Some(row) = rows.next()? {
+        let id: String = row.get(0)?;
+        if include(&id) {
+            let next = (id, row.get(1)?);
+            if let Some(first) = owner {
+                return Ok(MailboxOwnership::Shared(first, next));
+            }
+            owner = Some(next);
+        }
     }
+    Ok(owner.map_or(
+        MailboxOwnership::Unowned("The accounts table is empty"),
+        MailboxOwnership::Owned,
+    ))
+}
+
+/// Recheck ownership in the account write transaction. The store has already
+/// initialized its schema, and its demo cleanup handles the reserved rows.
+pub(crate) fn validate_configure_account(
+    conn: &Connection,
+    path: Option<&Path>,
+    account: &crate::Account,
+) -> crate::Result<()> {
+    let owners = read_mailbox_owners(conn, |id| !crate::backend::DEMO_ACCOUNT_IDS.contains(&id))?;
+    if matches!(owners, MailboxOwnership::Unowned(_)) {
+        return Ok(());
+    }
+    validate_ownership(
+        owners,
+        path.unwrap_or_else(|| Path::new("Local mailbox")),
+        account.id.as_str(),
+        Some(&account.email),
+    )
+    .map_err(|err| crate::Error::Invalid(err.cli_message()))
+}
+
+/// A new mailbox can be initialized. An existing mailbox can only be opened
+/// or removed on behalf of its single recorded owner.
+fn validate_mailbox(
+    path: &Path,
+    id: &str,
+    email: Option<&str>,
+    offline: bool,
+) -> Result<(), FileError> {
+    validate_ownership(inspect_mailbox(path, offline)?, path, id, email)
+}
+
+fn validate_ownership(
+    owners: MailboxOwnership,
+    path: &Path,
+    id: &str,
+    email: Option<&str>,
+) -> Result<(), FileError> {
+    let detail = match owners {
+        MailboxOwnership::New => return Ok(()),
+        MailboxOwnership::Owned((owner, address)) => {
+            if owner != id {
+                format!("Account {owner:?} ({address}) owns this mailbox. Requested ID: {id:?}")
+            } else if email.is_some_and(|email| !address.eq_ignore_ascii_case(email)) {
+                return Err(FileError::new(
+                    format!(
+                        "{}: Account {id:?} holds mail for {address}",
+                        path.display()
+                    ),
+                    MAILBOX_ADDRESS_RECOVERY,
+                ));
+            } else {
+                return Ok(());
+            }
+        }
+        MailboxOwnership::Unowned(reason) => reason.to_owned(),
+        MailboxOwnership::Shared((first, first_email), (second, second_email)) => {
+            format!("Multiple owners: {first:?} ({first_email}) and {second:?} ({second_email})")
+        }
+    };
+    Err(FileError::new(
+        format!("{}: {detail}", path.display()),
+        MAILBOX_OWNER_RECOVERY,
+    ))
+}
+
+fn check_live_mailbox(
+    path: &Path,
+    id: &str,
+    email: Option<&str>,
+    backup: Option<&Path>,
+) -> Result<(), FileError> {
+    let trash = removal_trash(path);
+    if path_exists(&trash).map_err(|err| FileError::access(&trash, err))? {
+        return Err(FileError::new(
+            format!("Removal of {id} is in progress at {}", trash.display()),
+            INTERRUPTED_REMOVAL_RECOVERY,
+        ));
+    }
+    validate_mailbox(path, id, email, false).map_err(|mut error| {
+        if let Some(backup) = backup {
+            error.detail = format!("{}: {}", file_name(backup), error.detail);
+        }
+        error
+    })
 }
 
 fn file_identity(meta: fs::Metadata) -> FileIdentity {
@@ -895,6 +1071,13 @@ pub fn read(path: &Path, id: Option<&str>) -> Result<Option<(AccountConfig, Stri
             Err(error) => return Err(FileError::access(dir, error)),
         }
     }
+    read_account_contents(path, id)
+}
+
+fn read_account_contents(
+    path: &Path,
+    id: Option<&str>,
+) -> Result<Option<(AccountConfig, String)>, FileError> {
     let mut file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -1201,6 +1384,160 @@ mod tests {
     }
 
     #[test]
+    fn matching_email_cannot_rebind_the_base_mailbox_to_another_id() {
+        for metadata in ["accounts/.original-id", "account.toml", "account.toml.bak"] {
+            let root = tempfile::tempdir().unwrap();
+            let config_dir = root.path().join("fell");
+            let base = root.path().join("mail.db");
+            let registry = Registry::at(config_dir.clone(), base.clone());
+            let text = "id = 'work'\nemail = 'same@example.test'\npassword = 'fixture'";
+            let config = AccountConfig::parse(text).unwrap();
+            let mut owner = config.account();
+            owner.id = AccountId("mail".into());
+            crate::Store::open(&base)
+                .unwrap()
+                .upsert_account(&owner)
+                .unwrap();
+            let sibling = sibling_mailbox(&base, "work");
+            fs::create_dir_all(sibling.parent().unwrap()).unwrap();
+            fs::write(&sibling, []).unwrap();
+            write_private(
+                &config_dir.join(metadata),
+                if metadata.ends_with(".original-id") {
+                    "work"
+                } else {
+                    text
+                },
+            );
+            if metadata != "account.toml" {
+                write_private(&registry.path("work").unwrap(), text);
+            }
+            for error in [
+                registry
+                    .store_path(&base, "work")
+                    .unwrap_err()
+                    .cli_message(),
+                registry
+                    .configured_store_path(&base, &config)
+                    .unwrap_err()
+                    .cli_message(),
+                registry.remove(&base, "work", true).unwrap_err(),
+            ] {
+                assert!(
+                    error.contains(&*base.to_string_lossy()),
+                    "{metadata}: {error}"
+                );
+                assert!(
+                    error.contains("Account \"mail\" (same@example.test)"),
+                    "{error}"
+                );
+            }
+            let store = crate::Store::open(&base).unwrap();
+            assert!(store.configure_account(&config.account(), false).is_err());
+            assert_eq!(
+                mailbox_owner(&base).unwrap(),
+                Some((owner.id.0, owner.email))
+            );
+            assert_eq!(sibling.metadata().unwrap().len(), 0);
+        }
+    }
+
+    #[test]
+    fn a_configured_mailbox_requires_one_owner_with_the_saved_address() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("mail.db");
+        let registry = Registry::at(root.path().join("fell"), base.clone());
+        let text = "email = 'work@example.test'\npassword = 'fixture'";
+        let config = AccountConfig::parse_for(text, "work").unwrap();
+        write_private(&registry.path("work").unwrap(), text);
+        let path = sibling_mailbox(&base, "work");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE other(id TEXT)").unwrap();
+        let error = registry.store_path(&base, "work").unwrap_err();
+        assert!(error.detail.contains("No accounts table"));
+        conn.execute_batch("CREATE TABLE accounts(id TEXT, email TEXT)")
+            .unwrap();
+        let error = registry.configured_store_path(&base, &config).unwrap_err();
+        assert!(error.detail.contains("accounts table is empty"));
+        conn.execute(
+            "INSERT INTO accounts VALUES ('work', 'old@example.test')",
+            [],
+        )
+        .unwrap();
+        let error = registry.store_path(&base, "work").unwrap_err();
+        assert!(error.detail.contains("old@example.test"));
+        assert_eq!(error.recovery, MAILBOX_ADDRESS_RECOVERY);
+        let removal = registry.remove(&base, "work", false).unwrap_err();
+        assert!(removal.contains("old@example.test"), "{removal}");
+        conn.execute("UPDATE accounts SET email = 'WORK@example.test'", [])
+            .unwrap();
+        assert_eq!(
+            registry.configured_store_path(&base, &config).unwrap(),
+            path
+        );
+        conn.execute(
+            "INSERT INTO accounts VALUES ('other', 'work@example.test')",
+            [],
+        )
+        .unwrap();
+        let error = registry.configured_store_path(&base, &config).unwrap_err();
+        assert!(error.detail.contains("Multiple owners"), "{error}");
+        assert!(error.detail.contains("other"), "{error}");
+    }
+
+    #[test]
+    fn a_sibling_unreadable_for_ownership_does_not_block_the_base() {
+        for unreadable in ["symlink", "corrupt", "busy"] {
+            let root = tempfile::tempdir().unwrap();
+            let base = root.path().join("mail.db");
+            let registry = Registry::at(root.path().join("fell"), base.clone());
+            let text = "email = 'mail@example.test'\npassword = 'fixture'";
+            let account = AccountConfig::parse(text).unwrap();
+            write_private(&registry.path("mail").unwrap(), text);
+            crate::Store::open(&base)
+                .unwrap()
+                .upsert_account(&account.account())
+                .unwrap();
+            let sibling = sibling_mailbox(&base, "mail");
+            fs::create_dir_all(sibling.parent().unwrap()).unwrap();
+            let mut conn = None;
+            if unreadable == "symlink" {
+                std::os::unix::fs::symlink(&base, &sibling).unwrap();
+            } else {
+                let db = Connection::open(&sibling).unwrap();
+                db.execute_batch("CREATE TABLE accounts(id TEXT, email TEXT)")
+                    .unwrap();
+                if unreadable == "corrupt" {
+                    drop(db);
+                    let mut bytes = fs::read(&sibling).unwrap();
+                    bytes[100] = 0;
+                    fs::write(&sibling, bytes).unwrap();
+                } else {
+                    db.execute_batch("BEGIN EXCLUSIVE").unwrap();
+                    conn = Some(db);
+                }
+            }
+            let error =
+                validate_mailbox(&sibling, "mail", Some(&account.email), false).unwrap_err();
+            assert_eq!(
+                error.recovery, MAILBOX_READ_RECOVERY,
+                "{unreadable}: {error}"
+            );
+            assert!(error.detail.contains(&*sibling.to_string_lossy()));
+            assert_eq!(
+                registry.configured_store_path(&base, &account).unwrap(),
+                base
+            );
+            assert_eq!(
+                registry.load_with_removals(&base).default_config(),
+                Some(&account)
+            );
+            drop(conn);
+        }
+    }
+
+    #[test]
     fn a_lost_or_invalid_marker_uses_the_migration_backup() {
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join("fell");
@@ -1344,7 +1681,7 @@ mod tests {
         for id in ["mail", "work"] {
             write_private(
                 &registry.path(id).unwrap(),
-                "email = 'synthetic@example.test'\npassword = 'fixture'\n",
+                "email = 'live@example.test'\npassword = 'fixture'\n",
             );
             assert_eq!(
                 registry.store_path(&base, id).unwrap(),

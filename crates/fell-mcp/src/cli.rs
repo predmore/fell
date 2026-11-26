@@ -437,8 +437,8 @@ fn registry_store(
             let damage = accounts
                 .entries
                 .iter()
-                .filter_map(|entry| entry.config.as_ref().err())
-                .find(|error| error.is_mailbox_link());
+                .filter(|entry| entry.file_identity.is_none())
+                .find_map(|entry| entry.config.as_ref().err());
             CliError::new(damage.map_or_else(
                 || "No readable account configuration. Try `fell account list`.".into(),
                 fell_core::accounts::FileError::cli_message,

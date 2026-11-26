@@ -470,14 +470,11 @@ fn remove(id: &str) -> Result<(), String> {
             &path,
             entry
                 .file_identity
-                .ok_or_else(|| entry.config.as_ref().unwrap_err().to_string())?,
+                .ok_or_else(|| entry.config.as_ref().unwrap_err().cli_message())?,
         )?;
         println!("Deleted {id}.toml.");
         return Ok(());
     }
-    let store = registry
-        .mailbox_path(&base, id)
-        .map_err(|err| err.to_string())?;
     if pending.is_none() && entry.is_none() {
         return Err(format!("No account file for {id:?}"));
     }
@@ -493,6 +490,9 @@ fn remove(id: &str) -> Result<(), String> {
         };
         registry.recover_removal(&base, id, delete, expected)?
     } else {
+        let store = registry
+            .store_path(&base, id)
+            .map_err(|err| err.cli_message())?;
         let delete = store.is_file()
             && terminal
             && matches!(

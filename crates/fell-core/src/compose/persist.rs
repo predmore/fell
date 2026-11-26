@@ -1296,9 +1296,25 @@ fn draft_store_matches(id: &str, mailbox: &Path) -> bool {
     .into_iter()
     .flatten()
     .any(|path| {
-        indexed_store(&path)
-            .is_ok_and(|path| std::path::absolute(path).ok() == std::path::absolute(mailbox).ok())
+        indexed_store(&path).is_ok_and(|path| {
+            normalized_mailbox(&path)
+                .is_ok_and(|path| normalized_mailbox(mailbox).is_ok_and(|mailbox| path == mailbox))
+        })
     })
+}
+
+fn normalized_mailbox(path: &Path) -> std::io::Result<PathBuf> {
+    let absolute = std::path::absolute(path)?;
+    if let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name()) {
+        // During removal the database has already moved, but the directory
+        // still resolves aliases and relative components in the saved path.
+        match parent.canonicalize() {
+            Ok(parent) => return Ok(parent.join(name)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(absolute)
 }
 
 pub(crate) fn remove_draft_workspaces(
@@ -1306,45 +1322,64 @@ pub(crate) fn remove_draft_workspaces(
     account: &str,
     mailbox: &Path,
 ) -> std::result::Result<(), String> {
-    let missing_ok = |result: std::io::Result<()>| match result {
+    let check = |path: &Path, result: std::io::Result<()>| match result {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err.to_string()),
+        Err(err) => Err(format!("{}: {err}", path.display())),
     };
+    let mailbox =
+        normalized_mailbox(mailbox).map_err(|err| format!("{}: {err}", mailbox.display()))?;
+    let mut workspaces = Vec::new();
     for id in ids {
-        let Ok(folder) = workspace::draft_folder(id) else {
-            crate::diagnostic!(
-                WARN,
-                "Skipped a draft with an invalid ID during account removal"
-            );
-            continue;
-        };
+        let folder = workspace::draft_folder(id).map_err(|err| format!("Draft {id:?}: {err}"))?;
         let control = workspace::control_dir(&folder);
-        if [&folder, &control]
-            .into_iter()
-            .any(|path| path.symlink_metadata().is_ok_and(|meta| !meta.is_dir()))
-        {
-            crate::diagnostic!(
-                WARN,
-                "Skipped a draft workspace that is not a directory during account removal"
-            );
-            continue;
+        for path in [&folder, &control] {
+            match path.symlink_metadata() {
+                Ok(meta) if !meta.is_dir() => {
+                    return Err(format!(
+                        "{}: Expected a draft workspace directory",
+                        path.display()
+                    ));
+                }
+                Ok(_) => {}
+                Err(err) => check(path, Err(err))?,
+            }
         }
         let index = compose_index_file(id).ok_or("No compose index directory")?;
-        let other_store = indexed_store(&index).ok().is_some_and(|path| {
-            std::path::absolute(path).ok() != std::path::absolute(mailbox).ok()
-        });
-        if other_store || workspace::read_account(&folder).is_some_and(|owner| owner != account) {
-            continue;
+        match indexed_store(&index).and_then(|path| normalized_mailbox(&path)) {
+            Ok(path) if path != mailbox => {
+                return Err(format!(
+                    "{} points to {}. Check which mailbox owns draft {id:?} before retrying.",
+                    index.display(),
+                    path.display(),
+                ));
+            }
+            Ok(_) => {}
+            Err(err) => check(&index, Err(err))?,
         }
-        missing_ok(std::fs::remove_dir_all(&folder))?;
-        missing_ok(std::fs::remove_dir_all(control))?;
+        if let Some(owner) = workspace::read_account(&folder).filter(|owner| owner != account) {
+            return Err(format!(
+                "{} belongs to account {owner:?}. Check which account owns draft {id:?} before retrying.",
+                folder.display(),
+            ));
+        }
+        workspaces.push((folder, control, index));
+    }
+    for (folder, control, index) in workspaces {
+        check(&folder, std::fs::remove_dir_all(&folder))?;
+        check(&control, std::fs::remove_dir_all(&control))?;
         if let Some(root) = folder.parent() {
-            missing_ok(std::fs::File::open(root).and_then(|dir| dir.sync_all()))?;
+            check(
+                root,
+                std::fs::File::open(root).and_then(|dir| dir.sync_all()),
+            )?;
         }
-        missing_ok(std::fs::remove_file(index))?;
-        if let Some(root) = compose_index_file(id).as_deref().and_then(Path::parent) {
-            missing_ok(std::fs::File::open(root).and_then(|dir| dir.sync_all()))?;
+        check(&index, std::fs::remove_file(&index))?;
+        if let Some(root) = index.parent() {
+            check(
+                root,
+                std::fs::File::open(root).and_then(|dir| dir.sync_all()),
+            )?;
         }
     }
     Ok(())

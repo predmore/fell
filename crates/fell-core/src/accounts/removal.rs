@@ -6,8 +6,10 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use super::{
-    Accounts, Entry, FileIdentity, OriginalMailbox, Registry, file_identity, mailbox_exists,
-    mailbox_owner, path_exists, publish, read, real_directory, removal_trash, verify_backup,
+    Accounts, Entry, FileError, FileIdentity, INTERRUPTED_REMOVAL_RECOVERY, MailboxOwnership,
+    OriginalMailbox, Registry, check_live_mailbox, file_identity, inspect_mailbox, mailbox_owner,
+    path_exists, publish, read, read_account_contents, real_directory, removal_trash,
+    sibling_mailbox, validate_mailbox,
 };
 use crate::{AccountId, Store, compose};
 
@@ -36,6 +38,11 @@ pub enum RemovalOutcome {
 impl Registry {
     pub fn load_with_removals(&self, base: &Path) -> Accounts {
         let mut catalog = self.load_at(Some(base));
+        let _lock = self
+            .directory()
+            .is_dir()
+            .then(|| self.lock_shared().ok())
+            .flatten();
         let original = match self.original_mailbox(base) {
             Ok(original) => original,
             Err(error) => {
@@ -50,49 +57,13 @@ impl Registry {
             }
         };
         let original = match original {
-            Some(OriginalMailbox::Known {
-                id,
-                backup: Some(backup),
-            }) => Some(match verify_backup(base, &backup, &id) {
-                Ok(()) => OriginalMailbox::Known { id, backup: None },
-                Err(error) => OriginalMailbox::Unavailable {
-                    id,
-                    path: backup,
-                    error,
-                },
-            }),
-            other => other,
-        };
-        let original = match original {
-            Some(OriginalMailbox::Known { id, .. }) => Some((id, removal_trash(base))),
+            Some(OriginalMailbox::Known { id, backup }) => Some((id, backup)),
             Some(OriginalMailbox::Unavailable { id, path, error }) => {
-                let config = self.directory().join(format!("{id}.toml"));
-                if let Some(entry) = catalog
-                    .entries
-                    .iter_mut()
-                    .find(|entry| entry.path == config)
+                let sibling = sibling_mailbox(base, &id);
+                if error.recovery != INTERRUPTED_REMOVAL_RECOVERY
+                    || !has_removal_plan(&sibling, &id)
                 {
-                    entry.damaged_link_name = entry
-                        .config
-                        .as_ref()
-                        .ok()
-                        .map(|config| config.account().display_name);
-                    entry.config = Err(error);
-                    entry.file_identity = None;
-                } else {
-                    let damaged_link_name = path
-                        .extension()
-                        .is_some_and(|ext| ext == "toml")
-                        .then(|| read(&path, None).ok().flatten())
-                        .flatten()
-                        .filter(|(config, _)| config.id == id)
-                        .map(|(config, _)| config.account().display_name);
-                    catalog.entries.push(Entry {
-                        path,
-                        config: Err(error),
-                        damaged_link_name,
-                        file_identity: None,
-                    });
+                    self.mark_mailbox_unavailable(&mut catalog, &id, path, error);
                 }
                 None
             }
@@ -112,8 +83,11 @@ impl Registry {
                     .to_owned();
                 Some((id, entry.path()))
             });
-        for (id, trash) in original.into_iter().chain(paths) {
-            let Ok(mailbox) = self.mailbox_path(base, &id) else {
+        let base_trash = original
+            .as_ref()
+            .map(|(id, _)| (id.clone(), removal_trash(base)));
+        for (id, trash) in base_trash.into_iter().chain(paths) {
+            let Ok(mailbox) = self.removal_mailbox(base, &id) else {
                 continue;
             };
             if !trash.symlink_metadata().is_ok_and(|meta| meta.is_dir())
@@ -148,7 +122,71 @@ impl Registry {
             });
         }
         catalog.interrupted.sort_by(|a, b| a.id.cmp(&b.id));
+        for entry in &mut catalog.entries {
+            let Ok(config) = &entry.config else { continue };
+            if catalog
+                .interrupted
+                .iter()
+                .any(|pending| pending.id == config.id)
+            {
+                continue;
+            }
+            let sibling;
+            let (mailbox, backup) = match &original {
+                Some((id, backup)) if *id == config.id => (base, backup.as_deref()),
+                _ => {
+                    sibling = sibling_mailbox(base, &config.id);
+                    (sibling.as_path(), None)
+                }
+            };
+            if let Err(error) = check_live_mailbox(mailbox, &config.id, Some(&config.email), backup)
+            {
+                mark_entry(entry, error);
+            }
+        }
         catalog
+    }
+
+    fn mark_mailbox_unavailable(
+        &self,
+        catalog: &mut Accounts,
+        id: &str,
+        path: PathBuf,
+        error: FileError,
+    ) {
+        let config = self.directory().join(format!("{id}.toml"));
+        if let Some(entry) = catalog
+            .entries
+            .iter_mut()
+            .find(|entry| entry.path == config)
+        {
+            mark_entry(entry, error);
+        } else {
+            let damaged_link_name = path
+                .extension()
+                .is_some_and(|ext| ext == "toml")
+                .then(|| read(&path, None).ok().flatten())
+                .flatten()
+                .filter(|(config, _)| config.id == id)
+                .map(|(config, _)| config.account().display_name);
+            catalog.entries.push(Entry {
+                path,
+                config: Err(error),
+                damaged_link_name,
+                file_identity: None,
+            });
+        }
+    }
+
+    fn removal_mailbox(&self, base: &Path, id: &str) -> Result<PathBuf, FileError> {
+        self.mailbox_path(base, id).or_else(|error| {
+            let sibling = sibling_mailbox(base, id);
+            if error.recovery == INTERRUPTED_REMOVAL_RECOVERY && has_removal_plan(&sibling, id) {
+                Ok(sibling)
+            } else {
+                Err(error)
+            }
+        })
     }
 
     pub fn remove_broken_file(&self, path: &Path, expected: FileIdentity) -> Result<(), String> {
@@ -194,7 +232,7 @@ impl Registry {
         snapshot: &str,
     ) -> Result<(), String> {
         let account = self.path(id).map_err(|err| err.to_string())?;
-        let mailbox = self.store_path(base, id).map_err(|err| err.to_string())?;
+        let mailbox = self.store_path(base, id).map_err(|err| err.cli_message())?;
         if !read(&account, Some(id))
             .is_ok_and(|current| current.is_some_and(|(_, text)| text == snapshot))
         {
@@ -234,10 +272,15 @@ impl Registry {
         expected: Option<FileIdentity>,
         recovery_only: bool,
     ) -> Result<RemovalOutcome, String> {
-        self.migrate_at(Some(base)).map_err(|err| err.to_string())?;
+        if !recovery_only {
+            self.migrate_at(Some(base))
+                .map_err(|err| err.cli_message())?;
+        }
         let directory = self.lock().map_err(|err| err.to_string())?;
         let account = self.path(id).map_err(|err| err.to_string())?;
-        let mailbox = self.mailbox_path(base, id).map_err(|err| err.to_string())?;
+        let mailbox = self
+            .removal_mailbox(base, id)
+            .map_err(|err| err.cli_message())?;
         let changed = match expected {
             Some(expected) => account.symlink_metadata().ok().map(file_identity) != Some(expected),
             None if recovery_only => !account
@@ -249,45 +292,55 @@ impl Registry {
             return Err("The account file changed. Select the account again.".into());
         }
         let trash = removal_trash(&mailbox);
-        if trash.symlink_metadata().is_ok() {
-            if !trash.symlink_metadata().is_ok_and(|meta| meta.is_dir()) {
-                return Err("The mailbox removal directory is unavailable.".into());
-            }
+        if path_exists(&trash).map_err(|err| err.to_string())? {
+            real_directory(&trash).map_err(|err| format!("{}: {err}", trash.display()))?;
             let plan = match read_plan(&trash) {
                 Ok(plan) => plan,
                 Err(err)
                     if err.kind() == io::ErrorKind::NotFound
-                        && fs::read_dir(&trash).is_ok_and(|mut entries| {
-                            entries.all(|entry| {
-                                entry.is_ok_and(|entry| entry.file_name() == "committed")
-                            })
-                        }) =>
+                        && only_removal_sidecars(&trash, &mailbox)
+                            .map_err(|err| err.to_string())? =>
                 {
                     if !delete && trash.join("committed").exists() {
                         return Err("Permanently deleting local mail has already started.".into());
                     }
+                    discard_staged_mailbox(&trash, &mailbox).map_err(|err| err.to_string())?;
                     clear_trash(&trash).map_err(|err| err.to_string())?;
                     return Ok(RemovalOutcome::Cleared);
                 }
                 Err(err) => return Err(err.to_string()),
             };
             if plan.account != id {
-                return Err("The mailbox removal directory belongs to another account.".into());
+                return Err(format!(
+                    "{} belongs to account {:?}. Select that account to recover it.",
+                    trash.display(),
+                    plan.account,
+                ));
             }
-            if trash
-                .join("committed")
-                .symlink_metadata()
-                .is_err_and(|err| err.kind() == io::ErrorKind::NotFound)
-                && let Some((_, snapshot)) =
-                    read(&trash.join("account.toml"), None).map_err(|err| err.to_string())?
-                && let Some((_, current)) =
-                    read(&account, Some(id)).map_err(|err| err.to_string())?
+            let _local = lock_mailbox(&mailbox)?;
+            let staged = staged_file(&trash, &mailbox, "");
+            let _staged = lock_mailbox(&staged)?;
+            let committed = path_exists(&trash.join("committed")).map_err(|err| err.to_string())?;
+            let snapshot = read_account_contents(&trash.join("account.toml"), Some(id))
+                .map_err(|err| err.cli_message())?;
+            let current = if committed && snapshot.is_some() {
+                None
+            } else {
+                read(&account, Some(id)).map_err(|err| err.to_string())?
+            };
+            if let (Some((_, snapshot)), Some((_, current))) = (&snapshot, &current)
                 && snapshot != current
             {
                 return Err("The account file differs from the one saved before deletion. Move it aside before recovering local mail.".into());
             }
-            let _local = lock_mailbox(&mailbox)?;
-            let _staged = lock_mailbox(&staged_file(&trash, &mailbox, ""))?;
+            let email = snapshot
+                .as_ref()
+                .or(current.as_ref())
+                .map(|(config, _)| config.email.as_str());
+            validate_mailbox(&staged, id, email, true).map_err(|err| err.cli_message())?;
+            if !committed {
+                validate_mailbox(&mailbox, id, email, true).map_err(|err| err.cli_message())?;
+            }
             return if delete {
                 finish(&account, &directory, &mailbox, &trash, &plan)?;
                 Ok(RemovalOutcome::Deleted)
@@ -308,11 +361,14 @@ impl Registry {
         let config = read(&account, Some(id))
             .map_err(|err| err.to_string())?
             .ok_or("The account file changed. Select the account again.")?;
+        validate_mailbox(&mailbox, id, Some(&config.0.email), false)
+            .map_err(|err| err.cli_message())?;
         let id = AccountId(id.to_owned());
         let mut store = match mailbox.symlink_metadata() {
-            Ok(meta) if meta.is_file() => {
+            Ok(meta) if meta.is_file() && meta.len() != 0 => {
                 Some(Store::open_existing_without_index(&mailbox).map_err(|err| err.to_string())?)
             }
+            Ok(meta) if meta.is_file() => None,
             Ok(_) => return Err("Expected a regular mailbox file.".into()),
             Err(err) if err.kind() == io::ErrorKind::NotFound => None,
             Err(err) => return Err(err.to_string()),
@@ -333,8 +389,10 @@ impl Registry {
                     .map_err(|err| err.to_string())?,
             )
         } else {
-            None
+            lock_mailbox(&mailbox)?
         };
+        validate_mailbox(&mailbox, id.as_str(), Some(&config.0.email), true)
+            .map_err(|err| err.cli_message())?;
         let mut drafts = compose::drafts_for_removal(&id, &mailbox, store.as_ref())?;
         if let Some(store) = store {
             store
@@ -380,6 +438,16 @@ impl Registry {
     }
 }
 
+fn mark_entry(entry: &mut Entry, error: FileError) {
+    entry.damaged_link_name = entry
+        .config
+        .as_ref()
+        .ok()
+        .map(|config| config.account().display_name);
+    entry.config = Err(error);
+    entry.file_identity = None;
+}
+
 fn read_plan(trash: &Path) -> io::Result<Removal> {
     let bytes = fs::read(trash.join("plan"))?;
     let (account, drafts, name) = serde_json::from_slice(&bytes)
@@ -400,7 +468,7 @@ pub(super) fn mailbox_file(mailbox: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn staged_file(trash: &Path, mailbox: &Path, suffix: &str) -> PathBuf {
+pub(super) fn staged_file(trash: &Path, mailbox: &Path, suffix: &str) -> PathBuf {
     trash.join(
         mailbox_file(mailbox, suffix)
             .file_name()
@@ -409,47 +477,27 @@ fn staged_file(trash: &Path, mailbox: &Path, suffix: &str) -> PathBuf {
 }
 
 pub(super) fn mailbox_has_owner(base: &Path, id: &str) -> bool {
-    let trash = removal_trash(base);
     mailbox_owner(base).is_ok_and(|owner| owner.is_some_and(|(owner, _)| owner == id))
-        || real_directory(&trash).is_ok()
-            && read_plan(&trash).is_ok_and(|plan| plan.account == id)
-            && verify_mailbox_owner(base, id)
+        || staged_mailbox_id(base).is_some_and(|owner| owner == id)
 }
 
 pub(super) fn staged_mailbox_id(base: &Path) -> Option<String> {
     let trash = removal_trash(base);
     real_directory(&trash).ok()?;
     let plan = read_plan(&trash).ok()?;
-    verify_mailbox_owner(base, &plan.account).then_some(plan.account)
+    let staged = staged_file(&trash, base, "");
+    let owner_matches = match inspect_mailbox(&staged, true).ok()? {
+        MailboxOwnership::Owned((id, _)) => id == plan.account,
+        MailboxOwnership::New => true,
+        _ => false,
+    };
+    (owner_matches && validate_mailbox(base, &plan.account, None, false).is_ok())
+        .then_some(plan.account)
 }
 
-pub(super) fn verify_mailbox_owner(base: &Path, id: &str) -> bool {
-    let verify = || -> io::Result<bool> {
-        let trash = removal_trash(base);
-        let staged = if path_exists(&trash)? {
-            real_directory(&trash)?;
-            let plan = read_plan(&trash)?;
-            if plan.account != id {
-                return Ok(false);
-            }
-            Some(staged_file(&trash, base, ""))
-        } else {
-            None
-        };
-        if staged.is_none() && !path_exists(base)? && mailbox_exists(base)? {
-            return Ok(false);
-        }
-        for path in std::iter::once(base).chain(staged.as_deref()) {
-            if path_exists(path)?
-                && !mailbox_owner(path)
-                    .is_ok_and(|owner| owner.is_some_and(|(owner, _)| owner == id))
-            {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    };
-    verify().unwrap_or(false)
+fn has_removal_plan(mailbox: &Path, id: &str) -> bool {
+    let trash = removal_trash(mailbox);
+    real_directory(&trash).is_ok() && read_plan(&trash).is_ok_and(|plan| plan.account == id)
 }
 
 fn move_mailbox(mailbox: &Path, trash: &Path, restoring: bool) -> io::Result<()> {
@@ -525,12 +573,15 @@ fn lock_mailbox(path: &Path) -> Result<Option<File>, String> {
             ))?;
             let metadata = file.metadata().map_err(|err| err.to_string())?;
             if !metadata.is_file() || metadata.nlink() != 1 {
-                return Err("Expected a mailbox file with one link.".into());
+                return Err(format!(
+                    "{}: Expected a regular mailbox file with one link.",
+                    path.display()
+                ));
             }
             Ok(Some(file))
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err.to_string()),
+        Err(err) => Err(format!("{}: {err}", path.display())),
     }
 }
 
@@ -545,12 +596,7 @@ fn finish(
     match committed.symlink_metadata() {
         Ok(_) => {
             // Older Fell versions committed before cleaning up drafts.
-            if compose::remove_draft_workspaces(&plan.drafts, &plan.account, mailbox).is_err() {
-                crate::diagnostic!(
-                    WARN,
-                    "Skipped draft cleanup for a committed mailbox deletion"
-                );
-            }
+            compose::remove_draft_workspaces(&plan.drafts, &plan.account, mailbox)?;
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             move_mailbox(mailbox, trash, false).map_err(|err| err.to_string())?;
@@ -565,15 +611,43 @@ fn finish(
         }
         Err(err) => return Err(err.to_string()),
     }
-    for suffix in MAILBOX_SUFFIXES {
-        absent_ok(fs::remove_file(staged_file(trash, mailbox, suffix)))
-            .map_err(|err| err.to_string())?;
-    }
+    discard_staged_mailbox(trash, mailbox).map_err(|err| err.to_string())?;
     absent_ok(fs::remove_file(trash.join("account.toml"))).map_err(|err| err.to_string())?;
     clear_trash(trash).map_err(|err| err.to_string())
 }
 
+fn only_removal_sidecars(trash: &Path, mailbox: &Path) -> io::Result<bool> {
+    for entry in fs::read_dir(trash)? {
+        let entry = entry?;
+        if entry.file_name() != "committed"
+            && !MAILBOX_SUFFIXES
+                .iter()
+                .filter(|suffix| !suffix.is_empty())
+                .any(|suffix| entry.path() == staged_file(trash, mailbox, suffix))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn discard_staged_mailbox(trash: &Path, mailbox: &Path) -> io::Result<()> {
+    for suffix in MAILBOX_SUFFIXES {
+        absent_ok(fs::remove_file(staged_file(trash, mailbox, suffix)))?;
+    }
+    Ok(())
+}
+
 fn clear_trash(trash: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(trash)? {
+        let entry = entry?;
+        if entry.file_name() != "plan" && entry.file_name() != "committed" {
+            return Err(io::Error::other(format!(
+                "Move {} out of the removal directory, then retry.",
+                entry.path().display(),
+            )));
+        }
+    }
     absent_ok(fs::remove_file(trash.join("plan")))?;
     sync_dir(trash)?;
     absent_ok(fs::remove_file(trash.join("committed")))?;
@@ -791,6 +865,171 @@ mod tests {
     }
 
     #[test]
+    fn sibling_trash_only_blocks_the_base_with_a_conflicting_staged_mailbox() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("mail.db");
+        let registry = Registry::at(root.path().join("fell"), base.clone());
+        fs::create_dir_all(registry.directory()).unwrap();
+        let text = "email = 'mail@example.test'\npassword = 'fixture'";
+        let config = crate::AccountConfig::parse(text).unwrap();
+        let account = registry.path("mail").unwrap();
+        publish(&registry.directory(), &account, text.as_bytes()).unwrap();
+        Store::open(&base)
+            .unwrap()
+            .upsert_account(&config.account())
+            .unwrap();
+        let sibling = sibling_mailbox(&base, "mail");
+        let trash = removal_trash(&sibling);
+        let staged = staged_file(&trash, &sibling, "");
+        fs::create_dir_all(&trash).unwrap();
+        assert_eq!(registry.store_path(&base, "mail").unwrap(), base);
+        fs::write(trash.join("plan"), br#"["mail",[]]"#).unwrap();
+        assert_eq!(registry.store_path(&base, "mail").unwrap(), base);
+        fs::write(&staged, "not a SQLite database".repeat(10)).unwrap();
+        assert_eq!(registry.store_path(&base, "mail").unwrap(), base);
+        fs::rename(&staged, root.path().join("not-a-db")).unwrap();
+        Store::open(&staged)
+            .unwrap()
+            .upsert_account(&config.account())
+            .unwrap();
+        assert_eq!(registry.store_path(&base, "mail").unwrap(), base);
+        assert!(registry.load_with_removals(&base).interrupted.is_empty());
+
+        let mut other = config.account();
+        other.email = "other@example.test".into();
+        Store::open(&staged)
+            .unwrap()
+            .upsert_account(&other)
+            .unwrap();
+        publish(
+            &trash,
+            &trash.join("account.toml"),
+            text.replace(&config.email, &other.email).as_bytes(),
+        )
+        .unwrap();
+        fs::write(trash.join("committed"), "").unwrap();
+        let error = registry.store_path(&base, "mail").unwrap_err();
+        assert_eq!(error.recovery, INTERRUPTED_REMOVAL_RECOVERY);
+        assert!(error.detail.contains(&*staged.to_string_lossy()));
+        assert!(error.detail.contains(&other.email));
+        let catalog = registry.load_with_removals(&base);
+        assert_eq!(catalog.interrupted.len(), 1);
+        assert!(!catalog.interrupted[0].can_restore);
+        assert_eq!(
+            registry
+                .recover_removal(&base, "mail", true, catalog.entries[0].file_identity)
+                .unwrap(),
+            RemovalOutcome::Deleted
+        );
+        assert!(account.is_file());
+        assert_eq!(registry.store_path(&base, "mail").unwrap(), base);
+        assert_eq!(mailbox_owner(&base).unwrap().unwrap().1, config.email);
+    }
+
+    #[test]
+    fn recovery_cannot_restore_or_delete_a_staged_mailbox_with_a_different_id() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("mail.db");
+        let registry = Registry::at(root.path().join("fell"), base.clone());
+        fs::create_dir_all(registry.directory()).unwrap();
+        let mailbox = sibling_mailbox(&base, "work");
+        let trash = removal_trash(&mailbox);
+        fs::create_dir_all(&trash).unwrap();
+        let staged = staged_file(&trash, &mailbox, "");
+        let text = "email = 'same@example.test'\npassword = 'fixture'";
+        let owner = crate::AccountConfig::parse(text).unwrap().account();
+        Store::open(&staged)
+            .unwrap()
+            .upsert_account(&owner)
+            .unwrap();
+        publish(&trash, &trash.join("account.toml"), text.as_bytes()).unwrap();
+        fs::write(trash.join("plan"), br#"["work",[]]"#).unwrap();
+        for delete in [false, true] {
+            let failure = registry
+                .recover_removal(&base, "work", delete, None)
+                .unwrap_err();
+            assert!(
+                failure.contains("Account \"mail\" (same@example.test)"),
+                "{failure}"
+            );
+            assert!(failure.contains(&*staged.to_string_lossy()), "{failure}");
+        }
+        assert!(staged.is_file());
+        assert!(!mailbox.exists());
+        assert!(!trash.join("committed").exists());
+    }
+
+    #[test]
+    fn staged_ownership_reads_the_wal_without_creating_shared_memory() {
+        let root = tempfile::tempdir().unwrap();
+        let live = root.path().join("mail.db");
+        let conn = rusqlite::Connection::open(&live).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE accounts(id TEXT, email TEXT);
+             PRAGMA journal_mode = WAL;
+             PRAGMA wal_autocheckpoint = 0;
+             INSERT INTO accounts VALUES ('mail', 'mail@example.test');",
+        )
+        .unwrap();
+        let trash = removal_trash(&live);
+        fs::create_dir(&trash).unwrap();
+        let staged = staged_file(&trash, &live, "");
+        fs::copy(&live, &staged).unwrap();
+        fs::copy(
+            mailbox_file(&live, "-wal"),
+            staged_file(&trash, &live, "-wal"),
+        )
+        .unwrap();
+        validate_mailbox(&staged, "mail", Some("mail@example.test"), true).unwrap();
+        assert!(!staged_file(&trash, &live, "-shm").exists());
+        assert_eq!(fs::read_dir(&trash).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn leftover_files_keep_the_journal_and_sidecar_only_trash_can_be_cleared() {
+        let Some(root) = crate::test_support::in_isolated_process() else {
+            return;
+        };
+        let base = root.join("mail.db");
+        let registry = Registry::resolve().unwrap();
+        fs::create_dir_all(registry.directory()).unwrap();
+        let trash = removal_trash(&base);
+        fs::create_dir(&trash).unwrap();
+        fs::write(trash.join("plan"), br#"["mail",[]]"#).unwrap();
+        fs::write(trash.join("committed"), "").unwrap();
+        let sidecar = staged_file(&trash, &base, "-shm");
+        fs::write(&sidecar, "").unwrap();
+        let unexpected = trash.join("unexpected");
+        fs::write(&unexpected, "").unwrap();
+        let failure = registry
+            .recover_removal(&base, "mail", true, None)
+            .unwrap_err();
+        assert!(
+            failure.contains(&*unexpected.to_string_lossy()),
+            "{failure}"
+        );
+        assert!(trash.join("plan").is_file());
+        assert!(trash.join("committed").is_file());
+        assert!(!sidecar.exists());
+        fs::rename(&unexpected, root.join("unexpected")).unwrap();
+        assert_eq!(
+            registry.recover_removal(&base, "mail", true, None).unwrap(),
+            RemovalOutcome::Deleted
+        );
+
+        fs::create_dir(&trash).unwrap();
+        fs::write(&sidecar, "").unwrap();
+        fs::write(trash.join("committed"), "").unwrap();
+        assert!(registry.mailbox_reserved(&base, "mail").unwrap());
+        assert_eq!(
+            registry.recover_removal(&base, "mail", true, None).unwrap(),
+            RemovalOutcome::Cleared
+        );
+        assert!(!trash.exists());
+        assert!(!registry.mailbox_reserved(&base, "mail").unwrap());
+    }
+
+    #[test]
     fn failed_draft_cleanup_leaves_the_staged_mailbox_restorable() {
         let Some(root) = crate::test_support::in_isolated_process() else {
             return;
@@ -811,9 +1050,9 @@ mod tests {
             .unwrap()
             .upsert_account(&owner)
             .unwrap();
-        fs::write(trash.join("plan"), br#"["work",["../invalid","cblocked"]]"#).unwrap();
-        // A directory in place of an index file makes cleanup fail after the
-        // invalid ID is skipped, regardless of the effective user's privileges.
+        fs::write(trash.join("plan"), br#"["work",["cblocked"]]"#).unwrap();
+        // A directory in place of an index file makes cleanup fail regardless
+        // of the effective user's privileges.
         fs::create_dir_all(root.join("data/compose-stores/cblocked")).unwrap();
         let failure = registry
             .recover_removal(&base, "work", true, None)
@@ -832,5 +1071,74 @@ mod tests {
             mailbox_owner(&mailbox).unwrap(),
             Some((owner.id.0, owner.email))
         );
+    }
+
+    #[test]
+    fn a_non_directory_draft_workspace_keeps_the_mailbox_restorable() {
+        let Some(root) = crate::test_support::in_isolated_process() else {
+            return;
+        };
+        let base = root.join("mail.db");
+        let registry = Registry::resolve().unwrap();
+        fs::create_dir_all(registry.directory()).unwrap();
+        let text = "email = 'mail@example.test'\npassword = 'fixture'";
+        let account = registry.path("mail").unwrap();
+        publish(&registry.directory(), &account, text.as_bytes()).unwrap();
+        let config = crate::AccountConfig::parse(text).unwrap();
+        Store::open(&base)
+            .unwrap()
+            .upsert_account(&config.account())
+            .unwrap();
+        let folder = root.join("drafts/kepttext");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("draft.md"), "secret draft body").unwrap();
+        let control = compose::control_dir(&folder);
+        fs::write(&control, "not a directory").unwrap();
+        compose::remember_compose_store("kepttext", &base).unwrap();
+        let failure = registry.remove(&base, "mail", true).unwrap_err();
+        assert!(failure.contains(&*control.to_string_lossy()), "{failure}");
+        assert!(!removal_trash(&base).join("committed").exists());
+        assert!(registry.load_with_removals(&base).interrupted[0].can_restore);
+        assert_eq!(
+            registry
+                .recover_removal(&base, "mail", false, None)
+                .unwrap(),
+            RemovalOutcome::Restored { connected: true }
+        );
+        assert_eq!(
+            fs::read_to_string(folder.join("draft.md")).unwrap(),
+            "secret draft body"
+        );
+    }
+
+    #[test]
+    fn a_relative_mailbox_route_cleans_drafts_indexed_by_absolute_path() {
+        let Some(root) = crate::test_support::in_isolated_process() else {
+            return;
+        };
+        let base = root.join("mail.db");
+        let registry = Registry::resolve().unwrap();
+        fs::create_dir_all(registry.directory()).unwrap();
+        let text = "email = 'mail@example.test'\npassword = 'fixture'";
+        let account = registry.path("mail").unwrap();
+        publish(&registry.directory(), &account, text.as_bytes()).unwrap();
+        let config = crate::AccountConfig::parse(text).unwrap();
+        Store::open(&base)
+            .unwrap()
+            .upsert_account(&config.account())
+            .unwrap();
+        let folder = root.join("drafts/kepttext");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("draft.md"), "secret draft body").unwrap();
+        compose::remember_compose_store("kepttext", &base).unwrap();
+        std::env::set_current_dir(&root).unwrap();
+        assert_eq!(
+            registry
+                .remove(Path::new("data/../mail.db"), "mail", true)
+                .unwrap(),
+            RemovalOutcome::Deleted
+        );
+        assert!(!folder.exists());
+        assert!(!root.join("data/compose-stores/kepttext").exists());
     }
 }

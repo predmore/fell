@@ -51,7 +51,7 @@ pub fn startup() -> Startup {
     let path = base.and_then(|base| match (&registry, &config) {
         (Ok(registry), Some(config)) => registry
             .store_path(&base, &config.id)
-            .map_err(|err| err.to_string()),
+            .map_err(|err| err.cli_message()),
         _ if accounts
             .as_ref()
             .is_some_and(|accounts| !accounts.is_empty()) =>
@@ -93,7 +93,10 @@ pub fn open_registered_store(
             return Ok(None);
         };
         let registry = Registry::resolve().map_err(|err| err.to_string())?;
-        let lock = registry.lock_shared().map_err(|err| err.to_string())?;
+        let base = store_path()?;
+        let lock = registry
+            .lock_for_mailbox_open(&base, &config.id)
+            .map_err(|err| err.cli_message())?;
         let account = AccountId(config.id.clone());
         if registry
             .get(&account)
@@ -104,15 +107,16 @@ pub fn open_registered_store(
             return Err("The account file changed while opening the mailbox.".into());
         }
         let current = registry
-            .configured_store_path(&store_path()?, config)
+            .configured_store_path(&base, config)
             .map_err(|err| err.cli_message())?;
         if path.as_ref().is_ok_and(|path| *path != current) {
             return Err("The mailbox link changed while opening the account.".into());
         }
-        Ok(Some(lock))
+        Ok(Some((lock, current)))
     })();
     match locked {
-        Ok(_lock) => open_store(path, config, demo),
+        Ok(Some((_lock, current))) => open_store(Ok(current), config, demo),
+        Ok(None) => open_store(path, config, demo),
         Err(error) => fallback(error),
     }
 }
@@ -349,7 +353,7 @@ pub(crate) fn stage_account_config(
     let base = store_path()?;
     let mailbox = registry
         .store_path(&base, &config.id)
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| err.cli_message())?;
     let mut configured = accounts::path_exists(&path).map_err(|err| err.to_string())?;
     if configured && save == AccountSave::New {
         return Err(AccountFileError::AlreadyConfigured);

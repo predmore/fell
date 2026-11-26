@@ -133,6 +133,7 @@ pub(super) fn selected_account_path<'a>(
     catalog: &'a fell_core::accounts::Accounts,
     index: usize,
     path: &Path,
+    usable: impl Fn(&fell_core::AccountConfig) -> bool,
 ) -> Option<&'a Path> {
     let mut paths: Vec<_> = catalog
         .entries
@@ -148,7 +149,23 @@ pub(super) fn selected_account_path<'a>(
         .collect();
     paths.sort_unstable();
     paths.dedup();
-    account_index(paths.iter().copied(), index, path).map(|index| paths[index])
+    let index = account_index(paths.iter().copied(), index, path)?;
+    paths[index..]
+        .iter()
+        .chain(paths[..index].iter().rev())
+        .copied()
+        .find(|path| {
+            catalog.entries.iter().any(|entry| {
+                entry.path == *path
+                    && entry.config.as_ref().is_ok_and(|config| {
+                        catalog
+                            .interrupted
+                            .iter()
+                            .all(|pending| pending.id != config.id)
+                            && usable(config)
+                    })
+            })
+        })
 }
 
 fn account_index<'a>(
@@ -275,9 +292,23 @@ impl View {
                         )
                     }
                     Err(error) => (
-                        entry.path.file_name()?.to_string_lossy().into_owned(),
+                        entry
+                            .damaged_link_name()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| {
+                                entry
+                                    .path
+                                    .file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .into_owned()
+                            }),
                         None,
-                        error.reason(&entry.path).to_owned(),
+                        if entry.file_identity.is_none() {
+                            error.cli_message()
+                        } else {
+                            error.reason(&entry.path).to_owned()
+                        },
                         true,
                     ),
                 };

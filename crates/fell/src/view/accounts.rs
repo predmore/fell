@@ -243,7 +243,7 @@ impl AccountWindow {
         &mut self,
         registry: &Registry,
         accounts: Accounts,
-        preferred: Option<&Path>,
+        preferred: Option<(usize, &Path)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -320,17 +320,21 @@ impl AccountWindow {
             });
         let mut switched = false;
         if self.active_id.is_none() || removed.is_some() {
-            let next = preferred
-                .and_then(|path| accounts.entries.iter().find(|entry| entry.path == path))
-                .and_then(|entry| entry.config.as_ref().ok())
-                .filter(|config| self.views.contains_key(&config.id))
-                .or_else(|| accounts.default_config())
-                .filter(|config| self.views.contains_key(&config.id))
-                .or_else(|| {
-                    accounts
-                        .configs()
-                        .find(|config| self.views.contains_key(&config.id))
-                });
+            let usable = |config: &fell_core::AccountConfig| {
+                self.views
+                    .get(&config.id)
+                    .is_some_and(|view| view.read(cx).session.sync != SyncKind::StoreError)
+            };
+            let next = if let Some((index, path)) = preferred {
+                super::settings::selected_account_path(&accounts, index, path, usable)
+                    .and_then(|path| accounts.entries.iter().find(|entry| entry.path == path))
+                    .and_then(|entry| entry.config.as_ref().ok())
+            } else {
+                accounts
+                    .default_config()
+                    .filter(|config| usable(config))
+                    .or_else(|| accounts.configs().find(|config| usable(config)))
+            };
             if let Some(next) = next {
                 self.switch(&next.id, window, cx);
                 switched = true;
@@ -614,12 +618,8 @@ impl AccountWindow {
                                 .account_position(&path)
                                 .map(|index| (index, path.as_path()))
                         })
-                        .and_then(|(index, path)| {
-                            super::settings::selected_account_path(&catalog, index, path)
-                        })
-                        .map(Path::to_owned)
-                })
-                .flatten();
+                        .unwrap_or((0, path.as_path()))
+                });
                 if !broken {
                     view.stopping.remove(&id);
                     view.removing.remove(&id);
@@ -627,13 +627,21 @@ impl AccountWindow {
                         view.reloading.remove(&id);
                     }
                 }
-                view.reconcile(&registry, catalog, preferred.as_deref(), window, cx);
-                if let Some(selection) = selection {
+                view.reconcile(&registry, catalog, preferred, window, cx);
+                let removed_active = preferred.is_some();
+                if let Some((index, mut path)) = selection {
+                    if removed_active
+                        && let Some(id) = &view.active_id
+                        && let Ok(active_path) = registry.path(id)
+                    {
+                        path = active_path;
+                    }
                     view.active.update(cx, |inbox, cx| {
                         inbox.session.overlay = Overlay::Settings;
-                        inbox
-                            .settings_view
-                            .restore_account_selection(&mut inbox.session.settings_nav, selection);
+                        inbox.settings_view.restore_account_selection(
+                            &mut inbox.session.settings_nav,
+                            (index, path),
+                        );
                         cx.notify();
                     });
                 }
@@ -1413,7 +1421,7 @@ mod tests {
     }
 
     #[test]
-    fn deleting_the_active_account_opens_the_neighbour_selected_in_settings() {
+    fn deleting_the_active_account_moves_the_inbox_and_cursor_past_damaged_rows() {
         use crate::model::settings::{Page, Row, Section};
 
         let Some(_root) = fell_core::test_support::in_isolated_process() else {
@@ -1424,52 +1432,71 @@ mod tests {
         for id in ["mail", "studio", "work"] {
             write_account(&registry, id, "");
         }
+        let damaged = registry.path("unreadable").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&damaged)
+            .unwrap()
+            .write_all(b"invalid = [")
+            .unwrap();
         let mut app = TestAppContext::single();
         let window = app.add_window(|window, cx| {
             AccountWindow::new(mailbox::startup(), false, None, window, cx)
         });
-        let path = registry.path("studio").unwrap();
-        let expected = catalog(&registry)
-            .entries
-            .into_iter()
-            .find(|entry| entry.path == path)
-            .unwrap()
-            .file_identity;
-        window
-            .update(&mut app, |view, window, cx| {
-                view.switch("studio", window, cx);
-                view.active.update(cx, |inbox, _| {
-                    inbox.session.overlay = Overlay::Settings;
-                    inbox.session.settings_nav.page = Page::Section(Section::Accounts);
-                    inbox.session.settings_nav.select_row(Row::Account(1));
-                });
-                view.request_removal(
-                    "studio",
-                    &registry,
-                    RequestedRemoval {
-                        kind: AccountRemovalKind::Account,
-                        path: path.clone(),
-                        expected,
-                        delete: true,
-                        name: "Studio".into(),
-                    },
-                    window,
-                    cx,
-                );
-            })
-            .unwrap();
-        app.run_until_parked();
-        window
-            .update(&mut app, |view, _, cx| {
-                assert_eq!(view.active_id.as_deref(), Some("work"));
-                let inbox = view.active.read(cx);
-                let selection = inbox
-                    .settings_view
-                    .account_selection(&inbox.session.settings_nav);
-                assert_eq!(selection, Some((1, registry.path("work").unwrap())));
-            })
-            .unwrap();
-        assert!(!path.exists());
+        for (id, index, next, next_index) in [
+            ("studio", 1, Some("work"), 2),
+            ("work", 2, Some("mail"), 0),
+            ("mail", 0, None, 0),
+        ] {
+            let path = registry.path(id).unwrap();
+            let expected = catalog(&registry)
+                .entries
+                .into_iter()
+                .find(|entry| entry.path == path)
+                .unwrap()
+                .file_identity;
+            window
+                .update(&mut app, |view, window, cx| {
+                    view.switch(id, window, cx);
+                    assert_eq!(view.active_id.as_deref(), Some(id));
+                    view.active.update(cx, |inbox, _| {
+                        inbox.session.overlay = Overlay::Settings;
+                        inbox.session.settings_nav.page = Page::Section(Section::Accounts);
+                        inbox.session.settings_nav.select_row(Row::Account(index));
+                    });
+                    view.request_removal(
+                        id,
+                        &registry,
+                        RequestedRemoval {
+                            kind: AccountRemovalKind::Account,
+                            path: path.clone(),
+                            expected,
+                            delete: true,
+                            name: id.into(),
+                        },
+                        window,
+                        cx,
+                    );
+                })
+                .unwrap();
+            app.run_until_parked();
+            window
+                .update(&mut app, |view, _, cx| {
+                    let inbox = view.active.read(cx);
+                    assert_eq!(view.active_id.as_deref(), next, "{:?}", inbox.session.toast);
+                    let selected =
+                        next.map_or_else(|| damaged.clone(), |id| registry.path(id).unwrap());
+                    let selection = inbox
+                        .settings_view
+                        .account_selection(&inbox.session.settings_nav);
+                    assert_eq!(selection, Some((next_index, selected)));
+                })
+                .unwrap();
+            assert!(!path.exists());
+        }
+        assert!(damaged.is_file());
     }
 
     #[test]
