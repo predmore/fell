@@ -36,6 +36,11 @@ pub struct Opened {
 
 pub fn startup() -> Startup {
     let registry = Registry::resolve();
+    if let Ok(registry) = &registry
+        && let Err(error) = crate::credential_recovery::recover(registry)
+    {
+        return startup_for(None, false, Some(error.clone()), Err(error));
+    }
     let base = store_path();
     let accounts = registry.as_ref().ok().map(|registry| match &base {
         Ok(base) => registry.load_with_removals(base),
@@ -401,6 +406,11 @@ pub(crate) fn stage_connection_config(
     registry.migrate().map_err(|err| err.to_string())?;
     let mut path = registry.path(&config.id).map_err(|err| err.to_string())?;
     let lock = lock_account_dir(&path)?;
+    let credential_journal =
+        crate::credential_recovery::Journal::for_accounts(&registry.directory());
+    if let Some(journal) = &credential_journal {
+        journal.recover_locked(&fell_core::credentials::SecretService)?;
+    }
     let base = store_path()?;
     let mailbox = registry
         .store_path(&base, &config.id)
@@ -464,6 +474,7 @@ pub(crate) fn stage_connection_config(
             .map_err(|err| err.to_string())?;
     }
     let mut staged = stage_account_text_at(path, &config.render(), !configured, lock)?;
+    staged.credential_journal = credential_journal;
     if configured && let Some((_, snapshot, _)) = &current {
         staged.backup = Some(stage_account_file(&staged.path, snapshot)?);
     }
@@ -483,9 +494,25 @@ pub(crate) struct StagedAccountConfig {
     lock: fs::File,
     original: Option<(Registry, PathBuf, String)>,
     keep: Option<(Registry, PathBuf, String, String)>,
+    credential_journal: Option<crate::credential_recovery::Journal>,
 }
 
 impl StagedAccountConfig {
+    pub(crate) fn back_up_credential(
+        &self,
+        key: &str,
+        previous: &str,
+    ) -> Result<crate::credential_recovery::Journal, AccountFileError> {
+        let journal = self
+            .credential_journal
+            .as_ref()
+            .ok_or("No private state directory for account password recovery.")?;
+        journal
+            .record(&self.path, self.file.as_file(), key, previous)
+            .map_err(|error| format!("Couldn't back up the account password. {error}"))?;
+        Ok(journal.clone())
+    }
+
     pub(crate) fn publish(self) -> Result<PathBuf, AccountFileError> {
         self.publish_then(|result, _| result)
     }
@@ -571,7 +598,11 @@ pub(crate) fn stage_account_config_at(
     first_run: bool,
 ) -> Result<StagedAccountConfig, AccountFileError> {
     let lock = lock_account_dir(&path)?;
-    stage_account_text_at(path, &config.render(), first_run, lock)
+    let dir = path.parent().expect("account file has a parent directory");
+    let journal = crate::credential_recovery::Journal::at(&dir.join("state"), dir);
+    let mut staged = stage_account_text_at(path, &config.render(), first_run, lock)?;
+    staged.credential_journal = Some(journal);
+    Ok(staged)
 }
 
 /// Import only the addresses the user checked, preserving comments and
@@ -661,6 +692,7 @@ fn stage_account_text_at(
         lock,
         original: None,
         keep: None,
+        credential_journal: None,
     })
 }
 

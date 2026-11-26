@@ -794,9 +794,9 @@ fn keep(
             super::parse(account, snapshot, Some(id.as_str())).map_err(|err| err.to_string())?;
         crate::store::save_reconnect_config(&tx, config).map_err(|err| err.to_string())?;
         crate::agent::disable_account_grants_on(&tx, id).map_err(|err| err.to_string())?;
-        // Preserve the grant rows and their revisions if disconnect fails.
-        disconnect(account, directory).map_err(|err| err.to_string())?;
-        tx.commit().map_err(|err| err.to_string())
+        // A crash after removing the account file must leave grants revoked.
+        tx.commit().map_err(|err| err.to_string())?;
+        disconnect(account, directory).map_err(|err| err.to_string())
     })();
     if let Err(error) = &result
         && account
@@ -831,46 +831,6 @@ fn absent_ok(result: io::Result<()>) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::AgentGrant;
-
-    #[test]
-    fn a_failed_disconnect_preserves_grants_and_their_revisions() {
-        let root = tempfile::tempdir().unwrap();
-        let account = root.path().join("mail.toml");
-        fs::create_dir(&account).unwrap();
-        let store = Store::open_in_memory().unwrap();
-        let config = crate::AccountConfig::bridge(
-            "mail@example.test",
-            "user",
-            crate::PasswordSource::Inline("fixture".into()),
-        );
-        let id = config.account().id;
-        store.upsert_account(&config.account()).unwrap();
-        store
-            .set_agent_grant(
-                &id,
-                "atlas",
-                AgentGrant {
-                    enabled: true,
-                    read: true,
-                    triage: false,
-                    draft: false,
-                    annotate: false,
-                },
-            )
-            .unwrap();
-        let before = store.list_agent_grants().unwrap();
-        assert!(
-            keep(
-                &account,
-                &File::open(root.path()).unwrap(),
-                &id,
-                Some(&store),
-                &config.render()
-            )
-            .is_err()
-        );
-        assert_eq!(store.list_agent_grants().unwrap(), before);
-    }
 
     #[test]
     fn removal_waits_for_a_shared_catalog_lock() {
@@ -913,6 +873,37 @@ mod tests {
             );
         });
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn keep_commits_revocation_and_reconnect_snapshot_before_unlink() {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("mail.db");
+        let store = Store::open(&db).unwrap();
+        let id = AccountId("work".into());
+        let snapshot = "email = 'work@example.test'\npassword = 'fixture'\n";
+        let mut config = crate::AccountConfig::parse(snapshot).unwrap();
+        config.id = id.0.clone();
+        store.upsert_account(&config.account()).unwrap();
+        store
+            .set_agent_grant(&id, "atlas", AgentGrant::enabled(true, true, true))
+            .unwrap();
+
+        // A directory at the file path makes unlink fail deterministically.
+        let account = root.path().join("work.toml");
+        fs::create_dir(&account).unwrap();
+        let parent = File::open(root.path()).unwrap();
+        assert!(keep(&account, &parent, &id, Some(&store), snapshot).is_err());
+        drop(store);
+
+        let store = Store::open(&db).unwrap();
+        assert_eq!(
+            store.agent_grant(&id, "atlas").unwrap(),
+            AgentGrant::DISABLED
+        );
+        let reconnect = Store::kept_connection(&db, id.as_str()).unwrap();
+        assert_eq!(reconnect.email, config.email);
+        assert_eq!(reconnect.password, crate::PasswordSource::Keyring);
     }
 
     #[test]

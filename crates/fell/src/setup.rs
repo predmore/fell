@@ -45,7 +45,16 @@ setup options (anything missing is asked for on a terminal):
 
 /// Run `fell account ...`. Returns the process exit code.
 pub fn account_command(args: &[String]) -> i32 {
-    let result = match args.first().map(String::as_str) {
+    let command = args.first().map(String::as_str);
+    let recovery = match command {
+        Some("setup" | "list" | "remove" | "show" | "check") => Registry::resolve()
+            .ok()
+            .map(|registry| crate::credential_recovery::recover(&registry))
+            .transpose()
+            .map(|_| ()),
+        _ => Ok(()),
+    };
+    let result = recovery.and_then(|()| match command {
         Some("setup") => setup(&args[1..]),
         Some("list") if args.len() == 1 => list(),
         Some("remove") if args.len() == 2 => remove(&args[1]),
@@ -65,7 +74,7 @@ pub fn account_command(args: &[String]) -> i32 {
             Ok(())
         }
         Some(other) => Err(format!("unknown account command {other:?}\n\n{USAGE}")),
-    };
+    });
     match result {
         Ok(()) => 0,
         Err(err) => {
@@ -535,6 +544,18 @@ pub(crate) fn save_account(
     } else {
         None
     };
+    let journal = previous_secret
+        .as_deref()
+        .map(|secret| staged.back_up_credential(&new_key, secret))
+        .transpose()
+        .map_err(SaveAccountError::File)?;
+    let clear_journal = || {
+        if let Some(journal) = &journal
+            && journal.clear().is_err()
+        {
+            fell_core::diagnostic!(WARN, "Could not clear the account credential recovery file");
+        }
+    };
     let rollback_password = || {
         let result = match &previous_secret {
             Some(secret) => keyring.store(&new_key, secret),
@@ -542,6 +563,8 @@ pub(crate) fn save_account(
         };
         if result.is_err() {
             fell_core::diagnostic!(WARN, "Could not roll back the account credential");
+        } else {
+            clear_journal();
         }
     };
     if let Some(password) = &password {
@@ -567,6 +590,7 @@ pub(crate) fn save_account(
     }
     staged.publish_then(|result, published| {
         if result.is_ok() {
+            clear_journal();
             if let Some(old_key) = &old_key
                 && (old_key != &new_key || config.password != PasswordSource::Keyring)
                 && keyring.remove(old_key).is_err()
@@ -1116,6 +1140,7 @@ mod tests {
     fn connection_edit_keeps_a_working_key_across_publication() {
         use std::cell::{Cell, RefCell};
         use std::collections::HashMap;
+        use std::os::unix::fs::PermissionsExt;
         use std::panic::{AssertUnwindSafe, catch_unwind};
 
         use fell_core::credentials::KeyringError;
@@ -1124,6 +1149,7 @@ mod tests {
         struct Keyring {
             keys: RefCell<HashMap<String, String>>,
             interrupt_read: Cell<bool>,
+            interrupt_store: Cell<bool>,
             interrupt_remove: Cell<bool>,
             new_key: String,
             refuse_readback: Cell<bool>,
@@ -1150,6 +1176,7 @@ mod tests {
 
             fn store(&self, key: &str, password: &str) -> Result<(), KeyringError> {
                 self.keys.borrow_mut().insert(key.into(), password.into());
+                assert!(!self.interrupt_store.get());
                 Ok(())
             }
 
@@ -1161,7 +1188,11 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mail.toml");
+        let registry = Registry::at(dir.path().join("config"), dir.path().join("mail.db"));
+        let accounts = registry.directory();
+        let path = registry.path("mail").unwrap();
+        let state = accounts.join("state");
+        let journal = crate::credential_recovery::Journal::at(&state, &accounts);
         let stage = |config: &mut AccountConfig| {
             crate::mailbox::stage_account_config_at(path.clone(), config, false)
         };
@@ -1183,6 +1214,49 @@ mod tests {
                 .0
         };
         let save = || save_account(edited.clone(), false, Some(&original), &keyring, stage);
+
+        let mut new_password = original.clone();
+        new_password.password = PasswordSource::Inline("edited".into());
+        keyring.interrupt_store.set(true);
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                save_account(new_password, false, Some(&original), &keyring, stage)
+            }))
+            .is_err()
+        );
+        keyring.interrupt_store.set(false);
+        assert_eq!(
+            published().resolve_password_with(&keyring).unwrap(),
+            "edited"
+        );
+        let backups: Vec<_> = std::fs::read_dir(&state).unwrap().collect();
+        assert_eq!(backups.len(), 1);
+        let backup = backups.into_iter().next().unwrap().unwrap().path();
+        assert_eq!(
+            backup.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        journal.recover(&registry, &keyring).unwrap();
+        assert_eq!(
+            published().resolve_password_with(&keyring).unwrap(),
+            "fixture"
+        );
+        assert!(!backup.exists());
+
+        // A crash after the rename must keep the new keyring value, even
+        // though a password-only edit leaves the account TOML unchanged.
+        let staged = stage(&mut original.clone()).unwrap();
+        let key = original.credential_key();
+        staged.back_up_credential(&key, "fixture").unwrap();
+        keyring.store(&key, "edited").unwrap();
+        staged.publish().unwrap();
+        journal.recover(&registry, &keyring).unwrap();
+        assert_eq!(
+            published().resolve_password_with(&keyring).unwrap(),
+            "edited"
+        );
+        assert!(!backup.exists());
+        keyring.store(&key, "fixture").unwrap();
 
         let blocked = dir.path().join("blocked.toml");
         for mut candidate in [original.clone(), edited.clone()] {
