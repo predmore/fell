@@ -447,6 +447,8 @@ fn flag_value(flags: CopyFlags, kind: OutboxKind) -> Option<bool> {
         OutboxKind::Seen => flags.seen,
         OutboxKind::Flagged => flags.flagged,
         OutboxKind::Move
+        | OutboxKind::Expunge
+        | OutboxKind::UnflagTrash
         | OutboxKind::AppendDraft
         | OutboxKind::DeleteDraft
         | OutboxKind::AppendSent

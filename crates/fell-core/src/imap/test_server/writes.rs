@@ -1,7 +1,7 @@
 //! The test server's write-back verbs: `SELECT` and `UID MOVE`, plus the
 //! `STATUS`, `UID SEARCH HEADER Message-ID`, and Message-ID header fetch
 //! replay uses to find a moved message. The selected write connection also
-//! supports UID STORE for Seen and Flagged, with conditional conflicts.
+//! supports UID STORE, with conditional conflicts, and UID EXPUNGE.
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -16,12 +16,13 @@ use super::{
 pub(in crate::imap) struct WriteFixture {
     /// Advertise MOVE (RFC 6851).
     pub moves: bool,
-    /// Advertise UIDPLUS (RFC 4315): `UID MOVE` reports COPYUID.
+    /// Advertise UIDPLUS (RFC 4315): enable UID EXPUNGE and MOVE's COPYUID.
     pub uidplus: bool,
     /// Answer every `UID MOVE` with this NO text.
     pub refuse: Option<String>,
     /// Run the hook when the next `SELECT` arrives, then answer it with NO.
     pub before_refusing_select: Option<Box<dyn FnOnce() + Send>>,
+    pub refuse_select_mailbox: Option<String>,
     /// Answer `UID SEARCH HEADER Message-ID` with NO.
     pub refuse_search: bool,
     /// Return this many tagged-OK empty HEADER searches before finding the copy.
@@ -37,16 +38,19 @@ pub(in crate::imap) struct WriteFixture {
     pub close_after_moves: Option<u32>,
     /// Disconnect without applying the next `UID MOVE`.
     pub lose_before_move: bool,
-    /// Apply the next command with this verb (`"MOVE"`), then drop the
+    /// Apply the next UID command with this verb, then drop the
     /// connection before any reply.
     pub lose_reply_to: Option<&'static str>,
     pub lose_before_store: bool,
+    pub lose_before_expunge: bool,
+    pub refuse_expunge: bool,
     pub before_store: Option<Box<dyn FnOnce() + Send>>,
     pub refuse_store_uid: Option<u32>,
     pub read_only_mailbox: Option<String>,
     pub modified_no: bool,
     pub omit_store_modseq: bool,
     pub omit_fetch_flags: bool,
+    pub refuse_fetch_flags: bool,
     pub nomodseq: bool,
 }
 
@@ -75,16 +79,21 @@ pub(super) fn handle(
 ) -> bool {
     let reply = match verb {
         "SELECT" => {
-            let (hook, nomodseq, read_only) = {
+            let mailbox = mailbox_name(rest);
+            let (hook, nomodseq, read_only, refused) = {
                 let mut writes = writes.lock().expect("writes");
                 (
                     writes.before_refusing_select.take(),
                     writes.nomodseq,
-                    writes.read_only_mailbox.as_deref() == Some(mailbox_name(rest).as_str()),
+                    writes.read_only_mailbox.as_deref() == Some(mailbox.as_str()),
+                    writes.refuse_select_mailbox.as_deref() == Some(mailbox.as_str()),
                 )
             };
+            let refused = refused || hook.is_some();
             if let Some(hook) = hook {
                 hook();
+            }
+            if refused {
                 format!("{tag} NO SELECT refused\r\n")
             } else {
                 select(
@@ -188,6 +197,11 @@ pub(super) fn handle(
             } else if let Some(args) = strip_prefix_ignore(rest, "EXPUNGE ") {
                 if !selected_write || !writes.uidplus {
                     format!("{tag} BAD UID EXPUNGE unavailable\r\n")
+                } else if std::mem::take(&mut writes.lose_before_expunge) {
+                    let _ = out.stream.shutdown(std::net::Shutdown::Both);
+                    return true;
+                } else if writes.refuse_expunge {
+                    format!("{tag} NO UID EXPUNGE refused\r\n")
                 } else {
                     expunge_uid(tag, args, &mut state)
                 }
@@ -309,6 +323,9 @@ fn select(tag: &str, rest: &str, state: &TestState, nomodseq: bool, read_only: b
 }
 
 fn fetch_flag(tag: &str, args: &str, state: &TestState, writes: &WriteFixture) -> String {
+    if writes.refuse_fetch_flags {
+        return format!("{tag} NO UID FETCH refused\r\n");
+    }
     let uid = args
         .split_ascii_whitespace()
         .next()

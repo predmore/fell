@@ -2038,9 +2038,12 @@ mod tests {
 
     #[test]
     fn removal_notice_keeps_its_answer_key_when_the_middle_clause_does_not_fit() {
-        let prompt = "Remove 20 from Fell only?  ·  No undo  ·  y";
+        let prompt = "Delete from Trash for good?  ·  20 marked  ·  No undo  ·  y";
         let fitted = fit_notice(prompt, 34.0, |text| text.chars().count() as f32);
-        assert_eq!(fitted, "Remove 20 from Fell only?  ·  y");
+        assert_eq!(fitted, "Delete from Trash for good?  ·  y");
+        let local = "Server copy stays. Remove here?  ·  20 marked  ·  No undo  ·  y";
+        let fitted = fit_notice(local, 37.0, |text| text.chars().count() as f32);
+        assert_eq!(fitted, "Server copy stays. Remove here?  ·  y");
     }
 
     #[test]

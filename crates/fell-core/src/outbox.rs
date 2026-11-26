@@ -26,23 +26,24 @@
 //! both rows are retired without a notice.
 //!
 //! Moves go out only as `UID MOVE` (RFC 6851). A server without MOVE keeps
-//! the move in Fell. Bridge labeling separately copies to a label mailbox
-//! and uses UID EXPUNGE only inside that mailbox.
+//! the move in Fell. A permanent delete queues known Trash UIDs, including
+//! those confirmed by a move that was pending at purge. Each UID is expunged
+//! individually on servers that advertise UIDPLUS.
 //!
 //! Turning write-back off starts a new generation, and rows not sent yet
-//! are deleted. No row from an earlier generation is ever sent or
-//! reversed, even when write-back is turned on again or a command on the
-//! wire when it went off is answered late.
+//! are retired. Earlier writes cannot resume, even when write-back is turned
+//! on again. A Trash expunge that may have marked a UID `\Deleted` becomes
+//! cleanup that can only remove that flag.
 //!
 //! Label, read, and star edits share the queue. Read and star keep one pending value per copy
-//! and flag. A permanent delete from Trash is never queued.
+//! and flag.
 //!
 //! [`WriteTx`]: crate::store::WriteTx
 
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::account::AccountId;
-use crate::folders::FolderRoles;
+use crate::folders::{FolderRole, FolderRoles, RoleSource};
 use crate::store::Store;
 use crate::{Error, Result};
 
@@ -56,8 +57,11 @@ CREATE TABLE IF NOT EXISTS write_back_accounts (
     enabled INTEGER NOT NULL,
     -- Bumped each time write-back is turned off; see the module doc.
     generation INTEGER NOT NULL DEFAULT 0,
-    -- 1 once the user was told the server has no MOVE.
-    move_missing INTEGER NOT NULL DEFAULT 0
+    -- 1 once the user was told the corresponding capability is missing.
+    move_missing INTEGER NOT NULL DEFAULT 0,
+    uidplus_missing INTEGER NOT NULL DEFAULT 0,
+    -- NULL until a sync or write session has observed the capability.
+    uidplus INTEGER
 ) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS server_outbox (
@@ -99,12 +103,17 @@ CREATE TABLE IF NOT EXISTS server_outbox (
     -- Exclusive upper UID bound from the most recent MOVE recovery check.
     -- NULL before a usable UIDNEXT is observed, including on older rows.
     move_recovery_end INTEGER,
+    -- Purge requested while this move into Trash was still pending.
+    trash_purge_action_id INTEGER,
+    -- The purge permitted a later expunge when the move placed the copy.
+    trash_purge_expunge INTEGER NOT NULL DEFAULT 1,
     -- Undo's reverse of a row that was sent but not settled: that row's
     -- id. The reverse moves the copy that row places. 0 otherwise.
     reverses INTEGER NOT NULL DEFAULT 0,
     flag_value INTEGER,
     flag_modseq BLOB,
-    -- Known value of the targeted flag at flag_modseq.
+    -- Known value of the targeted flag at flag_modseq, or of \\Deleted
+    -- before a Trash STORE (NULL if an older build never checked).
     flag_base INTEGER,
     -- An earlier flag write may have reached the server. Recover its result
     -- before replaying the replacement, without sending the old value again.
@@ -135,6 +144,12 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
         "move_missing",
         "INTEGER NOT NULL DEFAULT 0",
     ),
+    (
+        "write_back_accounts",
+        "uidplus_missing",
+        "INTEGER NOT NULL DEFAULT 0",
+    ),
+    ("write_back_accounts", "uidplus", "INTEGER"),
     ("server_outbox", "generation", "INTEGER NOT NULL DEFAULT 0"),
     ("server_outbox", "sent", "INTEGER NOT NULL DEFAULT 0"),
     (
@@ -148,6 +163,12 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
         "INTEGER NOT NULL DEFAULT 0",
     ),
     ("server_outbox", "move_recovery_end", "INTEGER"),
+    ("server_outbox", "trash_purge_action_id", "INTEGER"),
+    (
+        "server_outbox",
+        "trash_purge_expunge",
+        "INTEGER NOT NULL DEFAULT 1",
+    ),
     ("server_outbox", "reverses", "INTEGER NOT NULL DEFAULT 0"),
     ("server_outbox", "flag_value", "INTEGER"),
     ("server_outbox", "flag_modseq", "BLOB"),
@@ -178,6 +199,10 @@ pub enum OutboxKind {
     /// Move one copy from `source` to `target` (archive, move, delete to
     /// Trash, spam, and not spam).
     Move,
+    /// Permanently delete one recorded Trash copy.
+    Expunge,
+    /// Clear the Deleted flag of a canceled Trash expunge.
+    UnflagTrash,
     AppendSent,
     AppendDraft,
     DeleteDraft,
@@ -191,6 +216,8 @@ impl OutboxKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::Move => "move",
+            Self::Expunge => "expunge",
+            Self::UnflagTrash => "unflag_trash",
             Self::AppendSent => "append_sent",
             Self::AppendDraft => "append_draft",
             Self::DeleteDraft => "delete_draft",
@@ -204,6 +231,8 @@ impl OutboxKind {
     fn parse(raw: &str) -> Result<Self> {
         match raw {
             "move" => Ok(Self::Move),
+            "expunge" => Ok(Self::Expunge),
+            "unflag_trash" => Ok(Self::UnflagTrash),
             "append_sent" => Ok(Self::AppendSent),
             "append_draft" => Ok(Self::AppendDraft),
             "delete_draft" => Ok(Self::DeleteDraft),
@@ -222,6 +251,8 @@ impl OutboxKind {
     pub(crate) fn flag_name(self) -> Option<&'static str> {
         match self {
             Self::Move
+            | Self::Expunge
+            | Self::UnflagTrash
             | Self::AppendSent
             | Self::AppendDraft
             | Self::DeleteDraft
@@ -242,9 +273,7 @@ pub enum OutboxState {
     Done,
     /// Never applied: see `error`.
     Dropped,
-    /// Copied by an earlier build of write-back on a server without MOVE,
-    /// with the source copy not yet expunged. Fell no longer copies, so it
-    /// never finishes one: reported once, then Dropped.
+    /// A server copy Fell left in place. Reported once, then Dropped.
     Abandoned,
 }
 
@@ -305,6 +334,15 @@ pub struct OutboxEntry {
     pub flag_value: Option<bool>,
     pub(crate) flag_modseq: Option<u64>,
     pub(crate) flag_base: Option<bool>,
+    pub(crate) trash_purge_action_id: Option<i64>,
+}
+
+impl OutboxEntry {
+    pub(crate) fn owns_trash_mark(&self) -> bool {
+        matches!(self.kind, OutboxKind::Expunge | OutboxKind::UnflagTrash)
+            && self.sent
+            && self.flag_base == Some(false)
+    }
 }
 
 /// What one replay pass did ([`crate::AccountConfig::replay_outbox`]).
@@ -365,6 +403,14 @@ pub enum DropReason {
     /// The server has no MOVE. Fell does not copy and expunge instead, so
     /// the change stays in Fell.
     NoMove,
+    /// The server has no UIDPLUS, so permanent deletion stays in Fell.
+    NoUidPlus,
+    /// A permanent delete stayed local and the server copy was kept.
+    ServerCopyKept,
+    /// A move into Trash may have placed a copy that Fell could not verify.
+    TrashCopyUnconfirmed,
+    /// Fell could not clear a delete mark it may have set.
+    TrashMarkNotCleared,
     /// An earlier build copied the message to the target on a server
     /// without MOVE and never expunged the source copy. Fell leaves it.
     Abandoned,
@@ -373,15 +419,15 @@ pub enum DropReason {
 const ENTRY_COLS: &str = "id, kind, state, action_id, message_id, source_folder, source_mailbox,
     uidvalidity, uid, target_folder, target_mailbox, placed_uidvalidity, placed_uid,
     attempts, retry_unix, error, generation, sent, reverses,
-    flag_value, flag_modseq, flag_base, target_uidvalidity, target_uidnext, move_recovery_end";
+    flag_value, flag_modseq, flag_base, target_uidvalidity, target_uidnext, move_recovery_end,
+    trash_purge_action_id";
 
 impl Store {
     /// Turn write-back on or off for the account (`write_back` in
     /// `account.toml`). Off is the default.
     ///
-    /// Turning it off starts a new generation: rows never sent are deleted,
-    /// and Fell sends nothing more for any row queued before, even if
-    /// write-back comes back on.
+    /// Turning it off starts a new generation and cancels pending writes.
+    /// A Trash expunge that may have marked its UID is kept for flag cleanup.
     pub fn set_write_back(&self, account_id: &AccountId, enabled: bool) -> Result<()> {
         let tx = crate::store::immediate_transaction(self.connection())?;
         ensure_schema(&tx)?;
@@ -396,6 +442,13 @@ impl Store {
         let enabled = enabled(&tx, account_id)?;
         tx.commit()?;
         Ok(enabled)
+    }
+
+    /// Whether write-back can schedule a permanent delete in confirmed Trash.
+    /// A server that has not yet advertised its capabilities is eligible.
+    pub fn trash_expunge_available(&self, account: &AccountId) -> Result<bool> {
+        Ok(trash_expunge_enabled(self.connection(), account)?
+            && confirmed_trash(self.connection(), account)?.is_some())
     }
 
     /// Every outbox row on the account, oldest first.
@@ -432,7 +485,21 @@ pub(crate) fn set_write_back_on(
             )?;
         }
         conn.execute(
-            "DELETE FROM server_outbox WHERE account_id = ?1 AND state = 'pending'",
+            "UPDATE server_outbox SET kind = 'unflag_trash', retry_unix = 0
+             WHERE account_id = ?1 AND kind = 'expunge' AND state = 'pending' AND sent",
+            params![account_id.as_str()],
+        )?;
+        conn.execute(
+            "UPDATE server_outbox
+             SET state = 'abandoned', settled_unix = ?2,
+                 error = 'write-back turned off'
+             WHERE account_id = ?1 AND state = 'pending'
+               AND (kind = 'expunge' OR (kind = 'move' AND trash_purge_action_id IS NOT NULL))",
+            params![account_id.as_str(), now_unix()],
+        )?;
+        conn.execute(
+            "DELETE FROM server_outbox
+             WHERE account_id = ?1 AND state = 'pending' AND kind != 'unflag_trash'",
             params![account_id.as_str()],
         )?;
     }
@@ -460,9 +527,12 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_outbox_draft
          ON server_outbox(account_id, draft_id, id) WHERE draft_id IS NOT NULL;",
     )?;
-    // Earlier builds of write-back copied, flagged, and expunged on a server
-    // without MOVE. A row they left half done is never finished: the
-    // source copy stays (maybe flagged `\Deleted`), and it is reported once.
+    conn.execute_batch(
+        // A canceled purged move from round 2 still names its original UID.
+        "UPDATE server_outbox SET kind = 'move'
+         WHERE kind = 'expunge' AND trash_purge_action_id IS NOT NULL;",
+    )?;
+    // Earlier write-back builds left half-done copies when MOVE was absent.
     conn.execute(
         "UPDATE server_outbox
          SET state = 'abandoned', error = 'half-done copy from an earlier build',
@@ -679,6 +749,100 @@ pub(crate) fn queue_moves(
             )?;
         }
     }
+    Ok(())
+}
+
+pub(crate) fn confirmed_trash(
+    conn: &Connection,
+    account: &AccountId,
+) -> Result<Option<(String, String)>> {
+    let Some(roles) = crate::store::listed_folder_roles(conn, account)? else {
+        return Ok(None);
+    };
+    Ok(roles
+        .get(FolderRole::Trash)
+        .filter(|trash| {
+            trash.source != RoleSource::Name
+                && roles.is(FolderRole::Trash, &trash.name)
+                && !roles.is_view(&trash.name)
+        })
+        .map(|trash| (trash.name.clone(), trash.raw.clone())))
+}
+
+fn trash_expunge_enabled(conn: &Connection, account: &AccountId) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT enabled AND COALESCE(uidplus, NOT uidplus_missing)
+             FROM write_back_accounts WHERE account_id = ?1",
+            params![account.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(false))
+}
+
+pub(crate) fn observe_uidplus(
+    conn: &Connection,
+    account: &AccountId,
+    advertised: bool,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO write_back_accounts (account_id, enabled, uidplus) VALUES (?1, 0, ?2)
+         ON CONFLICT(account_id) DO UPDATE SET uidplus = excluded.uidplus,
+             uidplus_missing = CASE WHEN excluded.uidplus THEN 0 ELSE uidplus_missing END
+         WHERE uidplus IS NOT excluded.uidplus",
+        params![account.as_str(), advertised],
+    )?;
+    Ok(())
+}
+
+/// Queue concrete Trash copies and record follow-up work for pending moves.
+/// Use the purge's new tombstones before it inherits any from earlier actions.
+pub(crate) fn queue_expunges(conn: &Connection, account: &AccountId, action_id: i64) -> Result<()> {
+    if !enabled(conn, account)? {
+        return Ok(());
+    }
+    let generation = generation(conn, account)?;
+    let trash = if trash_expunge_enabled(conn, account)? {
+        confirmed_trash(conn, account)?
+    } else {
+        None
+    };
+    conn.execute(
+        "UPDATE server_outbox AS m SET trash_purge_action_id = ?1, trash_purge_expunge = ?4
+         WHERE m.account_id = ?2 AND m.kind = 'move' AND m.state = 'pending'
+           AND m.generation = ?3 AND EXISTS (
+               SELECT 1 FROM local_folder_tombstones t
+               WHERE t.action_id = ?1 AND t.account_id = ?2 AND t.message_id = m.message_id
+                 AND t.folder = m.target_folder COLLATE NOCASE
+           )",
+        params![action_id, account.as_str(), generation, trash.is_some()],
+    )?;
+    let Some((folder, mailbox)) = trash else {
+        return Ok(());
+    };
+    conn.execute(
+        "INSERT INTO server_outbox
+             (account_id, kind, state, action_id, message_id, source_folder,
+              source_mailbox, uidvalidity, uid, target_folder, created_unix, generation)
+         SELECT DISTINCT c.account_id, 'expunge', 'pending', t.action_id, c.message_id, c.folder,
+                ?4, c.uidvalidity, c.uid, '', ?6, ?7
+         FROM local_folder_tombstones t JOIN message_copies c
+           ON c.account_id = t.account_id AND c.message_id = t.message_id
+           AND c.folder = t.folder COLLATE NOCASE
+         WHERE t.action_id = ?1 AND t.account_id = ?2 AND t.folder = ?3 COLLATE NOCASE
+           AND c.mailbox = ?5 AND c.uidvalidity > 0 AND c.uid > 0
+         ORDER BY c.message_id, c.uidvalidity, c.uid",
+        params![
+            action_id,
+            account.as_str(),
+            folder,
+            mailbox,
+            crate::imap::escape_mailbox(&mailbox),
+            now_unix(),
+            generation,
+        ],
+    )?;
     Ok(())
 }
 
@@ -948,6 +1112,7 @@ fn select_entries(
                 row.get::<_, Option<bool>>(21)?,
                 (row.get::<_, u32>(22)?, row.get::<_, u32>(23)?),
                 row.get::<_, Option<u32>>(24)?,
+                row.get::<_, Option<i64>>(25)?,
             ),
         ))
     })?;
@@ -979,6 +1144,7 @@ fn select_entries(
                 flag_base,
                 target_bound,
                 move_recovery_end,
+                trash_purge_action_id,
             ),
         ) = row?;
         out.push(OutboxEntry {
@@ -1006,6 +1172,7 @@ fn select_entries(
             flag_value,
             flag_modseq,
             flag_base,
+            trash_purge_action_id,
         });
     }
     Ok(out)
@@ -1014,15 +1181,16 @@ fn select_entries(
 // Replay's side. Each call is its own short write transaction, so the
 // window's actions never wait on the network.
 
-/// Rows not yet applied in this generation, oldest first, when write-back
-/// is on. Settled rows past [`KEEP_SETTLED_SECS`] are pruned on the way.
-pub(crate) fn unfinished(store: &Store, account_id: &AccountId) -> Result<Vec<OutboxEntry>> {
+/// Pending Trash cleanup, then pending writes when write-back is on.
+/// Settled rows past [`KEEP_SETTLED_SECS`] are pruned on the way.
+pub(crate) fn unfinished(
+    store: &Store,
+    account_id: &AccountId,
+    write_back: bool,
+) -> Result<Vec<OutboxEntry>> {
     let tx = crate::store::immediate_transaction(store.connection())?;
     ensure_schema(&tx)?;
-    if !enabled(&tx, account_id)? {
-        tx.commit()?;
-        return Ok(Vec::new());
-    }
+    let allow_writes = i64::from(write_back && enabled(&tx, account_id)?);
     tx.execute(
         "DELETE FROM server_outbox AS settled
          WHERE account_id = ?1 AND state IN ('done', 'dropped') AND settled_unix < ?2
@@ -1032,14 +1200,16 @@ pub(crate) fn unfinished(store: &Store, account_id: &AccountId) -> Result<Vec<Ou
         params![account_id.as_str(), now_unix() - KEEP_SETTLED_SECS, generation(&tx, account_id)?],
     )?;
     let generation = generation(&tx, account_id)?;
-    labels::bind_keyword_copies(&tx, account_id, generation)?;
+    if allow_writes != 0 {
+        labels::bind_keyword_copies(&tx, account_id, generation)?;
+    }
     let entries = select_entries(
         &tx,
         &format!(
             "SELECT {ENTRY_COLS} FROM server_outbox
              WHERE account_id = ?1 AND state = 'pending'
-               AND generation = {generation}
-             ORDER BY COALESCE(keyword_parent, id), id"
+               AND (kind = 'unflag_trash' OR ({allow_writes} AND generation = {generation}))
+             ORDER BY kind != 'unflag_trash', COALESCE(keyword_parent, id), id"
         ),
         account_id,
     )?;
@@ -1049,7 +1219,12 @@ pub(crate) fn unfinished(store: &Store, account_id: &AccountId) -> Result<Vec<Ou
 
 /// Whether any row is due now, without resolving the password or opening a
 /// connection when none is.
-pub(crate) fn any_due(store: &Store, account_id: &AccountId, append_sent: bool) -> Result<bool> {
+pub(crate) fn any_due(
+    store: &Store,
+    account_id: &AccountId,
+    write_back: bool,
+    append_sent: bool,
+) -> Result<bool> {
     let tx = crate::store::immediate_transaction(store.connection())?;
     ensure_schema(&tx)?;
     let due: Option<i64> = tx
@@ -1057,10 +1232,11 @@ pub(crate) fn any_due(store: &Store, account_id: &AccountId, append_sent: bool) 
             "SELECT 1 FROM server_outbox
              WHERE account_id = ?1 AND state = 'pending' AND retry_unix <= ?2
                AND (?3 OR kind != 'append_sent')
-               AND generation = (SELECT COALESCE(MAX(generation), 0)
-                                 FROM write_back_accounts WHERE account_id = ?1)
+               AND (kind = 'unflag_trash' OR (?4 AND generation IN (
+                   SELECT generation FROM write_back_accounts WHERE account_id = ?1 AND enabled
+               )))
              LIMIT 1",
-            params![account_id.as_str(), now_unix(), append_sent],
+            params![account_id.as_str(), now_unix(), append_sent, write_back],
             |row| row.get(0),
         )
         .optional()?;
@@ -1249,24 +1425,121 @@ pub(crate) fn mark_sent(
     Ok(marked)
 }
 
-/// `report` as the status line should have it. Two notices are said only once:
+/// Check the generation again before each mutating command of a Trash purge.
+pub(crate) fn mark_expunge_sent(
+    store: &Store,
+    account: &AccountId,
+    entry: &OutboxEntry,
+    flag_base: bool,
+) -> Result<bool> {
+    let tx = crate::store::immediate_transaction(store.connection())?;
+    let changed = tx.execute(
+        "UPDATE server_outbox SET sent = 1, flag_base = ?4
+         WHERE id = ?1 AND account_id = ?2 AND kind = 'expunge' AND state = 'pending'
+           AND generation = ?3 AND EXISTS (
+               SELECT 1 FROM write_back_accounts w WHERE w.account_id = ?2
+                 AND w.enabled AND w.generation = ?3
+           )",
+        params![entry.id, account.as_str(), entry.generation, flag_base],
+    )?;
+    tx.commit()?;
+    Ok(changed != 0)
+}
+
+/// A cleanup can race with disabling write-back. Keep its retry budget
+/// when the same row becomes cleanup-only in the new generation.
+pub(crate) fn retry_trash(
+    store: &Store,
+    id: i64,
+    retry_unix: i64,
+    error: &str,
+    last: bool,
+    cleanup_pending: bool,
+) -> Result<Option<OutboxState>> {
+    let state: Option<String> = store.connection().query_row(
+        "UPDATE server_outbox
+         SET attempts = attempts + 1, retry_unix = ?2, error = ?3,
+             state = CASE WHEN kind = 'unflag_trash' AND NOT ?6 THEN 'abandoned'
+                          WHEN ?4 THEN 'dropped' ELSE state END,
+             settled_unix = CASE WHEN ?4 OR (kind = 'unflag_trash' AND NOT ?6) THEN ?5 ELSE NULL END,
+             sent = CASE WHEN ?6 THEN sent ELSE 0 END
+         WHERE id = ?1 AND kind IN ('expunge', 'unflag_trash') AND state = 'pending'
+         RETURNING state",
+        params![id, retry_unix, error, last, now_unix(), cleanup_pending],
+        |row| row.get(0),
+    ).optional()?;
+    state.as_deref().map(OutboxState::parse).transpose()
+}
+
+pub(crate) fn finish_trash_cleanup(store: &Store, id: i64, kept: bool) -> Result<bool> {
+    // A cancellation during cleanup turns the remaining notice into an
+    // abandoned-row notice, even when replay started with an active expunge.
+    Ok(store
+        .connection()
+        .query_row(
+            "UPDATE server_outbox SET
+             state = CASE WHEN ?2 AND kind = 'unflag_trash' THEN 'abandoned' ELSE 'dropped' END,
+             settled_unix = ?3, sent = 0, error = 'Trash expunge canceled'
+         WHERE id = ?1 AND kind IN ('expunge', 'unflag_trash') AND state = 'pending'
+         RETURNING kind = 'expunge'",
+            params![id, kept, now_unix()],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(false))
+}
+
+/// An expunge authorized before a toggle may still complete on the wire.
+pub(crate) fn finish_expunge(
+    store: &Store,
+    account: &AccountId,
+    entry: &OutboxEntry,
+) -> Result<bool> {
+    let tx = crate::store::immediate_transaction(store.connection())?;
+    let changed = tx.execute(
+        "UPDATE server_outbox SET state = 'done', error = '', settled_unix = ?2
+         WHERE id = ?1 AND state = 'pending' AND kind IN ('expunge', 'unflag_trash')",
+        params![entry.id, now_unix()],
+    )?;
+    if changed != 0 {
+        tx.execute(
+            "DELETE FROM message_copies
+             WHERE account_id = ?1 AND mailbox = ?2 AND uidvalidity = ?3 AND uid = ?4",
+            params![
+                account.as_str(),
+                entry
+                    .source_mailbox
+                    .as_deref()
+                    .map(crate::imap::escape_mailbox),
+                entry.uidvalidity,
+                entry.uid,
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(changed != 0)
+}
+
+/// `report` as the status line should have it. These notices are said only once:
 ///
-/// - "no MOVE": recorded as told when it appears, and left out after that;
-/// - a half-done copy from an earlier build ([`take_abandoned`]): taken only
-///   by a report with nothing else to say, so it waits for the next pass.
+/// - missing MOVE or UIDPLUS: recorded as told when they appear;
+/// - server copies left in place ([`take_abandoned`]): taken only by a
+///   report with nothing else to say, so they can wait for the next pass.
 pub(crate) fn report_for_status(
     store: &Store,
     account_id: &AccountId,
     mut report: ReplayReport,
 ) -> Result<ReplayReport> {
-    let no_move = report
-        .dropped
-        .iter()
-        .any(|dropped| dropped.reason == DropReason::NoMove);
-    if no_move && note_move_missing(store, account_id, true)? {
-        report
+    for capability in [Capability::Move, Capability::UidPlus] {
+        let reason = capability.drop_reason();
+        if report
             .dropped
-            .retain(|dropped| dropped.reason != DropReason::NoMove);
+            .iter()
+            .any(|dropped| dropped.reason == reason)
+            && note_capability_missing(store, account_id, capability, true)?
+        {
+            report.dropped.retain(|dropped| dropped.reason != reason);
+        }
     }
     if report.dropped.is_empty() && !report.flag_recovery_delayed && !report.sent_append_delayed {
         report.dropped = take_abandoned(store, account_id)?;
@@ -1274,28 +1547,48 @@ pub(crate) fn report_for_status(
     Ok(report)
 }
 
-/// Whether the user was already told this account's server has no MOVE,
-/// after recording that it has (`missing`) or has not. The notice is shown
-/// once, not on every archive.
-pub(crate) fn note_move_missing(
+#[derive(Clone, Copy)]
+pub(crate) enum Capability {
+    Move,
+    UidPlus,
+}
+
+impl Capability {
+    fn drop_reason(self) -> DropReason {
+        match self {
+            Self::Move => DropReason::NoMove,
+            Self::UidPlus => DropReason::NoUidPlus,
+        }
+    }
+}
+
+/// Whether a missing capability was already reported for this account.
+/// Observing the capability again resets the notice.
+pub(crate) fn note_capability_missing(
     store: &Store,
     account_id: &AccountId,
+    capability: Capability,
     missing: bool,
 ) -> Result<bool> {
     let tx = crate::store::immediate_transaction(store.connection())?;
     ensure_schema(&tx)?;
+    let column = match capability {
+        Capability::Move => "move_missing",
+        Capability::UidPlus => "uidplus_missing",
+    };
     let changed = tx.execute(
-        "UPDATE write_back_accounts SET move_missing = ?2
-         WHERE account_id = ?1 AND move_missing != ?2",
+        &format!(
+            "UPDATE write_back_accounts SET {column} = ?2
+             WHERE account_id = ?1 AND {column} != ?2"
+        ),
         params![account_id.as_str(), i64::from(missing)],
     )?;
     tx.commit()?;
     Ok(missing && changed == 0)
 }
 
-/// Half-done copies an earlier build left (see [`OutboxState::Abandoned`]),
-/// each reported once. Opens no connection, so it runs with write-back off
-/// too.
+/// Server copies left in place, each reported once. Opens no connection,
+/// so it runs with write-back off too.
 pub(crate) fn take_abandoned(store: &Store, account_id: &AccountId) -> Result<Vec<DroppedWrite>> {
     let tx = crate::store::immediate_transaction(store.connection())?;
     ensure_schema(&tx)?;
@@ -1315,11 +1608,26 @@ pub(crate) fn take_abandoned(store: &Store, account_id: &AccountId) -> Result<Ve
     tx.commit()?;
     Ok(abandoned
         .into_iter()
-        .map(|entry| DroppedWrite {
-            kind: entry.kind,
-            source_folder: entry.source_folder,
-            target_folder: entry.target_folder,
-            reason: DropReason::Abandoned,
+        .map(|entry| {
+            let reason = if entry.trash_purge_action_id.is_some() && entry.sent {
+                DropReason::TrashCopyUnconfirmed
+            } else if matches!(entry.kind, OutboxKind::Expunge | OutboxKind::UnflagTrash)
+                || entry.trash_purge_action_id.is_some()
+            {
+                DropReason::ServerCopyKept
+            } else {
+                DropReason::Abandoned
+            };
+            DroppedWrite {
+                kind: if reason != DropReason::Abandoned {
+                    OutboxKind::Expunge
+                } else {
+                    entry.kind
+                },
+                source_folder: entry.source_folder,
+                target_folder: entry.target_folder,
+                reason,
+            }
         })
         .collect())
 }
@@ -1330,7 +1638,7 @@ pub(crate) enum Outcome<'a> {
     /// or found in the target. A move whose new copy is not known is not
     /// done: it stays [`Outcome::Retry`] until it is dropped, so the source
     /// copy stays in `message_copies` until a new one replaces it.
-    Done { placed: (u32, u32) },
+    Done { placed: (u32, u32), uidplus: bool },
     /// Try again at `retry_unix`. `counts` is false for a dropped connection,
     /// which says nothing about the row. `refused`: a NO or BAD reply or
     /// recovery confirmed the MOVE did not land. The next try can send again.
@@ -1415,8 +1723,8 @@ pub(crate) fn settle(
         tx.commit()?;
         return Ok(Settled::Retired);
     }
-    let placed = match outcome {
-        Outcome::Done { placed } => placed,
+    let (placed, uidplus) = match outcome {
+        Outcome::Done { placed, uidplus } => (placed, uidplus),
         Outcome::Retry {
             error,
             retry_unix,
@@ -1531,11 +1839,56 @@ pub(crate) fn settle(
         ],
     )?;
     move_copy(&tx, account_id, &sent)?;
+    queue_placed_expunge(&tx, account_id, &sent, uidplus, now)?;
     if undone_meanwhile {
         queue_reverse(&tx, account_id, &sent, now)?;
     }
     tx.commit()?;
     Ok(Settled::Recorded)
+}
+
+fn queue_placed_expunge(
+    conn: &Connection,
+    account: &AccountId,
+    moved: &OutboxEntry,
+    uidplus: bool,
+    now: i64,
+) -> Result<()> {
+    let (purge, authorized): (Option<i64>, bool) = conn.query_row(
+        "SELECT trash_purge_action_id, trash_purge_expunge FROM server_outbox WHERE id = ?1",
+        params![moved.id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let (Some(purge), Some(mailbox), Some(validity), Some(uid)) = (
+        purge,
+        moved.target_mailbox.as_deref(),
+        moved.placed_uidvalidity,
+        moved.placed_uid,
+    ) else {
+        return Ok(());
+    };
+    let eligible = authorized
+        && uidplus
+        && validity != 0
+        && uid != 0
+        && confirmed_trash(conn, account)?.is_some_and(|(folder, raw)| {
+            mailbox == raw && moved.target_folder.eq_ignore_ascii_case(&folder)
+        });
+    conn.execute(
+        "INSERT INTO server_outbox
+             (account_id, kind, state, action_id, message_id, source_folder,
+              source_mailbox, uidvalidity, uid, target_folder, created_unix, settled_unix, generation)
+         SELECT ?1, 'expunge', CASE WHEN ?2 THEN 'pending' ELSE 'abandoned' END,
+                ?3, ?4, ?5, ?6, ?7, ?8, '', ?9, CASE WHEN ?2 THEN NULL ELSE ?9 END, ?10
+         WHERE NOT EXISTS (
+             SELECT 1 FROM server_outbox
+             WHERE account_id = ?1 AND kind = 'expunge' AND action_id = ?3
+               AND source_mailbox = ?6 AND uidvalidity = ?7 AND uid = ?8
+         )",
+        params![account.as_str(), eligible, purge, moved.message_id, moved.target_folder,
+                mailbox, validity, uid, now, moved.generation],
+    )?;
+    Ok(())
 }
 
 /// If undo queued a reverse of row `id`, drop both: `id` never reached the
@@ -1605,6 +1958,13 @@ pub(crate) fn give_up_move(
         } else {
             Some(DropReason::UnconfirmedMove)
         }
+    } else if tx.query_row(
+        "SELECT trash_purge_action_id IS NOT NULL FROM server_outbox WHERE id = ?1",
+        params![entry.id],
+        |row| row.get::<_, bool>(0),
+    )? {
+        // The purge may have been committed while MOVE was in flight.
+        Some(DropReason::TrashCopyUnconfirmed)
     } else if observed == MoveSource::Gone {
         Some(DropReason::MoveSourceGone)
     } else {

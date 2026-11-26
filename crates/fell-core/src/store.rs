@@ -881,6 +881,9 @@ impl Store {
         observer: Option<&mut inbox_arrivals::Observer<'_>>,
     ) -> Result<DeltaWrites> {
         let mut tx = self.begin_sync_write()?;
+        if let Some(uidplus) = delta.uidplus {
+            crate::outbox::observe_uidplus(&tx, account_id, uidplus)?;
+        }
         let mut merge_roles = MergeRoles::new(delta.roles.as_ref());
         let bridge = (!delta.flags.is_empty() || !delta.links.is_empty())
             && views::is_bridge(&tx, account_id)?;

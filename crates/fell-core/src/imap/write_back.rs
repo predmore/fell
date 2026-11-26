@@ -34,8 +34,8 @@ use crate::Error;
 use crate::account::AccountId;
 use crate::folders::{FolderRole, FolderRoles};
 use crate::outbox::{
-    self, DropReason, DroppedWrite, MoveSource, OutboxEntry, OutboxKind, Outcome, ReplayReport,
-    Reversed, Settled, drafts,
+    self, Capability, DropReason, DroppedWrite, MoveSource, OutboxEntry, OutboxKind, Outcome,
+    ReplayReport, Reversed, Settled, drafts,
     flags::{self, FetchReason, Observation, Progress},
 };
 use crate::store::{Store, copies::CopyFlags};
@@ -45,6 +45,7 @@ use super::session::{FlagReply, Placed, WriteError, WriteSession, quote_imap};
 use super::{ImapConfig, listed_mailboxes};
 
 mod labels;
+mod trash;
 
 /// Refusals (or "not on the server yet") before a row is dropped.
 pub(crate) const MAX_ATTEMPTS: u32 = 5;
@@ -69,6 +70,7 @@ pub(super) fn replay_with(
     config: &ImapConfig,
     account_id: &AccountId,
     store: &Store,
+    write_back: bool,
     append_sent: bool,
     before_send: &dyn Fn(),
 ) -> crate::Result<ReplayReport> {
@@ -77,7 +79,7 @@ pub(super) fn replay_with(
     if guard.is_none() && store.db_path().is_some() {
         return Ok(ReplayReport::default());
     }
-    let mut entries = outbox::unfinished(store, account_id)?;
+    let mut entries = outbox::unfinished(store, account_id, write_back)?;
     if !append_sent {
         entries.retain(|entry| entry.kind != OutboxKind::AppendSent);
     }
@@ -102,16 +104,22 @@ pub(super) fn replay_with(
         append_roles: FolderRoles::default(),
         overrides: &config.folder_overrides,
         selected: None,
+        uncleared_trash: entries
+            .iter()
+            .filter(|entry| entry.owns_trash_mark())
+            .map(|entry| entry.id)
+            .collect(),
         before_send,
         report: &mut report,
     };
     let result = match WriteSession::open(config) {
         Ok(mut session) => {
-            let result = pass.run(&mut session);
+            let result = pass.run(config, &mut session);
             if !matches!(
                 &result,
-                Err(Stop::Connection(_) | Stop::AppendCheckDisconnected(_))
-            ) {
+                Err(Stop::Connection(_) | Stop::Store(_) | Stop::AppendCheckDisconnected(_))
+            ) && pass.safe_to_logout()
+            {
                 session.logout();
             }
             result
@@ -156,7 +164,8 @@ pub(super) fn replay_with(
         Err(
             Stop::Connection(err)
             | Stop::AppendCheckDisconnected(err)
-            | Stop::DraftCleanupDisconnected(err),
+            | Stop::DraftCleanupDisconnected(err)
+            | Stop::TrashDisconnected(err),
         ) => {
             report.interrupted = Some(err.to_string());
         }
@@ -174,6 +183,8 @@ enum Stop {
     AppendRefused(String),
     DraftCleanupRefused(String),
     DraftCleanupDisconnected(Error),
+    /// Retry unrelated rows on a fresh session.
+    TrashDisconnected(Error),
     AppendCheck(String),
     AppendCheckDisconnected(Error),
     /// The row is no longer in this write-back generation: send nothing more.
@@ -232,18 +243,25 @@ struct Pass<'a> {
     overrides: &'a [(FolderRole, String)],
     /// The mailbox selected now and its UIDVALIDITY.
     selected: Option<(String, u32)>,
+    /// Rows whose UID Fell may have marked, including cleanup in backoff.
+    uncleared_trash: HashSet<i64>,
     before_send: &'a dyn Fn(),
     report: &'a mut ReplayReport,
 }
 
 impl Pass<'_> {
-    fn run(&mut self, session: &mut WriteSession) -> Result<(), Stop> {
+    fn run(&mut self, config: &ImapConfig, session: &mut WriteSession) -> Result<(), Stop> {
         // Whether the user hears of it is up to the status line's report
         // (`outbox::report_for_status`): that notice is said once.
         let mut visited = vec![false; self.entries.len()];
         let has_move = session.has_move();
+        outbox::observe_uidplus(
+            self.store.connection(),
+            self.account_id,
+            session.has_uidplus(),
+        )?;
         if has_move {
-            outbox::note_move_missing(self.store, self.account_id, false)?;
+            outbox::note_capability_missing(self.store, self.account_id, Capability::Move, false)?;
         } else {
             for (index, entry) in self.entries.iter().enumerate() {
                 if entry.kind == OutboxKind::Move && !entry.sent && entry.retry_unix <= self.now {
@@ -253,12 +271,18 @@ impl Pass<'_> {
             }
             self.held_moves.clear();
         }
+        let mut disconnected = None;
         for index in 0..self.entries.len() {
             let entry = &self.entries[index];
             if visited[index] || (!has_move && entry.kind == OutboxKind::Move && !entry.sent) {
                 continue;
             }
             visited[index] = true;
+            if disconnected.is_some() && entry.retry_unix <= self.now {
+                *session = WriteSession::open(config).map_err(Stop::Connection)?;
+                self.selected = None;
+                disconnected = None;
+            }
             let held_move = self.held_moves.get(&entry.message_id);
             match entry.kind {
                 OutboxKind::Move if held_move.is_some() => {}
@@ -272,7 +296,27 @@ impl Pass<'_> {
                         self.replay_append(session, index)?;
                     }
                 }
+                OutboxKind::UnflagTrash => {
+                    if entry.retry_unix <= self.now {
+                        match self.replay_trash_cleanup(session, index, entry, None) {
+                            Err(Stop::TrashDisconnected(error)) => disconnected = Some(error),
+                            result => result?,
+                        }
+                    }
+                }
                 _ if matches!(held_move, Some(MoveHold::EarlierMove)) => {}
+                OutboxKind::Expunge => {
+                    if entry.retry_unix <= self.now {
+                        match self.replay_expunge(session, index) {
+                            Err(Stop::TrashDisconnected(error)) => disconnected = Some(error),
+                            result => result?,
+                        }
+                    }
+                    if !self.settled[index] {
+                        self.held_moves
+                            .insert(entry.message_id.clone(), MoveHold::EarlierMove);
+                    }
+                }
                 OutboxKind::Seen | OutboxKind::Flagged => self.replay_flag(session, index)?,
                 OutboxKind::Keyword | OutboxKind::BridgeLabel => {
                     self.replay_label(session, index)?;
@@ -283,7 +327,16 @@ impl Pass<'_> {
                 }
             }
         }
-        Ok(())
+        disconnected.map_or(Ok(()), |error| Err(Stop::Connection(error)))
+    }
+
+    fn safe_to_logout(&self) -> bool {
+        !self.entries.iter().any(|entry| {
+            self.uncleared_trash.contains(&entry.id)
+                && self.selected.as_ref().is_none_or(|(mailbox, _)| {
+                    entry.source_mailbox.as_deref() == Some(mailbox.as_str())
+                })
+        })
     }
 
     fn replay_append(&mut self, session: &mut WriteSession, index: usize) -> Result<(), Stop> {
@@ -1216,7 +1269,13 @@ impl Pass<'_> {
         // Keep confirmed COPYUIDs even if a lookup for another row disconnects.
         for (&(row, uid), &placed) in batch.iter().zip(&placements) {
             if let Some(placed) = placed {
-                self.finish_move(row, (source, uidvalidity, uid), target, placed)?;
+                self.finish_move(
+                    row,
+                    (source, uidvalidity, uid),
+                    target,
+                    placed,
+                    session.has_uidplus(),
+                )?;
             }
         }
         for (at, &(row, uid)) in batch.iter().enumerate() {
@@ -1271,7 +1330,13 @@ impl Pass<'_> {
         match outcome {
             Ok(Transfer::Placed(placed)) => {
                 if let (Some((source, (validity, uid))), Some((target, _))) = (source, target) {
-                    self.finish_move(row, (source, validity, uid), target, placed)?;
+                    self.finish_move(
+                        row,
+                        (source, validity, uid),
+                        target,
+                        placed,
+                        session.has_uidplus(),
+                    )?;
                 }
                 return Ok(Some(placed));
             }
@@ -1356,6 +1421,7 @@ impl Pass<'_> {
         source: (&str, u32, u32),
         target: &str,
         placed: (u32, u32),
+        uidplus: bool,
     ) -> Result<(), Stop> {
         match outbox::settle(
             self.store,
@@ -1363,7 +1429,7 @@ impl Pass<'_> {
             &self.entries[row],
             Some(source),
             Some(target),
-            Outcome::Done { placed },
+            Outcome::Done { placed, uidplus },
         )? {
             Settled::Recorded => self.report.sent += 1,
             Settled::Stale => return Err(Stop::Stale),
@@ -1685,7 +1751,13 @@ impl Pass<'_> {
     fn note_drop(&mut self, index: usize, reason: DropReason) {
         let entry = &self.entries[index];
         self.report.dropped.push(DroppedWrite {
-            kind: entry.kind,
+            kind: if entry.kind == OutboxKind::UnflagTrash
+                || reason == DropReason::TrashCopyUnconfirmed
+            {
+                OutboxKind::Expunge
+            } else {
+                entry.kind
+            },
             source_folder: entry.source_folder.clone(),
             target_folder: entry.target_folder.clone(),
             reason,
