@@ -4,7 +4,7 @@ use std::ops::{Deref, Range};
 
 use cssparser::{
     AtRuleParser, Delimiter, ParseError, Parser, ParserInput, ParserState, QualifiedRuleParser,
-    RuleBodyItemParser, RuleBodyParser, Token,
+    StyleSheetParser, Token,
 };
 use scraper::node::{Element, Node};
 
@@ -239,21 +239,6 @@ impl<'i> QualifiedRuleParser<'i> for LayoutRules {
     }
 }
 
-impl<'i> RuleBodyItemParser<'i, LayoutRule, ()> for LayoutRules {
-    fn parse_declarations(&self) -> bool {
-        false
-    }
-
-    fn parse_qualified(&self) -> bool {
-        true
-    }
-}
-
-impl<'i> cssparser::DeclarationParser<'i> for LayoutRules {
-    type Declaration = LayoutRule;
-    type Error = ();
-}
-
 impl LayoutStyles {
     pub(crate) fn from_document(dom: &scraper::Html) -> Self {
         let mut styles = Self::default();
@@ -267,9 +252,19 @@ impl LayoutStyles {
             let css = node.text().collect::<String>();
             let mut input = ParserInput::new(&css);
             let mut parser = Parser::new(&mut input);
+            let start = parser.state();
+            // StyleSheetParser normally skips an initial @charset rule.
+            loop {
+                match parser.next() {
+                    Ok(Token::CDO | Token::CDC) => {}
+                    Ok(Token::AtKeyword(_)) => return Self::default(),
+                    _ => break,
+                }
+            }
+            parser.reset(&start);
             // A rule we cannot model may undo one that hid content. Only
             // apply the author cascade when we understand the entire sheet.
-            for rule in RuleBodyParser::new(&mut parser, &mut LayoutRules) {
+            for rule in StyleSheetParser::new(&mut parser, &mut LayoutRules) {
                 let Ok((selectors, declarations)) = rule else {
                     return Self::default();
                 };
@@ -695,6 +690,7 @@ fn height_estimates_discard_a_partial_author_cascade() {
         ("div {display:none}", "@media screen {div {display:block}}"),
         ("div {display:none}", "@charset \"utf-8\";"),
         ("div {display:none}", ".bad {display block}"),
+        ("div {display:none}", "} div {display:block}"),
         ("span {font-size:0}", "div span {font-size:16px}"),
         ("span {font-size:0}", "span {font:16px sans-serif}"),
     ] {
