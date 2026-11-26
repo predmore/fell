@@ -7484,6 +7484,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mail.sqlite");
+        create_private_file(&path).unwrap();
         let writer = open_mailbox_db(&path).unwrap();
         writer.execute_batch(SCHEMA).unwrap();
         writer.execute_batch(FTS_TRIGGERS).unwrap();

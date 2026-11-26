@@ -699,11 +699,18 @@ mod tests {
         let registry = Registry::resolve().unwrap();
         let base = root.join("mail.db");
         fs::create_dir_all(registry.directory()).unwrap();
+        let account =
+            crate::AccountConfig::parse("email = 'mail@example.test'\npassword = 'fixture'")
+                .unwrap()
+                .account();
+        let store = Store::open(&base).unwrap();
+        store.upsert_account(&account).unwrap();
+        drop(store);
         let trash = removal_trash(&base);
         fs::create_dir_all(&trash).unwrap();
         fs::write(trash.join("plan"), br#"["mail",[]]"#).unwrap();
         fs::write(trash.join("committed"), "").unwrap();
-        fs::write(trash.join("mail.db"), "mail").unwrap();
+        fs::rename(&base, trash.join("mail.db")).unwrap();
         assert!(!registry.load_with_removals(&base).interrupted[0].can_restore);
         assert!(registry.remove(&base, "mail", false).is_err());
         assert!(trash.join("mail.db").is_file());

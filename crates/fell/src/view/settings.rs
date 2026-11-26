@@ -1751,9 +1751,7 @@ pub(super) fn card(
                 ),
                 (false, AccountRemovalKind::Interrupted { can_restore }) => (
                     if can_restore {
-                        format!(
-                            "Deletion paused for {account_name}. You can restore its local mail."
-                        )
+                        format!("You can restore local mail for {account_name}.")
                     } else {
                         format!("Local mail for {account_name} can no longer be restored.")
                     },
