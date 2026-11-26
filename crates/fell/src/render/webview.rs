@@ -74,15 +74,7 @@ impl JobQueue {
 #[allow(deprecated)]
 struct Worker {
     queue: Arc<JobQueue>,
-    wake: glib::Sender<Wake>,
-    #[cfg(test)]
-    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
-}
-
-enum Wake {
-    Render,
-    #[cfg(test)]
-    Stop,
+    wake: glib::Sender<()>,
 }
 
 struct Load {
@@ -102,7 +94,7 @@ fn worker() -> Option<&'static Worker> {
             let (wake, rx) = glib::MainContext::channel(glib::Priority::DEFAULT);
             let queue = Arc::new(JobQueue::default());
             let queued = queue.clone();
-            let _thread = std::thread::Builder::new()
+            std::thread::Builder::new()
                 .name("fell-webview".into())
                 .spawn(move || {
                     if let Err(error) = run(rx, queued) {
@@ -116,12 +108,7 @@ fn worker() -> Option<&'static Worker> {
                     }
                 })
                 .ok()?;
-            Some(Worker {
-                queue,
-                wake,
-                #[cfg(test)]
-                thread: Mutex::new(Some(_thread)),
-            })
+            Some(Worker { queue, wake })
         })
         .as_ref()
 }
@@ -135,7 +122,7 @@ pub(crate) async fn render(request: WebRequest) -> Option<Snapshot> {
     let worker = worker()?;
     let budget = request.load_budget();
     worker.queue.submit(Job { request, reply });
-    worker.wake.send(Wake::Render).ok()?;
+    worker.wake.send(()).ok()?;
     // The worker can fail during setup, before GLib attaches its receiver.
     // Bound the wait even when GLib keeps an already queued request alive.
     let timeout = async_io::Timer::after(budget + Duration::from_secs(2));
@@ -146,7 +133,7 @@ pub(crate) async fn render(request: WebRequest) -> Option<Snapshot> {
 }
 
 #[allow(deprecated)]
-fn run(rx: glib::Receiver<Wake>, queue: Arc<JobQueue>) -> Result<(), Box<dyn std::error::Error>> {
+fn run(rx: glib::Receiver<()>, queue: Arc<JobQueue>) -> Result<(), Box<dyn std::error::Error>> {
     gtk::init()?;
     let window = gtk::OffscreenWindow::new();
     window.set_accept_focus(false);
@@ -186,17 +173,7 @@ fn run(rx: glib::Receiver<Wake>, queue: Arc<JobQueue>) -> Result<(), Box<dyn std
     window.show_all();
     // Prepare GTK and the content filter during prewarm. Let the first job
     // drive navigation so it cannot supersede an in-flight warmup document.
-    let _source = rx.attach(None, move |wake| {
-        match wake {
-            Wake::Render => {}
-            #[cfg(test)]
-            Wake::Stop => {
-                cancel(&active);
-                widget.stop_loading();
-                gtk::main_quit();
-                return glib::ControlFlow::Break;
-            }
-        }
+    let _source = rx.attach(None, move |()| {
         let Some(job) = queue.next() else {
             return glib::ControlFlow::Continue;
         };
@@ -657,21 +634,6 @@ mod tests {
     use super::*;
     use base64::Engine;
 
-    struct StopWorker;
-
-    impl Drop for StopWorker {
-        fn drop(&mut self) {
-            // Run GTK teardown before libtest exits, including after an
-            // assertion fails while WebKit is still processing a load.
-            if let Some(worker) = worker() {
-                let _ = worker.wake.send(Wake::Stop);
-                if let Some(thread) = worker.thread.lock().unwrap().take() {
-                    thread.join().unwrap();
-                }
-            }
-        }
-    }
-
     fn contains_display_color(picture: &Snapshot, rgb: [u8; 3]) -> bool {
         picture
             .image
@@ -722,44 +684,69 @@ mod tests {
         use fell_core::test_support::skip_unless_available;
 
         const TEST: &str = "render::webview::tests::hostile_email_makes_zero_webkit_requests";
+        const CHILD: &str = "FELL_WEBKIT_CORPUS_CHILD";
+        const COMPLETED: &str = "WebKit corpus passed";
         let no_display =
             std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none();
+        let required = std::env::var_os("CI").is_some()
+            || std::env::var_os("FELL_REQUIRE_ALL_TESTS").is_some();
         if no_display
-            && (std::env::var_os("CI").is_some()
-                || std::env::var_os("FELL_REQUIRE_ALL_TESTS").is_some())
+            && !required
+            && skip_unless_available(
+                TEST,
+                Some("WebKit requires an isolated Wayland or X11 display".into()),
+            )
         {
-            // The Ubuntu runner ships Xvfb. Give just this test a display,
-            // leaving the rest of the suite independent of GTK.
-            let output = std::process::Command::new("xvfb-run")
+            return;
+        }
+
+        if std::env::var_os(CHILD).is_some() {
+            let passed = std::panic::catch_unwind(|| {
+                assert!(!no_display, "the WebKit test child requires a display");
+                check_webkit_corpus();
+                eprintln!("{COMPLETED}");
+            })
+            .is_ok();
+            // GTK and WebKit own a process-lifetime worker. WebKit's thread
+            // exit handler can deadlock with its IPC threads, and C exit
+            // handlers can race them. The supervisor checks the completed
+            // corpus and status after the kernel closes the child process.
+            // SAFETY: This branch runs only in the isolated test child,
+            // after the checks have returned or their panic was reported.
+            unsafe { libc::_exit(if passed { 0 } else { 101 }) }
+        }
+
+        let executable = std::env::current_exe().unwrap();
+        let mut command = if no_display {
+            // The Ubuntu runner ships Xvfb. Give just this child a display.
+            let mut command = std::process::Command::new("xvfb-run");
+            command
                 .args(["-a", "--"])
-                .arg(std::env::current_exe().unwrap())
-                .args(["--exact", TEST, "--nocapture"])
+                .arg(&executable)
                 .env("GDK_BACKEND", "x11")
                 .env("LIBGL_ALWAYS_SOFTWARE", "1")
-                // Xvfb cannot supply a DRI device. Disable the backing
-                // store's EGL probe before WebKit constructs the view.
+                // Xvfb has no DRI device for the backing store's EGL probe.
                 .env("WEBKIT_DISABLE_DMABUF_RENDERER", "1")
-                .env_remove("DBUS_SESSION_BUS_ADDRESS")
-                .output()
-                .expect("start WebKit test on the CI virtual display");
-            assert!(
-                output.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
-            return;
-        }
-        if skip_unless_available(
-            TEST,
-            no_display.then(|| "WebKit requires an isolated Wayland or X11 display".into()),
-        ) {
-            return;
-        }
+                .env_remove("DBUS_SESSION_BUS_ADDRESS");
+            command
+        } else {
+            std::process::Command::new(executable)
+        };
+        let output = command
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .expect("start the isolated WebKit test child");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stderr.lines().any(|line| line == COMPLETED),
+            "{}\n{stderr}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+        eprint!("{stderr}");
+    }
 
-        let _worker = StopWorker;
-
+    fn check_webkit_corpus() {
         let local_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         // UDP connect selects a local interface without sending a datagram.
         // A second loopback address still gives us a distinct origin on an
