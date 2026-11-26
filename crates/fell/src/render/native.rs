@@ -3030,7 +3030,7 @@ pub(crate) fn fit_snapshot(width: u32, height: u32) -> (u32, u32) {
     (dst_w.max(1), dst_h.max(1))
 }
 
-fn image_limits() -> image::Limits {
+pub(super) fn image_limits() -> image::Limits {
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MAX_IMAGE_EDGE);
     limits.max_image_height = Some(MAX_IMAGE_EDGE);
@@ -3041,23 +3041,6 @@ fn image_limits() -> image::Limits {
 #[cfg(test)]
 pub(crate) fn decode_image(bytes: &[u8]) -> Option<Arc<RenderImage>> {
     decode_rgba(bytes).map(render_frame)
-}
-
-pub(super) fn raster_bytes_allowed(bytes: &[u8], mime: &str) -> bool {
-    let format = match mime {
-        "image/png" => image::ImageFormat::Png,
-        "image/jpeg" => image::ImageFormat::Jpeg,
-        "image/gif" => image::ImageFormat::Gif,
-        _ => return false,
-    };
-    if image::guess_format(bytes).ok() != Some(format) {
-        return false;
-    }
-    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
-    reader.limits(image_limits());
-    reader
-        .into_dimensions()
-        .is_ok_and(|(w, h)| raster_allowed(w, h))
 }
 
 fn decode_rgba(bytes: &[u8]) -> Option<image::RgbaImage> {

@@ -214,7 +214,8 @@ fn run(rx: glib::Receiver<Wake>, queue: Arc<JobQueue>) -> Result<(), Box<dyn std
         let image_limit = fell_render::WebMail::image_height_limit(width as f32);
         styles.add_style_sheet(&UserStyleSheet::new(
             &format!(
-                "img {{ min-height: 0 !important; max-height: {image_limit}px !important; }}
+                ":root {{ background-color: #{background:06x}; }}
+                 img {{ min-height: 0 !important; max-height: {image_limit}px !important; }}
                  html::-webkit-scrollbar {{ display: none; }}"
             ),
             UserContentInjectedFrames::TopFrame,
@@ -913,9 +914,12 @@ mod tests {
             ("mobile reveal", 360, String::from(concat!(
                 "<style>@media (max-width:600px) { .mobile { display:block !important; ",
                 "visibility:visible !important; font-size:16px !important; ",
-                "max-height:none !important; overflow:visible !important; background:#7a163f; } }</style>",
+                "max-height:none !important; overflow:visible !important; background:#7a163f; } ",
+                ".col{display:block!important;width:100%!important} } ",
+                ".col{display:inline-block;width:48%;height:65px;background:#3f167a}</style>",
                 r#"<div class="mobile" style="display:none;visibility:hidden;font-size:0;max-height:0;overflow:hidden">"#,
                 "Mobile dispatch<br>Edition 42</div>",
+                r#"<div class="col"></div><div class="col"></div>"#,
             ))),
             ("spacer cells and body padding", 440, String::from(concat!(
                 r#"<style media="print">.show {display:none !important}</style>"#,
@@ -952,6 +956,8 @@ mod tests {
                 r#"<style>p {{margin:0}} a:hover {{display:none}} img {{border:0}}</style>{}"#,
                 r#"<p style="text-align:left;font-family:serif;font-weight:normal"><a href="https://example.test">Around town</a> this week.</p>"#.repeat(8),
             )),
+            ("retail", 600, include_str!("../../../fell-render/fixtures/corpus/esp-marketing.html").into()),
+            ("ordinary newsletter", 680, include_str!("../../../fell-render/fixtures/web-newsletter.html").into()),
             ("long article", 440, format!(
                 r#"<article><h1 style="margin:0 0 12px">A walk along the lake</h1>{}</article>"#,
                 "<p>On Saturday the first ferry left the harbor just after sunrise. The new footpath now follows the water from the boat landing to the old railway bridge.</p>".repeat(18),
@@ -962,34 +968,41 @@ mod tests {
             let mail = fell_render::WebMail::prepare(&html);
             let extra_width = match label {
                 "inline-styled ESP table" => Some(560),
-                "desktop and mobile pair" => Some(680),
+                "desktop and mobile pair" | "mobile reveal" | "retail" => Some(680),
                 _ => None,
             };
-            for width in std::iter::once(width).chain(extra_width) {
-                let picture = futures::executor::block_on(render(WebRequest {
-                    html: mail.page("light", |_| None),
-                    width,
-                    background: 0xffffff,
-                }))
-                .unwrap_or_else(|| panic!("WebKit painted {label}"));
-                let estimate = mail.estimated_height(width as f32);
-                let painted = picture.height * width as f32 / picture.width;
-                let delta = estimate - painted;
-                eprintln!(
-                    "calibration | {label} | {width} | {estimate:.1} | {painted:.1} | {delta:+.1}"
-                );
-                if !(0. ..=25.).contains(&delta) {
-                    outliers.push((label, width, delta));
-                }
-                if matches!(label, "mobile reveal" | "desktop and mobile pair") {
-                    assert_eq!(
-                        contains_display_color(&picture, [0x7a, 0x16, 0x3f]),
-                        width < 600
+            let dark = matches!(
+                label,
+                "mobile reveal" | "hover and compact paragraphs" | "retail" | "ordinary newsletter"
+            )
+            .then_some(("dark", 0x24283b));
+            for (scheme, background) in std::iter::once(("light", 0xffffff)).chain(dark) {
+                for width in std::iter::once(width).chain(extra_width) {
+                    let picture = futures::executor::block_on(render(WebRequest {
+                        html: mail.page(scheme, |_| None),
+                        width,
+                        background,
+                    }))
+                    .unwrap_or_else(|| panic!("WebKit painted {label}"));
+                    let estimate = mail.estimated_height(width as f32);
+                    let painted = picture.height * width as f32 / picture.width;
+                    let delta = estimate - painted;
+                    eprintln!(
+                        "calibration | {label} | {scheme} | {width} | {estimate:.1} | {painted:.1} | {delta:+.1}"
                     );
-                    assert_eq!(
-                        contains_display_color(&picture, [0x3f, 0x16, 0x7a]),
-                        width > 600
-                    );
+                    if !(0. ..=25.).contains(&delta) {
+                        outliers.push((label, scheme, width, delta));
+                    }
+                    if matches!(label, "mobile reveal" | "desktop and mobile pair") {
+                        assert_eq!(
+                            contains_display_color(&picture, [0x7a, 0x16, 0x3f]),
+                            width < 600
+                        );
+                        assert_eq!(
+                            contains_display_color(&picture, [0x3f, 0x16, 0x7a]),
+                            label == "mobile reveal" || width > 600
+                        );
+                    }
                 }
             }
         }
@@ -997,6 +1010,18 @@ mod tests {
             outliers.is_empty(),
             "outside the 0–25px allowance: {outliers:?}"
         );
+
+        let dark = fell_render::WebMail::prepare(
+            r#"<div style="width:300px;height:90px;background:#7a163f">News</div>"#,
+        );
+        let picture = futures::executor::block_on(render(WebRequest {
+            html: dark.page("dark", |_| None),
+            width: 440,
+            background: 0x24283b,
+        }))
+        .expect("WebKit painted narrow dark mail");
+        assert!(contains_display_color(&picture, [0x24, 0x28, 0x3b]));
+        assert!(contains_display_color(&picture, [0x7a, 0x16, 0x3f]));
 
         let hero = fell_render::WebMail::prepare(
             r#"<div style="height:1000px;background:#7a163f">A tall hero</div>"#,

@@ -26,6 +26,7 @@ const THREAD_HOLD: Duration = Duration::from_millis(150);
 const SNAPSHOT_BATCH: Duration = Duration::from_millis(550);
 const RENDERER_EXIT: Duration = Duration::from_millis(60);
 const RENDERER_CHANGE: Duration = Duration::from_millis(140);
+const RETRY_SWAP: Duration = Duration::from_millis(120);
 const MEASURED_HEIGHTS: usize = 4 * CACHE_SIZE;
 const PROMPT_HEIGHT: f32 = 30.;
 const PROMPT_GAP: f32 = 8.;
@@ -229,19 +230,15 @@ impl Shown {
                 *alpha > 0.0
             });
             let retry_started = self.prompt == Some(Prompt::Retrying);
-            self.prompt_swap = if retry_failed {
-                motion::LayerSwap::start(
-                    motion,
-                    now,
-                    RENDERER_EXIT,
-                    RENDERER_CHANGE - RENDERER_EXIT,
-                )
+            let swap_retry = retry_failed || (retry_started && !self.outgoing_prompts.is_empty());
+            self.prompt_swap = if swap_retry {
+                motion::LayerSwap::start(motion, now, RENDERER_EXIT, RETRY_SWAP - RENDERER_EXIT)
             } else {
                 None
             };
             self.prompt_fade = motion.start(
-                if retry_failed {
-                    RENDERER_CHANGE
+                if swap_retry {
+                    RETRY_SWAP
                 } else if retry_started {
                     RENDERER_EXIT
                 } else {
@@ -584,7 +581,12 @@ impl Reader {
         }
     }
 
-    fn continue_in_native(&mut self, id: &str, viewport: gpui::Bounds<gpui::Pixels>) -> bool {
+    fn continue_in_native(
+        &mut self,
+        id: &str,
+        viewport: gpui::Bounds<gpui::Pixels>,
+        line_height: f32,
+    ) -> bool {
         let Some(shown) = self.shown.get_mut(id) else {
             return false;
         };
@@ -594,15 +596,19 @@ impl Reader {
         if !picture.clipped {
             return false;
         }
-        let fraction = shown.snapshot_geometry.get().map_or(0., |(top, height)| {
-            let into_view = if f32::from(viewport.bottom()) >= top + height {
-                height
-            } else {
-                f32::from(viewport.top()) - top
-            };
-            let snapshot_fraction = (into_view / height).clamp(0., 1.);
-            snapshot_fraction * webview::SNAPSHOT_HEIGHT_LIMIT as f32 / picture.document_height
-        });
+        let Some((top, height)) = shown.snapshot_geometry.get() else {
+            return false;
+        };
+        let row_top = top + height;
+        if f32::from(viewport.bottom()) < row_top
+            || f32::from(viewport.top()) >= row_top + crate::render::CLIP_NOTICE_HEIGHT
+        {
+            return false;
+        }
+        let snapshot_fraction =
+            (1. - (crate::render::CLIP_FADE_HEIGHT + line_height) / height).clamp(0., 1.);
+        let fraction =
+            snapshot_fraction * webview::SNAPSHOT_HEIGHT_LIMIT as f32 / picture.document_height;
         shown.continue_at = Some(fraction);
         self.show_native_for.insert(id.to_owned());
         true
@@ -902,9 +908,16 @@ impl Reader {
             self.release_opening();
         }
         for shown in self.shown.values() {
-            if let (Some(key), Some(height), None) =
-                (&shown.picture_key, shown.height.get(), shown.fade)
+            if let (Some(key), Body::Web(picture), None) =
+                (&shown.picture_key, &shown.body, shown.fade)
             {
+                // The placeholder lays out the link column itself.
+                let height = picture.height * key.width as f32 / picture.width
+                    + if picture.clipped {
+                        crate::render::CLIP_NOTICE_HEIGHT
+                    } else {
+                        0.
+                    };
                 if let Some(measured) = self
                     .measured
                     .iter_mut()
@@ -1149,10 +1162,11 @@ impl Inbox {
             return;
         }
         if action == Action::ToggleWebView {
-            if self
-                .web_mail
-                .continue_in_native(id, self.conv_scroll.bounds())
-            {
+            if self.web_mail.continue_in_native(
+                id,
+                self.conv_scroll.bounds(),
+                self.theme.ui_px * 1.45,
+            ) {
                 self.reader_took_over(self.message_selected());
                 self.motion.conv_glide = None;
                 cx.notify();
@@ -1531,7 +1545,7 @@ mod tests {
     }
 
     #[test]
-    fn continuing_clipped_mail_keeps_the_senders_choice_until_thread_close() {
+    fn clipped_mail_toggles_the_sender_at_the_top_and_continues_at_the_row() {
         super::super::tests::with_pending_inbox(|inbox, cx| {
             split_view(inbox);
             let sender = "newer@example.test";
@@ -1548,6 +1562,19 @@ mod tests {
                 "newer".into(),
                 Shown::new(Weak::new(), Some(picture), false, false, None),
             );
+            let geometry = inbox.web_mail.shown["newer"].snapshot_geometry.clone();
+            let viewport = inbox.conv_scroll.bounds();
+            let height = webview::SNAPSHOT_HEIGHT_LIMIT as f32;
+            geometry.set(Some((f32::from(viewport.top()), height)));
+            inbox.html_reading_action("newer", Action::ToggleWebView, cx);
+            assert_eq!(
+                inbox.web_mail.known_sender(Some(sender)),
+                (Some(false), false)
+            );
+            assert!(inbox.web_mail.show_native_for.is_empty());
+            inbox.html_reading_action("newer", Action::ToggleWebView, cx);
+
+            geometry.set(Some((f32::from(viewport.bottom()) - height, height)));
             inbox.html_reading_action("newer", Action::ToggleWebView, cx);
             assert!(
                 !inbox
@@ -1557,6 +1584,11 @@ mod tests {
             assert_eq!(
                 inbox.web_mail.known_sender(Some(sender)),
                 (Some(true), false)
+            );
+            let before_fade = height - crate::render::CLIP_FADE_HEIGHT - inbox.theme.ui_px * 1.45;
+            assert_eq!(
+                inbox.web_mail.shown["newer"].continue_at,
+                Some(before_fade / 16_384.)
             );
             inbox.web_mail.close_thread();
             assert!(
@@ -1819,9 +1851,13 @@ mod tests {
         assert_eq!(frame.height, 1.);
         assert_eq!(frame.incoming_alpha, 0.);
         assert!(matches!(frame.incoming, Some(Prompt::Retrying)));
-        let entering = shown.frame(retry + RENDERER_EXIT / 2).prompt.unwrap();
+        let leaving = shown.frame(retry + RENDERER_EXIT / 2).prompt.unwrap();
+        assert_eq!(leaving.incoming_alpha, 0.);
+        assert!(leaving.outgoing[0].1 > 0.);
+        let entering = shown.frame(retry + RETRY_SWAP * 3 / 4).prompt.unwrap();
         assert!(entering.incoming_alpha > 0. && entering.incoming_alpha < 1.);
-        let entered = shown.frame(retry + RENDERER_EXIT).prompt.unwrap();
+        assert_eq!(entering.outgoing[0].1, 0.);
+        let entered = shown.frame(retry + RETRY_SWAP).prompt.unwrap();
         assert_eq!(entered.incoming_alpha, 1.);
     }
 
@@ -1850,7 +1886,7 @@ mod tests {
         assert_eq!(seam.outgoing[0].1, 0.);
         assert_eq!(seam.height, 1.);
         let arriving = shown
-            .frame(now + (RENDERER_EXIT + RENDERER_CHANGE) / 2)
+            .frame(now + (RENDERER_EXIT + RETRY_SWAP) / 2)
             .prompt
             .unwrap();
         assert!(arriving.incoming_alpha > 0.);

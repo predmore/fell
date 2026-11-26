@@ -453,6 +453,7 @@ fn banner_edge(theme: Theme, web: bool, border: u32) -> u32 {
 }
 
 pub(crate) const CLIP_NOTICE_HEIGHT: f32 = 30.;
+pub(crate) const CLIP_FADE_HEIGHT: f32 = 48.;
 
 pub(crate) fn web_snapshot(
     snapshot: &webview::Snapshot,
@@ -478,7 +479,7 @@ pub(crate) fn web_snapshot(
                     .bottom_0()
                     .left_0()
                     .right_0()
-                    .h(px(48.))
+                    .h(px(CLIP_FADE_HEIGHT))
                     .bg(crate::theme::scroll_fade(snapshot.last_row_color, false)),
             )
         });

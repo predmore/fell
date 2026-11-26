@@ -43,7 +43,7 @@ impl Failure {
             Self::Address => "Image address blocked".into(),
             Self::Response => "Image server didn’t return an image".into(),
             Self::Format => "Unsupported or damaged image".into(),
-            Self::Limit => "Size limit".into(),
+            Self::Limit => "Image too large".into(),
             Self::PageLimit => "Download limit reached".into(),
         }
     }
@@ -64,8 +64,7 @@ impl UnavailableImages {
     pub(crate) fn label(&self, compact: bool) -> String {
         let noun = if self.count == 1 { "image" } else { "images" };
         match (&self.first, self.count) {
-            (Failure::Limit, 1) => "1 image too large".into(),
-            (Failure::PageLimit | Failure::NotFound | Failure::TimedOut, 1) => {
+            (Failure::Limit | Failure::PageLimit | Failure::NotFound | Failure::TimedOut, 1) => {
                 self.first.label(compact)
             }
             _ => format!(
@@ -277,10 +276,10 @@ fn fetch(
             url = next;
             continue;
         }
-        let mime = match response.body().mime_type() {
-            Some("image/png") => "image/png",
-            Some("image/jpeg") => "image/jpeg",
-            Some("image/gif") => "image/gif",
+        let (mime, format) = match response.body().mime_type() {
+            Some("image/png") => ("image/png", image::ImageFormat::Png),
+            Some("image/jpeg") => ("image/jpeg", image::ImageFormat::Jpeg),
+            Some("image/gif") => ("image/gif", image::ImageFormat::Gif),
             _ => return Err(Failure::Format),
         };
         let mut data = format!("data:{mime};base64,");
@@ -306,13 +305,25 @@ fn fetch(
         if !allowed() || bytes.len() > limit {
             return Err(Failure::Limit);
         }
-        if !super::native::raster_bytes_allowed(&bytes, mime) {
-            return Err(Failure::Format);
-        }
+        check_raster(&bytes, format)?;
         base64::engine::general_purpose::STANDARD.encode_string(bytes, &mut data);
         return Ok(data);
     }
     Err(Failure::Response)
+}
+
+fn check_raster(bytes: &[u8], format: image::ImageFormat) -> Result<(), Failure> {
+    if image::guess_format(bytes).ok() != Some(format) {
+        return Err(Failure::Format);
+    }
+    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
+    reader.limits(super::native::image_limits());
+    match reader.into_dimensions() {
+        Ok((0, _) | (_, 0)) => Err(Failure::Format),
+        Ok((width, height)) if super::native::raster_allowed(width, height) => Ok(()),
+        Ok(_) | Err(image::ImageError::Limits(_)) => Err(Failure::Limit),
+        Err(_) => Err(Failure::Format),
+    }
 }
 
 #[cfg(test)]
@@ -323,6 +334,25 @@ mod tests {
     use std::net::{Ipv4Addr, TcpListener, TcpStream};
 
     const HOST: &str = "images.example.test";
+
+    #[test]
+    fn excessive_dimensions_report_the_image_size_limit() {
+        // PNG signature and IHDR for a 600 × 200,000 RGB image.
+        let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\x02\x58\0\x03\x0d\x40\x08\x02\0\0\0\xa6\x46\xf8\x77";
+        assert_eq!(
+            check_raster(png, image::ImageFormat::Png),
+            Err(Failure::Limit)
+        );
+        assert_eq!(
+            UnavailableImages {
+                first: Failure::Limit,
+                count: 1,
+                retryable: false,
+            }
+            .label(false),
+            "Image too large",
+        );
+    }
 
     #[derive(Debug)]
     struct LoopbackResolver;

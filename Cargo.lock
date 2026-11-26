@@ -2092,6 +2092,7 @@ dependencies = [
  "percent-encoding",
  "pulldown-cmark",
  "scraper",
+ "selectors 0.26.0",
  "tendril 0.4.3",
  "url",
 ]

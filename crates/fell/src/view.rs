@@ -11215,8 +11215,34 @@ fn web_message_body(
 ) -> gpui::AnyElement {
     use web_mail::Body;
     let reveal = frame.disclosures().quotes.get(&message.id).copied();
+    let web_column = |card: gpui::AnyElement, live, showing_links: bool| {
+        div()
+            .child(card)
+            .when(!body.web_links.is_empty(), |pane| {
+                let palette = mail_body::palette(theme);
+                pane.child(
+                    div()
+                        .mt(px(7.))
+                        .when(!showing_links, |links| links.opacity(0.))
+                        .child(crate::render::blocks_column_spaced(
+                            &body.web_links,
+                            &palette,
+                            false,
+                            &body.gallery,
+                            folds.columns.blocks(folds.fill).with_links(live),
+                            3.0,
+                            markers,
+                        )),
+                )
+            })
+            .into_any_element()
+    };
     let mut layer = |shown: &Body, live| match shown {
-        Body::Placeholder => web_placeholder(theme, message, folds.columns, web.placeholder_height),
+        Body::Placeholder => web_column(
+            web_placeholder(theme, message, folds.columns, web.placeholder_height),
+            false,
+            false,
+        ),
         Body::StoredText => plain_message_body(
             theme,
             &message.body,
@@ -11269,21 +11295,11 @@ fn web_message_body(
                             .border_color(rgb(theme.border)),
                     )
                 });
-            div()
-                .child(folds.columns.card.place(snapshot))
-                .when(!body.web_links.is_empty(), |pane| {
-                    let palette = mail_body::palette(theme);
-                    pane.child(div().mt(px(7.)).child(crate::render::blocks_column_spaced(
-                        &body.web_links,
-                        &palette,
-                        false,
-                        &body.gallery,
-                        folds.columns.blocks(folds.fill).with_links(live),
-                        3.0,
-                        markers,
-                    )))
-                })
-                .into_any_element()
+            web_column(
+                folds.columns.card.place(snapshot).into_any_element(),
+                live,
+                true,
+            )
         }
     };
     let incoming = layer(&web.body, folds.live);

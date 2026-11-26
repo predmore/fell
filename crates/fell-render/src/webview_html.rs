@@ -20,7 +20,7 @@ fn web_page(body: &str, scheme: &str, body_padding: &str) -> String {
 <meta http-equiv="x-dns-prefetch-control" content="off">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data: cid:; font-src data:; media-src 'none'; frame-src 'none'; script-src 'none'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none';">
 <style>
-  html, body {{ margin: 0; padding: 0; background: transparent; }}
+  html, body {{ margin: 0; padding: 0; }}
   table, img {{ max-width: 100%; }}
   body {{ overflow-wrap: anywhere; }}
   img[src=""] {{

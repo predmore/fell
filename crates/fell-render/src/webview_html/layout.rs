@@ -7,6 +7,10 @@ use cssparser::{
     StyleSheetParser, Token,
 };
 use scraper::node::{Element, Node};
+use selectors::matching::{
+    MatchingContext, MatchingForInvalidation, MatchingMode, NeedsSelectorFlags, QuirksMode,
+    matches_selector,
+};
 
 use crate::html::{self, Declaration};
 
@@ -66,8 +70,68 @@ enum SelectorAtom {
 
 enum Selector {
     Compound(Vec<SelectorAtom>),
-    Unmodeled(Result<scraper::Selector, Vec<SelectorAtom>>),
+    Complex(Result<selectors::parser::Selector<scraper::selector::Simple>, Vec<SelectorAtom>>),
     AtRestInactive,
+}
+
+fn inactive_pseudo(name: &str) -> bool {
+    [
+        "active",
+        "hover",
+        "focus",
+        "focus-visible",
+        "focus-within",
+        "visited",
+    ]
+    .iter()
+    .any(|state| name.eq_ignore_ascii_case(state))
+}
+
+fn at_rest_selector(input: &mut Parser<'_, '_>, depth: usize) -> String {
+    let mut source = String::new();
+    let mut unchanged = input.position();
+    loop {
+        let start = input.position();
+        let Ok(token) = input.next_including_whitespace().cloned() else {
+            break;
+        };
+        match token {
+            Token::Colon => {
+                if input.try_parse(Parser::expect_colon).is_ok() {
+                    continue;
+                }
+                if input
+                    .try_parse(|input| input.expect_ident_cloned())
+                    .is_ok_and(|name| inactive_pseudo(&name))
+                {
+                    source.push_str(input.slice(unchanged..start));
+                    // An impossible child index has class specificity and
+                    // composes with :not(), :is() and :where().
+                    source.push_str(":nth-child(0)");
+                    unchanged = input.position();
+                }
+            }
+            Token::Function(name)
+                if depth < 32
+                    && ["not", "is", "where", "has"]
+                        .iter()
+                        .any(|pseudo| name.eq_ignore_ascii_case(pseudo)) =>
+            {
+                let arguments = input.position();
+                if let Ok(rest) = input.parse_nested_block(|input| {
+                    Ok::<_, ParseError<'_, ()>>(at_rest_selector(input, depth + 1))
+                }) {
+                    source.push_str(input.slice(unchanged..arguments));
+                    source.push_str(&rest);
+                    source.push(')');
+                    unchanged = input.position();
+                }
+            }
+            _ => {}
+        }
+    }
+    source.push_str(input.slice_from(unchanged));
+    source
 }
 
 impl Selector {
@@ -115,9 +179,7 @@ impl Selector {
                         Ok::<_, cssparser::BasicParseError<'_>>(if pseudo_element {
                             name.eq_ignore_ascii_case("selection")
                         } else {
-                            ["hover", "focus", "focus-visible", "focus-within", "visited"]
-                                .iter()
-                                .any(|state| name.eq_ignore_ascii_case(state))
+                            inactive_pseudo(name)
                         })
                     });
                     if state == Ok(true) {
@@ -141,15 +203,23 @@ impl Selector {
         if compound && (universal || !atoms.is_empty()) {
             Self::Compound(atoms)
         } else {
-            Self::Unmodeled(
-                scraper::Selector::parse(input.slice_from(start).trim()).map_err(|_| atoms),
+            let mut source = ParserInput::new(input.slice_from(start).trim());
+            let source = at_rest_selector(&mut Parser::new(&mut source), 0);
+            let mut source = ParserInput::new(&source);
+            let mut source = Parser::new(&mut source);
+            Self::Complex(
+                source
+                    .parse_entirely(|input| {
+                        selectors::parser::Selector::parse(&scraper::selector::Parser, input)
+                    })
+                    .map_err(|_| atoms),
             )
         }
     }
 
     fn key(&self) -> Option<&SelectorAtom> {
         let atoms = match self {
-            Self::Compound(atoms) | Self::Unmodeled(Err(atoms)) => atoms,
+            Self::Compound(atoms) | Self::Complex(Err(atoms)) => atoms,
             _ => return None,
         };
         atoms.iter().max_by_key(|atom| atom.specificity())
@@ -158,22 +228,39 @@ impl Selector {
     fn matches(&self, node: scraper::ElementRef<'_>) -> bool {
         match self {
             Self::AtRestInactive => false,
-            Self::Unmodeled(Ok(selector)) => selector.matches(&node),
-            Self::Compound(atoms) | Self::Unmodeled(Err(atoms)) => {
+            Self::Complex(Ok(selector)) => matches_selector(
+                selector,
+                0,
+                None,
+                &node,
+                &mut MatchingContext::new(
+                    MatchingMode::Normal,
+                    None,
+                    &mut Default::default(),
+                    QuirksMode::NoQuirks,
+                    NeedsSelectorFlags::No,
+                    MatchingForInvalidation::No,
+                ),
+            ),
+            Self::Compound(atoms) | Self::Complex(Err(atoms)) => {
                 atoms.iter().all(|atom| atom.matches(node.value()))
             }
         }
     }
 
-    fn specificity(&self) -> (usize, usize, usize) {
-        let Self::Compound(atoms) = self else {
-            return (0, 0, 0);
+    fn specificity(&self) -> u32 {
+        let atoms = match self {
+            Self::Compound(atoms) => atoms,
+            Self::Complex(Ok(selector)) => return selector.specificity(),
+            _ => return 0,
         };
-        let mut counts = [0; 3];
+        let mut counts = [0_u32; 3];
         for atom in atoms {
             counts[atom.specificity()] += 1;
         }
-        (counts[2], counts[1], counts[0])
+        // Servo packs the ID, class and type counts into 10 bits each.
+        let [types, classes, ids] = counts.map(|count| count.min(1023));
+        (ids << 20) | (classes << 10) | types
     }
 }
 
@@ -438,7 +525,7 @@ impl<'i> QualifiedRuleParser<'i> for LayoutRules<'_> {
         let declarations = declarations.unwrap_or_default();
         let invalid_selector = selectors
             .iter()
-            .any(|selector| matches!(selector, Selector::Unmodeled(Err(_))));
+            .any(|selector| matches!(selector, Selector::Complex(Err(_))));
         for selector in selectors {
             if matches!(selector, Selector::AtRestInactive) {
                 continue;
@@ -567,9 +654,12 @@ impl LayoutStyles {
                 && (rule.uncertain
                     || rule.conditional
                     || applies == Applicability::Uncertain
-                    || matches!(rule.selector, Selector::Unmodeled(_)));
+                    || matches!(rule.selector, Selector::Complex(Err(_))));
             if applies == Applicability::Yes
-                && matches!(rule.selector, Selector::Compound(_))
+                && matches!(
+                    rule.selector,
+                    Selector::Compound(_) | Selector::Complex(Ok(_))
+                )
                 && !rule.conditional
             {
                 author.push(rule);
@@ -704,6 +794,7 @@ fn neutral(declaration: &Declaration) -> bool {
     name.starts_with("background")
         || name.starts_with("outline")
         || name.starts_with("text-decoration")
+        || name.starts_with("mso-")
         || matches!(
             name,
             "font-family"
@@ -869,8 +960,10 @@ enum Layout {
     },
     Image {
         width: f32,
+        width_percent: Option<f32>,
         height: f32,
         min_height: f32,
+        inline: bool,
         padding: [Length; 4],
         margin: [Length; 4],
         border: [f32; 4],
@@ -882,6 +975,9 @@ enum Layout {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum FlowKind {
     Block,
+    InlineBlock,
+    Cell,
+    BlockCell,
     Stacked,
     Row,
     Table,
@@ -1193,10 +1289,16 @@ impl Layout {
         if name == "img" {
             let width = dimension("width");
             let height = dimension("height");
+            let width_percent = match html::declared_value(&style, "width").and_then(Length::parse)
+            {
+                Some(Length::Percent(percent)) => Some(percent * 0.01),
+                _ => None,
+            };
             return Some(Self::Image {
                 width: width
                     .or_else(|| height.map(|height| height * 1.5))
                     .unwrap_or(120.),
+                width_percent,
                 height: height
                     .or_else(|| width.map(|width| width / 1.5))
                     .unwrap_or(80.),
@@ -1208,6 +1310,7 @@ impl Layout {
                 } else {
                     min_height
                 },
+                inline: !matches!(display, Some("block")),
                 padding,
                 margin,
                 border,
@@ -1233,14 +1336,17 @@ impl Layout {
             _ if flex => FlowKind::Stacked,
             "table" => FlowKind::Table,
             "tr" => FlowKind::TableRow,
-            "td" | "th" | "tbody" | "thead" | "tfoot" => FlowKind::Stacked,
-            _ if matches!(display, Some("inline-block"))
-                || html::clips_vertical_overflow(&style) =>
-            {
-                FlowKind::Stacked
-            }
+            "td" | "th" if display == Some("block") => FlowKind::BlockCell,
+            "td" | "th" => FlowKind::Cell,
+            "tbody" | "thead" | "tfoot" => FlowKind::Stacked,
+            _ if display == Some("inline-block") => FlowKind::InlineBlock,
+            _ if html::clips_vertical_overflow(&style) => FlowKind::Stacked,
             _ => FlowKind::Block,
         };
+        let inline_flow = matches!(
+            kind,
+            FlowKind::Block | FlowKind::InlineBlock | FlowKind::Cell | FlowKind::BlockCell
+        );
         let mut children: Vec<Self> = Vec::new();
         for child in node
             .children()
@@ -1255,13 +1361,10 @@ impl Layout {
                         font: next_font,
                         line: next_line,
                     },
-                ) if matches!(kind, FlowKind::Block)
-                    && *font == next_font
-                    && *line == next_line =>
-                {
+                ) if inline_flow && *font == next_font && *line == next_line => {
                     *em += 0.25 + next;
                 }
-                (Some(Self::Text { .. }), Self::Break { .. }) if kind == FlowKind::Block => {
+                (Some(Self::Text { .. }), Self::Break { .. }) if inline_flow => {
                     children.push(Self::Break { height: 0. });
                 }
                 (_, child) => children.push(child),
@@ -1270,7 +1373,17 @@ impl Layout {
         if children.len() == 1
             && matches!(
                 name,
-                "a" | "b" | "em" | "font" | "i" | "small" | "span" | "strong" | "u"
+                "a" | "b"
+                    | "del"
+                    | "em"
+                    | "font"
+                    | "i"
+                    | "s"
+                    | "small"
+                    | "span"
+                    | "strike"
+                    | "strong"
+                    | "u"
             )
             && !uncertain
             && style.iter().all(neutral)
@@ -1353,16 +1466,20 @@ impl Layout {
             },
             Self::Image {
                 width: natural,
+                width_percent,
                 height,
                 min_height,
                 padding,
                 margin,
                 border,
                 font,
+                ..
             } => {
                 let [top, right, bottom, left] = insets(*padding, *border, width, *font);
+                let available = (width - left - right).max(1.);
+                let drawn = width_percent.map_or(*natural, |percent| width * percent);
                 Measured {
-                    height: (height * ((width - left - right).max(1.) / natural).min(1.))
+                    height: (height * (drawn.min(available) / natural))
                         .max(*min_height)
                         .min(image_limit)
                         + top
@@ -1371,7 +1488,7 @@ impl Layout {
                     below: margin[2].resolve(width, *font),
                 }
             }
-            Self::Flow(flow) => flow.measure(width, image_limit),
+            Self::Flow(flow) => flow.measure(width, image_limit, false),
         }
     }
 
@@ -1386,6 +1503,38 @@ impl Layout {
                 .fold(1., f32::max),
             Self::Break { .. } => 1.,
         }
+    }
+
+    fn inline_box_width(&self, width: f32) -> Option<f32> {
+        if let Self::Image {
+            width: natural,
+            width_percent,
+            inline: true,
+            padding,
+            margin,
+            border,
+            font,
+            ..
+        } = self
+        {
+            let [_, right, _, left] = insets(*padding, *border, width, *font);
+            let drawn = width_percent.map_or(*natural, |percent| width * percent);
+            let margins = margin[1].resolve(width, *font) + margin[3].resolve(width, *font);
+            return Some((drawn + left + right).min(width) + margins);
+        }
+        let Self::Flow(flow) = self else {
+            return None;
+        };
+        if flow.kind != FlowKind::InlineBlock {
+            return None;
+        }
+        let resolve = |length: Length| length.resolve(width, flow.font);
+        let declared = resolve(flow.width?)
+            .min(flow.max_width.map_or(f32::INFINITY, resolve))
+            .max(flow.min_width.map_or(0., resolve));
+        let [_, right, _, left] = insets(flow.padding, flow.border, width, flow.font);
+        let margins = resolve(flow.margin[1]) + resolve(flow.margin[3]);
+        Some(declared + margins + if flow.border_box { 0. } else { left + right })
     }
 }
 
@@ -1422,7 +1571,31 @@ fn authored_gap(
 }
 
 impl Flow {
-    fn measure(&self, width: f32, image_limit: f32) -> Measured {
+    fn inline_lines(&self, width: f32, image_limit: f32) -> impl Iterator<Item = Measured> + '_ {
+        let mut children = self.children.iter().peekable();
+        std::iter::from_fn(move || {
+            let child = children.next()?;
+            let line = child.measure(width, image_limit);
+            let Some(mut used) = child.inline_box_width(width) else {
+                return Some(line);
+            };
+            let mut tallest = line.outer_height();
+            while let Some(next) = children.peek()
+                && let Some(next_width) = next.inline_box_width(width)
+                && used + next_width <= width
+            {
+                used += next_width;
+                tallest = tallest.max(next.measure(width, image_limit).outer_height());
+                children.next();
+            }
+            Some(Measured {
+                height: tallest,
+                ..Measured::default()
+            })
+        })
+    }
+
+    fn measure(&self, width: f32, image_limit: f32, in_table_row: bool) -> Measured {
         let [top, right, bottom, left] = insets(self.padding, self.border, width, self.font);
         let [above, margin_right, below, margin_left] =
             self.margin.map(|edge| edge.resolve(width, self.font));
@@ -1433,8 +1606,18 @@ impl Flow {
         };
         let available = self
             .width
+            // The row already allocated a share of the table to the cell.
+            // Resolving a percentage again would narrow every nested box.
+            .filter(|width| !in_table_row || !matches!(width, Length::Percent(_)))
             .map_or(natural_width, content_width)
-            .min(self.max_width.map_or(natural_width, content_width))
+            .min(self.max_width.map_or(
+                if self.kind == FlowKind::BlockCell {
+                    f32::INFINITY
+                } else {
+                    natural_width
+                },
+                content_width,
+            ))
             .max(self.min_width.map_or(1., content_width));
         let [row_gap, column_gap] = self.gap.map(|gap| gap.resolve(available, self.font));
         let mut measured = Measured {
@@ -1443,6 +1626,18 @@ impl Flow {
             below,
         };
         let content = match self.kind {
+            FlowKind::TableRow
+                if self.children.iter().all(
+                    |child| matches!(child, Layout::Flow(flow) if flow.kind == FlowKind::BlockCell),
+                ) =>
+            {
+                // Responsive newsletters switch their cells to full-width
+                // blocks. The browser stacks them inside an anonymous cell.
+                self.children
+                    .iter()
+                    .map(|child| child.measure(available, image_limit).outer_height())
+                    .sum()
+            }
             FlowKind::Row | FlowKind::TableRow => {
                 let count = self.children.len();
                 let width = (available - column_gap * count.saturating_sub(1) as f32).max(1.);
@@ -1457,22 +1652,27 @@ impl Flow {
                         } else {
                             width
                         };
-                        child.measure(share, image_limit).outer_height()
+                        match child {
+                            Layout::Flow(flow) if self.kind == FlowKind::TableRow => {
+                                flow.measure(share, image_limit, true)
+                            }
+                            _ => child.measure(share, image_limit),
+                        }
+                        .outer_height()
                     })
                     .fold(0., f32::max)
             }
             FlowKind::Block => {
                 let mut previous = 0_f32;
                 let mut height = 0.;
-                for (index, child) in self.children.iter().enumerate() {
-                    let child = child.measure(available, image_limit);
+                for (index, line) in self.inline_lines(available, image_limit).enumerate() {
                     if index == 0 && top == 0. {
-                        measured.above = measured.above.max(child.above);
+                        measured.above = measured.above.max(line.above);
                     } else {
-                        height += previous.max(child.above);
+                        height += previous.max(line.above);
                     }
-                    height += child.height;
-                    previous = child.below;
+                    height += line.height;
+                    previous = line.below;
                 }
                 if bottom == 0. && self.height == 0. && self.min_height == 0. {
                     measured.below = measured.below.max(previous);
@@ -1481,6 +1681,10 @@ impl Flow {
                     height + previous
                 }
             }
+            FlowKind::InlineBlock | FlowKind::Cell | FlowKind::BlockCell => self
+                .inline_lines(available, image_limit)
+                .map(|line| line.outer_height())
+                .sum(),
             FlowKind::Stacked | FlowKind::Table => {
                 let table = self.kind == FlowKind::Table;
                 let width = if table {
@@ -1523,6 +1727,57 @@ impl Flow {
 
 #[cfg(test)]
 #[test]
+fn descendant_dimensions_win_by_specificity() {
+    let mail = WebMail::prepare(concat!(
+        "<style>.wrap .hero{height:280px}.hero{height:20px}</style>",
+        r#"<div class="wrap"><div class="hero"></div></div>"#,
+    ));
+    assert_eq!(mail.estimated_height(440.), 280. + HEIGHT_ALLOWANCE);
+}
+
+#[cfg(test)]
+#[test]
+fn structural_selectors_and_negated_hover_apply_at_rest() {
+    let mail = WebMail::prepare(concat!(
+        "<style>.wrap > .hero{height:280px} .wrap h1{margin:0;font-size:32px;line-height:40px} ",
+        "td.section:first-child{padding-top:80px} .idle:not(:hover){height:300px} ",
+        ".idle:hover{height:999px} @media(max-width:400px){.wrap > .hero{height:120px}}</style>",
+        r#"<div class="wrap"><div class="hero"></div><h1>News</h1></div>"#,
+        r#"<table cellspacing="0"><tr><td class="section">In town</td></tr></table>"#,
+        r#"<div class="idle"></div>"#,
+    ));
+    assert_eq!(
+        mail.estimated_height(440.),
+        280. + 40. + 99. + 300. + HEIGHT_ALLOWANCE
+    );
+    assert_eq!(
+        mail.estimated_height(360.),
+        120. + 40. + 99. + 300. + HEIGHT_ALLOWANCE
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn inline_blocks_share_height_until_they_wrap() {
+    let mail = WebMail::prepare(concat!(
+        "<style>.col{display:inline-block;width:48%;height:65px} ",
+        ".tall{height:100px} .fixed{width:160px} .unknown{width:auto} ",
+        "@media(max-width:400px){.col{display:block;width:100%}}</style>",
+        r#"<div class="col"></div> <div class="col tall"></div>"#,
+        r#"<div class="col fixed"></div><div class="col unknown"></div>"#,
+    ));
+    assert_eq!(
+        mail.estimated_height(600.),
+        100. + 65. + 65. + HEIGHT_ALLOWANCE
+    );
+    assert_eq!(
+        mail.estimated_height(360.),
+        100. + 3. * 65. + HEIGHT_ALLOWANCE
+    );
+}
+
+#[cfg(test)]
+#[test]
 fn height_estimates_account_for_headings_image_hints_and_table_rows() {
     let mail = WebMail::prepare(
         r#"<table><tr><td><h1>Today</h1></td><td><h1>News</h1></td></tr><tr><td colspan="2"><img width="300" src="https://example.test/photo"></td></tr></table>"#,
@@ -1537,8 +1792,10 @@ fn height_estimates_account_for_headings_image_hints_and_table_rows() {
 fn height_estimates_cap_image_hints_and_total_layout() {
     let image = Layout::Image {
         width: 1.,
+        width_percent: None,
         height: 10_000_000.,
         min_height: 0.,
+        inline: true,
         padding: [ZERO; 4],
         margin: [ZERO; 4],
         border: [0.; 4],
