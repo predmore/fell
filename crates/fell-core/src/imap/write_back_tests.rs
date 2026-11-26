@@ -1973,6 +1973,55 @@ fn undo_leaves_both_copies_when_move_recovery_cannot_search_the_full_span() {
     assert_eq!(fx.on_server("Archive"), copies);
 }
 
+/// A dropped move whose row has no recorded recovery end (written before
+/// the column existed) must not fall back to a 500-UID window: here that
+/// window would hold only the unrelated copy at UID 30.
+#[test]
+fn undo_of_a_move_without_a_recorded_window_moves_nothing() {
+    let fx = Fixture::new();
+    let account = &fx.account.id;
+    fx.server.state.lock().unwrap().mailboxes[1].uidnext = Some(10);
+    let bravo = fx.thread("INBOX", "Bravo");
+    fx.store.archive_thread(account, &bravo, "INBOX").unwrap();
+    fx.server.writes.lock().unwrap().lose_reply_to = Some("MOVE");
+    let report =
+        super::write_back::replay_with(&fx.backend.config, account, &fx.store, true, &|| {
+            fx.deliver(
+                "Archive",
+                30,
+                raw_with_message_id("Message-ID: <bravo@x>\r\n", "Bravo"),
+            );
+            fx.server.state.lock().unwrap().mailboxes[1].uidnext = Some(519);
+        });
+    assert!(report.unwrap().interrupted.is_some());
+    let copies = vec![(30, "Bravo".into()), (519, "Bravo".into())];
+    assert_eq!(fx.on_server("Archive"), copies);
+    assert_eq!(
+        fx.replay_until_dropped()[0].reason,
+        DropReason::MoveSourceGone
+    );
+    // As a row from before move_recovery_end was stored.
+    fx.store
+        .connection()
+        .execute("UPDATE server_outbox SET move_recovery_end = NULL", [])
+        .unwrap();
+
+    fx.store.undo(account).unwrap();
+    fx.sync();
+    assert!(fx.copy_recorded("Archive", 30));
+    fx.clear_commands();
+
+    let dropped = fx.replay_until_dropped();
+    assert_eq!(dropped.len(), 1);
+    assert_eq!(dropped[0].reason, DropReason::UnconfirmedReverse);
+    assert!(
+        without_tags(&fx.writes())
+            .iter()
+            .all(|command| !command.starts_with("UID MOVE"))
+    );
+    assert_eq!(fx.on_server("Archive"), copies);
+}
+
 #[test]
 fn move_recovery_rejects_too_many_search_hits_without_fetching() {
     let fx = move_with_lost_reply();

@@ -1636,10 +1636,10 @@ fn synced_reversal(store: &Store, account: &AccountId, entry: &OutboxEntry) -> R
     let placed = if let Some((mailbox, (validity, first))) =
         entry.target_mailbox.as_deref().zip(entry.target_bound)
     {
-        let end = entry
-            .move_recovery_end
-            .map(i64::from)
-            .unwrap_or(i64::from(first) + crate::imap::RECOVERY_UID_LIMIT as i64);
+        // No recorded end means recovery never observed a usable range (or
+        // the row predates the column): treat it as empty, so sync cannot
+        // supply a UID that might be a different copy of the message.
+        let end = entry.move_recovery_end.map_or(i64::from(first), i64::from);
         let uid: Option<u32> = store.connection().query_row(
             "SELECT CASE WHEN COUNT(*) = 1 THEN MAX(c.uid) END FROM message_copies c
              WHERE c.account_id = ?1 AND c.message_id = ?2 AND c.mailbox = ?3
