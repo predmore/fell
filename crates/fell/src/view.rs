@@ -40,12 +40,12 @@ use gpui::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use fell_core::actions::LabelUndoTarget;
-use fell_core::compose::{DraftSummary, ReplyKind, ReplyStart};
+use fell_core::compose::{DraftSummary, ReplyKind};
 
 use crate::attachments::{self, Download, Fetcher, Request as AttachmentRequest};
 use crate::compose_launch::ComposeLaunch;
 use crate::compose_ui::ComposeView;
-use crate::draft_host::{self, AgentDrafts, DraftHome};
+use crate::draft_host::{self, DraftHome};
 use crate::frame_log::{FrameLog, SharedFrameLog};
 use crate::inbox_motion::{Disclosures, InboxMotion, PaneEntry, StatusMotion, ThreadGhost};
 use crate::keymap::{self, Action, KeyId};
@@ -814,6 +814,9 @@ struct Inbox {
     merge_feedback_at: Option<Instant>,
     /// Background sync for the account file. `None` for the demo mailbox.
     sync: Option<SyncHandle>,
+    retired: bool,
+    compose_ready: futures::future::Shared<futures::channel::oneshot::Receiver<()>>,
+    account_arrival: Option<Transition>,
     /// Visible label rows as they looked in the last list prepaint.
     painted_label_rows: Vec<LeavingRow>,
     leaving_rows: Option<Arc<[LeavingRow]>>,
@@ -891,46 +894,6 @@ struct Warm {
 const WARM_ROWS: usize = 2;
 
 impl Inbox {
-    fn focused(
-        startup: mailbox::Startup,
-        demo: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let inbox = Self::with_startup(startup, demo, Some(window), cx);
-        window.focus(&inbox.focus);
-        cx.on_focus_lost(window, |inbox, window, _cx| {
-            // A focused link can disappear when its message closes.
-            let current = accounts::active_inbox(window, _cx);
-            if current
-                .as_ref()
-                .is_some_and(|entity| entity == &_cx.entity())
-            {
-                window.focus(&inbox.focus);
-            }
-        })
-        .detach();
-        cx.set_global(InboxWindow(window.window_handle()));
-        let mut viewport = (window.viewport_size(), window.scale_factor());
-        cx.observe_window_bounds(window, move |_, window, cx| {
-            let previous = viewport;
-            viewport = (window.viewport_size(), window.scale_factor());
-            if viewport != previous {
-                // Draw at the new bounds for the next compositor frame.
-                window.defer(cx, |window, cx| window.draw(cx).clear());
-            }
-        })
-        .detach();
-        cx.observe_window_activation(window, |this, window, cx| {
-            if window.is_window_active() {
-                this.refresh_settings_identities(cx);
-                cx.notify();
-            }
-        })
-        .detach();
-        inbox
-    }
-
     fn account_setup_handoff(&mut self, setup: gpui::Entity<Onboarding>) {
         self.first_preview = FirstPreview::Handoff;
         self.waiting_for_first_rows = true;
@@ -966,7 +929,7 @@ impl Inbox {
         let (store, ready) = StoreClient::spawn(
             {
                 let config = config.clone();
-                move || mailbox::open_store(path.clone(), config.as_ref(), demo)
+                move || mailbox::open_registered_store(path.clone(), config.as_ref(), demo)
             },
             notices,
         );
@@ -1011,6 +974,7 @@ impl Inbox {
             .detach();
             queue
         });
+        let (compose_ready_tx, compose_ready) = futures::channel::oneshot::channel();
         let mut inbox = Self {
             focus: cx.focus_handle(),
             notifications,
@@ -1083,6 +1047,9 @@ impl Inbox {
             regroup_selection: None,
             merge_feedback_at: None,
             sync: None,
+            retired: false,
+            compose_ready: futures::FutureExt::shared(compose_ready),
+            account_arrival: None,
             painted_label_rows: Vec::new(),
             leaving_rows: None,
             leaving_reader: None,
@@ -1118,7 +1085,12 @@ impl Inbox {
             let Ok(opened) = ready.await else {
                 return;
             };
-            let _ = this.update(cx, |inbox, cx| inbox.on_store_ready(opened, sync_with, cx));
+            let _ = this.update(cx, |inbox, cx| {
+                if !inbox.retired {
+                    inbox.on_store_ready(opened, sync_with, cx);
+                }
+            });
+            let _ = compose_ready_tx.send(());
         })
         .detach();
         inbox.show_crash_notice(cx);
@@ -1224,77 +1196,7 @@ impl Inbox {
         self.request_threads(ReadIntent::default(), cx);
         self.search_store_ready(cx);
         self.watch_reviews(cx);
-        self.watch_external_compose(cx);
         cx.notify();
-    }
-
-    fn watch_external_compose(&self, cx: &mut Context<Self>) {
-        if cx.try_global::<ExternalCompose>().is_none() {
-            return;
-        }
-        let Some(mut requests) = cx.global_mut::<ExternalCompose>().0.take() else {
-            return;
-        };
-        let hub = cx.global::<AgentDrafts>().0.clone();
-        cx.spawn(async move |_, cx| {
-            while let Some(request) = futures::StreamExt::next(&mut requests).await {
-                let target = cx
-                    .update(|cx| {
-                        let window = cx.try_global::<InboxWindow>().copied()?;
-                        window
-                            .0
-                            .update(cx, |_, window, cx| {
-                                let inbox = accounts::active_inbox(window, cx)?;
-                                let inbox = inbox.read(cx);
-                                Some((
-                                    inbox.draft_home.clone()?,
-                                    inbox.account_id.clone(),
-                                    fell_core::compose::configured_from(
-                                        &inbox.session.account_name,
-                                        &inbox.session.account_email,
-                                    ),
-                                ))
-                            })
-                            .ok()
-                            .flatten()
-                    })
-                    .ok()
-                    .flatten();
-                let result = if let Some((home, account, from)) = target {
-                    let hub = hub.clone();
-                    let (fields, body) = request.input.into_fields_and_body(from);
-                    let start = ReplyStart {
-                        fields,
-                        parts: Default::default(),
-                    };
-                    cx.background_executor()
-                        .spawn(async move {
-                            home.new_seeded(&hub, &account, start, body, request.files)
-                        })
-                        .await
-                } else {
-                    Err("The mailbox did not open, so a draft has nowhere to go".into())
-                };
-                match result {
-                    Ok(id) => {
-                        draft_host::show_draft(&hub, &id);
-                    }
-                    Err(err) => {
-                        let _ = cx.update(|cx| {
-                            if let Some(window) = cx.try_global::<InboxWindow>().copied() {
-                                window.update(cx, |inbox, cx| {
-                                    inbox
-                                        .session
-                                        .show_toast(format!("Couldn't start a draft. {err}"), true);
-                                    cx.notify();
-                                });
-                            }
-                        });
-                    }
-                }
-            }
-        })
-        .detach();
     }
 
     fn repair_cached_cids(
@@ -4603,6 +4505,7 @@ impl Inbox {
             });
             if self.help_scroll.on_key(key, &self.motion.motion, now) {
                 self.motion.end_key();
+                self.account_arrival = None;
                 cx.notify();
                 cx.stop_propagation();
                 return;
@@ -6094,6 +5997,13 @@ impl Render for Inbox {
                 status_labels,
                 link_preview,
                 recipient_popup,
+                account_opacity: {
+                    self.account_arrival = self.account_arrival.filter(|fade| fade.running(now));
+                    self.account_arrival.map_or(1.0, |fade| {
+                        window.request_animation_frame();
+                        motion::lerp(motion::ARRIVE_FROM, 1.0, fade.progress(now))
+                    })
+                },
             },
             width,
             (list_width, split_width),
@@ -6178,6 +6088,7 @@ struct Shown {
     status_labels: StatusLabelsFrame,
     link_preview: reader_links::PreviewFrame,
     recipient_popup: Option<gpui::Deferred>,
+    account_opacity: f32,
 }
 
 struct LeavingReader {
@@ -6382,6 +6293,7 @@ fn shell(
         status_labels,
         link_preview,
         recipient_popup,
+        account_opacity,
     } = shown;
     let frames = conv.frames.clone();
     let same_scope = session.search.is_none()
@@ -6516,7 +6428,7 @@ fn shell(
             )
         })
         .child(match &session.search {
-            Some(search) => search::header(&theme, search, width, window, cx),
+            Some(search) => search::header(&theme, search, session, width, window, cx),
             None => header(
                 &theme,
                 session,
@@ -6565,7 +6477,7 @@ fn shell(
                                         .flex()
                                         .flex_row()
                                         .opacity(motion.reading_list_opacity(now) * empty_list_pane)
-                                        .child(list)
+                                        .child(list.opacity(account_opacity))
                                         .child(splitter(&theme, cx)),
                                 )
                                 .when(!show_list, |clip| {
@@ -6581,7 +6493,10 @@ fn shell(
                                 }),
                         )
                     } else {
-                        row.child(entering(list.opacity(empty_list_pane), list_entry))
+                        row.child(entering(
+                            list.opacity(empty_list_pane * account_opacity),
+                            list_entry,
+                        ))
                     }
                 })
                 .when(
@@ -6607,7 +6522,7 @@ fn shell(
                                         ))
                                     },
                                 );
-                            return row.child(pane);
+                            return row.child(pane.opacity(account_opacity));
                         }
                         row.child(entering(
                             conversation(
@@ -6622,7 +6537,8 @@ fn shell(
                                 &conv,
                                 window,
                                 cx,
-                            ),
+                            )
+                            .opacity(account_opacity),
                             conv_entry,
                         ))
                     },
@@ -12310,10 +12226,12 @@ fn overlay(
                 .when_some(card, |card, height| card.h(px(height)))
                 .opacity(opacity)
                 .into_any_element(),
-            Overlay::Folders => folder_picker(theme, session, folder_scroll, picker, window, cx)
-                .when_some(card, |card, height| card.h(px(height)))
-                .opacity(opacity)
-                .into_any_element(),
+            Overlay::Folders => {
+                folder_picker(theme, session, folder_scroll, picker, live, window, cx)
+                    .when_some(card, |card, height| card.h(px(height)))
+                    .opacity(opacity)
+                    .into_any_element()
+            }
             Overlay::Snooze => snooze::card(
                 theme,
                 &session.snooze,
@@ -12519,6 +12437,7 @@ fn folder_picker(
         mark_opacity,
         merge_feedback,
     }: PickerCard<'_>,
+    live: bool,
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::Div {
@@ -12757,24 +12676,26 @@ fn folder_picker(
                         } else {
                             theme.foreground
                         }))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |inbox, _, window, cx| {
-                                // A picker fading out takes no clicks.
-                                if inbox.session.visible_overlay() != Overlay::Folders
-                                    || (merging && inbox.session.merge_loading)
-                                {
-                                    return;
-                                }
-                                cx.stop_propagation();
-                                window.focus(&inbox.focus);
-                                inbox.session.clear_toast();
-                                inbox.session.folder_index = index;
-                                let before = inbox.before_step();
-                                let step = inbox.session.confirm_folder();
-                                inbox.apply_step(step, before, cx);
-                            }),
-                        )
+                        .when(live, |row| {
+                            row.on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |inbox, _, window, cx| {
+                                    // A picker fading out takes no clicks.
+                                    if inbox.session.visible_overlay() != Overlay::Folders
+                                        || (merging && inbox.session.merge_loading)
+                                    {
+                                        return;
+                                    }
+                                    cx.stop_propagation();
+                                    window.focus(&inbox.focus);
+                                    inbox.session.clear_toast();
+                                    inbox.session.folder_index = index;
+                                    let before = inbox.before_step();
+                                    let step = inbox.session.confirm_folder();
+                                    inbox.apply_step(step, before, cx);
+                                }),
+                            )
+                        })
                         .gap(px(if merging { 0.0 } else { GAP }))
                         .overflow_hidden()
                         .when(

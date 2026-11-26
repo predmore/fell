@@ -15,13 +15,15 @@
 //! once, for the status bar.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fell_core::{
     Account, AccountConfig, BackendKind, DroppedWrite, InboxWait, ReaderBodyFetcher,
     ReplyToBackfill, ReplyToProgress, Store, SyncFailureKind, SyncReport, diagnostic,
-    fetch_missing_bodies, sync_with_arrivals,
+    fetch_missing_bodies, sync_until,
 };
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 
@@ -124,7 +126,9 @@ enum Ask {
 
 #[derive(Clone)]
 pub struct SyncHandle {
-    wake: Sender<Ask>,
+    wake: Arc<Mutex<Option<Sender<Ask>>>>,
+    thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+    stopping: Arc<AtomicBool>,
     /// `write_back` in the account file.
     write_back: bool,
 }
@@ -132,15 +136,28 @@ pub struct SyncHandle {
 impl SyncHandle {
     /// Start the next pass now. A pass already running finishes first.
     pub fn sync_now(&self) {
-        let _ = self.wake.send(Ask::Sync);
+        self.ask(Ask::Sync);
     }
 
     /// Send queued writes now, then run a pass, without
     /// showing "connecting". Nothing is queued while write-back is off.
     pub fn write_back_now(&self) {
         if self.write_back {
-            let _ = self.wake.send(Ask::WriteBack);
+            self.ask(Ask::WriteBack);
         }
+    }
+    fn ask(&self, ask: Ask) {
+        if let Some(wake) = self.wake.lock().expect("sync wake").as_ref() {
+            let _ = wake.send(ask);
+        }
+    }
+
+    /// Close the wake channel even if write-back callbacks still hold clones.
+    /// Join on the background executor before starting a replacement.
+    pub fn stop(self) -> Option<std::thread::JoinHandle<()>> {
+        self.stopping.store(true, Ordering::Release);
+        self.wake.lock().expect("sync wake").take();
+        self.thread.lock().expect("sync thread").take()
     }
 }
 
@@ -161,7 +178,9 @@ fn start_with(
     let (events_tx, events) = unbounded();
     let (wake, wake_rx) = mpsc::channel();
     let write_back = config.write_back;
-    std::thread::Builder::new()
+    let stopping = Arc::new(AtomicBool::new(false));
+    let stop = stopping.clone();
+    let thread = std::thread::Builder::new()
         .name("fell-sync".into())
         .spawn(move || {
             let mut restart = Restart::new(Worker::Sync, |event| {
@@ -176,11 +195,20 @@ fn start_with(
                     &wake_rx,
                     recovered,
                     notifications.as_ref(),
+                    &stop,
                 );
             });
         })
         .expect("spawn sync thread");
-    (SyncHandle { wake, write_back }, events)
+    (
+        SyncHandle {
+            wake: Arc::new(Mutex::new(Some(wake))),
+            thread: Arc::new(Mutex::new(Some(thread))),
+            stopping,
+            write_back,
+        },
+        events,
+    )
 }
 
 fn run(
@@ -190,15 +218,21 @@ fn run(
     wake: &Receiver<Ask>,
     recovered: &mut dyn FnMut(),
     notifications: Option<&notifications::Queue>,
+    stop: &AtomicBool,
 ) {
     let bridge = config.backend == BackendKind::Bridge;
     let send = |kind: SyncKind| events.unbounded_send(SyncEvent::Status(kind)).is_ok();
+
+    let stopping = || stop.load(Ordering::Acquire) || events.is_closed();
 
     // Another connection may still be opening or migrating the file. Retry
     // instead of giving up on a lock.
     let mut failures = 0usize;
     let store = loop {
-        match Store::open(store_path) {
+        if stopping() {
+            return;
+        }
+        match Store::open_existing(store_path) {
             Ok(store) => break store,
             Err(err) => {
                 diagnostic!(
@@ -251,6 +285,9 @@ fn run(
         return;
     }
     loop {
+        if stopping() {
+            return;
+        }
         // Replay writes before the read-only pass, so it sees their results.
         // A failure here is a connection problem the pass reports.
         if let Ok(report) = config.replay_outbox(&store) {
@@ -294,7 +331,7 @@ fn run(
             }
         };
         let result = config.backend().and_then(|backend| {
-            sync_with_arrivals(
+            sync_until(
                 &account,
                 backend.as_ref(),
                 &store,
@@ -316,12 +353,13 @@ fn run(
                     }
                 },
                 notifications.map(|_| &mut on_arrivals as &mut dyn FnMut(_)),
+                &stopping,
             )
         });
         if let Some(queue) = notifications {
             queue.pass_ended();
         }
-        if !alive || !refresh_trash_confirmation() {
+        if !alive || stopping() || !refresh_trash_confirmation() {
             return;
         }
         // Fold the log back into the file between passes so readers stay fast.
@@ -613,6 +651,32 @@ mod restart_tests {
     use std::os::unix::fs::PermissionsExt as _;
 
     #[test]
+    fn stopping_closes_the_worker_even_with_a_write_back_handle() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("mail.db");
+        let config = AccountConfig::bridge(
+            "test@example.test",
+            "fixture",
+            fell_core::PasswordSource::Command("exit 1".into()),
+        );
+        let (entered, ready) = mpsc::channel();
+        let (finish, resume) = mpsc::channel();
+        let (handle, mut events) = start_with(config, path.clone(), None, move || {
+            entered.send(()).unwrap();
+            resume.recv().unwrap();
+        });
+        ready.recv().unwrap();
+        let callback = handle.clone();
+        let thread = handle.stop().unwrap();
+        callback.sync_now();
+        finish.send(()).unwrap();
+        thread.join().unwrap();
+        assert!(!path.exists());
+        assert!(events.try_recv().is_err());
+        assert!(callback.stop().is_none());
+    }
+
+    #[test]
     fn injected_panic_writes_report_and_sync_restarts() {
         // Installing a process-global panic hook in the child keeps it out
         // of concurrent tests in the unit test process.
@@ -649,6 +713,7 @@ mod restart_tests {
         );
         let path =
             std::path::PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap()).join("mail.db");
+        drop(Store::open(&path).unwrap());
         let mut first = true;
         let (_handle, mut events) = start_with(config, path, None, move || {
             assert!(!std::mem::take(&mut first), "synthetic-panic-payload");

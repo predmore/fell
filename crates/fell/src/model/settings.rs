@@ -51,7 +51,7 @@ impl Section {
         use Preference::*;
         use Row::*;
         match self {
-            Self::Accounts => &[AccountSetup, EditAccount, ImportIdentities],
+            Self::Accounts => &[AccountSetup, EditAccount, ImportIdentities, RemoveAccount],
             Self::Appearance => &[Value(Theme), Value(FontSize), Value(ReduceMotion)],
             Self::Reading => &[Value(ReadDwell)],
             Self::Keymap => &[Value(WhichKey), EffectiveBindings, EditKeymap],
@@ -66,6 +66,8 @@ impl Section {
 pub enum Row {
     Value(Preference),
     AccountSetup,
+    Account(usize),
+    RemoveAccount,
     EditAccount,
     ImportIdentities,
     EffectiveBindings,
@@ -79,6 +81,8 @@ impl Row {
     pub fn command(self) -> &'static str {
         match self {
             Self::Value(preference) => preference.command(),
+            Self::Account(_) => "Settings: Open account",
+            Self::RemoveAccount => "Settings: Remove account",
             Self::AccountSetup => "Settings: Add account",
             Self::EditAccount => "Settings: Edit account file",
             Self::ImportIdentities => "Settings: Import sender addresses",
@@ -95,6 +99,9 @@ impl Row {
 pub enum Request {
     Save(Edit),
     AccountSetup,
+    OpenAccount(usize),
+    ConfirmAccountRemoval(usize),
+    RemoveAccount { delete: bool },
     EditAccount,
     ReadIdentityCandidates,
     ToggleIdentityCandidate(usize),
@@ -112,6 +119,9 @@ pub enum Page {
     Section(Section),
     Bindings,
     IdentityImport,
+    ConfirmAccountRemoval {
+        delete: bool,
+    },
     ConfirmModel {
         install: bool,
     },
@@ -122,7 +132,8 @@ pub struct Availability {
     pub account_setup: bool,
     pub edit_account: bool,
     pub identity_count: usize,
-    pub other_accounts: usize,
+    pub accounts: usize,
+    pub active_account: Option<usize>,
     pub install_model: bool,
     pub remove_model: bool,
 }
@@ -133,7 +144,8 @@ impl Default for Availability {
             account_setup: true,
             edit_account: false,
             identity_count: 0,
-            other_accounts: 0,
+            accounts: 0,
+            active_account: None,
             install_model: true,
             remove_model: false,
         }
@@ -144,6 +156,8 @@ impl Availability {
     pub fn shows(self, row: Row) -> bool {
         match row {
             Row::AccountSetup => self.account_setup,
+            Row::Account(index) => index < self.accounts,
+            Row::RemoveAccount => self.accounts > 0,
             Row::EditAccount => self.edit_account,
             Row::ImportIdentities => self.identity_count > 0,
             Row::InstallModel => self.install_model,
@@ -168,11 +182,24 @@ impl Nav {
     }
 
     pub fn rows(&self, section: Section) -> impl Iterator<Item = Row> {
-        section
-            .rows()
-            .iter()
-            .copied()
-            .filter(|row| self.availability.shows(*row))
+        let accounts = if section == Section::Accounts {
+            self.availability.accounts
+        } else {
+            0
+        };
+        let rows = (0..accounts).flat_map(move |index| {
+            let active = (self.availability.active_account == Some(index))
+                .then_some([Row::EditAccount, Row::ImportIdentities]);
+            std::iter::once(Row::Account(index)).chain(active.into_iter().flatten())
+        });
+        rows.chain(
+            section
+                .rows()
+                .iter()
+                .copied()
+                .filter(move |row| section != Section::Accounts || *row == Row::AccountSetup),
+        )
+        .filter(|row| self.availability.shows(*row))
     }
 
     pub fn set_availability(&mut self, next: Availability) {
@@ -208,6 +235,12 @@ impl Nav {
             }
             Page::Bindings => self.select_row(Row::EffectiveBindings),
             Page::IdentityImport => self.select_row(Row::ImportIdentities),
+            Page::ConfirmAccountRemoval { delete: true } => {
+                self.page = Page::ConfirmAccountRemoval { delete: false };
+            }
+            Page::ConfirmAccountRemoval { delete: false } => {
+                self.page = Page::Section(Section::Accounts);
+            }
             Page::ConfirmModel { install } => {
                 self.page = Page::Section(Section::Search);
                 self.selected = 0;
@@ -232,7 +265,9 @@ impl Nav {
             Page::Index => Section::ALL.len(),
             Page::Section(section) => self.rows(section).count(),
             Page::IdentityImport => self.identity_candidates + 1,
-            Page::Bindings | Page::ConfirmModel { .. } => return,
+            Page::Bindings | Page::ConfirmModel { .. } | Page::ConfirmAccountRemoval { .. } => {
+                return;
+            }
         };
         if len != 0 {
             self.selected = match key {

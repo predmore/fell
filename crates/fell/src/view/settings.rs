@@ -8,7 +8,7 @@ use fell_core::embed::{
     LocalEmbedder, MINILM_L6_V2_INT8, ModelError, default_models_dir, load_local_embedder,
     model_dir, remove_model,
 };
-use fell_core::{AccountConfig, BackendKind, Identity};
+use fell_core::{AccountConfig, Identity};
 use futures::channel::mpsc;
 use futures::{FutureExt, StreamExt};
 use gpui::{
@@ -18,6 +18,7 @@ use gpui::{
 };
 
 use super::{FontOpt, Inbox};
+use crate::keymap::KeyId;
 use crate::model::Overlay;
 use crate::model::settings::{self as nav, Availability, Page, Request, Row, Section};
 use crate::motion::{self, Glide, LayerSwap, Motion, SwapFrame, Transition};
@@ -95,8 +96,8 @@ pub(super) struct View {
     chevrons: Option<Transition>,
     page: Option<Page>,
     page_fade: Option<Transition>,
-    server: Option<String>,
-    other_accounts: Vec<(String, String, bool)>,
+    accounts: Vec<AccountRow>,
+    removal: Option<AccountRow>,
     identities: Vec<Identity>,
     identity_read: Option<gpui::Task<()>>,
     identity_candidates: Option<Result<Vec<IdentityCandidate>, String>>,
@@ -106,6 +107,18 @@ pub(super) struct View {
     model: ModelStatus,
     model_generation: u64,
     model_notice: Option<(String, bool)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AccountRow {
+    id: String,
+    path: PathBuf,
+    file_identity: Option<fell_core::accounts::FileIdentity>,
+    name: String,
+    email: Option<String>,
+    status: String,
+    alert: bool,
+    active: bool,
 }
 
 struct IdentityCandidate {
@@ -137,20 +150,8 @@ impl View {
             chevrons: None,
             page: None,
             page_fade: None,
-            server: account.map(|config| {
-                let host = crate::present::display_safe(&config.host);
-                let host = if host.contains(':') && !host.starts_with('[') {
-                    format!("[{host}]")
-                } else {
-                    host
-                };
-                match config.backend {
-                    BackendKind::Bridge => format!("Proton Mail Bridge on {host}:{}", config.port),
-                    BackendKind::Imap => format!("IMAP · {host}:{}", config.port),
-                    BackendKind::ProtonApi => "Proton Mail".into(),
-                }
-            }),
-            other_accounts: Vec::new(),
+            accounts: Vec::new(),
+            removal: None,
             identities: account
                 .map(AccountConfig::compose_identities)
                 .unwrap_or_default(),
@@ -165,40 +166,68 @@ impl View {
         }
     }
 
-    pub fn set_accounts(&mut self, catalog: &fell_core::accounts::Accounts, active: Option<&str>) {
-        self.other_accounts = catalog
+    pub fn set_accounts(
+        &mut self,
+        catalog: &fell_core::accounts::Accounts,
+        active: Option<&str>,
+        statuses: &std::collections::HashMap<String, (String, bool)>,
+    ) -> bool {
+        let accounts: Vec<_> = catalog
             .entries
             .iter()
             .filter_map(|entry| {
-                let id = entry.path.file_stem()?.to_string_lossy();
-                if active == Some(id.as_ref()) {
-                    return None;
-                }
-                Some(match &entry.config {
-                    Ok(config) => (
-                        config.account().display_name,
-                        format!("{} · {}", id, config.email),
-                        false,
-                    ),
-                    Err(error) => (format!("{id} unavailable"), error.recovery.into(), true),
+                let id = entry.path.file_stem()?.to_str()?.to_owned();
+                let active = active == Some(id.as_str());
+                let (name, email, status, alert) = match &entry.config {
+                    Ok(config) => {
+                        let (status, alert) = statuses
+                            .get(&id)
+                            .cloned()
+                            .unwrap_or_else(|| ("Opening mailbox…".into(), false));
+                        (
+                            config.account().display_name,
+                            Some(config.email.clone()),
+                            status,
+                            alert,
+                        )
+                    }
+                    Err(error) => {
+                        let prefix = format!("{}: ", entry.path.display());
+                        let detail = error.detail.strip_prefix(&prefix).unwrap_or(&error.detail);
+                        (
+                            entry.path.file_name()?.to_string_lossy().into_owned(),
+                            None,
+                            detail.to_owned(),
+                            true,
+                        )
+                    }
+                };
+                Some(AccountRow {
+                    id,
+                    path: entry.path.clone(),
+                    file_identity: entry.file_identity,
+                    name,
+                    email,
+                    status,
+                    alert,
+                    active,
                 })
             })
             .collect();
-        if let Some(error) = &catalog.error {
-            self.other_accounts.push((
-                "Account configuration unavailable".into(),
-                error.recovery.into(),
-                true,
-            ));
+        if self.accounts == accounts {
+            return false;
         }
+        self.accounts = accounts;
+        true
     }
 
     pub fn availability(&self) -> Availability {
         Availability {
             account_setup: true,
-            edit_account: self.server.is_some(),
+            edit_account: self.accounts.iter().any(|account| account.active),
             identity_count: self.identities.len(),
-            other_accounts: self.other_accounts.len(),
+            accounts: self.accounts.len(),
+            active_account: self.accounts.iter().position(|account| account.active),
             install_model: matches!(
                 self.model,
                 ModelStatus::Checking | ModelStatus::Missing | ModelStatus::NeedsRepair
@@ -454,7 +483,45 @@ impl Inbox {
                 self.settings_notice("Could not save settings", true, cx);
             }
             Request::AccountSetup => self.open_account_setup(cx),
-            Request::EditAccount => self.open_account_editor(cx),
+            Request::EditAccount => {
+                if let Some(account) = self
+                    .settings_view
+                    .accounts
+                    .iter()
+                    .find(|account| account.active)
+                {
+                    self.open_account_editor(account.path.clone(), cx);
+                }
+            }
+            Request::OpenAccount(index) => {
+                if let Some(account) = self.settings_view.accounts.get(index).cloned() {
+                    if account.email.is_none() {
+                        self.open_account_editor(account.path, cx);
+                    } else if !account.active {
+                        self.session.dismiss_overlay();
+                        self.account_action(account.id, None, cx);
+                    }
+                }
+            }
+            Request::ConfirmAccountRemoval(index) => {
+                self.settings_view.removal = self.settings_view.accounts.get(index).cloned();
+            }
+            Request::RemoveAccount { delete } => {
+                if let Some(target) = self.settings_view.removal.take() {
+                    if self.settings_view.accounts.iter().any(|account| {
+                        account.id == target.id && account.file_identity == target.file_identity
+                    }) {
+                        self.session.dismiss_overlay();
+                        self.account_action(target.id, Some((delete, target.file_identity)), cx);
+                    } else {
+                        self.settings_notice(
+                            "The account file changed. Select the account again.",
+                            true,
+                            cx,
+                        );
+                    }
+                }
+            }
             Request::ReadIdentityCandidates => self.read_identity_candidates(cx),
             Request::ToggleIdentityCandidate(index) => {
                 if !self.settings_view.importing_identities
@@ -539,19 +606,27 @@ impl Inbox {
         }
     }
 
-    fn open_account_editor(&mut self, cx: &mut Context<Self>) {
-        let account = self.account_id.clone();
+    fn account_action(
+        &self,
+        id: String,
+        remove: Option<(bool, Option<fell_core::accounts::FileIdentity>)>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(window) = cx.try_global::<super::InboxWindow>().copied() {
+            cx.defer(move |cx| {
+                let _ = window.0.update(cx, |_, window, cx| match remove {
+                    Some(removal) => super::accounts::remove(&id, removal, window, cx),
+                    None => super::accounts::switch(&id, window, cx),
+                });
+            });
+        }
+    }
+
+    fn open_account_editor(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move {
-                    let registry = fell_core::accounts::Registry::resolve()
-                        .map_err(|err| io::Error::other(err.to_string()))?;
-                    let path = registry
-                        .path(account.as_str())
-                        .map_err(|err| io::Error::other(err.to_string()))?;
-                    super::diagnostics::open_in_editor(&path)
-                })
+                .spawn(async move { super::diagnostics::open_in_editor(&path) })
                 .await;
             if let Err(error) = result {
                 let _ = this.update(cx, |inbox, cx| {
@@ -895,7 +970,6 @@ fn report_unknown(snapshot: &Snapshot) {
 const HEADER_HEIGHT: f32 = 64.;
 const SECTION_ROW_HEIGHT: f32 = 64.;
 const INDEX_ROW_HEIGHT: f32 = 49.;
-const ACCOUNT_SUMMARY_HEIGHT: f32 = 80.;
 const ACCOUNT_ROW_HEIGHT: f32 = 64.;
 const BODY_PADDING: f32 = 16.;
 const BINDING_ROW_HEIGHT: f32 = 39.;
@@ -918,29 +992,23 @@ pub(super) fn card_height(nav: &nav::Nav, room: f32, narrow: bool) -> f32 {
         Page::Index => Section::ALL.len() as f32 * INDEX_ROW_HEIGHT + INDEX_FOOTER_HEIGHT,
         Page::Section(section) => {
             nav.rows(section)
-                .map(|row| {
-                    SECTION_ROW_HEIGHT
-                        + if narrow && matches!(row, Row::Value(_)) {
-                            8.
-                        } else {
-                            0.
-                        }
+                .map(|row| match row {
+                    Row::Account(_) => ACCOUNT_ROW_HEIGHT,
+                    Row::EditAccount | Row::ImportIdentities => 45.,
+                    _ if narrow && matches!(row, Row::Value(_)) => SECTION_ROW_HEIGHT + 8.,
+                    _ => SECTION_ROW_HEIGHT,
                 })
                 .sum::<f32>()
                 + match section {
-                    Section::Accounts => {
-                        ACCOUNT_SUMMARY_HEIGHT
-                            + nav.availability.other_accounts as f32 * ACCOUNT_ROW_HEIGHT
-                            + if nav.availability.identity_count > 0 {
-                                28. + nav.availability.identity_count as f32 * IDENTITY_ROW_HEIGHT
-                            } else {
-                                0.
-                            }
+                    Section::Accounts if nav.availability.identity_count > 0 => {
+                        28. + nav.availability.identity_count as f32 * IDENTITY_ROW_HEIGHT
                     }
                     Section::Search => SEARCH_SUMMARY_HEIGHT,
                     _ => 0.,
                 }
         }
+        Page::ConfirmAccountRemoval { .. } if narrow => 115.,
+        Page::ConfirmAccountRemoval { .. } => 98.,
         Page::ConfirmModel { install: true } if narrow => 445.,
         Page::ConfirmModel { .. } => 370.,
         Page::IdentityImport => 54. + (nav.identity_candidates + 1) as f32 * IDENTITY_ROW_HEIGHT,
@@ -973,7 +1041,7 @@ pub(super) fn card(
         Page::Index => None,
         Page::Section(_) => Some("Settings"),
         Page::Bindings => Some("Keymap"),
-        Page::IdentityImport => Some("Accounts"),
+        Page::IdentityImport | Page::ConfirmAccountRemoval { .. } => Some("Accounts"),
         Page::ConfirmModel { .. } => Some("Search"),
     };
     let title = match page {
@@ -981,6 +1049,8 @@ pub(super) fn card(
         Page::Section(section) => section.label(),
         Page::Bindings => "Effective bindings",
         Page::IdentityImport => "Import sender addresses",
+        Page::ConfirmAccountRemoval { delete: false } => "Remove account",
+        Page::ConfirmAccountRemoval { delete: true } => "Delete local mail?",
         Page::ConfirmModel { install: true } => "Install local search model",
         Page::ConfirmModel { install: false } => "Remove local search model",
     };
@@ -1073,9 +1143,34 @@ pub(super) fn card(
             // Keep scroll indices aligned with the selectable rows.
             for (index, setting) in session.settings_nav.rows(section).enumerate() {
                 let selected = selected == index;
-                let mut control =
-                    row(theme, index, selected, live, SECTION_ROW_HEIGHT, cx).py(px(10.));
-                if let Row::Value(preference) = setting {
+                let height = match setting {
+                    Row::Account(_) => ACCOUNT_ROW_HEIGHT,
+                    Row::EditAccount | Row::ImportIdentities => 45.,
+                    _ => SECTION_ROW_HEIGHT,
+                };
+                let mut control = row(theme, index, selected, live, height, cx);
+                if let Row::Account(account) = setting {
+                    if let Some(account) = view.accounts.get(account) {
+                        control = control
+                            .child(account_label(theme, account, selected))
+                            .when(selected, |row| {
+                                row.child(account_button(
+                                    theme,
+                                    "remove-account",
+                                    "Remove",
+                                    KeyId::Char('d'),
+                                    false,
+                                    true,
+                                    live,
+                                    cx,
+                                ))
+                            })
+                            .when(account.email.is_none(), |row| {
+                                row.child(trailing(theme, "↗", selected))
+                            });
+                    }
+                } else if let Row::Value(preference) = setting {
+                    control = control.py(px(10.));
                     let state = preference.display(view.snapshot.values);
                     let note = preference_note(&view.snapshot, preference, &state, width);
                     let previous = view.value_fade(now);
@@ -1206,7 +1301,7 @@ pub(super) fn card(
                             "›",
                             false,
                         ),
-                        Row::Value(_) => unreachable!(),
+                        Row::Value(_) | Row::Account(_) | Row::RemoveAccount => unreachable!(),
                     };
                     let suffix = if info {
                         div()
@@ -1222,108 +1317,21 @@ pub(super) fn card(
                         trailing(theme, suffix, selected)
                     };
                     control = control
+                        .when(
+                            matches!(setting, Row::EditAccount | Row::ImportIdentities),
+                            |row| row.pl(px(26.)),
+                        )
                         .child(row_label(theme, label, Some(description), selected))
                         .child(suffix);
                 }
-                body = body.child(control);
-            }
-
-            if section == Section::Accounts && session.settings_nav.availability.identity_count > 0
-            {
-                body = body.child(
-                    div()
-                        .px(px(10.))
-                        .h(px(28.))
-                        .flex()
-                        .items_center()
-                        .text_color(rgb(theme.dimmed))
-                        .text_size(px(12.))
-                        .child("Sender identities"),
-                );
-                for (index, identity) in view.identities.iter().enumerate() {
-                    let label = if identity.name.is_empty() {
-                        &identity.address
-                    } else {
-                        &identity.name
-                    };
-                    let secondary =
-                        (!identity.name.is_empty()).then_some(identity.address.as_str());
-                    body = body.child(
-                        div()
-                            .h(px(IDENTITY_ROW_HEIGHT))
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .px(px(10.))
-                            .child(row_label(
-                                theme,
-                                crate::present::display_safe(label),
-                                secondary.map(crate::present::display_safe),
-                                false,
-                            ))
-                            .when(index == 0, |row| {
-                                row.child(
-                                    div()
-                                        .flex_none()
-                                        .text_size(px(12.))
-                                        .text_color(rgb(theme.dimmed))
-                                        .child("Default"),
-                                )
-                            }),
-                    );
-                }
+                body = if setting == Row::ImportIdentities {
+                    body.child(div().child(control).child(sender_identities(theme, view)))
+                } else {
+                    body.child(control)
+                };
             }
 
             details = match section {
-                Section::Accounts => {
-                    let (title, description) = if let Some(server) = &view.server {
-                        (
-                            crate::present::display_safe(&session.account_email),
-                            server.as_str(),
-                        )
-                    } else {
-                        (
-                            "No active account".to_owned(),
-                            "Connect an account to sync your mailbox.",
-                        )
-                    };
-                    let sync = view.server.as_ref().map(|_| {
-                        session.last_sync_at.map_or_else(
-                            || "Waiting for first sync".into(),
-                            |at| {
-                                format!(
-                                    "Last sync · {}",
-                                    crate::present::activity_time(super::now_unix(), at)
-                                )
-                            },
-                        )
-                    });
-                    Some(
-                        div()
-                            .child(
-                                detail(theme, title, description, false, true)
-                                    .h(px(ACCOUNT_SUMMARY_HEIGHT))
-                                    .children(sync.map(|label| {
-                                        div()
-                                            .text_size(px(12.))
-                                            .text_color(rgb(theme.dimmed))
-                                            .child(label)
-                                    })),
-                            )
-                            .children(view.other_accounts.iter().map(
-                                |(title, description, alert)| {
-                                    detail(
-                                        theme,
-                                        crate::present::display_safe(title),
-                                        &crate::present::display_safe(description),
-                                        *alert,
-                                        true,
-                                    )
-                                    .h(px(ACCOUNT_ROW_HEIGHT))
-                                },
-                            )),
-                    )
-                }
                 Section::Search => {
                     let (status, description) = view.model.status();
                     let (message, alert) = view
@@ -1484,6 +1492,82 @@ pub(super) fn card(
                 );
             }
         },
+        Page::ConfirmAccountRemoval { delete } => {
+            let name = view
+                .removal
+                .as_ref()
+                .map_or("This account", |account| account.name.as_str());
+            body = body.child(
+                div()
+                    .px(px(10.))
+                    .py(px(6.))
+                    .text_size(px(13.))
+                    .line_height(px(19.))
+                    .child(if delete {
+                        format!(
+                            "Delete the downloaded mail and drafts for {name} from this device?"
+                        )
+                    } else {
+                        format!("Disconnect {name} and revoke its agent access.")
+                    }),
+            );
+            footer = Some(
+                div()
+                    .flex_none()
+                    .flex()
+                    .justify_end()
+                    .flex_wrap()
+                    .gap(px(8.))
+                    .p(px(12.))
+                    .border_t_1()
+                    .border_color(rgb(theme.border))
+                    .child(account_button(
+                        theme,
+                        "cancel-remove",
+                        "Cancel",
+                        KeyId::Escape,
+                        false,
+                        false,
+                        live,
+                        cx,
+                    ))
+                    .child(if delete {
+                        account_button(
+                            theme,
+                            "confirm-delete",
+                            "Delete local mail · y",
+                            KeyId::Char('y'),
+                            false,
+                            true,
+                            live,
+                            cx,
+                        )
+                    } else {
+                        account_button(
+                            theme,
+                            "keep-mail",
+                            "Keep local mail",
+                            KeyId::Enter,
+                            true,
+                            false,
+                            live,
+                            cx,
+                        )
+                    })
+                    .when(!delete, |footer| {
+                        footer.child(account_button(
+                            theme,
+                            "delete-mail",
+                            "Delete local mail · d",
+                            KeyId::Char('d'),
+                            false,
+                            true,
+                            live,
+                            cx,
+                        ))
+                    }),
+            );
+        }
         Page::ConfirmModel { install } => {
             body = body.child(if install {
                 install_plan(theme, view.model_root.as_deref())
@@ -1545,6 +1629,129 @@ pub(super) fn card(
         .when(binding_edges.1, |card| {
             card.child(super::help::edge(theme, false, 44.))
         })
+}
+
+fn account_label(theme: &theme::Theme, account: &AccountRow, selected: bool) -> gpui::Div {
+    let (muted, fill) = if selected {
+        (theme.on_selection_dim, theme.selection)
+    } else {
+        (theme.dimmed, theme.surface)
+    };
+    let muted = theme::account_detail_color(muted, fill);
+    div()
+        .flex_1()
+        .min_w_0()
+        .child(
+            div()
+                .truncate()
+                .font_weight(FontWeight::MEDIUM)
+                .child(crate::present::display_safe(&account.name)),
+        )
+        .children(
+            account
+                .email
+                .as_deref()
+                .filter(|email| !email.eq_ignore_ascii_case(&account.name))
+                .map(|email| {
+                    div()
+                        .truncate()
+                        .text_size(px(12.))
+                        .line_height(px(15.))
+                        .text_color(rgb(muted))
+                        .child(crate::present::display_safe(email))
+                }),
+        )
+        .child(
+            div()
+                .truncate()
+                .text_size(px(12.))
+                .line_height(px(15.))
+                .text_color(rgb(if account.alert { theme.error } else { muted }))
+                .child(crate::present::display_safe(&account.status)),
+        )
+}
+
+fn sender_identities(theme: &theme::Theme, view: &View) -> gpui::Div {
+    div()
+        .pl(px(26.))
+        .child(
+            div()
+                .h(px(28.))
+                .flex()
+                .items_center()
+                .text_color(rgb(theme.dimmed))
+                .text_size(px(12.))
+                .child("Sender identities"),
+        )
+        .children(view.identities.iter().enumerate().map(|(index, identity)| {
+            let named = !identity.name.is_empty();
+            div()
+                .h(px(IDENTITY_ROW_HEIGHT))
+                .flex()
+                .items_center()
+                .gap_2()
+                .pr(px(10.))
+                .child(row_label(
+                    theme,
+                    crate::present::display_safe(if named {
+                        &identity.name
+                    } else {
+                        &identity.address
+                    }),
+                    named.then(|| crate::present::display_safe(&identity.address)),
+                    false,
+                ))
+                .when(index == 0, |row| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .text_size(px(12.))
+                            .text_color(rgb(theme.dimmed))
+                            .child("Default"),
+                    )
+                })
+        }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn account_button(
+    theme: &theme::Theme,
+    id: &'static str,
+    title: &'static str,
+    key: KeyId,
+    focused: bool,
+    destructive: bool,
+    live: bool,
+    cx: &mut Context<Inbox>,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .px(px(9.))
+        .py(px(5.))
+        .flex_none()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(theme.border))
+        .text_size(px(12.))
+        .whitespace_nowrap()
+        .when(focused, |button| {
+            button
+                .bg(rgb(theme.selection))
+                .text_color(rgb(theme.on_selection))
+        })
+        .when(destructive, |button| button.text_color(rgb(theme.error)))
+        .when(live, |button| {
+            button.cursor_pointer().on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |inbox, _, _, cx| {
+                    if inbox.session.overlay == Overlay::Settings {
+                        cx.stop_propagation();
+                        inbox.settings_click(inbox.session.settings_nav.selected, key, cx);
+                    }
+                }),
+            )
+        })
+        .child(title)
 }
 
 fn install_plan(theme: &theme::Theme, root: Option<&Path>) -> gpui::Div {

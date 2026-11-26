@@ -302,6 +302,7 @@ pub const ACTION_SECTIONS: &[(&str, &[Action])] = &[
             Action::Setting(SettingsRow::Value(Preference::WhichKey)),
             Action::Setting(SettingsRow::Value(Preference::Notifications)),
             Action::Setting(SettingsRow::AccountSetup),
+            Action::Setting(SettingsRow::RemoveAccount),
             Action::Setting(SettingsRow::EditAccount),
             Action::Setting(SettingsRow::ImportIdentities),
             Action::Setting(SettingsRow::EffectiveBindings),
@@ -640,10 +641,22 @@ pub struct WhichItem {
     pub is_group: bool,
 }
 
+#[cfg(test)]
 pub fn which_key(keymap: &Keymap, prefix: &[KeyId]) -> Vec<WhichItem> {
+    which_key_filtered(keymap, prefix, |_| true)
+}
+
+pub fn which_key_filtered(
+    keymap: &Keymap,
+    prefix: &[KeyId],
+    visible: impl Fn(Action) -> bool,
+) -> Vec<WhichItem> {
     let mut groups: Vec<(String, Vec<&Binding>)> = Vec::new();
     for binding in &keymap.bindings {
-        if binding.keys.len() <= prefix.len() || !binding.keys.starts_with(prefix) {
+        if binding.keys.len() <= prefix.len()
+            || !binding.keys.starts_with(prefix)
+            || !visible(binding.action)
+        {
             continue;
         }
         let key = key_label(binding.keys[prefix.len()], &keymap.leader_name);

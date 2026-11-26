@@ -367,6 +367,19 @@ impl DraftHome {
         body: String,
         files: Vec<ResolvedFile>,
     ) -> Result<String, String> {
+        let _account_lock = if let Some(registry) = &self.registry
+            && registry.directory().is_dir()
+            && !fell_core::is_demo_account(account)
+        {
+            let lock = registry.lock_shared().map_err(|err| err.to_string())?;
+            registry
+                .get(account)
+                .map_err(|err| err.to_string())?
+                .ok_or("The account is unavailable.")?;
+            Some(lock)
+        } else {
+            None
+        };
         let id = new_draft_id();
         let draft = new_compose_row(
             &id,
@@ -379,7 +392,8 @@ impl DraftHome {
         if draft.files.is_empty() {
             DraftSession::start_stored_in(&self.root, draft, &self.store)?;
         } else {
-            let store = fell_core::Store::open(&self.store).map_err(|err| err.to_string())?;
+            let store =
+                fell_core::Store::open_existing(&self.store).map_err(|err| err.to_string())?;
             store.save_compose(&draft).map_err(|err| err.to_string())?;
         }
         self.open(hub, &id, account)?;
@@ -397,7 +411,7 @@ impl DraftHome {
             .ok_or_else(|| {
                 fell_core::Error::Action("There is no server draft in the demo mailbox".into())
             })?;
-        let store = fell_core::Store::open(&self.store)?;
+        let store = fell_core::Store::open_existing(&self.store)?;
         let id = config.import_server_draft_copy(&store, source, &new_draft_id())?;
         self.open(hub, &id, account)
             .map_err(fell_core::Error::Action)?;
@@ -430,7 +444,7 @@ impl DraftHome {
         let Some(_opening) = hub.begin_open(id) else {
             return Err("The reply draft is already opening".into());
         };
-        let store = fell_core::Store::open(&self.store).map_err(|err| err.to_string())?;
+        let store = fell_core::Store::open_existing(&self.store).map_err(|err| err.to_string())?;
         let action = store
             .save_suggested_reply(
                 &new_compose_row(
@@ -479,7 +493,7 @@ impl DraftHome {
         let Some(_opening) = hub.begin_open(id) else {
             return Ok(());
         };
-        let store = fell_core::Store::open(&self.store).map_err(|err| err.to_string())?;
+        let store = fell_core::Store::open_existing(&self.store).map_err(|err| err.to_string())?;
         self.open_reserved(hub, id, account, &store)
     }
 

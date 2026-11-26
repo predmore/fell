@@ -547,6 +547,7 @@ pub struct Session {
     pub worker_outages: HashSet<Worker>,
     /// Mailbox or keymap failure from startup. Folder and message reads do not clear it.
     pub startup_error: Option<String>,
+    pub account_config_error: Option<String>,
     /// Failure from the latest folder or message read.
     pub error: Option<String>,
     pub error_fault: Option<QueryFault>,
@@ -657,6 +658,7 @@ impl Session {
             },
             sync,
             startup_error: None,
+            account_config_error: None,
             error: None,
             error_fault: None,
             attachment_error: None,
@@ -906,12 +908,17 @@ impl Session {
         }
     }
 
-    fn status_details(&self) -> [Option<&str>; 3] {
+    fn status_details(&self) -> [Option<&str>; 4] {
         let sync = match &self.sync {
             SyncKind::Failed(failure) => Some(failure.detail.as_str()),
             _ => None,
         };
-        [self.startup_error.as_deref(), self.error.as_deref(), sync]
+        [
+            self.startup_error.as_deref(),
+            self.account_config_error.as_deref(),
+            self.error.as_deref(),
+            sync,
+        ]
     }
 
     pub fn has_status_details(&self) -> bool {
@@ -1066,7 +1073,9 @@ impl Session {
     }
 
     pub fn which_items(&self) -> Vec<WhichItem> {
-        keymap::which_key(&self.keymap, &self.chord)
+        keymap::which_key_filtered(&self.keymap, &self.chord, |action| {
+            action != Action::AccountPicker || self.account_choices.len() > 1
+        })
     }
 
     pub fn palette(&self) -> Vec<PaletteItem> {
@@ -1083,6 +1092,7 @@ impl Session {
             ))
             .filter(|item| match item.action {
                 Action::Setting(row) => self.settings_nav.availability.shows(row),
+                Action::AccountPicker => self.account_choices.len() > 1,
                 _ => true,
             })
             .collect()
@@ -2261,6 +2271,30 @@ impl Session {
     fn settings_key(&mut self, key: KeyId, page_rows: usize) -> Step {
         use settings::{Page, Request, Row, Section};
 
+        if let Page::ConfirmAccountRemoval { delete } = self.settings_nav.page {
+            let request = match (delete, key) {
+                (_, KeyId::Escape | KeyId::Char('n')) => {
+                    self.settings_nav.back();
+                    None
+                }
+                (false, KeyId::Char('d')) => {
+                    self.settings_nav.page = Page::ConfirmAccountRemoval { delete: true };
+                    None
+                }
+                (false, KeyId::Enter | KeyId::Space) | (true, KeyId::Char('y')) => {
+                    self.settings_nav.page = Page::Section(Section::Accounts);
+                    Some(Request::RemoveAccount { delete })
+                }
+                _ => None,
+            };
+            return Step {
+                settings: request,
+                ..Step::default()
+            };
+        }
+        if key == KeyId::Char('d') && matches!(self.settings_nav.row(), Some(Row::Account(_))) {
+            return self.activate_setting(Row::RemoveAccount, page_rows);
+        }
         if let Page::ConfirmModel { install } = self.settings_nav.page
             && matches!(key, KeyId::Char('y' | 'n') | KeyId::Escape)
         {
@@ -2342,12 +2376,30 @@ impl Session {
     pub fn activate_setting(&mut self, row: settings::Row, page_rows: usize) -> Step {
         use settings::{Page, Request, Row};
 
-        self.settings_nav.select_row(row);
+        if row != Row::RemoveAccount {
+            self.settings_nav.select_row(row);
+        }
         let settings = match row {
             Row::Value(preference) => Some(Request::Save(crate::settings::Edit::Cycle(
                 preference, false,
             ))),
             Row::AccountSetup => Some(Request::AccountSetup),
+            Row::Account(index) => Some(Request::OpenAccount(index)),
+            Row::RemoveAccount => {
+                let index = match self.settings_nav.row() {
+                    Some(Row::Account(index)) => Some(index),
+                    _ => self
+                        .settings_nav
+                        .availability
+                        .active_account
+                        .or_else(|| (self.settings_nav.availability.accounts > 0).then_some(0)),
+                };
+                index.map(|index| {
+                    self.settings_nav.select_row(Row::Account(index));
+                    self.settings_nav.page = Page::ConfirmAccountRemoval { delete: false };
+                    Request::ConfirmAccountRemoval(index)
+                })
+            }
             Row::EditAccount => Some(Request::EditAccount),
             Row::ImportIdentities => {
                 self.settings_nav.page = Page::IdentityImport;
@@ -2907,6 +2959,7 @@ impl Session {
                     step.triage = Some(snooze::TriageEdit { ids, kind });
                 }
             }
+            Action::AccountPicker if self.account_choices.len() < 2 => {}
             Action::AccountPicker => {
                 self.count.clear();
                 self.folder_intent = FolderIntent::Account;

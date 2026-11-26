@@ -43,23 +43,18 @@ pub fn startup() -> Startup {
         .and_then(|accounts| accounts.default_config())
         .cloned();
     let account_missing = accounts.as_ref().is_some_and(accounts::Accounts::is_empty);
-    let config_error = registry
-        .as_ref()
-        .err()
-        .or_else(|| {
-            accounts.as_ref().and_then(|accounts| {
-                accounts.error.as_ref().or_else(|| {
-                    accounts
-                        .entries
-                        .iter()
-                        .find_map(|entry| entry.config.as_ref().err())
-                })
-            })
-        })
-        .map(ToString::to_string);
-    let path = store_path().map(|base| match (&registry, &config) {
-        (Ok(registry), Some(config)) => registry.store_path(&base, &config.id),
-        _ => base,
+    let config_error = registry.as_ref().err().map(ToString::to_string);
+    let path = store_path().and_then(|base| match (&registry, &config) {
+        (Ok(registry), Some(config)) => registry
+            .store_path(&base, &config.id)
+            .map_err(|err| err.to_string()),
+        _ if accounts
+            .as_ref()
+            .is_some_and(|accounts| !accounts.is_empty()) =>
+        {
+            Err("No readable account configuration".into())
+        }
+        _ => Ok(base),
     });
     startup_for(config, account_missing, config_error, path)
 }
@@ -81,6 +76,34 @@ pub fn startup_for(
         account_missing,
         config,
         path,
+    }
+}
+
+pub fn open_registered_store(
+    path: Result<PathBuf, String>,
+    config: Option<&AccountConfig>,
+    demo: bool,
+) -> (Store, Opened) {
+    let locked = (|| {
+        let Some(config) = config else {
+            return Ok(None);
+        };
+        let registry = Registry::resolve().map_err(|err| err.to_string())?;
+        let lock = registry.lock_shared().map_err(|err| err.to_string())?;
+        let account = AccountId(config.id.clone());
+        if registry
+            .get(&account)
+            .map_err(|err| err.to_string())?
+            .as_ref()
+            != Some(config)
+        {
+            return Err("The account file changed while opening the mailbox.".into());
+        }
+        Ok(Some(lock))
+    })();
+    match locked {
+        Ok(_lock) => open_store(path, config, demo),
+        Err(error) => fallback(error),
     }
 }
 
@@ -124,7 +147,11 @@ pub(crate) fn next_account_id() -> Result<String, String> {
         };
         let path = registry.path(&id).map_err(|err| err.to_string())?;
         if !path.symlink_metadata().is_ok()
-            && (number == 1 || !registry.store_path(&base, &id).exists())
+            && (number == 1
+                || !registry
+                    .store_path(&base, &id)
+                    .map_err(|err| err.to_string())?
+                    .exists())
         {
             return Ok(id);
         }
@@ -242,7 +269,13 @@ fn stage_config(
     let registry = Registry::resolve().map_err(|err| err.to_string())?;
     registry.migrate().map_err(|err| err.to_string())?;
     let path = registry.path(&config.id).map_err(|err| err.to_string())?;
-    stage_account_config_at(path, config, first_run)
+    let lock = lock_account_dir(&path)?;
+    if let Ok(base) = store_path() {
+        registry
+            .store_path(&base, &config.id)
+            .map_err(|err| err.to_string())?;
+    }
+    stage_account_text_at(path, &config.render(), first_run, lock)
 }
 
 pub(crate) struct StagedAccountConfig {
@@ -270,6 +303,7 @@ impl StagedAccountConfig {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn stage_account_config_at(
     path: PathBuf,
     config: &AccountConfig,

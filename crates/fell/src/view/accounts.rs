@@ -1,21 +1,25 @@
 //! Keep each mailbox and its view open so switching only changes the shown view.
 
-use std::collections::HashMap;
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
-use fell_core::accounts::{Accounts, Registry};
-use gpui::{App, Context, Entity, IntoElement, Render, Window, div, prelude::*};
+use fell_core::accounts::{Accounts, FileIdentity, Registry};
+use futures::StreamExt as _;
+use gpui::{App, Context, Entity, IntoElement, Render, Window, div, prelude::*, rgb};
 
-use super::{Inbox, Onboarding, mailbox};
-use crate::model::PickerChoice;
+use super::{ExternalCompose, Inbox, InboxWindow, Onboarding, mailbox};
+use crate::inbox_motion::Layer;
+use crate::model::{Overlay, PickerChoice, SyncKind};
 use crate::motion::{self, Transition};
 
 pub(super) struct AccountWindow {
     active: Entity<Inbox>,
     active_id: Option<String>,
     views: HashMap<String, Entity<Inbox>>,
+    stopping: HashSet<String>,
     catalog: Accounts,
-    entering: Option<Transition>,
+    picker_exit: Option<(Entity<Inbox>, Layer, Option<f32>, Transition)>,
+    _compose_listener: Option<gpui::Task<()>>,
 }
 
 impl AccountWindow {
@@ -27,8 +31,9 @@ impl AccountWindow {
         cx: &mut Context<Self>,
     ) -> Self {
         let active_id = startup.config.as_ref().map(|config| config.id.clone());
+        let initial = startup.config.clone();
         let active = cx.new(|cx| {
-            let mut inbox = Inbox::focused(startup, demo, window, cx);
+            let mut inbox = Inbox::with_startup(startup, demo, Some(window), cx);
             if let Some(setup) = setup {
                 inbox.account_setup_handoff(setup);
             }
@@ -42,11 +47,44 @@ impl AccountWindow {
             active,
             active_id,
             views,
+            stopping: HashSet::new(),
             catalog: Accounts::default(),
-            entering: None,
+            picker_exit: None,
+            _compose_listener: Self::watch_compose(window, cx),
         };
+        view.focus(window, cx);
+        cx.set_global(InboxWindow(window.window_handle()));
+        cx.on_focus_lost(window, |view, window, cx| view.focus(window, cx))
+            .detach();
+        let mut viewport = (window.viewport_size(), window.scale_factor());
+        cx.observe_window_bounds(window, move |_, window, cx| {
+            let previous = viewport;
+            viewport = (window.viewport_size(), window.scale_factor());
+            if viewport != previous {
+                window.defer(cx, |window, cx| window.draw(cx).clear());
+            }
+        })
+        .detach();
+        cx.observe_window_activation(window, |view, window, cx| {
+            if window.is_window_active() {
+                view.active.update(cx, |inbox, cx| {
+                    inbox.refresh_settings_identities(cx);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
         if let Ok(registry) = Registry::resolve() {
-            view.reconcile(&registry, registry.load(), window, cx);
+            let catalog = registry.load();
+            if let Some(config) = initial
+                && !catalog
+                    .entries
+                    .iter()
+                    .any(|entry| entry.config.as_ref() == Ok(&config))
+            {
+                view.retire(&config.id, &registry, None, window, cx);
+            }
+            view.reconcile(&registry, catalog, window, cx);
             view.watch(registry, window, cx);
         }
         view
@@ -78,6 +116,68 @@ impl AccountWindow {
         .detach();
     }
 
+    fn watch_compose(window: &Window, cx: &mut Context<Self>) -> Option<gpui::Task<()>> {
+        cx.try_global::<ExternalCompose>()?;
+        let mut requests = cx.global_mut::<ExternalCompose>().0.take()?;
+        let hub = cx.global::<crate::draft_host::AgentDrafts>().0.clone();
+        Some(cx.spawn_in(window, async move |this, cx| {
+            while let Some(request) = requests.next().await {
+                let Ok((target, ready)) = this.update_in(cx, |view, _, cx| {
+                    (
+                        view.active.downgrade(),
+                        view.active.read(cx).compose_ready.clone(),
+                    )
+                }) else {
+                    break;
+                };
+                let _ = ready.await;
+                let target = cx
+                    .update(|_, cx| {
+                        let inbox = target.upgrade()?;
+                        let inbox = inbox.read(cx);
+                        if inbox.retired {
+                            return None;
+                        }
+                        Some((
+                            inbox.draft_home.clone()?,
+                            inbox.account_id.clone(),
+                            fell_core::compose::configured_from(
+                                &inbox.session.account_name,
+                                &inbox.session.account_email,
+                            ),
+                        ))
+                    })
+                    .ok()
+                    .flatten();
+                let result = if let Some((home, account, from)) = target {
+                    let hub = hub.clone();
+                    let (fields, body) = request.input.into_fields_and_body(from);
+                    let start = fell_core::compose::ReplyStart {
+                        fields,
+                        parts: Default::default(),
+                    };
+                    cx.background_executor()
+                        .spawn(async move {
+                            home.new_seeded(&hub, &account, start, body, request.files)
+                        })
+                        .await
+                } else {
+                    Err("The mailbox did not open, so a draft has nowhere to go".into())
+                };
+                match result {
+                    Ok(id) => {
+                        crate::draft_host::show_draft(&hub, &id);
+                    }
+                    Err(err) => {
+                        let _ = this.update_in(cx, |view, _, cx| {
+                            view.notice(format!("Couldn't start a draft. {err}"), true, cx);
+                        });
+                    }
+                }
+            }
+        }))
+    }
+
     fn reconcile(
         &mut self,
         registry: &Registry,
@@ -85,155 +185,461 @@ impl AccountWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.catalog == accounts {
-            return;
+        let changed = self.catalog != accounts;
+        if changed {
+            let replaced: Vec<_> = self
+                .catalog
+                .entries
+                .iter()
+                .filter_map(|old| {
+                    let id = &old.config.as_ref().ok()?.id;
+                    if accounts.entries.contains(old) {
+                        None
+                    } else {
+                        Some(id.clone())
+                    }
+                })
+                .collect();
+            for id in replaced {
+                self.retire(&id, registry, None, window, cx);
+            }
         }
 
-        let configs: Vec<_> = accounts
+        let mut added = false;
+        for config in accounts
             .entries
             .iter()
             .filter_map(|entry| entry.config.as_ref().ok())
-            .collect();
-        for config in &configs {
-            if !self.views.contains_key(&config.id) {
-                let path = mailbox::store_path().map(|base| registry.store_path(&base, &config.id));
-                let startup = mailbox::startup_for(Some((*config).clone()), false, None, path);
-                let entity = cx.new(|cx| {
-                    let mut inbox = Inbox::with_startup(startup, false, Some(window), cx);
-                    inbox.window_active = false;
-                    if let Some(queue) = &inbox.notifications {
-                        queue.set_viewing(false);
-                    }
-                    inbox
-                });
-                self.views.insert(config.id.clone(), entity);
-            }
-        }
-        self.views.retain(|id, _| {
-            if configs.iter().any(|config| &config.id == id) {
-                true
-            } else {
-                let account = fell_core::AccountId(id.clone());
-                cx.default_global::<crate::compose_ui::RecipientStore>()
-                    .0
-                    .remove(&account);
-                cx.default_global::<crate::reply_check::ReplyChecks>()
-                    .0
-                    .remove(&account);
-                if let Some(hub) = cx.try_global::<crate::draft_host::AgentDrafts>() {
-                    hub.0.remove_server_draft_wake(&account);
-                }
-                false
-            }
-        });
-
-        if self
-            .active_id
-            .as_ref()
-            .is_none_or(|id| !self.views.contains_key(id))
         {
-            if let Some(config) = accounts.default_config() {
-                self.switch(&config.id, window, cx);
+            if self.views.contains_key(&config.id) || self.stopping.contains(&config.id) {
+                continue;
+            }
+            let path = mailbox::store_path().and_then(|base| {
+                registry
+                    .store_path(&base, &config.id)
+                    .map_err(|err| err.to_string())
+            });
+            let startup = mailbox::startup_for(Some(config.clone()), false, None, path);
+            let entity = cx.new(|cx| {
+                let mut inbox = Inbox::with_startup(startup, false, Some(window), cx);
+                inbox.window_active = false;
+                if let Some(queue) = &inbox.notifications {
+                    queue.set_viewing(false);
+                }
+                inbox
+            });
+            self.views.insert(config.id.clone(), entity);
+            added = true;
+        }
+
+        let removed = self
+            .active_id
+            .as_deref()
+            .filter(|id| !self.views.contains_key(*id))
+            .map(|id| {
+                (
+                    id.to_owned(),
+                    self.active.read(cx).session.account_name.clone(),
+                )
+            });
+        let mut switched = false;
+        if self.active_id.is_none() || removed.is_some() {
+            let next = accounts
+                .default_config()
+                .filter(|config| self.views.contains_key(&config.id))
+                .or_else(|| {
+                    accounts
+                        .entries
+                        .iter()
+                        .filter_map(|entry| entry.config.as_ref().ok())
+                        .find(|config| self.views.contains_key(&config.id))
+                });
+            if let Some(next) = next {
+                self.switch(&next.id, window, cx);
+                switched = true;
             } else if self.active_id.take().is_some() {
                 let startup =
                     mailbox::startup_for(None, false, None, Err("No account configured".into()));
                 self.active = cx.new(|cx| Inbox::with_startup(startup, false, Some(window), cx));
                 self.focus(window, cx);
+                switched = true;
             }
+        }
+        if let Some((id, name)) = removed
+            && !accounts.entries.iter().any(|entry| {
+                entry
+                    .path
+                    .file_stem()
+                    .is_some_and(|stem| stem == id.as_str())
+            })
+        {
+            let next = &self.active.read(cx).session.account_name;
+            let message = if self.active_id.is_some() {
+                format!("{name} was removed · showing {next}")
+            } else {
+                format!("{name} was removed")
+            };
+            self.notice(message, false, cx);
         }
 
         self.catalog = accounts;
-        self.update_choices(cx);
-        cx.notify();
-    }
-
-    fn focus(&self, window: &mut Window, cx: &mut App) {
-        let active = self.active.read(cx);
-        window.focus(&active.focus);
-    }
-
-    fn update_choices(&self, cx: &mut App) {
-        for (id, view) in &self.views {
-            self.set_choices(view, Some(id), cx);
-        }
-        if self.active_id.is_none() {
-            self.set_choices(&self.active, None, cx);
+        self.update_choices(changed || switched || added, cx);
+        if changed || switched {
+            cx.notify();
         }
     }
 
-    fn set_choices(&self, view: &Entity<Inbox>, current: Option<&str>, cx: &mut App) {
-        view.update(cx, |inbox, cx| {
-            let catalog = &self.catalog;
-            inbox.session.account_choices = catalog
-                .entries
-                .iter()
-                .filter_map(|entry| {
-                    let config = entry.config.as_ref().ok()?;
-                    let account = config.account();
-                    Some(PickerChoice {
-                        name: config.id.clone(),
-                        title: account.display_name,
-                        detail: Some(account.email),
-                        date: None,
-                        mark: (current == Some(config.id.as_str())).then_some("✓"),
-                        divider: false,
-                    })
+    fn retire(
+        &mut self,
+        id: &str,
+        registry: &Registry,
+        remove: Option<(bool, Option<FileIdentity>)>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.stopping.insert(id.to_owned()) {
+            return;
+        }
+        let removing_active = (remove.is_some() && self.active_id.as_deref() == Some(id))
+            .then(|| self.active.read(cx).session.account_name.clone());
+        let account = fell_core::AccountId(id.to_owned());
+        cx.default_global::<crate::compose_ui::RecipientStore>()
+            .0
+            .remove(&account);
+        cx.default_global::<crate::reply_check::ReplyChecks>()
+            .0
+            .remove(&account);
+        let hub = cx
+            .try_global::<crate::draft_host::AgentDrafts>()
+            .map(|drafts| drafts.0.clone());
+        if let Some(hub) = &hub {
+            hub.remove_server_draft_wake(&account);
+        }
+        let mut workers = Vec::new();
+        let mut parts = None;
+        if let Some(view) = self.views.remove(id) {
+            if self
+                .picker_exit
+                .as_ref()
+                .is_some_and(|(outgoing, ..)| outgoing == &view)
+            {
+                self.picker_exit = None;
+            }
+            view.update(cx, |inbox, _| {
+                inbox.retired = true;
+                parts = Some(inbox.attachment_fetcher.clone());
+                inbox.draft_home = None;
+                inbox.reader_bodies.active = None;
+                workers.extend(
+                    inbox
+                        .sync
+                        .take()
+                        .and_then(crate::sync_worker::SyncHandle::stop),
+                );
+                workers.extend(
+                    inbox
+                        .reader_fetcher
+                        .take()
+                        .map(crate::reader_body_worker::Handle::stop),
+                );
+                workers.extend(inbox.store.stop());
+            });
+        }
+        let registry = registry.clone();
+        let id = id.to_owned();
+        cx.spawn_in(window, async move |this, cx| {
+            let read = registry.clone();
+            let retired = id.clone();
+            let (result, catalog) = cx
+                .background_executor()
+                .spawn(async move {
+                    if let Some(parts) = parts {
+                        parts.stop();
+                    }
+                    for worker in workers {
+                        let _ = worker.join();
+                    }
+                    let result = remove.map(|(delete, expected)| {
+                        if delete && let Some(hub) = hub {
+                            hub.release_account_drafts(&account)?;
+                        }
+                        read.remove_if_unchanged(
+                            &mailbox::store_path()?,
+                            &retired,
+                            delete,
+                            expected,
+                        )
+                    });
+                    (result, read.load())
                 })
-                .collect();
-            inbox.settings_view.set_accounts(catalog, current);
-            inbox.refresh_settings_availability();
+                .await;
+            let _ = this.update_in(cx, |view, window, cx| {
+                view.stopping.remove(&id);
+                view.reconcile(&registry, catalog, window, cx);
+                if let Some(result) = result {
+                    match result {
+                        Ok(()) => {
+                            let outcome = if remove.is_some_and(|(delete, _)| delete) {
+                                "Local mail deleted."
+                            } else {
+                                "Local mail kept."
+                            };
+                            let message = if let Some(name) = removing_active {
+                                let next = &view.active.read(cx).session.account_name;
+                                if view.active_id.is_some() {
+                                    format!("{name} was removed · showing {next}")
+                                } else {
+                                    format!("{name} was removed")
+                                }
+                            } else {
+                                outcome.into()
+                            };
+                            view.notice(message, false, cx);
+                        }
+                        Err(err) => {
+                            view.notice(format!("Couldn't remove account. {err}"), true, cx)
+                        }
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn notice(&self, message: String, error: bool, cx: &mut App) {
+        self.active.update(cx, |inbox, cx| {
+            inbox.session.show_toast(message, error);
+            inbox.dismiss_notice_after(
+                inbox.session.toast_generation(),
+                Duration::from_secs(5),
+                cx,
+            );
             cx.notify();
         });
     }
 
+    fn focus(&self, window: &mut Window, cx: &mut App) {
+        window.focus(&self.active.read(cx).focus);
+    }
+
+    fn update_choices(&self, catalog_changed: bool, cx: &mut App) {
+        let statuses: HashMap<_, _> = self
+            .views
+            .iter()
+            .map(|(id, view)| {
+                let session = &view.read(cx).session;
+                let status = match &session.sync {
+                    SyncKind::Failed(failure) => (failure.detail.clone(), true),
+                    SyncKind::StoreError => (
+                        session
+                            .startup_error
+                            .clone()
+                            .unwrap_or_else(|| "Mailbox unavailable".into()),
+                        true,
+                    ),
+                    _ if self.active_id.as_ref() == Some(id) => ("Active".into(), false),
+                    _ => (
+                        session.last_sync_at.map_or_else(
+                            || "Waiting for first sync".into(),
+                            |at| {
+                                let time = crate::present::activity_time(super::now_unix(), at);
+                                format!(
+                                    "Last sync {}",
+                                    time.strip_prefix("Today · ").unwrap_or(&time)
+                                )
+                            },
+                        ),
+                        false,
+                    ),
+                };
+                (id.clone(), status)
+            })
+            .collect();
+        let error = self
+            .catalog
+            .error
+            .as_ref()
+            .map(|error| error.detail.clone())
+            .or_else(|| {
+                self.catalog
+                    .entries
+                    .iter()
+                    .find_map(|entry| entry.config.as_ref().err().map(|err| err.detail.clone()))
+            });
+        for (id, view) in &self.views {
+            self.set_choices(
+                view,
+                Some(id),
+                &statuses,
+                error.as_deref(),
+                catalog_changed,
+                cx,
+            );
+        }
+        if self.active_id.is_none() {
+            self.set_choices(
+                &self.active,
+                None,
+                &statuses,
+                error.as_deref(),
+                catalog_changed,
+                cx,
+            );
+        }
+    }
+
+    fn set_choices(
+        &self,
+        view: &Entity<Inbox>,
+        current: Option<&String>,
+        statuses: &HashMap<String, (String, bool)>,
+        error: Option<&str>,
+        catalog_changed: bool,
+        cx: &mut App,
+    ) {
+        view.update(cx, |inbox, cx| {
+            if catalog_changed {
+                inbox.session.account_choices = self
+                    .catalog
+                    .entries
+                    .iter()
+                    .filter_map(|entry| {
+                        let config = entry.config.as_ref().ok()?;
+                        let account = config.account();
+                        Some(PickerChoice {
+                            name: config.id.clone(),
+                            title: account.display_name,
+                            detail: Some(account.email),
+                            date: None,
+                            mark: (current == Some(&config.id)).then_some("✓"),
+                            divider: false,
+                        })
+                    })
+                    .collect();
+                inbox.session.account_config_error = error.map(str::to_owned);
+            }
+            if inbox.settings_view.set_accounts(
+                &self.catalog,
+                current.map(String::as_str),
+                statuses,
+            ) || catalog_changed
+            {
+                inbox.refresh_settings_availability();
+                cx.notify();
+            }
+        });
+    }
+
     pub fn switch(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active_id.as_deref() == Some(id) {
+        if self.active_id.as_deref() == Some(id) && self.views.get(id) == Some(&self.active) {
             return;
         }
         if let Some(next) = self.views.get(id).cloned() {
             let frames = self.active.read(cx).frames.clone();
-            self.active.update(cx, |inbox, _| {
+            let outgoing = self.active.clone();
+            self.picker_exit = outgoing.update(cx, |inbox, _| {
                 inbox.session.cancel_read_delay();
+                if inbox.session.overlay != Overlay::None {
+                    inbox.session.dismiss_overlay();
+                }
                 inbox.window_active = false;
                 if let Some(queue) = &inbox.notifications {
                     queue.set_viewing(false);
                 }
+                let now = inbox.motion.clock.now();
+                let picker = inbox.motion.settle_account_switch(now);
+                let fade = inbox.motion.motion.start(motion::QUICK, now);
+                picker
+                    .zip(fade)
+                    .map(|((layer, height), fade)| (outgoing.clone(), layer, height, fade))
             });
             self.active = next;
             self.active_id = Some(id.to_owned());
             self.active.update(cx, |inbox, cx| {
                 inbox.frames = frames;
-                inbox.window_active = window.is_window_active();
-                self.entering = inbox
+                inbox.notification_window_activation(window, cx);
+                inbox.account_arrival = inbox
                     .motion
                     .motion
-                    .start(motion::QUICK, std::time::Instant::now());
+                    .start(motion::FADE, inbox.motion.clock.now());
                 cx.notify();
             });
             self.focus(window, cx);
+            self.update_choices(false, cx);
             cx.notify();
         }
     }
 }
 
 impl Render for AccountWindow {
-    fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        let now = std::time::Instant::now();
-        self.entering = self.entering.filter(|transition| transition.running(now));
-        let opacity = self.entering.map_or(1., |transition| {
-            window.request_animation_frame();
-            motion::lerp(0.4, 1., transition.progress(now))
-        });
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let now = Instant::now();
+        let theme = &self.active.read(cx).theme;
+        let background = theme.background;
+        self.picker_exit = self
+            .picker_exit
+            .take()
+            .filter(|(_, _, _, fade)| fade.running(now));
+        let picker = self
+            .picker_exit
+            .as_mut()
+            .map(|(outgoing, layer, height, fade)| {
+                window.request_animation_frame();
+                outgoing.update(cx, |inbox, cx| {
+                    layer.swap(&mut inbox.session);
+                    let picker = super::overlay(
+                        &inbox.theme,
+                        &inbox.session,
+                        (1.0 - fade.progress(now), 0.0),
+                        *height,
+                        false,
+                        (0.0, super::CARD_TOP_PX),
+                        &inbox.palette_scroll,
+                        &inbox.folder_scroll,
+                        super::PickerCard {
+                            choices: &layer.picker_choices,
+                            prompt: &layer.folder_prompt,
+                            target: layer.folder_target.as_deref(),
+                            mark_opacity: layer.label_marks,
+                            merge_feedback: 0.0,
+                        },
+                        None,
+                        None,
+                        window,
+                        cx,
+                    );
+                    layer.swap(&mut inbox.session);
+                    picker
+                })
+            });
         div()
+            .relative()
             .size_full()
-            .opacity(opacity)
+            .bg(rgb(background))
             .child(self.active.clone())
+            .children(picker)
     }
 }
 
 pub(super) fn switch(id: &str, window: &mut Window, cx: &mut App) {
     if let Some(root) = window.root::<AccountWindow>().flatten() {
         root.update(cx, |view, cx| view.switch(id, window, cx));
+    }
+}
+
+pub(super) fn remove(
+    id: &str,
+    removal: (bool, Option<FileIdentity>),
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if let Some(root) = window.root::<AccountWindow>().flatten()
+        && let Ok(registry) = Registry::resolve()
+    {
+        root.update(cx, |view, cx| {
+            view.retire(id, &registry, Some(removal), window, cx);
+            view.reconcile(&registry, registry.load(), window, cx);
+        });
     }
 }
 
@@ -252,6 +658,125 @@ mod tests {
     use gpui::TestAppContext;
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
+
+    fn write_account(registry: &Registry, id: &str, suffix: &str) {
+        let path = registry.path(id).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        writeln!(
+            file,
+            "email = '{id}@example.test'\npassword_command = 'exit 1'\n{suffix}"
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn replaced_accounts_wait_for_the_previous_worker_before_reopening() {
+        let Some(_temp) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let registry = Registry::resolve().unwrap();
+        std::fs::create_dir_all(registry.directory()).unwrap();
+        write_account(&registry, "mail", "");
+        write_account(&registry, "work", "");
+        let mut app = TestAppContext::single();
+        let window = app.add_window(|window, cx| {
+            AccountWindow::new(mailbox::startup(), false, None, window, cx)
+        });
+        let old = window
+            .update(&mut app, |view, _, _| view.views["work"].clone())
+            .unwrap();
+        let store = old.read_with(&app, |inbox, _| inbox.store.clone());
+        futures::executor::block_on(store.call(|_| ())).unwrap();
+        app.run_until_parked();
+        write_account(&registry, "work", "name = 'New work'");
+        window
+            .update(&mut app, |view, window, cx| {
+                view.reconcile(&registry, registry.load(), window, cx);
+                assert!(view.stopping.contains("work"));
+                assert!(!view.views.contains_key("work"));
+                assert!(old.read(cx).retired);
+            })
+            .unwrap();
+        app.run_until_parked();
+        window
+            .update(&mut app, |view, _, cx| {
+                let next = &view.views["work"];
+                assert_ne!(next, &old);
+                assert_eq!(next.read(cx).session.account_name, "New work");
+                assert!(!view.stopping.contains("work"));
+            })
+            .unwrap();
+        assert!(futures::executor::block_on(store.call(|_| ())).is_err());
+    }
+
+    #[test]
+    fn compose_listener_routes_again_after_its_first_account_is_removed() {
+        let Some(_temp) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let registry = Registry::resolve().unwrap();
+        std::fs::create_dir_all(registry.directory()).unwrap();
+        write_account(&registry, "mail", "");
+        write_account(&registry, "work", "");
+        let mut app = TestAppContext::single();
+        let hub = std::sync::Arc::new(fell_core::compose::DraftHub::new());
+        let (send, requests) = futures::channel::mpsc::channel(4);
+        app.update(|cx| {
+            cx.set_global(ExternalCompose(Some(requests)));
+            cx.set_global(crate::draft_host::AgentDrafts(hub.clone()));
+        });
+        let window = app.add_window(|window, cx| {
+            AccountWindow::new(mailbox::startup(), false, None, window, cx)
+        });
+        let clients = window
+            .update(&mut app, |view, _, cx| {
+                view.views
+                    .values()
+                    .map(|view| view.read(cx).store.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap();
+        for client in clients {
+            futures::executor::block_on(client.call(|_| ())).unwrap();
+        }
+        app.run_until_parked();
+        let mut send = send;
+        send.try_send(crate::compose_launch::mailto("mailto:first@example.test").unwrap())
+            .unwrap();
+        app.run_until_parked();
+        let first = hub.focused_id().unwrap();
+        assert_eq!(
+            hub.with_session(&first, |draft| draft.account_id().0.clone())
+                .as_deref(),
+            Some("mail")
+        );
+
+        registry
+            .remove(&mailbox::store_path().unwrap(), "mail", false)
+            .unwrap();
+        window
+            .update(&mut app, |view, window, cx| {
+                view.reconcile(&registry, registry.load(), window, cx);
+                assert_eq!(view.active_id.as_deref(), Some("work"));
+            })
+            .unwrap();
+        send.try_send(crate::compose_launch::cli(&["--to=second@example.test".into()]).unwrap())
+            .unwrap();
+        app.run_until_parked();
+        let second = hub.focused_id().unwrap();
+        assert_ne!(first, second);
+        assert_eq!(
+            hub.with_session(&second, |draft| draft.account_id().0.clone())
+                .as_deref(),
+            Some("work")
+        );
+    }
 
     #[test]
     fn switching_restores_each_accounts_folder_selection_and_search() {

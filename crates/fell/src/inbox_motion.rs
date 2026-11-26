@@ -570,6 +570,29 @@ impl InboxMotion {
         }
     }
 
+    /// The window owns the outgoing account picker once its inbox goes away.
+    pub fn settle_account_switch(&mut self, now: Instant) -> Option<(Layer, Option<f32>)> {
+        let card = self.card_height(now);
+        let picker = self
+            .overlay_out
+            .take()
+            .map(|(layer, _)| layer)
+            .or_else(|| self.last_layer.take())
+            .filter(|layer| {
+                layer.overlay == Overlay::Folders && layer.folder_intent == FolderIntent::Account
+            });
+        self.last_layer = None;
+        self.last_overlay = Overlay::None;
+        self.last_which = false;
+        self.last_chord = false;
+        self.overlay = None;
+        self.which = None;
+        self.which_out = None;
+        self.card_to = None;
+        self.card_glide = None;
+        picker.map(|layer| (layer, card))
+    }
+
     pub fn reading_progress(&self, now: Instant) -> f32 {
         let target = if self.reading_target() { 1.0 } else { 0.0 };
         self.reading_slide.map_or(target, |(from, slide)| {

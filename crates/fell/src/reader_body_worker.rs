@@ -46,7 +46,7 @@ impl Drop for Job {
     }
 }
 
-pub struct Handle(mpsc::Sender<Request>);
+pub struct Handle(mpsc::Sender<Request>, std::thread::JoinHandle<()>);
 
 struct Request {
     ids: Vec<MessageId>,
@@ -55,6 +55,11 @@ struct Request {
 }
 
 impl Handle {
+    pub fn stop(self) -> std::thread::JoinHandle<()> {
+        drop(self.0);
+        self.1
+    }
+
     pub fn fetch(&self, ids: Vec<MessageId>) -> (Job, UnboundedReceiver<Event>) {
         let (send, events) = unbounded();
         let cancel = CancelBodyFetch::default();
@@ -69,7 +74,7 @@ impl Handle {
 
 pub fn start(config: AccountConfig, path: PathBuf) -> Handle {
     let (send, requests) = mpsc::channel::<Request>();
-    std::thread::Builder::new()
+    let thread = std::thread::Builder::new()
         .name("fell-reader-body".into())
         .spawn(move || {
             let mut store = None;
@@ -116,5 +121,5 @@ pub fn start(config: AccountConfig, path: PathBuf) -> Handle {
             }
         })
         .expect("spawn reader body worker");
-    Handle(send)
+    Handle(send, thread)
 }

@@ -9,7 +9,8 @@
 //! at once, so holding `j` during a first sync never waits behind a refresh.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use fell_core::{Store, diagnostic};
@@ -27,6 +28,8 @@ pub struct StoreClient {
     background_ready: Arc<AtomicBool>,
     file_backed: Arc<AtomicBool>,
     background: mpsc::Sender<Job>,
+    stopping: Arc<AtomicBool>,
+    thread: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl StoreClient {
@@ -44,7 +47,9 @@ impl StoreClient {
         let lane = Arc::clone(&background_ready);
         let file_backed = Arc::new(AtomicBool::new(false));
         let has_file = Arc::clone(&file_backed);
-        std::thread::Builder::new()
+        let stopping = Arc::new(AtomicBool::new(false));
+        let stop = stopping.clone();
+        let thread = std::thread::Builder::new()
             .name("fell-store".into())
             .spawn(move || {
                 let mut restart = Restart::new(Worker::Store, |worker| {
@@ -60,20 +65,28 @@ impl StoreClient {
                 diagnostic!(INFO, "Mailbox worker opened the store");
                 // The first connection has finished opening and migrating
                 // the file, so the second one never races it for the lock.
-                if let Some(path) = store.db_path().map(std::path::Path::to_path_buf) {
-                    has_file.store(true, Ordering::Release);
-                    spawn_background(path, lane, background_jobs, notices.clone());
-                } else {
-                    drop(background_jobs);
-                }
+                let background_thread =
+                    if let Some(path) = store.db_path().map(std::path::Path::to_path_buf) {
+                        has_file.store(true, Ordering::Release);
+                        spawn_background(path, lane, background_jobs, notices.clone(), stop.clone())
+                    } else {
+                        drop(background_jobs);
+                        None
+                    };
                 let _ = ready_tx.send(info);
                 // Do not replay an interrupted job. Unwinding rolls back its
                 // SQLite transaction and drops its sender (an Err to the caller).
                 // The channel still owns all jobs we have not started.
                 let mut seen_snoozes = store.snooze_revision().ok();
                 restart.run(|recovered| {
-                    run_interactive(&store, &rx, &notices, &mut seen_snoozes, recovered);
+                    run_interactive(&store, &rx, &notices, &mut seen_snoozes, recovered, &stop);
                 });
+                drop(store);
+                if let Some(background) = background_thread {
+                    // On ordinary window close, the background senders drop
+                    // with the view. Explicit retirement wakes both lanes.
+                    let _ = background.join();
+                }
             })
             .expect("spawn store thread");
         (
@@ -82,9 +95,18 @@ impl StoreClient {
                 background_ready,
                 file_backed,
                 background,
+                stopping,
+                thread: Arc::new(Mutex::new(Some(thread))),
             },
             ready,
         )
+    }
+
+    pub fn stop(&self) -> Option<JoinHandle<()>> {
+        self.stopping.store(true, Ordering::Release);
+        let _ = self.interactive.send(Box::new(|_| {}));
+        let _ = self.background.send(Box::new(|_| {}));
+        self.thread.lock().expect("store thread").take()
     }
 
     /// Run `job` on the interactive lane. An interrupted job or a closed
@@ -158,10 +180,11 @@ fn run_interactive(
     notices: &UnboundedSender<WorkerEvent>,
     seen_snoozes: &mut Option<i64>,
     recovered: &mut dyn FnMut(),
+    stop: &AtomicBool,
 ) {
     let mut next_snooze = Instant::now();
     let mut failed = false;
-    loop {
+    while !stop.load(Ordering::Acquire) {
         let now = Instant::now();
         if now >= next_snooze {
             next_snooze = now + Duration::from_millis(500);
@@ -232,8 +255,9 @@ fn spawn_background(
     ready: Arc<AtomicBool>,
     jobs: mpsc::Receiver<Job>,
     notices: UnboundedSender<WorkerEvent>,
-) {
-    let _ = std::thread::Builder::new()
+    stop: Arc<AtomicBool>,
+) -> Option<JoinHandle<()>> {
+    std::thread::Builder::new()
         .name("fell-store-background".into())
         .spawn(move || {
             let mut restart = Restart::new(Worker::BackgroundStore, |worker| {
@@ -242,7 +266,10 @@ fn spawn_background(
             let Some(Some(store)) = restart.run(|recovered| {
                 let mut waits = BACKGROUND_RETRIES.iter();
                 loop {
-                    match Store::open(&path) {
+                    if stop.load(Ordering::Acquire) {
+                        break None;
+                    }
+                    match Store::open_existing(&path) {
                         Ok(store) => {
                             store.warm_search();
                             recovered();
@@ -269,17 +296,23 @@ fn spawn_background(
             diagnostic!(DEBUG, "Mailbox background connection opened");
             ready.store(true, Ordering::Release);
             drop(ready);
-            restart.run(|recovered| run_background(&store, &jobs, recovered));
-        });
+            restart.run(|recovered| run_background(&store, &jobs, recovered, &stop));
+        })
+        .ok()
 }
 
-fn run_background(store: &Store, jobs: &mpsc::Receiver<Job>, recovered: &mut dyn FnMut()) {
+fn run_background(
+    store: &Store,
+    jobs: &mpsc::Receiver<Job>,
+    recovered: &mut dyn FnMut(),
+    stop: &AtomicBool,
+) {
     // Sweep after startup and between jobs, even while working offline or
     // when nobody has opened an attachment in this window.
     let mut next_sweep = Instant::now();
     let mut next_correspondents = next_sweep;
     let mut failed = false;
-    loop {
+    while !stop.load(Ordering::Acquire) {
         if Instant::now() >= next_sweep {
             match store.clean_default_part_cache() {
                 Ok(()) => failed = false,
@@ -439,6 +472,8 @@ mod tests {
             background_ready: Arc::new(AtomicBool::new(false)),
             file_backed: Arc::new(AtomicBool::new(true)),
             background,
+            stopping: Arc::new(AtomicBool::new(false)),
+            thread: Arc::new(Mutex::new(None)),
         };
         let store = Store::open_in_memory().unwrap();
 
@@ -486,6 +521,8 @@ mod tests {
             background_ready: Arc::new(AtomicBool::new(false)),
             file_backed: Arc::new(AtomicBool::new(true)),
             background,
+            stopping: Arc::new(AtomicBool::new(false)),
+            thread: Arc::new(Mutex::new(None)),
         };
         let store = Store::open_in_memory().unwrap();
 

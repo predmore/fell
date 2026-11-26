@@ -390,79 +390,35 @@ fn list() -> Result<(), String> {
 fn remove(id: &str) -> Result<(), String> {
     let registry = Registry::resolve().map_err(|err| err.to_string())?;
     let path = registry.path(id).map_err(|err| err.to_string())?;
-    if !path.exists() {
-        registry.migrate().map_err(|err| err.to_string())?;
-    }
+    registry.migrate().map_err(|err| err.to_string())?;
     let base = crate::mailbox::store_path()?;
-    let store = registry.store_path(&base, id);
-    if !path
-        .symlink_metadata()
-        .is_ok_and(|meta| meta.is_file() || meta.is_symlink())
+    let store = registry
+        .mailbox_path(&base, id)
+        .map_err(|err| err.to_string())?;
+    let finishing_delete = registry.store_path(&base, id).is_err();
+    if !finishing_delete
+        && !path
+            .symlink_metadata()
+            .is_ok_and(|meta| meta.is_file() || meta.is_symlink())
     {
         return Err(format!("No account file for {id:?}"));
     }
-    let delete = store.is_file()
-        && io::stdin().is_terminal()
-        && matches!(
-            prompt(
-                "Delete the local mail, drafts and grants for this account? [y/N]",
-                Some("")
-            )?
-            .to_ascii_lowercase()
-            .as_str(),
-            "y" | "yes"
-        );
-    remove_account(&path, &store, delete)?;
-    println!("Removed {id}.");
+    let delete = finishing_delete
+        || (store.is_file()
+            && io::stdin().is_terminal()
+            && matches!(
+                prompt(
+                    "Delete the local mail, drafts and grants for this account? [y/N]",
+                    Some("")
+                )?
+                .to_ascii_lowercase()
+                .as_str(),
+                "y" | "yes"
+            ));
+    registry.remove(&base, id, delete)?;
+    let local = if delete { "deleted" } else { "kept" };
+    println!("Removed {id}. Local mail {local}.");
     Ok(())
-}
-
-fn remove_account(
-    path: &std::path::Path,
-    store: &std::path::Path,
-    delete: bool,
-) -> Result<(), String> {
-    use std::fs;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let parent = path.parent().expect("account file has a directory");
-    let dir = crate::mailbox::private_config_dir(parent).map_err(|err| err.to_string())?;
-    dir.try_lock().map_err(|err| err.to_string())?;
-    // An open store has a shared lock on its inode. SQLite files cannot
-    // be unlinked and recreated while another process still uses them.
-    let locked_store = if delete {
-        match fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(store)
-        {
-            Ok(file) => {
-                file.try_lock().map_err(|err| format!("Close Fell and any fell-mcp sessions using this account before deleting local mail: {err}"))?;
-                if !file.metadata().map_err(|err| err.to_string())?.is_file() {
-                    return Err("Expected a regular mailbox file.".into());
-                }
-                Some(file)
-            }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => None,
-            Err(err) => return Err(err.to_string()),
-        }
-    } else {
-        None
-    };
-    if locked_store.is_some() {
-        for suffix in ["-wal", "-shm", "-journal", ""] {
-            let mut path = store.as_os_str().to_os_string();
-            path.push(suffix);
-            match fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    return Err(format!("{}: {err}", std::path::Path::new(&path).display()));
-                }
-            }
-        }
-    }
-    fs::remove_file(path).map_err(|err| format!("{}: {err}", path.display()))
 }
 
 fn show(id: Option<&str>) -> Result<(), String> {
@@ -640,28 +596,6 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|arg| arg.to_string()).collect()
-    }
-
-    #[test]
-    fn removing_an_account_keeps_mail_unless_deletion_was_chosen() {
-        let temp = tempfile::tempdir().unwrap();
-        let configs = temp.path().join("config/fell/accounts");
-        std::fs::create_dir_all(&configs).unwrap();
-        for id in ["kept", "deleted"] {
-            let path = configs.join(format!("{id}.toml"));
-            std::fs::write(&path, "fixture").unwrap();
-            let db = temp.path().join(format!("{id}.db"));
-            let store = fell_core::Store::open(&db).unwrap();
-            if id == "deleted" {
-                assert!(remove_account(&path, &db, true).is_err());
-                assert!(path.exists() && db.exists());
-            }
-            drop(store);
-            let delete = id == "deleted";
-            remove_account(&path, &db, delete).unwrap();
-            assert!(!path.exists());
-            assert_eq!(db.exists(), !delete);
-        }
     }
 
     #[test]

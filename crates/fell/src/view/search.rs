@@ -1393,12 +1393,31 @@ fn search_suggestions(
 pub(super) fn header(
     theme: &Theme,
     search: &Search,
+    session: &crate::model::Session,
     width: f32,
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::Div {
     let font = conversation_line_style(window, theme, px(theme.ui_px));
-    let field_width = (width - 94.).max(32.);
+    let account_color = super::theme::account_detail_color(theme.dimmed, theme.background);
+    let account = (session.account_choices.len() > 1)
+        .then(|| {
+            let (name, _) = super::account_header(&session.account_name, &session.account_email);
+            let style = conversation_line_style(window, theme, px(12.));
+            super::clip_shaped(
+                window,
+                &style,
+                name,
+                (width * 0.31).min(220.),
+                FontWeight::NORMAL,
+                Some(account_color),
+            )
+        })
+        .flatten();
+    let reserved = account
+        .as_ref()
+        .map_or(0., |line| f32::from(line.width).ceil() + 10.);
+    let field_width = (width - 94. - reserved).max(32.);
     let line = shape_ui_line(
         window,
         &font,
@@ -1482,7 +1501,15 @@ pub(super) fn header(
                         .text_color(rgb(theme.accent))
                         .child("/"),
                 )
-                .child(field),
+                .child(field)
+                .children(account.map(|line| {
+                    div()
+                        .flex_none()
+                        .text_right()
+                        .text_size(px(12.))
+                        .text_color(rgb(account_color))
+                        .child(line.text)
+                })),
         )
 }
 
