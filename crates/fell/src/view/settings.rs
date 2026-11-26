@@ -186,7 +186,7 @@ impl View {
             })
             .filter_map(|entry| {
                 let id = entry.path.file_stem()?.to_string_lossy().into_owned();
-                let active = active == Some(id.as_str());
+                let active = entry.config.is_ok() && active == Some(id.as_str());
                 let (name, email, status, alert) = match &entry.config {
                     Ok(config) => {
                         let (status, alert) = statuses

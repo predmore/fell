@@ -523,7 +523,9 @@ mod tests {
         let trash = removal_trash(&db);
         fs::create_dir(&trash).unwrap();
         fs::write(trash.join("plan"), br#"["work",["cwork"]]"#).unwrap();
-        fs::write(trash.join("work.db.embed.lock"), "staged sidecar").unwrap();
+        let sidecar = mailbox_file(&db, ".embed.lock");
+        fs::write(&sidecar, "staged sidecar").unwrap();
+        fs::rename(sidecar, trash.join("work.db.embed.lock")).unwrap();
         assert!(file.is_file());
         assert!(registry.store_path(&base, id.as_str()).is_err());
         assert!(Store::open_existing(&db).is_err());
@@ -600,6 +602,7 @@ mod tests {
         };
         let registry = Registry::resolve().unwrap();
         let base = root.join("mail.db");
+        fs::create_dir_all(registry.directory()).unwrap();
         let trash = removal_trash(&base);
         fs::create_dir_all(&trash).unwrap();
         fs::write(trash.join("plan"), br#"["mail",[]]"#).unwrap();

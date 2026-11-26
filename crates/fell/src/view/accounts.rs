@@ -687,7 +687,7 @@ impl AccountWindow {
             .filter(|(_, _, _, fade)| fade.running(now));
         self.picker_exit
             .as_ref()
-            .map(|(_, _, _, fade)| 1.0 - fade.progress(now))
+            .map(|(_, _, _, fade)| fade.remaining(now))
     }
 }
 
@@ -702,7 +702,6 @@ impl Render for AccountWindow {
                 window.on_next_frame(move |_, cx| {
                     let _ = entity.update(cx, |_, cx| cx.notify());
                 });
-                window.request_animation_frame();
                 outgoing.update(cx, |inbox, cx| {
                     layer.swap(&mut inbox.session);
                     let picker = super::overlay(
@@ -807,6 +806,38 @@ mod tests {
         let store = old.read_with(&app, |inbox, _| inbox.store.clone());
         futures::executor::block_on(store.call(|_| ())).unwrap();
         app.run_until_parked();
+        let check_position = |inbox: &Inbox| {
+            assert_eq!(inbox.session.folder, "Sent");
+            assert_eq!(inbox.session.cursor_id.as_deref(), Some("selected-thread"));
+            assert_eq!(inbox.session.search.as_ref().unwrap().query, "trail");
+        };
+        window
+            .update(&mut app, |view, window, cx| {
+                view.switch("work", window, cx);
+                old.update(cx, |inbox, _| {
+                    inbox.session.folder = "Sent".into();
+                    inbox.session.search = Some(Default::default());
+                    inbox.session.search.as_mut().unwrap().query = "trail".into();
+                    inbox.session.cursor_id = Some("selected-thread".into());
+                });
+            })
+            .unwrap();
+
+        mailbox::import_identities(
+            &fell_core::AccountId("work".into()),
+            vec!["alias@example.test".into()],
+        )
+        .unwrap();
+        window
+            .update(&mut app, |view, window, cx| {
+                view.reconcile(&registry, registry.load(), window, cx);
+                assert_eq!(view.active(), old);
+                assert!(view.stopping.is_empty());
+                check_position(old.read(cx));
+            })
+            .unwrap();
+        futures::executor::block_on(store.call(|_| ())).unwrap();
+
         write_account(&registry, "work", "name = 'New work'");
         window
             .update(&mut app, |view, window, cx| {
@@ -814,6 +845,9 @@ mod tests {
                 assert!(view.stopping.contains("work"));
                 assert!(!view.views.contains_key("work"));
                 assert!(old.read(cx).retired);
+                assert_eq!(view.active(), old);
+                assert_eq!(view.active_id.as_deref(), Some("work"));
+                check_position(old.read(cx));
             })
             .unwrap();
         app.run_until_parked();
@@ -821,11 +855,148 @@ mod tests {
             .update(&mut app, |view, _, cx| {
                 let next = &view.views["work"];
                 assert_ne!(next, &old);
+                assert_eq!(&view.active(), next);
                 assert_eq!(next.read(cx).session.account_name, "New work");
+                check_position(next.read(cx));
                 assert!(!view.stopping.contains("work"));
             })
             .unwrap();
         assert!(futures::executor::block_on(store.call(|_| ())).is_err());
+    }
+
+    #[test]
+    fn mailto_waits_for_the_new_active_account() {
+        let Some(_temp) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let registry = Registry::resolve().unwrap();
+        std::fs::create_dir_all(registry.directory()).unwrap();
+        write_account(&registry, "mail", "");
+        write_account(&registry, "work", "");
+        let mut app = TestAppContext::single();
+        let hub = std::sync::Arc::new(fell_core::compose::DraftHub::new());
+        let (mut send, requests) = futures::channel::mpsc::channel(4);
+        app.update(|cx| {
+            cx.set_global(ExternalCompose(Some(requests)));
+            cx.set_global(crate::draft_host::AgentDrafts(hub.clone()));
+        });
+        let window = app.add_window(|window, cx| {
+            AccountWindow::new(mailbox::startup(), false, None, window, cx)
+        });
+        let clients = window
+            .update(&mut app, |view, _, cx| {
+                view.views
+                    .values()
+                    .map(|inbox| inbox.read(cx).store.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap();
+        for client in clients {
+            futures::executor::block_on(client.call(|_| ())).unwrap();
+        }
+        app.run_until_parked();
+        let first = window.update(&mut app, |view, _, _| view.active()).unwrap();
+        let (first_ready, first_wait) = oneshot::channel();
+        let (second_ready, second_wait) = oneshot::channel();
+        window
+            .update(&mut app, |view, _, cx| {
+                first.update(cx, |inbox, _| inbox.compose_ready = first_wait.shared());
+                view.views["work"]
+                    .update(cx, |inbox, _| inbox.compose_ready = second_wait.shared());
+            })
+            .unwrap();
+        send.try_send(crate::compose_launch::mailto("mailto:friend@example.test").unwrap())
+            .unwrap();
+        app.run_until_parked();
+        assert!(hub.focused_id().is_none());
+
+        window
+            .update(&mut app, |view, window, cx| view.switch("work", window, cx))
+            .unwrap();
+        let _ = first_ready.send(());
+        app.run_until_parked();
+        assert!(hub.focused_id().is_none());
+
+        second_ready.send(()).unwrap();
+        app.run_until_parked();
+        let draft = hub.focused_id().unwrap();
+        assert_eq!(
+            hub.with_session(&draft, |draft| draft.account_id().0.clone())
+                .as_deref(),
+            Some("work")
+        );
+    }
+
+    #[test]
+    fn account_picker_and_inbox_fade_on_every_switch() {
+        let Some(_temp) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let registry = Registry::resolve().unwrap();
+        std::fs::create_dir_all(registry.directory()).unwrap();
+        write_account(&registry, "mail", "");
+        write_account(&registry, "work", "");
+        let mut app = TestAppContext::single();
+        let window = app.add_window(|window, cx| {
+            AccountWindow::new(mailbox::startup(), false, None, window, cx)
+        });
+        for id in ["work", "mail", "work"] {
+            window
+                .update(&mut app, |view, _, cx| {
+                    let current = view.active();
+                    current.update(cx, |inbox, cx| {
+                        inbox.motion.motion = motion::Motion::new(true);
+                        inbox.session.on_key(KeyId::Char('g'), 10);
+                        inbox.session.on_key(KeyId::Char('A'), 10);
+                        assert_eq!(inbox.session.overlay, Overlay::Folders);
+                        cx.notify();
+                    });
+                })
+                .unwrap();
+            app.update(|cx| {
+                gpui::AnyWindowHandle::from(window)
+                    .update(cx, |_, window, cx| window.draw(cx).clear())
+                    .unwrap();
+            });
+            window
+                .update(&mut app, |view, window, cx| {
+                    let stale = Instant::now() - Duration::from_secs(1);
+                    for inbox in [&view.active, &view.views[id]] {
+                        inbox.update(cx, |inbox, _| {
+                            inbox.motion.motion = motion::Motion::new(true);
+                            inbox.motion.clock.idle();
+                            inbox.motion.clock.now_at(stale);
+                        });
+                    }
+                    view.switch(id, window, cx);
+                    let active = view.active();
+                    let first = Instant::now();
+                    let opacity = |real, cx: &mut App| {
+                        active.update(cx, |inbox, _| {
+                            let now = inbox.motion.clock.frame(real);
+                            inbox.account_opacity(now)
+                        })
+                    };
+                    let mut arrival = opacity(first, cx);
+                    let mut exit = view.picker_opacity(first).unwrap();
+                    assert!(arrival < 1.0 && exit > 0.9);
+                    for millis in [20, 40, 60, 80] {
+                        let frame = first + Duration::from_millis(millis);
+                        let next_arrival = opacity(frame, cx);
+                        let next_exit = view.picker_opacity(frame).unwrap();
+                        assert!(next_arrival > arrival && next_arrival < 1.0);
+                        assert!(next_exit < exit && next_exit > 0.0);
+                        arrival = next_arrival;
+                        exit = next_exit;
+                    }
+                    let _ = opacity(first + Duration::from_millis(100), cx);
+                    let _ = view.picker_opacity(first + Duration::from_millis(100));
+                    let last = first + motion::FADE;
+                    assert_eq!(opacity(last, cx), 1.0);
+                    assert!(view.picker_opacity(last).is_none());
+                })
+                .unwrap();
+        }
     }
 
     #[test]

@@ -99,7 +99,7 @@ pub fn open_registered_store(
             .get(&account)
             .map_err(|err| err.to_string())?
             .as_ref()
-            .is_none_or(|current| !config.same_except_identities(&current))
+            .is_none_or(|current| !config.same_except_identities(current))
         {
             return Err("The account file changed while opening the mailbox.".into());
         }

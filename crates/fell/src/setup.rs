@@ -369,7 +369,10 @@ pub(crate) fn save_account(
 
 fn list() -> Result<(), String> {
     let registry = Registry::resolve().map_err(|err| err.to_string())?;
-    let accounts = registry.load_with_removals(&crate::mailbox::store_path()?);
+    let accounts = match crate::mailbox::store_path() {
+        Ok(base) => registry.load_with_removals(&base),
+        Err(_) => registry.load(),
+    };
     if accounts.is_empty() {
         println!("No accounts configured.");
     }
@@ -377,11 +380,7 @@ fn list() -> Result<(), String> {
         eprintln!("{error}");
     }
     for entry in accounts.entries {
-        if accounts
-            .interrupted
-            .iter()
-            .any(|pending| registry.path(&pending.id).as_ref() == Ok(&entry.path))
-        {
+        if accounts.interrupted.iter().any(|pending| pending.path == entry.path) {
             continue;
         }
         match entry.config {
