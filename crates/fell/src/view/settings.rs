@@ -1068,6 +1068,9 @@ const HEADER_HEIGHT: f32 = 64.;
 const SECTION_ROW_HEIGHT: f32 = 64.;
 const INDEX_ROW_HEIGHT: f32 = 49.;
 const ACCOUNT_ROW_HEIGHT: f32 = 64.;
+const CARD_WIDTH: f32 = 530.;
+const BROKEN_FILE_BUTTON_WIDTH: f32 = 88.;
+const BROKEN_FILE_LINK_WIDTH: f32 = 14.;
 const BODY_PADDING: f32 = 16.;
 const BINDING_ROW_HEIGHT: f32 = 39.;
 const MAX_BINDING_ROWS: f32 = 9.;
@@ -1272,8 +1275,31 @@ pub(super) fn card(
                         );
                         let recover =
                             matches!(account.kind, AccountRemovalKind::Interrupted { .. });
+                        let broken = account.kind == AccountRemovalKind::BrokenFile;
+                        let status = if broken {
+                            // Card borders, body and row padding, then the link
+                            // and the optional Remove button with their gaps.
+                            let room = CARD_WIDTH.min(width * 0.94)
+                                - 42.
+                                - BROKEN_FILE_LINK_WIDTH
+                                - 9.
+                                - if account.can_remove() {
+                                    BROKEN_FILE_BUTTON_WIDTH + 9.
+                                } else {
+                                    0.
+                                };
+                            super::clip_line(
+                                window,
+                                &super::conversation_line_style(window, theme, px(12.)),
+                                &crate::present::display_safe(&account.status),
+                                room,
+                                FontWeight::NORMAL,
+                            )
+                        } else {
+                            crate::present::display_safe(&account.status)
+                        };
                         control = control
-                            .child(account_label(theme, account, selected))
+                            .child(account_label(theme, account, status, selected))
                             .when(account.can_remove(), |row| {
                                 let button = account_button(
                                     theme,
@@ -1289,10 +1315,20 @@ pub(super) fn card(
                                     live && selected,
                                     cx,
                                 );
-                                row.child(button.opacity(if selected { 1. } else { 0. }))
+                                row.child(
+                                    button
+                                        .when(broken, |button| {
+                                            button.w(px(BROKEN_FILE_BUTTON_WIDTH)).text_center()
+                                        })
+                                        .opacity(if selected { 1. } else { 0. }),
+                                )
                             })
-                            .when(account.kind == AccountRemovalKind::BrokenFile, |row| {
-                                row.child(trailing(theme, "↗", selected))
+                            .when(broken, |row| {
+                                row.child(
+                                    trailing(theme, "↗", selected)
+                                        .w(px(BROKEN_FILE_LINK_WIDTH))
+                                        .text_right(),
+                                )
                             });
                     }
                 } else if let Row::Value(preference) = setting {
@@ -1743,7 +1779,7 @@ pub(super) fn card(
     }
     div()
         .relative()
-        .w(px(530.))
+        .w(px(CARD_WIDTH))
         .max_w(gpui::relative(0.94))
         .h(px(height))
         .bg(rgb(theme.surface))
@@ -1773,7 +1809,12 @@ pub(super) fn card(
         })
 }
 
-fn account_label(theme: &theme::Theme, account: &AccountRow, selected: bool) -> gpui::Div {
+fn account_label(
+    theme: &theme::Theme,
+    account: &AccountRow,
+    status: String,
+    selected: bool,
+) -> gpui::Div {
     let (muted, fill) = if selected {
         (theme.on_selection_dim, theme.selection)
     } else {
@@ -1811,7 +1852,7 @@ fn account_label(theme: &theme::Theme, account: &AccountRow, selected: bool) -> 
                 .text_size(px(12.))
                 .line_height(px(15.))
                 .text_color(rgb(if account.alert { theme.error } else { muted }))
-                .child(crate::present::display_safe(&account.status)),
+                .child(status),
         )
 }
 
