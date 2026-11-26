@@ -6124,7 +6124,7 @@ fn registry_accounts_sync_in_parallel_into_separate_stores() {
     let ready = Barrier::new(configs.len());
     std::thread::scope(|scope| {
         for config in configs {
-            let path = registry.store_path(&base, &config.id);
+            let path = registry.store_path(&base, &config.id).unwrap();
             let ready = &ready;
             scope.spawn(move || {
                 ready.wait();

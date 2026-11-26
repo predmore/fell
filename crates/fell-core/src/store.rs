@@ -449,16 +449,28 @@ pub use bodies::cid_upgrade::{CidRepairBatch, CidRepairProgress};
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_mailbox(path.as_ref(), true)
+        Self::open_mailbox(path.as_ref(), true, true)
+    }
+
+    /// Open an existing mailbox without recreating a recently removed file.
+    pub fn open_existing(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_mailbox(path.as_ref(), true, false)
     }
 
     pub(crate) fn open_for_part_fetch(path: &Path) -> Result<Self> {
-        Self::open_mailbox(path, false)
+        Self::open_mailbox(path, false, true)
     }
 
-    fn open_mailbox(requested: &Path, index: bool) -> Result<Self> {
+    pub(crate) fn open_existing_without_index(path: &Path) -> Result<Self> {
+        Self::open_mailbox(path, false, false)
+    }
+
+    fn open_mailbox(requested: &Path, index: bool, create: bool) -> Result<Self> {
+        check_mailbox_removal(requested)?;
         // The mailbox holds message text. Create it owner-only before SQLite writes.
-        create_private_file(requested)?;
+        if create {
+            create_private_file(requested)?;
+        }
         // One path string per inode. A symlink or a second hard link must not
         // open a different `-wal` while another connection still has the file.
         let claimed = claim_mailbox(requested)?;
@@ -552,6 +564,25 @@ impl Store {
 
     pub fn db_path(&self) -> Option<&Path> {
         self.path.as_deref()
+    }
+
+    /// Keep the inode locked while the caller closes SQLite and stages its files.
+    pub(crate) fn take_exclusive_mailbox_lock(&mut self) -> Result<std::fs::File> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let lock = self
+            ._mailbox_lock
+            .as_ref()
+            .ok_or_else(|| crate::Error::Invalid("Expected a mailbox file".into()))?;
+        if lock.metadata()?.nlink() != 1 {
+            return Err(crate::Error::Invalid(
+                "Expected a mailbox file with one link".into(),
+            ));
+        }
+        lock.try_lock().map_err(|err| crate::Error::Invalid(format!(
+            "Close Fell and any fell-mcp sessions using this account before deleting local mail: {err}"
+        )))?;
+        Ok(self._mailbox_lock.take().expect("locked mailbox file"))
     }
 
     #[cfg(test)]
@@ -2476,6 +2507,7 @@ fn claim_mailbox_unix(requested: &Path) -> Result<ClaimedMailbox> {
     use fs4::fs_std::FileExt;
 
     let canonical = absolute_opened(&requested.canonicalize()?)?;
+    check_mailbox_removal(&canonical)?;
     loop {
         let db = std::fs::File::open(requested)?;
         let nlink = db.metadata()?.nlink();
@@ -2504,6 +2536,12 @@ fn claim_mailbox_unix(requested: &Path) -> Result<ClaimedMailbox> {
             // Block until the exclusive holder shares or exits. Replaying a
             // large WAL can take longer than a short poll.
             db.lock_shared()?;
+            check_mailbox_removal(requested)?;
+            if !same_inode(&db, requested) {
+                return Err(crate::Error::Invalid(
+                    "mailbox was moved during open".into(),
+                ));
+            }
             if let Some(path) = read_published_path(&db) {
                 let conn = open_mailbox_db(&path)?;
                 if read_published_path(&db).as_ref() == Some(&path) {
@@ -2527,6 +2565,12 @@ fn claim_mailbox_unix(requested: &Path) -> Result<ClaimedMailbox> {
             }
             return Err(crate::Error::Invalid(
                 "mailbox is already open and its path was not published".into(),
+            ));
+        }
+        check_mailbox_removal(requested)?;
+        if !same_inode(&db, requested) {
+            return Err(crate::Error::Invalid(
+                "mailbox was moved during open".into(),
             ));
         }
         let (path, conn) = if let Some(published) = read_published_path(&db) {
@@ -2610,13 +2654,24 @@ fn canonical_wal_has_frames(canonical: &Path) -> bool {
 }
 
 fn open_mailbox_db(path: &Path) -> Result<Connection> {
-    let conn = Connection::open(path)?;
+    let flags = rusqlite::OpenFlags::default() & !rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
+    let conn = Connection::open_with_flags(path, flags)?;
     // Wait for other writers from the first statement on, including the
     // journal mode below, not only after `from_connection` sets it.
     conn.busy_timeout(Duration::from_secs(5))?;
     // The UI and `fell-mcp` share this file. WAL lets a reader run beside a writer.
     conn.pragma_update(None, "journal_mode", "WAL")?;
     Ok(conn)
+}
+
+fn check_mailbox_removal(path: &Path) -> Result<()> {
+    match crate::accounts::removal_trash(path).symlink_metadata() {
+        Ok(_) => Err(crate::Error::Invalid(
+            "mailbox removal is in progress".into(),
+        )),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
 }
 
 #[cfg(unix)]

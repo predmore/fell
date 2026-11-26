@@ -2,12 +2,15 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::{AccountConfig, AccountId};
 
+mod removal;
+
 pub const DEFAULT_ID: &str = "mail";
+pub type FileIdentity = (u64, u64, i64, i64);
 
 pub fn validate_id(id: &str) -> Result<(), &'static str> {
     if id.is_empty()
@@ -59,6 +62,8 @@ impl std::fmt::Display for FileError {
 pub struct Entry {
     pub path: PathBuf,
     pub config: Result<AccountConfig, FileError>,
+    /// A replacement with identical settings can still replace a removed account.
+    pub file_identity: Option<FileIdentity>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -123,6 +128,26 @@ impl Registry {
         self.config.join("accounts")
     }
 
+    /// Serialize registry-backed grant changes with account removal.
+    pub fn lock(&self) -> Result<File, FileError> {
+        let dir = self.directory();
+        real_directory(&self.config).map_err(|err| FileError::access(&self.config, err))?;
+        let lock = open_account_directory(&dir).map_err(|err| FileError::access(&dir, err))?;
+        lock.try_lock()
+            .map_err(|err| FileError::access(&dir, err.into()))?;
+        Ok(lock)
+    }
+
+    /// Hold the account file stable while opening its mailbox for the UI.
+    pub fn lock_shared(&self) -> Result<File, FileError> {
+        let dir = self.directory();
+        real_directory(&self.config).map_err(|err| FileError::access(&self.config, err))?;
+        let lock = open_account_directory(&dir).map_err(|err| FileError::access(&dir, err))?;
+        lock.lock_shared()
+            .map_err(|err| FileError::access(&dir, err))?;
+        Ok(lock)
+    }
+
     pub fn path(&self, id: &str) -> Result<PathBuf, FileError> {
         validate_id(id)
             .map_err(|recovery| FileError::new(format!("Invalid account ID {id:?}"), recovery))?;
@@ -163,7 +188,12 @@ impl Registry {
                             .map(|(config, _)| config)
                             .ok_or_else(|| missing(&path))
                     });
-                    accounts.entries.push(Entry { path, config });
+                    let file_identity = path.symlink_metadata().ok().map(file_identity);
+                    accounts.entries.push(Entry {
+                        path,
+                        config,
+                        file_identity,
+                    });
                 }
                 accounts.entries.sort_by(|a, b| a.path.cmp(&b.path));
             }
@@ -192,20 +222,67 @@ impl Registry {
 
     /// Use the existing mailbox for the original account, including old
     /// configs that set a custom ID. Every other account has its own DB.
-    pub fn store_path(&self, base: &Path, id: &str) -> PathBuf {
-        let original = self.directory().join(".original-id");
-        let original = fs::read_to_string(original).ok();
-        if id == original.as_deref().unwrap_or(DEFAULT_ID) {
+    pub fn store_path(&self, base: &Path, id: &str) -> Result<PathBuf, FileError> {
+        let path = self.mailbox_path(base, id)?;
+        if removal_trash(&path).symlink_metadata().is_ok() {
+            return Err(FileError::new(
+                format!("Removal of {id} is in progress"),
+                "Run fell account remove again to finish.",
+            ));
+        }
+        Ok(path)
+    }
+
+    pub fn mailbox_path(&self, base: &Path, id: &str) -> Result<PathBuf, FileError> {
+        self.path(id)?;
+        // Read the source first. If migration has already renamed it, the
+        // durable marker must be visible before any migrated file is visible.
+        let legacy = read(&self.config.join("account.toml"), None)?;
+        match real_directory(&self.directory()) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(FileError::access(&self.directory(), err)),
+        }
+        let marker = self.directory().join(".original-id");
+        let original = match legacy {
+            Some((config, _)) => config.id,
+            None => match OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&marker)
+            {
+                Ok(file) => {
+                    let mut value = String::new();
+                    file.take(65)
+                        .read_to_string(&mut value)
+                        .map_err(|err| FileError::access(&marker, err))?;
+                    validate_id(&value).map_err(|err| {
+                        FileError::new(
+                            format!("{}: {err}", marker.display()),
+                            "Restore the original account ID.",
+                        )
+                    })?;
+                    value
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => DEFAULT_ID.into(),
+                Err(err) => return Err(FileError::access(&marker, err)),
+            },
+        };
+        Ok(if id == original {
             base.to_owned()
         } else {
             base.with_extension("accounts").join(format!("{id}.db"))
-        }
+        })
     }
 
     /// Copy the original bytes into the new layout, then rename the source
     /// to its backup. Both names survive a crash between those operations.
     /// The account directory lock also serializes setup and removal.
     pub fn migrate(&self) -> Result<(), FileError> {
+        self.migrate_with(|| {})
+    }
+
+    fn migrate_with(&self, published: impl FnOnce()) -> Result<(), FileError> {
         match real_directory(&self.config) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -230,16 +307,28 @@ impl Registry {
             if backup.symlink_metadata().is_ok() {
                 return Err(io::Error::other("account.toml.bak already exists"));
             }
-            publish(&dir, &target, text.as_bytes())?;
-            if config.id != DEFAULT_ID {
-                publish(&dir, &dir.join(".original-id"), config.id.as_bytes())?;
-            }
+            publish(&dir, &dir.join(".original-id"), config.id.as_bytes())?;
             lock.sync_all()?;
+            publish(&dir, &target, text.as_bytes())?;
+            lock.sync_all()?;
+            File::open(&self.config)?.sync_all()?;
+            published();
             fs::rename(&legacy, &backup)?;
             File::open(&self.config)?.sync_all()
         };
         write().map_err(|err| FileError::access(&legacy, err))
     }
+}
+
+fn file_identity(meta: fs::Metadata) -> FileIdentity {
+    (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec())
+}
+
+/// Durable staging directory beside the mailbox being removed.
+pub(crate) fn removal_trash(store: &Path) -> PathBuf {
+    let mut name = store.file_name().unwrap_or_default().to_os_string();
+    name.push(".removing");
+    store.with_file_name(name)
 }
 
 fn real_directory(path: &Path) -> io::Result<()> {
@@ -432,11 +521,67 @@ mod tests {
             );
             assert!(!legacy.exists());
             let base = root.path().join("data/fell/mail.db");
-            assert_eq!(registry.store_path(&base, id), base);
-            assert_ne!(registry.store_path(&base, "work"), base);
+            assert_eq!(registry.store_path(&base, id).unwrap(), base);
+            assert_ne!(registry.store_path(&base, "work").unwrap(), base);
             fs::rename(account, dir.join("disconnected.toml")).unwrap();
             assert!(registry.load().is_empty());
         }
+    }
+
+    #[test]
+    fn a_failed_marker_never_publishes_a_new_mailbox_path() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("fell");
+        let registry = Registry::at(config.clone());
+        let legacy = config.join("account.toml");
+        let text = "id = 'personal'\nemail = 'personal@example.test'\npassword = 'fixture'\n";
+        write_private(&legacy, text);
+        fs::create_dir_all(registry.directory().join(".original-id")).unwrap();
+        assert!(registry.load().error.is_some());
+        assert!(!registry.path("personal").unwrap().exists());
+        assert_eq!(fs::read_to_string(&legacy).unwrap(), text);
+
+        // An account file left by an older Fell stays on the legacy DB too.
+        write_private(&registry.path("personal").unwrap(), text);
+        let base = root.path().join("mail.db");
+        assert_eq!(registry.store_path(&base, "personal").unwrap(), base);
+        assert!(!base.with_extension("accounts").exists());
+    }
+
+    #[test]
+    fn a_reader_during_migration_sees_the_legacy_mailbox() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("fell");
+        let registry = Registry::at(config.clone());
+        let legacy = config.join("account.toml");
+        write_private(
+            &legacy,
+            "id = 'personal'\nemail = 'p@example.test'\npassword = 'fixture'\n",
+        );
+        let base = root.path().join("mail.db");
+        std::thread::scope(|scope| {
+            let (published, observed) = std::sync::mpsc::channel();
+            let (read, done) = std::sync::mpsc::channel();
+            let registry = &registry;
+            let migrating = scope.spawn(move || {
+                registry.migrate_with(|| {
+                    published.send(()).unwrap();
+                    done.recv().unwrap();
+                })
+            });
+            observed.recv().unwrap();
+            let during = registry.store_path(&base, "personal");
+            let account = registry.get(&AccountId("personal".into()));
+            let legacy_visible = legacy.is_file();
+            let marker = fs::read_to_string(registry.directory().join(".original-id"));
+            read.send(()).unwrap();
+            migrating.join().unwrap().unwrap();
+            assert!(legacy_visible);
+            assert_eq!(marker.unwrap(), "personal");
+            assert_eq!(during.unwrap(), base);
+            assert!(account.unwrap().is_some());
+        });
+        assert_eq!(registry.store_path(&base, "personal").unwrap(), base);
     }
 
     #[test]

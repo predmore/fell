@@ -188,6 +188,18 @@ impl WriteScope {
 }
 
 impl crate::Store {
+    pub(crate) fn disable_account_grants(&self, account: &AccountId) -> Result<()> {
+        let tx = crate::store::immediate_transaction(&self.conn)?;
+        tx.execute(
+            "UPDATE agent_grants
+             SET enabled = 0, can_read = 0, can_triage = 0, can_draft = 0, can_annotate = 0
+             WHERE account_id = ?1",
+            [account.as_str()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn set_agent_grant(
         &self,
         account_id: &AccountId,

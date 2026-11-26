@@ -39,7 +39,8 @@ pub use persist::{
     remember_compose_store, remembered_store_path, stored_compose_account, stored_compose_owner,
 };
 pub(crate) use persist::{
-    confirm_synced_sends, mark_discarded, record_confirmed_send, undo_discard,
+    confirm_synced_sends, drafts_for_removal, mark_discarded, record_confirmed_send,
+    remove_draft_workspaces, undo_discard,
 };
 pub(crate) use reply::format_address;
 pub use reply::{

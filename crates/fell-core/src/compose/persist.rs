@@ -1098,10 +1098,12 @@ pub fn remember_compose_store(id: &str, store: &Path) -> std::result::Result<(),
 }
 
 pub fn remembered_store_path(id: &str) -> Option<PathBuf> {
-    let path = compose_index_file(id)?;
-    let text = std::fs::read_to_string(path).ok()?;
-    let store = PathBuf::from(text.trim());
+    let store = indexed_store(&compose_index_file(id)?).ok()?;
     store.is_file().then_some(store)
+}
+
+fn indexed_store(path: &Path) -> std::io::Result<PathBuf> {
+    std::fs::read_to_string(path).map(|text| PathBuf::from(text.trim()))
 }
 
 pub fn stored_compose_account(id: &str) -> Option<String> {
@@ -1168,6 +1170,7 @@ pub fn mailbox_db_path() -> Option<PathBuf> {
 }
 
 pub(crate) fn compose_index_file(id: &str) -> Option<PathBuf> {
+    workspace::validate_id(id).ok()?;
     let root = if let Some(dir) = std::env::var_os("FELL_COMPOSE_INDEX") {
         PathBuf::from(dir)
     } else if cfg!(any(test, feature = "test-utils")) {
@@ -1187,11 +1190,140 @@ pub(crate) fn open_store_for_draft(id: &str) -> Option<Store> {
 }
 
 fn open_store_for(id: &str) -> Option<Store> {
-    let path = remembered_store_path(id).or_else(mailbox_db_path)?;
-    if !path.is_file() {
-        return None;
+    let open = |path: &Path| -> crate::Result<_> {
+        match path.metadata() {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            result => {
+                result?;
+            }
+        }
+        let store = Store::open_existing_without_index(path)?;
+        Ok(store.load_compose(id)?.map(|draft| (store, draft)))
+    };
+    let index = compose_index_file(id)?;
+    match indexed_store(&index) {
+        Ok(path) => return open(&path).ok()?.map(|(store, _)| store),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return None,
     }
-    Store::open(path).ok()
+    let base = mailbox_db_path()?;
+    let registry = crate::accounts::Registry::resolve().ok()?;
+    let accounts = registry.load();
+    if accounts.is_empty() && !registry.directory().exists() {
+        return open(&base).ok()?.map(|(store, _)| store);
+    }
+    let mut matched = None;
+    for entry in accounts.entries {
+        let id = entry.path.file_stem()?.to_str()?;
+        let path = registry.store_path(&base, id).ok()?;
+        if let Some((store, draft)) = open(&path).ok()? {
+            if draft.account_id.as_str() != id || matched.is_some() {
+                return None;
+            }
+            matched = Some(store);
+        }
+    }
+    matched
+}
+
+/// Include discarded drafts and workspaces whose index was written before
+/// their SQLite row. Both may still have local text or attachments.
+pub(crate) fn drafts_for_removal(
+    account: &AccountId,
+    mailbox: &Path,
+    store: Option<&Store>,
+) -> std::result::Result<Vec<String>, String> {
+    let mut drafts = Vec::new();
+    if let Some(store) = store {
+        let read = || -> crate::Result<Vec<String>> {
+            let mut stmt = store
+                .conn
+                .prepare("SELECT id FROM compose_drafts WHERE account_id = ?1")?;
+            Ok(stmt
+                .query_map([account.as_str()], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?)
+        };
+        drafts = read().map_err(|err| err.to_string())?;
+    }
+    let root = workspace::draft_root();
+    for dir in [
+        root.as_path(),
+        compose_index_file("draft")
+            .as_deref()
+            .and_then(Path::parent)
+            .unwrap_or(&root),
+    ] {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.to_string()),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|err| err.to_string())?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let id = name
+                .strip_prefix('.')
+                .and_then(|name| name.strip_suffix(".private"))
+                .unwrap_or(name);
+            if workspace::validate_id(id).is_err() {
+                continue;
+            }
+            let folder = root.join(id);
+            if workspace::read_account(&folder).as_deref() == Some(account.as_str())
+                || draft_store_matches(id, mailbox)
+            {
+                drafts.push(id.to_owned());
+            }
+        }
+    }
+    Ok(drafts)
+}
+
+fn draft_store_matches(id: &str, mailbox: &Path) -> bool {
+    let folder = workspace::draft_root().join(id);
+    [
+        compose_index_file(id),
+        Some(workspace::control_dir(&folder).join("store")),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|path| {
+        indexed_store(&path)
+            .is_ok_and(|path| std::path::absolute(path).ok() == std::path::absolute(mailbox).ok())
+    })
+}
+
+pub(crate) fn remove_draft_workspaces(
+    ids: &[String],
+    account: &str,
+    mailbox: &Path,
+) -> std::result::Result<(), String> {
+    let missing_ok = |result: std::io::Result<()>| match result {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.to_string()),
+    };
+    for id in ids {
+        let folder = workspace::draft_folder(id)?;
+        let index = compose_index_file(id).ok_or("No compose index directory")?;
+        let other_store = indexed_store(&index).ok().is_some_and(|path| {
+            std::path::absolute(path).ok() != std::path::absolute(mailbox).ok()
+        });
+        if other_store || workspace::read_account(&folder).is_some_and(|owner| owner != account) {
+            continue;
+        }
+        missing_ok(std::fs::remove_dir_all(&folder))?;
+        missing_ok(std::fs::remove_dir_all(workspace::control_dir(&folder)))?;
+        if let Some(root) = folder.parent() {
+            missing_ok(std::fs::File::open(root).and_then(|dir| dir.sync_all()))?;
+        }
+        missing_ok(std::fs::remove_file(index))?;
+        if let Some(root) = compose_index_file(id).as_deref().and_then(Path::parent) {
+            missing_ok(std::fs::File::open(root).and_then(|dir| dir.sync_all()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Recreate the runtime folder from the mailbox when `draft.md` is gone.
@@ -1227,6 +1359,55 @@ fn now_unix() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unindexed_draft_resolves_its_account_or_fails_on_ambiguity() {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let Some(root) = crate::test_support::in_isolated_process() else {
+            return;
+        };
+        let registry = crate::accounts::Registry::resolve().unwrap();
+        std::fs::create_dir_all(registry.directory()).unwrap();
+        let base = root.join("mail.db");
+        let mut stores = Vec::new();
+        for id in ["mail", "work"] {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(registry.path(id).unwrap())
+                .unwrap();
+            writeln!(file, "email = '{id}@example.test'\npassword = 'fixture'").unwrap();
+            let config = registry.get(&AccountId(id.into())).unwrap().unwrap();
+            let path = registry.store_path(&base, id).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let store = Store::open(&path).unwrap();
+            let account = config.account();
+            store.upsert_account(&account).unwrap();
+            stores.push((store, account));
+        }
+        let save = |(store, account): &(Store, crate::Account)| {
+            store
+                .save_compose(&StoredCompose {
+                    id: "cfixture".into(),
+                    account_id: account.id.clone(),
+                    fields: DraftFields::default(),
+                    body: "Synthetic draft".into(),
+                    files: Vec::new(),
+                    identities: Vec::new(),
+                    managed_signature: None,
+                    owner: String::new(),
+                    reply: Default::default(),
+                })
+                .unwrap();
+        };
+        save(&stores[1]);
+        assert_eq!(stored_compose_account("cfixture").as_deref(), Some("work"));
+        save(&stores[0]);
+        assert!(open_store_for("cfixture").is_none());
+    }
 
     #[test]
     fn people_mailed_from_any_sent_folder_are_known() {

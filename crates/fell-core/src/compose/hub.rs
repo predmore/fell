@@ -754,6 +754,37 @@ impl DraftHub {
             .collect()
     }
 
+    /// Explicit account deletion closes its draft writers before the mailbox
+    /// and workspaces are moved. An in-flight send must finish first.
+    pub fn release_account_drafts(&self, account: &crate::AccountId) -> Result<(), String> {
+        let mut sessions = self.sessions.lock().expect("sessions");
+        let opening = self.opening.lock().expect("opening");
+        if !opening.is_empty() {
+            return Err("A draft is opening. Try removing the account again.".into());
+        }
+        let mut ids = Vec::new();
+        for (id, session) in sessions.iter() {
+            if session.account_id() == account {
+                if session.send_lock() == Some(SendLock::InFlight) {
+                    return Err(SEND_IN_PROGRESS.into());
+                }
+                ids.push(id.clone());
+            }
+        }
+        let released: Vec<_> = ids.iter().filter_map(|id| sessions.remove(id)).collect();
+        for slot in [&self.focused, &self.shown, &self.last_closed] {
+            let mut slot = slot.lock().expect("draft window");
+            if slot.as_ref().is_some_and(|id| ids.contains(id)) {
+                *slot = None;
+            }
+        }
+        drop(opening);
+        drop(sessions);
+        drop(released);
+        self.emit();
+        Ok(())
+    }
+
     /// How many `request_send` calls have asked for the editor. A host opens
     /// or raises the compose window when this changes.
     pub fn reveal_count(&self) -> u64 {

@@ -657,7 +657,7 @@ impl PartFetcher {
                         }
                         let store = match &store {
                             Some(store) => store,
-                            None => store.insert(Store::open_for_part_fetch(&path)?),
+                            None => store.insert(Store::open_existing_without_index(&path)?),
                         };
                         fetch_one(&backend, &cache, store, &request, stopped, &mut events)
                     })();

@@ -74,6 +74,26 @@ pub fn sync_with_arrivals(
     progress: &mut dyn FnMut(&SyncReport),
     arrivals: Option<&mut dyn FnMut(Result<Vec<InboxArrival>>)>,
 ) -> Result<SyncReport> {
+    sync_until(account, backend, store, progress, arrivals, &|| false)
+}
+
+/// Stop before applying the next delta when the mailbox worker is retiring.
+pub fn sync_until(
+    account: &Account,
+    backend: &dyn MailBackend,
+    store: &Store,
+    progress: &mut dyn FnMut(&SyncReport),
+    arrivals: Option<&mut dyn FnMut(Result<Vec<InboxArrival>>)>,
+    stop: &dyn Fn() -> bool,
+) -> Result<SyncReport> {
+    let check = || {
+        if stop() {
+            Err(crate::Error::Backend("Sync stopped".into()))
+        } else {
+            Ok(())
+        }
+    };
+    check()?;
     store.upsert_account(account)?;
     let cursor = store.sync_cursor_for_pass(&account.id)?;
     let mut observer = arrivals.and_then(|send| {
@@ -89,9 +109,11 @@ pub fn sync_with_arrivals(
     });
     let mut report = SyncReport::default();
     let known = |mailbox: &str, uidvalidity: u32, range: (u32, u32)| {
+        check()?;
         store.stored_uids(&account.id, mailbox, uidvalidity, range)
     };
     backend.sync_changes(cursor.as_ref(), &known, &mut |delta| {
+        check()?;
         let writes = store.apply_sync_delta_observed(&account.id, &delta, observer.as_mut())?;
         report.changed |= writes.changed;
         let advances_walk = delta.progress.is_some();
@@ -110,6 +132,7 @@ pub fn sync_with_arrivals(
         }
         Ok(())
     })?;
+    check()?;
     // Repair a bounded page of undated mail after a successful sync pass.
     if let Ok(changed) = repair_internal_dates(&account.id, backend, store) {
         report.changed |= changed;
