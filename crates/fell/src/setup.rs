@@ -481,6 +481,9 @@ pub(crate) fn save_account(
             None
         }
     };
+    config
+        .validate()
+        .map_err(|error| SaveAccountError::File(error.to_string().into()))?;
     let staged = stage(&mut config).map_err(SaveAccountError::File)?;
     let old_key = previous
         .filter(|old| old.id == config.id && old.password == PasswordSource::Keyring)

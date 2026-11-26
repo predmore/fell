@@ -234,6 +234,7 @@ impl Onboarding {
     fn has_back_label(&self, step: Step) -> bool {
         match step {
             Step::Provider => false,
+            Step::Identity if self.form.previous.is_some() => false,
             Step::Done => self.feedback.save_actions[0]
                 .value
                 .is_some_and(|action| action.label == "Back"),
@@ -441,10 +442,15 @@ impl Onboarding {
                     self.heading(title, detail)
                 });
                 self.reserved_heading(
-                    Connection::ALL.map(|state| {
-                        let (title, detail) = state.heading();
-                        self.heading(title, detail)
-                    }),
+                    Connection::ALL
+                        .into_iter()
+                        .filter(|state| {
+                            self.form.previous.is_some() || *state != Connection::EditFailed
+                        })
+                        .map(|state| {
+                            let (title, detail) = state.heading();
+                            self.heading(title, detail)
+                        }),
                     heading,
                 )
             }
