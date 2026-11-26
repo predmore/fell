@@ -422,9 +422,13 @@ impl Indexer {
         let path = path.to_path_buf();
         let abort = abort_this_indexer();
         let source = EmbedderSource::from_env();
+        #[cfg(test)]
+        let on_paused = ON_INDEXER_PAUSED.with(Cell::take);
         let thread = thread::Builder::new()
             .name("fell-embeddings".into())
             .spawn(move || {
+                #[cfg(test)]
+                ON_INDEXER_PAUSED.with(|cell| cell.set(on_paused));
                 if abort {
                     if let Ok(Some(lock)) = try_embed_lock(&path) {
                         active_thread.store(true, Ordering::Relaxed);
@@ -606,7 +610,8 @@ fn restrict_lock_mode(path: &Path) -> Result<()> {
 
 fn index_loop(path: &Path, stop: &Arc<AtomicBool>, pause: &AtomicBool, source: &EmbedderSource) {
     let conn = loop {
-        if stop.load(Ordering::Relaxed) {
+        // Opening the index connection can update the schema and drop orphans.
+        if !wait_until_unpaused(stop, pause) {
             return;
         }
         match open_index_conn(path, stop) {
@@ -640,11 +645,7 @@ fn index_loop(path: &Path, stop: &Arc<AtomicBool>, pause: &AtomicBool, source: &
     };
     let mut scan = Scan::default();
     let mut idle = IDLE_MIN;
-    while !stop.load(Ordering::Relaxed) {
-        if pause.load(Ordering::Relaxed) {
-            thread::sleep(Duration::from_millis(5));
-            continue;
-        }
+    while wait_until_unpaused(stop, pause) {
         let kind = match scan.step(&conn, INDEX_BATCH, Some(stop.as_ref()), embedder.as_ref()) {
             Ok(IndexStep::Wrote(_)) => AfterBatch::Progress,
             Ok(IndexStep::Idle) => AfterBatch::Idle,
@@ -655,6 +656,17 @@ fn index_loop(path: &Path, stop: &Arc<AtomicBool>, pause: &AtomicBool, source: &
         idle = next_idle_wait;
         sleep_unless_stopped(delay, stop);
     }
+}
+
+fn wait_until_unpaused(stop: &AtomicBool, pause: &AtomicBool) -> bool {
+    while pause.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
+        #[cfg(test)]
+        if let Some(sender) = ON_INDEXER_PAUSED.with(Cell::take) {
+            let _ = sender.send(());
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    !stop.load(Ordering::Relaxed)
 }
 
 const INDEX_BATCH: usize = 32;
@@ -1299,6 +1311,7 @@ fn indexer_starts_paused() -> bool {
 #[cfg(test)]
 thread_local! {
     static START_INDEXER_PAUSED: Cell<bool> = const { Cell::new(false) };
+    static ON_INDEXER_PAUSED: Cell<Option<std::sync::mpsc::Sender<()>>> = const { Cell::new(None) };
 }
 
 /// When set, the next file-backed indexer starts paused so a test can observe
@@ -2331,19 +2344,13 @@ mod tests {
 
     #[test]
     fn reopen_fills_missing_rows_and_drops_orphans() {
-        let dir = std::env::temp_dir().join(format!(
-            "fell-embed-reopen-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("mail.sqlite");
+        let _reset = PauseReset;
+        testing_start_indexer_paused(true);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mail.sqlite");
+        // Hold the worker off until the orphan exists and the mailbox reopens.
+        let lock = try_embed_lock(&path).unwrap().unwrap();
         {
-            let _reset = PauseReset;
-            testing_start_indexer_paused(true);
             let store = Store::open(&path).unwrap();
             store.upsert_account(&account("a1")).unwrap();
             store
@@ -2364,10 +2371,15 @@ mod tests {
                 .conn
                 .execute("DELETE FROM messages WHERE message_id = 'drop@x'", [])
                 .unwrap();
-            assert_eq!(embedding_count(&store), 1);
         }
-        testing_start_indexer_paused(false);
+        let (on_paused, paused) = std::sync::mpsc::channel();
+        ON_INDEXER_PAUSED.with(|cell| cell.set(Some(on_paused)));
         let store = Store::open(&path).unwrap();
+        drop(lock);
+        paused.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(embedding_count(&store), 1);
+
+        store.testing_pause_indexer(false);
         assert_eq!(
             wait_indexed(&store, "a1", "kept@x"),
             embed_body("please pay the invoice")
@@ -2379,8 +2391,6 @@ mod tests {
                 .is_none()
         );
         assert_eq!(embedding_count(&store), 1);
-        drop(store);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
