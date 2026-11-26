@@ -19,7 +19,7 @@
 //! so reopening a thread prepares nothing and a resync that replaces a
 //! body is prepared again.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Weak};
 
 use fell_core::{AccountId, PartStamp, Store};
@@ -169,7 +169,7 @@ pub fn prepare_html(html: &str, headers_in: &[(String, String)]) -> HtmlBody {
         .map(|text| crate::render::is_right_to_left(text))
         .collect();
     let mut web_links = Vec::new();
-    collect_web_links(&folded.document.blocks, &mut web_links);
+    collect_web_links(&folded.document.blocks, &mut web_links, &mut HashSet::new());
     HtmlBody {
         folded,
         suggested,
@@ -184,21 +184,50 @@ pub fn prepare_html(html: &str, headers_in: &[(String, String)]) -> HtmlBody {
 
 // Reuse native link widgets below the snapshot. The image has no hit targets
 // of its own, and no WebKit event can activate a URL.
-fn collect_web_links(blocks: &[fell_render::Block], links: &mut Vec<fell_render::Block>) {
+fn collect_web_links(
+    blocks: &[fell_render::Block],
+    links: &mut Vec<fell_render::Block>,
+    seen: &mut HashSet<String>,
+) {
     use fell_render::{Block, Inline};
 
-    fn visit(inlines: &[Inline], links: &mut Vec<Block>) {
+    fn text_label(inlines: &[Inline], label: &mut String) {
         for inline in inlines {
             match inline {
-                Inline::Link { href, .. } if fell_render::reader_link_target(href).is_some() => {
-                    links.push(Block::Paragraph {
-                        inlines: vec![inline.clone()],
-                    });
+                Inline::Text(text) | Inline::Code(text) => label.push_str(text),
+                Inline::Emphasis(children)
+                | Inline::Strong(children)
+                | Inline::Strike(children) => {
+                    text_label(children, label);
+                }
+                Inline::LineBreak => label.push(' '),
+                _ => {}
+            }
+        }
+    }
+
+    fn visit(inlines: &[Inline], links: &mut Vec<Block>, seen: &mut HashSet<String>) {
+        for inline in inlines {
+            match inline {
+                Inline::Link { href, children } => {
+                    let mut label = String::new();
+                    text_label(children, &mut label);
+                    if !label.trim().is_empty()
+                        && let Some(target) = fell_render::reader_link_target(href)
+                        && seen.insert(target)
+                    {
+                        links.push(Block::Paragraph {
+                            inlines: vec![Inline::Link {
+                                href: href.clone(),
+                                children: vec![Inline::Text(label)],
+                            }],
+                        });
+                    }
                 }
                 Inline::Emphasis(children)
                 | Inline::Strong(children)
                 | Inline::Strike(children) => {
-                    visit(children, links);
+                    visit(children, links, seen);
                 }
                 _ => {}
             }
@@ -207,18 +236,20 @@ fn collect_web_links(blocks: &[fell_render::Block], links: &mut Vec<fell_render:
 
     for block in blocks {
         match block {
-            Block::Paragraph { inlines } | Block::Heading { inlines, .. } => visit(inlines, links),
+            Block::Paragraph { inlines } | Block::Heading { inlines, .. } => {
+                visit(inlines, links, seen)
+            }
             Block::Quote { blocks } | Block::Small { blocks } | Block::ReplyHeader { blocks } => {
-                collect_web_links(blocks, links);
+                collect_web_links(blocks, links, seen);
             }
             Block::List { items, .. } => {
                 for item in items {
-                    collect_web_links(&item.blocks, links);
+                    collect_web_links(&item.blocks, links, seen);
                 }
             }
             Block::Table { header, rows, .. } => {
                 for cell in header.iter().chain(rows.iter().flatten()) {
-                    collect_web_links(cell, links);
+                    collect_web_links(cell, links, seen);
                 }
             }
             _ => {}

@@ -26,7 +26,8 @@ const THREAD_HOLD: Duration = Duration::from_millis(150);
 const SNAPSHOT_BATCH: Duration = Duration::from_millis(550);
 const RENDERER_EXIT: Duration = Duration::from_millis(60);
 const RENDERER_CHANGE: Duration = Duration::from_millis(140);
-const RETRY_SWAP: Duration = Duration::from_millis(120);
+const PROMPT_ENTER: Duration = Duration::from_millis(80);
+const PROMPT_SWAP: Duration = RENDERER_EXIT.saturating_add(PROMPT_ENTER);
 const RETRY_MINIMUM: Duration = Duration::from_millis(300);
 const MEASURED_HEIGHTS: usize = 4 * CACHE_SIZE;
 const PROMPT_HEIGHT: f32 = 30.;
@@ -218,8 +219,6 @@ impl Shown {
             let progress = motion::progress(self.prompt_fade.as_ref(), now);
             self.prompt_height_from = self.prompt_height(progress);
             let [incoming, outgoing] = self.prompt_opacities(progress, now);
-            let retry_failed = self.prompt == Some(Prompt::Retrying)
-                && matches!(prompt, Some(Prompt::Unavailable { .. }));
             let prior = std::mem::replace(&mut self.prompt, prompt);
             for (_, alpha) in &mut self.outgoing_prompts {
                 *alpha *= outgoing;
@@ -235,18 +234,13 @@ impl Shown {
                 }
                 *alpha > 0.0
             });
-            let retry_started = self.prompt == Some(Prompt::Retrying);
-            let swap_retry = retry_failed || (retry_started && !self.outgoing_prompts.is_empty());
-            self.prompt_swap = if swap_retry {
-                motion::LayerSwap::start(motion, now, RENDERER_EXIT, RETRY_SWAP - RENDERER_EXIT)
-            } else {
-                None
-            };
+            let swaps_labels = self.prompt.is_some() && !self.outgoing_prompts.is_empty();
+            self.prompt_swap = swaps_labels
+                .then(|| motion::LayerSwap::start(motion, now, RENDERER_EXIT, PROMPT_ENTER))
+                .flatten();
             self.prompt_fade = motion.start(
-                if swap_retry {
-                    RETRY_SWAP
-                } else if retry_started {
-                    RENDERER_EXIT
+                if swaps_labels {
+                    PROMPT_SWAP
                 } else {
                     motion::FADE
                 },
@@ -1965,7 +1959,7 @@ mod tests {
     }
 
     #[test]
-    fn a_fast_download_fades_from_the_current_prompt_mix() {
+    fn a_fast_download_replaces_the_unpainted_loading_label() {
         let blocked = Prompt::Blocked { verified: false };
         let mut shown = Shown::new(Weak::new(), None, true, false, Some(blocked.clone()));
         let now = Instant::now();
@@ -1984,8 +1978,14 @@ mod tests {
         assert_eq!(allowed.incoming_alpha, 0.0);
         assert!(allowed.outgoing[0].0 == blocked);
         assert_eq!(allowed.outgoing[0].1, loading.outgoing[0].1);
-        assert!(allowed.outgoing[1].0 == Prompt::Loading);
-        assert_eq!(allowed.outgoing[1].1, loading.incoming_alpha);
+        assert_eq!(allowed.outgoing.len(), 1);
+        assert_eq!(loading.incoming_alpha, 0.);
+        let arriving = shown
+            .frame(finished + RENDERER_EXIT + PROMPT_ENTER / 2)
+            .prompt
+            .unwrap();
+        assert!(arriving.incoming_alpha > 0.);
+        assert_eq!(arriving.outgoing[0].1, 0.);
     }
 
     #[test]
@@ -2020,10 +2020,10 @@ mod tests {
         let leaving = shown.frame(retry + RENDERER_EXIT / 2).prompt.unwrap();
         assert_eq!(leaving.incoming_alpha, 0.);
         assert!(leaving.outgoing[0].1 > 0.);
-        let entering = shown.frame(retry + RETRY_SWAP * 3 / 4).prompt.unwrap();
+        let entering = shown.frame(retry + PROMPT_SWAP * 3 / 4).prompt.unwrap();
         assert!(entering.incoming_alpha > 0. && entering.incoming_alpha < 1.);
         assert_eq!(entering.outgoing[0].1, 0.);
-        let entered = shown.frame(retry + RETRY_SWAP).prompt.unwrap();
+        let entered = shown.frame(retry + PROMPT_SWAP).prompt.unwrap();
         assert_eq!(entered.incoming_alpha, 1.);
     }
 
@@ -2052,7 +2052,7 @@ mod tests {
         assert_eq!(seam.outgoing[0].1, 0.);
         assert_eq!(seam.height, 1.);
         let arriving = shown
-            .frame(now + (RENDERER_EXIT + RETRY_SWAP) / 2)
+            .frame(now + (RENDERER_EXIT + PROMPT_SWAP) / 2)
             .prompt
             .unwrap();
         assert!(arriving.incoming_alpha > 0.);

@@ -107,9 +107,15 @@ impl WebMail {
                     write!(body_attrs, " {name}=\"{}\"", escape_attr(value)).unwrap();
                 }
             }
+            if let Some(value) = element
+                .attr("background")
+                .filter(|value| keep_offline_attr(element.value(), "background", value))
+            {
+                write!(body_attrs, " background=\"{}\"", escape_attr(value)).unwrap();
+            }
             body_attrs.push_str(" style=\"");
             for rule in html::style_declarations(element.value()) {
-                if layout::is_padding(&rule.name) || layout::is_color_property(&rule.name) {
+                if layout::is_body_spacing(&rule.name) || layout::is_color_property(&rule.name) {
                     write!(body_attrs, "{}:", rule.name).unwrap();
                     serialize_css(&rule.value, &mut body_attrs, None, escape_attr);
                     if rule.important {
@@ -121,7 +127,16 @@ impl WebMail {
             body_attrs.push('"');
         }
         let layout_dom = html::parse_html(&format!("<body{body_attrs}>{body}</body>"));
-        let layout = layout::Estimate::prepare(&layout_dom, metrics);
+        // Remote background attributes have empty slots in the offline page.
+        let author_background = dom
+            .root_element()
+            .descendants()
+            .filter_map(scraper::ElementRef::wrap)
+            .any(|node| {
+                node.attr("background")
+                    .is_some_and(|url| !url.trim().is_empty())
+            });
+        let layout = layout::Estimate::prepare(&layout_dom, metrics, author_background);
         Self {
             body,
             body_attrs,
@@ -1228,6 +1243,14 @@ mod tests {
             "<p style='background:#fff'>Story</p>",
             "<style>@media (max-width:600px){p, a:hover {color: #555}}</style><p>Story</p>",
             "<font color='#555'>Story</font>",
+            "<body style='background-image:linear-gradient(#fff,#fff)'>Story</body>",
+            "<p style='background-image:linear-gradient(#fff,#fff)'>Story</p>",
+            "<style>p {background-image:linear-gradient(#fff,#fff)}</style><p>Story</p>",
+            "<table background='https://example.test/paper.png'><tr><td>Story</td></tr></table>",
+            "<body background='data:image/png;base64,AAAA'>Story</body>",
+            "<p style='box-shadow:inset 0 0 0 1000px #fff'>Story</p>",
+            "<style>p {box-shadow:inset 0 0 0 1000px #fff}</style><p>Story</p>",
+            "<p style='background-image:url(https://example.test/paper.png)'>Story</p>",
         ] {
             let mail = WebMail::prepare(html);
             assert_eq!(
@@ -1240,7 +1263,18 @@ mod tests {
                 page.contains(r#"name="color-scheme" content="light""#),
                 "{html}"
             );
-            assert!(!page.contains("padding: 12px 14px"));
+            assert!(page.contains("padding: 12px 14px"));
+        }
+    }
+
+    #[test]
+    fn no_paint_backgrounds_keep_the_theme() {
+        for html in [
+            "<body background=''>Story</body>",
+            "<p style='background-image:none; box-shadow:none; background-color:transparent'>Story</p>",
+            "<style>p{background-image:initial;box-shadow:unset}</style><p>Story</p>",
+        ] {
+            assert!(!WebMail::prepare(html).has_author_colors(), "{html}");
         }
     }
 
@@ -1254,6 +1288,8 @@ mod tests {
         for html in [
             "<body style='padding-top:6px'><div>Booked.</div></body>",
             "<style>.note, td {padding-top:6px}</style><body class='note'><div>Booked.</div></body>",
+            "<body style='margin-top:6px'><div>Booked.</div></body>",
+            "<style>body {margin-top:6px}</style><body><div>Booked.</div></body>",
         ] {
             let mail = WebMail::prepare(html);
             assert!(!mail.page("dark", |_| None).contains("padding: 12px 14px"));

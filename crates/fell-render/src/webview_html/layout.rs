@@ -33,13 +33,18 @@ pub(super) struct Estimate {
 }
 
 impl Estimate {
-    pub(super) fn prepare(layout_dom: &scraper::Html, metrics: TextMetrics) -> Self {
+    pub(super) fn prepare(
+        layout_dom: &scraper::Html,
+        metrics: TextMetrics,
+        author_background: bool,
+    ) -> Self {
         let mut styles = LayoutStyles::from_document(layout_dom);
         let elements = layout_dom
             .root_element()
             .descendants()
             .filter_map(scraper::ElementRef::wrap);
-        let author_colors = styles.author_colors
+        let author_colors = author_background
+            || styles.author_colors
             || elements.clone().any(|node| {
                 let element = node.value();
                 element.attr("bgcolor").is_some()
@@ -50,10 +55,9 @@ impl Estimate {
                             .any(|attr| element.attr(attr).is_some())
                     || html::style_declarations(element).iter().any(sets_color)
             });
-        let native_body_inset = !author_colors
-            && elements
-                .filter(|node| node.value().name() == "body")
-                .all(|body| !styles.has_body_padding(body));
+        let native_body_inset = elements
+            .filter(|node| node.value().name() == "body")
+            .all(|body| !styles.has_body_spacing(body));
         styles.native_body_inset = native_body_inset;
         let root = *layout_dom.root_element();
         let font = Font {
@@ -673,16 +677,17 @@ impl LayoutStyles {
         self.cascade(node, None).0
     }
 
-    fn has_body_padding(&self, body: scraper::ElementRef<'_>) -> bool {
-        let has_padding =
-            |declarations: &[Declaration]| declarations.iter().any(|rule| is_padding(&rule.name));
-        has_padding(&html::style_declarations(body.value()))
+    fn has_body_spacing(&self, body: scraper::ElementRef<'_>) -> bool {
+        let has_spacing = |declarations: &[Declaration]| {
+            declarations.iter().any(|rule| is_body_spacing(&rule.name))
+        };
+        has_spacing(&html::style_declarations(body.value()))
             || self
                 .indexed
                 .values()
                 .flatten()
                 .chain(&self.unindexed)
-                .any(|rule| rule.selector.matches(body) && has_padding(&rule.declarations))
+                .any(|rule| rule.selector.matches(body) && has_spacing(&rule.declarations))
     }
 
     fn cascade(
@@ -884,7 +889,7 @@ fn neutral(declaration: &Declaration) -> bool {
         )
 }
 
-pub(super) fn is_padding(property: &str) -> bool {
+pub(super) fn is_body_spacing(property: &str) -> bool {
     matches!(
         property,
         "padding"
@@ -898,18 +903,44 @@ pub(super) fn is_padding(property: &str) -> bool {
             | "padding-inline"
             | "padding-inline-start"
             | "padding-inline-end"
+            | "margin"
+            | "margin-top"
+            | "margin-right"
+            | "margin-bottom"
+            | "margin-left"
+            | "margin-block"
+            | "margin-block-start"
+            | "margin-block-end"
+            | "margin-inline"
+            | "margin-inline-start"
+            | "margin-inline-end"
     )
 }
 
 pub(super) fn is_color_property(property: &str) -> bool {
     matches!(
         property,
-        "color" | "background" | "background-color" | "-webkit-text-fill-color"
+        "color"
+            | "background"
+            | "background-color"
+            | "background-image"
+            | "box-shadow"
+            | "-webkit-text-fill-color"
     )
 }
 
 fn sets_color(declaration: &Declaration) -> bool {
     is_color_property(&declaration.name)
+        && !matches!(
+            declaration.value.trim().to_ascii_lowercase().as_str(),
+            "" | "none"
+                | "transparent"
+                | "inherit"
+                | "initial"
+                | "unset"
+                | "revert"
+                | "revert-layer"
+        )
 }
 
 #[derive(Clone, Copy, Debug)]
