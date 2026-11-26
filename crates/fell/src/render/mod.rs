@@ -43,6 +43,7 @@ pub struct Reader {
     web_job: Option<gpui::Task<()>>,
     web_allowed: Arc<std::sync::atomic::AtomicBool>,
     web_failed: bool,
+    web_too_wide: bool,
     gallery: ImageGallery,
     _release: gpui::Subscription,
 }
@@ -82,6 +83,7 @@ impl Reader {
             web_job: None,
             web_allowed: Default::default(),
             web_failed: false,
+            web_too_wide: false,
             gallery,
             _release: release,
         }
@@ -97,6 +99,7 @@ impl Reader {
         let (scheme, background) = self
             .web_mail
             .appearance(palette.scheme(), palette.background);
+        let background = self.web_mail.has_author_colors().then_some(background);
         let text = fell_render::WebTextStyle {
             family: Some("Inter".into()),
             size: 15.,
@@ -116,6 +119,7 @@ impl Reader {
             cx.drop_image(old.image, Some(window));
         }
         self.web_failed = false;
+        self.web_too_wide = false;
         let Some((width, scheme, allowed)) = key else {
             return;
         };
@@ -147,7 +151,8 @@ impl Reader {
                         reader.web_failed = image.is_none();
                         reader.web_image = image;
                     }
-                    Err(webview::Superseded) => reader.web_key = None,
+                    Err(webview::RenderError::Superseded) => reader.web_key = None,
+                    Err(webview::RenderError::TooWide) => reader.web_too_wide = true,
                 }
                 cx.notify();
             });
@@ -408,7 +413,7 @@ fn message_body(
     window: &Window,
 ) -> gpui::Stateful<gpui::Div> {
     const NATIVE_BODY_PAD_PX: f32 = 16.;
-    let web = reader.model.mode() == RenderMode::Web;
+    let web = reader.model.mode() == RenderMode::Web && !reader.web_too_wide;
     let mut body = div()
         .id("message-body")
         .flex_1()
@@ -424,6 +429,7 @@ fn message_body(
                 f32::from(window.viewport_size().width),
                 palette.background,
                 palette.foreground,
+                Some(("fixture", palette.accent)),
             ))
         } else if reader.web_failed {
             body.child(
@@ -476,6 +482,7 @@ pub(crate) fn web_snapshot(
     width: f32,
     fill: u32,
     text: u32,
+    links: Option<(&str, u32)>,
 ) -> gpui::Div {
     let height = snapshot.height * width / snapshot.width;
     let image = div()
@@ -497,9 +504,24 @@ pub(crate) fn web_snapshot(
                     .left_0()
                     .right_0()
                     .h(px(CLIP_FADE_HEIGHT))
-                    .bg(crate::theme::scroll_fade(snapshot.last_row_color, false)),
+                    .bg(crate::theme::scroll_fade(
+                        snapshot.last_row_color.unwrap_or(fill),
+                        false,
+                    )),
             )
         });
+    let image = if let Some((id, accent)) = links.filter(|_| !snapshot.links.is_empty()) {
+        image.child(native::SnapshotLinks {
+            id: gpui::ElementId::Name(format!("web-links-{id}").into()),
+            links: snapshot.links.clone(),
+            width: snapshot.width,
+            height,
+            drawn_width: width,
+            accent,
+        })
+    } else {
+        image
+    };
     div().child(image).when(snapshot.clipped, |body| {
         body.child(
             div()

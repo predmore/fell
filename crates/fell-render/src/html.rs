@@ -2088,8 +2088,23 @@ pub(crate) fn style_declarations(element: &scraper::node::Element) -> Vec<Declar
     })
 }
 
+pub(crate) fn case_preserving_style(element: &scraper::node::Element) -> Vec<Declaration> {
+    element.attr("style").map_or_else(Vec::new, |style| {
+        let mut input = ParserInput::new(style);
+        let mut parser = Parser::new(&mut input);
+        RuleBodyParser::new(
+            &mut parser,
+            &mut Declarations {
+                preserve_case: true,
+            },
+        )
+        .filter_map(Result::ok)
+        .collect()
+    })
+}
+
 pub(crate) fn parse_declarations(input: &mut Parser<'_, '_>) -> Vec<Declaration> {
-    RuleBodyParser::new(input, &mut Declarations)
+    RuleBodyParser::new(input, &mut Declarations::default())
         .filter_map(Result::ok)
         .collect()
 }
@@ -2097,12 +2112,15 @@ pub(crate) fn parse_declarations(input: &mut Parser<'_, '_>) -> Vec<Declaration>
 pub(crate) fn parse_stylesheet_declarations<'i>(
     input: &mut Parser<'i, '_>,
 ) -> Result<Vec<Declaration>, ParseError<'i, ()>> {
-    RuleBodyParser::new(input, &mut Declarations)
+    RuleBodyParser::new(input, &mut Declarations::default())
         .map(|result| result.map_err(|(error, _)| error))
         .collect()
 }
 
-struct Declarations;
+#[derive(Default)]
+struct Declarations {
+    preserve_case: bool,
+}
 
 impl<'i> DeclarationParser<'i> for Declarations {
     type Declaration = Declaration;
@@ -2149,9 +2167,14 @@ impl<'i> DeclarationParser<'i> for Declarations {
                 _ => value.push_str(input.slice_from(start)),
             }
         }
+        let value = value.trim();
         Ok(Declaration {
             name: name.to_ascii_lowercase(),
-            value: value.trim().to_ascii_lowercase(),
+            value: if self.preserve_case {
+                value.to_owned()
+            } else {
+                value.to_ascii_lowercase()
+            },
             important,
         })
     }

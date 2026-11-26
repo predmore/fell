@@ -18,6 +18,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use super::theme::{Palette, ink, paint};
 
 mod links;
+pub(crate) use links::SnapshotLinks;
 use links::{LinkControls, LinkSpan, checked_target, link_controls, link_spans};
 
 /// Decoded inline images for one message.

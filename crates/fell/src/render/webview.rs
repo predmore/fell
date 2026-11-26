@@ -29,13 +29,30 @@ pub(crate) struct Snapshot {
     pub height: f32,
     pub clipped: bool,
     pub document_height: f32,
-    pub last_row_color: u32,
+    pub last_row_color: Option<u32>,
+    pub links: Arc<[WebLink]>,
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct WebLink {
+    pub href: String,
+    pub label: String,
+    pub rects: Vec<[f32; 4]>,
+}
+
+#[derive(serde::Deserialize)]
+struct Document {
+    height: i32,
+    scroll_width: u32,
+    viewport_width: u32,
+    gutter: u32,
+    links: Vec<WebLink>,
 }
 
 pub(crate) struct WebRequest {
     pub html: String,
     pub width: i32,
-    pub background: u32,
+    pub background: Option<u32>,
 }
 
 impl WebRequest {
@@ -54,9 +71,12 @@ struct Job {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Superseded;
+pub(crate) enum RenderError {
+    Superseded,
+    TooWide,
+}
 
-pub(crate) type RenderResult = Result<Option<Snapshot>, Superseded>;
+pub(crate) type RenderResult = Result<Option<Snapshot>, RenderError>;
 type Reply = oneshot::Sender<RenderResult>;
 
 #[derive(Default)]
@@ -67,7 +87,7 @@ impl JobQueue {
         let (reply, done) = oneshot::channel();
         let superseded = self.0.lock().unwrap().replace(Job { request, reply });
         if let Some(job) = superseded {
-            let _ = job.reply.send(Err(Superseded));
+            let _ = job.reply.send(Err(RenderError::Superseded));
         }
         done
     }
@@ -91,11 +111,11 @@ struct Load {
     reply: Reply,
     cancel: gtk::gio::Cancellable,
     settling: bool,
-    background: u32,
+    background: Option<u32>,
 }
 
 impl Load {
-    fn new(reply: Reply, background: u32) -> Self {
+    fn new(reply: Reply, background: Option<u32>) -> Self {
         Self {
             reply,
             cancel: gtk::gio::Cancellable::new(),
@@ -201,7 +221,7 @@ fn run(rx: glib::Receiver<()>, queue: Arc<JobQueue>) -> Result<(), Box<dyn std::
         let Some(job) = queue.next() else {
             return glib::ControlFlow::Continue;
         };
-        stop_load(&active, Err(Superseded));
+        stop_load(&active, Err(RenderError::Superseded));
         widget.stop_loading();
         let budget = job.request.load_budget();
         let WebRequest {
@@ -213,9 +233,13 @@ fn run(rx: glib::Receiver<()>, queue: Arc<JobQueue>) -> Result<(), Box<dyn std::
         window.resize(width, UNLAID_HEIGHT);
         styles.remove_all_style_sheets();
         let image_limit = fell_render::WebMail::image_height_limit(width as f32);
+        let root = background.map_or_else(
+            || "background-color: transparent; --fell-snapshot-links: 1".into(),
+            |color| format!("background-color: #{color:06x}"),
+        );
         styles.add_style_sheet(&UserStyleSheet::new(
             &format!(
-                ":root {{ background-color: #{background:06x}; }}
+                ":root {{ {root}; }}
                  img {{ min-height: 0 !important; max-height: {image_limit}px !important; }}
                  html::-webkit-scrollbar {{ display: none; }}"
             ),
@@ -224,12 +248,12 @@ fn run(rx: glib::Receiver<()>, queue: Arc<JobQueue>) -> Result<(), Box<dyn std::
             &[],
             &[],
         ));
-        let channel = |shift| f64::from((background >> shift) & 255_u32) / 255.0;
+        let channel = |shift| f64::from((background.unwrap_or(0) >> shift) & 255_u32) / 255.0;
         widget.set_background_color(&gtk::gdk::RGBA::new(
             channel(16),
             channel(8),
             channel(0),
-            1.0,
+            f64::from(u8::from(background.is_some())),
         ));
         let load = Load::new(job.reply, background);
         let cancellable = load.cancel.clone();
@@ -272,7 +296,7 @@ impl TestWorker {
 
     pub(crate) fn start_next(&self) {
         let job = self.queue.next().expect("queued snapshot");
-        stop_load(&self.active, Err(Superseded));
+        stop_load(&self.active, Err(RenderError::Superseded));
         *self.active.borrow_mut() = Some(Load::new(job.reply, job.request.background));
     }
 
@@ -308,7 +332,11 @@ fn wait_for_images(widget: &webkit2gtk::WebView, active: Active, token: gtk::gio
     // visible paint. Wait for resource completion and force rasterization
     // with a canvas read before giving the document a chance to paint.
     const READY: &str = r#"
-        (() => {
+        ((viewportWidth) => {
+            // WebKit may see the previous GTK allocation until the resize
+            // reaches its process. Wait for this job's CSS viewport.
+            const root = document.documentElement;
+            if (root.clientWidth !== viewportWidth) return 0;
             const all = Array.from(document.images);
             const images = all.filter(image =>
                 /^data:image\/(?:png|jpe?g|gif|webp|avif|bmp|x-icon|vnd\.microsoft\.icon)[;,]/i
@@ -338,10 +366,30 @@ fn wait_for_images(widget: &webkit2gtk::WebView, active: Active, token: gtk::gio
             }
             // A full-document capture allocates its surface before Rust can
             // inspect or downsample it. Reject widths outside our raster budget.
-            if (Math.max(document.documentElement.scrollWidth, document.body.scrollWidth) >
-                __WIDTH_LIMIT__) return -1;
-            return Math.max(1, document.documentElement.scrollHeight, document.body.scrollHeight);
-        })();
+            const body = document.body;
+            const width = Math.max(root.scrollWidth, body.scrollWidth);
+            if (width > __WIDTH_LIMIT__) return -1;
+            const height = Math.max(1, root.scrollHeight, body.scrollHeight);
+            const inset = Number(getComputedStyle(body).getPropertyValue('--fell-paper-inset'));
+            const gutter = width > viewportWidth && Number.isFinite(inset)
+                ? Math.max(0, Math.min(14, Math.round(inset), __WIDTH_LIMIT__ - width))
+                : 0;
+            const links = [];
+            if (getComputedStyle(root).getPropertyValue('--fell-snapshot-links').trim() === '1') {
+                for (const anchor of body.querySelectorAll('a[href]')) {
+                    if (links.length >= 512) break;
+                    const href = anchor.getAttribute('href');
+                    const label = anchor.innerText?.trim();
+                    if (!label || !href || href.length > 4096) continue;
+                    const rects = Array.from(anchor.getClientRects())
+                        .filter(rect => rect.width > 0 && rect.height > 0)
+                        .slice(0, 64)
+                        .map(rect => [rect.x, rect.y, rect.width, rect.height]);
+                    if (rects.length) links.push({href, label: label.slice(0, 1024), rects});
+                }
+            }
+            return {height, scroll_width: width, viewport_width: viewportWidth, gutter, links};
+        })
     "#;
     if token.is_cancelled() {
         return;
@@ -354,40 +402,50 @@ fn wait_for_images(widget: &webkit2gtk::WebView, active: Active, token: gtk::gio
         )
     });
     let view = widget.clone();
+    let ready = format!("{ready}({})", view.width_request());
     widget.run_javascript_in_world(
-        ready,
+        &ready,
         "fell-snapshot",
         Some(&token.clone()),
         move |result| {
             if token.is_cancelled() {
                 return;
             }
-            let height = result.ok().and_then(|result| result.js_value());
-            match height.map(|value| value.to_int32()) {
-                Some(0) => {
+            let Some(value) = result.ok().and_then(|result| result.js_value()) else {
+                stop_load(&active, Ok(None));
+                return;
+            };
+            if value.is_number() {
+                if value.to_int32() == 0 {
                     glib::timeout_add_local_once(PAINT_SETTLE, move || {
                         wait_for_images(&view, active, token);
                     });
+                } else {
+                    stop_load(&active, Err(RenderError::TooWide));
                 }
-                Some(height) if height > 0 => {
-                    let region = if height > SNAPSHOT_HEIGHT_LIMIT
-                        && let Some(window) = view.toplevel().and_downcast::<gtk::Window>()
-                    {
-                        // A full-document surface can exceed Cairo's size
-                        // limit before we get the chance to downsample it.
-                        let width = view.allocated_width();
-                        view.set_size_request(width, SNAPSHOT_HEIGHT_LIMIT);
-                        window.resize(width, SNAPSHOT_HEIGHT_LIMIT);
-                        webkit2gtk::SnapshotRegion::Visible
-                    } else {
-                        webkit2gtk::SnapshotRegion::FullDocument
-                    };
-                    glib::timeout_add_local_once(PAINT_SETTLE, move || {
-                        capture(&view, active, token, height, region, true);
-                    });
-                }
-                _ => stop_load(&active, Ok(None)),
+                return;
             }
+            let Some(document) = value
+                .to_json(0)
+                .and_then(|json| serde_json::from_str::<Document>(&json).ok())
+            else {
+                stop_load(&active, Ok(None));
+                return;
+            };
+            let region = if document.height > SNAPSHOT_HEIGHT_LIMIT
+                && let Some(window) = view.toplevel().and_downcast::<gtk::Window>()
+            {
+                // A full-document surface can exceed Cairo's size limit.
+                let width = view.allocated_width();
+                view.set_size_request(width, SNAPSHOT_HEIGHT_LIMIT);
+                window.resize(width, SNAPSHOT_HEIGHT_LIMIT);
+                webkit2gtk::SnapshotRegion::Visible
+            } else {
+                webkit2gtk::SnapshotRegion::FullDocument
+            };
+            glib::timeout_add_local_once(PAINT_SETTLE, move || {
+                capture(&view, active, token, document, region, true);
+            });
         },
     );
 }
@@ -396,7 +454,7 @@ fn capture(
     widget: &webkit2gtk::WebView,
     active: Active,
     token: gtk::gio::Cancellable,
-    document_height: i32,
+    document: Document,
     region: webkit2gtk::SnapshotRegion,
     retry: bool,
 ) {
@@ -404,33 +462,34 @@ fn capture(
         return;
     }
     let view = widget.clone();
-    widget.snapshot(
-        region,
-        webkit2gtk::SnapshotOptions::NONE,
-        Some(&token.clone()),
-        move |result| {
-            if token.is_cancelled() {
-                return;
-            }
-            let clipped = region == webkit2gtk::SnapshotRegion::Visible;
-            let image = active.borrow().as_ref().and_then(|load| {
-                surface_image(result.ok()?, load.background, clipped, document_height)
-            });
-            match image {
-                Some(image) => {
-                    if let Some(load) = active.borrow_mut().take() {
-                        let _ = load.reply.send(Ok(Some(image)));
-                    }
+    let background = active.borrow().as_ref().and_then(|load| load.background);
+    let options = if background.is_some() {
+        webkit2gtk::SnapshotOptions::NONE
+    } else {
+        webkit2gtk::SnapshotOptions::TRANSPARENT_BACKGROUND
+    };
+    widget.snapshot(region, options, Some(&token.clone()), move |result| {
+        if token.is_cancelled() {
+            return;
+        }
+        let clipped = region == webkit2gtk::SnapshotRegion::Visible;
+        let image = result
+            .ok()
+            .and_then(|surface| surface_image(surface, background, clipped, &document));
+        match image {
+            Some(image) => {
+                if let Some(load) = active.borrow_mut().take() {
+                    let _ = load.reply.send(Ok(Some(image)));
                 }
-                None if retry => {
-                    glib::timeout_add_local_once(PAINT_SETTLE, move || {
-                        capture(&view, active, token, document_height, region, false);
-                    });
-                }
-                None => stop_load(&active, Ok(None)),
             }
-        },
-    );
+            None if retry => {
+                glib::timeout_add_local_once(PAINT_SETTLE, move || {
+                    capture(&view, active, token, document, region, false);
+                });
+            }
+            None => stop_load(&active, Ok(None)),
+        }
+    });
 }
 
 fn secure(widget: &webkit2gtk::WebView) -> Result<(), Box<dyn std::error::Error>> {
@@ -557,9 +616,9 @@ fn install_filter(widget: &webkit2gtk::WebView) -> Result<(), Box<dyn std::error
 
 fn surface_image(
     surface: gtk::cairo::Surface,
-    background: u32,
+    background: Option<u32>,
     clipped: bool,
-    document_height: i32,
+    document: &Document,
 ) -> Option<Snapshot> {
     let mut image = gtk::cairo::ImageSurface::try_from(surface).ok()?;
     image.flush();
@@ -574,7 +633,22 @@ fn surface_image(
     let Ok(height) = u32::try_from(height) else {
         return None;
     };
-    let (dst_w, dst_h) = super::native::fit_snapshot(width, height);
+    let css_width = if clipped {
+        document.viewport_width
+    } else {
+        document.scroll_width
+    };
+    let pixel_scale = width as f32 / css_width.max(1) as f32;
+    let gutter = if clipped {
+        0
+    } else {
+        (document.gutter as f32 * pixel_scale).round() as u32
+    };
+    let (dst_w, dst_h) = super::native::fit_snapshot(width + gutter, height);
+    let source_width = (width + gutter) as usize;
+    let [_, r, g, b] = background.unwrap_or(0).to_be_bytes();
+    let paper = [b, g, r, if background.is_some() { 255 } else { 0 }];
+    let opaque_pixels = image.format() == gtk::cairo::Format::Rgb24;
     let stride = image.stride() as usize;
     let data = image.data().ok()?;
     let src_w = width as usize;
@@ -589,8 +663,8 @@ fn surface_image(
             bgra.extend_from_slice(row);
         } else {
             for x in 0..dst_w_us {
-                let offset = (x * src_w / dst_w_us) * 4;
-                bgra.extend_from_slice(&row[offset..offset + 4]);
+                let offset = (x * source_width / dst_w_us) * 4;
+                bgra.extend_from_slice(row.get(offset..offset + 4).unwrap_or(&paper));
             }
         }
     }
@@ -606,6 +680,9 @@ fn surface_image(
             pixel.reverse();
         }
         let [b, g, r, a] = pixel;
+        if opaque_pixels {
+            *a = 255;
+        }
         if *a != 0 && *a != 255 {
             let alpha = u16::from(*a);
             *b = ((u16::from(*b) * 255) / alpha) as u8;
@@ -613,7 +690,7 @@ fn surface_image(
             *r = ((u16::from(*r) * 255) / alpha) as u8;
         }
     }
-    let last_row_color = if clipped {
+    let last_row_color = if clipped && background.is_some() {
         let mut colors = std::collections::HashMap::new();
         for &[b, g, r, _] in bgra[bgra.len() - dst_w_us * 4..].as_chunks::<4>().0 {
             *colors.entry(u32::from_be_bytes([0, r, g, b])).or_insert(0) += 1;
@@ -621,7 +698,8 @@ fn surface_image(
         colors
             .into_iter()
             .max_by_key(|&(color, count)| (count, color))
-            .map_or(background, |(color, _)| color)
+            .map(|(color, _)| color)
+            .or(background)
     } else {
         background
     };
@@ -633,8 +711,33 @@ fn surface_image(
         width: dst_w as f32,
         height: dst_h as f32,
         clipped,
-        document_height: document_height as f32,
+        document_height: document.height as f32,
         last_row_color,
+        links: if background.is_none() {
+            let scale = pixel_scale * dst_w as f32 / source_width as f32;
+            document
+                .links
+                .iter()
+                .filter_map(|link| {
+                    let href = fell_render::reader_link_target(&link.href)?;
+                    let rects = link
+                        .rects
+                        .iter()
+                        .map(|&[x, y, w, h]| [x * scale, y * scale, w * scale, h * scale])
+                        .filter(|&[x, y, w, h]| {
+                            x < dst_w as f32 && y < dst_h as f32 && x + w > 0. && y + h > 0.
+                        })
+                        .collect::<Vec<_>>();
+                    (!rects.is_empty()).then(|| WebLink {
+                        href,
+                        label: link.label.clone(),
+                        rects,
+                    })
+                })
+                .collect()
+        } else {
+            Arc::default()
+        },
     })
 }
 
@@ -661,7 +764,7 @@ mod tests {
         let picture = futures::executor::block_on(render(WebRequest {
             html: mail.page("light", |_| None),
             width,
-            background: 0xffffff,
+            background: Some(0xffffff),
         }))
         .unwrap()
         .unwrap_or_else(|| panic!("WebKit painted {label}"));
@@ -679,13 +782,13 @@ mod tests {
             queue.submit(WebRequest {
                 html: html.into(),
                 width: 440,
-                background: 0xffffff,
+                background: Some(0xffffff),
             })
         });
         for reply in [first, second] {
             assert!(matches!(
                 futures::executor::block_on(reply),
-                Ok(Err(Superseded))
+                Ok(Err(RenderError::Superseded))
             ));
         }
         assert_eq!(queue.next().unwrap().request.html, "third");
@@ -853,7 +956,7 @@ mod tests {
         let picture = futures::executor::block_on(render(WebRequest {
             html,
             width: 440,
-            background: 0xffffff,
+            background: Some(0xffffff),
         }))
         .unwrap()
         .expect("WebKit drew the hostile document");
@@ -872,18 +975,25 @@ mod tests {
             "hostile WebKit corpus drew a frame without proxy, origin or file loads ({public})"
         );
 
-        let too_wide = fell_render::WebMail::prepare(
-            r#"<div style="width:calc(100000px + 1%)">Too wide to rasterize</div>"#,
-        );
-        assert!(
-            futures::executor::block_on(render(WebRequest {
-                html: too_wide.page("light", |_| None),
-                width: 440,
-                background: 0xffffff,
-            }))
-            .unwrap()
-            .is_none()
-        );
+        for html in [
+            "<div style='width:calc(100000px + 1%)'>Too wide to rasterize</div>",
+            "<table width='8180' bgcolor='white'><tr><td>Table</td></tr></table>",
+            "<table><tr><td style='min-width:5000px'>Left</td><td style='min-width:5000px'>Right</td></tr></table>",
+            "<table style='width:600em'><tr><td>Table</td></tr></table>",
+        ] {
+            let too_wide = fell_render::WebMail::prepare(html);
+            assert!(
+                matches!(
+                    futures::executor::block_on(render(WebRequest {
+                        html: too_wide.page("light", |_| None),
+                        width: 440,
+                        background: Some(0xffffff),
+                    })),
+                    Err(RenderError::TooWide)
+                ),
+                "{html}"
+            );
+        }
 
         let blocked = fell_render::WebMail::prepare(
             r#"<style>@media (width:360px) { p { background:#7a163f; } }</style><p>Preview</p>
@@ -1044,7 +1154,7 @@ mod tests {
                             mail.calibration_page(scheme)
                         },
                         width,
-                        background,
+                        background: Some(background),
                     }))
                     .unwrap()
                     .unwrap_or_else(|| panic!("WebKit painted {label}"));
@@ -1054,7 +1164,7 @@ mod tests {
                         assert_eq!(picture.width, width as f32, "{label}");
                     }
                     if matches!(label, "nested fixed cells" | "oversubscribed fixed cells") {
-                        assert_eq!(picture.width, width.max(654) as f32, "{label}");
+                        assert_eq!(picture.width, width.max(668) as f32, "{label}");
                     }
                     let delta = estimate - painted;
                     eprintln!(
@@ -1098,7 +1208,7 @@ mod tests {
                     |_| None,
                 ),
                 width: 440,
-                background,
+                background: mail.has_author_colors().then_some(background),
             }))
             .unwrap()
             .expect("WebKit painted mail in dark mode");
@@ -1123,11 +1233,21 @@ mod tests {
             let rgb = |[r, g, b]: [u8; 3]| u32::from_be_bytes([0, r, g, b]);
             assert!(crate::theme::contrast(rgb(text), rgb(background)) >= 4.5);
         }
-        let personal = dark_mail("<div>Booked. The hall opens at noon.</div>");
-        assert!(contains_display_color(&personal, [0x24, 0x28, 0x3b]));
+        let personal = dark_mail(
+            "<div><a href='https://example.test/'>Booked.</a> The hall opens at noon.</div>",
+        );
+        assert!(personal.last_row_color.is_none());
+        assert_eq!(personal.links.len(), 1);
+        assert_eq!(personal.links[0].label, "Booked.");
+        assert_eq!(personal.links[0].href, "https://example.test/");
+        let [[x, y, w, h]] = personal.links[0].rects.as_slice() else {
+            panic!("expected one rectangle");
+        };
+        assert_eq!(*x, 14.);
+        assert!(*y >= 12. && *w > 0. && *h > 0.);
         let pixels = personal.image.as_bytes(0).unwrap().as_chunks::<4>().0;
         let width = personal.width as usize;
-        let surface = [0x3b, 0x28, 0x24, 255];
+        let surface = [0, 0, 0, 0];
         assert!(pixels[..12 * width].iter().all(|pixel| *pixel == surface));
         assert!(
             pixels
@@ -1149,7 +1269,7 @@ mod tests {
         let picture = estimate_covers_snapshot("clipped page with a uniform tail", &tall, 440);
         assert!(picture.clipped);
         assert!(picture.document_height >= 200_000.);
-        assert_eq!(picture.last_row_color, 0xffffff);
+        assert_eq!(picture.last_row_color, Some(0xffffff));
         assert_eq!(picture.height, SNAPSHOT_HEIGHT_LIMIT as f32);
         assert!(contains_display_color(&picture, [0x7a, 0x16, 0x3f]));
         assert!(!contains_display_color(&picture, [0x3f, 0x16, 0x7a]));
@@ -1187,7 +1307,7 @@ mod tests {
         let blank = futures::executor::block_on(render(WebRequest {
             html: "<!doctype html><style>body { height: 240px; }</style>".into(),
             width: 360,
-            background: 0xffffff,
+            background: Some(0xffffff),
         }));
         assert!(
             blank.unwrap().is_none(),

@@ -12,6 +12,11 @@ use layout::style_applies;
 /// Largest scroll width that can be captured in a single raster.
 pub const WEB_SNAPSHOT_WIDTH_LIMIT: i32 = 8192;
 
+/// Line height shared by the simple reader and themed web snapshots.
+pub fn reader_line_height(size: f32) -> f32 {
+    22. * size / layout::BODY_FONT_SIZE
+}
+
 /// Typography and colors shared with the native reader for colorless mail.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WebTextStyle {
@@ -23,7 +28,7 @@ pub struct WebTextStyle {
     pub inset: bool,
 }
 
-fn web_page(body: &str, scheme: &str, body_attrs: &str, body_css: &str, link_css: &str) -> String {
+fn web_page(content: &str, scheme: &str, body_css: &str, link_css: &str) -> String {
     format!(
         r#"<!DOCTYPE html>
 <html>
@@ -49,10 +54,8 @@ fn web_page(body: &str, scheme: &str, body_attrs: &str, body_css: &str, link_css
   img {{ height: auto; object-fit: contain; }}
 </style>
 </head>
-<body{body_attrs}>{body}</body>
+<body{content}</body>
 </html>"#,
-        scheme = scheme,
-        body = body,
     )
 }
 
@@ -60,8 +63,7 @@ fn web_page(body: &str, scheme: &str, body_attrs: &str, body_css: &str, link_css
 /// sees local bytes. The caller supplies a slot value after the user consents.
 #[derive(Debug)]
 pub struct WebMail {
-    body: String,
-    body_attrs: String,
+    content: String,
     images: Vec<(usize, String)>,
     layout: layout::Estimate,
     source_bytes: usize,
@@ -98,18 +100,9 @@ impl WebMail {
 
     fn prepare_with_metrics(html: &str, metrics: layout::TextMetrics) -> Self {
         let dom = crate::html::parse_html(html);
-        let mut body = String::new();
+        let mut content = String::new();
         let mut images = Vec::new();
-        serialize_children(
-            dom.root_element(),
-            &mut body,
-            false,
-            true,
-            0,
-            Some(&mut images),
-        );
         // Keep the body's presentation attributes while replacing its wrapper.
-        let mut body_attrs = String::new();
         let mut author_background = false;
         if let Some(element) = dom
             .root_element()
@@ -120,30 +113,48 @@ impl WebMail {
             use std::fmt::Write;
             for name in ["id", "class", "bgcolor", "text", "link", "vlink", "alink"] {
                 if let Some(value) = element.attr(name) {
-                    write!(body_attrs, " {name}=\"{}\"", escape_attr(value)).unwrap();
+                    write!(content, " {name}=\"{}\"", escape_attr(value)).unwrap();
                 }
             }
-            if let Some(value) = element
-                .attr("background")
-                .filter(|value| keep_offline_attr(element.value(), "background", value))
-            {
-                write!(body_attrs, " background=\"{}\"", escape_attr(value)).unwrap();
+            if let Some(value) = element.attr("background") {
+                if let Some(url) = remote_image_url(value) {
+                    content.push_str(" background=\"");
+                    images.push((content.len(), url));
+                    content.push('"');
+                } else if keep_offline_attr(element.value(), "background", value) {
+                    write!(content, " background=\"{}\"", escape_attr(value)).unwrap();
+                }
             }
-            body_attrs.push_str(" style=\"");
-            for rule in html::style_declarations(element.value()) {
+            content.push_str(" style=\"");
+            for rule in html::case_preserving_style(element.value()) {
                 author_background |= layout::sets_color(&rule);
                 if layout::is_body_spacing(&rule.name) || layout::is_color_property(&rule.name) {
-                    write!(body_attrs, "{}:", rule.name).unwrap();
-                    serialize_css(&rule.value, &mut body_attrs, None, escape_attr);
+                    write!(content, "{}:", rule.name).unwrap();
+                    serialize_css_with_property(
+                        &rule.value,
+                        Some(&rule.name),
+                        &mut content,
+                        Some(&mut images),
+                        escape_attr,
+                    );
                     if rule.important {
-                        body_attrs.push_str(" !important");
+                        content.push_str(" !important");
                     }
-                    body_attrs.push(';');
+                    content.push(';');
                 }
             }
-            body_attrs.push('"');
+            content.push('"');
         }
-        let layout_dom = html::parse_html(&format!("<body{body_attrs}>{body}</body>"));
+        content.push('>');
+        serialize_children(
+            dom.root_element(),
+            &mut content,
+            false,
+            true,
+            0,
+            Some(&mut images),
+        );
+        let layout_dom = html::parse_html(&format!("<body{content}</body>"));
         // Remote background attributes have empty slots in the offline page.
         author_background |= dom
             .root_element()
@@ -155,8 +166,7 @@ impl WebMail {
             });
         let layout = layout::Estimate::prepare(&layout_dom, metrics, author_background);
         Self {
-            body,
-            body_attrs,
+            content,
             images,
             layout,
             source_bytes: html.len(),
@@ -171,13 +181,19 @@ impl WebMail {
         self.layout.height(width, Self::image_height_limit(width))
     }
 
-    pub fn estimated_height_with_style(&self, width: f32, style: Option<&WebTextStyle>) -> f32 {
+    /// Returns no web height when the document exceeds the snapshot width budget.
+    pub fn estimated_height_with_style(
+        &self,
+        width: f32,
+        style: Option<&WebTextStyle>,
+    ) -> Option<f32> {
         let size = style.map_or(layout::BODY_FONT_SIZE, |style| style.size);
         self.layout.height_at_size(
             width,
             Self::image_height_limit(width),
             size,
             self.body_inset(style),
+            style.is_some(),
         )
     }
 
@@ -226,11 +242,13 @@ impl WebMail {
                     .unwrap();
                 body_css.push_str(", ");
             }
+            let (size, line_height) = text.map_or_else(
+                || (layout::BODY_FONT_SIZE, layout::BODY_LINE_HEIGHT.to_string()),
+                |style| (style.size, format!("{}px", reader_line_height(style.size))),
+            );
             write!(
                 body_css,
-                "system-ui, sans-serif; font-size: {}px; line-height: {};",
-                text.map_or(layout::BODY_FONT_SIZE, |style| style.size),
-                layout::BODY_LINE_HEIGHT
+                "system-ui, sans-serif; font-size: {size}px; line-height: {line_height};",
             )
             .unwrap();
             if let Some(text) = text {
@@ -241,29 +259,31 @@ impl WebMail {
         if self.body_inset(text) {
             write!(
                 body_css,
-                " padding: {}px {}px;",
+                " padding: {}px {}px; --fell-paper-inset: {};",
                 layout::BODY_PAD_Y,
-                layout::BODY_PAD_X
+                layout::BODY_PAD_X,
+                layout::BODY_PAD_X,
+            )
+            .unwrap();
+        } else if self.layout.native_body_inset && text.is_some() {
+            write!(
+                body_css,
+                " padding-bottom: {}px;",
+                layout::READER_BOTTOM_PAD
             )
             .unwrap();
         }
-        let mut body = String::with_capacity(self.body.len());
+        let mut content = String::with_capacity(self.content.len());
         let mut offset = 0;
         for (at, url) in &self.images {
-            body.push_str(&self.body[offset..*at]);
+            content.push_str(&self.content[offset..*at]);
             if let Some(data) = image(url).filter(|data| data.starts_with("data:image/")) {
-                body.push_str(&escape_attr(&data));
+                content.push_str(&escape_attr(&data));
             }
             offset = *at;
         }
-        body.push_str(&self.body[offset..]);
-        web_page(
-            &body,
-            self.appearance(scheme, 0).0,
-            &self.body_attrs,
-            &body_css,
-            &link_css,
-        )
+        content.push_str(&self.content[offset..]);
+        web_page(&content, self.appearance(scheme, 0).0, &body_css, &link_css)
     }
 }
 
@@ -965,6 +985,16 @@ fn css_width_property(css: &str, start: usize) -> bool {
 fn serialize_css(
     css: &str,
     out: &mut String,
+    images: Option<&mut Vec<(usize, String)>>,
+    escape: impl Fn(&str) -> String,
+) {
+    serialize_css_with_property(css, None, out, images, escape);
+}
+
+fn serialize_css_with_property(
+    css: &str,
+    property: Option<&str>,
+    out: &mut String,
     mut images: Option<&mut Vec<(usize, String)>>,
     escape: impl Fn(&str) -> String,
 ) {
@@ -976,7 +1006,7 @@ fn serialize_css(
     css_resources(&mut Parser::new(&mut input), &css, 0, false, &mut resources);
     let mut from = 0;
     for (range, resource) in resources {
-        let name = css_declaration(&css, range.start);
+        let name = property.or_else(|| css_declaration(&css, range.start));
         if matches!(resource, CssResource::FluidWidth) && images.is_none() {
             continue;
         }
@@ -1003,7 +1033,11 @@ fn serialize_css(
                     (quoted && name.starts_with("--"))
                         || matches!(
                             name.to_ascii_lowercase().as_str(),
-                            "background" | "background-image" | "border-image" | "list-style-image"
+                            "background"
+                                | "background-image"
+                                | "border-image"
+                                | "border-image-source"
+                                | "list-style-image"
                         )
                 })
                 && let Some(url) = remote_image_url(&value)
@@ -1328,6 +1362,9 @@ mod tests {
             "<body background='data:image/png;base64,AAAA'>Story</body>",
             "<p style='box-shadow:inset 0 0 0 1000px #fff'>Story</p>",
             "<style>p {box-shadow:inset 0 0 0 1000px #fff}</style><p>Story</p>",
+            "<p style='-webkit-box-shadow:inset 0 0 0 1000px #fff'>Story</p>",
+            "<style>p {border-image:linear-gradient(#fff,#fff) 1}</style><p>Story</p>",
+            "<p style='border-image-source:linear-gradient(#fff,#fff)'>Story</p>",
             "<p style='background-image:url(https://example.test/paper.png)'>Story</p>",
         ] {
             let mail = WebMail::prepare(html);
@@ -1351,9 +1388,68 @@ mod tests {
             "<body background=''>Story</body>",
             "<p style='background-image:none; box-shadow:none; background-color:transparent'>Story</p>",
             "<style>p{background-image:initial;box-shadow:unset}</style><p>Story</p>",
+            "<p style='border-image:none;border-image-source:none;-webkit-box-shadow:transparent'>Story</p>",
         ] {
             assert!(!WebMail::prepare(html).has_author_colors(), "{html}");
         }
+    }
+
+    #[test]
+    fn body_backgrounds_use_consent_slots_and_preserve_payload_case() {
+        let mail = WebMail::prepare(concat!(
+            "<body background='https://example.test/Paper.png' ",
+            "style='background-image:url(data:image/png;base64,aBcD), ",
+            "url(https://example.test/Texture.png); color: #FaFafa'>",
+            "<table background='https://example.test/Table.png'><tr><td>Story</td></tr></table>",
+        ));
+        assert!(mail.has_remote_images());
+        let blocked = mail.page("light", |_| None);
+        assert!(!blocked.contains("example.test"));
+        assert!(blocked.contains("data:image/png;base64,aBcD"));
+        let mut urls = Vec::new();
+        let allowed = mail.page("light", |url| {
+            urls.push(url.to_owned());
+            Some("data:image/png;base64,AbCd".into())
+        });
+        assert_eq!(
+            urls,
+            [
+                "https://example.test/Paper.png",
+                "https://example.test/Texture.png",
+                "https://example.test/Table.png"
+            ],
+        );
+        assert_eq!(allowed.matches("data:image/png;base64,AbCd").count(), 3);
+    }
+
+    #[test]
+    fn over_budget_width_has_no_web_height_to_reserve() {
+        let text = "A letter with several sentences and enough words to wrap at the pane width. "
+            .repeat(80);
+        for html in [
+            "<table width='8180'><tr><td>Table</td></tr></table>".to_owned(),
+            "<table><tr><td style='min-width:5000px'>Left</td><td style='min-width:5000px'>Right</td></tr></table>".to_owned(),
+            "<table style='width:600em'><tr><td>Table</td></tr></table>".to_owned(),
+            format!("<table width='8180'><tr><td>{text}</td></tr></table>"),
+        ] {
+            assert_eq!(WebMail::prepare(&html).estimated_height_with_style(440., None), None);
+        }
+    }
+
+    #[test]
+    fn flush_overflow_uses_its_full_width() {
+        let mail = WebMail::prepare("<div style='width:600px;height:1800px'>Letter</div>");
+        let style = WebTextStyle {
+            family: None,
+            size: 15.,
+            foreground: 0,
+            link: 0,
+            inset: false,
+        };
+        assert_eq!(
+            mail.estimated_height_with_style(400., Some(&style)),
+            Some(1212. + 8. * 400. / 600.)
+        );
     }
 
     #[test]
@@ -1369,29 +1465,28 @@ mod tests {
         let page = plain.page_with_style("dark", Some(&style), |_| None);
         assert_eq!(plain.appearance("dark", 0x24283b), ("dark", 0x24283b));
         assert!(page.contains(r#"font-family: "Inter", system-ui, sans-serif"#));
-        assert!(page.contains("font-size: 15px; line-height: 1.4; color: #a9b1d6"));
+        assert!(page.contains("font-size: 15px; line-height: 22px; color: #a9b1d6"));
         assert!(page.contains("a:any-link { color: #7aa2f7; }"));
         let bigger = WebTextStyle {
             size: 20.,
             ..style.clone()
         };
-        assert_eq!(
-            plain.estimated_height_with_style(440., Some(&bigger)) - plain.estimated_height(440.),
-            7.
-        );
+        let estimated = |style| {
+            plain
+                .estimated_height_with_style(440., Some(style))
+                .unwrap()
+        };
+        assert!((estimated(&bigger) - estimated(&style) - 22. / 3.).abs() < 0.001);
         let flush = WebTextStyle {
             inset: false,
-            ..style
+            ..style.clone()
         };
         assert!(
             !plain
                 .page_with_style("dark", Some(&flush), |_| None)
                 .contains("padding: 12px 14px")
         );
-        assert_eq!(
-            plain.estimated_height(440.) - plain.estimated_height_with_style(440., Some(&flush)),
-            24.
-        );
+        assert_eq!(plain.estimated_height(440.) - estimated(&flush), 15.);
         assert!(page.contains("padding: 12px 14px"));
         for html in [
             "<body style='padding-top:6px'><div>Booked.</div></body>",

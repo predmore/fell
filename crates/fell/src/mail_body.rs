@@ -19,7 +19,7 @@
 //! so reopening a thread prepares nothing and a resync that replaces a
 //! body is prepared again.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Weak};
 
 use fell_core::{AccountId, PartStamp, Store};
@@ -168,7 +168,7 @@ pub fn prepare_html(html: &str, headers_in: &[(String, String)]) -> HtmlBody {
         .iter()
         .map(|text| crate::render::is_right_to_left(text))
         .collect();
-    let web_links = web_link_blocks(&folded.document.blocks);
+    let web_links = web_link_blocks(&folded.document.blocks, web.has_author_colors());
     HtmlBody {
         folded,
         suggested,
@@ -181,64 +181,93 @@ pub fn prepare_html(html: &str, headers_in: &[(String, String)]) -> HtmlBody {
     }
 }
 
-// Reuse native link widgets below the snapshot. The image has no hit targets
-// of its own, and no WebKit event can activate a URL.
-fn web_link_blocks(blocks: &[fell_render::Block]) -> Vec<fell_render::Block> {
+// Snapshots with author colors keep a native link list. Colorless snapshots
+// place text controls over the ink, and keep a row for image-only destinations.
+fn web_link_blocks(blocks: &[fell_render::Block], include_text: bool) -> Vec<fell_render::Block> {
     use fell_render::{Block, Inline};
 
     let mut links = Vec::new();
-    collect_web_links(blocks, &mut links, &mut HashSet::new());
+    collect_web_links(blocks, &mut links, &mut HashMap::new());
     let single = links.len() == 1;
     links
         .into_iter()
-        .map(|(href, label)| Block::Paragraph {
-            inlines: vec![Inline::Link {
-                href,
-                // The snapshot already shows the caption. One destination
-                // needs only an action, with the URL available on focus.
-                children: vec![Inline::Text(if single {
-                    "Open link".into()
-                } else {
-                    label
-                })],
-            }],
+        .filter_map(|link| {
+            let label = if let Some(text) = link.text {
+                if !include_text {
+                    return None;
+                }
+                if single { "Open link".into() } else { text }
+            } else {
+                link.alt.unwrap_or_else(|| "Open link".into())
+            };
+            Some(Block::Paragraph {
+                inlines: vec![Inline::Link {
+                    href: link.href,
+                    children: vec![Inline::Text(label)],
+                }],
+            })
         })
         .collect()
 }
 
+struct WebLink {
+    href: String,
+    text: Option<String>,
+    alt: Option<String>,
+}
+
 fn collect_web_links(
     blocks: &[fell_render::Block],
-    links: &mut Vec<(String, String)>,
-    seen: &mut HashSet<String>,
+    links: &mut Vec<WebLink>,
+    seen: &mut HashMap<String, usize>,
 ) {
     use fell_render::{Block, Inline};
 
-    fn text_label(inlines: &[Inline], label: &mut String) {
+    fn label(inlines: &[Inline], text: &mut String, alt: &mut Option<String>) {
         for inline in inlines {
             match inline {
-                Inline::Text(text) | Inline::Code(text) => label.push_str(text),
+                Inline::Text(part) | Inline::Code(part) => text.push_str(part),
                 Inline::Emphasis(children)
                 | Inline::Strong(children)
-                | Inline::Strike(children) => {
-                    text_label(children, label);
+                | Inline::Strike(children) => label(children, text, alt),
+                Inline::LineBreak => text.push(' '),
+                Inline::Image { alt: part, .. } if alt.as_ref().is_none_or(String::is_empty) => {
+                    *alt = Some(part.trim().into());
                 }
-                Inline::LineBreak => label.push(' '),
                 _ => {}
             }
         }
     }
 
-    fn visit(inlines: &[Inline], links: &mut Vec<(String, String)>, seen: &mut HashSet<String>) {
+    fn visit(inlines: &[Inline], links: &mut Vec<WebLink>, seen: &mut HashMap<String, usize>) {
         for inline in inlines {
             match inline {
                 Inline::Link { href, children } => {
-                    let mut label = String::new();
-                    text_label(children, &mut label);
-                    if !label.trim().is_empty()
-                        && let Some(target) = fell_render::reader_link_target(href)
-                        && seen.insert(target)
-                    {
-                        links.push((href.clone(), label));
+                    let Some(target) = fell_render::reader_link_target(href) else {
+                        continue;
+                    };
+                    let (scheme, rest) = target.split_once(':').expect("validated link");
+                    let key = format!("{}:{rest}", scheme.to_ascii_lowercase());
+                    let mut text = String::new();
+                    let mut alt = None;
+                    label(children, &mut text, &mut alt);
+                    if text.trim().is_empty() && alt.is_none() {
+                        continue;
+                    }
+                    let index = *seen.entry(key).or_insert(links.len());
+                    if index == links.len() {
+                        links.push(WebLink {
+                            href: target,
+                            text: None,
+                            alt: None,
+                        });
+                    }
+                    let link = &mut links[index];
+                    if link.text.is_none() && !text.trim().is_empty() {
+                        link.text = Some(text.trim().into());
+                    }
+                    if link.alt.is_none() {
+                        link.alt = alt.filter(|alt| !alt.is_empty());
                     }
                 }
                 Inline::Emphasis(children)
@@ -379,21 +408,21 @@ impl BodyCache {
 /// What the store thread found for a conversation's bodies.
 #[derive(Default)]
 pub struct BodyReads {
-    /// Bodies prepared on the store thread and their positions in the read.
+    /// Prepared bodies and their positions in the read.
     prepared: Vec<(usize, PreparedBody)>,
-    web_previews: Vec<(usize, BodyJob)>,
+    jobs: Vec<(usize, BodyJob)>,
     /// The stored revision of each HTML body in the read.
     stamps: HashMap<String, PartStamp>,
 }
 
 impl BodyReads {
-    pub fn has_web_previews(&self) -> bool {
-        !self.web_previews.is_empty()
+    pub fn has_jobs(&self) -> bool {
+        !self.jobs.is_empty()
     }
 
-    pub fn prepare_web_previews(&mut self) {
+    pub fn prepare_jobs(&mut self) {
         self.prepared.extend(
-            self.web_previews
+            self.jobs
                 .drain(..)
                 .map(|(index, job)| (index, job.prepare())),
         );
@@ -402,7 +431,7 @@ impl BodyReads {
 
 /// Find which messages have HTML on the store thread.
 ///
-/// Prepare small expanded bodies above the last message here so they
+/// Read small expanded bodies to prepare off the store thread so they
 /// arrive in place. The window resolves the rest against its live cache
 /// and starts any remaining loads for the revisions returned here.
 #[cfg(test)]
@@ -412,7 +441,10 @@ fn read_bodies(
     messages: &mut [ConvMessage],
     cached: &HashMap<String, PartStamp>,
 ) -> BodyReads {
-    read_bodies_with_latest(store, account, messages, cached, false, |_| Some(false))
+    let mut reads =
+        read_bodies_with_latest(store, account, messages, cached, false, |_| Some(false));
+    reads.prepare_jobs();
+    reads
 }
 
 pub fn read_bodies_with_latest(
@@ -461,11 +493,7 @@ pub fn read_bodies_with_latest(
                     )
                 {
                     budget -= bytes;
-                    if web_preview {
-                        reads.web_previews.push((index, job));
-                    } else {
-                        reads.prepared.push((index, job.prepare()));
-                    }
+                    reads.jobs.push((index, job));
                 }
             }
             // A stored row with no parts is a settled result as well.
@@ -534,12 +562,12 @@ impl BodyLoads {
         BodyReads {
             mut stamps,
             prepared,
-            web_previews,
+            jobs,
         }: BodyReads,
         cache: &mut BodyCache,
         messages: &mut [ConvMessage],
     ) {
-        debug_assert!(web_previews.is_empty());
+        debug_assert!(jobs.is_empty());
         for message in messages.iter_mut() {
             let Some(wanted) = stamps.get(&message.id) else {
                 continue;
@@ -663,7 +691,7 @@ mod tests {
             r#"<a href="https://example.test">Harbor office</a>
                 <a href="https://example.test">Office hours</a>"#,
         );
-        let links = super::web_link_blocks(&doc.blocks);
+        let links = super::web_link_blocks(&doc.blocks, true);
         assert_eq!(
             fell_render::StyledDocument::blocks_text(&links),
             "Open link"
@@ -671,16 +699,24 @@ mod tests {
     }
 
     #[test]
-    fn web_links_keep_the_first_text_label_and_skip_images() {
+    fn web_links_prefer_text_and_keep_one_control_for_each_image_destination() {
         let html = r#"<p><a href="https://example.test/route"><img src="https://example.test/image" alt="Map"></a>
             <a href="https://example.test/route"><strong>The route</strong></a>
             <a href="https://example.test/route">Map again</a>
-            <a href="https://example.test/shops"><img src="https://example.test/logo" alt="Logo">Shops</a></p>"#;
+            <a href="https://example.test/shops"><img src="https://example.test/logo" alt="Logo">Shops</a>
+            <a href="HTTPS://example.test/ferry"><img src="https://example.test/ferry.png" alt="Ferry timetable"></a>
+            <a href="https://example.test/ferry"><img src="https://example.test/ferry2.png" alt="Duplicate"></a>
+            <a href="https://example.test/harbor"><img src="https://example.test/harbor.png"></a></p>"#;
         let doc = fell_render::prepare(html, &Default::default()).document;
-        let links = super::web_link_blocks(&doc.blocks);
+        let links = super::web_link_blocks(&doc.blocks, true);
         assert_eq!(
             fell_render::StyledDocument::blocks_text(&links),
-            "The route\nShops"
+            "The route\nShops\nFerry timetable\nOpen link"
+        );
+        let colorless = super::web_link_blocks(&doc.blocks, false);
+        assert_eq!(
+            fell_render::StyledDocument::blocks_text(&colorless),
+            "Ferry timetable\nOpen link"
         );
     }
 
@@ -886,7 +922,17 @@ mod tests {
         );
         let store = store_with(&[first, second, plain, bare, last]);
         let mut view = open(&store, "a@fell.test");
-        let reads = read_bodies(&store, &account().id, &mut view, &HashMap::new());
+        let mut reads = read_bodies_with_latest(
+            &store,
+            &account().id,
+            &mut view,
+            &HashMap::new(),
+            false,
+            |_| Some(false),
+        );
+        assert!(reads.prepared.is_empty());
+        assert_eq!(reads.jobs.len(), 1);
+        reads.prepare_jobs();
         assert_eq!(reads.prepared.len(), 1);
         let mut loads = BodyLoads::default();
         loads.accept(reads, &mut BodyCache::default(), &mut view);
@@ -996,8 +1042,8 @@ mod tests {
             false,
             |_| None,
         );
-        assert!(reads.has_web_previews());
-        reads.prepare_web_previews();
+        assert!(reads.has_jobs());
+        reads.prepare_jobs();
         BodyLoads::default().accept(reads, &mut BodyCache::default(), &mut view);
         let Rich::Html(body) = &view[0].rich else {
             panic!("expected web body on arrival")
@@ -1307,7 +1353,17 @@ mod tests {
         ));
         let store = store_with(&messages);
         let mut view = open(&store, "m0@fell.test");
-        let reads = read_bodies(&store, &account().id, &mut view, &HashMap::new());
+        let mut reads = read_bodies_with_latest(
+            &store,
+            &account().id,
+            &mut view,
+            &HashMap::new(),
+            false,
+            |_| Some(false),
+        );
+        assert!(reads.prepared.is_empty());
+        assert_eq!(reads.jobs.len(), 1);
+        reads.prepare_jobs();
         assert_eq!(reads.prepared.len(), 1);
         let mut loads = BodyLoads::default();
         loads.accept(reads, &mut BodyCache::default(), &mut view);
@@ -1355,7 +1411,7 @@ mod tests {
                 false,
                 |_| sender_mode,
             );
-            assert!(!reads.has_web_previews());
+            assert!(!reads.has_jobs());
             assert!(reads.prepared.is_empty());
             assert_eq!(view[0].rich, Rich::PendingWeb);
             let mut loads = BodyLoads::default();

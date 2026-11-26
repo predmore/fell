@@ -2934,12 +2934,12 @@ impl Inbox {
                 .await
                 .unwrap_or_else(|_| Err("Mailbox store stopped".into()));
             if let Ok(Some(read)) = &mut result
-                && read.reads.has_web_previews()
+                && read.reads.has_jobs()
             {
                 let mut reads = std::mem::take(&mut read.reads);
                 read.reads = cx
                     .background_spawn(async move {
-                        reads.prepare_web_previews();
+                        reads.prepare_jobs();
                         reads
                     })
                     .await;
@@ -4665,8 +4665,9 @@ impl Inbox {
         self.reader_bodies.clear();
         self.invalidate_conversation_layout();
         self.session.messages.clear();
-        self.open_thread = None;
-        self.web_mail.close_thread();
+        if self.open_thread.take().is_some() {
+            self.web_mail.close_thread();
+        }
         self.open_subject.clear();
         self.note_pin = agent_notes::NotePin::default();
     }
@@ -11212,6 +11213,8 @@ fn web_message_body(
 ) -> gpui::AnyElement {
     use web_mail::Body;
     let reveal = frame.disclosures().quotes.get(&message.id).copied();
+    let colorless =
+        web.body.is_colorless() || web.outgoing.as_ref().is_some_and(Body::is_colorless);
     let web_column = |card: gpui::AnyElement, live, showing_links: bool| {
         div()
             .child(card)
@@ -11250,7 +11253,9 @@ fn web_message_body(
         ),
         Body::Native => {
             let native = div()
-                .bg(rgb(folds.fill))
+                // The card already paints this fill. A second copy would
+                // dim the outgoing text under a partially opaque layer.
+                .when(!colorless, |native| native.bg(rgb(folds.fill)))
                 .children(html_sections(
                     theme,
                     (body, web.continuation.as_ref()),
@@ -11278,6 +11283,7 @@ fn web_message_body(
                     folds.columns.card.width,
                     folds.fill,
                     theme.dimmed,
+                    live.then_some((&message.id, theme.accent)),
                 ))
                 .when(picture.clipped && live, |snapshot| {
                     let geometry = web.snapshot_geometry.clone();
@@ -11531,7 +11537,7 @@ fn html_sections(
 ) -> Vec<gpui::AnyElement> {
     let palette = mail_body::palette(theme);
     let quiet = mail_body::history_palette(theme);
-    let line = px(theme.ui_px * 1.45);
+    let line = px(fell_render::reader_line_height(theme.ui_px));
     let folded = &body.folded;
     let top_level_markers = markers.with_top_level_lists(&folded.document.blocks);
     let columns = folds.columns;

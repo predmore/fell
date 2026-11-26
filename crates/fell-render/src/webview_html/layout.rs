@@ -26,6 +26,8 @@ pub(super) const BODY_PAD_Y: f32 = 12.;
 pub(super) const BODY_FONT_SIZE: f32 = 15.;
 pub(super) const BODY_LINE_HEIGHT: f32 = 1.4;
 
+pub(super) const READER_BOTTOM_PAD: f32 = 8.;
+
 #[derive(Debug)]
 pub(super) struct Estimate {
     layouts: Vec<(i32, Option<Layout>)>,
@@ -66,7 +68,7 @@ impl Estimate {
             line: if author_colors {
                 LineHeight::Normal
             } else {
-                LineHeight::Ratio(BODY_LINE_HEIGHT)
+                LineHeight::Body
             },
             metrics,
             serif: false,
@@ -93,7 +95,14 @@ impl Estimate {
     }
 
     pub(super) fn height(&self, width: f32, image_limit: f32) -> f32 {
-        self.height_at_size(width, image_limit, BODY_FONT_SIZE, self.native_body_inset)
+        self.height_at_size(
+            width,
+            image_limit,
+            BODY_FONT_SIZE,
+            self.native_body_inset,
+            false,
+        )
+        .unwrap_or(MAX_ESTIMATED_HEIGHT)
     }
 
     pub(super) fn height_at_size(
@@ -102,7 +111,8 @@ impl Estimate {
         image_limit: f32,
         font_size: f32,
         body_inset: bool,
-    ) -> f32 {
+        native_line: bool,
+    ) -> Option<f32> {
         let style = MeasureStyle {
             image_limit,
             font_scale: if self.author_colors {
@@ -111,34 +121,34 @@ impl Estimate {
                 font_size / BODY_FONT_SIZE
             },
             body_inset,
+            native_line_height: (native_line && !self.author_colors)
+                .then(|| super::reader_line_height(font_size)),
         };
         let width = width.max(1.);
         let index = self
             .layouts
             .partition_point(|(min, _)| *min <= width.round() as i32);
-        (self.layouts[index.saturating_sub(1)]
-            .1
-            .as_ref()
-            .map_or(0., |layout| {
-                // Reflow at the viewport, as WebKit does. Scale the painted
-                // document only after accounting for horizontal overflow.
-                let trailing_inset = if self.native_body_inset {
-                    BODY_PAD_X
-                } else {
-                    0.
-                };
-                let outer_width =
-                    (layout.overflow_width(width, style.body_inset) - trailing_inset).max(width);
-                let scale = if outer_width <= super::WEB_SNAPSHOT_WIDTH_LIMIT as f32 {
-                    width / outer_width
-                } else {
-                    // The worker falls back to simple view above the raster limit.
-                    1.
-                };
-                layout.measure(width, style).outer_height() * scale
-            })
-            + HEIGHT_ALLOWANCE)
-            .min(MAX_ESTIMATED_HEIGHT)
+        let Some(layout) = self.layouts[index.saturating_sub(1)].1.as_ref() else {
+            return Some(HEIGHT_ALLOWANCE);
+        };
+        // WebKit excludes the trailing body padding from an overflowing
+        // scroll width. Check that width before allowing for the paper edge.
+        let trailing_inset = if style.body_inset { BODY_PAD_X } else { 0. };
+        let outer_width = layout.overflow_width(width, style.body_inset);
+        let scroll_width = outer_width - trailing_inset;
+        let limit = super::WEB_SNAPSHOT_WIDTH_LIMIT as f32;
+        if scroll_width.round() > limit {
+            return None;
+        }
+        let raster_width = outer_width.min(limit).max(width);
+        let footer = if style.native_line_height.is_some() && self.native_body_inset && !body_inset
+        {
+            READER_BOTTOM_PAD
+        } else {
+            0.
+        };
+        let height = (layout.measure(width, style).outer_height() + footer) * width / raster_width;
+        Some((height + HEIGHT_ALLOWANCE).min(MAX_ESTIMATED_HEIGHT))
     }
 }
 
@@ -956,7 +966,10 @@ pub(super) fn is_color_property(property: &str) -> bool {
             | "background"
             | "background-color"
             | "background-image"
+            | "border-image"
+            | "border-image-source"
             | "box-shadow"
+            | "-webkit-box-shadow"
             | "-webkit-text-fill-color"
     )
 }
@@ -1017,6 +1030,7 @@ const ZERO: Length = Length::Px(0.);
 
 #[derive(Clone, Copy, Debug)]
 enum LineHeight {
+    Body,
     Normal,
     Ratio(f32),
     Px(f32),
@@ -1036,6 +1050,7 @@ impl LineHeight {
 
     fn resolve(self, size: f32, metrics: TextMetrics) -> f32 {
         match self {
+            Self::Body => BODY_LINE_HEIGHT * size,
             Self::Normal => (metrics.normal_line)(size),
             Self::Ratio(ratio) => ratio * size,
             Self::Px(pixels) => pixels,
@@ -1053,6 +1068,14 @@ struct Font {
 }
 
 impl Font {
+    fn measured_line(self) -> MeasuredLine {
+        MeasuredLine {
+            height: self.line.resolve(self.size, self.metrics),
+            relative: self.relative_size && !matches!(self.line, LineHeight::Px(_)),
+            body: matches!(self.line, LineHeight::Body),
+        }
+    }
+
     fn for_element(self, name: &str, style: &[Declaration], zero: bool, uncertain: bool) -> Self {
         let scale = match name {
             "h1" => 2.,
@@ -1144,14 +1167,10 @@ enum Layout {
         space: f32,
         em: f32,
         font: f32,
-        line: f32,
+        line: MeasuredLine,
         relative_size: bool,
-        relative_line: bool,
     },
-    Break {
-        height: f32,
-        relative: bool,
-    },
+    Break(MeasuredLine),
     Image {
         width: f32,
         width_percent: Option<f32>,
@@ -1203,6 +1222,25 @@ struct MeasureStyle {
     image_limit: f32,
     font_scale: f32,
     body_inset: bool,
+    native_line_height: Option<f32>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct MeasuredLine {
+    height: f32,
+    relative: bool,
+    body: bool,
+}
+
+impl MeasuredLine {
+    fn height(self, style: MeasureStyle) -> f32 {
+        if self.body
+            && let Some(height) = style.native_line_height
+        {
+            return height;
+        }
+        self.height * if self.relative { style.font_scale } else { 1. }
+    }
 }
 
 #[derive(Default)]
@@ -1532,10 +1570,8 @@ impl Layout {
                     space,
                     em,
                     font: inherited.size,
-                    line: inherited.line.resolve(inherited.size, inherited.metrics),
+                    line: inherited.measured_line(),
                     relative_size: inherited.relative_size,
-                    relative_line: inherited.relative_size
-                        && !matches!(inherited.line, LineHeight::Px(_)),
                 });
             }
             Node::Element(element) => element,
@@ -1562,10 +1598,7 @@ impl Layout {
             && html::has_zero_font_size(element, &style, inherited.size == 0.);
         let font = inherited.for_element(name, &style, zero, uncertain);
         if name == "br" {
-            return (font.size > 0.).then_some(Self::Break {
-                height: font.line.resolve(font.size, font.metrics),
-                relative: font.relative_size && !matches!(font.line, LineHeight::Px(_)),
-            });
+            return (font.size > 0.).then(|| Self::Break(font.measured_line()));
         }
         let length = |property| {
             html::declared_value(&style, property)
@@ -1690,7 +1723,6 @@ impl Layout {
                         font: text_font,
                         line,
                         relative_size,
-                        relative_line,
                     }),
                     Self::Text {
                         words: next_words,
@@ -1698,23 +1730,18 @@ impl Layout {
                         font: next_font,
                         line: next_line,
                         relative_size: next_relative_size,
-                        relative_line: next_relative_line,
                         ..
                     },
                 ) if inline_flow
                     && *text_font == next_font
                     && *line == next_line
-                    && *relative_size == next_relative_size
-                    && *relative_line == next_relative_line =>
+                    && *relative_size == next_relative_size =>
                 {
                     *em += *space + next;
                     words.extend(next_words);
                 }
-                (Some(Self::Text { .. }), Self::Break { .. }) if inline_flow => {
-                    children.push(Self::Break {
-                        height: 0.,
-                        relative: false,
-                    });
+                (Some(Self::Text { .. }), Self::Break(_)) if inline_flow => {
+                    children.push(Self::Break(MeasuredLine::default()));
                 }
                 (_, child) => children.push(child),
             }
@@ -1832,15 +1859,14 @@ impl Layout {
                 font,
                 line,
                 relative_size,
-                relative_line,
                 ..
             } => Measured {
                 height: wrapped_lines(words, *space, width / scale(*font, *relative_size))
-                    * scale(*line, *relative_line),
+                    * line.height(style),
                 ..Measured::default()
             },
-            Self::Break { height, relative } => Measured {
-                height: scale(*height, *relative),
+            Self::Break(line) => Measured {
+                height: line.height(style),
                 ..Measured::default()
             },
             Self::Image {
@@ -1885,7 +1911,7 @@ impl Layout {
                 .iter()
                 .map(|child| child.inline_width(font_scale))
                 .fold(1., f32::max),
-            Self::Break { .. } => 1.,
+            Self::Break(_) => 1.,
         }
     }
 
@@ -2055,7 +2081,7 @@ impl Flow {
                 .map(|child| child.overflow_width(space, body_inset))
                 .fold(0., f32::max)
         };
-        (required.max(children + spacing) + edges).min(super::WEB_SNAPSHOT_WIDTH_LIMIT as f32 + 1.)
+        required.max(children + spacing) + edges
     }
 
     fn inline_lines(&self, width: f32, style: MeasureStyle) -> impl Iterator<Item = Measured> + '_ {
@@ -2283,12 +2309,12 @@ fn fixed_table_widths_are_measured_before_scaling_to_the_pane() {
     let body = r#"<body style="color:#222"><table cellpadding="0" cellspacing="0" {table}>
         <tr><td {cell}><div style="height:420px">Story</div></td></tr></table></body>"#;
     for (table, cell, outer_width) in [
-        ("width='600'", "", 614.),
-        ("style='width:600px'", "", 614.),
-        ("style='min-width:600px'", "", 614.),
+        ("width='600'", "", 628.),
+        ("style='width:600px'", "", 628.),
+        ("style='min-width:600px'", "", 628.),
         ("", "style='width:598px'", 480.),
-        ("style='width:600px;max-width:100%'", "", 614.),
-        ("style='width:600px;max-width:500px'", "", 514.),
+        ("style='width:600px;max-width:100%'", "", 628.),
+        ("style='width:600px;max-width:500px'", "", 528.),
         ("width='100000'", "", 480.),
         ("style='min-width:100000px'", "", 480.),
         ("style='min-width:100000%'", "", 480.),
@@ -2373,6 +2399,7 @@ fn height_estimates_cap_image_hints_and_total_layout() {
                     image_limit: WebMail::image_height_limit(440.),
                     font_scale: 1.,
                     body_inset: true,
+                    native_line_height: None,
                 }
             )
             .outer_height(),

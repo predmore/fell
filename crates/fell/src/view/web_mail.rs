@@ -19,7 +19,7 @@ use crate::mail_body::HtmlBody;
 use crate::model::Session;
 use crate::motion::{self, Motion, Transition};
 use crate::render::remote_images;
-use crate::render::webview::{self, Snapshot, WebRequest};
+use crate::render::webview::{self, RenderError, Snapshot, WebRequest};
 
 const CACHE_SIZE: usize = 12;
 const THREAD_HOLD: Duration = Duration::from_millis(150);
@@ -42,6 +42,7 @@ pub(super) struct Reader {
     allowed_once: HashMap<String, (Option<String>, Weak<WebMail>)>,
     show_images_for: HashMap<String, (Option<String>, Weak<WebMail>)>,
     show_native_for: HashSet<String>,
+    continue_at: HashMap<String, f32>,
     pending: Option<Pending>,
     cache: VecDeque<Cached>,
     measured: VecDeque<MeasuredHeight>,
@@ -82,7 +83,7 @@ struct Key {
     mail: Arc<WebMail>,
     width: i32,
     scheme: &'static str,
-    background: u32,
+    background: Option<u32>,
     text: Option<WebTextStyle>,
     images: bool,
 }
@@ -107,6 +108,7 @@ impl Key {
 struct Cached {
     key: Key,
     picture: Option<Snapshot>,
+    too_wide: bool,
     image_failure: Option<remote_images::UnavailableImages>,
 }
 
@@ -130,7 +132,6 @@ struct Shown {
     fade: Option<Transition>,
     renderer_painted: Option<Rc<Cell<Option<Instant>>>>,
     snapshot_geometry: Rc<Cell<Option<(f32, f32)>>>,
-    continue_at: Option<f32>,
     height: Rc<Cell<Option<f32>>>,
     from_height: Option<f32>,
     placeholder_height: f32,
@@ -171,7 +172,6 @@ impl Shown {
             fade: None,
             renderer_painted: None,
             snapshot_geometry: Rc::default(),
-            continue_at: None,
             height: Rc::default(),
             from_height: None,
             placeholder_height: 100.,
@@ -200,8 +200,9 @@ impl Shown {
             let renderer_change = self.body.is_web() != body.is_web();
             self.outgoing = Some(std::mem::replace(&mut self.body, body));
             self.from_height = self.height.get();
-            self.renderer_painted = (renderer_change && motion.enabled()).then(Rc::default);
-            self.fade = (!renderer_change)
+            let paint_first = renderer_change || matches!(self.outgoing, Some(Body::Placeholder));
+            self.renderer_painted = (paint_first && motion.enabled()).then(Rc::default);
+            self.fade = (!paint_first)
                 .then(|| motion.start(motion::FADE, now))
                 .flatten();
         }
@@ -282,9 +283,23 @@ impl Shown {
             let elapsed = real
                 .saturating_duration_since(painted)
                 .min(motion::MAX_STEP);
-            self.fade = motion.start(RENDERER_CHANGE, now - elapsed);
+            let duration = if self.fade_through() {
+                RENDERER_CHANGE
+            } else {
+                motion::FADE
+            };
+            self.fade = motion.start(duration, now - elapsed);
             self.renderer_painted = None;
         }
+    }
+
+    fn fade_through(&self) -> bool {
+        self.outgoing.as_ref().is_some_and(|outgoing| {
+            outgoing.is_web() != self.body.is_web()
+                && !matches!(outgoing, Body::Placeholder)
+                && !outgoing.is_colorless()
+                && !self.body.is_colorless()
+        })
     }
 
     fn frame(&self, now: Instant) -> Frame {
@@ -295,15 +310,15 @@ impl Shown {
         };
         let progress = motion::ease_out(linear);
         let body_alpha = match &self.outgoing {
-            Some(outgoing) if outgoing.is_web() != self.body.is_web() => {
+            Some(_) if self.fade_through() => {
                 let exit = RENDERER_EXIT.as_secs_f32() / RENDERER_CHANGE.as_secs_f32();
                 [
                     (1. - linear / exit).max(0.),
                     motion::ease_out((linear - exit) / (1. - exit)),
                 ]
             }
-            Some(Body::Placeholder) => [(1. - progress / motion::ease_out(0.4)).max(0.), progress],
-            _ => [1., progress],
+            Some(_) if linear < 1. => [1., progress],
+            _ => [0., 1.],
         };
         let leaving_clipped = matches!(&self.outgoing, Some(Body::Web(picture)) if picture.clipped)
             && matches!(self.body, Body::Native);
@@ -379,6 +394,10 @@ impl Body {
 
     fn is_web(&self) -> bool {
         matches!(self, Self::Web(_) | Self::Placeholder)
+    }
+
+    pub(super) fn is_colorless(&self) -> bool {
+        matches!(self, Self::Web(picture) if picture.last_row_color.is_none())
     }
 }
 
@@ -546,6 +565,7 @@ impl Reader {
                     && self.known_sender(sender.as_deref()).1);
         let scheme = if theme.is_light() { "light" } else { "dark" };
         let (scheme, background) = body.web.appearance(scheme, theme.surface);
+        let background = body.web.has_author_colors().then_some(background);
         Key {
             id: message.id.clone(),
             sender,
@@ -578,9 +598,7 @@ impl Reader {
 
     pub(super) fn close_thread(&mut self) {
         self.show_native_for.clear();
-        for shown in self.shown.values_mut() {
-            shown.continue_at = None;
-        }
+        self.continue_at.clear();
     }
 
     fn continue_in_native(
@@ -589,7 +607,7 @@ impl Reader {
         viewport: gpui::Bounds<gpui::Pixels>,
         line_height: f32,
     ) -> bool {
-        let Some(shown) = self.shown.get_mut(id) else {
+        let Some(shown) = self.shown.get(id) else {
             return false;
         };
         let Body::Web(picture) = &shown.body else {
@@ -611,16 +629,14 @@ impl Reader {
             (1. - (crate::render::CLIP_FADE_HEIGHT + line_height) / height).clamp(0., 1.);
         let fraction =
             snapshot_fraction * webview::SNAPSHOT_HEIGHT_LIMIT as f32 / picture.document_height;
-        shown.continue_at = Some(fraction);
+        self.continue_at.insert(id.to_owned(), fraction);
         self.show_native_for.insert(id.to_owned());
         true
     }
 
     fn clear_native_override(&mut self, id: &str) {
         self.show_native_for.remove(id);
-        if let Some(shown) = self.shown.get_mut(id) {
-            shown.continue_at = None;
-        }
+        self.continue_at.remove(id);
     }
 
     fn show_web_for(&mut self, id: String, sender: Option<String>, body: &HtmlBody) {
@@ -712,7 +728,6 @@ impl Reader {
     pub(super) fn stop(&mut self) {
         self.pending = None;
         self.shown.clear();
-        self.close_thread();
         self.release_opening();
     }
 
@@ -790,18 +805,27 @@ impl Reader {
                     return;
                 }
                 reader.pending = None;
-                if let Ok(picture) = picture {
-                    if picture.is_some()
-                        && let Some(log) = &inbox.frames
-                    {
+                let (picture, too_wide) = match picture {
+                    Ok(picture) => (picture, false),
+                    Err(RenderError::TooWide) => (None, true),
+                    Err(RenderError::Superseded) => {
+                        cx.notify();
+                        return;
+                    }
+                };
+                if let Some(log) = &inbox.frames {
+                    if too_wide {
+                        log.borrow_mut().note("web_too_wide", 1.0);
+                    } else if picture.is_some() {
                         log.borrow_mut().note("web_snapshot", 1.0);
                     }
-                    reader.cache.push_back(Cached {
-                        key: install,
-                        picture,
-                        image_failure,
-                    });
                 }
+                reader.cache.push_back(Cached {
+                    key: install,
+                    picture,
+                    too_wide,
+                    image_failure,
+                });
                 cx.notify();
             });
         });
@@ -816,9 +840,8 @@ impl Reader {
         let Rich::Html(body) = &message.rich else {
             return None;
         };
-        let key = self.key(message, body, theme, width);
-        self.prefers_web(&key.id, key.sender.as_deref(), body)
-            .then_some(key)
+        self.prefers_message_web(message)
+            .then(|| self.key(message, body, theme, width))
     }
 
     pub(super) fn prefetch(
@@ -829,7 +852,6 @@ impl Reader {
         cx: &mut Context<Inbox>,
     ) {
         self.shown.clear();
-        self.close_thread();
         let width = width.round().clamp(1., 1600.) as i32;
         let key = message
             .and_then(|message| self.snapshot_key(message, theme, width))
@@ -975,6 +997,7 @@ impl Reader {
                 .then(|| self.retry_until(&key))
                 .flatten()
                 .filter(|until| real < *until || entry.is_none());
+            let too_wide = entry.is_some_and(|entry| entry.too_wide);
             let failed =
                 retry_until.is_none() && entry.is_some_and(|entry| entry.picture.is_none());
             let retrying = retry_until.is_some();
@@ -982,30 +1005,33 @@ impl Reader {
                 .then(|| self.image(&key))
                 .flatten();
             let large = key.mail.source_bytes() > webview::LARGE_HTML_BYTES;
-            let wait = web && !failed && !large;
-            let stored = web && !failed && large;
-            let placeholder_height = (wait && image.is_none()).then(|| {
-                self.measured
-                    .iter()
-                    .find(|measured| measured.matches(&key))
-                    .map_or_else(
-                        || {
-                            let height = body
-                                .web
-                                .estimated_height_with_style(width as f32, key.text.as_ref())
-                                .max(48.);
+            let placeholder_height = if web && !failed && image.is_none() {
+                if let Some(measured) = self.measured.iter().find(|measured| measured.matches(&key))
+                {
+                    Some(measured.height)
+                } else {
+                    key.mail
+                        .estimated_height_with_style(width as f32, key.text.as_ref())
+                        .map(|height| {
                             if height >= webview::SNAPSHOT_HEIGHT_LIMIT as f32 {
                                 height + crate::render::CLIP_NOTICE_HEIGHT
                             } else {
-                                height
+                                height.max(48.)
                             }
-                        },
-                        |measured| measured.height,
-                    )
-            });
+                        })
+                }
+            } else {
+                None
+            };
+            // A predicted width fallback lays out the actual native body at
+            // the pane width while the worker confirms the document width.
+            let wait = placeholder_height.is_some() && !large;
+            let stored = placeholder_height.is_some() && large;
             let verified = self.verified(body, key.sender.as_deref());
             let always = verified && self.known_sender(key.sender.as_deref()).1;
-            let prompt = if retrying {
+            let prompt = if too_wide {
+                None
+            } else if retrying {
                 Some(Prompt::Retrying)
             } else {
                 self.image_prompt(&key, web, verified, always)
@@ -1056,7 +1082,7 @@ impl Reader {
             let mut frame = shown.frame(now);
             if matches!(frame.body, Body::Native)
                 && (frame.outgoing.is_none() || frame.body_alpha[0] == 0.)
-                && let Some(fraction) = shown.continue_at.take()
+                && let Some(fraction) = self.continue_at.remove(&message.id)
             {
                 frame.continuation = Some(crate::scroll_anchor::Continuation::new(fraction));
             }
@@ -1072,6 +1098,9 @@ impl Reader {
     fn image_prompt(&self, key: &Key, web: bool, verified: bool, always: bool) -> Option<Prompt> {
         let has_images = key.mail.has_remote_images();
         let entry = web.then(|| self.entry(key)).flatten();
+        if entry.is_some_and(|cached| cached.too_wide) {
+            return None;
+        }
         if let Some(cached) = entry
             && (cached.picture.is_none() || cached.image_failure.is_some())
         {
@@ -1581,7 +1610,8 @@ mod tests {
             height: 1.,
             clipped: false,
             document_height: 1.,
-            last_row_color: 0,
+            last_row_color: Some(0),
+            links: Arc::default(),
         }
     }
 
@@ -1620,7 +1650,7 @@ mod tests {
             mail: Arc::new(WebMail::prepare("<p>First account</p>")),
             width: 440,
             scheme: "light",
-            background: 0xffffff,
+            background: Some(0xffffff),
             text: None,
             images: false,
         };
@@ -1748,15 +1778,27 @@ mod tests {
             );
             let before_fade = height - crate::render::CLIP_FADE_HEIGHT - inbox.theme.ui_px * 1.45;
             assert_eq!(
-                inbox.web_mail.shown["newer"].continue_at,
+                inbox.web_mail.continue_at.get("newer").copied(),
                 Some(before_fade / 16_384.)
             );
-            inbox.web_mail.close_thread();
+            inbox.web_mail.stop();
+            inbox.web_mail.prefetch(None, &inbox.theme, 460., cx);
+            assert!(inbox.web_mail.show_native_for.contains("newer"));
+            assert!(inbox.web_mail.continue_at.contains_key("newer"));
+            let current = inbox.open_thread.clone().unwrap();
+            inbox.mark_open(current, None);
+            assert!(
+                !inbox
+                    .web_mail
+                    .prefers_message_web(&inbox.session.messages[1])
+            );
+            inbox.mark_open("another-thread".into(), None);
             assert!(
                 inbox
                     .web_mail
                     .prefers_message_web(&inbox.session.messages[1])
             );
+            assert!(inbox.web_mail.continue_at.is_empty());
         });
     }
 
@@ -1796,6 +1838,75 @@ mod tests {
     }
 
     #[test]
+    fn colorless_switches_and_placeholder_fallback_keep_the_outgoing_layer() {
+        let now = Instant::now();
+        let motion = Motion::new(true);
+        let mut colorless = snapshot();
+        colorless.last_row_color = None;
+        for (from, to) in [
+            (Body::Native, Body::Web(colorless.clone())),
+            (Body::Web(colorless), Body::Native),
+            (Body::Placeholder, Body::Native),
+        ] {
+            let mut shown = Shown::new(Weak::new(), None, false, false, None);
+            shown.body = from;
+            let web = to.is_web();
+            shown.update(to, None, web, motion, now);
+            let painted = now + Duration::from_millis(300);
+            assert_eq!(shown.frame(painted).body_alpha, [1., 0.]);
+            shown.renderer_painted.as_ref().unwrap().set(Some(painted));
+            shown.start_painted_fade(motion, painted, painted);
+            for ms in 1..120 {
+                let [outgoing, incoming] =
+                    shown.frame(painted + Duration::from_millis(ms)).body_alpha;
+                assert_eq!(outgoing, 1.);
+                assert!(incoming > 0. && incoming <= 1.);
+            }
+            assert_eq!(shown.frame(painted + motion::FADE).body_alpha, [0., 1.]);
+        }
+    }
+
+    #[test]
+    fn a_too_wide_body_uses_simple_view_without_retry() {
+        super::super::tests::with_pending_inbox(|inbox, cx| {
+            split_view(inbox);
+            let message = &inbox.session.messages[0];
+            let Rich::Html(body) = &message.rich else {
+                panic!("HTML fixture")
+            };
+            let mut reader = Reader::default();
+            reader
+                .preferences
+                .insert(message.email.clone(), (Some(true), false));
+            let key = reader.key(message, body, &inbox.theme, 460);
+            let now = Instant::now();
+            let old = Shown::new(Arc::downgrade(&key.mail), None, true, false, None);
+            old.height.set(Some(115.));
+            reader.shown.insert(message.id.clone(), old);
+            reader.cache.push_back(Cached {
+                key: key.clone(),
+                picture: None,
+                too_wide: true,
+                image_failure: None,
+            });
+            assert!(reader.image_prompt(&key, true, true, false).is_none());
+            let frames = reader.frames(
+                &inbox.session.messages,
+                (Some(0), &[true, true]),
+                &inbox.theme,
+                460.,
+                (Motion::new(true), now, now),
+                cx,
+            );
+            let frame = &frames[&message.id];
+            assert!(matches!(frame.body, Body::Native));
+            assert!(matches!(frame.outgoing, Some(Body::Placeholder)));
+            assert!(frame.prompt.is_none());
+            assert_eq!(frame.body_alpha, [1., 0.]);
+        });
+    }
+
+    #[test]
     fn retry_evicts_a_failed_snapshot_even_if_the_images_downloaded() {
         let blocked = Key {
             id: "newsletter".into(),
@@ -1803,7 +1914,7 @@ mod tests {
             mail: Arc::new(WebMail::prepare("<p>News</p>")),
             width: 640,
             scheme: "light",
-            background: 0xffffff,
+            background: Some(0xffffff),
             text: None,
             images: false,
         };
@@ -1816,11 +1927,13 @@ mod tests {
             Cached {
                 key: blocked.clone(),
                 picture: Some(snapshot()),
+                too_wide: false,
                 image_failure: None,
             },
             Cached {
                 key: allowed.clone(),
                 picture: None,
+                too_wide: false,
                 image_failure: None,
             },
         ]);
@@ -1839,7 +1952,7 @@ mod tests {
             mail: Arc::new(WebMail::prepare(r#"<img src="https://example.test/hero">"#)),
             width: 460,
             scheme: "light",
-            background: 0xffffff,
+            background: Some(0xffffff),
             text: None,
             images: false,
         };
@@ -1847,6 +1960,7 @@ mod tests {
         reader.cache.push_back(Cached {
             key: key.clone(),
             picture: None,
+            too_wide: false,
             image_failure: None,
         });
         assert!(matches!(
@@ -1871,6 +1985,7 @@ mod tests {
             reader.cache.push_back(Cached {
                 key,
                 picture: None,
+                too_wide: false,
                 image_failure: None,
             });
             let now = Instant::now();
@@ -1906,7 +2021,7 @@ mod tests {
             mail: Arc::new(WebMail::prepare("<p>News</p>")),
             width: 460,
             scheme: "light",
-            background: 0xffffff,
+            background: Some(0xffffff),
             text: None,
             images: false,
         };
@@ -1925,6 +2040,7 @@ mod tests {
         reader.cache.push_back(Cached {
             key: key.clone(),
             picture: Some(held.clone()),
+            too_wide: false,
             image_failure: None,
         });
         reader.cache.extend((0..CACHE_SIZE).map(|id| Cached {
@@ -1933,6 +2049,7 @@ mod tests {
                 ..key.clone()
             },
             picture: Some(snapshot()),
+            too_wide: false,
             image_failure: None,
         }));
         let mut released = Vec::new();
@@ -2107,6 +2224,7 @@ mod tests {
             inbox.web_mail.cache.push_back(Cached {
                 key: key.clone(),
                 picture: Some(image.clone()),
+                too_wide: false,
                 image_failure: None,
             });
             for n in 0..CACHE_SIZE {
@@ -2117,6 +2235,7 @@ mod tests {
                 inbox.web_mail.cache.push_back(Cached {
                     key,
                     picture: None,
+                    too_wide: false,
                     image_failure: None,
                 });
             }
