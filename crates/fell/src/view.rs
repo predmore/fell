@@ -6641,8 +6641,7 @@ fn shell(
                 (&folder, label.as_deref()),
                 motion,
                 now,
-                width,
-                window,
+                (width, window),
                 account_header_fade,
             ),
         })
@@ -7072,8 +7071,7 @@ fn header(
     scope: (&str, Option<&str>),
     motion: &mut InboxMotion,
     now: Instant,
-    width: f32,
-    window: &Window,
+    (width, window): (f32, &Window),
     account_fade: Option<((&str, &str), f32)>,
 ) -> gpui::Div {
     const PAD: f32 = 16.;
@@ -14743,8 +14741,7 @@ mod tests {
                                 ("INBOX", None),
                                 &mut motion,
                                 at + Duration::from_millis(60),
-                                width,
-                                window,
+                                (width, window),
                                 None,
                             )
                         }),
