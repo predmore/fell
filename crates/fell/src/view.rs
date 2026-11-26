@@ -11292,16 +11292,6 @@ fn web_message_body(
                         .absolute()
                         .inset_0(),
                     )
-                })
-                .when(!theme.is_light(), |snapshot| {
-                    snapshot.child(
-                        div()
-                            .absolute()
-                            .inset_0()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(rgb(theme.border)),
-                    )
                 });
             web_column(
                 folds.columns.card.place(snapshot).into_any_element(),

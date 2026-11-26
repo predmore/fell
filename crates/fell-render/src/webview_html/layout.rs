@@ -23,7 +23,8 @@ const HEIGHT_ALLOWANCE: f32 = 12.;
 
 pub(super) const BODY_PAD_X: f32 = 14.;
 pub(super) const BODY_PAD_Y: f32 = 12.;
-pub(super) const BODY_LINE_HEIGHT: f32 = 1.125;
+pub(super) const BODY_FONT_SIZE: f32 = 15.;
+pub(super) const BODY_LINE_HEIGHT: f32 = 1.4;
 
 #[derive(Debug)]
 pub(super) struct Estimate {
@@ -61,7 +62,7 @@ impl Estimate {
         styles.native_body_inset = native_body_inset;
         let root = *layout_dom.root_element();
         let font = Font {
-            size: 16.,
+            size: if author_colors { 16. } else { BODY_FONT_SIZE },
             line: if author_colors {
                 LineHeight::Normal
             } else {
@@ -69,6 +70,7 @@ impl Estimate {
             },
             metrics,
             serif: false,
+            relative_size: !author_colors,
         };
         let layouts = if styles.breakpoints.len() <= 8 {
             std::iter::once(1)
@@ -91,6 +93,15 @@ impl Estimate {
     }
 
     pub(super) fn height(&self, width: f32, image_limit: f32) -> f32 {
+        self.height_at_size(width, image_limit, BODY_FONT_SIZE)
+    }
+
+    pub(super) fn height_at_size(&self, width: f32, image_limit: f32, font_size: f32) -> f32 {
+        let font_scale = if self.author_colors {
+            1.
+        } else {
+            font_size / BODY_FONT_SIZE
+        };
         let width = width.max(1.);
         let index = self
             .layouts
@@ -99,11 +110,24 @@ impl Estimate {
             .1
             .as_ref()
             .map_or(0., |layout| {
-                // Media queries and the image cap use the pane's viewport. A
-                // full-document snapshot also includes any horizontal overflow,
-                // and the reader scales that wider surface back to the pane.
-                let outer_width = width.max(layout.overflow_width(width));
-                layout.measure(outer_width, image_limit).outer_height() * width / outer_width
+                // Reflow at the viewport, as WebKit does. Scale the painted
+                // document only after accounting for horizontal overflow.
+                let trailing_inset = if self.native_body_inset {
+                    BODY_PAD_X
+                } else {
+                    0.
+                };
+                let outer_width = (layout.overflow_width(width) - trailing_inset).max(width);
+                let scale = if outer_width <= super::WEB_SNAPSHOT_WIDTH_LIMIT as f32 {
+                    width / outer_width
+                } else {
+                    // The worker falls back to simple view above the raster limit.
+                    1.
+                };
+                layout
+                    .measure(width, image_limit, font_scale)
+                    .outer_height()
+                    * scale
             })
             + HEIGHT_ALLOWANCE)
             .min(MAX_ESTIMATED_HEIGHT)
@@ -929,7 +953,7 @@ pub(super) fn is_color_property(property: &str) -> bool {
     )
 }
 
-fn sets_color(declaration: &Declaration) -> bool {
+pub(super) fn sets_color(declaration: &Declaration) -> bool {
     is_color_property(&declaration.name)
         && !matches!(
             declaration.value.trim().to_ascii_lowercase().as_str(),
@@ -966,6 +990,10 @@ impl Length {
             })?;
         let number = number.parse::<f32>().ok()?;
         (number.is_finite() && number >= 0.).then(|| unit(number))
+    }
+
+    fn is_fixed(self) -> bool {
+        !matches!(self, Self::Percent(_))
     }
 
     fn resolve(self, width: f32, font: f32) -> f32 {
@@ -1013,6 +1041,7 @@ struct Font {
     line: LineHeight,
     metrics: TextMetrics,
     serif: bool,
+    relative_size: bool,
 }
 
 impl Font {
@@ -1057,6 +1086,7 @@ impl Font {
                 _ => {}
             }
         }
+        let relative_size = self.relative_size && !matches!(size, Some((_, Some(Length::Px(_)))));
         let size = if zero {
             0.
         } else {
@@ -1085,6 +1115,7 @@ impl Font {
             size,
             line,
             serif,
+            relative_size,
             ..self
         }
     }
@@ -1101,12 +1132,17 @@ impl Font {
 #[derive(Debug)]
 enum Layout {
     Text {
+        words: Vec<f32>,
+        space: f32,
         em: f32,
         font: f32,
         line: f32,
+        relative_size: bool,
+        relative_line: bool,
     },
     Break {
         height: f32,
+        relative: bool,
     },
     Image {
         width: f32,
@@ -1272,6 +1308,16 @@ fn css_pixels(value: &str) -> Option<f32> {
     }
     let pixels = value.strip_suffix("px")?.parse::<f32>().ok()?;
     (pixels.is_finite() && pixels >= 0.).then_some(pixels)
+}
+
+pub(super) fn fluid_width_fallback(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    match Length::parse(&value) {
+        Some(Length::Percent(percent)) => percent > 100.,
+        _ => {
+            html_pixels(&value).is_some_and(|width| width >= super::WEB_SNAPSHOT_WIDTH_LIMIT as f32)
+        }
+    }
 }
 
 fn html_pixels(value: &str) -> Option<f32> {
@@ -1460,15 +1506,20 @@ impl Layout {
             Node::Text(text) if inherited.size > 0. => {
                 let advance = inherited.advance();
                 let space = advance(' ');
-                let em = text
+                let words: Vec<f32> = text
                     .split_whitespace()
-                    .map(|word| word.chars().map(advance).sum::<f32>() + space)
-                    .sum::<f32>()
-                    - space;
+                    .map(|word| word.chars().map(advance).sum())
+                    .collect();
+                let em = words.iter().sum::<f32>() + words.len().saturating_sub(1) as f32 * space;
                 return (em > 0.).then_some(Self::Text {
+                    words,
+                    space,
                     em,
                     font: inherited.size,
                     line: inherited.line.resolve(inherited.size, inherited.metrics),
+                    relative_size: inherited.relative_size,
+                    relative_line: inherited.relative_size
+                        && !matches!(inherited.line, LineHeight::Px(_)),
                 });
             }
             Node::Element(element) => element,
@@ -1497,6 +1548,7 @@ impl Layout {
         if name == "br" {
             return (font.size > 0.).then_some(Self::Break {
                 height: font.line.resolve(font.size, font.metrics),
+                relative: font.relative_size && !matches!(font.line, LineHeight::Px(_)),
             });
         }
         let length = |property| {
@@ -1615,20 +1667,37 @@ impl Layout {
             match (children.last_mut(), child) {
                 (
                     Some(Self::Text {
+                        words,
+                        space,
                         em,
                         font: text_font,
                         line,
+                        relative_size,
+                        relative_line,
                     }),
                     Self::Text {
+                        words: next_words,
                         em: next,
                         font: next_font,
                         line: next_line,
+                        relative_size: next_relative_size,
+                        relative_line: next_relative_line,
+                        ..
                     },
-                ) if inline_flow && *text_font == next_font && *line == next_line => {
-                    *em += font.advance()(' ') + next;
+                ) if inline_flow
+                    && *text_font == next_font
+                    && *line == next_line
+                    && *relative_size == next_relative_size
+                    && *relative_line == next_relative_line =>
+                {
+                    *em += *space + next;
+                    words.extend(next_words);
                 }
                 (Some(Self::Text { .. }), Self::Break { .. }) if inline_flow => {
-                    children.push(Self::Break { height: 0. });
+                    children.push(Self::Break {
+                        height: 0.,
+                        relative: false,
+                    });
                 }
                 (_, child) => children.push(child),
             }
@@ -1730,14 +1799,24 @@ impl Layout {
         }
     }
 
-    fn measure(&self, width: f32, image_limit: f32) -> Measured {
+    fn measure(&self, width: f32, image_limit: f32, font_scale: f32) -> Measured {
+        let scale = |value, relative| if relative { value * font_scale } else { value };
         match self {
-            Self::Text { em, font, line } => Measured {
-                height: (em * font / width.max(1.)).ceil() * line,
+            Self::Text {
+                words,
+                space,
+                font,
+                line,
+                relative_size,
+                relative_line,
+                ..
+            } => Measured {
+                height: wrapped_lines(words, *space, width / scale(*font, *relative_size))
+                    * scale(*line, *relative_line),
                 ..Measured::default()
             },
-            Self::Break { height } => Measured {
-                height: *height,
+            Self::Break { height, relative } => Measured {
+                height: scale(*height, *relative),
                 ..Measured::default()
             },
             Self::Image {
@@ -1764,18 +1843,23 @@ impl Layout {
                     below: margin[2].resolve(width, *font),
                 }
             }
-            Self::Flow(flow) => flow.measure(width, image_limit, false),
+            Self::Flow(flow) => flow.measure(width, image_limit, font_scale, false),
         }
     }
 
-    fn inline_width(&self) -> f32 {
+    fn inline_width(&self, font_scale: f32) -> f32 {
         match self {
-            Self::Text { em, font, .. } => em * font,
+            Self::Text {
+                em,
+                font,
+                relative_size,
+                ..
+            } => em * font * if *relative_size { font_scale } else { 1. },
             Self::Image { width, .. } => *width,
             Self::Flow(flow) => flow
                 .children
                 .iter()
-                .map(Self::inline_width)
+                .map(|child| child.inline_width(font_scale))
                 .fold(1., f32::max),
             Self::Break { .. } => 1.,
         }
@@ -1812,6 +1896,27 @@ impl Layout {
         let margins = resolve(flow.margin[1]) + resolve(flow.margin[3]);
         Some(declared + margins + if flow.border_box { 0. } else { left + right })
     }
+}
+
+fn wrapped_lines(words: &[f32], space: f32, width: f32) -> f32 {
+    let width = width.max(0.01);
+    let mut lines = 1.;
+    let mut used = 0.;
+    for &word in words {
+        if used > 0. && used + space + word > width {
+            lines += 1.;
+            used = 0.;
+        }
+        if word > width {
+            // overflow-wrap:anywhere allows a break inside a long word.
+            let breaks = (word / width).ceil() - 1.;
+            lines += breaks;
+            used = word - breaks * width;
+        } else {
+            used += if used == 0. { word } else { space + word };
+        }
+    }
+    lines
 }
 
 fn insets(padding: [Length; 4], border: [f32; 4], width: f32, font: f32) -> [f32; 4] {
@@ -1851,12 +1956,19 @@ impl Flow {
         let Layout::Flow(cell) = child else {
             return None;
         };
-        (cell.kind == FlowKind::Cell
-            && (matches!(cell.width, Some(Length::Px(_)))
-                || matches!(cell.min_width, Some(Length::Px(_)))))
-        .then(|| {
-            let (_, required, edges) = cell.horizontal_size(width);
-            required + edges
+        (cell.kind == FlowKind::Cell && cell.width.is_some_and(Length::is_fixed)).then(|| {
+            let (preferred, _, edges) = cell.horizontal_size(width);
+            (preferred + edges).max(cell.overflow_width(width))
+        })
+    }
+
+    fn effective_max_width(&self) -> Option<Length> {
+        self.max_width.filter(|max| {
+            // WebKit honors an absolute table maximum, but a percentage
+            // does not constrain an otherwise fixed auto-layout table.
+            !(self.kind == FlowKind::Table
+                && self.width.is_some_and(Length::is_fixed)
+                && matches!(max, Length::Percent(_)))
         })
     }
 
@@ -1869,16 +1981,19 @@ impl Flow {
         let declared = |hint: Length| {
             (hint.resolve(width, self.font) - if self.border_box { inset } else { 0. }).max(0.)
         };
-        let maximum = self.max_width.map_or(f32::INFINITY, declared);
+        let maximum = self.effective_max_width().map_or(f32::INFINITY, declared);
         let minimum = self.min_width.map_or(0., declared);
         let preferred = self
             .width
             .map_or(natural, declared)
             .min(maximum)
             .max(minimum);
-        let required = match self.width {
-            Some(Length::Px(_)) => preferred,
-            _ => minimum,
+        let required = if self.kind != FlowKind::Cell && self.width.is_some_and(Length::is_fixed) {
+            preferred
+        } else {
+            self.min_width
+                .filter(|hint| hint.is_fixed())
+                .map_or(0., declared)
         };
         (preferred, required, inset + margins)
     }
@@ -1907,14 +2022,19 @@ impl Flow {
                 .map(|child| child.overflow_width(space))
                 .fold(0., f32::max)
         };
-        required.max(children + spacing) + edges
+        (required.max(children + spacing) + edges).min(super::WEB_SNAPSHOT_WIDTH_LIMIT as f32 + 1.)
     }
 
-    fn inline_lines(&self, width: f32, image_limit: f32) -> impl Iterator<Item = Measured> + '_ {
+    fn inline_lines(
+        &self,
+        width: f32,
+        image_limit: f32,
+        font_scale: f32,
+    ) -> impl Iterator<Item = Measured> + '_ {
         let mut children = self.children.iter().peekable();
         std::iter::from_fn(move || {
             let child = children.next()?;
-            let line = child.measure(width, image_limit);
+            let line = child.measure(width, image_limit, font_scale);
             let Some(mut used) = child.inline_box_width(width) else {
                 return Some(line);
             };
@@ -1924,7 +2044,7 @@ impl Flow {
                 && used + next_width <= width
             {
                 used += next_width;
-                tallest = tallest.max(next.measure(width, image_limit).outer_height());
+                tallest = tallest.max(next.measure(width, image_limit, font_scale).outer_height());
                 children.next();
             }
             Some(Measured {
@@ -1934,7 +2054,13 @@ impl Flow {
         })
     }
 
-    fn measure(&self, width: f32, image_limit: f32, in_table_row: bool) -> Measured {
+    fn measure(
+        &self,
+        width: f32,
+        image_limit: f32,
+        font_scale: f32,
+        in_table_row: bool,
+    ) -> Measured {
         let [top, right, bottom, left] = insets(self.padding, self.border, width, self.font);
         let [above, margin_right, below, margin_left] =
             self.margin.map(|edge| edge.resolve(width, self.font));
@@ -1943,21 +2069,26 @@ impl Flow {
             let inset = if self.border_box { left + right } else { 0. };
             (hint.resolve(width, self.font) - inset).max(1.)
         };
-        let available = self
-            .width
-            // The row already allocated a share of the table to the cell.
-            // Resolving a percentage again would narrow every nested box.
-            .filter(|width| !in_table_row || !matches!(width, Length::Percent(_)))
-            .map_or(natural_width, content_width)
-            .min(self.max_width.map_or(
-                if self.kind == FlowKind::BlockCell {
-                    f32::INFINITY
-                } else {
-                    natural_width
-                },
-                content_width,
-            ))
-            .max(self.min_width.map_or(1., content_width));
+        let maximum = self
+            .effective_max_width()
+            .map_or(f32::INFINITY, content_width);
+        let minimum = self.min_width.map_or(1., content_width);
+        let mut available = if in_table_row && self.kind == FlowKind::Cell {
+            // Auto-layout cell hints are preferences. WebKit wraps content
+            // inside the assigned column after distributing the row width.
+            natural_width
+        } else {
+            self.width
+                .map_or(natural_width, content_width)
+                .min(maximum)
+                .max(minimum)
+        };
+        if self.kind == FlowKind::Table {
+            // A fixed descendant or a cell's minimum can enlarge a table,
+            // including one whose own width is a percentage or auto.
+            available = available
+                .max(self.overflow_width(width) - left - right - margin_left - margin_right);
+        }
         let [row_gap, column_gap] = self.gap.map(|gap| gap.resolve(available, self.font));
         let mut measured = Measured {
             height: 0.,
@@ -1974,13 +2105,21 @@ impl Flow {
                 // blocks. The browser stacks them inside an anonymous cell.
                 self.children
                     .iter()
-                    .map(|child| child.measure(available, image_limit).outer_height())
+                    .map(|child| {
+                        child
+                            .measure(available, image_limit, font_scale)
+                            .outer_height()
+                    })
                     .sum()
             }
             FlowKind::Row | FlowKind::TableRow => {
                 let count = self.children.len();
                 let width = (available - column_gap * count.saturating_sub(1) as f32).max(1.);
-                let preferred: f32 = self.children.iter().map(Layout::inline_width).sum();
+                let preferred: f32 = self
+                    .children
+                    .iter()
+                    .map(|child| child.inline_width(font_scale))
+                    .sum();
                 let equal = width / count.max(1) as f32;
                 let fixed_width = |child| Self::fixed_cell_width(child, equal);
                 let (fixed_count, fixed_total) = if self.kind == FlowKind::TableRow {
@@ -1994,21 +2133,27 @@ impl Flow {
                 let fluid_width = ((width - fixed_total)
                     / count.saturating_sub(fixed_count).max(1) as f32)
                     .max(1.);
+                let fixed_scale =
+                    if fixed_total > 0. && (fixed_total > width || fixed_count == count) {
+                        width / fixed_total
+                    } else {
+                        1.
+                    };
                 self.children
                     .iter()
                     .map(|child| {
                         let share = if self.kind == FlowKind::TableRow {
-                            fixed_width(child).unwrap_or(fluid_width)
+                            fixed_width(child).map_or(fluid_width, |hint| hint * fixed_scale)
                         } else if preferred > width {
-                            width * child.inline_width() / preferred
+                            width * child.inline_width(font_scale) / preferred
                         } else {
                             width
                         };
                         match child {
                             Layout::Flow(flow) if self.kind == FlowKind::TableRow => {
-                                flow.measure(share, image_limit, true)
+                                flow.measure(share, image_limit, font_scale, true)
                             }
-                            _ => child.measure(share, image_limit),
+                            _ => child.measure(share, image_limit, font_scale),
                         }
                         .outer_height()
                     })
@@ -2018,7 +2163,10 @@ impl Flow {
                 let collapses_through_edges = self.kind == FlowKind::Block;
                 let mut previous = 0_f32;
                 let mut height = 0.;
-                for (index, line) in self.inline_lines(available, image_limit).enumerate() {
+                for (index, line) in self
+                    .inline_lines(available, image_limit, font_scale)
+                    .enumerate()
+                {
                     if index == 0 && collapses_through_edges && top == 0. {
                         measured.above = measured.above.max(line.above);
                     } else {
@@ -2048,7 +2196,7 @@ impl Flow {
                 let boxes = self
                     .children
                     .iter()
-                    .map(|child| child.measure(width, image_limit).outer_height());
+                    .map(|child| child.measure(width, image_limit, font_scale).outer_height());
                 let rows = if table {
                     self.children
                         .iter()
@@ -2098,7 +2246,7 @@ fn grouped_resets_and_idle_selectors_keep_their_declarations() {
     let estimate =
         |css: &str| WebMail::prepare(&format!("<style>{css}</style>{body}")).estimated_height(440.);
     let expected = estimate("p{margin:0} h1{margin:0} td{margin:0} .card{height:400px}");
-    assert!((450. ..500.).contains(&expected));
+    assert!((450. ..510.).contains(&expected), "{expected}");
     for card in [
         ".card, .card:hover",
         ".card:focus > p, .card",
@@ -2115,14 +2263,18 @@ fn fixed_table_widths_are_measured_before_scaling_to_the_pane() {
     let body = r#"<body style="color:#222"><table cellpadding="0" cellspacing="0" {table}>
         <tr><td {cell}><div style="height:420px">Story</div></td></tr></table></body>"#;
     for (table, cell, outer_width) in [
-        ("width='600'", "", 600.),
-        ("style='width:600px'", "", 600.),
-        ("style='min-width:600px'", "", 600.),
-        ("", "style='width:598px'", 600.),
-        ("style='width:600px;max-width:100%'", "", 480.),
+        ("width='600'", "", 614.),
+        ("style='width:600px'", "", 614.),
+        ("style='min-width:600px'", "", 614.),
+        ("", "style='width:598px'", 480.),
+        ("style='width:600px;max-width:100%'", "", 614.),
+        ("style='width:600px;max-width:500px'", "", 514.),
+        ("width='100000'", "", 480.),
+        ("style='min-width:100000px'", "", 480.),
+        ("style='min-width:100000%'", "", 480.),
     ] {
         let mail = WebMail::prepare(&body.replace("{table}", table).replace("{cell}", cell));
-        let expected = 422. * 480. / outer_width + HEIGHT_ALLOWANCE;
+        let expected = (422. + 2. * BODY_PAD_Y) * (480. / outer_width) + HEIGHT_ALLOWANCE;
         assert_eq!(mail.estimated_height(480.), expected, "{table} {cell}");
     }
 }
@@ -2140,11 +2292,11 @@ fn structural_selectors_and_negated_hover_apply_at_rest() {
     ));
     assert_eq!(
         mail.estimated_height(440.),
-        280. + 40. + 99. + 300. + HEIGHT_ALLOWANCE + 2. * BODY_PAD_Y
+        280. + 40. + 102. + 300. + HEIGHT_ALLOWANCE + 2. * BODY_PAD_Y
     );
     assert_eq!(
         mail.estimated_height(360.),
-        120. + 40. + 99. + 300. + HEIGHT_ALLOWANCE + 2. * BODY_PAD_Y
+        120. + 40. + 102. + 300. + HEIGHT_ALLOWANCE + 2. * BODY_PAD_Y
     );
 }
 
@@ -2195,7 +2347,7 @@ fn height_estimates_cap_image_hints_and_total_layout() {
     };
     assert_eq!(
         image
-            .measure(440., WebMail::image_height_limit(440.))
+            .measure(440., WebMail::image_height_limit(440.), 1.)
             .outer_height(),
         660.
     );
@@ -2248,7 +2400,7 @@ fn height_estimates_respect_stylesheets_escapes_and_clipped_height() {
         <aside class="clipped">{hidden}</aside>
         <aside style="max-height:10px;overflow:hidden">{hidden}</aside>"#
     );
-    assert_eq!(WebMail::prepare(&html).estimated_height(440.), 106.);
+    assert_eq!(WebMail::prepare(&html).estimated_height(440.), 107.);
 }
 
 #[cfg(test)]
@@ -2329,7 +2481,7 @@ fn height_estimates_keep_author_reveals_and_spacer_boxes() {
     let reveal = WebMail::prepare(
         r#"<style>.show {display:block !important}</style><div class="show" hidden>Story</div>"#,
     );
-    assert_eq!(reveal.estimated_height(440.), 54.);
+    assert_eq!(reveal.estimated_height(440.), 57.);
 
     let mail = WebMail::prepare(concat!(
         "<style>.show {display:block !important}</style>",
@@ -2338,5 +2490,5 @@ fn height_estimates_keep_author_reveals_and_spacer_boxes() {
         r#"<div height="40" style="height:30px;min-height:50px;border-top:3px solid;border-bottom:4px solid;padding-block:8px 9px;margin-block:5px 6px"></div>"#,
         "</body>",
     ));
-    assert_eq!(mail.estimated_height(440.), 169.);
+    assert_eq!(mail.estimated_height(440.), 172.);
 }

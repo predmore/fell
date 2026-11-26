@@ -89,7 +89,7 @@ impl UnavailableImages {
 pub(crate) fn inline_page(
     mail: &fell_render::WebMail,
     scheme: &str,
-    ui_family: Option<&str>,
+    text: Option<&fell_render::WebTextStyle>,
     allowed: impl Fn() -> bool,
 ) -> (String, Result<(), UnavailableImages>) {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
@@ -97,7 +97,7 @@ pub(crate) fn inline_page(
     inline_page_with(
         mail,
         scheme,
-        ui_family,
+        text,
         PAGE_BYTES,
         deadline,
         &allowed,
@@ -117,7 +117,7 @@ pub(crate) fn inline_page(
 fn inline_page_with(
     mail: &fell_render::WebMail,
     scheme: &str,
-    ui_family: Option<&str>,
+    text: Option<&fell_render::WebTextStyle>,
     mut remaining: usize,
     deadline: Instant,
     allowed: impl Fn() -> bool,
@@ -140,7 +140,7 @@ fn inline_page_with(
         failure.retryable |= retryable;
         None
     };
-    let html = mail.page_with_font(scheme, ui_family, |url| {
+    let html = mail.page_with_style(scheme, text, |url| {
         if !allowed() {
             return None;
         }

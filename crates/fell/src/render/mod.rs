@@ -97,6 +97,12 @@ impl Reader {
         let (scheme, background) = self
             .web_mail
             .appearance(palette.scheme(), palette.background);
+        let text = fell_render::WebTextStyle {
+            family: Some("Inter".into()),
+            size: 15.,
+            foreground: palette.foreground,
+            link: palette.accent,
+        };
         let allowed = self.model.remote_images_allowed();
         let key = web.then_some((width, scheme, allowed));
         if self.web_key == key {
@@ -119,12 +125,12 @@ impl Reader {
             let html = cx
                 .background_spawn(async move {
                     if allowed {
-                        remote_images::inline_page(&mail, scheme, Some("Inter"), || {
+                        remote_images::inline_page(&mail, scheme, Some(&text), || {
                             permission.load(Ordering::Acquire)
                         })
                         .0
                     } else {
-                        mail.page_with_font(scheme, Some("Inter"), |_| None)
+                        mail.page_with_style(scheme, Some(&text), |_| None)
                     }
                 })
                 .await;

@@ -336,15 +336,26 @@ fn wait_for_images(widget: &webkit2gtk::WebView, active: Active, token: gtk::gio
                     context.getImageData(0, 0, 1, 1);
                 }
             }
+            // A full-document capture allocates its surface before Rust can
+            // inspect or downsample it. Reject widths outside our raster budget.
+            if (Math.max(document.documentElement.scrollWidth, document.body.scrollWidth) >
+                __WIDTH_LIMIT__) return -1;
             return Math.max(1, document.documentElement.scrollHeight, document.body.scrollHeight);
         })();
     "#;
     if token.is_cancelled() {
         return;
     }
+    static READY_SCRIPT: OnceLock<String> = OnceLock::new();
+    let ready = READY_SCRIPT.get_or_init(|| {
+        READY.replace(
+            "__WIDTH_LIMIT__",
+            &fell_render::WEB_SNAPSHOT_WIDTH_LIMIT.to_string(),
+        )
+    });
     let view = widget.clone();
     widget.run_javascript_in_world(
-        READY,
+        ready,
         "fell-snapshot",
         Some(&token.clone()),
         move |result| {
@@ -861,6 +872,19 @@ mod tests {
             "hostile WebKit corpus drew a frame without proxy, origin or file loads ({public})"
         );
 
+        let too_wide = fell_render::WebMail::prepare(
+            r#"<div style="width:calc(100000px + 1%)">Too wide to rasterize</div>"#,
+        );
+        assert!(
+            futures::executor::block_on(render(WebRequest {
+                html: too_wide.page("light", |_| None),
+                width: 440,
+                background: 0xffffff,
+            }))
+            .unwrap()
+            .is_none()
+        );
+
         let blocked = fell_render::WebMail::prepare(
             r#"<style>@media (width:360px) { p { background:#7a163f; } }</style><p>Preview</p>
             <img src="https://cdn.example.test/width-only" width="300" alt="A photo" style="display:block">"#,
@@ -959,6 +983,14 @@ mod tests {
             )),
             ("fixed-width article", 493, include_str!("../../../fell-render/fixtures/web-fixed-article.html").into()),
             ("SendGrid", 493, include_str!("../../../fell-render/fixtures/web-sendgrid.html").into()),
+            ("nested fixed cells", 493, include_str!("../../../fell-render/fixtures/web-nested-fixed.html").into()),
+            ("oversubscribed fixed cells", 493, include_str!("../../../fell-render/fixtures/web-nested-fixed.html")
+                .replace("padding:18px 10px 22px", "padding:18px 30px 22px")) ,
+            ("oversized attribute width", 493, include_str!("../../../fell-render/fixtures/web-oversized-width.html").into()),
+            ("oversized pixel minimum", 493, include_str!("../../../fell-render/fixtures/web-oversized-width.html")
+                .replace("width=\"100000\"", "").replace("style=\"background:#e8eeef", "style=\"min-width:100000px;background:#e8eeef")),
+            ("oversized percentage minimum", 493, include_str!("../../../fell-render/fixtures/web-oversized-width.html")
+                .replace("width=\"100000\"", "").replace("style=\"background:#e8eeef", "style=\"min-width:100000%;background:#e8eeef")),
             ("ESP grouped reset", 530, String::from(concat!(
                 "<style>body, table, td { margin:0; padding:0 } p, h1, td { margin:0 } ",
                 ".card, .card:hover { height:400px } .card:hover { display:none }</style>",
@@ -997,6 +1029,9 @@ mod tests {
                 "mobile reveal with padded columns" => &[490, 680],
                 "retail" => &[530, 680, 960],
                 "fixed-width article" | "SendGrid" => &[435, 472, 530, 960],
+                "nested fixed cells"
+                | "oversubscribed fixed cells"
+                | "oversized attribute width" => &[530, 960],
                 _ => &[],
             };
             for (scheme, background) in [("light", 0xffffff), ("dark", 0x24283b)] {
@@ -1015,9 +1050,16 @@ mod tests {
                     .unwrap_or_else(|| panic!("WebKit painted {label}"));
                     let estimate = mail.estimated_height(width as f32);
                     let painted = picture.height * width as f32 / picture.width;
+                    if label.starts_with("oversized") {
+                        assert_eq!(picture.width, width as f32, "{label}");
+                    }
+                    if matches!(label, "nested fixed cells" | "oversubscribed fixed cells") {
+                        assert_eq!(picture.width, width.max(654) as f32, "{label}");
+                    }
                     let delta = estimate - painted;
                     eprintln!(
-                        "calibration | {label} | {scheme} | {width} | {estimate:.1} | {painted:.1} | {delta:+.1}"
+                        "calibration | {label} | {scheme} | {width} | {estimate:.1} | {painted:.1} | {delta:+.1} | {:?} × {:?}",
+                        picture.width, picture.height
                     );
                     if !(0. ..=25.).contains(&delta) {
                         outliers.push((label, scheme, width, delta));
@@ -1044,7 +1086,16 @@ mod tests {
             let mail = fell_render::WebMail::prepare(html);
             let (scheme, background) = mail.appearance("dark", 0x24283b);
             let picture = futures::executor::block_on(render(WebRequest {
-                html: mail.page_with_font(scheme, Some("Inter"), |_| None),
+                html: mail.page_with_style(
+                    scheme,
+                    Some(&fell_render::WebTextStyle {
+                        family: Some("Inter".into()),
+                        size: 15.,
+                        foreground: 0xa9b1d6,
+                        link: 0x7aa2f7,
+                    }),
+                    |_| None,
+                ),
                 width: 440,
                 background,
             }))
@@ -1087,7 +1138,7 @@ mod tests {
             r#"<div style="height:1000px;background:#7a163f">A tall hero</div>"#,
         );
         let picture = estimate_covers_snapshot("solid hero", &hero, 440);
-        assert_eq!(picture.height, 1000.);
+        assert_eq!(picture.height, 1024.);
         assert!(!picture.clipped);
 
         let tall = fell_render::WebMail::prepare(

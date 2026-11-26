@@ -639,6 +639,26 @@ fn mix(a: u32, b: u32, t: f32) -> u32 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn web_links_keep_the_first_text_label_and_skip_images() {
+        let html = r#"<p><a href="https://example.test/route"><img src="https://example.test/image" alt="Map"></a>
+            <a href="https://example.test/route"><strong>The route</strong></a>
+            <a href="https://example.test/route">Map again</a>
+            <a href="https://example.test/shops"><img src="https://example.test/logo" alt="Logo">Shops</a></p>"#;
+        let doc = fell_render::prepare(html, &Default::default()).document;
+        let mut links = Vec::new();
+        super::collect_web_links(
+            &doc.blocks,
+            &mut links,
+            &mut std::collections::HashSet::new(),
+        );
+        assert_eq!(
+            fell_render::StyledDocument::blocks_text(&links),
+            "The route\nShops"
+        );
+    }
+
     use super::*;
     use fell_core::{
         Account, Address, BackendKind, FolderRoles, Message, MessageHeaders, MessageId,

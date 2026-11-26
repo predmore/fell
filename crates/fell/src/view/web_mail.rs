@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-use fell_render::{RenderMode, WebMail};
+use fell_render::{RenderMode, WebMail, WebTextStyle};
 use gpui::{
     AnyElement, Context, ElementId, FontWeight, InteractiveElement, IntoElement, ParentElement,
     Styled, Window, div, prelude::*, px, rgb,
@@ -61,7 +61,7 @@ struct MeasuredHeight {
     mail: Weak<WebMail>,
     width: i32,
     images: bool,
-    ui_family: Option<String>,
+    text: Option<WebTextStyle>,
     height: f32,
 }
 
@@ -70,7 +70,7 @@ impl MeasuredHeight {
         self.id == key.id
             && self.width == key.width
             && self.images == key.images
-            && self.ui_family == key.ui_family
+            && self.text == key.text
             && Weak::ptr_eq(&self.mail, &Arc::downgrade(&key.mail))
     }
 }
@@ -83,7 +83,7 @@ struct Key {
     width: i32,
     scheme: &'static str,
     background: u32,
-    ui_family: Option<String>,
+    text: Option<WebTextStyle>,
     images: bool,
 }
 
@@ -100,7 +100,7 @@ impl Key {
             && self.width == other.width
             && self.scheme == other.scheme
             && self.background == other.background
-            && self.ui_family == other.ui_family
+            && self.text == other.text
     }
 }
 
@@ -553,10 +553,12 @@ impl Reader {
             width,
             scheme,
             background,
-            ui_family: theme
-                .ui_family
-                .clone()
-                .filter(|_| !body.web.has_author_colors()),
+            text: (!body.web.has_author_colors()).then(|| WebTextStyle {
+                family: theme.ui_family.clone(),
+                size: theme.ui_px,
+                foreground: theme.foreground,
+                link: theme.accent,
+            }),
             images,
         }
     }
@@ -757,17 +759,15 @@ impl Reader {
                         let (html, result) = remote_images::inline_page(
                             &fetch.mail,
                             fetch.scheme,
-                            fetch.ui_family.as_deref(),
+                            fetch.text.as_ref(),
                             || permission.load(Ordering::Acquire),
                         );
                         (html, result.err())
                     } else {
                         (
-                            fetch.mail.page_with_font(
-                                fetch.scheme,
-                                fetch.ui_family.as_deref(),
-                                |_| None,
-                            ),
+                            fetch
+                                .mail
+                                .page_with_style(fetch.scheme, fetch.text.as_ref(), |_| None),
                             None,
                         )
                     }
@@ -952,7 +952,7 @@ impl Reader {
                         mail: Arc::downgrade(&key.mail),
                         width: key.width,
                         images: key.images,
-                        ui_family: key.ui_family.clone(),
+                        text: key.text.clone(),
                         height,
                     });
                 }
@@ -989,7 +989,10 @@ impl Reader {
                     .find(|measured| measured.matches(&key))
                     .map_or_else(
                         || {
-                            let height = body.web.estimated_height(width as f32).max(48.);
+                            let height = body
+                                .web
+                                .estimated_height_with_style(width as f32, key.text.as_ref())
+                                .max(48.);
                             if height >= webview::SNAPSHOT_HEIGHT_LIMIT as f32 {
                                 height + crate::render::CLIP_NOTICE_HEIGHT
                             } else {
@@ -1617,7 +1620,7 @@ mod tests {
             width: 440,
             scheme: "light",
             background: 0xffffff,
-            ui_family: None,
+            text: None,
             images: false,
         };
         let second_key = Key {
@@ -1800,7 +1803,7 @@ mod tests {
             width: 640,
             scheme: "light",
             background: 0xffffff,
-            ui_family: None,
+            text: None,
             images: false,
         };
         let allowed = Key {
@@ -1836,7 +1839,7 @@ mod tests {
             width: 460,
             scheme: "light",
             background: 0xffffff,
-            ui_family: None,
+            text: None,
             images: false,
         };
         let mut reader = Reader::default();
@@ -1903,7 +1906,7 @@ mod tests {
             width: 460,
             scheme: "light",
             background: 0xffffff,
-            ui_family: None,
+            text: None,
             images: false,
         };
         let mut reader = Reader::default();

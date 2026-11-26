@@ -9,7 +9,19 @@ mod layout;
 pub(crate) use layout::LayoutStyles;
 use layout::style_applies;
 
-fn web_page(body: &str, scheme: &str, body_attrs: &str, body_css: &str) -> String {
+/// Largest scroll width that can be captured in a single raster.
+pub const WEB_SNAPSHOT_WIDTH_LIMIT: i32 = 8192;
+
+/// Typography and colors shared with the native reader for colorless mail.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WebTextStyle {
+    pub family: Option<String>,
+    pub size: f32,
+    pub foreground: u32,
+    pub link: u32,
+}
+
+fn web_page(body: &str, scheme: &str, body_attrs: &str, body_css: &str, link_css: &str) -> String {
     format!(
         r#"<!DOCTYPE html>
 <html>
@@ -21,8 +33,9 @@ fn web_page(body: &str, scheme: &str, body_attrs: &str, body_css: &str) -> Strin
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data: cid:; font-src data:; media-src 'none'; frame-src 'none'; script-src 'none'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none';">
 <style>
   html, body {{ margin: 0; padding: 0; }}
-  table, img {{ max-width: 100%; }}
+  img {{ max-width: 100%; }}
   body {{ overflow-wrap: anywhere; {body_css} }}
+  {link_css}
   img[src=""] {{
     background-color: rgba(128, 128, 128, 0.12);
     border: 0 !important;
@@ -95,6 +108,7 @@ impl WebMail {
         );
         // Keep the body's presentation attributes while replacing its wrapper.
         let mut body_attrs = String::new();
+        let mut author_background = false;
         if let Some(element) = dom
             .root_element()
             .children()
@@ -115,6 +129,7 @@ impl WebMail {
             }
             body_attrs.push_str(" style=\"");
             for rule in html::style_declarations(element.value()) {
+                author_background |= layout::sets_color(&rule);
                 if layout::is_body_spacing(&rule.name) || layout::is_color_property(&rule.name) {
                     write!(body_attrs, "{}:", rule.name).unwrap();
                     serialize_css(&rule.value, &mut body_attrs, None, escape_attr);
@@ -128,7 +143,7 @@ impl WebMail {
         }
         let layout_dom = html::parse_html(&format!("<body{body_attrs}>{body}</body>"));
         // Remote background attributes have empty slots in the offline page.
-        let author_background = dom
+        author_background |= dom
             .root_element()
             .descendants()
             .filter_map(scraper::ElementRef::wrap)
@@ -154,6 +169,12 @@ impl WebMail {
         self.layout.height(width, Self::image_height_limit(width))
     }
 
+    pub fn estimated_height_with_style(&self, width: f32, style: Option<&WebTextStyle>) -> f32 {
+        let size = style.map_or(layout::BODY_FONT_SIZE, |style| style.size);
+        self.layout
+            .height_at_size(width, Self::image_height_limit(width), size)
+    }
+
     pub fn has_author_colors(&self) -> bool {
         self.layout.author_colors
     }
@@ -175,30 +196,36 @@ impl WebMail {
     }
 
     pub fn page(&self, scheme: &str, image: impl FnMut(&str) -> Option<String>) -> String {
-        self.page_with_font(scheme, None, image)
+        self.page_with_style(scheme, None, image)
     }
 
-    pub fn page_with_font(
+    pub fn page_with_style(
         &self,
         scheme: &str,
-        ui_family: Option<&str>,
+        text: Option<&WebTextStyle>,
         mut image: impl FnMut(&str) -> Option<String>,
     ) -> String {
         use std::fmt::Write;
         let mut body_css = String::new();
+        let mut link_css = String::new();
         if !self.has_author_colors() {
             body_css.push_str("font-family: ");
-            if let Some(family) = ui_family {
+            if let Some(family) = text.and_then(|style| style.family.as_deref()) {
                 cssparser::serialize_string(&family.replace('<', "\u{fffd}"), &mut body_css)
                     .unwrap();
                 body_css.push_str(", ");
             }
             write!(
                 body_css,
-                "system-ui, sans-serif; line-height: {};",
+                "system-ui, sans-serif; font-size: {}px; line-height: {};",
+                text.map_or(layout::BODY_FONT_SIZE, |style| style.size),
                 layout::BODY_LINE_HEIGHT
             )
             .unwrap();
+            if let Some(text) = text {
+                write!(body_css, " color: #{:06x};", text.foreground).unwrap();
+                write!(link_css, "a:any-link {{ color: #{:06x}; }}", text.link).unwrap();
+            }
         }
         if self.layout.native_body_inset {
             write!(
@@ -224,6 +251,7 @@ impl WebMail {
             self.appearance(scheme, 0).0,
             &self.body_attrs,
             &body_css,
+            &link_css,
         )
     }
 }
@@ -353,6 +381,7 @@ fn serialize_node(
                 out.push_str("</style>");
                 return;
             }
+            let prepared_page = images.is_some();
             out.push('<');
             out.push_str(name);
             for (name_attr, value) in &element.attrs {
@@ -396,7 +425,12 @@ fn serialize_node(
                 if !keep_attr(name, attr, value, allow_remote_images) {
                     continue;
                 }
-                let value = rewrite_attr(name, attr, value, allow_remote_images);
+                let value =
+                    if prepared_page && attr == "width" && layout::fluid_width_fallback(value) {
+                        "100%".into()
+                    } else {
+                        rewrite_attr(name, attr, value, allow_remote_images)
+                    };
                 out.push(' ');
                 if let Some(prefix) = &name_attr.prefix {
                     out.push_str(prefix.as_ref());
@@ -520,7 +554,7 @@ fn keep_offline_attr(element: &scraper::node::Element, name: &str, value: &str) 
         let css = strip_css_comments(value);
         let mut input = ParserInput::new(&css);
         let mut resources = Vec::new();
-        css_resources(&mut Parser::new(&mut input), 0, false, &mut resources);
+        css_resources(&mut Parser::new(&mut input), &css, 0, false, &mut resources);
         return resources.into_iter().all(|(_, resource)| match resource {
             CssResource::Url(url) | CssResource::ImageString(url) => local_resource(&url),
             _ => false,
@@ -810,10 +844,12 @@ enum CssResource {
     Url(String),
     ImageString(String),
     VariableCandidate,
+    FluidWidth,
 }
 
 fn css_resources(
     css: &mut Parser<'_, '_>,
+    source: &str,
     depth: usize,
     image_strings: bool,
     resources: &mut Vec<(Range<usize>, CssResource)>,
@@ -821,6 +857,18 @@ fn css_resources(
     loop {
         let start = css.position().byte_index();
         let resource = match css.next_including_whitespace_and_comments() {
+            Ok(Token::Dimension { value, unit, .. })
+                if unit.eq_ignore_ascii_case("px")
+                    && *value >= WEB_SNAPSHOT_WIDTH_LIMIT as f32
+                    && css_width_property(source, start) =>
+            {
+                CssResource::FluidWidth
+            }
+            Ok(Token::Percentage { unit_value, .. })
+                if *unit_value > 1. && css_width_property(source, start) =>
+            {
+                CssResource::FluidWidth
+            }
             Ok(Token::AtKeyword(name)) if name.eq_ignore_ascii_case("import") => {
                 let _ = css.parse_until_after(Delimiter::Semicolon, |rule| {
                     while rule.next().is_ok() {}
@@ -866,7 +914,7 @@ fn css_resources(
                 };
                 let _ = css.parse_nested_block(|nested| {
                     if depth < 64 {
-                        css_resources(nested, depth + 1, nested_images, resources);
+                        css_resources(nested, source, depth + 1, nested_images, resources);
                     }
                     Ok::<_, ParseError<'_, ()>>(())
                 });
@@ -890,6 +938,19 @@ fn css_declaration(css: &str, start: usize) -> Option<&str> {
         .map(|(name, _)| name.trim())
 }
 
+fn css_width_property(css: &str, start: usize) -> bool {
+    let Some((name, preceding)) = css[..start]
+        .rsplit([';', '{', '}'])
+        .next()
+        .and_then(|part| part.split_once(':'))
+    else {
+        return false;
+    };
+    preceding.trim().is_empty()
+        && (name.trim().eq_ignore_ascii_case("width")
+            || name.trim().eq_ignore_ascii_case("min-width"))
+}
+
 fn serialize_css(
     css: &str,
     out: &mut String,
@@ -901,10 +962,13 @@ fn serialize_css(
     let css = strip_css_comments(css);
     let mut input = ParserInput::new(&css);
     let mut resources = Vec::new();
-    css_resources(&mut Parser::new(&mut input), 0, false, &mut resources);
+    css_resources(&mut Parser::new(&mut input), &css, 0, false, &mut resources);
     let mut from = 0;
     for (range, resource) in resources {
         let name = css_declaration(&css, range.start);
+        if matches!(resource, CssResource::FluidWidth) && images.is_none() {
+            continue;
+        }
         if images.is_none()
             && matches!(resource, CssResource::VariableCandidate)
             && !name.is_some_and(|name| name.starts_with("--"))
@@ -941,6 +1005,8 @@ fn serialize_css(
             } else {
                 out.push_str(" none ");
             }
+        } else if matches!(resource, CssResource::FluidWidth) {
+            out.push_str("100%");
         } else {
             out.push(' ');
         }
@@ -1244,6 +1310,7 @@ mod tests {
             "<style>@media (max-width:600px){p, a:hover {color: #555}}</style><p>Story</p>",
             "<font color='#555'>Story</font>",
             "<body style='background-image:linear-gradient(#fff,#fff)'>Story</body>",
+            "<body style='background-image:url(https://example.test/paper.png)'>Story</body>",
             "<p style='background-image:linear-gradient(#fff,#fff)'>Story</p>",
             "<style>p {background-image:linear-gradient(#fff,#fff)}</style><p>Story</p>",
             "<table background='https://example.test/paper.png'><tr><td>Story</td></tr></table>",
@@ -1281,9 +1348,22 @@ mod tests {
     #[test]
     fn colorless_mail_uses_the_ui_font_and_respects_author_insets() {
         let plain = WebMail::prepare("<div>Booked.</div>");
-        let page = plain.page_with_font("dark", Some("Inter"), |_| None);
+        let style = WebTextStyle {
+            family: Some("Inter".into()),
+            size: 15.,
+            foreground: 0xa9b1d6,
+            link: 0x7aa2f7,
+        };
+        let page = plain.page_with_style("dark", Some(&style), |_| None);
         assert_eq!(plain.appearance("dark", 0x24283b), ("dark", 0x24283b));
         assert!(page.contains(r#"font-family: "Inter", system-ui, sans-serif"#));
+        assert!(page.contains("font-size: 15px; line-height: 1.4; color: #a9b1d6"));
+        assert!(page.contains("a:any-link { color: #7aa2f7; }"));
+        let bigger = WebTextStyle { size: 20., ..style };
+        assert_eq!(
+            plain.estimated_height_with_style(440., Some(&bigger)) - plain.estimated_height(440.),
+            7.
+        );
         assert!(page.contains("padding: 12px 14px"));
         for html in [
             "<body style='padding-top:6px'><div>Booked.</div></body>",
