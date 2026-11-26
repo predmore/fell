@@ -103,6 +103,7 @@ impl Fixture {
     }
 
     fn with_server(store: Store, server: TestServer) -> Self {
+        server.use_patient_reads();
         {
             let mut writes = server.writes.lock().unwrap();
             writes.moves = true;
