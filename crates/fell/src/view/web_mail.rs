@@ -1181,6 +1181,7 @@ mod tests {
             message.id = id.into();
             message.email = format!("{id}@example.test");
             message.expanded = true;
+            message.body_state = fell_core::BodyState::Stored;
             message.rich = crate::present::Rich::Html(Arc::new(crate::mail_body::prepare_html(
                 r#"<p>Personal note</p><img src="https://example.test/image" alt="Photo">"#,
                 &[("X-Fell-Verified-Sender".into(), message.email.clone())],
@@ -1188,6 +1189,7 @@ mod tests {
             message
         });
         inbox.session.set_messages(messages.into());
+        inbox.settle_pending_bodies();
         inbox.session.pane = Pane::List;
         inbox.conv_layout_current = true;
         inbox.web_mail.trusted_delivery = true;
