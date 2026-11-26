@@ -2389,8 +2389,7 @@ impl Render for ComposeView {
             .as_ref()
             .and_then(|theme| theme.mono_family.clone());
         let can_pick_from = can_pick_from && lock.is_none();
-        let from_width =
-            ((window.viewport_size().width - window.rem_size() * 2.) * 0.70).max(px(0.));
+        let from_width = identity::header_width(window.viewport_size().width, window.rem_size());
         let from_label = self.identity_display.label(
             recipient_theme,
             window,
@@ -2399,7 +2398,7 @@ impl Render for ComposeView {
             &ui_family,
             can_pick_from,
         );
-        let from_picker = self.identity_picker_view(recipient_theme, window, cx);
+        let from_picker = self.identity_picker_view(recipient_theme, &ui_family, window, cx);
         let feedback = feedback.map(|feedback| {
             send_feedback_view(feedback, self.send_panel, &self.send_detail_scroll, colors)
         });

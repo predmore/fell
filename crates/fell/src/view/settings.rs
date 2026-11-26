@@ -1357,10 +1357,12 @@ pub(super) fn card(
             Some(Ok(candidates)) if !candidates.is_empty() => {
                 body = body.child(
                     div()
-                        .px(px(10.)).py(px(6.))
-                        .text_size(px(12.)).line_height(px(17.))
+                        .px(px(10.))
+                        .py(px(6.))
+                        .text_size(px(12.))
+                        .line_height(px(17.))
                         .text_color(rgb(theme.dimmed))
-                        .child("Found in mail delivered to this account. Selected addresses are added to account.toml."),
+                        .child("Found in delivered mail. Selected addresses go into account.toml."),
                 );
                 for (index, candidate) in candidates.iter().enumerate() {
                     let label = crate::present::display_safe(&candidate.address);

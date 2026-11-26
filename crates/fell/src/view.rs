@@ -8322,7 +8322,7 @@ fn clip_shaped(
     })
 }
 
-fn fit_shaped_line(
+pub(crate) fn fit_shaped_line(
     text: &str,
     max_px: f32,
     font_px: f32,

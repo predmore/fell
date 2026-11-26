@@ -2,8 +2,8 @@ use std::time::{Duration, Instant};
 
 use fell_core::{Identity, compose::DraftSession};
 use gpui::{
-    Context, FontWeight, InteractiveElement, MouseButton, ParentElement, ScrollHandle,
-    StatefulInteractiveElement, Styled, Window, div, prelude::*, px, rgb,
+    Context, FontWeight, InteractiveElement, MouseButton, ParentElement, Pixels, ScrollHandle,
+    ShapedLine, SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::*, px, rgb,
 };
 
 use super::ComposeView;
@@ -14,6 +14,14 @@ pub(super) const SIGNATURE_SEPARATOR: &str = "-- ";
 pub(super) const NOTICE_HOLD: Duration = Duration::from_millis(2500);
 const NAME_WEIGHT: FontWeight = FontWeight(550.);
 const FROM_GAP: f32 = 8.;
+const NAME_SHARE: f32 = 0.60;
+const PICKER_BORDER: f32 = 1.;
+const PICKER_ROW_MARGIN: f32 = 4.;
+const PICKER_ROW_PADDING: f32 = 10.;
+const PICKER_ROW_GAP: f32 = 12.;
+const RECEIVED_SIZE: f32 = 12.;
+const RECEIVED_LABEL: &str = "received here";
+const CURRENT_MARK: &str = "✓";
 const FOOTER_FADE_FRACTION: f32 = 0.6;
 
 #[derive(Default)]
@@ -155,41 +163,41 @@ impl Display {
         &self,
         theme: &theme::Theme,
         window: &Window,
-        width: gpui::Pixels,
+        width: Pixels,
         font_px: f32,
         family: &str,
         can_pick: bool,
     ) -> gpui::Div {
-        let mut style = window.text_style();
-        style.font_family = family.to_owned().into();
-        let measure = |text: &str, weight: FontWeight| {
-            let mut run = style.to_run(text.len());
-            run.font.weight = weight;
-            f32::from(
-                window
-                    .text_system()
-                    .shape_line(text.to_owned().into(), px(font_px), &[run], None)
-                    .width,
+        let shape = sender_shaper(window, family);
+        let fit_text = sender_fitter(&shape, font_px);
+        let measure = |text: &str| f32::from(shape(text, FontWeight::NORMAL, font_px).width).ceil();
+        let available = header_line_width(width, can_pick, measure);
+        let fit = |sender: &Sender| {
+            SenderLine::fit(
+                sender.name.as_deref(),
+                &sender.address,
+                available,
+                available * NAME_SHARE,
+                &fit_text,
             )
         };
-        let regular = FontWeight(400.);
-        let chevron = if can_pick {
-            measure("⌄", regular) + FROM_GAP
-        } else {
-            0.
-        };
-        let available = (f32::from(width) - measure("From", regular) - FROM_GAP - chevron).max(0.);
-        let sender_width = |sender: &Sender| {
-            let name = sender.name.as_ref().map_or(0., |name| {
-                measure(name, NAME_WEIGHT).min(available * 0.45) + FROM_GAP
-            });
-            (name + measure(&sender.address, regular)).min(available)
+        let label = |line: SenderLine, sender: &Sender| {
+            let color = if sender.other_than_default {
+                theme.foreground
+            } else {
+                theme.dimmed
+            };
+            let width = line.width;
+            line.view(color, theme.dimmed).justify_end().w(px(width))
         };
         let previous = self.fade.as_ref().and_then(|fade| fade.from.as_ref());
         let progress = previous.map_or(1., |_| motion::ease_out(self.linear_progress));
-        let current_width = sender_width(&self.current);
-        let from_width = previous.map_or(current_width, sender_width);
-        let shown_width = motion::lerp(from_width, current_width, progress);
+        let current_line = fit(&self.current);
+        let previous_line = previous.map(fit);
+        let previous_width = previous_line
+            .as_ref()
+            .map_or(current_line.width, |line| line.width);
+        let shown_width = motion::lerp(previous_width, current_line.width, progress);
         div()
             .flex()
             .justify_end()
@@ -207,23 +215,21 @@ impl Display {
                 div()
                     .relative()
                     .flex_none()
-                    .w(px(shown_width.ceil() + 1.))
+                    .w(px(shown_width.ceil()))
                     .flex()
                     .justify_end()
                     .overflow_hidden()
                     .child(
-                        sender_label(&self.current, theme, available)
+                        label(current_line, &self.current)
                             .flex_none()
-                            .w(px(current_width.ceil() + 1.))
                             .opacity(progress),
                     )
-                    .children(previous.map(|from| {
-                        sender_label(from, theme, available)
+                    .children(previous.zip(previous_line).map(|(from, line)| {
+                        label(line, from)
                             .absolute()
                             .right_0()
                             .top_0()
-                            .w(px(from_width.ceil() + 1.))
-                            .opacity(1. - progress)
+                            .opacity(1. - (2. * progress).min(1.))
                     })),
             )
             // The right edge anchors the chevron through both measurements.
@@ -231,39 +237,125 @@ impl Display {
     }
 }
 
-fn sender_label(sender: &Sender, theme: &theme::Theme, available: f32) -> gpui::Div {
-    let dim = theme.dimmed;
-    let name_color = if sender.other_than_default {
-        theme.foreground
+pub(super) fn header_width(viewport: Pixels, rem: Pixels) -> Pixels {
+    ((viewport - rem * 2.) * 0.70).max(px(0.))
+}
+
+fn header_line_width(width: Pixels, can_pick: bool, measure: impl Fn(&str) -> f32) -> f32 {
+    let chevron = if can_pick {
+        measure("⌄") + FROM_GAP
     } else {
-        dim
+        0.
     };
-    div()
-        .flex()
-        .items_baseline()
-        .justify_end()
-        .min_w_0()
-        .max_w(px(available))
-        .gap(px(FROM_GAP))
-        .children(sender.name.as_ref().map(|name| {
-            div()
-                .max_w(px(available * 0.45))
-                .truncate()
-                .font_weight(NAME_WEIGHT)
-                .text_color(rgb(name_color))
-                .child(name.clone())
-        }))
-        .child(
-            div()
-                .min_w_0()
-                .truncate()
-                .text_color(rgb(if sender.name.is_some() {
-                    dim
-                } else {
-                    name_color
-                }))
-                .child(sender.address.clone()),
-        )
+    f32::from(width) - measure("From") - FROM_GAP - chevron
+}
+
+fn sender_shaper<'a>(
+    window: &'a Window,
+    family: &str,
+) -> impl Fn(&str, FontWeight, f32) -> ShapedLine + 'a {
+    let mut style = window.text_style();
+    style.font_family = family.to_owned().into();
+    move |text, weight, font_px| {
+        let mut run = style.to_run(text.len());
+        run.font.weight = weight;
+        window
+            .text_system()
+            .shape_line(text.to_owned().into(), px(font_px), &[run], None)
+    }
+}
+
+fn sender_fitter(
+    shape: &impl Fn(&str, FontWeight, f32) -> ShapedLine,
+    font_px: f32,
+) -> impl Fn(&str, f32, FontWeight) -> Option<(SharedString, f32)> + '_ {
+    move |text, room, weight| {
+        if text.is_empty() || room < 1. {
+            return None;
+        }
+        let line = crate::view::fit_shaped_line(text, room.floor(), font_px, |text| {
+            Some(shape(text, weight, font_px))
+        })?;
+        let width = f32::from(line.width).ceil();
+        (width <= room).then_some((line.text, width))
+    }
+}
+
+struct SenderLine {
+    name: Option<SharedString>,
+    address: Option<SharedString>,
+    width: f32,
+}
+
+impl SenderLine {
+    fn fit(
+        name: Option<&str>,
+        address: &str,
+        available: f32,
+        name_limit: f32,
+        fit: &impl Fn(&str, f32, FontWeight) -> Option<(SharedString, f32)>,
+    ) -> Self {
+        // Preserve the name's natural width up to its cap. The address
+        // takes the remaining space, including any room the name leaves.
+        let (name, name_width) = name
+            .and_then(|name| fit(name, name_limit, NAME_WEIGHT))
+            .map_or((None, 0.), |(text, width)| (Some(text), width));
+        let gap = if name.is_some() { FROM_GAP } else { 0. };
+        let (address, address_width) =
+            fit(address, available - name_width - gap, FontWeight::NORMAL)
+                .map_or((None, 0.), |(text, width)| (Some(text), width));
+        let width = name_width + address_width + if address.is_some() { gap } else { 0. };
+        Self {
+            name,
+            address,
+            width,
+        }
+    }
+
+    fn view(self, name_color: u32, dimmed: u32) -> gpui::Div {
+        let address_color = if self.name.is_some() {
+            dimmed
+        } else {
+            name_color
+        };
+        div()
+            .flex()
+            .items_baseline()
+            .min_w_0()
+            .gap(px(FROM_GAP))
+            .children(self.name.map(|name| {
+                div()
+                    .flex_shrink_0()
+                    .whitespace_nowrap()
+                    .font_weight(NAME_WEIGHT)
+                    .text_color(rgb(name_color))
+                    .child(name)
+            }))
+            .children(self.address.map(|address| {
+                div()
+                    .flex_shrink()
+                    .whitespace_nowrap()
+                    .text_color(rgb(address_color))
+                    .child(address)
+            }))
+    }
+}
+
+fn picker_width(viewport: f32) -> f32 {
+    (viewport - 32.).clamp(0., 460.)
+}
+
+fn picker_line_widths(card_width: f32, markers: impl IntoIterator<Item = f32>) -> (f32, f32) {
+    let row_width = card_width - 2. * (PICKER_BORDER + PICKER_ROW_MARGIN + PICKER_ROW_PADDING);
+    let available = row_width
+        - markers
+            .into_iter()
+            .map(|width| width.ceil() + PICKER_ROW_GAP)
+            .sum::<f32>();
+    // Markers take space from the address first too, while it still has
+    // a quarter of the remaining line for a preview.
+    let name_limit = (row_width * NAME_SHARE).min(available * 0.75);
+    (available, name_limit)
 }
 
 pub(super) struct Picker {
@@ -427,6 +519,7 @@ impl ComposeView {
     pub(super) fn identity_picker_view(
         &self,
         theme: &theme::Theme,
+        family: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui::Div> {
@@ -446,18 +539,23 @@ impl ComposeView {
         }
         let viewport_width = f32::from(window.viewport_size().width);
         let narrow = viewport_width < 520.;
-        let width = (viewport_width - 32.).clamp(0., 460.);
+        let width = picker_width(viewport_width) * motion::lerp(0.96, 1., progress);
         let height = f32::from(window.viewport_size().height);
+        let shape = sender_shaper(window, family);
+        let fit_text = sender_fitter(&shape, self.ui_px);
+        let marker_width = |text, size| f32::from(shape(text, FontWeight::NORMAL, size).width);
+        let received_width = marker_width(RECEIVED_LABEL, RECEIVED_SIZE);
+        let current_width = marker_width(CURRENT_MARK, self.ui_px);
         let matches = picker.matches();
         let card =
             div()
-                .w(px(width * motion::lerp(0.96, 1., progress)))
+                .w(px(width))
                 .max_h(px((height - 92.).clamp(96., 348.)))
                 .opacity(progress)
                 .flex()
                 .flex_col()
                 .bg(rgb(theme.surface))
-                .border_1()
+                .border(px(PICKER_BORDER))
                 .border_color(rgb(theme.border))
                 .rounded_md()
                 .shadow_lg()
@@ -516,15 +614,34 @@ impl ComposeView {
                             let name = present::display_safe(&identity.name);
                             let address = present::display_safe(&identity.address);
                             let option = identity.address.clone();
+                            let (available, name_limit) = picker_line_widths(
+                                width,
+                                received
+                                    .then_some(received_width)
+                                    .into_iter()
+                                    .chain(current.then_some(current_width)),
+                            );
+                            let line = SenderLine::fit(
+                                Some(&name),
+                                &address,
+                                available,
+                                name_limit,
+                                &fit_text,
+                            );
+                            let (foreground, dimmed) = if selected {
+                                (theme.on_selection, theme.on_selection_dim)
+                            } else {
+                                (theme.foreground, theme.dimmed)
+                            };
                             div()
                                 .id(gpui::ElementId::named_usize("compose-identity", index))
                                 .h(px(42.))
-                                .mx_1()
-                                .px(px(10.))
+                                .mx(px(PICKER_ROW_MARGIN))
+                                .px(px(PICKER_ROW_PADDING))
                                 .rounded_md()
                                 .flex()
                                 .items_center()
-                                .gap_3()
+                                .gap(px(PICKER_ROW_GAP))
                                 .when(selected, |row| {
                                     row.bg(rgb(theme.selection))
                                         .text_color(rgb(theme.on_selection))
@@ -534,46 +651,20 @@ impl ComposeView {
                                         move |this, _, _, cx| this.pick_identity(&option, cx),
                                     ))
                                 })
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .flex()
-                                        .items_baseline()
-                                        .gap_2()
-                                        .when(!name.is_empty(), |line| {
-                                            line.child(
-                                                div()
-                                                    .max_w(gpui::relative(0.45))
-                                                    .truncate()
-                                                    .font_weight(NAME_WEIGHT)
-                                                    .child(name),
-                                            )
-                                        })
-                                        .child(
-                                            div()
-                                                .min_w_0()
-                                                .truncate()
-                                                .when(!identity.name.is_empty(), |line| {
-                                                    line.text_color(rgb(if selected {
-                                                        theme.on_selection_dim
-                                                    } else {
-                                                        theme.dimmed
-                                                    }))
-                                                })
-                                                .child(address),
-                                        ),
-                                )
+                                .child(line.view(foreground, dimmed).flex_1())
                                 .when(received, |row| {
                                     row.child(
                                         div()
                                             .flex_none()
-                                            .text_size(px(12.))
+                                            .text_size(px(RECEIVED_SIZE))
+                                            .whitespace_nowrap()
                                             .text_color(rgb(received_color(theme, selected)))
-                                            .child("received here"),
+                                            .child(RECEIVED_LABEL),
                                     )
                                 })
-                                .when(current, |row| row.child(div().flex_none().child("✓")))
+                                .when(current, |row| {
+                                    row.child(div().flex_none().child(CURRENT_MARK))
+                                })
                         })),
                 );
         Some(
@@ -614,6 +705,47 @@ fn received_color(theme: &theme::Theme, selected: bool) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_sender_name_keeps_its_room_in_the_picker_and_header() {
+        let name = "Fieldwork Studio Letters";
+        let address = "fieldwork-studio-letters@example.test";
+        assert_eq!(name.chars().count(), 24);
+        let measure = |text: &str| 8. * text.chars().count() as f32;
+        let fit = |text: &str, room, _| {
+            let visible = super::super::fit_px(text, room, &measure);
+            let width = measure(&visible);
+            (!visible.is_empty()).then_some((visible.into(), width))
+        };
+        let check = |(available, name_limit)| {
+            let line = SenderLine::fit(Some(name), address, available, name_limit, &fit);
+            assert!(line.width <= available);
+            (line.name.unwrap(), line.address.unwrap())
+        };
+        let header = |viewport| {
+            let available = header_line_width(header_width(px(viewport), px(16.)), true, measure);
+            (available, available * NAME_SHARE)
+        };
+        let picker = |viewport| {
+            picker_line_widths(
+                picker_width(viewport),
+                [measure(RECEIVED_LABEL), measure(CURRENT_MARK)],
+            )
+        };
+
+        let (shown_name, shown_address) = check(header(1040.));
+        assert_eq!(shown_name.as_ref(), name);
+        assert_eq!(shown_address.as_ref(), address);
+        for viewport in [1040., 500.] {
+            let (shown_name, shown_address) = check(picker(viewport));
+            assert_eq!(shown_name.as_ref(), name);
+            assert!(shown_address.ends_with('…'));
+        }
+        let (shown_name, shown_address) = check(header(500.));
+        let prefix = shown_name.strip_suffix('…').unwrap();
+        assert!(!prefix.is_empty() && name.starts_with(prefix));
+        assert!(shown_address.ends_with('…'));
+    }
 
     #[test]
     fn received_here_stays_legible_on_the_selected_row() {
