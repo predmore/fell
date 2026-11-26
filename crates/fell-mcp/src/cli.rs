@@ -411,6 +411,15 @@ fn registry_store(
         // A demo or standalone store may have no account file.
         return Ok(base.to_owned());
     }
+    if let Some(pending) = accounts.interrupted.iter().find(|pending| match id {
+        Some(id) => pending.id == id,
+        None => accounts.configs().next().is_none(),
+    }) {
+        return Err(CliError::new(format!(
+            "{} · Deletion interrupted. Open Fell Settings → Accounts to recover it.",
+            pending.name
+        )));
+    }
     let config = match id {
         Some(id) => registry
             .get(&AccountId(id.into()))

@@ -2010,9 +2010,12 @@ fn account_label(
         )
         .child(
             div()
-                .truncate()
+                .when(account.link_damaged, |detail| {
+                    detail.line_clamp(2).text_ellipsis()
+                })
+                .when(!account.link_damaged, |detail| detail.truncate())
                 .text_size(px(12.))
-                .line_height(px(15.))
+                .line_height(px(if account.link_damaged { 13. } else { 15. }))
                 .text_color(rgb(if account.alert && !account.link_damaged {
                     theme.error
                 } else {

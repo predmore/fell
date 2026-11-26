@@ -306,11 +306,11 @@ impl Registry {
     }
 
     pub fn mailbox_reserved(&self, base: &Path, id: &str) -> Result<bool, FileError> {
-        let (path, backup) = self.mailbox_location(base, id)?;
-        if backup.is_some_and(|backup| verify_backup(base, &backup, id).is_err()) {
-            return Ok(true);
+        match self.mailbox_path(base, id) {
+            Ok(path) => mailbox_exists(&path).map_err(|err| FileError::access(&path, err)),
+            Err(error) if error.is_mailbox_link() => Ok(true),
+            Err(error) => Err(error),
         }
-        mailbox_exists(&path).map_err(|err| FileError::access(&path, err))
     }
 
     fn mailbox_location(
@@ -1028,6 +1028,8 @@ mod tests {
             let damaged = config.join(metadata);
             write_private(&damaged, "invalid = [");
             assert!(registry.mailbox_path(&base, "mail").is_err());
+            assert!(registry.mailbox_reserved(&base, "mail").unwrap());
+            assert!(!registry.mailbox_reserved(&base, "work").unwrap());
             let catalog = registry.load_with_removals(&base);
             assert!(!catalog.is_empty());
             let [entry] = catalog.entries.as_slice() else {
