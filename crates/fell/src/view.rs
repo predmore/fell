@@ -11875,24 +11875,20 @@ fn folder_picker(
                         })
                         .children(label.map(|line| {
                             let matched = folder_match(&line.text, &match_query);
+                            let (label_dim, match_color) = if index == selected {
+                                theme.selected_picker_match
+                            } else {
+                                theme.picker_match
+                            };
                             let highlight = HighlightStyle {
-                                color: Some(
-                                    rgb(if index == selected {
-                                        theme.on_selection_accent
-                                    } else {
-                                        theme.accent
-                                    })
-                                    .into(),
-                                ),
+                                color: Some(rgb(match_color).into()),
                                 ..HighlightStyle::default()
                             };
                             div()
                                 .flex_none()
                                 .whitespace_nowrap()
                                 .font_weight(FontWeight::NORMAL)
-                                .when(matched.is_some(), |label| {
-                                    label.text_color(rgb(detail_color))
-                                })
+                                .when(matched.is_some(), |label| label.text_color(rgb(label_dim)))
                                 .child(
                                     StyledText::new(line.text)
                                         .with_highlights(matched.map(|range| (range, highlight))),

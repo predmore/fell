@@ -1835,7 +1835,7 @@ fn row(
         count,
         star,
         attachment,
-        subject,
+        mut subject,
         detail,
     } = fit_row_line(
         row,
@@ -1887,7 +1887,31 @@ fn row(
             };
             let mut style = subject_style.clone();
             style.color = rgb(dim).into();
-            fit_highlighted_excerpt(window, &style, &text, &highlights, highlight, snippet_room)
+            let excerpt = fit_highlighted_excerpt(
+                window,
+                &style,
+                &text,
+                &highlights,
+                highlight,
+                snippet_room,
+            )
+            .filter(|line| line.width <= px(snippet_room));
+            if selected
+                && subject
+                    .as_ref()
+                    .zip(excerpt.as_ref())
+                    .is_some_and(|(subject, excerpt)| {
+                        clipped_subject_repeats_match(
+                            &row.subject,
+                            &subject.text,
+                            &excerpt.text,
+                            &highlights,
+                        )
+                    })
+            {
+                subject = None;
+            }
+            excerpt
         }
         _ => clip_shaped(
             window,
@@ -1896,9 +1920,9 @@ fn row(
             snippet_room,
             FontWeight::NORMAL,
             Some(dim),
-        ),
+        )
+        .filter(|line| line.width <= px(snippet_room)),
     };
-    let excerpt = excerpt.filter(|line| line.width <= px(snippet_room));
     div()
         .id(gpui::ElementId::named_usize("search-row", index))
         .relative()
@@ -1998,6 +2022,33 @@ fn row(
                 .children(labels.map(|(group, _)| group)),
         )
         .into_any_element()
+}
+
+fn clipped_subject_repeats_match(
+    subject: &str,
+    fitted_subject: &str,
+    fitted_excerpt: &str,
+    highlights: &[Range<usize>],
+) -> bool {
+    let Some(visible_subject) = fitted_subject
+        .strip_suffix('…')
+        .filter(|_| fitted_subject != subject)
+    else {
+        return false;
+    };
+    let Some(remainder) = subject.strip_prefix(visible_subject) else {
+        return false;
+    };
+    if remainder.starts_with(char::is_alphanumeric) {
+        return false;
+    }
+    let visible_subject = visible_subject.to_lowercase();
+    let fitted_excerpt = fitted_excerpt.strip_suffix('…').unwrap_or(fitted_excerpt);
+    highlights.iter().any(|range| {
+        fitted_excerpt
+            .get(range.clone())
+            .is_some_and(|matched| visible_subject == matched.to_lowercase())
+    })
 }
 
 fn fit_highlighted_excerpt(
@@ -2280,6 +2331,28 @@ mod tests {
         assert_eq!(detail_budget(400., 300., 155., 100.), 145.);
         assert_eq!(detail_budget(400., 300., 270., 100.), 100.);
         assert_eq!(detail_budget(260., 150., 270., 100.), 78.);
+    }
+
+    #[test]
+    fn clipped_subject_only_hides_when_it_repeats_a_visible_match() {
+        let subject = "Survey planning";
+        let excerpt = "The survey starts tomorrow";
+        let matches = [4..10, 18..26];
+        for (full, fitted, excerpt, repeats) in [
+            (subject, "Survey…", excerpt, true),
+            ("Surveying the coast", "Survey…", excerpt, false),
+            (subject, "Survey p…", excerpt, false),
+            (subject, "Surv…", excerpt, false),
+            (subject, "Survey…", "The surv…", false),
+            ("Survey…", "Survey…", excerpt, false),
+            (subject, "The…", excerpt, false),
+        ] {
+            assert_eq!(
+                clipped_subject_repeats_match(full, fitted, excerpt, &matches),
+                repeats,
+                "{fitted} with {excerpt}",
+            );
+        }
     }
 
     #[test]
