@@ -1255,7 +1255,13 @@ pub(crate) mod tests {
         let account = me();
         let home = temp_home("socket", &account);
         let hub = Arc::new(DraftHub::new());
-        let socket = home.root.with_file_name("live.sock");
+        // A unix socket path must fit in 108 bytes, and TMPDIR can be deep
+        // (a worktree's target dir), so bind in a short private dir.
+        let socket_dir = tempfile::Builder::new()
+            .prefix("fell-s")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let socket = socket_dir.path().join("live.sock");
         serve_socket_at(hub.clone(), &socket).unwrap();
         let id = home.new_draft(&hub, &account.id, &account.email).unwrap();
         assert!(show_draft(&hub, &id));
