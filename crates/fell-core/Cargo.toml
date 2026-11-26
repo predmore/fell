@@ -62,6 +62,7 @@ unsafe_code = "forbid"
 
 [target."cfg(unix)".dependencies]
 libc = "0.2.191"
+rustix = { version = "1", features = ["process"] }
 xattr = "0.2"
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]

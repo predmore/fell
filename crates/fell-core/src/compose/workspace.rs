@@ -3,8 +3,8 @@
 //! Context is not copied here. Agents read threads through `fell-mcp`.
 
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 
@@ -117,38 +117,83 @@ fn folder_device(folder: &Path) -> Option<u64> {
     fs::metadata(folder).ok().map(|meta| meta.dev())
 }
 
-fn runtime_home() -> PathBuf {
+fn runtime_home() -> io::Result<PathBuf> {
     if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
-        return PathBuf::from(runtime).join("fell");
+        return Ok(PathBuf::from(runtime).join("fell"));
     }
-    std::env::temp_dir().join(format!("fell-{}", user_id()))
+    let uid = rustix::process::geteuid().as_raw();
+    let path = std::env::temp_dir().join(format!("fell-{uid}"));
+    ensure_runtime_dir(&path, uid).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("draft runtime directory {}: {err}", path.display()),
+        )
+    })?;
+    Ok(path)
 }
 
-pub fn draft_root() -> PathBuf {
+fn ensure_runtime_dir(path: &Path, uid: u32) -> io::Result<()> {
+    match fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(err) => return Err(err),
+    }
+
+    let meta = fs::symlink_metadata(path)?;
+    let refuse = |why| io::Error::new(io::ErrorKind::PermissionDenied, why);
+    if meta.is_symlink() {
+        return Err(refuse("is a symlink"));
+    }
+    if !meta.is_dir() {
+        return Err(refuse("is not a directory"));
+    }
+    if meta.uid() != uid {
+        return Err(refuse("is owned by another user"));
+    }
+    if meta.mode() & 0o7777 != 0o700 {
+        // Pin the directory without requiring read access, even at mode 000.
+        // Chmod the pinned inode so a replacement symlink cannot redirect it.
+        let dir = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | O_DIRECTORY | O_NOFOLLOW)
+            .open(path)?;
+        let opened = dir.metadata()?;
+        if (opened.dev(), opened.ino(), opened.uid()) != (meta.dev(), meta.ino(), uid) {
+            return Err(refuse("changed while checking permissions"));
+        }
+        fs::set_permissions(
+            format!("/proc/self/fd/{}", dir.as_raw_fd()),
+            fs::Permissions::from_mode(0o700),
+        )?;
+    }
+    Ok(())
+}
+
+pub fn draft_root() -> io::Result<PathBuf> {
     if let Some(root) = std::env::var_os("FELL_DRAFT_ROOT") {
-        PathBuf::from(root)
+        Ok(PathBuf::from(root))
     } else if cfg!(any(test, feature = "test-utils")) {
         panic!("draft tests must use an explicit root or set FELL_DRAFT_ROOT in an isolated child");
     } else {
-        runtime_home().join("drafts")
+        Ok(runtime_home()?.join("drafts"))
     }
 }
 
-pub fn draft_socket_path() -> PathBuf {
+pub fn draft_socket_path() -> io::Result<PathBuf> {
     if let Some(path) = std::env::var_os("FELL_DRAFT_SOCK") {
-        PathBuf::from(path)
+        Ok(PathBuf::from(path))
     } else if cfg!(any(test, feature = "test-utils")) {
         panic!(
             "draft tests must use an explicit socket or set FELL_DRAFT_SOCK in an isolated child"
         );
     } else {
-        runtime_home().join("live.sock")
+        Ok(runtime_home()?.join("live.sock"))
     }
 }
 
 pub fn draft_folder(id: &str) -> Result<PathBuf, String> {
     validate_id(id)?;
-    Ok(draft_root().join(id))
+    Ok(draft_root().map_err(|err| err.to_string())?.join(id))
 }
 
 pub fn materialize_workspace(
@@ -157,7 +202,13 @@ pub fn materialize_workspace(
     body: &str,
     account: &AccountId,
 ) -> Result<PathBuf, String> {
-    materialize_in(&draft_root(), id, fields, body, account)
+    materialize_in(
+        &draft_root().map_err(|err| err.to_string())?,
+        id,
+        fields,
+        body,
+        account,
+    )
 }
 
 pub fn materialize_in(
@@ -1029,24 +1080,6 @@ fn is_remote(src: &str) -> bool {
     lower.contains("://") || lower.starts_with("cid:") || lower.starts_with("data:")
 }
 
-fn user_id() -> u32 {
-    std::fs::metadata("/proc/self")
-        .map(|meta| meta.uid())
-        .unwrap_or(0)
-}
-
-#[cfg(test)]
-mod uid_test {
-    use super::user_id;
-    use std::os::unix::fs::MetadataExt;
-
-    #[test]
-    fn runtime_fallback_uses_the_numeric_user_id() {
-        let uid = std::fs::metadata("/proc/self").unwrap().uid();
-        assert_eq!(user_id(), uid);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::frontmatter::AttachmentRef;
@@ -1059,6 +1092,57 @@ mod tests {
             .prefix(&format!("fell-draft-{tag}-"))
             .tempdir()
             .unwrap()
+    }
+
+    #[test]
+    fn runtime_fallback_is_private_on_first_use() {
+        let temp = isolated("runtime");
+        let path = temp.path().join("runtime");
+        let uid = rustix::process::geteuid().as_raw();
+        ensure_runtime_dir(&path, uid).unwrap();
+        let meta = fs::symlink_metadata(&path).unwrap();
+        assert!(meta.is_dir());
+        assert_eq!(meta.uid(), uid);
+        assert_eq!(meta.mode() & 0o7777, 0o700);
+        ensure_runtime_dir(&path, uid).unwrap();
+    }
+
+    #[test]
+    fn runtime_fallback_repairs_permissions() {
+        let temp = isolated("runtime");
+        let path = temp.path().join("runtime");
+        fs::create_dir(&path).unwrap();
+        for mode in [0o777, 0o000, 0o2700] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            ensure_runtime_dir(&path, rustix::process::geteuid().as_raw()).unwrap();
+            assert_eq!(fs::symlink_metadata(&path).unwrap().mode() & 0o7777, 0o700);
+        }
+    }
+
+    #[test]
+    fn runtime_fallback_refuses_a_symlink_without_touching_its_target() {
+        let temp = isolated("runtime");
+        let target = temp.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = temp.path().join("runtime");
+        symlink(&target, &path).unwrap();
+        let err = ensure_runtime_dir(&path, rustix::process::geteuid().as_raw()).unwrap_err();
+        assert!(err.to_string().contains("symlink"));
+        assert_eq!(fs::read_link(&path).unwrap(), target);
+        assert_eq!(fs::metadata(&target).unwrap().mode() & 0o7777, 0o755);
+    }
+
+    #[test]
+    fn runtime_fallback_refuses_a_foreign_owner_without_repairing_permissions() {
+        let temp = isolated("runtime");
+        let path = temp.path().join("runtime");
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let other_uid = fs::symlink_metadata(&path).unwrap().uid() ^ 1;
+        let err = ensure_runtime_dir(&path, other_uid).unwrap_err();
+        assert!(err.to_string().contains("owned by another user"));
+        assert_eq!(fs::symlink_metadata(&path).unwrap().mode() & 0o7777, 0o755);
     }
 
     #[test]

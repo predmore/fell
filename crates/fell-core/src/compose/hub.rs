@@ -1212,7 +1212,7 @@ fn ok_draft_with(id: Value, session: &DraftSession, _agent: &str, changes: Strin
 }
 
 pub fn rpc_call(request: &Value) -> Result<Value, String> {
-    let path = draft_socket_path();
+    let path = draft_socket_path().map_err(|err| err.to_string())?;
     let mut stream = UnixStream::connect(&path).map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound
             || err.kind() == std::io::ErrorKind::ConnectionRefused
@@ -1264,7 +1264,7 @@ fn open_draft_for_agent(
 }
 
 pub fn editor_is_running() -> bool {
-    UnixStream::connect(draft_socket_path()).is_ok()
+    draft_socket_path().is_ok_and(|path| UnixStream::connect(path).is_ok())
 }
 
 pub fn file_fallback_get(draft_id: &str, agent: &str, account: &str) -> Result<Value, String> {

@@ -31,7 +31,9 @@ use crate::compose_ui::ComposeView;
 /// Answer `fell-mcp` draft calls on the user's private socket. Another Fell
 /// already serving it keeps it; this one then serves no agents.
 pub fn serve_socket(hub: Arc<DraftHub>) {
-    if let Err(err) = serve_socket_at(hub, &fell_core::compose::draft_socket_path()) {
+    if let Err(err) =
+        fell_core::compose::draft_socket_path().and_then(|path| serve_socket_at(hub, &path))
+    {
         fell_core::diagnostic!(
             WARN,
             "Could not serve agent drafts",
@@ -61,10 +63,23 @@ pub(crate) fn inbox_socket(
     hub: Arc<DraftHub>,
     initial: Option<ComposeLaunch>,
 ) -> Result<Option<mpsc::Receiver<ComposeLaunch>>, String> {
-    let path = fell_core::compose::draft_socket_path();
+    let listener =
+        fell_core::compose::draft_socket_path().and_then(|path| match DraftHub::bind(&path) {
+            Ok(listener) => Ok(Some(listener)),
+            Err(err) => {
+                if let Some(initial) = &initial
+                    && err.kind() == io::ErrorKind::AddrInUse
+                {
+                    send_compose(&path, initial)?;
+                    return Ok(None);
+                }
+                Err(err)
+            }
+        });
     let (mut queued, requests) = mpsc::channel(4);
-    match DraftHub::bind(&path) {
-        Ok(listener) => {
+    match listener {
+        Ok(None) => return Ok(None),
+        Ok(Some(listener)) => {
             if let Some(initial) = initial {
                 queued.try_send(initial).expect("empty compose queue");
             }
@@ -75,11 +90,7 @@ pub(crate) fn inbox_socket(
             });
         }
         Err(err) => {
-            if let Some(initial) = initial {
-                if err.kind() == io::ErrorKind::AddrInUse {
-                    send_compose(&path, &initial).map_err(|err| err.to_string())?;
-                    return Ok(None);
-                }
+            if initial.is_some() {
                 return Err(format!("could not open the Fell socket: {err}"));
             }
             fell_core::diagnostic!(
@@ -297,14 +308,14 @@ pub(crate) struct DraftHome {
 
 impl DraftHome {
     /// The real drafts location for the mailbox at `store`.
-    pub fn real(store: PathBuf) -> Self {
-        Self {
-            root: fell_core::compose::draft_root(),
+    pub fn real(store: PathBuf) -> io::Result<Self> {
+        Ok(Self {
+            root: fell_core::compose::draft_root()?,
             store,
             registry: fell_core::accounts::Registry::resolve().ok(),
             #[cfg(test)]
             _temp: None,
-        }
+        })
     }
 
     fn account_config(&self, account: &AccountId) -> Option<fell_core::AccountConfig> {
@@ -821,7 +832,7 @@ pub(crate) mod tests {
             .unwrap()
             .upsert_account(&account)
             .unwrap();
-        let home = DraftHome::real(db);
+        let home = DraftHome::real(db).unwrap();
         let hub = DraftHub::new();
         let mailto = crate::compose_launch::mailto(
             "mailto:team@example.org?body=use_snake_case%0A%2A%2Anote%2A%2A",
