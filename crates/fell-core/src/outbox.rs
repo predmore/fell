@@ -96,6 +96,9 @@ CREATE TABLE IF NOT EXISTS server_outbox (
     -- 0 when unknown.
     target_uidvalidity INTEGER NOT NULL DEFAULT 0,
     target_uidnext INTEGER NOT NULL DEFAULT 0,
+    -- Exclusive upper UID bound from the most recent MOVE recovery check.
+    -- NULL before a usable UIDNEXT is observed, including on older rows.
+    move_recovery_end INTEGER,
     -- Undo's reverse of a row that was sent but not settled: that row's
     -- id. The reverse moves the copy that row places. 0 otherwise.
     reverses INTEGER NOT NULL DEFAULT 0,
@@ -144,6 +147,7 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
         "target_uidnext",
         "INTEGER NOT NULL DEFAULT 0",
     ),
+    ("server_outbox", "move_recovery_end", "INTEGER"),
     ("server_outbox", "reverses", "INTEGER NOT NULL DEFAULT 0"),
     ("server_outbox", "flag_value", "INTEGER"),
     ("server_outbox", "flag_modseq", "BLOB"),
@@ -292,6 +296,7 @@ pub struct OutboxEntry {
     pub sent: bool,
     /// The destination's UID state before sending the write.
     pub(crate) target_bound: Option<Bound>,
+    pub(crate) move_recovery_end: Option<u32>,
     /// Undo's reverse of the row with this id, which was sent but not yet
     /// settled: this row moves the copy that one places.
     pub reverses: Option<i64>,
@@ -367,7 +372,7 @@ pub enum DropReason {
 const ENTRY_COLS: &str = "id, kind, state, action_id, message_id, source_folder, source_mailbox,
     uidvalidity, uid, target_folder, target_mailbox, placed_uidvalidity, placed_uid,
     attempts, retry_unix, error, generation, sent, reverses,
-    flag_value, flag_modseq, flag_base, target_uidvalidity, target_uidnext";
+    flag_value, flag_modseq, flag_base, target_uidvalidity, target_uidnext, move_recovery_end";
 
 impl Store {
     /// Turn write-back on or off for the account (`write_back` in
@@ -941,6 +946,7 @@ fn select_entries(
                 row.get::<_, Option<[u8; 8]>>(20)?.map(u64::from_be_bytes),
                 row.get::<_, Option<bool>>(21)?,
                 (row.get::<_, u32>(22)?, row.get::<_, u32>(23)?),
+                row.get::<_, Option<u32>>(24)?,
             ),
         ))
     })?;
@@ -971,6 +977,7 @@ fn select_entries(
                 flag_modseq,
                 flag_base,
                 target_bound,
+                move_recovery_end,
             ),
         ) = row?;
         out.push(OutboxEntry {
@@ -993,6 +1000,7 @@ fn select_entries(
             generation,
             sent,
             target_bound: (target_bound.1 > 0).then_some(target_bound),
+            move_recovery_end,
             reverses: (reverses != 0).then_some(reverses),
             flag_value,
             flag_modseq,
@@ -1132,7 +1140,8 @@ pub(crate) fn mark_moves_sent(
             let changed = tx.execute(
                 "UPDATE server_outbox
                  SET sent = 1, source_mailbox = ?2, uidvalidity = ?3, uid = ?4,
-                     target_mailbox = ?5, target_uidvalidity = ?6, target_uidnext = ?7
+                     target_mailbox = ?5, target_uidvalidity = ?6, target_uidnext = ?7,
+                     move_recovery_end = NULL
                  WHERE id = ?1 AND account_id = ?8 AND state = 'pending'
                    AND generation = ?9 AND sent = 0",
                 params![
@@ -1154,6 +1163,16 @@ pub(crate) fn mark_moves_sent(
     }
     tx.commit()?;
     Ok(marked)
+}
+
+/// Save the exclusive UID bound before further recovery commands can fail.
+pub(crate) fn record_move_recovery_end(store: &Store, id: i64, end: u32) -> Result<()> {
+    store.connection().execute(
+        "UPDATE server_outbox SET move_recovery_end = ?2
+         WHERE id = ?1 AND state = 'pending' AND sent = 1 AND move_recovery_end IS NOT ?2",
+        params![id, end],
+    )?;
+    Ok(())
 }
 
 /// Record that a label write for these rows is about to go out. `target` is the
@@ -1616,17 +1635,29 @@ fn synced_reversal(store: &Store, account: &AccountId, entry: &OutboxEntry) -> R
     let placed = if let Some((mailbox, (validity, first))) =
         entry.target_mailbox.as_deref().zip(entry.target_bound)
     {
+        let end = entry
+            .move_recovery_end
+            .map(i64::from)
+            .unwrap_or(i64::from(first) + crate::imap::RECOVERY_UID_LIMIT as i64);
         let uid: Option<u32> = store.connection().query_row(
             "SELECT CASE WHEN COUNT(*) = 1 THEN MAX(c.uid) END FROM message_copies c
              WHERE c.account_id = ?1 AND c.message_id = ?2 AND c.mailbox = ?3
-               AND c.uidvalidity = ?4 AND c.uid >= ?5
+               AND c.uidvalidity = ?4 AND c.uid >= ?5 AND c.uid < ?6
                AND NOT EXISTS (SELECT 1 FROM server_outbox o
                                WHERE o.account_id = c.account_id AND o.kind = 'move'
-                                 AND ((o.state = 'pending' AND o.source_mailbox = ?6
+                                 AND ((o.state = 'pending' AND o.source_mailbox = ?7
                                        AND o.uidvalidity = c.uidvalidity AND o.uid = c.uid)
-                                   OR (o.target_mailbox = ?6 AND o.placed_uidvalidity = c.uidvalidity
+                                   OR (o.target_mailbox = ?7 AND o.placed_uidvalidity = c.uidvalidity
                                        AND o.placed_uid = c.uid)))",
-            params![account.as_str(), entry.message_id, crate::imap::escape_mailbox(mailbox), validity, first, mailbox],
+            params![
+                account.as_str(),
+                entry.message_id,
+                crate::imap::escape_mailbox(mailbox),
+                validity,
+                first,
+                end,
+                mailbox,
+            ],
             |row| row.get(0),
         )?;
         uid.map(|uid| (validity, uid))

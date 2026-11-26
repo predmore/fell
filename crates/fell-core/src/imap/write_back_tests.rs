@@ -1834,6 +1834,63 @@ fn undo_uses_only_a_unique_synced_destination_after_the_source_resets() {
 }
 
 #[test]
+fn undo_ignores_a_duplicate_synced_after_the_move_recovery_window() {
+    for moved_copy_survives in [true, false] {
+        let fx = move_with_lost_reply();
+        fx.server.writes.lock().unwrap().refuse_search = true;
+        let dropped = fx.replay_until_dropped();
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].reason, DropReason::MoveSourceGone);
+        let account = &fx.account.id;
+        assert_eq!(
+            fx.store.outbox(account).unwrap()[0].move_recovery_end,
+            Some(2)
+        );
+
+        if !moved_copy_survives {
+            // Another client removed the moved copy before sync saw it.
+            fx.server.state.lock().unwrap().mailboxes[1]
+                .messages
+                .clear();
+        }
+        fx.server.writes.lock().unwrap().refuse_search = false;
+        fx.deliver(
+            "Archive",
+            2,
+            raw_with_message_id("Message-ID: <bravo@x>\r\n", "Bravo"),
+        );
+        fx.store.undo(account).unwrap();
+        fx.sync();
+        assert_eq!(fx.copy_recorded("Archive", 1), moved_copy_survives);
+        assert!(fx.copy_recorded("Archive", 2));
+        fx.clear_commands();
+
+        if moved_copy_survives {
+            assert_eq!(fx.replay().sent, 1);
+            assert!(without_tags(&fx.writes()).contains(&"UID MOVE 1 \"INBOX\"".into()));
+        } else {
+            let report = fx.replay();
+            assert_eq!((report.sent, report.waiting), (0, 1), "{report:?}");
+            assert_eq!(fx.store.outbox(account).unwrap()[1].attempts, 1);
+            let dropped = fx.replay_until_dropped();
+            assert_eq!(dropped.len(), 1);
+            assert_eq!(dropped[0].reason, DropReason::UnconfirmedReverse);
+            let reverse = &fx.store.outbox(account).unwrap()[1];
+            assert_eq!(
+                (reverse.state, reverse.attempts),
+                (OutboxState::Dropped, super::write_back::MAX_ATTEMPTS - 1)
+            );
+            assert!(
+                without_tags(&fx.writes())
+                    .iter()
+                    .all(|command| !command.starts_with("UID MOVE"))
+            );
+        }
+        assert_eq!(fx.on_server("Archive"), vec![(2, "Bravo".into())]);
+    }
+}
+
+#[test]
 fn move_recovery_skips_a_uid_span_wider_than_the_limit() {
     let fx = move_with_lost_reply();
     fx.server.state.lock().unwrap().mailboxes[1].uidnext =
@@ -1842,6 +1899,10 @@ fn move_recovery_skips_a_uid_span_wider_than_the_limit() {
     assert_eq!(fx.replay().waiting, 1);
     let row = &fx.store.outbox(&fx.account.id).unwrap()[0];
     assert_eq!((row.state, row.attempts), (OutboxState::Pending, 1));
+    assert_eq!(
+        row.move_recovery_end,
+        Some(1 + super::write_back::RECOVERY_UID_LIMIT as u32)
+    );
     assert!(
         without_tags(&fx.commands())
             .iter()

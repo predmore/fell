@@ -24,7 +24,8 @@
 //!
 //! Undo's reverse of a row that was sent but not settled waits behind it,
 //! then moves the copy that row placed. If replay gave up finding that copy,
-//! the reverse can use a destination UID recorded by the read-only sync.
+//! the reverse can use a destination UID recorded by the read-only sync
+//! within the persisted recovery window.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
@@ -51,7 +52,7 @@ pub(crate) const MAX_ATTEMPTS: u32 = 5;
 const BACKOFF_SECS: [i64; 5] = [10, 30, 120, 600, 1800];
 /// Inconclusive checks are independent of explicit APPEND refusals.
 pub(super) const MAX_APPEND_CHECKS: u32 = 5;
-pub(super) const RECOVERY_UID_LIMIT: usize = 500;
+pub(crate) const RECOVERY_UID_LIMIT: usize = 500;
 const RECOVERY_HEADER_BATCH: usize = 100;
 const UNCONFIRMED_MOVE: &str = "Could not confirm the move";
 
@@ -679,6 +680,7 @@ impl Pass<'_> {
     ) -> Result<(Option<u32>, bool), Stop> {
         let mut complete = true;
         let mut found = None;
+        // search_uid_range returns UIDs in ascending order from search_uids.
         for batch in uids.chunks(RECOVERY_HEADER_BATCH) {
             let headers = session
                 .uid_fetch_message_ids(batch)
@@ -1256,9 +1258,14 @@ impl Pass<'_> {
             MoveSource::Unknown
         };
         let outcome = match (source, target) {
-            (Some(_), Some((target, bound))) => {
-                self.locate(session, &entry.message_id, target, Some(bound), taken, true)
-            }
+            (Some(_), Some((target, bound))) => self.locate(
+                session,
+                &entry.message_id,
+                target,
+                Some(bound),
+                taken,
+                Some(entry.id),
+            ),
             _ => Ok(Transfer::Unknown),
         };
         match outcome {
@@ -1376,7 +1383,7 @@ impl Pass<'_> {
     ) -> Result<Option<(u32, u32)>, Stop> {
         let entry = &self.entries[row];
         let message = "cannot identify the label copy";
-        match self.locate(session, &entry.message_id, target, bound, taken, false) {
+        match self.locate(session, &entry.message_id, target, bound, taken, None) {
             Ok(Transfer::Placed(placed)) => Ok(Some(placed)),
             Ok(_) => {
                 self.retry(row, DropReason::NotFound, message)?;
@@ -1406,8 +1413,9 @@ impl Pass<'_> {
         target: &str,
         bound: Option<outbox::Bound>,
         taken: &[Option<(u32, u32)>],
-        check_absence: bool,
+        move_id: Option<i64>,
     ) -> Result<Transfer, Stop> {
+        let check_absence = move_id.is_some();
         let synthetic = is_synthetic_message_id(message_id);
         if synthetic && !check_absence {
             return Ok(Transfer::Unknown);
@@ -1424,6 +1432,15 @@ impl Pass<'_> {
             Err(WriteError::Connection(error)) => return Err(Stop::Connection(error)),
         };
         self.selected = Some((target.to_string(), uidvalidity));
+        if let (Some(id), Some(next)) = (move_id, next)
+            && uidvalidity == bound_validity
+            && first != 0
+            && next >= first
+        {
+            // Keep the bound even if the checks below cannot identify a copy.
+            let end = next.min(first.saturating_add(RECOVERY_UID_LIMIT as u32));
+            outbox::record_move_recovery_end(self.store, id, end)?;
+        }
         if check_absence && first != 0 && uidvalidity == bound_validity && next == Some(first) {
             return Ok(Transfer::Absent);
         }
@@ -1451,6 +1468,7 @@ impl Pass<'_> {
             }
             candidates.push(uid);
         }
+        // Filtering the sorted search_uids result preserves ascending order.
         for batch in candidates.chunks(RECOVERY_HEADER_BATCH) {
             let headers = match session.uid_fetch_message_ids(batch) {
                 Ok(headers) => headers,
@@ -1479,6 +1497,7 @@ impl Pass<'_> {
             Ok(_) | Err(WriteError::Refused(_)) => return Ok(Transfer::Unknown),
             Err(WriteError::Connection(error)) => return Err(Stop::Connection(error)),
         };
+        // search_uids already sorted these UIDs, so sort the headers to match.
         for batch in uids.chunks(RECOVERY_HEADER_BATCH) {
             let mut headers = match session.uid_fetch_message_ids(batch) {
                 Ok(headers) => headers,

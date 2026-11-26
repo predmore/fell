@@ -36,6 +36,7 @@ pub(crate) use rfc822::{
 };
 pub(crate) use stored_metadata::{fetch_internal_dates, fetch_reply_to};
 pub use structure::BodyStructure;
+pub(crate) use write_back::RECOVERY_UID_LIMIT;
 
 #[cfg(test)]
 mod bridge_sync_tests;
