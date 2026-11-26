@@ -802,7 +802,7 @@ impl Session {
             Some(Io::Tls(stream)) => &stream.sock.inner,
             None => return Err(imap_err("connection closed")),
         };
-        tcp.set_read_timeout(Some(timeout))
+        set_socket_read_timeout(tcp, timeout)
             .map_err(|err| imap_err(format!("read timeout on {}: {err}", self.host)))
     }
 
@@ -1406,8 +1406,7 @@ fn connect_addrs(
         tried = true;
         match TcpStream::connect_timeout(&addr, TIMEOUT) {
             Ok(stream) => {
-                stream
-                    .set_read_timeout(Some(TIMEOUT))
+                set_socket_read_timeout(&stream, TIMEOUT)
                     .map_err(|err| imap_err(err.to_string()))?;
                 stream
                     .set_write_timeout(Some(TIMEOUT))
@@ -1425,6 +1424,20 @@ fn connect_addrs(
     }
     let err = last_err.expect("a failed connect records an error");
     Err(imap_err(format!("connect {host}:{port} failed: {err}")))
+}
+
+fn set_socket_read_timeout(stream: &TcpStream, timeout: Duration) -> std::io::Result<()> {
+    // A loaded test machine can stall a loopback reply past TIMEOUT. Fixture
+    // sockets get a longer bound, so a stall passes and a real hang still fails.
+    #[cfg(test)]
+    if timeout == TIMEOUT
+        && stream
+            .peer_addr()
+            .is_ok_and(super::test_server::uses_patient_reads)
+    {
+        return stream.set_read_timeout(Some(super::test_server::PATIENT_READ_TIMEOUT));
+    }
+    stream.set_read_timeout(Some(timeout))
 }
 
 fn wrap_tls(

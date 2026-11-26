@@ -6,9 +6,9 @@
 //! arrived. Give `uidnext` when the highest UID goes, as a real server keeps
 //! UIDNEXT where it was.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -102,8 +102,21 @@ pub(super) struct TestState {
 
 type Structures = Option<Arc<HashMap<u32, String>>>;
 
+/// The read timeout on both ends of a patient fixture's connections. Long
+/// enough for a scheduler stall on a loaded machine, short enough that a
+/// test that really hangs fails instead of stalling CI.
+pub(super) const PATIENT_READ_TIMEOUT: Duration = Duration::from_secs(120);
+
+// Both ends use the fixture's listening address, including when the client
+// opens a new session through AccountConfig or from another thread.
+static PATIENT_READS: Mutex<BTreeSet<SocketAddr>> = Mutex::new(BTreeSet::new());
+
+pub(super) fn uses_patient_reads(addr: SocketAddr) -> bool {
+    PATIENT_READS.lock().unwrap().contains(&addr)
+}
+
 pub(super) struct TestServer {
-    pub addr: std::net::SocketAddr,
+    pub addr: SocketAddr,
     pub state: Arc<Mutex<TestState>>,
     /// Bytes the server has written to clients, greetings and replies alike.
     pub sent: Arc<AtomicUsize>,
@@ -124,6 +137,11 @@ impl TestServer {
     /// while another connection reads the mailbox.
     pub(super) fn spawn_parallel(state: TestState, structures: HashMap<u32, String>) -> Self {
         Self::spawn_with(state, Some(Arc::new(structures)))
+    }
+
+    /// Read with [`PATIENT_READ_TIMEOUT`] instead of the client's own timeout.
+    pub(super) fn use_patient_reads(&self) {
+        PATIENT_READS.lock().unwrap().insert(self.addr);
     }
 
     fn spawn_with(state: TestState, structures: Structures) -> Self {
@@ -164,6 +182,7 @@ impl TestServer {
 
 impl Drop for TestServer {
     fn drop(&mut self) {
+        PATIENT_READS.lock().unwrap().remove(&self.addr);
         self.shutdown.store(true, Ordering::Relaxed);
         let _ = TcpStream::connect_timeout(&self.addr, Duration::from_secs(1));
         if let Some(thread) = self.thread.take() {
@@ -182,6 +201,7 @@ fn accept_loop(
     structures: Structures,
 ) {
     listener.set_nonblocking(false).expect("blocking");
+    let addr = listener.local_addr().expect("local addr");
     let mut connections = Vec::new();
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -194,7 +214,11 @@ fn accept_loop(
                 }
                 // As long as the client's own timeout: a large fetch on a
                 // loaded machine can still be persisting when the reply ends.
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
+                let _ = stream.set_read_timeout(Some(if uses_patient_reads(addr) {
+                    PATIENT_READ_TIMEOUT
+                } else {
+                    Duration::from_secs(15)
+                }));
                 if let Some(structures) = &structures {
                     let (state, writes, sent, body_responses, structures) = (
                         state.clone(),
