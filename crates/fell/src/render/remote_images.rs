@@ -14,6 +14,7 @@ use url::Url;
 
 const IMAGE_BYTES: usize = 4 * 1024 * 1024;
 const PAGE_BYTES: usize = 12 * 1024 * 1024;
+const MIN_DATA_URI_BYTES: usize = "data:image/png;base64,AAAA".len();
 const FETCH_TIME: Duration = Duration::from_secs(3);
 const PAGE_TIME: Duration = Duration::from_secs(12);
 
@@ -24,17 +25,26 @@ pub(crate) enum Failure {
     Response,
     Format,
     Limit,
+    PageLimit,
 }
 
 impl Failure {
-    fn label(&self) -> String {
+    fn label(&self, compact: bool) -> String {
         match self {
+            Self::Unreachable(_) if compact => "Couldn’t reach server".into(),
             Self::Unreachable(host) => format!("Couldn’t reach {host}"),
+            Self::Response if compact => "Server error".into(),
+            Self::Format if compact => "Unsupported format".into(),
             Self::Address => "Image address blocked".into(),
             Self::Response => "Image server didn’t return an image".into(),
             Self::Format => "Unsupported or damaged image".into(),
-            Self::Limit => "Image download limit reached".into(),
+            Self::Limit => "Size limit".into(),
+            Self::PageLimit => "Download limit reached".into(),
         }
+    }
+
+    fn retryable(&self) -> bool {
+        !matches!(self, Self::Limit | Self::PageLimit)
     }
 }
 
@@ -42,16 +52,25 @@ impl Failure {
 pub(crate) struct UnavailableImages {
     first: Failure,
     count: usize,
+    retryable: bool,
 }
 
 impl UnavailableImages {
     pub(crate) fn label(&self, compact: bool) -> String {
         let noun = if self.count == 1 { "image" } else { "images" };
-        if compact {
-            format!("{} {noun} unavailable", self.count)
-        } else {
-            format!("{} {noun} unavailable · {}", self.count, self.first.label())
+        match (&self.first, self.count) {
+            (Failure::Limit, 1) => "1 image too large".into(),
+            (Failure::PageLimit, 1) => self.first.label(compact),
+            _ => format!(
+                "{} {noun} unavailable · {}",
+                self.count,
+                self.first.label(compact)
+            ),
         }
+    }
+
+    pub(crate) fn retryable(&self) -> bool {
+        self.retryable
     }
 }
 
@@ -61,9 +80,13 @@ pub(crate) fn inline_page(
     allowed: impl Fn() -> bool,
 ) -> (String, Result<(), UnavailableImages>) {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-    inline_page_with(mail, scheme, PAGE_BYTES, &allowed, |url, limit| {
-        fetch(AGENT.get_or_init(agent), url, limit, &allowed)
-    })
+    inline_page_with(
+        mail,
+        scheme,
+        PAGE_BYTES,
+        &allowed,
+        |url, limit, bytes_read| fetch(AGENT.get_or_init(agent), url, limit, &allowed, bytes_read),
+    )
 }
 
 fn inline_page_with(
@@ -71,32 +94,39 @@ fn inline_page_with(
     scheme: &str,
     mut remaining: usize,
     allowed: impl Fn() -> bool,
-    mut fetch: impl FnMut(&str, usize) -> Result<String, Failure>,
+    mut fetch: impl FnMut(&str, usize, &mut usize) -> Result<String, Failure>,
 ) -> (String, Result<(), UnavailableImages>) {
     let deadline = Instant::now() + PAGE_TIME;
     let mut fetched: HashMap<String, Result<String, Failure>> = HashMap::new();
     let mut unavailable = None;
     let mut limited = false;
-    let mut failed = |error| {
-        if error == Failure::Limit && std::mem::replace(&mut limited, true) {
+    let mut failed = |error: Failure| {
+        if error == Failure::PageLimit && std::mem::replace(&mut limited, true) {
             return None;
         }
+        let retryable = error.retryable();
         let failure = unavailable.get_or_insert(UnavailableImages {
             first: error,
             count: 0,
+            retryable: false,
         });
         failure.count += 1;
+        failure.retryable |= retryable;
         None
     };
     let html = mail.page(scheme, |url| {
-        if !allowed() || Instant::now() >= deadline || remaining == 0 {
-            return failed(Failure::Limit);
+        if !allowed() || Instant::now() >= deadline || remaining < MIN_DATA_URI_BYTES {
+            return failed(Failure::PageLimit);
         }
         let image = match fetched.entry(url.to_owned()) {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => {
-                let image = entry.insert(fetch(url, remaining));
+                let mut bytes_read = 0;
+                let image = entry.insert(fetch(url, remaining, &mut bytes_read));
                 if let Err(error) = image {
+                    // Failed bodies still spent network bytes. A successful
+                    // one is charged its larger encoded length below.
+                    remaining = remaining.saturating_sub(bytes_read);
                     return failed(error.clone());
                 }
                 image
@@ -107,7 +137,7 @@ fn inline_page_with(
                 remaining -= data.len();
                 Some(data.clone())
             }
-            Ok(_) => failed(Failure::Limit),
+            Ok(_) => failed(Failure::PageLimit),
             Err(_) => None,
         }
     });
@@ -171,6 +201,7 @@ fn fetch(
     source: &str,
     encoded_limit: usize,
     allowed: &impl Fn() -> bool,
+    bytes_read: &mut usize,
 ) -> Result<String, Failure> {
     let mut url = Url::parse(source).map_err(|_| Failure::Address)?;
     let started = Instant::now();
@@ -223,15 +254,16 @@ fn fetch(
         // Base64 takes four bytes per three input bytes, including padding.
         let limit = (encoded_limit.saturating_sub(data.len()) / 4 * 3).min(IMAGE_BYTES);
         if limit == 0 {
-            return Err(Failure::Limit);
+            return Err(Failure::PageLimit);
         }
         let mut bytes = Vec::new();
-        response
+        let result = response
             .into_body()
             .into_reader()
             .take(limit as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| unreachable())?;
+            .read_to_end(&mut bytes);
+        *bytes_read = bytes.len();
+        result.map_err(|_| unreachable())?;
         if !allowed() || bytes.len() > limit {
             return Err(Failure::Limit);
         }
@@ -310,8 +342,15 @@ mod tests {
             body.len(),
         )
         .unwrap();
-        stream.write_all(body).unwrap();
-        stream.flush().unwrap();
+        if let Err(error) = stream.write_all(body).and_then(|()| stream.flush()) {
+            assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ),
+                "writing fixture response: {error}"
+            );
+        }
     }
 
     #[test]
@@ -398,11 +437,17 @@ mod tests {
                 );
             });
             assert_eq!(
-                fetch(&client, &http_url("/start"), data.len(), &|| true),
+                fetch(&client, &http_url("/start"), data.len(), &|| true, &mut 0),
                 Ok(data.clone())
             );
             assert_eq!(
-                fetch(&client, &http_url("/image"), data.len() - 1, &|| true),
+                fetch(
+                    &client,
+                    &http_url("/image"),
+                    data.len() - 1,
+                    &|| true,
+                    &mut 0
+                ),
                 Err(Failure::Limit)
             );
             for url in [
@@ -412,7 +457,7 @@ mod tests {
                 format!("https://{HOST}:{https_port}/downgrade"),
             ] {
                 assert_eq!(
-                    fetch(&client, &url, PAGE_BYTES, &|| true),
+                    fetch(&client, &url, PAGE_BYTES, &|| true, &mut 0),
                     Err(Failure::Address),
                     "{url}"
                 );
@@ -437,7 +482,7 @@ mod tests {
                 "light",
                 PAGE_BYTES,
                 || true,
-                |url, _| {
+                |url, _, _| {
                     if url == urls[0] {
                         Ok("data:image/png;base64,AAAA".into())
                     } else if url == urls[1] {
@@ -452,7 +497,8 @@ mod tests {
                 result,
                 Err(UnavailableImages {
                     first: Failure::Response,
-                    count: 2
+                    count: 2,
+                    retryable: true
                 })
             ));
         }
@@ -471,7 +517,7 @@ mod tests {
             "light",
             data.len(),
             || true,
-            |url, _| {
+            |url, _, _| {
                 if url.ends_with("/bad") {
                     Err(Failure::Response)
                 } else {
@@ -485,7 +531,8 @@ mod tests {
             result,
             Err(UnavailableImages {
                 first: Failure::Response,
-                count: 2
+                count: 2,
+                retryable: true
             })
         ));
     }
@@ -501,15 +548,19 @@ mod tests {
         let (page, result) = inline_page_with(
             &mail,
             "light",
-            small.len(),
+            PAGE_BYTES,
             || true,
-            |url, limit| {
-                assert_eq!(limit, small.len());
+            |url, limit, bytes_read| {
                 requested.push(url.rsplit('/').next().unwrap().to_owned());
                 match requested.last().unwrap().as_str() {
-                    "big" => Err(Failure::Limit),
-                    "larger" => Ok(format!("{small}AAAA")),
-                    _ => Ok(small.into()),
+                    "big" | "larger" => {
+                        *bytes_read = IMAGE_BYTES + 1;
+                        Err(Failure::Limit)
+                    }
+                    _ => {
+                        assert_eq!(limit, PAGE_BYTES - 2 * (IMAGE_BYTES + 1));
+                        Ok(small.into())
+                    }
                 }
             },
         );
@@ -519,8 +570,60 @@ mod tests {
             result,
             Err(UnavailableImages {
                 first: Failure::Limit,
-                count: 1
+                count: 2,
+                retryable: false
             })
         ));
+    }
+
+    #[test]
+    fn many_oversized_responses_cannot_spend_the_page_budget_repeatedly() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut html = String::new();
+        for index in 0..48 {
+            html.push_str(&format!(r#"<img src="http://{HOST}:{port}/{index}">"#));
+        }
+        let mail = fell_render::WebMail::prepare(&html);
+        let client = ureq::Agent::with_parts(
+            agent_config(ureq::tls::TlsConfig::default()),
+            DefaultConnector::default(),
+            LoopbackResolver,
+        );
+        let mut requested = 0;
+        let mut read = 0;
+        let body = vec![0; IMAGE_BYTES + 1];
+        let (_, result) = inline_page_with(
+            &mail,
+            "light",
+            PAGE_BYTES,
+            || true,
+            |url, limit, bytes_read| {
+                let path = format!("/{requested}");
+                let result = std::thread::scope(|scope| {
+                    scope.spawn(|| {
+                        respond(
+                            accept(&listener),
+                            &path,
+                            "200 OK\r\nContent-Type: image/png",
+                            &body,
+                        );
+                    });
+                    fetch(&client, url, limit, &|| true, bytes_read)
+                });
+                assert_eq!(result, Err(Failure::Limit));
+                requested += 1;
+                read += *bytes_read;
+                result
+            },
+        );
+
+        assert!(result.is_err_and(|failure| !failure.retryable()));
+        assert!((3..48).contains(&requested), "{requested} requests");
+        assert!(
+            (PAGE_BYTES - MIN_DATA_URI_BYTES..=PAGE_BYTES + IMAGE_BYTES).contains(&read),
+            "{read} bytes"
+        );
     }
 }

@@ -24,7 +24,8 @@ use crate::render::webview::{self, Snapshot, WebRequest};
 const CACHE_SIZE: usize = 12;
 const THREAD_HOLD: Duration = Duration::from_millis(150);
 const SNAPSHOT_BATCH: Duration = Duration::from_millis(550);
-const WEB_EXIT: Duration = Duration::from_millis(60);
+const RENDERER_EXIT: Duration = Duration::from_millis(60);
+const RENDERER_CHANGE: Duration = Duration::from_millis(140);
 const MEASURED_HEIGHTS: usize = 4 * CACHE_SIZE;
 const PROMPT_HEIGHT: f32 = 30.;
 const PROMPT_GAP: f32 = 8.;
@@ -179,9 +180,14 @@ impl Shown {
     ) {
         self.reserves_tag |= web;
         if !self.body.same_as(&body) {
+            let duration = if self.body.is_web() != body.is_web() {
+                RENDERER_CHANGE
+            } else {
+                motion::FADE
+            };
             self.outgoing = Some(std::mem::replace(&mut self.body, body));
             self.from_height = self.height.get();
-            self.fade = motion.start(motion::FADE, now);
+            self.fade = motion.start(duration, now);
         }
         if !motion.enabled() || self.fade.is_none_or(|fade| !fade.running(now)) {
             self.fade = None;
@@ -232,9 +238,19 @@ impl Shown {
 
     fn frame(&self, now: Instant) -> Frame {
         let progress = motion::progress(self.fade.as_ref(), now);
-        let height_progress = self
-            .fade
-            .map_or(1., |fade| motion::ease_out_quad(fade.linear(now)));
+        let linear = self.fade.map_or(1., |fade| fade.linear(now));
+        let height_progress = motion::ease_out_quad(linear);
+        let body_alpha = match &self.outgoing {
+            Some(outgoing) if outgoing.is_web() != self.body.is_web() => {
+                let exit = RENDERER_EXIT.as_secs_f32() / RENDERER_CHANGE.as_secs_f32();
+                [
+                    (1. - linear / exit).max(0.),
+                    motion::ease_out((linear - exit) / (1. - exit)),
+                ]
+            }
+            Some(Body::Placeholder) => [(1. - progress / motion::ease_out(0.4)).max(0.), progress],
+            _ => [1., progress],
+        };
         let current_tag = f32::from(u8::from(self.body.is_web()));
         let previous_tag = self
             .outgoing
@@ -244,8 +260,7 @@ impl Shown {
         Frame {
             body: self.body.clone(),
             outgoing: self.outgoing.clone(),
-            progress,
-            linear_progress: self.fade.map_or(1., |fade| fade.linear(now)),
+            body_alpha,
             height_progress,
             prompt: (self.prompt.is_some() || self.prompt_fade.is_some()).then(|| PromptFrame {
                 incoming: self.prompt.clone(),
@@ -302,8 +317,7 @@ impl Body {
 pub(super) struct Frame {
     pub body: Body,
     pub outgoing: Option<Body>,
-    pub progress: f32,
-    linear_progress: f32,
+    pub body_alpha: [f32; 2],
     pub height_progress: f32,
     pub prompt: Option<PromptFrame>,
     pub web_tag: Option<f32>,
@@ -314,16 +328,6 @@ pub(super) struct Frame {
 }
 
 impl Frame {
-    pub(super) fn outgoing_alpha(&self, light: bool) -> f32 {
-        match (&self.outgoing, &self.body) {
-            (Some(Body::Placeholder), _) => (1. - self.progress / motion::ease_out(0.4)).max(0.),
-            (Some(Body::Web(_)), Body::Native) if light => (1.
-                - self.linear_progress * motion::FADE.as_secs_f32() / WEB_EXIT.as_secs_f32())
-            .max(0.),
-            _ => 1.,
-        }
-    }
-
     pub(super) fn body_animating(&self) -> bool {
         self.height_progress < 1.0
     }
@@ -987,10 +991,20 @@ impl Inbox {
             if shown.retrying {
                 return;
             }
-            if let Some(Prompt::Unavailable { images, .. }) = shown.prompt {
-                shown.retrying = true;
-                self.web_mail.retry_images(id, images);
-                cx.notify();
+            if let Some(Prompt::Unavailable {
+                images,
+                ref failure,
+                ..
+            }) = shown.prompt
+            {
+                if failure
+                    .as_ref()
+                    .is_none_or(remote_images::UnavailableImages::retryable)
+                {
+                    shown.retrying = true;
+                    self.web_mail.retry_images(id, images);
+                    cx.notify();
+                }
                 return;
             }
         }
@@ -1025,10 +1039,8 @@ impl Inbox {
         } else if let Some(sender) = sender {
             let allow = action == Action::AllowSenderImages;
             if allow && !self.web_mail.verified(body, Some(&sender)) {
-                self.session.show_toast(
-                    "Sender verification unavailable · Allow images for this message instead",
-                    false,
-                );
+                self.session
+                    .show_toast("Sender verification unavailable · Use Load images", false);
                 return;
             }
             self.web_mail
@@ -1138,7 +1150,10 @@ fn prompt_layer(
                 "Remote images blocked"
             }
             .into(),
-            Some(("Load images", Action::AllowMessageImages)),
+            Some((
+                Action::AllowMessageImages.label(),
+                Action::AllowMessageImages,
+            )),
             verified.then_some(("Always allow", Action::AllowSenderImages)),
         ),
         Prompt::Loading => ("Loading remote images…".into(), None, None),
@@ -1164,7 +1179,10 @@ fn prompt_layer(
                 || "Couldn’t render web view · showing simple view".into(),
                 |failure| failure.label(width < COMPACT_PROMPT_WIDTH).into(),
             ),
-            Some(("Retry", Action::AllowMessageImages)),
+            failure
+                .as_ref()
+                .is_none_or(remote_images::UnavailableImages::retryable)
+                .then_some(("Retry", Action::AllowMessageImages)),
             if *always {
                 Some(("Revoke", Action::BlockSenderImages))
             } else {
@@ -1366,17 +1384,34 @@ mod tests {
     }
 
     #[test]
-    fn the_web_layer_fades_out_under_the_light_native_view_for_60_ms() {
-        let started = Instant::now();
+    fn switching_renderers_fades_through_while_loading_images_keeps_the_old_snapshot() {
+        let now = Instant::now();
+        let motion = Motion::new(true);
+        for to_web in [true, false] {
+            let mut shown = Shown::new(Weak::new(), (!to_web).then(snapshot), false, false, None);
+            let target = if to_web {
+                Body::Web(snapshot())
+            } else {
+                Body::Native
+            };
+            shown.update(target, None, to_web, motion, now);
+            let at = |ms| shown.frame(now + Duration::from_millis(ms));
+            assert_eq!(at(0).body_alpha, [1., 0.]);
+            assert!((at(30).body_alpha[0] - 0.5).abs() < 0.001);
+            assert_eq!(at(60).body_alpha, [0., 0.]);
+            assert!(at(60).body_animating());
+            assert_eq!(at(140).body_alpha, [0., 1.]);
+            assert!(!at(140).body_animating());
+            for ms in 0..=140 {
+                let [outgoing, incoming] = at(ms).body_alpha;
+                assert_eq!(outgoing * incoming, 0., "{ms} ms");
+            }
+        }
         let mut shown = Shown::new(Weak::new(), Some(snapshot()), false, false, None);
-        shown.update(Body::Native, None, false, Motion::new(true), started);
-        assert_eq!(shown.frame(started).outgoing_alpha(true), 1.);
-        let halfway = shown.frame(started + Duration::from_millis(30));
-        assert!((halfway.outgoing_alpha(true) - 0.5).abs() < 0.001);
-        assert!(halfway.progress > 0.);
-        let end = shown.frame(started + Duration::from_millis(60));
-        assert_eq!(end.outgoing_alpha(true), 0.);
-        assert!(end.body_animating());
+        shown.update(Body::Web(snapshot()), None, true, motion, now);
+        let [outgoing, incoming] = shown.frame(now + motion::FADE / 2).body_alpha;
+        assert_eq!(outgoing, 1.);
+        assert!(incoming > 0. && incoming < 1.);
     }
 
     #[test]
@@ -1525,7 +1560,7 @@ mod tests {
     }
 
     #[test]
-    fn an_expanded_native_body_crossfades_from_its_painted_height() {
+    fn an_expanded_native_body_transitions_from_its_painted_height() {
         let mut shown = Shown::new(Weak::new(), None, false, false, None);
         shown.height.set(Some(350.));
         let now = Instant::now();
@@ -1534,8 +1569,8 @@ mod tests {
         assert_eq!(frame.from_height, Some(350.));
         assert!(matches!(frame.outgoing, Some(Body::Native)));
         assert_eq!(frame.web_tag, Some(0.));
-        let frame = shown.frame(now + motion::FADE / 2);
-        assert_eq!(frame.web_tag, Some(frame.progress));
+        let frame = shown.frame(now + RENDERER_CHANGE / 2);
+        assert_eq!(frame.web_tag, Some(motion::ease_out(0.5)));
     }
 
     #[test]

@@ -143,25 +143,16 @@ pub(crate) fn reflow(
     layered(width, layers, frame.alpha, frame.height, [true; 2])
 }
 
-/// Fade the new body over the old one without exposing the card underneath.
-pub(super) fn crossfade(
+/// Lay out the two mail bodies while their shared slot changes height.
+pub(super) fn body_transition(
     width: f32,
-    progress: f32,
+    alpha: [f32; 2],
     height_progress: f32,
     from_height: Option<f32>,
     layers: [AnyElement; 2],
-    outgoing_alpha: f32,
-    native_fill: Option<u32>,
 ) -> AnyElement {
-    let mut fade = layer_pair(
-        width,
-        layers,
-        [outgoing_alpha, progress],
-        height_progress,
-        [true; 2],
-    );
+    let mut fade = layer_pair(width, layers, alpha, height_progress, [true; 2]);
     fade.from_height = from_height;
-    fade.native_fill = native_fill;
     fade.into_any_element()
 }
 
@@ -222,7 +213,6 @@ fn layer_pair(
         height,
         clipped,
         from_height: None,
-        native_fill: None,
     }
 }
 
@@ -232,7 +222,6 @@ struct Layered {
     height: f32,
     clipped: [bool; 2],
     from_height: Option<f32>,
-    native_fill: Option<u32>,
 }
 
 impl IntoElement for Layered {
@@ -244,7 +233,7 @@ impl IntoElement for Layered {
 }
 
 impl Element for Layered {
-    type RequestLayoutState = Pixels;
+    type RequestLayoutState = ();
     type PrepaintState = ();
 
     fn id(&self) -> Option<ElementId> {
@@ -261,7 +250,7 @@ impl Element for Layered {
         _: Option<&InspectorElementId>,
         window: &mut Window,
         cx: &mut App,
-    ) -> (LayoutId, Pixels) {
+    ) -> (LayoutId, ()) {
         let space = size(AvailableSpace::MaxContent, AvailableSpace::MaxContent);
         let [from, to] = self
             .layers
@@ -275,7 +264,7 @@ impl Element for Layered {
             },
             ..Style::default()
         };
-        (window.request_layout(style, [], cx), px(to))
+        (window.request_layout(style, [], cx), ())
     }
 
     fn prepaint(
@@ -283,7 +272,7 @@ impl Element for Layered {
         _: Option<&GlobalElementId>,
         _: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
-        _: &mut Pixels,
+        _: &mut (),
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -304,25 +293,12 @@ impl Element for Layered {
         _: Option<&GlobalElementId>,
         _: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
-        incoming_height: &mut Pixels,
+        _: &mut (),
         _: &mut (),
         window: &mut Window,
         cx: &mut App,
     ) {
         for (index, layer) in self.layers.iter_mut().enumerate() {
-            // As the web layer shrinks, blend its exposed bottom into the
-            // same fill the native layer is painting above it.
-            if index == 1
-                && let Some(fill) = self.native_fill
-                && bounds.size.height > *incoming_height
-            {
-                let tail = Bounds::new(
-                    gpui::point(bounds.left(), bounds.top() + *incoming_height),
-                    size(bounds.size.width, bounds.size.height - *incoming_height),
-                );
-                let fill = gpui::Hsla::from(gpui::rgb(fill)).opacity(self.alpha[1]);
-                window.paint_quad(gpui::fill(tail, fill));
-            }
             if self.alpha[index] > 0.0 {
                 window.with_content_mask(
                     self.clipped[index].then_some(ContentMask { bounds }),
@@ -367,17 +343,15 @@ mod tests {
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll)
                     .child(div().h(px(400.)))
-                    .child(crossfade(
+                    .child(body_transition(
                         400.,
-                        motion::ease_out(self.time),
+                        [1., motion::ease_out(self.time)],
                         motion::ease_out_quad(self.time),
                         Some(self.from),
                         [
                             div().h(px(self.from)).into_any_element(),
                             div().h(px(self.to)).into_any_element(),
                         ],
-                        1.,
-                        None,
                     ))
             }
         }

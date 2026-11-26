@@ -11,10 +11,14 @@ use gpui::RenderImage;
 use gtk::glib;
 use gtk::prelude::*;
 use javascriptcore::ValueExt;
-use webkit2gtk::{PolicyDecisionExt, SettingsExt, WebViewExt};
+use webkit2gtk::{
+    PolicyDecisionExt, SettingsExt, UserContentInjectedFrames, UserContentManagerExt,
+    UserStyleLevel, UserStyleSheet, WebViewExt,
+};
 use wry::{WebViewBuilderExtUnix, WebViewExtUnix};
 
 const UNLAID_HEIGHT: i32 = 1;
+const SNAPSHOT_HEIGHT_LIMIT: i32 = super::native::MAX_IMAGE_EDGE as i32;
 const PAINT_SETTLE: Duration = Duration::from_millis(80);
 pub(crate) const LARGE_HTML_BYTES: usize = 256 * 1024;
 
@@ -146,6 +150,9 @@ fn run(rx: glib::Receiver<()>, queue: Arc<JobQueue>) -> Result<(), Box<dyn std::
         .build_gtk(&container)?;
     let widget = webview.webview();
     secure(&widget)?;
+    let styles = widget
+        .user_content_manager()
+        .ok_or("missing WebKit content manager")?;
     let active: Active = Rc::default();
     widget.connect_load_changed({
         let active = active.clone();
@@ -176,6 +183,18 @@ fn run(rx: glib::Receiver<()>, queue: Arc<JobQueue>) -> Result<(), Box<dyn std::
         } = job.request;
         widget.set_size_request(width, 1);
         window.resize(width, UNLAID_HEIGHT);
+        styles.remove_all_style_sheets();
+        let image_limit = fell_render::WebMail::image_height_limit(width as f32);
+        styles.add_style_sheet(&UserStyleSheet::new(
+            &format!(
+                "img {{ max-height: {image_limit}px !important; }}
+                 html::-webkit-scrollbar {{ display: none; }}"
+            ),
+            UserContentInjectedFrames::TopFrame,
+            UserStyleLevel::User,
+            &[],
+            &[],
+        ));
         let channel = |shift| f64::from((background >> shift) & 255_u32) / 255.0;
         widget.set_background_color(&gtk::gdk::RGBA::new(
             channel(16),
@@ -236,14 +255,23 @@ fn wait_for_images(widget: &webkit2gtk::WebView, active: Active, token: gtk::gio
     // with a canvas read before giving the document a chance to paint.
     const READY: &str = r#"
         (() => {
-            const images = Array.from(document.images).filter(image =>
+            const all = Array.from(document.images);
+            for (const image of all) {
+                if (image.getAttribute('src') !== '') continue;
+                // With no image bytes, the intrinsic ratio can come from
+                // the broken-image icon and the alt text. Use the layout
+                // hint explicitly for the blocked slot.
+                const ratio = getComputedStyle(image).aspectRatio;
+                if (ratio.startsWith('auto ')) image.style.aspectRatio = ratio.slice(5);
+            }
+            const images = all.filter(image =>
                 /^data:image\/(?:png|jpe?g|gif|webp|avif|bmp|x-icon|vnd\.microsoft\.icon)[;,]/i
                     .test(image.currentSrc || image.getAttribute('src') || ''));
             for (const image of images) {
                 if (image.loading === 'lazy') image.loading = 'eager';
             }
-            if (images.some(image => !image.complete)) return 0;
-            if (images.some(image => image.naturalWidth === 0)) return -1;
+            if (images.some(image => !image.complete)) return [0];
+            if (images.some(image => image.naturalWidth === 0)) return [-1];
             if (images.length > 0) {
                 const canvas = document.createElement('canvas');
                 canvas.width = canvas.height = 1;
@@ -268,7 +296,8 @@ fn wait_for_images(widget: &webkit2gtk::WebView, active: Active, token: gtk::gio
                 }
                 node = child;
             }
-            return 1 + Math.ceil(Math.min(limit, bottom));
+            const height = Math.max(document.documentElement.scrollHeight, document.body.scrollHeight);
+            return [Math.max(1, height), Math.ceil(Math.min(limit, bottom))];
         })();
     "#;
     if token.is_cancelled() {
@@ -283,20 +312,35 @@ fn wait_for_images(widget: &webkit2gtk::WebView, active: Active, token: gtk::gio
             if token.is_cancelled() {
                 return;
             }
-            match result
-                .ok()
-                .and_then(|result| result.js_value())
-                .map(|value| value.to_int32())
-            {
+            let result = result.ok().and_then(|result| result.js_value());
+            let result_at = |index| {
+                result
+                    .as_ref()?
+                    .object_get_property_at_index(index)
+                    .map(|value| value.to_int32())
+            };
+            match result_at(0) {
                 Some(0) => {
                     glib::timeout_add_local_once(PAINT_SETTLE, move || {
                         wait_for_images(&view, active, token);
                     });
                 }
-                Some(ready) if ready > 0 => {
-                    let bottom_padding = (ready - 1) as u32;
+                Some(height) if height > 0 => {
+                    let bottom_padding = result_at(1).unwrap_or(0) as u32;
+                    let region = if height > SNAPSHOT_HEIGHT_LIMIT
+                        && let Some(window) = view.toplevel().and_downcast::<gtk::Window>()
+                    {
+                        // A full-document surface can exceed Cairo's size
+                        // limit before we get the chance to downsample it.
+                        let width = view.allocated_width();
+                        view.set_size_request(width, SNAPSHOT_HEIGHT_LIMIT);
+                        window.resize(width, SNAPSHOT_HEIGHT_LIMIT);
+                        webkit2gtk::SnapshotRegion::Visible
+                    } else {
+                        webkit2gtk::SnapshotRegion::FullDocument
+                    };
                     glib::timeout_add_local_once(PAINT_SETTLE, move || {
-                        capture(&view, active, token, bottom_padding, true);
+                        capture(&view, active, token, bottom_padding, region, true);
                     });
                 }
                 _ => cancel(&active),
@@ -310,6 +354,7 @@ fn capture(
     active: Active,
     token: gtk::gio::Cancellable,
     bottom_padding: u32,
+    region: webkit2gtk::SnapshotRegion,
     retry: bool,
 ) {
     if token.is_cancelled() {
@@ -317,7 +362,7 @@ fn capture(
     }
     let view = widget.clone();
     widget.snapshot(
-        webkit2gtk::SnapshotRegion::FullDocument,
+        region,
         webkit2gtk::SnapshotOptions::NONE,
         Some(&token.clone()),
         move |result| {
@@ -335,7 +380,7 @@ fn capture(
                 }
                 None if retry => {
                     glib::timeout_add_local_once(PAINT_SETTLE, move || {
-                        capture(&view, active, token, bottom_padding, false);
+                        capture(&view, active, token, bottom_padding, region, false);
                     });
                 }
                 None => cancel(&active),
@@ -735,6 +780,70 @@ mod tests {
             "placeholder height: {}",
             picture.height
         );
+
+        let huge = fell_render::WebMail::prepare(
+            r#"<p>River news</p><img src="https://cdn.example.test/huge"
+            width="600" height="200000" style="display:block">"#,
+        );
+        let picture = futures::executor::block_on(render(WebRequest {
+            html: huge.page("light", |_| None),
+            width: 440,
+            background: 0xffffff,
+        }))
+        .expect("WebKit drew the oversized image placeholder");
+        assert!(
+            (680. ..740.).contains(&picture.height)
+                && (0. ..=32.).contains(&(huge.estimated_height(440.) - picture.height)),
+            "snapshot: {}, estimate: {}",
+            picture.height,
+            huge.estimated_height(440.),
+        );
+        eprintln!(
+            "600 × 200,000 image: {} px snapshot, {} px estimate",
+            picture.height,
+            huge.estimated_height(440.)
+        );
+
+        let newsletter = fell_render::WebMail::prepare(
+            r#"<style>.masthead {display:flex;gap:12px}</style>
+            <table role="presentation" width="100%" cellspacing="0" style="background:#f3f0e8;color:#263950">
+            <tr><td style="padding:20px 22px 16px;font:14px sans-serif">
+            <div class="masthead"><b>THE LAKESIDE DISPATCH</b><span>No. 42</span></div>
+            <h1 style="margin:12px 0 8px;font:30px Georgia">The week the river slowed</h1>
+            <p style="margin:0;font:16px Georgia">For three days the river barely moved. The ferry ran on time anyway.</p></td></tr>
+            <tr><td style="padding:0 22px 20px">
+            <img src="https://cdn.example.test/river" width="540" height="169" style="display:block">
+            <table role="presentation" width="100%"><tr>
+            <td style="padding-top:8px"><img src="https://cdn.example.test/pier" width="156" height="64"></td>
+            <td style="padding-top:8px"><img src="https://cdn.example.test/library" width="156" height="64"></td>
+            </tr></table></td></tr></table>"#,
+        );
+        for width in [493, 560] {
+            let picture = futures::executor::block_on(render(WebRequest {
+                html: newsletter.page("light", |_| None),
+                width,
+                background: 0xffffff,
+            }))
+            .expect("WebKit drew the newsletter");
+            let estimate = newsletter.estimated_height(width as f32);
+            eprintln!(
+                "{width} px newsletter: {} px snapshot, {estimate} px estimate",
+                picture.height
+            );
+            assert!((0. ..=25.).contains(&(estimate - picture.height)));
+        }
+
+        let tall = futures::executor::block_on(render(WebRequest {
+            html: r#"<div style="height:200000px;background:#7a163f">Tall page</div>
+                     <div style="background:#3f167a">Offscreen</div>"#
+                .into(),
+            width: 440,
+            background: 0xffffff,
+        }))
+        .expect("WebKit drew the clipped beginning of a tall document");
+        assert!(contains_display_color(&tall, [0x7a, 0x16, 0x3f]));
+        assert!(!contains_display_color(&tall, [0x3f, 0x16, 0x7a]));
+        assert!(tall.height > 1000. && tall.height <= SNAPSHOT_HEIGHT_LIMIT as f32);
 
         let mut png = std::io::Cursor::new(Vec::new());
         let image = image::RgbImage::from_fn(1024, 768, |x, _| {

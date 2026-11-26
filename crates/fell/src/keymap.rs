@@ -167,7 +167,7 @@ impl Action {
             Self::Visual => "Visual select",
             Self::FullWidth => "Full-width conversation",
             Self::ToggleWebView => "Toggle web view",
-            Self::AllowMessageImages => "Allow images for this message",
+            Self::AllowMessageImages => "Load images",
             Self::AllowSenderImages => "Always allow images from this sender",
             Self::BlockSenderImages => "Revoke image permission for this sender",
             Self::ToggleQuotes => "Quoted text and recipients",

@@ -11230,14 +11230,12 @@ fn web_message_body(
     };
     let incoming = layer(&web.body, folds.live);
     if let Some(outgoing) = &web.outgoing {
-        disclosure::crossfade(
+        disclosure::body_transition(
             folds.columns.pane_right,
-            web.progress,
+            web.body_alpha,
             web.height_progress,
             web.from_height,
             [layer(outgoing, false), incoming],
-            web.outgoing_alpha(theme.is_light()),
-            matches!(web.body, Body::Native).then_some(folds.fill),
         )
     } else {
         incoming

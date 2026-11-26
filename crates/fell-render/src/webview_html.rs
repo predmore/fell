@@ -34,7 +34,7 @@ fn web_page(body: &str, scheme: &str, body_padding: &str) -> String {
   }}
   img[src=""]:not([width][height]) {{ aspect-ratio: 3 / 2; }}
   img[src=""]:not([width], [height]) {{ width: 120px; }}
-  img {{ object-fit: contain; }}
+  img {{ height: auto; object-fit: contain; }}
 </style>
 </head>
 <body style="{body_padding}">{body}</body>
@@ -111,16 +111,18 @@ impl WebMail {
     }
 
     pub fn estimated_height(&self, width: f32) -> f32 {
-        (self
-            .layout
-            .as_ref()
-            .map_or(0., |layout| layout.height(width, 20.))
-            + 12.)
+        (self.layout.as_ref().map_or(0., |layout| {
+            layout.height(width, 20., Self::image_height_limit(width))
+        }) + 12.)
             .min(MAX_ESTIMATED_HEIGHT)
     }
 
     pub fn has_remote_images(&self) -> bool {
         !self.images.is_empty()
+    }
+
+    pub fn image_height_limit(width: f32) -> f32 {
+        1.5 * width
     }
 
     pub fn page(&self, scheme: &str, mut image: impl FnMut(&str) -> Option<String>) -> String {
@@ -156,7 +158,7 @@ fn add_declaration(rules: &mut OrderedDeclarations, order: usize, declaration: D
 }
 
 #[derive(Default)]
-struct LayoutStyles {
+pub(crate) struct LayoutStyles {
     tags: HashMap<String, OrderedDeclarations>,
     classes: HashMap<String, OrderedDeclarations>,
     ids: HashMap<String, OrderedDeclarations>,
@@ -215,7 +217,20 @@ impl<'i> QualifiedRuleParser<'i> for LayoutRules {
             }
             if matches!(
                 declaration.name.as_str(),
-                "display" | "font-size" | "max-height" | "overflow" | "overflow-y"
+                "display"
+                    | "font-size"
+                    | "line-height"
+                    | "max-height"
+                    | "overflow"
+                    | "overflow-y"
+                    | "padding"
+                    | "padding-top"
+                    | "padding-right"
+                    | "padding-bottom"
+                    | "padding-left"
+                    | "margin"
+                    | "margin-top"
+                    | "margin-bottom"
             ) {
                 add_declaration(&mut rules, order, declaration);
             }
@@ -240,7 +255,7 @@ impl<'i> cssparser::DeclarationParser<'i> for LayoutRules {
 }
 
 impl LayoutStyles {
-    fn from_document(dom: &scraper::Html) -> Self {
+    pub(crate) fn from_document(dom: &scraper::Html) -> Self {
         let mut styles = Self::default();
         let mut order = 0;
         for node in dom
@@ -278,7 +293,7 @@ impl LayoutStyles {
         styles
     }
 
-    fn declarations(&self, element: &Element) -> Vec<Declaration> {
+    pub(crate) fn declarations(&self, element: &Element) -> Vec<Declaration> {
         let tag = self.tags.get(element.name());
         let classes = element
             .classes()
@@ -305,7 +320,7 @@ impl LayoutStyles {
 
 #[derive(Debug)]
 enum Layout {
-    Text(usize),
+    Text(f32),
     Image {
         width: f32,
         height: f32,
@@ -313,13 +328,89 @@ enum Layout {
     Flow {
         children: Vec<Layout>,
         scale: f32,
-        padding: f32,
+        line_height: Option<f32>,
+        vertical: f32,
+        horizontal: f32,
     },
     Row(Vec<Layout>),
     Clipped {
         child: Box<Layout>,
         max_height: f32,
     },
+}
+
+fn text_width_em(text: &str) -> f32 {
+    // Typical widths in the browser's default serif body face.
+    text.chars()
+        .map(|ch| match ch {
+            ' ' | '\t' | '\n' | '\r' | '.' | ',' | '!' | ':' | ';' | '\'' => 0.25,
+            'i' | 'j' | 'l' | 't' => 0.28,
+            'f' | 'r' => 0.33,
+            's' => 0.4,
+            'a' | 'c' | 'e' | 'z' => 0.45,
+            'w' => 0.73,
+            'm' => 0.78,
+            'M' | 'W' => 0.89,
+            'A'..='Z' => 0.64,
+            '\0'..='\x7f' => 0.5,
+            _ => 1.0,
+        })
+        .sum()
+}
+
+fn css_pixels(value: &str) -> Option<f32> {
+    if html::is_zero_length(value) {
+        return Some(0.);
+    }
+    let pixels = value.strip_suffix("px")?.parse::<f32>().ok()?;
+    (pixels.is_finite() && pixels >= 0.).then_some(pixels)
+}
+
+fn box_edges(style: &[Declaration], property: &str, sides: [&str; 4]) -> [Option<f32>; 4] {
+    let mut edges = [None; 4];
+    for declaration in style {
+        let assign = |edge: &mut Option<(bool, Option<f32>)>, length| {
+            if declaration.important || edge.is_none_or(|(important, _)| !important) {
+                *edge = Some((declaration.important, length));
+            }
+        };
+        if declaration.name == property {
+            let mut lengths = declaration.value.split_ascii_whitespace().map(css_pixels);
+            let Some(top) = lengths.next() else { continue };
+            let right = lengths.next().unwrap_or(top);
+            let bottom = lengths.next().unwrap_or(top);
+            let left = lengths.next().unwrap_or(right);
+            for (edge, length) in edges.iter_mut().zip([top, right, bottom, left]) {
+                assign(edge, length);
+            }
+        } else if let Some(side) = sides.iter().position(|side| *side == declaration.name) {
+            assign(&mut edges[side], css_pixels(&declaration.value));
+        }
+    }
+    edges.map(|edge| edge.and_then(|(_, length)| length))
+}
+
+fn authored_line_height(style: &[Declaration]) -> Option<f32> {
+    let size = style
+        .iter()
+        .filter(|declaration| matches!(declaration.name.as_str(), "font" | "font-size"))
+        .max_by_key(|declaration| declaration.important)
+        .and_then(|declaration| {
+            declaration
+                .value
+                .split_ascii_whitespace()
+                .filter_map(|word| css_pixels(word.split('/').next()?))
+                .find(|size| *size > 0.)
+        });
+    html::declared_value(style, "line-height")
+        .and_then(|value| {
+            css_pixels(value).or_else(|| {
+                let multiplier = value.parse::<f32>().ok()?;
+                (multiplier.is_finite() && multiplier >= 1.)
+                    .then(|| multiplier * size.unwrap_or(16.))
+            })
+        })
+        .or_else(|| size.map(|size| size * 1.25))
 }
 
 impl Layout {
@@ -330,8 +421,8 @@ impl Layout {
     ) -> Option<Self> {
         let element = match node.value() {
             Node::Text(text) if !inherited_zero => {
-                let chars = text.trim().chars().count();
-                return (chars > 0).then_some(Self::Text(chars));
+                let width = text_width_em(text.trim());
+                return (width > 0.).then_some(Self::Text(width));
             }
             Node::Element(element) => element,
             _ => return None,
@@ -400,7 +491,9 @@ impl Layout {
             return (!zero_font || name == "hr").then_some(Self::Flow {
                 children: Vec::new(),
                 scale: 1.,
-                padding: 20.,
+                line_height: None,
+                vertical: 20.,
+                horizontal: 0.,
             });
         }
         let mut children: Vec<Layout> = Vec::new();
@@ -409,7 +502,7 @@ impl Layout {
             .filter_map(|child| Self::from_node(child, styles, zero_font))
         {
             if let (Some(Self::Text(before)), Self::Text(after)) = (children.last_mut(), &child) {
-                *before += 1 + after;
+                *before += 0.25 + after;
             } else {
                 children.push(child);
             }
@@ -417,13 +510,31 @@ impl Layout {
         if children.is_empty() {
             return None;
         }
-        let (scale, padding) = match name {
+        let line_height = authored_line_height(style);
+        let [top, right, bottom, left] = box_edges(
+            style,
+            "padding",
+            [
+                "padding-top",
+                "padding-right",
+                "padding-bottom",
+                "padding-left",
+            ],
+        );
+        let [above, _, below, _] = box_edges(
+            style,
+            "margin",
+            ["margin-top", "margin-right", "margin-bottom", "margin-left"],
+        );
+        let horizontal = left.unwrap_or(0.) + right.unwrap_or(0.);
+        let padding = top.unwrap_or(0.) + bottom.unwrap_or(0.);
+        let (scale, default_margin) = match name {
             "tr" => return Some(Self::Row(children)),
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => (1.9, 18.),
-            "td" | "th" => (1., 12.),
-            "p" | "ul" | "ol" | "blockquote" => (1., 12.),
+            "p" => (1., 20.),
+            "ul" | "ol" | "blockquote" => (1., 12.),
             "a" | "b" | "em" | "font" | "i" | "small" | "span" | "strong" | "u"
-                if children.len() == 1 =>
+                if children.len() == 1 && line_height.is_none() && style.is_empty() =>
             {
                 return children.pop();
             }
@@ -432,33 +543,52 @@ impl Layout {
         Some(Self::Flow {
             children,
             scale,
-            padding,
+            line_height,
+            vertical: above.unwrap_or(default_margin / 2.)
+                + below.unwrap_or(default_margin / 2.)
+                + padding
+                + if matches!(name, "td" | "th") && top.is_none() && bottom.is_none() {
+                    4.
+                } else {
+                    0.
+                },
+            horizontal,
         })
     }
 
-    fn height(&self, width: f32, line: f32) -> f32 {
+    fn height(&self, width: f32, line: f32, image_limit: f32) -> f32 {
         match self {
-            Self::Text(chars) => (*chars as f32 * line * 0.44 / width.max(1.)).ceil() * line,
+            Self::Text(em) => (em * (line / 1.25) / width.max(1.)).ceil() * line,
             Self::Image {
                 width: natural,
                 height,
-            } => (height * (width / natural).min(1.)).min(1.5 * width),
+            } => (height * (width / natural).min(1.)).min(image_limit),
             Self::Flow {
                 children,
                 scale,
-                padding,
+                line_height,
+                vertical,
+                horizontal,
             } => {
                 children
                     .iter()
-                    .map(|node| node.height(width, line * scale))
+                    .map(|node| {
+                        node.height(
+                            (width - horizontal).max(1.),
+                            line_height.unwrap_or(line * scale),
+                            image_limit,
+                        )
+                    })
                     .sum::<f32>()
-                    + padding
+                    + vertical
             }
             Self::Row(cells) => cells
                 .iter()
-                .map(|node| node.height((width / cells.len() as f32 - 12.).max(1.), line))
+                .map(|node| node.height((width / cells.len() as f32).max(1.), line, image_limit))
                 .fold(0., f32::max),
-            Self::Clipped { child, max_height } => child.height(width, line).min(*max_height),
+            Self::Clipped { child, max_height } => {
+                child.height(width, line, image_limit).min(*max_height)
+            }
         }
     }
 }
@@ -481,7 +611,10 @@ fn height_estimates_cap_image_hints_and_total_layout() {
         width: 1.,
         height: 10_000_000.,
     };
-    assert_eq!(image.height(440., 20.), 660.);
+    assert_eq!(
+        image.height(440., 20., WebMail::image_height_limit(440.)),
+        660.
+    );
     let mail =
         WebMail::prepare(r#"<img width="600" height="200000" src="https://example.test/large">"#);
     assert_eq!(mail.estimated_height(440.), 672.);
@@ -525,7 +658,7 @@ fn height_estimates_respect_stylesheets_escapes_and_clipped_height() {
         <aside class="clipped">{hidden}</aside>
         <aside style="max-height:10px;overflow:hidden">{hidden}</aside>"#
     );
-    assert_eq!(WebMail::prepare(&html).estimated_height(440.), 64.);
+    assert_eq!(WebMail::prepare(&html).estimated_height(440.), 72.);
 }
 
 #[cfg(test)]
