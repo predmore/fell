@@ -508,17 +508,18 @@ impl StagedAccountConfig {
             .as_ref()
             .ok_or("No private state directory for account password recovery.")?;
         journal
-            .record(&self.path, self.file.as_file(), key, previous)
+            .record(key, previous)
             .map_err(|error| format!("Couldn't back up the account password. {error}"))?;
         Ok(journal.clone())
     }
 
     pub(crate) fn publish(self) -> Result<PathBuf, AccountFileError> {
-        self.publish_then(|result, _| result)
+        self.publish_then(None, |result, _| result)
     }
 
     pub(crate) fn publish_then<T>(
         self,
+        journal: Option<&crate::credential_recovery::Journal>,
         finish: impl FnOnce(Result<PathBuf, AccountFileError>, bool) -> T,
     ) -> T {
         let mut published = false;
@@ -549,23 +550,37 @@ impl StagedAccountConfig {
                 );
             }
             published = true;
-            if let Err(error) = self.lock.sync_all() {
-                let rollback = match self.backup {
-                    Some(backup) => backup
-                        .persist(&self.path)
-                        .map(|_| ())
-                        .map_err(|err| err.error),
-                    None if self.first_run => fs::remove_file(&self.path),
-                    None => return Err(error.to_string().into()),
-                };
-                rollback
-                    .map_err(|err| format!("{error}; couldn't restore the account file: {err}"))?;
-                published = false;
-                if let Some(marker) = marker {
-                    fs::remove_file(marker).map_err(|err| err.to_string())?;
+            let journal_dir = self.lock.sync_all().and_then(|()| {
+                journal
+                    .map(crate::credential_recovery::Journal::mark_published)
+                    .transpose()
+            });
+            match journal_dir {
+                Ok(Some(directory)) => {
+                    // The flag is installed. Keep the account and password
+                    // together even if syncing its directory fails.
+                    directory.sync_all().map_err(|err| err.to_string())?;
                 }
-                self.lock.sync_all().map_err(|err| err.to_string())?;
-                return Err(error.to_string().into());
+                Ok(None) => {}
+                Err(error) => {
+                    let rollback = match self.backup {
+                        Some(backup) => backup
+                            .persist(&self.path)
+                            .map(|_| ())
+                            .map_err(|err| err.error),
+                        None if self.first_run => fs::remove_file(&self.path),
+                        None => return Err(error.to_string().into()),
+                    };
+                    rollback.map_err(|err| {
+                        format!("{error}; couldn't restore the account file: {err}")
+                    })?;
+                    published = false;
+                    if let Some(marker) = marker {
+                        fs::remove_file(marker).map_err(|err| err.to_string())?;
+                    }
+                    self.lock.sync_all().map_err(|err| err.to_string())?;
+                    return Err(error.to_string().into());
+                }
             }
             if let Some((registry, base, id, snapshot)) = self.keep
                 && let Err(error) = registry.keep_for_replacement(&self.lock, &base, &id, &snapshot)

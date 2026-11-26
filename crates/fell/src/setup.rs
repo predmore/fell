@@ -45,37 +45,7 @@ setup options (anything missing is asked for on a terminal):
 
 /// Run `fell account ...`. Returns the process exit code.
 pub fn account_command(args: &[String]) -> i32 {
-    let command = args.first().map(String::as_str);
-    let recovery = match command {
-        Some("setup" | "list" | "remove" | "show" | "check") => Registry::resolve()
-            .ok()
-            .map(|registry| crate::credential_recovery::recover(&registry))
-            .transpose()
-            .map(|_| ()),
-        _ => Ok(()),
-    };
-    let result = recovery.and_then(|()| match command {
-        Some("setup") => setup(&args[1..]),
-        Some("list") if args.len() == 1 => list(),
-        Some("remove") if args.len() == 2 => remove(&args[1]),
-        Some(cmd @ ("show" | "check")) => match &args[1..] {
-            [help] if matches!(help.as_str(), "--help" | "-h") => {
-                println!("{USAGE}");
-                Ok(())
-            }
-            [] if cmd == "show" => show(None),
-            [] => check(None),
-            [flag, id] if flag == "--id" && cmd == "show" => show(Some(id)),
-            [flag, id] if flag == "--id" => check(Some(id)),
-            _ => Err(format!("Expected {cmd} [--id ID]\n\n{USAGE}")),
-        },
-        Some("--help" | "-h" | "help") | None => {
-            println!("{USAGE}");
-            Ok(())
-        }
-        Some(other) => Err(format!("unknown account command {other:?}\n\n{USAGE}")),
-    });
-    match result {
+    match run_account_command(args) {
         Ok(()) => 0,
         Err(err) => {
             fell_core::diagnostic!(WARN, "Account command failed");
@@ -84,6 +54,59 @@ pub fn account_command(args: &[String]) -> i32 {
             // top-level parser. Anything else (a failed login) exits 1.
             if err.ends_with(USAGE) { 2 } else { 1 }
         }
+    }
+}
+
+fn run_account_command(args: &[String]) -> Result<(), String> {
+    let usage = || {
+        println!("{USAGE}");
+        Ok(())
+    };
+    let recover = || {
+        if let Ok(registry) = Registry::resolve() {
+            crate::credential_recovery::recover(&registry)?;
+        }
+        Ok::<_, String>(())
+    };
+    let validate_account_id =
+        |id: &str| validate_id(id).map_err(|_| format!("Invalid account ID {id:?}"));
+    match args.first().map(String::as_str) {
+        Some("setup") => {
+            let flags = parse_flags(&args[1..])?;
+            if flags.help {
+                return usage();
+            }
+            if let Some(id) = &flags.id {
+                validate_id(id).map_err(|err| format!("{id:?}: {err}"))?;
+            }
+            recover()?;
+            setup(flags)
+        }
+        Some("list") if args.len() == 1 => {
+            recover()?;
+            list()
+        }
+        Some("remove") if args.len() == 2 => {
+            let id = &args[1];
+            validate_account_id(id)?;
+            recover()?;
+            remove(id)
+        }
+        Some(cmd @ ("show" | "check")) => {
+            let id = match &args[1..] {
+                [help] if matches!(help.as_str(), "--help" | "-h") => return usage(),
+                [] => None,
+                [flag, id] if flag == "--id" => {
+                    validate_account_id(id)?;
+                    Some(id.as_str())
+                }
+                _ => return Err(format!("Expected {cmd} [--id ID]\n\n{USAGE}")),
+            };
+            recover()?;
+            if cmd == "show" { show(id) } else { check(id) }
+        }
+        Some("--help" | "-h" | "help") | None => usage(),
+        Some(other) => Err(format!("unknown account command {other:?}\n\n{USAGE}")),
     }
 }
 
@@ -222,18 +245,10 @@ fn choose_smtp(
     Ok(())
 }
 
-fn setup(args: &[String]) -> Result<(), String> {
-    let flags = parse_flags(args)?;
-    if flags.help {
-        println!("{USAGE}");
-        return Ok(());
-    }
+fn setup(flags: Flags) -> Result<(), String> {
     let named = flags.id.is_some();
     let id = match flags.id {
-        Some(id) => {
-            validate_id(&id).map_err(|err| format!("{id:?}: {err}"))?;
-            id
-        }
+        Some(id) => id,
         None => next_account_id()?,
     };
     let tty = io::stdin().is_terminal() && !flags.password_stdin;
@@ -588,7 +603,7 @@ pub(crate) fn save_account(
             }
         }
     }
-    staged.publish_then(|result, published| {
+    staged.publish_then(journal.as_ref(), |result, published| {
         if result.is_ok() {
             clear_journal();
             if let Some(old_key) = &old_key
@@ -955,15 +970,49 @@ mod tests {
 
     #[test]
     fn show_and_check_take_help_and_refuse_stray_words() {
-        // Help and usage errors return before any account file is read or
-        // any server is contacted.
+        let Some(root) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let registry = Registry::resolve().unwrap();
+        let accounts = registry.directory();
+        std::fs::create_dir_all(&accounts).unwrap();
+        let state = root.join("state/fell");
+        let journal = crate::credential_recovery::Journal::at(&state, &accounts);
+        journal.record("fixture-key", "fixture-secret").unwrap();
+        journal.mark_published().unwrap().sync_all().unwrap();
+        let path = std::fs::read_dir(state)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+
         for cmd in ["show", "check"] {
             assert_eq!(account_command(&args(&[cmd, "--help"])), 0, "{cmd}");
             assert_eq!(account_command(&args(&[cmd, "--bogus"])), 2, "{cmd}");
+            assert_eq!(
+                account_command(&args(&[cmd, "--id", "../mail"])),
+                1,
+                "{cmd}"
+            );
         }
+        assert_eq!(account_command(&args(&["setup", "--help"])), 0);
         assert_eq!(account_command(&args(&["--bogus"])), 2);
         assert_eq!(account_command(&args(&["setup", "--bogus"])), 2);
         assert_eq!(account_command(&args(&["setup", "--email"])), 2);
+        assert_eq!(account_command(&args(&["setup", "--id", "../mail"])), 1);
+        assert_eq!(account_command(&args(&["list", "unexpected"])), 2);
+        assert_eq!(account_command(&args(&["remove", "../mail"])), 1);
+        assert!(
+            path.exists(),
+            "help and invalid arguments must leave the journal alone"
+        );
+
+        assert_eq!(account_command(&args(&["list"])), 0);
+        assert!(
+            !path.exists(),
+            "a valid account command still recovers the journal"
+        );
     }
 
     #[test]
@@ -1243,19 +1292,27 @@ mod tests {
         );
         assert!(!backup.exists());
 
-        // A crash after the rename must keep the new keyring value, even
-        // though a password-only edit leaves the account TOML unchanged.
+        // Recovery must keep the new key after publication, even if another
+        // account edit has replaced the file while the journal still exists.
         let staged = stage(&mut original.clone()).unwrap();
         let key = original.credential_key();
-        staged.back_up_credential(&key, "fixture").unwrap();
+        let pending = staged.back_up_credential(&key, "fixture").unwrap();
         keyring.store(&key, "edited").unwrap();
-        staged.publish().unwrap();
+        staged
+            .publish_then(Some(&pending), |result, _| result)
+            .unwrap();
+        assert!(backup.exists());
+        let mut replacement = original.clone();
+        replacement.name = "Replacement".into();
+        stage(&mut replacement).unwrap().publish().unwrap();
+        assert_eq!(published(), replacement);
         journal.recover(&registry, &keyring).unwrap();
         assert_eq!(
             published().resolve_password_with(&keyring).unwrap(),
             "edited"
         );
         assert!(!backup.exists());
+        stage(&mut original.clone()).unwrap().publish().unwrap();
         keyring.store(&key, "fixture").unwrap();
 
         let blocked = dir.path().join("blocked.toml");
