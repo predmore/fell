@@ -446,11 +446,19 @@ pub fn remove_model(model: &LocalModel, root: &Path) -> io::Result<bool> {
 
 /// Settings and the CLI share the staging area. An installer must not
 /// sweep another installer's files, and a remove must wait for publication.
-fn lock_models_root(root: &Path) -> io::Result<fs::File> {
-    let lock = fs::OpenOptions::new()
+fn lock_models_root(root: &Path) -> io::Result<InstallLock> {
+    fs::OpenOptions::new()
         .read(true)
         .custom_flags(O_DIRECTORY | O_NOFOLLOW)
         .open(root)?;
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(root.join(".install.lock"))?;
     lock.try_lock().map_err(|error| {
         let error = io::Error::from(error);
         if error.kind() == io::ErrorKind::WouldBlock {
@@ -459,7 +467,16 @@ fn lock_models_root(root: &Path) -> io::Result<fs::File> {
             error
         }
     })?;
-    Ok(lock)
+    Ok(InstallLock(lock))
+}
+
+struct InstallLock(fs::File);
+
+impl Drop for InstallLock {
+    fn drop(&mut self) {
+        // Release the lock even if another thread forked before the fd closed.
+        let _ = self.0.unlock();
+    }
 }
 
 fn remove_path(path: &Path) -> io::Result<()> {
@@ -622,6 +639,16 @@ mod tests {
             .unwrap()
     }
 
+    fn model_entries(root: &Path) -> Vec<std::ffi::OsString> {
+        let mut entries: Vec<_> = fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name != ".install.lock")
+            .collect();
+        entries.sort();
+        entries
+    }
+
     #[test]
     fn pinned_urls_are_https_at_a_fixed_commit() {
         let model = MINILM_L6_V2_INT8;
@@ -755,11 +782,7 @@ mod tests {
             "{err}"
         );
         assert!(installed_model_dir(model, &root).is_none());
-        assert_eq!(
-            fs::read_dir(&root).unwrap().count(),
-            0,
-            "staging is removed"
-        );
+        assert!(model_entries(&root).is_empty(), "staging is removed");
     }
 
     #[test]
@@ -820,7 +843,7 @@ mod tests {
             "{err}"
         );
         assert!(installed_model_dir(model, &root).is_none());
-        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        assert!(model_entries(&root).is_empty());
     }
 
     #[test]
@@ -972,15 +995,11 @@ mod tests {
         assert!(err.to_string().contains("injected"), "{err}");
         assert_eq!(fs::read(dir.join("model.onnx")).unwrap(), b"onnx");
         assert_eq!(fs::read(dir.join("vocab.txt")).unwrap(), b"VOCAB");
-        let names: Vec<_> = fs::read_dir(&root)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect();
-        assert_eq!(names, vec![std::ffi::OsString::from("test-model")]);
+        assert_eq!(model_entries(&root), ["test-model"]);
         // Without the failure the replacement goes in and the backup is gone.
         install_model(model, &root, &mut fetch).unwrap();
         verify_installed(model, &root).unwrap();
-        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        assert_eq!(model_entries(&root), ["test-model"]);
     }
 
     #[test]
