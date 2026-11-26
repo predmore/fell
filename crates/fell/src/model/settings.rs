@@ -250,7 +250,7 @@ impl Nav {
 }
 
 pub fn bindings(keymap: &Keymap) -> impl Iterator<Item = (Action, String)> {
-    Action::all().iter().copied().filter_map(|action| {
+    Action::all().filter_map(|action| {
         let keys = keymap::binding_text(keymap, action);
         (!keys.is_empty()).then_some((action, keys))
     })

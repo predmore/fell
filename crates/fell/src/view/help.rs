@@ -5,7 +5,7 @@ use gpui::prelude::*;
 use gpui::{Context, Div, FontWeight, MouseButton, Pixels, Size, Window, div, px, rgb};
 
 use super::{CARD_TOP_PX, FontOpt, Inbox, conversation_line_style};
-use crate::keymap::{Action, KeyId, binding_text};
+use crate::keymap::{ACTION_SECTIONS, Action, KeyId, binding_text};
 use crate::model::{Overlay, Session};
 use crate::motion::{self, Glide, Motion};
 use crate::theme::Theme;
@@ -139,6 +139,7 @@ const SUBJECT_JOIN_HELP: &str = "Joined by subject · Fell matched the subject a
 pub(super) struct Layout {
     top: f32,
     width: f32,
+    text_width: f32,
     header: f32,
     row: f32,
     line: f32,
@@ -146,6 +147,7 @@ pub(super) struct Layout {
     details: Vec<(String, bool, usize)>,
     detail_rows: usize,
     detail_gap: f32,
+    rows: Vec<HelpRow>,
     page: usize,
     total: usize,
 }
@@ -212,14 +214,16 @@ impl Layout {
                 (text, error, lines)
             })
             .collect();
-        let detail_rows = details.iter().map(|(_, _, lines)| *lines).sum();
+        let detail_rows: usize = details.iter().map(|(_, _, lines)| *lines).sum();
         let detail_gap = if detail_rows > 0 { DETAIL_GAP } else { 0. };
-        let total = actions().count() + detail_rows;
+        let rows = help_rows().collect::<Vec<_>>();
+        let total = rows.len() + detail_rows;
         let page =
             (((height - header - 2. - 2. * INSET - detail_gap) / row) as usize).clamp(1, total);
         Self {
             top,
             width,
+            text_width,
             header,
             row,
             line,
@@ -227,17 +231,34 @@ impl Layout {
             details,
             detail_rows,
             detail_gap,
+            rows,
             page,
             total,
         }
     }
 }
 
-fn actions() -> impl Iterator<Item = Action> {
-    Action::all()
-        .iter()
-        .copied()
-        .filter(|a| !matches!(a, Action::About | Action::Help))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HelpRow {
+    Section(&'static str),
+    Action(Action),
+}
+
+fn help_rows() -> impl Iterator<Item = HelpRow> {
+    ACTION_SECTIONS.iter().flat_map(|&(section, actions)| {
+        std::iter::once(HelpRow::Section(section)).chain(
+            actions
+                .iter()
+                .copied()
+                .filter(|action| !matches!(action, Action::About | Action::Help))
+                .map(HelpRow::Action),
+        )
+    })
+}
+
+fn thumb_height(body: f32, page: usize, total: usize, ui_px: f32) -> f32 {
+    let minimum = ui_px * (16. / 15.);
+    (body * page as f32 / total as f32).max(minimum).min(body)
 }
 
 fn card(
@@ -254,9 +275,13 @@ fn card(
     let last = (layout.total - layout.page) as f32 * layout.row;
     let first = (offset / layout.row).floor() as usize;
     let end = ((offset + page_height) / layout.row).ceil() as usize;
-    let action_start =
-        (((offset - layout.detail_gap) / layout.row).floor() as usize).max(layout.detail_rows);
-    let thumb = (body * layout.page as f32 / layout.total as f32).clamp(0., body);
+    // The detail gap can expose a sliver of the preceding row during a glide.
+    let action_offset = if moving {
+        offset - layout.detail_gap
+    } else {
+        offset
+    };
+    let action_start = ((action_offset / layout.row).floor() as usize).max(layout.detail_rows);
     div()
         .w(px(layout.width))
         .h(px(layout.header + body + 2. * INSET + 2.))
@@ -349,10 +374,13 @@ fn card(
                                     },
                                 )
                                 .children(
-                                    actions()
+                                    layout
+                                        .rows
+                                        .iter()
+                                        .copied()
                                         .skip(action_start - layout.detail_rows)
                                         .take(end.saturating_sub(action_start))
-                                        .map(|action| action_row(theme, session, action, &layout)),
+                                        .map(|row| help_row(theme, session, row, &layout)),
                                 ),
                         )
                         .children((moving && offset > 0.).then(|| edge(theme, true, 14.)))
@@ -360,6 +388,7 @@ fn card(
                 )
                 .when(last > 0., |viewport| {
                     // This gutter is reserved at every scroll position.
+                    let thumb = thumb_height(body, layout.page, layout.total, theme.ui_px);
                     viewport.child(
                         div()
                             .absolute()
@@ -383,16 +412,42 @@ fn card(
         )
 }
 
-fn action_row(theme: &Theme, session: &Session, action: Action, layout: &Layout) -> Div {
+fn help_row(theme: &Theme, session: &Session, row: HelpRow, layout: &Layout) -> Div {
+    let action = match row {
+        HelpRow::Section(label) => {
+            return div()
+                .h(px(layout.row))
+                .flex()
+                .items_center()
+                .line_height(px(layout.line))
+                .text_color(rgb(theme.dimmed))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(label);
+        }
+        HelpRow::Action(action) => action,
+    };
     div()
         .h(px(layout.row))
-        .flex()
         .line_height(px(layout.line))
-        .when(layout.stacked, |row| row.flex_col())
-        .when(!layout.stacked, |row| row.items_center().gap(px(12.)))
-        .child(div().min_w_0().flex_1().truncate().child(action.label()))
+        .when(!layout.stacked, |row| {
+            row.flex().items_center().gap(px(12.))
+        })
         .child(
             div()
+                .min_w_0()
+                // Give GPUI a definite width on its first ellipsis measurement.
+                .when(layout.stacked, |label| {
+                    label.w(px(layout.text_width)).h(px(layout.line))
+                })
+                .when(!layout.stacked, |label| label.flex_1())
+                .truncate()
+                .child(action.label()),
+        )
+        .child(
+            div()
+                .when(layout.stacked, |keys| {
+                    keys.w(px(layout.text_width)).h(px(layout.line))
+                })
                 .font_family_opt(theme.mono_family.clone())
                 .text_color(rgb(theme.dimmed))
                 .truncate()
@@ -415,6 +470,7 @@ pub(super) fn edge(theme: &Theme, top: bool, height: f32) -> Div {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keymap::Keymap;
     use std::time::Duration;
 
     #[test]
@@ -433,6 +489,79 @@ mod tests {
         scroll.advance(layout.page, layout.total, layout.row, now);
         assert_eq!(scroll.target, half_page);
         assert_eq!(scroll.drawn, half_page as f32 * layout.row);
+    }
+
+    #[test]
+    fn section_headers_and_actions_follow_the_palette_order() {
+        let keymap = Keymap::default();
+        let rows: Vec<_> = help_rows().collect();
+        let headings: Vec<_> = rows
+            .iter()
+            .filter_map(|row| match row {
+                HelpRow::Section(label) => Some(*label),
+                HelpRow::Action(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            headings,
+            [
+                "Navigation",
+                "Reading",
+                "Compose",
+                "Organize",
+                "Attachments",
+                "Search",
+                "Agents",
+                "Settings and help",
+            ]
+        );
+        let actions: Vec<_> = rows
+            .into_iter()
+            .filter_map(|row| match row {
+                HelpRow::Section(_) => None,
+                HelpRow::Action(action) => Some(action),
+            })
+            .collect();
+        let palette: Vec<_> = crate::keymap::palette_items(&keymap, "", &[])
+            .into_iter()
+            .map(|item| item.action)
+            .filter(|action| !matches!(action, Action::About | Action::Help))
+            .collect();
+        assert_eq!(actions, palette);
+    }
+
+    #[test]
+    fn scroll_can_settle_with_a_whole_header_on_either_edge() {
+        let now = Instant::now();
+        let motion = Motion::new(false);
+        for ui_px in [12., 18.] {
+            let layout = Layout::measure(ui_px, gpui::size(px(420.), px(380.)), None, |_, _| 0);
+            let header = layout
+                .rows
+                .iter()
+                .position(|row| *row == HelpRow::Section("Reading"))
+                .unwrap();
+            let mut scroll = HelpScroll::default();
+            scroll.advance(layout.page, layout.total, layout.row, now);
+            for first in [header + 1 - layout.page, header] {
+                scroll.scroll((first - scroll.target) as isize, &motion, now);
+                scroll.advance(layout.page, layout.total, layout.row, now);
+                assert_eq!(scroll.drawn, first as f32 * layout.row);
+                let header_top = header as f32 * layout.row - scroll.drawn;
+                assert!(header_top >= 0.);
+                assert!(header_top + layout.row <= layout.page as f32 * layout.row);
+            }
+        }
+    }
+
+    #[test]
+    fn scrollbar_thumb_has_a_scaled_floor_bounded_by_the_track() {
+        for ui_px in [12., 15., 18.] {
+            let floor = thumb_height(50., 2, 100, ui_px);
+            assert!((floor - 16. * ui_px / 15.).abs() < 0.001);
+        }
+        assert_eq!(thumb_height(300., 10, 50, 15.), 60.);
+        assert_eq!(thumb_height(10., 1, 100, 15.), 10.);
     }
 
     #[test]
