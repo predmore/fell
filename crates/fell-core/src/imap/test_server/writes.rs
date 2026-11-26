@@ -26,7 +26,7 @@ pub(in crate::imap) struct WriteFixture {
     pub refuse_search: bool,
     /// Return this many tagged-OK empty HEADER searches before finding the copy.
     pub empty_header_searches: usize,
-    /// Override a selected write session's range search with this many UID hits.
+    /// Override a selected write session's bounded search with this many UID hits.
     pub range_search_hits: Option<usize>,
     pub omit_message_id_header: Option<u32>,
     pub close_on_login: bool,
@@ -35,6 +35,8 @@ pub(in crate::imap) struct WriteFixture {
     pub lose_append_before_commit: bool,
     /// Drop the connection after this many `UID MOVE` replies.
     pub close_after_moves: Option<u32>,
+    /// Disconnect without applying the next `UID MOVE`.
+    pub lose_before_move: bool,
     /// Apply the next command with this verb (`"MOVE"`), then drop the
     /// connection before any reply.
     pub lose_reply_to: Option<&'static str>,
@@ -104,13 +106,21 @@ pub(super) fn handle(
                 .lose_reply_to
                 .is_some_and(|verb| strip_prefix_ignore(rest, &format!("{verb} ")).is_some());
             let reply = if let Some(args) = strip_prefix_ignore(rest, "SEARCH HEADER Message-ID ") {
+                let range = args
+                    .rsplit_once(" UID ")
+                    .map(|(_, range)| range)
+                    .filter(|range| !range.ends_with('"'));
                 if writes.refuse_search {
                     format!("{tag} NO search not now\r\n")
                 } else if writes.empty_header_searches > 0 {
                     writes.empty_header_searches -= 1;
                     format!("* SEARCH\r\n{tag} OK SEARCH\r\n")
+                } else if range.is_some()
+                    && let Some(hits) = writes.range_search_hits
+                {
+                    format!("* SEARCH{}\r\n{tag} OK SEARCH\r\n", " 1".repeat(hits))
                 } else {
-                    search_message_id(tag, args, &state)
+                    search_message_id(tag, args, range, &state)
                 }
             } else if selected_write
                 && strip_prefix_ignore(rest, "SEARCH UID ").is_some()
@@ -152,6 +162,10 @@ pub(super) fn handle(
                 if !writes.moves {
                     format!("{tag} BAD MOVE not offered\r\n")
                 } else {
+                    if std::mem::take(&mut writes.lose_before_move) {
+                        let _ = out.stream.shutdown(std::net::Shutdown::Both);
+                        return true;
+                    }
                     let reply = place(tag, args, &mut state, &writes, true);
                     if let Some(left) = writes.close_after_moves.as_mut() {
                         *left = left.saturating_sub(1);
@@ -617,7 +631,7 @@ fn expunge_uid(tag: &str, args: &str, state: &mut TestState) -> String {
 /// `UID SEARCH HEADER Message-ID "<id>"` in the selected mailbox. As RFC
 /// 3501 says, a match is any header value that holds the string, ignoring
 /// case, so replay must check what it finds.
-fn search_message_id(tag: &str, args: &str, state: &TestState) -> String {
+fn search_message_id(tag: &str, args: &str, range: Option<&str>, state: &TestState) -> String {
     let Some(source) = selected(state) else {
         return format!("{tag} BAD no mailbox selected\r\n");
     };
@@ -627,6 +641,9 @@ fn search_message_id(tag: &str, args: &str, state: &TestState) -> String {
     let wanted = mailbox_name(args);
     let mut line = String::from("* SEARCH");
     for message in &mailbox.messages {
+        if range.is_some_and(|range| !uid_in_range(message.uid, range, 0)) {
+            continue;
+        }
         let raw = String::from_utf8_lossy(&message.raw);
         let found = raw
             .split("\r\n")

@@ -5,6 +5,8 @@
 //! is opened only to replay the outbox, on its own connection. A server
 //! without MOVE can still receive read and star writes.
 
+use std::ops::RangeInclusive;
+
 use crate::Error;
 use crate::outbox::OutboxKind;
 use crate::store::copies::CopyFlags;
@@ -26,9 +28,8 @@ pub(in crate::imap) enum WriteError {
 
 /// Where the server put the messages a move took: the target's UIDVALIDITY
 /// and `(source UID, new UID)` pairs, from `COPYUID`. A UID with no pair
-/// was not placed by this command, or the server did not say (no UIDPLUS,
-/// or nothing matched because an earlier try already moved it); replay
-/// then looks for the message in the target.
+/// was not placed by this command, or the server did not say. Replay
+/// looks for that message in the target.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(in crate::imap) struct Placed {
     pub uidvalidity: Option<u32>,
@@ -359,14 +360,17 @@ impl WriteSession {
         &mut self,
         message_id: &str,
         limit: usize,
+        range: Option<RangeInclusive<u32>>,
     ) -> Result<Vec<u32>, WriteError> {
         let value = quote_imap(&format!("<{message_id}>"))
             .map_err(|err| WriteError::Refused(err.to_string()))?;
-        let reply = self.run(
-            "UID SEARCH",
-            &format!("UID SEARCH HEADER Message-ID {value}"),
-        )?;
+        let mut command = format!("UID SEARCH HEADER Message-ID {value}");
+        if let Some(range) = &range {
+            command.push_str(&format!(" UID {}:{}", range.start(), range.end()));
+        }
+        let reply = self.run("UID SEARCH", &command)?;
         search_uids(&reply.untagged, limit)
+            .filter(|uids| range.is_none_or(|range| uids.iter().all(|uid| range.contains(uid))))
             .ok_or_else(|| WriteError::Refused("UID SEARCH returned no usable result".into()))
     }
 

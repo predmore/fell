@@ -96,6 +96,9 @@ CREATE TABLE IF NOT EXISTS server_outbox (
     -- 0 when unknown.
     target_uidvalidity INTEGER NOT NULL DEFAULT 0,
     target_uidnext INTEGER NOT NULL DEFAULT 0,
+    -- Exclusive upper UID bound from the most recent MOVE recovery check.
+    -- NULL before a usable UIDNEXT is observed, including on older rows.
+    move_recovery_end INTEGER,
     -- Undo's reverse of a row that was sent but not settled: that row's
     -- id. The reverse moves the copy that row places. 0 otherwise.
     reverses INTEGER NOT NULL DEFAULT 0,
@@ -144,6 +147,7 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
         "target_uidnext",
         "INTEGER NOT NULL DEFAULT 0",
     ),
+    ("server_outbox", "move_recovery_end", "INTEGER"),
     ("server_outbox", "reverses", "INTEGER NOT NULL DEFAULT 0"),
     ("server_outbox", "flag_value", "INTEGER"),
     ("server_outbox", "flag_modseq", "BLOB"),
@@ -290,6 +294,10 @@ pub struct OutboxEntry {
     pub generation: i64,
     /// The write for this row may have reached the server.
     pub sent: bool,
+    /// The destination's UID state before sending the write.
+    pub(crate) target_bound: Option<Bound>,
+    /// Exclusive end for synced undo. Equal to UIDNEXT at send if unusable.
+    pub(crate) move_recovery_end: Option<u32>,
     /// Undo's reverse of the row with this id, which was sent but not yet
     /// settled: this row moves the copy that one places.
     pub reverses: Option<i64>,
@@ -307,7 +315,7 @@ pub struct ReplayReport {
     /// Rows still queued: refused for now, waiting on an earlier row, or
     /// not due yet.
     pub waiting: usize,
-    /// Rows given up on. The local change stays; the server never got it.
+    /// Rows given up on and what is known about their server copies.
     pub dropped: Vec<DroppedWrite>,
     /// A previous flag write reached the retry limit without confirmation.
     /// The newer edit still waits for that confirmation.
@@ -324,7 +332,7 @@ pub struct ReplayReport {
     pub interrupted: Option<String>,
 }
 
-/// An action the server will not get.
+/// A write that replay gave up on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DroppedWrite {
     pub kind: OutboxKind,
@@ -342,6 +350,14 @@ pub enum DropReason {
     Refused,
     /// The result of a Sent APPEND could not be verified.
     UnconfirmedAppend,
+    /// The destination copy of a possibly applied MOVE could not be verified.
+    UnconfirmedMove,
+    /// The MOVE could not be verified, but the source copy was restored in Fell.
+    MoveRestored,
+    /// The MOVE could not be verified and the original UID is gone.
+    MoveSourceGone,
+    /// Sync could not identify a unique copy to move back for undo.
+    UnconfirmedReverse,
     /// The previous Drafts copy could not be removed.
     DraftCleanup,
     /// The folder, or the message in it, never turned up on the server.
@@ -357,7 +373,7 @@ pub enum DropReason {
 const ENTRY_COLS: &str = "id, kind, state, action_id, message_id, source_folder, source_mailbox,
     uidvalidity, uid, target_folder, target_mailbox, placed_uidvalidity, placed_uid,
     attempts, retry_unix, error, generation, sent, reverses,
-    flag_value, flag_modseq, flag_base";
+    flag_value, flag_modseq, flag_base, target_uidvalidity, target_uidnext, move_recovery_end";
 
 impl Store {
     /// Turn write-back on or off for the account (`write_back` in
@@ -697,7 +713,9 @@ pub(crate) fn undo_action(conn: &Connection, account_id: &AccountId, action_id: 
         &format!(
             "SELECT {ENTRY_COLS} FROM server_outbox
              WHERE account_id = ?1 AND action_id = {action_id} AND kind = 'move'
-               AND state IN ('done', 'pending') AND generation = {generation}
+               AND (state IN ('done', 'pending') OR (state = 'dropped' AND sent = 1
+                    AND error != 'half-done copy from an earlier build'))
+               AND generation = {generation}
                AND {undoable}
              ORDER BY id"
         ),
@@ -928,6 +946,8 @@ fn select_entries(
                 row.get::<_, Option<bool>>(19)?,
                 row.get::<_, Option<[u8; 8]>>(20)?.map(u64::from_be_bytes),
                 row.get::<_, Option<bool>>(21)?,
+                (row.get::<_, u32>(22)?, row.get::<_, u32>(23)?),
+                row.get::<_, Option<u32>>(24)?,
             ),
         ))
     })?;
@@ -957,6 +977,8 @@ fn select_entries(
                 flag_value,
                 flag_modseq,
                 flag_base,
+                target_bound,
+                move_recovery_end,
             ),
         ) = row?;
         out.push(OutboxEntry {
@@ -978,6 +1000,8 @@ fn select_entries(
             error,
             generation,
             sent,
+            target_bound: (target_bound.1 > 0).then_some(target_bound),
+            move_recovery_end,
             reverses: (reverses != 0).then_some(reverses),
             flag_value,
             flag_modseq,
@@ -1000,8 +1024,10 @@ pub(crate) fn unfinished(store: &Store, account_id: &AccountId) -> Result<Vec<Ou
         return Ok(Vec::new());
     }
     tx.execute(
-        "DELETE FROM server_outbox
+        "DELETE FROM server_outbox AS settled
          WHERE account_id = ?1 AND state IN ('done', 'dropped') AND settled_unix < ?2
+           AND NOT EXISTS (SELECT 1 FROM server_outbox pending
+                           WHERE pending.reverses = settled.id AND pending.state = 'pending')
            AND NOT (kind = 'append_draft' AND state = 'dropped' AND append_checks > 0 AND generation = ?3)",
         params![account_id.as_str(), now_unix() - KEEP_SETTLED_SECS, generation(&tx, account_id)?],
     )?;
@@ -1095,7 +1121,91 @@ pub(crate) fn is_claimed(
 /// A target's `(UIDVALIDITY, UIDNEXT)` before a move into it.
 pub(crate) type Bound = (u32, u32);
 
-/// Record that a MOVE for these rows is about to go out. `target` is the
+/// Claim unsent moves and record the exact source copies and destination
+/// bound before sending. A later pass can recover even a move whose source
+/// UID was initially deferred and has since disappeared from the source.
+pub(crate) fn mark_moves_sent(
+    store: &Store,
+    account_id: &AccountId,
+    moves: &[(i64, u32)],
+    (source, validity): (&str, u32),
+    target: &str,
+    bound: Bound,
+) -> Result<Vec<i64>> {
+    let tx = crate::store::immediate_transaction(store.connection())?;
+    ensure_schema(&tx)?;
+    let mut marked = Vec::new();
+    if enabled(&tx, account_id)? {
+        let generation = generation(&tx, account_id)?;
+        for &(id, uid) in moves {
+            let changed = tx.execute(
+                "UPDATE server_outbox
+                 SET sent = 1, source_mailbox = ?2, uidvalidity = ?3, uid = ?4,
+                     target_mailbox = ?5, target_uidvalidity = ?6, target_uidnext = ?7,
+                     move_recovery_end = ?7
+                 WHERE id = ?1 AND account_id = ?8 AND state = 'pending'
+                   AND generation = ?9 AND sent = 0",
+                params![
+                    id,
+                    source,
+                    validity,
+                    uid,
+                    target,
+                    bound.0,
+                    bound.1,
+                    account_id.as_str(),
+                    generation
+                ],
+            )?;
+            if changed != 0 {
+                marked.push(id);
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(marked)
+}
+
+/// Save the exclusive UID bound before further recovery commands can fail.
+/// Record what one recovery check learned about where a sent move could
+/// have landed. `first` is the target's UIDNEXT before the move.
+///
+/// Every UIDNEXT seen after the move was sent bounds where it landed, so a
+/// usable bound (`observed`, a span recovery could search in full) only ever
+/// narrows the window. A check whose span was too wide leaves an earlier
+/// usable bound in place and otherwise records the empty window `first`.
+/// A failed SELECT records nothing; [`clear_move_recovery_end`] handles a
+/// target whose UIDVALIDITY changed.
+pub(crate) fn record_move_recovery_end(
+    store: &Store,
+    id: i64,
+    first: u32,
+    observed: Option<u32>,
+) -> Result<()> {
+    store.connection().execute(
+        "UPDATE server_outbox SET move_recovery_end = CASE
+             WHEN move_recovery_end > ?2 AND ?3 IS NOT NULL THEN MIN(move_recovery_end, ?3)
+             WHEN move_recovery_end > ?2 THEN move_recovery_end
+             ELSE COALESCE(?3, ?2)
+         END
+         WHERE id = ?1 AND state = 'pending' AND sent = 1",
+        params![id, first, observed],
+    )?;
+    Ok(())
+}
+
+/// The target's UIDVALIDITY changed, so no UID bound for this move means
+/// anything any more: record the empty window `first`.
+pub(crate) fn clear_move_recovery_end(store: &Store, id: i64, first: u32) -> Result<()> {
+    store.connection().execute(
+        "UPDATE server_outbox SET move_recovery_end = ?2
+         WHERE id = ?1 AND state = 'pending' AND sent = 1 AND move_recovery_end IS NOT ?2",
+        params![id, first],
+    )?;
+    Ok(())
+}
+
+/// Record that a label write for these rows is about to go out. `target` is the
 /// target's `(UIDVALIDITY, UIDNEXT)` just now; a row not sent before keeps
 /// it, so a later look for its copy there trusts only UIDs from it up.
 ///
@@ -1198,7 +1308,8 @@ pub(crate) fn take_abandoned(store: &Store, account_id: &AccountId) -> Result<Ve
         account_id,
     )?;
     tx.execute(
-        "UPDATE server_outbox SET state = 'dropped' WHERE account_id = ?1 AND state = 'abandoned'",
+        "UPDATE server_outbox SET state = 'dropped', sent = 0
+         WHERE account_id = ?1 AND state = 'abandoned'",
         params![account_id.as_str()],
     )?;
     tx.commit()?;
@@ -1221,9 +1332,8 @@ pub(crate) enum Outcome<'a> {
     /// copy stays in `message_copies` until a new one replaces it.
     Done { placed: (u32, u32) },
     /// Try again at `retry_unix`. `counts` is false for a dropped connection,
-    /// which says nothing about the row. `refused`: the server answered the
-    /// MOVE with NO or BAD, so it did not move it, and the next try is a
-    /// first send again.
+    /// which says nothing about the row. `refused`: a NO or BAD reply or
+    /// recovery confirmed the MOVE did not land. The next try can send again.
     Retry {
         error: &'a str,
         retry_unix: i64,
@@ -1273,29 +1383,30 @@ pub(crate) fn settle(
     let tx = crate::store::immediate_transaction(store.connection())?;
     ensure_schema(&tx)?;
     let now = now_unix();
-    let live: Option<(i64, bool, bool)> = tx
+    let live: Option<(i64, bool, bool, bool)> = tx
         .query_row(
-            "SELECT generation, flag_superseded, sent FROM server_outbox
+            "SELECT generation, flag_superseded, sent, state = 'pending' FROM server_outbox
              WHERE id = ?1 AND (kind = 'move' OR state = 'pending')",
             params![entry.id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
     let current = enabled(&tx, account_id)?
         .then(|| generation(&tx, account_id))
         .transpose()?;
-    if Some(live.map_or(entry.generation, |(generation, _, _)| generation)) != current {
+    if Some(live.map_or(entry.generation, |(generation, ..)| generation)) != current {
         tx.commit()?;
         return Ok(Settled::Stale);
     }
-    if live.is_none() && entry.kind != OutboxKind::Move {
+    if matches!(live, Some((_, _, _, false))) || (live.is_none() && entry.kind != OutboxKind::Move)
+    {
         tx.commit()?;
         return Ok(Settled::Retired);
     }
     let recovering = entry.kind.flag_name().is_some()
-        && matches!(live, Some((_, true, true)))
+        && matches!(live, Some((_, true, true, _)))
         && matches!(outcome, Outcome::Retry { refused: false, .. });
-    if entry.kind.flag_name().is_some() && matches!(live, Some((_, true, _))) && !recovering {
+    if entry.kind.flag_name().is_some() && matches!(live, Some((_, true, _, _))) && !recovering {
         tx.execute(
             "UPDATE server_outbox SET state = 'dropped', error = 'superseded', settled_unix = ?2
              WHERE id = ?1 AND state = 'pending'",
@@ -1441,11 +1552,66 @@ fn retire_reversed(conn: &Connection, account_id: &AccountId, id: i64, now: i64)
     }
     conn.execute(
         "UPDATE server_outbox
-         SET state = 'dropped', error = 'undone; the server did not move it', settled_unix = ?2
+         SET state = 'dropped', sent = 0, error = 'undone; the server did not move it', settled_unix = ?2
          WHERE id = ?1",
         params![id, now],
     )?;
     Ok(true)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MoveSource {
+    Present,
+    Gone,
+    Unknown,
+}
+
+const UNCONFIRMED_SOURCE_GONE: &str = "Destination UID unconfirmed. The source copy is gone";
+
+/// Settle the uncertain write and its local filing in one transaction.
+pub(crate) fn give_up_move(
+    store: &Store,
+    account: &AccountId,
+    entry: &OutboxEntry,
+    observed: MoveSource,
+    source: Option<(&str, (u32, u32))>,
+) -> Result<Option<DropReason>> {
+    let tx = crate::store::immediate_transaction(store.connection())?;
+    let now = now_unix();
+    let error = match observed {
+        MoveSource::Present => "Destination UID unconfirmed. The source copy is still present",
+        MoveSource::Gone => UNCONFIRMED_SOURCE_GONE,
+        MoveSource::Unknown => "Destination and source UIDs unconfirmed",
+    };
+    let changed = tx.execute(
+        "UPDATE server_outbox
+         SET state = 'dropped', error = ?2, settled_unix = ?3, sent = ?4
+         WHERE id = ?1 AND state = 'pending' AND sent = 1
+           AND generation IN (SELECT generation FROM write_back_accounts
+                              WHERE account_id = server_outbox.account_id AND enabled)",
+        params![entry.id, error, now, observed != MoveSource::Present],
+    )?;
+    let reason = if changed == 0 {
+        None
+    } else if observed == MoveSource::Present {
+        if retire_reversed(&tx, account, entry.id, now)? {
+            None
+        } else if let Some((mailbox, (validity, uid))) = source
+            && crate::store::copies::restore_move_source(
+                &tx, account, entry, mailbox, validity, uid,
+            )?
+        {
+            Some(DropReason::MoveRestored)
+        } else {
+            Some(DropReason::UnconfirmedMove)
+        }
+    } else if observed == MoveSource::Gone {
+        Some(DropReason::MoveSourceGone)
+    } else {
+        Some(DropReason::UnconfirmedMove)
+    };
+    tx.commit()?;
+    Ok(reason)
 }
 
 /// Where the row a reverse follows stands now.
@@ -1456,28 +1622,79 @@ pub(crate) enum Reversed {
     /// The server applied it and placed the copy at `(UIDVALIDITY, UID)`
     /// in the reverse's source mailbox.
     Placed(u32, u32),
-    /// It never reached the server, or was given up: nothing to move back.
+    /// A dropped sent move may have landed. Only sync can supply the copy.
+    Unconfirmed {
+        /// Check this original UID first if it wasn't confirmed gone.
+        source: Option<(u32, u32)>,
+        placed: Option<(u32, u32)>,
+    },
+    /// The source copy stayed on the server: nothing to move back.
     Gone,
 }
 
 /// The state of row `id`, which undo's reverse row follows.
-pub(crate) fn reversed(store: &Store, id: i64) -> Result<Reversed> {
-    let found: Option<(String, Option<u32>, Option<u32>)> = store
-        .connection()
-        .query_row(
-            "SELECT state, placed_uidvalidity, placed_uid FROM server_outbox WHERE id = ?1",
-            params![id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()?;
-    let Some((state, uidvalidity, uid)) = found else {
+pub(crate) fn reversed(store: &Store, account: &AccountId, id: i64) -> Result<Reversed> {
+    let entries = select_entries(
+        store.connection(),
+        &format!("SELECT {ENTRY_COLS} FROM server_outbox WHERE account_id = ?1 AND id = {id}"),
+        account,
+    )?;
+    let Some(entry) = entries.first() else {
         return Ok(Reversed::Gone);
     };
-    Ok(match (OutboxState::parse(&state)?, uidvalidity.zip(uid)) {
-        (OutboxState::Pending, _) => Reversed::Waiting,
-        (OutboxState::Done, Some((uidvalidity, uid))) => Reversed::Placed(uidvalidity, uid),
-        _ => Reversed::Gone,
-    })
+    Ok(
+        match (entry.state, entry.placed_uidvalidity.zip(entry.placed_uid)) {
+            (OutboxState::Pending, _) => Reversed::Waiting,
+            (OutboxState::Done, Some((uidvalidity, uid))) => Reversed::Placed(uidvalidity, uid),
+            (OutboxState::Dropped, _)
+                if entry.sent && entry.error != "half-done copy from an earlier build" =>
+            {
+                synced_reversal(store, account, entry)?
+            }
+            _ => Reversed::Gone,
+        },
+    )
+}
+
+fn synced_reversal(store: &Store, account: &AccountId, entry: &OutboxEntry) -> Result<Reversed> {
+    let source = if entry.error == UNCONFIRMED_SOURCE_GONE {
+        None
+    } else {
+        entry.uidvalidity.zip(entry.uid)
+    };
+    let placed = if let Some((mailbox, (validity, first))) =
+        entry.target_mailbox.as_deref().zip(entry.target_bound)
+    {
+        // No recorded end means recovery never observed a usable range (or
+        // the row predates the column): treat it as empty, so sync cannot
+        // supply a UID that might be a different copy of the message.
+        let end = entry.move_recovery_end.map_or(i64::from(first), i64::from);
+        let uid: Option<u32> = store.connection().query_row(
+            "SELECT CASE WHEN COUNT(*) = 1 THEN MAX(c.uid) END FROM message_copies c
+             WHERE c.account_id = ?1 AND c.message_id = ?2 AND c.mailbox = ?3
+               AND c.uidvalidity = ?4 AND c.uid >= ?5 AND c.uid < ?6
+               AND NOT EXISTS (SELECT 1 FROM server_outbox o
+                               WHERE o.account_id = c.account_id AND o.kind = 'move'
+                                 AND ((o.state = 'pending' AND o.source_mailbox = ?7
+                                       AND o.uidvalidity = c.uidvalidity AND o.uid = c.uid)
+                                   OR (o.target_mailbox = ?7 AND o.placed_uidvalidity = c.uidvalidity
+                                       AND o.placed_uid = c.uid)))",
+            params![
+                account.as_str(),
+                entry.message_id,
+                crate::imap::escape_mailbox(mailbox),
+                validity,
+                first,
+                end,
+                mailbox,
+            ],
+            |row| row.get(0),
+        )?;
+        uid.map(|uid| (validity, uid))
+    } else {
+        None
+    };
+    Ok(Reversed::Unconfirmed { source, placed })
 }
 
 /// The server moved `sent`'s copy: record it where it went. The source copy
