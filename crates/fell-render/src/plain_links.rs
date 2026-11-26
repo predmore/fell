@@ -44,9 +44,13 @@ const URI_COMPONENT: &AsciiSet = &NON_ALPHANUMERIC
 pub(crate) fn canonical_mailto(rest: &str) -> Option<String> {
     let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
     let mut target = String::from("mailto:");
-    for (index, address) in path.trim_matches(' ').split(',').enumerate() {
-        let (raw_local, domain) = address.split_once('@')?;
+    for (index, address) in path.split(',').enumerate() {
+        let (raw_local, raw_domain) = address.split_once('@')?;
         let local = decode_mailto_component(raw_local)?;
+        let domain = decode_mailto_component(raw_domain)?;
+        // Trim only the outside of the mailbox, including encoded padding.
+        let local = local.trim_start_matches([' ', '\t']);
+        let domain = domain.trim_end_matches([' ', '\t']);
         // A client may decode the path before parsing mailboxes. Accept a
         // local part only if decoding can't introduce mailbox syntax.
         if local.is_empty()
@@ -65,7 +69,7 @@ pub(crate) fn canonical_mailto(rest: &str) -> Option<String> {
         if index > 0 {
             target.push(',');
         }
-        target.extend(utf8_percent_encode(&local, URI_COMPONENT));
+        target.extend(utf8_percent_encode(local, URI_COMPONENT));
         target.push('@');
         target.push_str(domain);
     }
@@ -79,12 +83,8 @@ pub(crate) fn canonical_mailto(rest: &str) -> Option<String> {
         let slot = match key.as_str() {
             "subject" => &mut subject,
             "body" => &mut body,
-            _ if ["to", "cc", "bcc", "from"]
-                .iter()
-                .any(|name| key.contains(name)) =>
-            {
-                return None;
-            }
+            // Keep rejecting the malformed subject/Bcc spelling as well.
+            "to" | "cc" | "bcc" | "from" | "subjectbcc" => return None,
             _ => continue,
         };
         if parts.is_none() || slot.is_some() || value.contains(['\u{2028}', '\u{2029}']) {
@@ -166,11 +166,14 @@ pub fn plain_link_targets(text: &str) -> Vec<(Range<usize>, String)> {
         }) {
             continue;
         }
-        let end = text[colon + 1..]
-            .find(|ch: char| {
-                ch.is_whitespace() || matches!(ch, '<' | '>' | '"' | '`' | '“' | '”' | '‘' | '’')
-            })
-            .map_or(text.len(), |end| colon + 1 + end);
+        let rest = &text[colon + 1..];
+        let end = colon
+            + 1
+            + if text[start..colon].eq_ignore_ascii_case("mailto") {
+                plain_mailto_end(rest)
+            } else {
+                plain_url_end(rest)
+            };
         scanned = end;
         let label = trim_url_end(&text[start..end]);
         if let Some(target) = reader_link_target(label)
@@ -180,6 +183,46 @@ pub fn plain_link_targets(text: &str) -> Vec<(Range<usize>, String)> {
         }
     }
     links
+}
+
+fn plain_url_end(text: &str) -> usize {
+    text.find(|ch: char| {
+        ch.is_whitespace() || matches!(ch, '<' | '>' | '"' | '`' | '“' | '”' | '‘' | '’')
+    })
+    .unwrap_or(text.len())
+}
+
+fn plain_mailto_end(text: &str) -> usize {
+    let mut end = plain_url_end(text);
+    let mut segment = &text[..end];
+    while !segment.contains('?') {
+        let tail = &text[end..];
+        let next = tail.trim_start_matches([' ', '\t']);
+        if next.len() == tail.len() {
+            break;
+        }
+        let next = match next.strip_prefix(',') {
+            Some(rest) => rest.trim_start_matches([' ', '\t']),
+            None if next.starts_with('?') || segment.ends_with(',') => next,
+            None => break,
+        };
+        let next_segment = &next[..plain_url_end(next)];
+        let path = next_segment
+            .split_once('?')
+            .map_or(next_segment, |(path, _)| path);
+        // A comma can end the link in prose. Consume an address-shaped
+        // continuation so validation can reject the entire target if needed.
+        if !next_segment.starts_with('?')
+            && path
+                .split_once('@')
+                .is_none_or(|(local, _)| local.contains(':'))
+        {
+            break;
+        }
+        segment = next_segment;
+        end = text.len() - next.len() + segment.len();
+    }
+    end
 }
 
 pub(crate) fn plain_link_inlines(text: &str) -> Vec<Inline> {
@@ -342,12 +385,25 @@ mod tests {
                 "mailto:a@x,b@y?subject=Hi&body=Text",
             ),
             (
+                "mailto:ada@example.com, bea@example.com?subject=Hello",
+                "mailto:ada@example.com,bea@example.com?subject=Hello",
+            ),
+            ("mailto:a@x,%20b@y?subject=Hi", "mailto:a@x,b@y?subject=Hi"),
+            (
+                "mailto:a@x , b@y,\tc@z ?subject=Hi",
+                "mailto:a@x,b@y,c@z?subject=Hi",
+            ),
+            (
                 "MAILTO:a%2Bb@x?body=Note&%20Subject%09=Hello%20world&priority=high",
                 "mailto:a%2Bb@x?subject=Hello%20world&body=Note",
             ),
             (
                 "mailto:a@x?subject=100%25+done&body=A%26B%3DC%3F",
                 "mailto:a@x?subject=100%25%2Bdone&body=A%26B%3DC%3F",
+            ),
+            (
+                "mailto:a@x?reply-to=b@y&in-reply-to=id&subject=Hi",
+                "mailto:a@x?subject=Hi",
             ),
             ("mailto:a@x?priority=high", "mailto:a@x"),
         ] {
@@ -366,6 +422,19 @@ mod tests {
     }
 
     #[test]
+    fn spaced_mailto_continuations_preserve_prose_and_validate_the_whole_target() {
+        check("mailto:a@x, then call me", &["mailto:a@x"]);
+        check(
+            "mailto:a@x, https://example.test/u@team",
+            &["mailto:a@x", "https://example.test/u@team"],
+        );
+        check("mailto:a@x, b@bücher.example?subject=Hi", &[]);
+        check("mailto:a@x ?bcc=other@example.test", &[]);
+        check("mailto:a@x, b@y?to=other@example.test", &[]);
+        check("mailto:a@x,\nb@y?subject=Hi", &["mailto:a@x"]);
+    }
+
+    #[test]
     fn ambiguous_mailto_targets_remain_text() {
         for rest in [
             "help@example.test?subject=Hi#&bcc=other@example.test",
@@ -378,11 +447,14 @@ mod tests {
             "help@example.test?cc%20=other@example.test",
             "help@example.test?bcc%09=other@example.test",
             "help@example.test?%62cc%20=other@example.test",
+            "help@example.test?%62cc=other@example.test",
             "help@example.test?subjectbcc=other@example.test",
             "help@example.test?from=other@example.test",
             "help@example.test?subject=one&Subject=two",
             "help@example.test?body=broken%ZZ",
             "help%40example.test%2Cother@example.test",
+            "help%20@example.test",
+            "help@%20example.test",
         ] {
             let target = format!("mailto:{rest}");
             assert_eq!(reader_link_target(&target), None, "{target}");

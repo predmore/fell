@@ -93,6 +93,8 @@ fn link_preview(label: &str, target: &str) -> Option<LinkPreview> {
         return None;
     }
     let (destination, mismatch) = crate::compose_ui::reader_link_destination(label, target)?;
+    let mismatch = mismatch
+        && !(target.starts_with("mailto:") && checked_target(label).as_deref() == Some(target));
     Some(LinkPreview {
         destination: destination.into(),
         target: target.to_owned().into(),
@@ -395,10 +397,11 @@ mod tests {
 
     #[test]
     fn mailto_status_bar_and_opener_use_the_same_canonical_target() {
-        let raw = "mailto:a@x,b@y?Subject=Hi&body=Text&priority=high";
-        let canonical = "mailto:a@x,b@y?subject=Hi&body=Text";
+        let raw = "mailto:ada@example.com, bea@example.com?Subject=Hi&body=Text&priority=high";
+        let canonical = "mailto:ada@example.com,bea@example.com?subject=Hi&body=Text";
         let check = |label: &str, target: &str| {
             let preview = link_preview(label, target).unwrap();
+            assert!(!preview.mismatch);
             let command = open_command(target);
             assert_eq!(command.get_program(), "xdg-open");
             assert!(command.get_args().eq([std::ffi::OsStr::new(canonical)]));
@@ -409,7 +412,16 @@ mod tests {
         let [link] = plain.links.as_ref() else {
             panic!("{plain:?}");
         };
+        assert_eq!(&plain[link.range.clone()], raw);
         check(&plain[link.range.clone()], &link.target);
+        assert!(
+            link_preview(
+                "mailto:ada@example.com, cyd@example.com?Subject=Hi",
+                canonical
+            )
+            .unwrap()
+            .mismatch
+        );
 
         let html = html_to_document(&format!(
             "<a href=\"{}\">Write to us</a>",
