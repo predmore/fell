@@ -74,7 +74,15 @@ impl JobQueue {
 #[allow(deprecated)]
 struct Worker {
     queue: Arc<JobQueue>,
-    wake: glib::Sender<()>,
+    wake: glib::Sender<Wake>,
+    #[cfg(test)]
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+enum Wake {
+    Render,
+    #[cfg(test)]
+    Stop,
 }
 
 struct Load {
@@ -94,7 +102,7 @@ fn worker() -> Option<&'static Worker> {
             let (wake, rx) = glib::MainContext::channel(glib::Priority::DEFAULT);
             let queue = Arc::new(JobQueue::default());
             let queued = queue.clone();
-            std::thread::Builder::new()
+            let _thread = std::thread::Builder::new()
                 .name("fell-webview".into())
                 .spawn(move || {
                     if let Err(error) = run(rx, queued) {
@@ -108,7 +116,12 @@ fn worker() -> Option<&'static Worker> {
                     }
                 })
                 .ok()?;
-            Some(Worker { queue, wake })
+            Some(Worker {
+                queue,
+                wake,
+                #[cfg(test)]
+                thread: Mutex::new(Some(_thread)),
+            })
         })
         .as_ref()
 }
@@ -122,7 +135,7 @@ pub(crate) async fn render(request: WebRequest) -> Option<Snapshot> {
     let worker = worker()?;
     let budget = request.load_budget();
     worker.queue.submit(Job { request, reply });
-    worker.wake.send(()).ok()?;
+    worker.wake.send(Wake::Render).ok()?;
     // The worker can fail during setup, before GLib attaches its receiver.
     // Bound the wait even when GLib keeps an already queued request alive.
     let timeout = async_io::Timer::after(budget + Duration::from_secs(2));
@@ -133,7 +146,7 @@ pub(crate) async fn render(request: WebRequest) -> Option<Snapshot> {
 }
 
 #[allow(deprecated)]
-fn run(rx: glib::Receiver<()>, queue: Arc<JobQueue>) -> Result<(), Box<dyn std::error::Error>> {
+fn run(rx: glib::Receiver<Wake>, queue: Arc<JobQueue>) -> Result<(), Box<dyn std::error::Error>> {
     gtk::init()?;
     let window = gtk::OffscreenWindow::new();
     window.set_accept_focus(false);
@@ -171,9 +184,19 @@ fn run(rx: glib::Receiver<()>, queue: Arc<JobQueue>) -> Result<(), Box<dyn std::
         move |_, _| cancel(&active)
     });
     window.show_all();
-    // Start the web process before the first conversation needs it.
-    widget.load_html("<!doctype html>", None);
-    let _source = rx.attach(None, move |()| {
+    // Prepare GTK and the content filter during prewarm. Let the first job
+    // drive navigation so it cannot supersede an in-flight warmup document.
+    let _source = rx.attach(None, move |wake| {
+        match wake {
+            Wake::Render => {}
+            #[cfg(test)]
+            Wake::Stop => {
+                cancel(&active);
+                widget.stop_loading();
+                gtk::main_quit();
+                return glib::ControlFlow::Break;
+            }
+        }
         let Some(job) = queue.next() else {
             return glib::ControlFlow::Continue;
         };
@@ -216,7 +239,7 @@ fn run(rx: glib::Receiver<()>, queue: Arc<JobQueue>) -> Result<(), Box<dyn std::
         widget.load_html(&html, None);
         glib::timeout_add_local_once(budget, {
             let active = active.clone();
-            let widget = widget.clone();
+            let widget = widget.downgrade();
             move || {
                 if active
                     .borrow()
@@ -224,7 +247,9 @@ fn run(rx: glib::Receiver<()>, queue: Arc<JobQueue>) -> Result<(), Box<dyn std::
                     .is_some_and(|load| load.cancel == cancellable)
                 {
                     cancel(&active);
-                    widget.stop_loading();
+                    if let Some(widget) = widget.upgrade() {
+                        widget.stop_loading();
+                    }
                 }
             }
         });
@@ -411,6 +436,9 @@ fn capture(
 
 fn secure(widget: &webkit2gtk::WebView) -> Result<(), Box<dyn std::error::Error>> {
     let settings = WebViewExt::settings(widget).ok_or("missing WebKit settings")?;
+    // The offscreen view hands Cairo snapshots to GPUI. Software compositing
+    // avoids making the first paint depend on an EGL/DRI3 presentation path.
+    settings.set_hardware_acceleration_policy(webkit2gtk::HardwareAccelerationPolicy::Never);
     // Only the fixed decode probe runs, in a separate script world. Mail
     // cannot supply scripts or handlers, and its CSP also denies scripts.
     settings.set_enable_javascript_markup(false);
@@ -628,6 +656,21 @@ mod tests {
     use super::*;
     use base64::Engine;
 
+    struct StopWorker;
+
+    impl Drop for StopWorker {
+        fn drop(&mut self) {
+            // Run GTK teardown before libtest exits, including after an
+            // assertion fails while WebKit is still processing a load.
+            if let Some(worker) = worker() {
+                let _ = worker.wake.send(Wake::Stop);
+                if let Some(thread) = worker.thread.lock().unwrap().take() {
+                    thread.join().unwrap();
+                }
+            }
+        }
+    }
+
     fn contains_display_color(picture: &Snapshot, rgb: [u8; 3]) -> bool {
         picture
             .image
@@ -691,6 +734,7 @@ mod tests {
                 .arg(std::env::current_exe().unwrap())
                 .args(["--exact", TEST, "--nocapture"])
                 .env("GDK_BACKEND", "x11")
+                .env("LIBGL_ALWAYS_SOFTWARE", "1")
                 .env_remove("DBUS_SESSION_BUS_ADDRESS")
                 .output()
                 .expect("start WebKit test on the CI virtual display");
@@ -709,6 +753,8 @@ mod tests {
         ) {
             return;
         }
+
+        let _worker = StopWorker;
 
         let local_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         // UDP connect selects a local interface without sending a datagram.
