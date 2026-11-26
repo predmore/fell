@@ -801,7 +801,7 @@ mod tests {
             .unwrap();
         writeln!(
             file,
-            "email = '{id}@example.test'\npassword_command = 'exit 1'\n{suffix}"
+            "email = '{id}@example.test'\npassword = 'fixture'\nport = 1\nnotifications = 'off'\n{suffix}"
         )
         .unwrap();
     }
@@ -823,6 +823,12 @@ mod tests {
             .update(&mut app, |view, _, _| view.views["work"].clone())
             .unwrap();
         let store = old.read_with(&app, |inbox, _| inbox.store.clone());
+        let sibling_store = window
+            .update(&mut app, |view, _, cx| {
+                view.views["mail"].read(cx).store.clone()
+            })
+            .unwrap();
+        futures::executor::block_on(sibling_store.call(|_| ())).unwrap();
         futures::executor::block_on(store.call(|_| ())).unwrap();
         app.run_until_parked();
         let check_position = |inbox: &Inbox| {
