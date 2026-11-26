@@ -24,22 +24,66 @@ const CHOICE_PADDING: f32 = 16.;
 const CHOICE_GAP: f32 = 12.;
 const CHOICE_ARROW: f32 = 16.;
 const SERVER_INPUT_PADDING_REM: f32 = 0.375;
-const SECURITY_WIDTH: f32 = 92.;
 const FIELD_GAP: f32 = 8.;
+const SECURITY_PADDING: f32 = 5.;
+const SECURITY_GAP: f32 = 6.;
+const SECURITY_CAPTION: &str = "Security";
+const SECURITY_ICON: &str = "↻";
 
-fn port_width(window: &Window, theme: &crate::theme::Theme) -> f32 {
-    let mut style = window.text_style();
-    if let Some(family) = &theme.ui_family {
-        style.font_family = family.clone().into();
+#[derive(Clone, Copy)]
+struct ServerFieldWidths {
+    port: f32,
+    security: f32,
+}
+
+impl ServerFieldWidths {
+    fn measure(window: &Window, theme: &crate::theme::Theme) -> Self {
+        let mut style = window.text_style();
+        if let Some(family) = &theme.ui_family {
+            style.font_family = family.clone().into();
+        }
+        let text_width = |text: &'static str, size, style: &gpui::TextStyle| {
+            let run = style.to_run(text.len());
+            let line = window
+                .text_system()
+                .shape_line(text.into(), px(size), &[run], None);
+            f32::from(line.width)
+        };
+        let digits = text_width("65535", theme.ui_px, &style);
+        // Allow for the border, horizontal padding, and the caret at the end.
+        let input_padding = f32::from(window.rem_size()) * SERVER_INPUT_PADDING_REM;
+        let port = (digits + 2. * (input_padding + 1.) + 2.).ceil();
+
+        // Reserve space for every option so cycling keeps the fields aligned.
+        let size = security_text_size(theme);
+        let label = [
+            ImapSecurity::Tls,
+            ImapSecurity::StartTls,
+            ImapSecurity::Plain,
+        ]
+        .into_iter()
+        .map(|mode| text_width(security_label(mode), size, &style))
+        .fold(0., f32::max);
+        let icon = text_width(SECURITY_ICON, size, &style);
+        style.font_weight = FontWeight::MEDIUM;
+        let caption = text_width(SECURITY_CAPTION, theme.ui_px - 1., &style);
+        let security = (label + icon + SECURITY_GAP + 2. * (SECURITY_PADDING + 1.))
+            .max(caption)
+            .ceil();
+        Self { port, security }
     }
-    let sample = "65535";
-    let run = style.to_run(sample.len());
-    let line = window
-        .text_system()
-        .shape_line(sample.into(), px(theme.ui_px), &[run], None);
-    // Allow for the border, horizontal padding, and the caret at the end.
-    let padding = f32::from(window.rem_size()) * SERVER_INPUT_PADDING_REM;
-    (f32::from(line.width) + 2. * (padding + 1.) + 2.).ceil()
+}
+
+fn security_text_size(theme: &crate::theme::Theme) -> f32 {
+    theme.ui_px - 2.
+}
+
+fn security_label(mode: ImapSecurity) -> &'static str {
+    match mode {
+        ImapSecurity::StartTls => "STARTTLS",
+        ImapSecurity::Tls => "TLS",
+        ImapSecurity::Plain => "Plain",
+    }
 }
 
 fn focus_ring(accent: u32, radius: f32) -> Div {
@@ -321,14 +365,14 @@ impl Onboarding {
                 )
             }
             Step::Servers => {
-                let port_width = port_width(window, &self.theme);
+                let fields = ServerFieldWidths::measure(window, &self.theme);
                 (
                     "Server settings",
                     self.form.provider.name(),
                     column().gap_4().children(
                         Service::ALL
                             .into_iter()
-                            .map(|service| self.server(service, measure, port_width, live, cx)),
+                            .map(|service| self.server(service, measure, fields, live, cx)),
                     ),
                     self.footer("Back", None, live, cx),
                 )
@@ -917,7 +961,7 @@ impl Onboarding {
         &self,
         service: Service,
         width: f32,
-        port_width: f32,
+        fields: ServerFieldWidths,
         live: bool,
         cx: &Context<Self>,
     ) -> Div {
@@ -925,20 +969,17 @@ impl Onboarding {
         let control = Control::Field(field);
         let focused = live && self.control == control;
         let border = self.field_border(field, focused);
-        let security = match self.form.security(service) {
-            ImapSecurity::StartTls => "STARTTLS",
-            ImapSecurity::Tls => "TLS",
-            ImapSecurity::Plain => "Plain",
-        };
+        let security = security_label(self.form.security(service));
+        let security_size = px(security_text_size(&self.theme));
         let issues = &self.feedback.servers[service as usize];
         let current = self
-            .server_issues(service, issues.value, port_width, live, cx)
+            .server_issues(service, issues.value, fields, live, cx)
             .into_any_element();
         let feedback = match issues.frame {
             Some((old, shown)) => layered(
                 width,
                 [
-                    self.server_issues(service, old, port_width, false, cx)
+                    self.server_issues(service, old, fields, false, cx)
                         .into_any_element(),
                     current,
                 ],
@@ -969,22 +1010,24 @@ impl Onboarding {
                     .child(
                         self.field_box(Field::Port(service), "Port", "", live, cx)
                             .flex_none()
-                            .w(px(port_width)),
+                            .w(px(fields.port)),
                     )
                     .child(
                         div()
-                            .w(px(SECURITY_WIDTH))
+                            .w(px(fields.security))
+                            .flex_none()
                             .flex()
                             .flex_col()
                             .gap_1()
-                            .child(self.label("Security"))
+                            .child(self.label(SECURITY_CAPTION))
                             .child(
                                 self.clickable(control, service.name(), live, cx)
+                                    .debug_selector(|| format!("{service:?}-security"))
                                     .flex()
                                     .justify_between()
                                     .items_center()
-                                    .gap(px(6.))
-                                    .px(px(5.))
+                                    .gap(px(SECURITY_GAP))
+                                    .px(px(SECURITY_PADDING))
                                     .py_1p5()
                                     .h(px(self.theme.ui_px + 20.))
                                     .border_1()
@@ -994,14 +1037,18 @@ impl Onboarding {
                                     .when(focused, |el| el.relative().child(focus_ring(border, 7.)))
                                     .child(
                                         div()
+                                            .debug_selector(|| {
+                                                format!("{service:?}-security-value")
+                                            })
                                             .flex_none()
-                                            .text_size(px(self.theme.ui_px - 2.))
+                                            .text_size(security_size)
                                             .child(security),
                                     )
                                     .child(
-                                        self.meta("↻")
+                                        self.meta(SECURITY_ICON)
+                                            .debug_selector(|| format!("{service:?}-security-icon"))
                                             .flex_none()
-                                            .text_size(px(self.theme.ui_px - 2.)),
+                                            .text_size(security_size),
                                     ),
                             ),
                     ),
@@ -1013,7 +1060,7 @@ impl Onboarding {
         &self,
         service: Service,
         [host, port, security]: ServerIssues,
-        port_width: f32,
+        fields: ServerFieldWidths,
         live: bool,
         cx: &Context<Self>,
     ) -> Div {
@@ -1047,7 +1094,7 @@ impl Onboarding {
                         .child(
                             div()
                                 .flex_none()
-                                .w(px(port_width + SECURITY_WIDTH + FIELD_GAP))
+                                .w(px(fields.port + fields.security + FIELD_GAP))
                                 .children(port.map(|issue| self.field_issue(&issue))),
                         ),
                 )
@@ -1138,7 +1185,7 @@ mod tests {
 
     use super::*;
     use crate::motion::Motion;
-    use gpui::{EntityInputHandler, Modifiers, TestAppContext, point};
+    use gpui::{EntityInputHandler, Modifiers, TestAppContext, point, size};
 
     #[test]
     fn port_width_reserves_room_for_five_digits_at_each_ui_size() {
@@ -1158,13 +1205,71 @@ mod tests {
                     &[style.to_run(5)],
                     None,
                 );
-                let width = port_width(window, &theme);
+                let width = ServerFieldWidths::measure(window, &theme).port;
                 let insets = 2. * (f32::from(window.rem_size()) * 0.375 + 1.);
                 assert!(width - insets >= f32::from(digits.width) + 2.);
                 assert!(width > previous_width);
                 previous_width = width;
             }
         });
+    }
+
+    #[test]
+    fn security_options_fit_both_server_fields_at_supported_sizes() {
+        let mut app = TestAppContext::single();
+        let (entity, cx) = app.add_window_view(|window, cx| {
+            let mut setup = Onboarding::init(window, cx);
+            setup.form.choose(Provider::Custom);
+            setup.form.edit_servers();
+            for service in Service::ALL {
+                setup
+                    .form
+                    .set_text(Field::Host(service), "127.0.0.1".into());
+            }
+            setup.select(Control::Field(Field::Security(Service::Smtp)));
+            setup
+        });
+        for width in [360., 1180.] {
+            cx.simulate_resize(size(px(width), px(760.)));
+            for half_px in 24..=36 {
+                let font_size = half_px as f32 / 2.;
+                let mut previous = None;
+                for _ in 0..3 {
+                    cx.update(|_, cx| {
+                        entity.update(cx, |setup, cx| {
+                            setup.theme.ui_px = font_size;
+                            for service in Service::ALL {
+                                setup.form.cycle_security(service, false);
+                            }
+                            cx.notify();
+                        });
+                    });
+                    cx.run_until_parked();
+                    let fields = [
+                        ["Imap-security", "Imap-security-value", "Imap-security-icon"],
+                        ["Smtp-security", "Smtp-security-value", "Smtp-security-icon"],
+                    ]
+                    .map(|selectors| {
+                        let [field, label, icon] =
+                            selectors.map(|key| cx.debug_bounds(key).unwrap());
+                        assert!(field.right() <= px(width - 20.));
+                        assert!(label.left() > field.left());
+                        assert!(label.right() < icon.left());
+                        assert!(
+                            icon.right() < field.right(),
+                            "{width}px window, {font_size}px UI font"
+                        );
+                        field
+                    });
+                    assert_eq!(fields[0].left(), fields[1].left());
+                    assert_eq!(fields[0].size.width, fields[1].size.width);
+                    if let Some(previous) = previous {
+                        assert_eq!(fields, previous);
+                    }
+                    previous = Some(fields);
+                }
+            }
+        }
     }
 
     #[test]
