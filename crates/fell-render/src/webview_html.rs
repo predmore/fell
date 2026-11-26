@@ -199,11 +199,13 @@ fn serialize_node(
             }
             out.push('<');
             out.push_str(name);
-            for (attr, value) in element.attrs() {
+            for (name_attr, value) in &element.attrs {
+                let attr = name_attr.local.as_ref();
                 // Only image attributes and image-valued CSS declarations
                 // may enter the fetch list.
                 if let Some(slots) = images.as_deref_mut() {
-                    if (attr == "src" && name == "img"
+                    if name_attr.prefix.is_none()
+                        && (attr == "src" && name.eq_ignore_ascii_case("img")
                         || attr == "background" && matches!(name, "table" | "tr" | "td" | "th"))
                         && let Some(url) = remote_image_url(value)
                     {
@@ -222,7 +224,10 @@ fn serialize_node(
                         out.push('"');
                         continue;
                     }
-                    if matches!(attr, "ping" | "attributionsrc") {
+                    let link = attr == "href"
+                        && name_attr.prefix.is_none()
+                        && (name.eq_ignore_ascii_case("a") || name.eq_ignore_ascii_case("area"));
+                    if !link && !keep_offline_attr(element, attr, value) {
                         continue;
                     }
                 }
@@ -231,6 +236,10 @@ fn serialize_node(
                 }
                 let value = rewrite_attr(name, attr, value, allow_remote_images);
                 out.push(' ');
+                if let Some(prefix) = &name_attr.prefix {
+                    out.push_str(prefix.as_ref());
+                    out.push(':');
+                }
                 out.push_str(attr);
                 out.push_str("=\"");
                 out.push_str(&escape_attr(&value));
@@ -259,6 +268,78 @@ fn serialize_node(
 }
 
 const VOID: &[&str] = &["area", "br", "hr", "img", "wbr", "col"];
+
+fn resource_attr(name: &str) -> bool {
+    matches!(
+        name,
+        "href" | "xlink:href" | "src" | "srcset" | "imagesrcset" | "poster" | "background"
+            | "lowsrc" | "dynsrc" | "data" | "codebase" | "archive" | "classid" | "manifest"
+            | "profile" | "longdesc" | "usemap" | "action" | "formaction" | "cite" | "base"
+            | "xml:base"
+    )
+}
+
+fn local_resource(value: &str) -> bool {
+    let value = value.trim();
+    let (scheme, _) = value.split_once(':').unwrap_or_default();
+    value.is_empty()
+        || value.starts_with('#')
+        || scheme.eq_ignore_ascii_case("cid")
+        || value.get(..11).is_some_and(|head| head.eq_ignore_ascii_case("data:image/"))
+}
+
+fn contains_external_url(value: &str) -> bool {
+    // Base64 may contain consecutive slashes without containing a URL.
+    if let Some((header, payload)) = value.split_once(',')
+        && header.to_ascii_lowercase().starts_with("data:image/")
+        && header.to_ascii_lowercase().ends_with(";base64")
+        && payload.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')
+        })
+    {
+        return false;
+    }
+    let normalized = normalize_resource_url(value).to_ascii_lowercase();
+    ["http:", "https:", "//", "file:"]
+        .iter()
+        .any(|scheme| normalized.contains(scheme))
+}
+
+fn keep_offline_attr(element: &scraper::node::Element, name: &str, value: &str) -> bool {
+    if matches!(name, "ping" | "attributionsrc" | "base") || contains_external_url(value) {
+        return false;
+    }
+    if matches!(name, "srcset" | "imagesrcset") {
+        // A comma can separate candidates or belong to a data URL. Keep
+        // only single local resource attributes and omit source sets.
+        return false;
+    }
+    if resource_attr(name) {
+        return local_resource(value);
+    }
+    if matches!(name, "values" | "from" | "to" | "by")
+        && ["set", "animate", "animateColor", "animateTransform", "animateMotion"]
+            .iter()
+            .any(|tag| tag.eq_ignore_ascii_case(element.name()))
+        && element.attr("attributeName").is_some_and(|target| {
+            let target = target.to_ascii_lowercase();
+            resource_attr(&target) || target == "style"
+        })
+    {
+        return value.split(';').all(local_resource);
+    }
+    if value.contains('(') {
+        let css = strip_css_comments(value);
+        let mut input = ParserInput::new(&css);
+        let mut resources = Vec::new();
+        css_resources(&mut Parser::new(&mut input), 0, false, &mut resources);
+        return resources.into_iter().all(|(_, resource)| match resource {
+            CssResource::Url(url) | CssResource::ImageString(url) => local_resource(&url),
+            _ => false,
+        });
+    }
+    true
+}
 
 fn subtree_text(node: ego_tree::NodeRef<'_, scraper::node::Node>) -> String {
     let mut text = String::new();
@@ -311,11 +392,17 @@ fn image_attr_is_remote(tag: &str, name: &str, value: &str) -> bool {
         "src" | "poster" | "background" | "lowsrc" | "dynsrc" => is_remote_url(value),
         "srcset" => srcset_is_remote(value),
         // HTML parses `<image>` as `<img>`, so a remote href on either is an image.
-        "href" | "xlink:href" if matches!(tag, "img" | "image" | "use" | "feimage") => {
+        "href" | "xlink:href" if image_href_tag(tag) => {
             is_remote_url(value)
         }
         _ => false,
     }
+}
+
+fn image_href_tag(tag: &str) -> bool {
+    ["img", "image", "use", "feimage"]
+        .iter()
+        .any(|name| tag.eq_ignore_ascii_case(name))
 }
 
 fn srcset_is_remote(value: &str) -> bool {
@@ -565,7 +652,7 @@ fn css_resources(
                 CssResource::ImageString(value.to_string())
             }
             // A standalone URL string can also become an image source via var().
-            Ok(Token::QuotedString(value)) if is_remote_url(value) => {
+            Ok(Token::QuotedString(value)) if contains_external_url(value) => {
                 CssResource::VariableCandidate
             }
             Ok(Token::BadString(_)) if image_strings => CssResource::Remove,
@@ -632,7 +719,8 @@ fn serialize_css(
     let mut from = 0;
     for (range, resource) in resources {
         let name = css_declaration(&css, range.start);
-        if matches!(resource, CssResource::VariableCandidate)
+        if images.is_none()
+            && matches!(resource, CssResource::VariableCandidate)
             && !name.is_some_and(|name| name.starts_with("--"))
         {
             continue;
@@ -683,7 +771,7 @@ fn image_attr_is_blocked(tag: &str, name: &str, value: &str, allow_remote_images
         "srcset" => value
             .split(',')
             .any(|part| resource_is_disallowed(part, allow_remote_images)),
-        "href" | "xlink:href" if matches!(tag, "img" | "image" | "use" | "feimage") => {
+        "href" | "xlink:href" if image_href_tag(tag) => {
             resource_is_disallowed(value, allow_remote_images)
         }
         _ => false,
@@ -1164,6 +1252,51 @@ mod tests {
         assert!(math.contains("<math"), "{math}");
         assert!(math.contains("<mi"), "{math}");
         assert!(math.contains("</math>"), "{math}");
+    }
+
+    #[test]
+    fn offline_page_omits_external_svg_and_attribute_resources() {
+        let cases = [
+            r#"<svg><feImage href="https://probe.invalid/image"/></svg>"#,
+            r#"<svg><feImage xlink:href="//probe.invalid/xlink"/></svg>"#,
+            r#"<svg><textPath href="HTTP://probe.invalid/path">Text</textPath></svg>"#,
+            r#"<svg><linearGradient href="https://probe.invalid/gradient"/></svg>"#,
+            r#"<svg><pattern href="file:///probe.png"/></svg>"#,
+            r#"<svg><filter href="relative-probe.svg#filter"/></svg>"#,
+            r#"<svg><mpath href="https://probe.invalid/motion"/></svg>"#,
+            r#"<svg><cursor href="//probe.invalid/cursor"/></svg>"#,
+            r#"<svg><font-face-uri href="https://probe.invalid/font"/></svg>"#,
+            r#"<svg><path fill="url(https://probe.invalid/fill)"/></svg>"#,
+            r#"<svg><path stroke="url(file:///probe.png)"/></svg>"#,
+            r#"<svg><path filter="url(//probe.invalid/filter)"/></svg>"#,
+            r#"<svg><path mask="url('relative-probe.svg#mask')"/></svg>"#,
+            r#"<svg><path clip-path="url(ht&#10;tps://probe.invalid/clip)"/></svg>"#,
+            r#"<svg><set attributeName="href" to="relative-probe.svg"/></svg>"#,
+            r#"<svg><set to="url(file:///probe.png)"/></svg>"#,
+            r##"<svg><animate values="#local;https://probe.invalid/next"/></svg>"##,
+            r#"<svg><animate from="//probe.invalid/from"/></svg>"#,
+            r#"<svg><animate to="https://probe.invalid/to"/></svg>"#,
+            r#"<svg><animate by="url(relative-probe.svg)"/></svg>"#,
+            r#"<img srcset="relative-probe.png 2x" src="relative-probe.png">"#,
+            r#"<p data-src="photo: //probe.invalid/data" title="see file:///probe.png">Text</p>"#,
+            r#"<p style='font-family: "https://probe.invalid/family"'>Text</p>"#,
+            r#"<svg><a xlink:href="https://probe.invalid/link">Text</a></svg>"#,
+        ];
+        for html in cases {
+            let mail = WebMail::prepare(html);
+            assert!(!mail.has_remote_images(), "{html}");
+            let page = mail.page("light", |_| None);
+            for forbidden in ["probe.invalid", "file:", "relative-probe"] {
+                assert!(!page.contains(forbidden), "{html}: {page}");
+            }
+        }
+        let page = WebMail::prepare(
+            r##"<svg><use href="#local" fill="url(#accent)"/></svg><a href="https://example.test">Link</a><img src="cid:logo"><img src="data:image/png;base64,//AA">"##,
+        )
+        .page("light", |_| None);
+        for local in ["#local", "url(#accent)", "https://example.test", "cid:logo", "//AA"] {
+            assert!(page.contains(local), "{page}");
+        }
     }
 
     #[test]

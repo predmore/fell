@@ -44,36 +44,44 @@ pub(crate) fn inline_page(
     allowed: impl Fn() -> bool,
 ) -> (String, Result<(), Failure>) {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    inline_page_with(mail, scheme, &allowed, |url, limit| {
+        fetch(AGENT.get_or_init(agent), url, limit, &allowed)
+    })
+}
+
+fn inline_page_with(
+    mail: &fell_render::WebMail,
+    scheme: &str,
+    allowed: impl Fn() -> bool,
+    mut fetch: impl FnMut(&str, usize) -> Result<String, Failure>,
+) -> (String, Result<(), Failure>) {
     let deadline = Instant::now() + PAGE_TIME;
     let mut remaining = PAGE_BYTES;
     let mut fetched: HashMap<String, Result<String, Failure>> = HashMap::new();
-    let mut result = Err(Failure::Limit);
+    let mut failure = None;
     let html = mail.page(scheme, |url| {
         if !allowed() || Instant::now() >= deadline || remaining == 0 {
+            failure.get_or_insert(Failure::Limit);
             return None;
         }
-        let image = fetched.entry(url.to_owned()).or_insert_with(|| {
-            fetch(
-                AGENT.get_or_init(agent),
-                url,
-                remaining.min(IMAGE_BYTES),
-                &allowed,
-            )
-        });
+        let image = fetched
+            .entry(url.to_owned())
+            .or_insert_with(|| fetch(url, remaining.min(IMAGE_BYTES)));
         match image {
             Ok(data) if data.len() <= remaining => {
-                result = Ok(());
                 remaining -= data.len();
                 Some(data.clone())
             }
-            Err(failure) if matches!(result, Err(Failure::Limit)) => {
-                result = Err(failure.clone());
+            _ => {
+                failure.get_or_insert_with(|| match image {
+                    Err(error) => error.clone(),
+                    Ok(_) => Failure::Limit,
+                });
                 None
             }
-            _ => None,
         }
     });
-    (html, result)
+    (html, failure.map_or(Ok(()), Err))
 }
 
 fn agent() -> ureq::Agent {
@@ -193,4 +201,35 @@ fn fetch(
         ));
     }
     Err(Failure::Response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_partial_page_keeps_the_first_image_failure() {
+        let urls = [
+            "https://example.test/good",
+            "https://example.test/missing",
+            "https://example.test/damaged",
+        ];
+        for order in [[0, 1, 2], [1, 0, 2]] {
+            let html = order
+                .map(|index| format!(r#"<img src="{}">"#, urls[index]))
+                .concat();
+            let mail = fell_render::WebMail::prepare(&html);
+            let (page, result) = inline_page_with(&mail, "light", || true, |url, _| {
+                if url == urls[0] {
+                    Ok("data:image/png;base64,AAAA".into())
+                } else if url == urls[1] {
+                    Err(Failure::Response)
+                } else {
+                    Err(Failure::Format)
+                }
+            });
+            assert!(page.contains("data:image/png;base64,AAAA"));
+            assert!(matches!(result, Err(Failure::Response)));
+        }
+    }
 }

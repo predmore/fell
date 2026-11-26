@@ -419,7 +419,7 @@ fn surface_image(surface: gtk::cairo::Surface) -> Option<Snapshot> {
 #[cfg(test)]
 mod tests {
     use std::io::ErrorKind;
-    use std::net::TcpListener;
+    use std::net::{TcpListener, UdpSocket};
 
     use super::*;
 
@@ -446,12 +446,15 @@ mod tests {
 
     #[test]
     fn hostile_email_makes_zero_webkit_requests() {
-        use fell_core::test_support::{skip_unless_available, test_net_missing};
+        use fell_core::test_support::skip_unless_available;
 
         const TEST: &str = "render::webview::tests::hostile_email_makes_zero_webkit_requests";
         let no_display =
             std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none();
-        if no_display && std::env::var_os("CI").is_some_and(|ci| ci == "true") {
+        if no_display
+            && (std::env::var_os("CI").is_some_and(|ci| ci == "true")
+                || std::env::var_os("FELL_REQUIRE_ALL_TESTS").is_some_and(|set| set == "1"))
+        {
             // The Ubuntu runner ships Xvfb. Give just this test a display,
             // leaving the rest of the suite independent of GTK.
             let output = std::process::Command::new("xvfb-run")
@@ -471,22 +474,28 @@ mod tests {
             assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
             return;
         }
-        let missing = if no_display {
-            Some("WebKit requires an isolated Wayland or X11 display".into())
-        } else {
-            test_net_missing()
-        };
-        if skip_unless_available(TEST, missing) {
+        if skip_unless_available(
+            TEST,
+            no_display.then(|| "WebKit requires an isolated Wayland or X11 display".into()),
+        ) {
             return;
         }
 
-        let listener = |host| {
-            let listener = TcpListener::bind((host, 0)).unwrap();
+        let local_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        // UDP connect selects a local interface without sending a datagram.
+        // A second loopback address still gives us a distinct origin on an
+        // isolated machine with no non-loopback interface or default route.
+        let public_listener = TcpListener::bind("192.0.2.1:0")
+            .or_else(|_| {
+                let route = UdpSocket::bind("0.0.0.0:0")?;
+                route.connect("192.0.2.1:80")?;
+                TcpListener::bind((route.local_addr()?.ip(), 0))
+            })
+            .or_else(|_| TcpListener::bind("127.0.0.2:0"))
+            .expect("bind a second origin for the WebKit probe");
+        for listener in [&local_listener, &public_listener] {
             listener.set_nonblocking(true).unwrap();
-            listener
-        };
-        let local_listener = listener("127.0.0.1");
-        let public_listener = listener("192.0.2.1");
+        }
         let local = format!("http://{}", local_listener.local_addr().unwrap());
         let public = format!("http://{}", public_listener.local_addr().unwrap());
         let dir = tempfile::tempdir().unwrap();
@@ -531,7 +540,26 @@ mod tests {
             <form action="{local}/form"><input></form>
             <script>fetch("{local}/script");</script>
             <a href="{public}/link" ping="{local}/ping">Link</a>
-            <svg xmlns="http://www.w3.org/2000/svg"><image href="{public}/svg"/></svg>
+            <svg xmlns="http://www.w3.org/2000/svg">
+              <defs>
+                <filter id="filter"><feImage href="{public}/fe-image" xlink:href="{local}/fe-xlink"/></filter>
+                <linearGradient href="{public}/gradient"/>
+                <pattern href="{file}"/>
+                <filter href="{public}/filter"/>
+                <cursor href="{public}/cursor"/>
+                <font-face><font-face-src><font-face-uri href="{public}/font-face"/></font-face-src></font-face>
+              </defs>
+              <image href="{public}/svg" filter="url(#filter)" data-src="{local}/data">
+                <set attributeName="href" to="{file}"/>
+                <animate attributeName="href" values="{public}/values;relative.png"
+                  from="{public}/from" to="{local}/to" by="{public}/by"/>
+              </image>
+              <text><textPath href="{public}/path">Text</textPath></text>
+              <animateMotion><mpath href="{public}/motion"/></animateMotion>
+              <rect width="10" height="10" fill="url({public}/fill)" stroke="url({file})"
+                filter="url({public}/paint-filter)" mask="url({public}/mask)"
+                clip-path="url({public}/clip)"/>
+            </svg>
             </body>"#
         );
         let start = super::super::proxy::requests();
@@ -549,7 +577,7 @@ mod tests {
         for listener in [local_listener, public_listener] {
             assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
         }
-        eprintln!("hostile WebKit corpus drew a frame without proxy, origin or file loads");
+        eprintln!("hostile WebKit corpus drew a frame without proxy, origin or file loads ({public})");
 
         let blocked = fell_render::WebMail::prepare(
             r#"<img src="https://cdn.example.test/width-only" width="300" alt="A photo" style="display:block">"#,
