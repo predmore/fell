@@ -2576,6 +2576,7 @@ impl Inbox {
                 let top = slot + self.motion.row_offset(&row.id, slot, now);
                 ((first..last).contains(&index) || (top < view && top + ROW_PX > 0.0)).then(|| {
                     Drawn {
+                        index,
                         top,
                         slot,
                         selected: highlighted.contains(&row.id),
@@ -2664,6 +2665,23 @@ impl Inbox {
                 .list
                 .as_ref()
                 .is_some_and(ListShift::has_batch_ghosts);
+        let viewport_scrolled = batch_leave
+            && drawn.first().is_some_and(|first| {
+                let previous_offset = first.slot - first.index as f32 * ROW_PX;
+                (previous_offset - offset).abs() >= 0.5
+            });
+        let batch_offsets: Vec<_> = if viewport_scrolled {
+            let visible = |top| top < viewport && top + ROW_PX > 0.0;
+            drawn
+                .iter()
+                .filter_map(|old| {
+                    let slot = *ids.get(old.row.id.as_str())? as f32 * ROW_PX + offset;
+                    (visible(old.top) || visible(slot)).then_some(old.top - slot)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         if !replace && batch {
             let threads = &self.session.threads;
             let visible_start = (-offset / ROW_PX).floor() as usize;
@@ -2722,7 +2740,9 @@ impl Inbox {
             now,
         )
         .map(|shift| {
-            let shift = shift.fading_below(below);
+            let shift = shift
+                .with_batch_scroll(batch_offsets.into_iter())
+                .fading_below(below);
             if top_arrival && !batch_leave {
                 shift.top_arrival()
             } else if reveal_selection && !replace && !batch_leave {
@@ -6509,6 +6529,7 @@ impl Render for Inbox {
 /// A row as the last frame drew it.
 struct Drawn {
     row: ThreadRow,
+    index: usize,
     selected: bool,
     /// Its top in the viewport, as painted (in flight or not).
     top: f32,
@@ -7660,6 +7681,8 @@ fn thread_list(
                 let ids = inbox.session.threads.iter().map(|row| row.id.as_str());
                 inbox.row_widths.keep_drawn(range.clone(), ids);
                 let visible = range.clone();
+                let last_visible = visible.end.saturating_sub(1);
+                let mut sliders = Vec::new();
                 let selection_bands = inbox
                     .motion
                     .list
@@ -7673,6 +7696,7 @@ fn thread_list(
                             .map(|ghost| (ghost.top, ghost.opacity(now)))
                             .collect::<Vec<_>>()
                     });
+                let batch_leave = selection_bands.is_some();
                 let rows: Vec<_> = range
                     .map(|index| {
                         let row = inbox.session.threads[index].clone();
@@ -7712,7 +7736,7 @@ fn thread_list(
                             ),
                         };
                         let top = index as f32 * ROW_PX + offset;
-                        let (moving, ghosts, overflow, batch) = if let Some(shift) =
+                        let (moving, ghosts, mut overflow, batch) = if let Some(shift) =
                             inbox.motion.list.as_mut()
                         {
                             let below = inbox.session.threads[index + 1..]
@@ -7745,7 +7769,12 @@ fn thread_list(
                                     let slot = outside as f32 * ROW_PX + offset;
                                     let painted = shift
                                         .visible_overflow(&row.id, slot, ROW_PX, viewport, now)?;
-                                    let dy = motion::snap(painted - top, window.scale_factor());
+                                    let anchor = if batch_leave {
+                                        last_visible as f32 * ROW_PX + offset
+                                    } else {
+                                        top
+                                    };
+                                    let dy = motion::snap(painted - anchor, window.scale_factor());
                                     let look = RowLook {
                                         content_only: false,
                                         selected: highlighted.contains(&row.id),
@@ -7803,6 +7832,7 @@ fn thread_list(
                             && moving == RowMotion::STILL
                             && ghosts.is_empty()
                             && overflow.is_empty()
+                            && (index != last_visible || sliders.is_empty())
                         {
                             return element;
                         }
@@ -7820,6 +7850,11 @@ fn thread_list(
                                 )
                             })
                             .collect();
+                        let slider_slot = batch_slider_slot(
+                            last_visible,
+                            batch_leave && regroup.is_none(),
+                            moving,
+                        );
                         let layer = if let Some(regroup) = regroup {
                             let progress = regroup.fade.progress(now);
                             let previous = &regroup.previous;
@@ -7863,7 +7898,7 @@ fn thread_list(
                             )
                         } else {
                             moving_row_layer(
-                                0.0,
+                                (index as f32 - slider_slot.unwrap_or(index) as f32) * ROW_PX,
                                 moving,
                                 selected.then_some(theme_for_rows.selection),
                                 batch.then_some(theme_for_rows.background),
@@ -7871,6 +7906,15 @@ fn thread_list(
                                 window,
                             )
                         };
+                        let layer = if slider_slot.is_some() {
+                            sliders.push(layer.block_mouse_except_scroll());
+                            None
+                        } else {
+                            Some(layer)
+                        };
+                        if batch_leave {
+                            sliders.append(&mut overflow);
+                        }
                         div()
                             .id(gpui::ElementId::named_usize("thread-slot", index))
                             .relative()
@@ -7879,10 +7923,13 @@ fn thread_list(
                             .children(ghosts)
                             .map(|slot| {
                                 if regroup.is_some() {
-                                    slot.children(overflow).child(layer)
+                                    slot.children(overflow).children(layer)
                                 } else {
-                                    slot.child(layer).children(overflow)
+                                    slot.children(layer).children(overflow)
                                 }
+                            })
+                            .when(index == last_visible, |slot| {
+                                slot.children(std::mem::take(&mut sliders))
                             })
                             .into_any_element()
                     })
@@ -7903,6 +7950,11 @@ fn thread_list(
     .min_h(px(0.))
     .track_scroll(scroll);
     pane.child(rows)
+}
+
+/// The last slot paints the moving batch rows over every arrival's fill.
+fn batch_slider_slot(last_visible: usize, batch: bool, row: RowMotion) -> Option<usize> {
+    (batch && row.dy != 0.0).then_some(last_visible)
 }
 
 /// GPUI asks for one row during layout and again during prepaint to find the
@@ -13983,6 +14035,52 @@ mod tests {
     use crate::present::Pane;
     use gpui::{IntoElement, Keystroke, Modifiers, div};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn later_batch_arrivals_paint_below_crossing_survivors() {
+        use super::{ListChange, ListShift, ROW_PX, batch_slider_slot};
+
+        // Mark old slots 0, 2, 4 and 6. Old slot 5 crosses several
+        // later arrivals, one of which also owns the final paint slot.
+        let start = Instant::now();
+        let rows = [("a", 1), ("b", 3), ("c", 5), ("d", 7), ("e", 8), ("f", 9)];
+        let mut shift = ListShift::start(
+            &motion::Motion::new(true),
+            rows.map(|(id, old)| (id.to_owned(), old as f32 * ROW_PX))
+                .to_vec(),
+            [0, 2, 4, 6].map(|old| (old, old as f32 * ROW_PX)).to_vec(),
+            vec![],
+            640.0,
+            ListChange::BatchLeave { row_height: ROW_PX },
+            start,
+        )
+        .unwrap();
+        let last_visible = rows.len() - 1;
+        let mut crossed_later_arrival = false;
+        for ms in 0..=120 {
+            let now = start + Duration::from_millis(ms);
+            let frames: [_; 6] = std::array::from_fn(|index| {
+                let top = index as f32 * ROW_PX;
+                let mut row = shift.row(rows[index].0, top, ROW_PX, None, now);
+                row.dy = motion::snap(row.dy, 1.0);
+                (top, row, batch_slider_slot(last_visible, true, row))
+            });
+            for (index, &(top, slider, host)) in frames.iter().enumerate() {
+                if slider.dy == 0.0 {
+                    continue;
+                }
+                for (slot, &(arrival_top, arrival, arrival_host)) in frames.iter().enumerate() {
+                    let overlaps = (top + slider.dy - arrival_top).abs() < ROW_PX;
+                    if slot > index && arrival.opacity < 1.0 && overlaps {
+                        crossed_later_arrival = true;
+                        assert_eq!(arrival_host, None);
+                        assert_eq!(host, Some(last_visible), "at {ms} ms");
+                    }
+                }
+            }
+        }
+        assert!(crossed_later_arrival);
+    }
 
     #[test]
     fn inbox_list_builds_each_visible_row_only_once() {
