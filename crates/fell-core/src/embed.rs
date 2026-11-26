@@ -1978,30 +1978,35 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_hard_link_waits_while_the_path_is_published() {
+        use std::sync::mpsc::channel;
+
         let _reset = PauseReset;
         testing_start_indexer_paused(true);
-        let dir = std::env::temp_dir().join(format!(
-            "fell-embed-hard-wait-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("mail.sqlite");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mail.sqlite");
         std::fs::File::create(&path).unwrap();
-        let other = dir.join("mail-link.sqlite");
+        let other = dir.path().join("mail-link.sqlite");
         std::fs::hard_link(&path, &other).unwrap();
-        crate::store::testing_delay_publish_once(true);
-        let opener = std::thread::spawn(move || Store::open(&path).unwrap());
-        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let (publishing, wait_for_publisher) = channel();
+        let (contended, wait_for_contention) = channel();
+        let opener = std::thread::spawn(move || {
+            testing_start_indexer_paused(true);
+            crate::store::testing_on_mailbox_claim(move |exclusive| {
+                assert!(exclusive);
+                publishing.send(()).unwrap();
+                wait_for_contention.recv().unwrap();
+            });
+            Store::open(&path).unwrap()
+        });
+        wait_for_publisher.recv().unwrap();
+        crate::store::testing_on_mailbox_claim(move |exclusive| {
+            assert!(!exclusive);
+            contended.send(()).unwrap();
+        });
         let second = Store::open(&other).unwrap();
         let first = opener.join().unwrap();
         assert_eq!(second.mailbox_path(), first.mailbox_path());
-        drop(second);
-        drop(first);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]

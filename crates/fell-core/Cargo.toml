@@ -55,6 +55,7 @@ fell-confirm.workspace = true
 # Builds a tiny ONNX graph in tests. Same major version tract-onnx uses.
 prost = "0.14"
 rcgen = "0.13"
+rusqlite = { workspace = true, features = ["hooks"] }
 tempfile = "3"
 
 [lints.rust]
