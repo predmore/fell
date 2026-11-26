@@ -1214,13 +1214,20 @@ fn open_store_for(id: &str) -> Option<Store> {
     }
     let mut matched = None;
     for entry in accounts.entries {
-        let id = entry.path.file_stem()?.to_str()?;
-        let path = registry.store_path(&base, id).ok()?;
-        if let Some((store, draft)) = open(&path).ok()? {
-            if draft.account_id.as_str() != id || matched.is_some() {
-                return None;
-            }
-            matched = Some(store);
+        let Some(id) = entry.path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if entry.path.parent() != Some(registry.directory().as_path()) {
+            continue;
+        }
+        let Ok(path) = registry.store_path(&base, id) else {
+            continue;
+        };
+        if let Ok(Some((store, draft))) = open(&path)
+            && draft.account_id.as_str() == id
+            && matched.replace(store).is_some()
+        {
+            return None;
         }
     }
     matched
@@ -1407,6 +1414,9 @@ mod tests {
         assert_eq!(stored_compose_account("cfixture").as_deref(), Some("work"));
         save(&stores[0]);
         assert!(open_store_for("cfixture").is_none());
+        drop(stores);
+        std::fs::create_dir(crate::accounts::removal_trash(&base)).unwrap();
+        assert_eq!(stored_compose_account("cfixture").as_deref(), Some("work"));
     }
 
     #[test]

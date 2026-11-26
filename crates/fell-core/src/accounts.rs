@@ -50,6 +50,14 @@ impl FileError {
             "Restore read access to the account file.",
         )
     }
+
+    pub fn reason(&self, path: &Path) -> &str {
+        let path = path.to_string_lossy();
+        self.detail
+            .strip_prefix(path.as_ref())
+            .and_then(|rest| rest.strip_prefix(": ").or_else(|| rest.strip_prefix(' ')))
+            .unwrap_or(&self.detail)
+    }
 }
 
 impl std::fmt::Display for FileError {
@@ -195,11 +203,21 @@ impl Registry {
                         file_identity,
                     });
                 }
-                accounts.entries.sort_by(|a, b| a.path.cmp(&b.path));
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => accounts.error = Some(FileError::access(&dir, error)),
         }
+        let legacy = self.config.join("account.toml");
+        if accounts.error.is_none()
+            && let Err(error) = read(&legacy, None)
+        {
+            accounts.entries.push(Entry {
+                file_identity: legacy.symlink_metadata().ok().map(file_identity),
+                path: legacy,
+                config: Err(error),
+            });
+        }
+        accounts.entries.sort_by(|a, b| a.path.cmp(&b.path));
         accounts
     }
 
@@ -227,7 +245,7 @@ impl Registry {
         if removal_trash(&path).symlink_metadata().is_ok() {
             return Err(FileError::new(
                 format!("Removal of {id} is in progress"),
-                "Run fell account remove again to finish.",
+                "Open Settings → Accounts to restore local mail or finish deleting.",
             ));
         }
         Ok(path)
@@ -237,42 +255,55 @@ impl Registry {
         self.path(id)?;
         // Read the source first. If migration has already renamed it, the
         // durable marker must be visible before any migrated file is visible.
-        let legacy = read(&self.config.join("account.toml"), None)?;
+        let legacy = read(&self.config.join("account.toml"), None);
         match real_directory(&self.directory()) {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => return Err(FileError::access(&self.directory(), err)),
         }
-        let marker = self.directory().join(".original-id");
-        let original = match legacy {
-            Some((config, _)) => config.id,
-            None => match OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(&marker)
-            {
-                Ok(file) => {
-                    let mut value = String::new();
-                    file.take(65)
-                        .read_to_string(&mut value)
-                        .map_err(|err| FileError::access(&marker, err))?;
-                    validate_id(&value).map_err(|err| {
-                        FileError::new(
-                            format!("{}: {err}", marker.display()),
-                            "Restore the original account ID.",
-                        )
-                    })?;
-                    value
+        let original = match self.original_marker() {
+            Ok(Some(id)) => id,
+            marker => {
+                let backup = self.config.join("account.toml.bak");
+                match backup.symlink_metadata() {
+                    Ok(_) => read(&backup, None)?.ok_or_else(|| missing(&backup))?.0.id,
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => match legacy? {
+                        Some((config, _)) => config.id,
+                        None => marker?.unwrap_or_else(|| DEFAULT_ID.into()),
+                    },
+                    Err(err) => return Err(FileError::access(&backup, err)),
                 }
-                Err(err) if err.kind() == io::ErrorKind::NotFound => DEFAULT_ID.into(),
-                Err(err) => return Err(FileError::access(&marker, err)),
-            },
+            }
         };
         Ok(if id == original {
             base.to_owned()
         } else {
             base.with_extension("accounts").join(format!("{id}.db"))
         })
+    }
+
+    fn original_marker(&self) -> Result<Option<String>, FileError> {
+        let marker = self.directory().join(".original-id");
+        let file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&marker)
+        {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(FileError::access(&marker, err)),
+        };
+        let mut value = String::new();
+        file.take(65)
+            .read_to_string(&mut value)
+            .map_err(|err| FileError::access(&marker, err))?;
+        validate_id(&value).map_err(|err| {
+            FileError::new(
+                format!("{}: {err}", marker.display()),
+                "Restore the original account ID.",
+            )
+        })?;
+        Ok(Some(value))
     }
 
     /// Copy the original bytes into the new layout, then rename the source
@@ -298,7 +329,11 @@ impl Registry {
         let lock = open_account_directory(&dir).map_err(|err| FileError::access(&dir, err))?;
         lock.try_lock()
             .map_err(|err| FileError::access(&dir, err.into()))?;
-        let Some((config, text)) = read(&legacy, None)? else {
+        let legacy_config = match read(&legacy, None) {
+            Err(_) if matches!(self.original_marker(), Ok(Some(_))) => return Ok(()),
+            result => result?,
+        };
+        let Some((config, text)) = legacy_config else {
             return Ok(());
         };
         let target = self.path(&config.id)?;
@@ -546,6 +581,59 @@ mod tests {
         let base = root.path().join("mail.db");
         assert_eq!(registry.store_path(&base, "personal").unwrap(), base);
         assert!(!base.with_extension("accounts").exists());
+    }
+
+    #[test]
+    fn a_lost_or_invalid_marker_uses_the_migration_backup() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("fell");
+        let registry = Registry::at(config.clone());
+        let base = root.path().join("mail.db");
+        let backup = config.join("account.toml.bak");
+        write_private(
+            &backup,
+            "id = 'personal'\nemail = 'personal@example.test'\npassword = 'fixture'\n",
+        );
+        for marker in [None, Some("bad/id")] {
+            if let Some(marker) = marker {
+                write_private(&registry.directory().join(".original-id"), marker);
+            }
+            assert_eq!(registry.store_path(&base, "personal").unwrap(), base);
+            assert_ne!(registry.store_path(&base, "mail").unwrap(), base);
+        }
+        fs::write(backup, "broken").unwrap();
+        assert!(registry.store_path(&base, "mail").is_err());
+    }
+
+    #[test]
+    fn a_broken_legacy_leftover_is_listed_without_blocking_mailboxes() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("fell");
+        let registry = Registry::at(config.clone());
+        let legacy = config.join("account.toml");
+        let base = root.path().join("mail.db");
+        write_private(
+            &legacy,
+            "id = 'personal'\nemail = 'personal@example.test'\npassword = 'fixture'\n",
+        );
+        registry.migrate().unwrap();
+        write_private(
+            &registry.path("work").unwrap(),
+            "email = 'work@example.test'\npassword = 'fixture'\n",
+        );
+        write_private(&legacy, "invalid = [");
+        registry.migrate().unwrap();
+        let catalog = registry.load();
+        assert!(catalog.error.is_none());
+        let broken = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.path == legacy)
+            .unwrap();
+        assert!(broken.config.is_err());
+        assert_eq!(registry.store_path(&base, "personal").unwrap(), base);
+        assert_ne!(registry.store_path(&base, "work").unwrap(), base);
+        assert_eq!(fs::read_to_string(legacy).unwrap(), "invalid = [");
     }
 
     #[test]
