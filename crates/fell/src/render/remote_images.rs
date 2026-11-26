@@ -17,7 +17,7 @@ const PAGE_BYTES: usize = 12 * 1024 * 1024;
 const FETCH_TIME: Duration = Duration::from_secs(3);
 const PAGE_TIME: Duration = Duration::from_secs(12);
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Failure {
     Unreachable(String),
     Address,
@@ -78,6 +78,9 @@ fn inline_page_with(
     let mut unavailable = None;
     let mut limited = false;
     let mut failed = |error| {
+        if error == Failure::Limit && std::mem::replace(&mut limited, true) {
+            return None;
+        }
         let failure = unavailable.get_or_insert(UnavailableImages {
             first: error,
             count: 0,
@@ -86,17 +89,13 @@ fn inline_page_with(
         None
     };
     let html = mail.page(scheme, |url| {
-        if limited {
-            return None;
-        }
         if !allowed() || Instant::now() >= deadline || remaining == 0 {
-            limited = true;
             return failed(Failure::Limit);
         }
         let image = match fetched.entry(url.to_owned()) {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => {
-                let image = entry.insert(fetch(url, remaining.min(IMAGE_BYTES)));
+                let image = entry.insert(fetch(url, remaining));
                 if let Err(error) = image {
                     return failed(error.clone());
                 }
@@ -108,10 +107,7 @@ fn inline_page_with(
                 remaining -= data.len();
                 Some(data.clone())
             }
-            Ok(_) => {
-                limited = true;
-                failed(Failure::Limit)
-            }
+            Ok(_) => failed(Failure::Limit),
             Err(_) => None,
         }
     });
@@ -129,15 +125,22 @@ fn agent() -> ureq::Agent {
         .root_certs(RootCerts::new_with_certs(&roots))
         .unversioned_rustls_crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
         .build();
-    let config = ureq::Agent::config_builder()
+    ureq::Agent::with_parts(
+        agent_config(tls),
+        DefaultConnector::default(),
+        PublicResolver,
+    )
+}
+
+fn agent_config(tls: ureq::tls::TlsConfig) -> ureq::config::Config {
+    ureq::Agent::config_builder()
         .proxy(None)
         .max_redirects(0)
         .max_idle_connections(0)
         .timeout_global(Some(FETCH_TIME))
         .timeout_resolve(Some(FETCH_TIME))
         .tls_config(tls)
-        .build();
-    ureq::Agent::with_parts(config, DefaultConnector::default(), PublicResolver)
+        .build()
 }
 
 #[derive(Debug)]
@@ -166,7 +169,7 @@ impl Resolver for PublicResolver {
 fn fetch(
     agent: &ureq::Agent,
     source: &str,
-    limit: usize,
+    encoded_limit: usize,
     allowed: &impl Fn() -> bool,
 ) -> Result<String, Failure> {
     let mut url = Url::parse(source).map_err(|_| Failure::Address)?;
@@ -216,6 +219,12 @@ fn fetch(
             Some("image/gif") => "image/gif",
             _ => return Err(Failure::Format),
         };
+        let mut data = format!("data:{mime};base64,");
+        // Base64 takes four bytes per three input bytes, including padding.
+        let limit = (encoded_limit.saturating_sub(data.len()) / 4 * 3).min(IMAGE_BYTES);
+        if limit == 0 {
+            return Err(Failure::Limit);
+        }
         let mut bytes = Vec::new();
         response
             .into_body()
@@ -229,10 +238,8 @@ fn fetch(
         if !super::native::raster_bytes_allowed(&bytes, mime) {
             return Err(Failure::Format);
         }
-        return Ok(format!(
-            "data:{mime};base64,{}",
-            base64::engine::general_purpose::STANDARD.encode(bytes)
-        ));
+        base64::engine::general_purpose::STANDARD.encode_string(bytes, &mut data);
+        return Ok(data);
     }
     Err(Failure::Response)
 }
@@ -240,6 +247,178 @@ fn fetch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{Ipv4Addr, TcpListener, TcpStream};
+
+    const HOST: &str = "images.example.test";
+
+    #[derive(Debug)]
+    struct LoopbackResolver;
+
+    impl Resolver for LoopbackResolver {
+        fn resolve(
+            &self,
+            uri: &ureq::http::Uri,
+            _: &ureq::config::Config,
+            _: NextTimeout,
+        ) -> Result<ResolvedSocketAddrs, ureq::Error> {
+            // Only the synthetic public hostname is routed to the fixture.
+            // fetch still validates every URL before issuing a request.
+            assert_eq!(uri.host(), Some(HOST), "{uri}");
+            let mut addresses = self.empty();
+            addresses.push((Ipv4Addr::LOCALHOST, uri.port_u16().unwrap()).into());
+            Ok(addresses)
+        }
+    }
+
+    fn accept(listener: &TcpListener) -> TcpStream {
+        let deadline = Instant::now() + FETCH_TIME;
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_read_timeout(Some(FETCH_TIME)).unwrap();
+                    stream.set_write_timeout(Some(FETCH_TIME)).unwrap();
+                    return stream;
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("waiting for fixture request: {error}"),
+            }
+        }
+    }
+
+    fn respond(mut stream: impl Read + Write, path: &str, headers: &str, body: &[u8]) {
+        let mut reader = BufReader::new(&mut stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line, format!("GET {path} HTTP/1.1\r\n"));
+        loop {
+            line.clear();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            if line == "\r\n" {
+                break;
+            }
+        }
+        write!(
+            stream,
+            "HTTP/1.1 {headers}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len(),
+        )
+        .unwrap();
+        stream.write_all(body).unwrap();
+        stream.flush().unwrap();
+    }
+
+    #[test]
+    fn fetch_follows_http_redirects_and_checks_each_target() {
+        use rustls::pki_types::PrivateKeyDer;
+        use rustls::{ServerConfig, ServerConnection, StreamOwned};
+        use ureq::tls::{Certificate, RootCerts, TlsConfig};
+
+        let http = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let https = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        http.set_nonblocking(true).unwrap();
+        https.set_nonblocking(true).unwrap();
+        let port = http.local_addr().unwrap().port();
+        let https_port = https.local_addr().unwrap().port();
+        let fixture = rcgen::generate_simple_self_signed(vec![HOST.into()]).unwrap();
+        let cert = fixture.cert.der();
+        let key = PrivateKeyDer::Pkcs8(fixture.key_pair.serialize_der().into());
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let server = ServerConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key)
+            .unwrap();
+        let tls = TlsConfig::builder()
+            .root_certs(RootCerts::new_with_certs(&[Certificate::from_der(
+                cert.as_ref(),
+            )
+            .to_owned()]))
+            .unversioned_rustls_crypto_provider(provider)
+            .build();
+        let client = ureq::Agent::with_parts(
+            agent_config(tls),
+            DefaultConnector::default(),
+            LoopbackResolver,
+        );
+        let encoded = "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"; // 1 × 1 GIF
+        let gif = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        let data = format!("data:image/gif;base64,{encoded}");
+        let http_url = |path| format!("http://{HOST}:{port}{path}");
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for (path, header) in [
+                    (
+                        "/start",
+                        "301 Moved Permanently\r\nLocation: /next".to_owned(),
+                    ),
+                    ("/next", "302 Found\r\nLocation: /image".to_owned()),
+                ] {
+                    respond(accept(&http), path, &header, b"");
+                }
+                for _ in 0..2 {
+                    respond(
+                        accept(&http),
+                        "/image",
+                        "200 OK\r\nContent-Type: image/gif",
+                        &gif,
+                    );
+                }
+                for (path, target) in [
+                    ("/loopback", format!("http://127.0.0.1:{port}/image")),
+                    ("/private", "http://10.0.0.1/image".into()),
+                    ("/scheme", format!("ftp://{HOST}:{port}/image")),
+                ] {
+                    respond(
+                        accept(&http),
+                        path,
+                        &format!("302 Found\r\nLocation: {target}"),
+                        b"",
+                    );
+                }
+            });
+            scope.spawn(|| {
+                let conn = ServerConnection::new(Arc::new(server)).unwrap();
+                let tls = StreamOwned::new(conn, accept(&https));
+                respond(
+                    tls,
+                    "/downgrade",
+                    &format!("302 Found\r\nLocation: {}", http_url("/image")),
+                    b"",
+                );
+            });
+            assert_eq!(
+                fetch(&client, &http_url("/start"), data.len(), &|| true),
+                Ok(data.clone())
+            );
+            assert_eq!(
+                fetch(&client, &http_url("/image"), data.len() - 1, &|| true),
+                Err(Failure::Limit)
+            );
+            for url in [
+                http_url("/loopback"),
+                http_url("/private"),
+                http_url("/scheme"),
+                format!("https://{HOST}:{https_port}/downgrade"),
+            ] {
+                assert_eq!(
+                    fetch(&client, &url, PAGE_BYTES, &|| true),
+                    Err(Failure::Address),
+                    "{url}"
+                );
+            }
+        });
+    }
 
     #[test]
     fn a_partial_page_keeps_the_first_image_failure() {
@@ -307,6 +486,40 @@ mod tests {
             Err(UnavailableImages {
                 first: Failure::Response,
                 count: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn images_that_miss_the_budget_do_not_stop_smaller_downloads() {
+        let mail = fell_render::WebMail::prepare(concat!(
+            r#"<img src="https://example.test/big"><img src="https://example.test/larger">"#,
+            r#"<img src="https://example.test/small">"#,
+        ));
+        let small = "data:image/png;base64,AAAA";
+        let mut requested = Vec::new();
+        let (page, result) = inline_page_with(
+            &mail,
+            "light",
+            small.len(),
+            || true,
+            |url, limit| {
+                assert_eq!(limit, small.len());
+                requested.push(url.rsplit('/').next().unwrap().to_owned());
+                match requested.last().unwrap().as_str() {
+                    "big" => Err(Failure::Limit),
+                    "larger" => Ok(format!("{small}AAAA")),
+                    _ => Ok(small.into()),
+                }
+            },
+        );
+        assert_eq!(requested, ["big", "larger", "small"]);
+        assert_eq!(page.matches(small).count(), 1);
+        assert!(matches!(
+            result,
+            Err(UnavailableImages {
+                first: Failure::Limit,
+                count: 1
             })
         ));
     }

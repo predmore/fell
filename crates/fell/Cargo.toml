@@ -62,5 +62,6 @@ fell-core = { workspace = true, features = ["ui-confirm", "test-utils"] }
 gpui = { workspace = true, features = ["test-support"] }
 # The shaper GPUI uses on Linux, to test line cuts on real shaping.
 cosmic-text = "0.14"
+rcgen = "0.13"
 rusqlite.workspace = true
 toml = "1"

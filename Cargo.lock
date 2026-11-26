@@ -1999,6 +1999,7 @@ dependencies = [
  "notify",
  "psl",
  "raw-window-handle",
+ "rcgen",
  "rusqlite",
  "rustix 1.1.6",
  "rustls",

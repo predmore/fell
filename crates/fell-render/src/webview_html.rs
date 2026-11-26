@@ -1,7 +1,14 @@
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::{Deref, Range};
 
-use cssparser::{Delimiter, ParseError, Parser, ParserInput, Token};
+use cssparser::{
+    AtRuleParser, Delimiter, ParseError, Parser, ParserInput, ParserState, QualifiedRuleParser,
+    StyleSheetParser, Token,
+};
+use scraper::node::{Element, Node};
+
+use crate::html::{self, Declaration};
 
 const MAX_ESTIMATED_HEIGHT: f32 = 8_192.;
 
@@ -61,9 +68,9 @@ impl WebMail {
             0,
             Some(&mut images),
         );
-        let mut layout_dom = crate::html::parse_html(&body);
-        crate::html::prune_hidden(&mut layout_dom);
-        let layout = Layout::from_node(*layout_dom.root_element());
+        let layout_dom = crate::html::parse_html(&body);
+        let styles = LayoutStyles::from_document(&layout_dom);
+        let layout = Layout::from_node(*layout_dom.root_element(), &styles, false);
         // The surrounding document is ours. Carry over the email body's
         // padding so the snapshot can honor its bottom inset.
         let mut body_padding = String::new();
@@ -131,6 +138,145 @@ impl WebMail {
     }
 }
 
+// One winning declaration per property and simple selector. Indexing rules
+// keeps estimation from scanning the stylesheet for every element.
+type OrderedDeclarations = Vec<(usize, Declaration)>;
+
+fn add_declaration(rules: &mut OrderedDeclarations, order: usize, declaration: Declaration) {
+    if let Some(rule) = rules
+        .iter_mut()
+        .find(|(_, prior)| prior.name == declaration.name)
+    {
+        if declaration.important || !rule.1.important {
+            *rule = (order, declaration);
+        }
+    } else {
+        rules.push((order, declaration));
+    }
+}
+
+#[derive(Default)]
+struct LayoutStyles {
+    tags: HashMap<String, OrderedDeclarations>,
+    classes: HashMap<String, OrderedDeclarations>,
+    ids: HashMap<String, OrderedDeclarations>,
+}
+
+enum SimpleSelector {
+    Tag(String),
+    Class(String),
+    Id(String),
+}
+
+type LayoutRule = (Vec<SimpleSelector>, OrderedDeclarations);
+
+struct LayoutRules;
+
+impl<'i> AtRuleParser<'i> for LayoutRules {
+    type Prelude = ();
+    type AtRule = LayoutRule;
+    type Error = ();
+}
+
+impl<'i> QualifiedRuleParser<'i> for LayoutRules {
+    type Prelude = Vec<SimpleSelector>;
+    type QualifiedRule = LayoutRule;
+    type Error = ();
+
+    fn parse_prelude<'t>(
+        &mut self,
+        input: &mut Parser<'i, 't>,
+    ) -> Result<Self::Prelude, ParseError<'i, ()>> {
+        input.parse_comma_separated(|input| {
+            Ok(match input.next()?.clone() {
+                Token::Ident(tag) => SimpleSelector::Tag(tag.to_ascii_lowercase()),
+                Token::Delim('.') => SimpleSelector::Class(input.expect_ident()?.to_string()),
+                Token::IDHash(id) => SimpleSelector::Id(id.to_string()),
+                token => return Err(input.new_unexpected_token_error(token)),
+            })
+        })
+    }
+
+    fn parse_block<'t>(
+        &mut self,
+        selectors: Self::Prelude,
+        _: &ParserState,
+        input: &mut Parser<'i, 't>,
+    ) -> Result<LayoutRule, ParseError<'i, ()>> {
+        let mut rules = Vec::new();
+        for (order, declaration) in html::parse_declarations(input).into_iter().enumerate() {
+            if matches!(
+                declaration.name.as_str(),
+                "display" | "visibility" | "font-size" | "max-height" | "overflow" | "overflow-y"
+            ) {
+                add_declaration(&mut rules, order, declaration);
+            }
+        }
+        Ok((selectors, rules))
+    }
+}
+
+impl LayoutStyles {
+    fn from_document(dom: &scraper::Html) -> Self {
+        let mut styles = Self::default();
+        let mut order = 0;
+        for node in dom
+            .root_element()
+            .descendants()
+            .filter_map(scraper::ElementRef::wrap)
+            .filter(|node| node.value().name() == "style")
+        {
+            let css = node.text().collect::<String>();
+            let mut input = ParserInput::new(&css);
+            let mut parser = Parser::new(&mut input);
+            for (selectors, declarations) in
+                StyleSheetParser::new(&mut parser, &mut LayoutRules).flatten()
+            {
+                let Some(last) = declarations.iter().map(|(index, _)| *index).max() else {
+                    continue;
+                };
+                for selector in selectors {
+                    let rules = match selector {
+                        SimpleSelector::Tag(tag) => styles.tags.entry(tag),
+                        SimpleSelector::Class(class) => styles.classes.entry(class),
+                        SimpleSelector::Id(id) => styles.ids.entry(id),
+                    }
+                    .or_default();
+                    for (index, declaration) in &declarations {
+                        add_declaration(rules, order + index, declaration.clone());
+                    }
+                }
+                order += last + 1;
+            }
+        }
+        styles
+    }
+
+    fn declarations(&self, element: &Element) -> Vec<Declaration> {
+        let tag = self.tags.get(element.name());
+        let classes = element
+            .classes()
+            .filter_map(|class| self.classes.get(class));
+        let id = element.id().and_then(|id| self.ids.get(id));
+        let mut author: Vec<_> = [(0, tag), (2, id)]
+            .into_iter()
+            .filter_map(|(specificity, rules)| Some((specificity, rules?)))
+            .chain(classes.map(|rules| (1, rules)))
+            .flat_map(|(specificity, rules)| {
+                rules
+                    .iter()
+                    .map(move |(order, decl)| ((specificity, *order), decl))
+            })
+            .collect();
+        author.sort_unstable_by_key(|(precedence, _)| *precedence);
+        author
+            .into_iter()
+            .map(|(_, decl)| decl.clone())
+            .chain(html::style_declarations(element))
+            .collect()
+    }
+}
+
 #[derive(Debug)]
 enum Layout {
     Text(usize),
@@ -144,24 +290,61 @@ enum Layout {
         padding: f32,
     },
     Row(Vec<Layout>),
+    Clipped {
+        child: Box<Layout>,
+        max_height: f32,
+    },
 }
 
 impl Layout {
-    fn from_node(node: ego_tree::NodeRef<'_, scraper::node::Node>) -> Option<Self> {
+    fn from_node(
+        node: ego_tree::NodeRef<'_, Node>,
+        styles: &LayoutStyles,
+        inherited_zero: bool,
+    ) -> Option<Self> {
         let element = match node.value() {
-            scraper::node::Node::Text(text) => {
+            Node::Text(text) if !inherited_zero => {
                 let chars = text.trim().chars().count();
                 return (chars > 0).then_some(Self::Text(chars));
             }
-            scraper::node::Node::Element(element) => element,
+            Node::Element(element) => element,
             _ => return None,
         };
-        let name = element.name();
-        let attr = |name| element.attr(name);
-        if matches!(name, "head" | "script" | "style" | "title" | "svg") || attr("hidden").is_some()
-        {
+        if matches!(
+            element.name(),
+            "head" | "script" | "style" | "title" | "svg"
+        ) {
             return None;
         }
+        let style = styles.declarations(element);
+        let max_height = html::declared_value(&style, "max-height");
+        if html::is_hidden(element, &style) || max_height.is_some_and(html::is_zero_length) {
+            return None;
+        }
+        let zero = html::has_zero_font_size(element, &style, inherited_zero);
+        let layout = Self::from_element(node, element, styles, &style, zero)?;
+        if html::clips_vertical_overflow(&style)
+            && let Some(height) = max_height.and_then(|value| value.strip_suffix("px"))
+            && let Ok(max_height) = height.parse::<f32>()
+            && max_height.is_finite()
+            && max_height > 0.
+        {
+            return Some(Self::Clipped {
+                child: Box::new(layout),
+                max_height,
+            });
+        }
+        Some(layout)
+    }
+
+    fn from_element(
+        node: ego_tree::NodeRef<'_, Node>,
+        element: &Element,
+        styles: &LayoutStyles,
+        style: &[Declaration],
+        zero_font: bool,
+    ) -> Option<Self> {
+        let name = element.name();
         if name == "img" {
             let dimension = |name| {
                 let pixels = |value: &str| {
@@ -172,18 +355,9 @@ impl Layout {
                         .ok()
                         .filter(|px| px.is_finite() && *px > 0.)
                 };
-                attr("style")
-                    .into_iter()
-                    .flat_map(|style| style.split(';'))
-                    .filter_map(|rule| rule.split_once(':'))
-                    .find_map(|(property, value)| {
-                        property
-                            .trim()
-                            .eq_ignore_ascii_case(name)
-                            .then(|| pixels(value))
-                            .flatten()
-                    })
-                    .or_else(|| attr(name).and_then(pixels))
+                html::declared_value(style, name)
+                    .and_then(pixels)
+                    .or_else(|| element.attr(name).and_then(pixels))
             };
             let width = dimension("width");
             let height = dimension("height");
@@ -197,14 +371,17 @@ impl Layout {
             });
         }
         if matches!(name, "br" | "hr") {
-            return Some(Self::Flow {
+            return (!zero_font || name == "hr").then_some(Self::Flow {
                 children: Vec::new(),
                 scale: 1.,
                 padding: 20.,
             });
         }
         let mut children: Vec<Layout> = Vec::new();
-        for child in node.children().filter_map(Self::from_node) {
+        for child in node
+            .children()
+            .filter_map(|child| Self::from_node(child, styles, zero_font))
+        {
             if let (Some(Self::Text(before)), Self::Text(after)) = (children.last_mut(), &child) {
                 *before += 1 + after;
             } else {
@@ -239,7 +416,7 @@ impl Layout {
             Self::Image {
                 width: natural,
                 height,
-            } => (height * (width / natural).min(1.)).min(MAX_ESTIMATED_HEIGHT),
+            } => (height * (width / natural).min(1.)).min(1.5 * width),
             Self::Flow {
                 children,
                 scale,
@@ -255,6 +432,7 @@ impl Layout {
                 .iter()
                 .map(|node| node.height((width / cells.len() as f32 - 12.).max(1.), line))
                 .fold(0., f32::max),
+            Self::Clipped { child, max_height } => child.height(width, line).min(*max_height),
         }
     }
 }
@@ -277,16 +455,15 @@ fn height_estimates_cap_image_hints_and_total_layout() {
         width: 1.,
         height: 10_000_000.,
     };
-    assert_eq!(image.height(440., 20.), MAX_ESTIMATED_HEIGHT);
-    for html in [
-        r#"<img width="1" height="10000000">"#.to_owned(),
-        "<p>Another line</p>".repeat(500),
-    ] {
-        assert_eq!(
-            WebMail::prepare(&html).estimated_height(440.),
-            MAX_ESTIMATED_HEIGHT
-        );
-    }
+    assert_eq!(image.height(440., 20.), 660.);
+    let mail =
+        WebMail::prepare(r#"<img width="600" height="200000" src="https://example.test/large">"#);
+    assert_eq!(mail.estimated_height(440.), 672.);
+    assert_eq!(mail.estimated_height(300.), 462.);
+    assert_eq!(
+        WebMail::prepare(&"<p>Another line</p>".repeat(500)).estimated_height(440.),
+        MAX_ESTIMATED_HEIGHT
+    );
 }
 
 #[cfg(test)]
@@ -304,6 +481,49 @@ fn height_estimates_ignore_hidden_text_but_keep_visible_descendants() {
     assert_eq!(
         WebMail::prepare(&html).estimated_height(440.),
         WebMail::prepare(visible).estimated_height(440.)
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn height_estimates_respect_stylesheets_escapes_and_clipped_height() {
+    let hidden = "x".repeat(80_000);
+    let html = format!(
+        r#"<style>
+            div {{ display: none !important }}
+            .quiet {{ visibility: hidden }}
+            #zero {{ font-size: 0 }}
+            .clipped {{ max-height: 10px; overflow: hidden }}
+        </style>
+        <p>Hi</p><div style="display:block">{hidden}</div>
+        <aside class="quiet">{hidden}</aside><aside id="zero">{hidden}</aside>
+        <aside style="display:\6e one">{hidden}</aside>
+        <aside style="max-height:0">{hidden}</aside>
+        <aside class="clipped">{hidden}</aside>
+        <aside style="max-height:10px;overflow:hidden">{hidden}</aside>"#
+    );
+    assert_eq!(WebMail::prepare(&html).estimated_height(440.), 64.);
+}
+
+#[cfg(test)]
+#[test]
+fn height_estimates_keep_stylesheet_overrides_and_visible_overflow() {
+    let visible = "x".repeat(500);
+    let html = format!(
+        r#"<style>
+            #first, #second {{ visibility: visible }}
+            .hide {{ visibility: hidden }}
+            .show {{ display: block }}
+            .hide {{ display: none }}
+            @media print {{ p {{ display: none }} }}
+        </style>
+        <p id="first" class="hide" style="display:block">{visible}</p>
+        <p class="hide show" id="second" style="display:block">{visible}</p>
+        <p style="max-height:10px">{visible}</p>"#
+    );
+    assert_eq!(
+        WebMail::prepare(&html).estimated_height(440.),
+        WebMail::prepare(&format!("<p>{visible}</p>").repeat(3)).estimated_height(440.)
     );
 }
 

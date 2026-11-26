@@ -1366,6 +1366,20 @@ mod tests {
     }
 
     #[test]
+    fn the_web_layer_fades_out_under_the_light_native_view_for_60_ms() {
+        let started = Instant::now();
+        let mut shown = Shown::new(Weak::new(), Some(snapshot()), false, false, None);
+        shown.update(Body::Native, None, false, Motion::new(true), started);
+        assert_eq!(shown.frame(started).outgoing_alpha(true), 1.);
+        let halfway = shown.frame(started + Duration::from_millis(30));
+        assert!((halfway.outgoing_alpha(true) - 0.5).abs() < 0.001);
+        assert!(halfway.progress > 0.);
+        let end = shown.frame(started + Duration::from_millis(60));
+        assert_eq!(end.outgoing_alpha(true), 0.);
+        assert!(end.body_animating());
+    }
+
+    #[test]
     fn retry_evicts_a_failed_snapshot_even_if_the_images_downloaded() {
         let blocked = Key {
             id: "newsletter".into(),
@@ -1441,12 +1455,13 @@ mod tests {
                 picture: None,
                 image_failure: None,
             });
+            let now = Instant::now();
             let frames = reader.frames(
                 &inbox.session.messages,
                 (Some(0), &[true, true]),
                 &inbox.theme,
                 460.,
-                (Motion::new(true), Instant::now()),
+                (Motion::new(true), now, now),
                 cx,
             );
             assert!(matches!(frames["older"].body, Body::Native));
@@ -1637,12 +1652,13 @@ mod tests {
             }
             for expect_web in [false, true] {
                 inbox.html_reading_action("newer", Action::ToggleWebView, cx);
+                let now = Instant::now();
                 let frames = inbox.web_mail.frames(
                     &inbox.session.messages,
                     (Some(1), &[true, true]),
                     &inbox.theme,
                     440.,
-                    (Motion::new(false), Instant::now()),
+                    (Motion::new(false), now, now),
                     cx,
                 );
                 assert_eq!(
