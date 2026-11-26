@@ -611,23 +611,18 @@ impl AccountWindow {
             .catalog
             .error
             .as_ref()
-            .map(|error| error.detail.clone())
+            .map(|error| error.detail.as_str())
             .or_else(|| {
+                if self.catalog.configs().next().is_some() {
+                    return None;
+                }
                 self.catalog.entries.iter().find_map(|entry| {
                     let err = entry.config.as_ref().err()?;
-                    let name = entry.path.file_name()?.to_string_lossy();
-                    Some(format!("{name} · {}", err.reason(&entry.path)))
+                    Some(err.detail.as_str())
                 })
             });
         for (id, view) in &self.views {
-            self.set_choices(
-                view,
-                Some(id),
-                &statuses,
-                error.as_deref(),
-                catalog_changed,
-                cx,
-            );
+            self.set_choices(view, Some(id), &statuses, error, catalog_changed, cx);
         }
         if self
             .active_id
@@ -638,7 +633,7 @@ impl AccountWindow {
                 &self.active,
                 self.active_id.as_ref(),
                 &statuses,
-                error.as_deref(),
+                error,
                 catalog_changed,
                 cx,
             );
@@ -1106,6 +1101,15 @@ mod tests {
         std::fs::create_dir_all(registry.directory()).unwrap();
         write_account(&registry, "mail", "");
         write_account(&registry, "work", "");
+        let leftover = registry.directory().parent().unwrap().join("account.toml");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(leftover)
+            .unwrap()
+            .write_all(b"invalid = [")
+            .unwrap();
         let mut app = TestAppContext::single();
         let window = app.add_window(|window, cx| {
             AccountWindow::new(mailbox::startup(), false, None, window, cx)
@@ -1113,6 +1117,7 @@ mod tests {
         window
             .update(&mut app, |view, window, cx| {
                 let original = view.active();
+                assert!(original.read(cx).session.account_config_error.is_none());
                 original.update(cx, |inbox, _| {
                     inbox.motion.motion = motion::Motion::new(true);
                     inbox.session.overlay = Overlay::Settings;

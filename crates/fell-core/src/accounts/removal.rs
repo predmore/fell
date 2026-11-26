@@ -6,8 +6,8 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use super::{
-    Accounts, Entry, FileIdentity, Registry, file_identity, mailbox_owner, path_exists, publish,
-    read, real_directory, removal_trash, verify_backup,
+    Accounts, Entry, FileIdentity, Registry, file_identity, mailbox_exists, mailbox_owner,
+    path_exists, publish, read, real_directory, removal_trash, verify_backup,
 };
 use crate::{AccountId, Store, compose};
 
@@ -370,6 +370,9 @@ pub(super) fn verify_mailbox_owner(base: &Path, id: &str) -> bool {
         } else {
             None
         };
+        if staged.is_none() && !path_exists(base)? && mailbox_exists(base)? {
+            return Ok(false);
+        }
         for path in std::iter::once(base).chain(staged.as_deref()) {
             if path_exists(path)?
                 && !mailbox_owner(path)
