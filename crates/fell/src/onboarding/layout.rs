@@ -225,8 +225,7 @@ impl Onboarding {
                                 (pulse, dy),
                                 (arrival, if shared_back { 1. } else { arrival }),
                                 cx,
-                            ))
-                            .children(self.primary_button(window, live, cx)),
+                            )),
                     ),
             )
     }
@@ -272,15 +271,15 @@ impl Onboarding {
             .flex_col()
             .gap_3()
             .mb_8()
-            .child(
-                div()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(if self.form.previous.is_some() {
-                        "Edit connection"
-                    } else {
-                        "Account setup"
-                    }),
-            )
+            .child(div().font_weight(FontWeight::SEMIBOLD).child(
+                if self.form.reconnect_to.is_some() {
+                    "Reconnect account"
+                } else if self.form.previous.is_some() {
+                    "Edit connection"
+                } else {
+                    "Account setup"
+                },
+            ))
             .child(div().flex().gap_1p5().children((1..=4).map(|index| {
                 let color = if index == step {
                     theme.accent
@@ -421,7 +420,7 @@ impl Onboarding {
                     .child(
                         self.feedback.save_note.paint(false, |state, _| match state {
                             SaveState::Ready if self.form.reconnect_to.is_some() =>
-                                self.meta("Fell will reconnect this mailbox and keep its local mail."),
+                                div(),
                             SaveState::Ready if self.form.retained_mailbox.is_some() =>
                                 self.meta("Start empty keeps the old mail on this device but doesn't show it."),
                             SaveState::Ready if self.form.previous.is_some() =>
@@ -522,21 +521,16 @@ impl Onboarding {
             }
             _ => self.heading(title, detail),
         };
-        let footer = match step {
+        let buttons = match step {
             Step::Connection => {
-                let buttons =
-                    self.animated_footer(&self.feedback.connection_actions, false, live, cx);
-                self.footer_rows(buttons, narrow, (opacity, back_opacity))
+                self.animated_footer(&self.feedback.connection_actions, false, live, cx)
             }
-            Step::Done => {
-                let buttons = self.animated_footer(&self.feedback.save_actions, true, live, cx);
-                self.footer_rows(buttons, narrow, (opacity, back_opacity))
-            }
-            _ => {
-                let stack = narrow && footer[1].is_some();
-                self.footer_rows(footer, stack, (opacity, back_opacity))
-            }
+            Step::Done => self.animated_footer(&self.feedback.save_actions, true, live, cx),
+            _ => footer,
         };
+        let primary = (step == self.form.step)
+            .then(|| self.primary_button(window, measure, live, cx))
+            .flatten();
         div()
             .flex()
             .flex_col()
@@ -550,23 +544,23 @@ impl Onboarding {
                     .child(heading.mb_5())
                     .child(content),
             )
-            .child(footer)
+            .child(self.footer_rows(buttons, primary, narrow, (opacity, back_opacity)))
     }
 
     fn footer_rows(
         &self,
         [back, secondary]: [Footer; 2],
+        primary: Option<Stateful<Div>>,
         stacked: bool,
         (opacity, back_opacity): (f32, f32),
     ) -> Div {
         let faded = |element: AnyElement, alpha| div().flex_none().opacity(alpha).child(element);
-        let beside_primary = self.feedback.primary.is_some() && !stacked && secondary.is_some();
         let mut secondary = secondary.map(|el| faded(el, opacity));
-        if back.is_none() && secondary.is_none() {
+        if back.is_none() && secondary.is_none() && primary.is_none() {
             return div();
         }
         div()
-            .when(stacked, |el| {
+            .when(stacked && secondary.is_some(), |el| {
                 el.child(
                     div()
                         .flex()
@@ -585,9 +579,7 @@ impl Onboarding {
                     .children(back.map(|el| faded(el, back_opacity)))
                     .child(div().flex_1())
                     .children(secondary)
-                    .when(beside_primary, |row| {
-                        row.child(div().w(px(10. * self.theme.ui_px)).flex_none())
-                    }),
+                    .children(primary),
             )
     }
 
@@ -830,14 +822,20 @@ impl Onboarding {
             .child(label.to_owned())
     }
 
-    fn primary_button(&self, window: &Window, live: bool, cx: &Context<Self>) -> Option<Div> {
+    fn primary_button(
+        &self,
+        window: &Window,
+        measure: f32,
+        live: bool,
+        cx: &Context<Self>,
+    ) -> Option<Stateful<Div>> {
         let action = self.feedback.primary.as_ref()?;
         let mut style = window.text_style();
         if let Some(family) = &self.theme.ui_family {
             style.font_family = family.clone().into();
         }
         style.font_weight = FontWeight::SEMIBOLD;
-        let padding = 12.;
+        let padding = f32::from(window.rem_size()) * 0.75;
         let width = |label: &str| {
             let run = style.to_run(label.len());
             let text = window.text_system().shape_line(
@@ -850,49 +848,29 @@ impl Onboarding {
         };
         let (text, opacity, button_width) = self.feedback.primary_label_frame(&action.label, width);
         let warning = action.label.starts_with("Save anyway");
-        let button_width =
-            button_width.min((f32::from(window.viewport_size().width) - 145.).max(1.));
+        let button_width = button_width.min((measure - 105.).max(1.));
         Some(
-            div()
-                .absolute()
-                .right_0()
-                .bottom_0()
-                .h(px(self.theme.ui_px + 18.))
-                .flex()
-                .items_center()
-                .child(
-                    self.button_shell(
-                        action.control,
-                        "primary-action",
-                        !warning,
-                        (live, action.enabled),
-                        cx,
-                    )
-                    .when(warning, |button| {
-                        button
-                            .bg(rgb(self.theme.surface))
-                            .text_color(rgb(self.theme.error))
-                            .border_color(rgb(self.theme.border))
-                    })
-                    .relative()
-                    .w(px(button_width))
-                    .h(px(self.theme.ui_px + 18.))
-                    .child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .bottom_0()
-                            .left(px(padding))
-                            .right(px(padding))
-                            .overflow_hidden()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .whitespace_nowrap()
-                            .opacity(opacity)
-                            .child(div().truncate().child(text.to_owned())),
-                    ),
-                ),
+            self.button_shell(
+                action.control,
+                "primary-action",
+                !warning,
+                (live, action.enabled),
+                cx,
+            )
+            .when(warning, |button| {
+                button
+                    .bg(rgb(self.theme.surface))
+                    .text_color(rgb(self.theme.error))
+                    .border_color(rgb(self.theme.border))
+            })
+            .w(px(button_width))
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .opacity(opacity)
+                    .child(text.to_owned()),
+            ),
         )
     }
 
@@ -908,8 +886,12 @@ impl Onboarding {
         let theme = &self.theme;
         self.clickable(control, label, live && enabled, cx)
             .flex_shrink_0()
+            .h(px(theme.ui_px + 18.))
+            .line_height(px(theme.ui_px + 4.))
+            .flex()
+            .items_center()
+            .justify_center()
             .px_3()
-            .py_1p5()
             .rounded_md()
             .border_1()
             .when(primary, |el| {

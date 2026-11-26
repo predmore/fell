@@ -275,12 +275,12 @@ fn resume_held(
     Ok(())
 }
 
-pub(crate) fn resend_held_writes(
+pub(crate) fn requeue_held_writes(
     config: &crate::AccountConfig,
     store: &Store,
-) -> crate::Result<usize> {
+) -> crate::Result<Vec<i64>> {
     if !config.write_back {
-        return Ok(0);
+        return Ok(Vec::new());
     }
     let guard = store.try_lock_mailbox_operation(".write-back")?;
     if guard.is_none() && store.db_path().is_some() {
@@ -291,7 +291,7 @@ pub(crate) fn resend_held_writes(
     let account = AccountId(config.id.clone());
     let rows = outbox::endpoint::held(store, &account)?;
     if rows.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
     let imap = config.imap_config()?;
     let mut session = WriteSession::open(&imap)?;
@@ -330,7 +330,7 @@ pub(crate) fn resend_held_writes(
                     .and_then(by_role)
             })
     };
-    let mut queued = 0;
+    let mut queued = Vec::new();
     for row in rows {
         if is_synthetic_message_id(&row.message_id)
             || row.reverses.is_some()
@@ -352,13 +352,10 @@ pub(crate) fn resend_held_writes(
         }
         match locate_for_resend(&mut session, source, &row.message_id) {
             Ok(Some((validity, uid))) => {
-                queued += usize::from(outbox::endpoint::requeue(
-                    store,
-                    config,
-                    &row,
-                    (source, validity, uid),
-                    target,
-                )?);
+                if outbox::endpoint::requeue(store, config, &row, (source, validity, uid), target)?
+                {
+                    queued.push(row.id);
+                }
             }
             Ok(None) | Err(WriteError::Refused(_)) => {}
             Err(WriteError::Connection(error)) => return Err(error),

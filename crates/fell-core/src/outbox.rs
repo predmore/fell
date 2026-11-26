@@ -475,6 +475,18 @@ impl Store {
         tx.commit()?;
         Ok(entries)
     }
+
+    pub fn outbox_state(&self, account_id: &AccountId, id: i64) -> Result<Option<OutboxState>> {
+        self.connection()
+            .prepare_cached("SELECT state FROM server_outbox WHERE account_id = ?1 AND id = ?2")?
+            .query_row(params![account_id.as_str(), id], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?
+            .as_deref()
+            .map(OutboxState::parse)
+            .transpose()
+    }
 }
 
 pub(crate) fn set_write_back_on(

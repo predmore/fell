@@ -1465,13 +1465,15 @@ impl Inbox {
                             SyncEvent::Status(kind) => kind,
                             SyncEvent::HeldChanges(count) => {
                                 if count > inbox.held_changes {
-                                    inbox.session.show_toast(
-                                        format!(
-                                            "{} · Settings → Accounts",
-                                            accounts::held_changes_label(count)
-                                        ),
-                                        true,
-                                    );
+                                    use crate::model::settings::{Page, Section};
+                                    let mut notice = accounts::held_changes_label(count);
+                                    if inbox.session.overlay != Overlay::Settings
+                                        || inbox.session.settings_nav.page
+                                            != Page::Section(Section::Accounts)
+                                    {
+                                        notice.push_str(" · Settings → Accounts");
+                                    }
+                                    inbox.session.show_toast(notice, true);
                                 }
                                 inbox.held_changes = count;
                                 cx.notify();
@@ -1482,10 +1484,8 @@ impl Inbox {
                                     (Ok(0), true) => {
                                         ("No matching messages found for resend".into(), true)
                                     }
-                                    (Ok(1), true) => ("1 change queued to resend".into(), false),
-                                    (Ok(count), true) => {
-                                        (format!("{count} changes queued to resend"), false)
-                                    }
+                                    (Ok(1), true) => ("Resent 1 change".into(), false),
+                                    (Ok(count), true) => (format!("Resent {count} changes"), false),
                                     (Ok(1), false) => ("Discarded 1 unsynced change".into(), false),
                                     (Ok(count), false) => {
                                         (format!("Discarded {count} unsynced changes"), false)
@@ -6003,8 +6003,7 @@ impl Render for Inbox {
             now,
         );
         let settings_animating = self.settings_view.observe(
-            (self.session.overlay == Overlay::Settings).then_some(self.session.settings_nav.page),
-            self.session.settings_nav.selected,
+            (self.session.overlay == Overlay::Settings).then_some(&self.session.settings_nav),
             now,
             self.motion.motion,
         );

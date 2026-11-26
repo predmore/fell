@@ -98,6 +98,7 @@ pub(super) struct View {
     page: Option<Page>,
     page_fade: Option<Transition>,
     accounts: Vec<AccountRow>,
+    held_actions: Option<(PathBuf, bool, Option<Glide>)>,
     removal: Option<AccountRow>,
     identities: Vec<Identity>,
     identity_read: Option<gpui::Task<()>>,
@@ -198,7 +199,6 @@ impl AccountRow {
 
     fn can_remove(&self) -> bool {
         !self.removing
-            && !self.disconnected
             && (self.kind != crate::model::settings::AccountRemovalKind::BrokenFile
                 || self.file_identity.is_some())
     }
@@ -234,6 +234,7 @@ impl View {
             page: None,
             page_fade: None,
             accounts: Vec::new(),
+            held_actions: None,
             removal: None,
             identities: account
                 .map(AccountConfig::compose_identities)
@@ -381,20 +382,27 @@ impl View {
                 },
             }
         }));
-        accounts.extend(catalog.disconnected.iter().map(|kept| AccountRow {
-            id: kept.id.clone(),
-            path: kept.path.clone(),
-            file_identity: None,
-            name: kept.email.clone(),
-            email: None,
-            status: "Not connected".into(),
-            link_damaged: false,
-            alert: false,
-            active: false,
-            removing: false,
-            disconnected: true,
-            held_changes: 0,
-            kind: AccountRemovalKind::Account,
+        accounts.extend(catalog.disconnected.iter().map(|kept| {
+            AccountRow {
+                id: kept.id.clone(),
+                path: kept.path.clone(),
+                file_identity: None,
+                name: kept.email.clone(),
+                email: None,
+                status: if removing(&kept.id) {
+                    "Removing…"
+                } else {
+                    "Not connected"
+                }
+                .into(),
+                link_damaged: false,
+                alert: false,
+                active: false,
+                removing: removing(&kept.id),
+                disconnected: true,
+                held_changes: 0,
+                kind: AccountRemovalKind::Disconnected,
+            }
         }));
         accounts.sort_by(|a, b| a.path.cmp(&b.path));
         if self.accounts == accounts {
@@ -507,6 +515,9 @@ impl View {
     pub fn settle(&mut self) {
         self.fade = None;
         self.page_fade = None;
+        if let Some((_, _, glide)) = &mut self.held_actions {
+            *glide = None;
+        }
     }
 
     fn scroll_lines(&mut self, lines: i32, motion: Motion, now: Instant) {
@@ -534,13 +545,8 @@ impl View {
         Some((old, outgoing, incoming))
     }
 
-    pub fn observe(
-        &mut self,
-        page: Option<Page>,
-        selected: usize,
-        now: Instant,
-        motion: Motion,
-    ) -> bool {
+    pub fn observe(&mut self, nav: Option<&nav::Nav>, now: Instant, motion: Motion) -> bool {
+        let page = nav.map(|nav| nav.page);
         if page.is_none() || !motion.enabled() {
             if let Some(glide) = self.scroll_glide.take() {
                 self.scroll.set_offset(gpui::point(px(0.), px(glide.to)));
@@ -552,7 +558,7 @@ impl View {
                 self.scroll_glide = None;
             }
         }
-        let selection = page.map(|page| (page, selected));
+        let selection = nav.map(|nav| (nav.page, nav.selected));
         if self.selection != selection {
             self.reveal_index_selection = page == Some(Page::Index);
             self.selection = selection;
@@ -566,10 +572,36 @@ impl View {
             };
             self.page = page;
         }
+        self.held_actions = match nav.and_then(nav::Nav::row) {
+            Some(Row::Account(index)) => self.accounts.get(index).and_then(|account| {
+                if !account.can_edit_connection() {
+                    return None;
+                }
+                let held = account.held_changes > 0;
+                let glide = self
+                    .held_actions
+                    .as_ref()
+                    .filter(|(path, _, _)| *path == account.path && motion.enabled())
+                    .and_then(|(_, old, glide)| {
+                        if *old == held {
+                            return glide.filter(|glide| glide.running(now));
+                        }
+                        let distance = |shown| if shown { HELD_ACTION_SLIDE } else { 0. };
+                        let from = glide.map_or(distance(*old), |glide| glide.value(now));
+                        Glide::start(&motion, from, distance(held), 0., motion::FADE, now)
+                    });
+                Some((account.path.clone(), held, glide))
+            }),
+            _ => None,
+        };
         self.scroll_glide.is_some()
             || self.value_fade(now).is_some()
             || self.page_fade.is_some_and(|fade| fade.running(now))
             || self.chevrons.is_some_and(|fade| fade.running(now))
+            || self
+                .held_actions
+                .as_ref()
+                .is_some_and(|(_, _, glide)| glide.is_some())
     }
 }
 
@@ -833,6 +865,8 @@ impl Inbox {
                         account.path == target.path
                             && account.file_identity == target.file_identity
                             && account.kind == target.kind
+                            && account.name == target.name
+                            && account.can_remove()
                     }) {
                         let removal = super::accounts::RequestedRemoval {
                             kind: target.kind,
@@ -968,10 +1002,9 @@ impl Inbox {
             .get(index)
             .filter(|row| row.can_remove())
         {
-            self.session.settings_nav.page = Page::ConfirmAccountRemoval {
-                delete: false,
-                kind: target.kind,
-            };
+            self.session
+                .settings_nav
+                .confirm_account_removal(target.kind);
             self.settings_view.removal = Some(target.clone());
         } else {
             self.session.settings_nav.page = Page::Section(Section::Accounts);
@@ -1414,6 +1447,7 @@ const HEADER_HEIGHT: f32 = 64.;
 const SECTION_ROW_HEIGHT: f32 = 64.;
 const INDEX_ROW_HEIGHT: f32 = 49.;
 const ACCOUNT_ROW_HEIGHT: f32 = 64.;
+const HELD_ACTION_SLIDE: f32 = 5.;
 const CARD_WIDTH: f32 = 530.;
 const BROKEN_FILE_BUTTON_WIDTH: f32 = 88.;
 const BROKEN_FILE_LINK_WIDTH: f32 = 14.;
@@ -1674,7 +1708,7 @@ pub(super) fn card(
                                         .opacity(if selected { 1. } else { 0. }),
                                     )
                                 })
-                                .when(account.disconnected, |row| {
+                                .when(account.disconnected && !account.removing, |row| {
                                     row.child(
                                         account_button(
                                             theme,
@@ -1720,17 +1754,29 @@ pub(super) fn card(
                                     )
                                 });
                         let held = account.held_changes > 0 && account.can_edit_connection();
+                        let reveal = view
+                            .held_actions
+                            .as_ref()
+                            .filter(|(path, _, _)| live && selected && *path == account.path)
+                            .and_then(|(_, _, glide)| *glide)
+                            .map_or(if held { 1. } else { 0. }, |glide| {
+                                glide.value(now) / HELD_ACTION_SLIDE
+                            });
                         control = control
                             .child(account_label(theme, account, status, selected))
                             .child(div().flex_none().flex().flex_col().items_end().gap(px(2.))
+                                // Reserve the lower button slot even when there are no held writes.
+                                .when(account.can_edit_connection(), |actions| actions.h(px(56.)))
                                 .child(actions)
-                                .when(held, |actions| {
+                                .when(selected && (held || reveal > 0.), |actions| {
                                     let button = |id, title, key, destructive, cx: &mut Context<Inbox>| {
-                                        account_button(theme, id, title, key, false, destructive, live && selected, cx)
+                                        account_button(theme, id, title, key, false, destructive, live && held, cx)
                                             .py(px(3.))
                                     };
                                     actions.child(div().flex().gap(px(9.))
-                                        .opacity(if selected { 1. } else { 0. })
+                                        .relative()
+                                        .top(px(HELD_ACTION_SLIDE * (1. - reveal)))
+                                        .opacity(reveal)
                                         .child(button("resend-held", "Resend · r", nav::RESEND_CHANGES_KEY, false, cx))
                                         .child(button("discard-held", "Discard · x", nav::DISCARD_CHANGES_KEY, true, cx)))
                                 }));
@@ -2103,7 +2149,7 @@ pub(super) fn card(
                     can_restore.then_some("Restore local mail"),
                     Some(("Finish deleting · f", KeyId::Char('f'))),
                 ),
-                (true, AccountRemovalKind::Account) => (
+                (true, AccountRemovalKind::Account) | (_, AccountRemovalKind::Disconnected) => (
                     format!(
                         "Delete the downloaded mail and drafts for {account_name} from this device?"
                     ),
@@ -2361,6 +2407,7 @@ fn account_button(
         .border_1()
         .border_color(rgb(theme.border))
         .text_size(px(12.))
+        .line_height(px(16.))
         .whitespace_nowrap()
         .text_color(rgb(if destructive {
             theme::account_detail_color(theme.error, theme.selection)
