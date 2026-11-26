@@ -23,6 +23,8 @@ pub(super) struct HelpScroll {
     page: usize,
     last: usize,
     row: f32,
+    detail_rows: usize,
+    detail_gap: f32,
     target: usize,
     drawn: f32,
     glide: Option<Glide>,
@@ -33,8 +35,7 @@ impl HelpScroll {
     /// An open and a scroll key can arrive before the first paint.
     pub(super) fn prepare(&mut self, now: Instant, measure: impl FnOnce() -> Layout) {
         if self.page == 0 {
-            let layout = measure();
-            self.advance(layout.page, layout.total, layout.row, now);
+            self.advance(&measure(), now);
         }
     }
 
@@ -76,7 +77,7 @@ impl HelpScroll {
         self.glide = Glide::start(
             motion,
             self.drawn,
-            target as f32 * self.row,
+            scroll_px(target, self.row, self.detail_rows, self.detail_gap),
             0.,
             motion::SLIDE,
             now,
@@ -88,21 +89,28 @@ impl HelpScroll {
         self.glide.is_some_and(|glide| glide.running(now))
     }
 
-    fn advance(&mut self, page: usize, total: usize, row: f32, now: Instant) {
-        self.page = page;
-        self.last = total.saturating_sub(page);
-        if self.target > self.last || self.row != row {
+    fn advance(&mut self, layout: &Layout, now: Instant) {
+        self.page = layout.page;
+        self.last = layout.total - layout.page;
+        if self.target > self.last
+            || self.row != layout.row
+            || self.detail_rows != layout.detail_rows
+            || self.detail_gap != layout.detail_gap
+        {
             self.target = self.target.min(self.last);
             self.glide = None;
         }
-        self.row = row;
+        self.row = layout.row;
+        self.detail_rows = layout.detail_rows;
+        self.detail_gap = layout.detail_gap;
         if !self.running(now) {
             self.glide = None;
         }
+        let settled = scroll_px(self.target, self.row, self.detail_rows, self.detail_gap);
         self.drawn = self
             .glide
-            .map_or(self.target as f32 * row, |glide| glide.value(now))
-            .min(self.last as f32 * row);
+            .map_or(settled, |glide| glide.value(now))
+            .min(layout.last_offset());
     }
 
     pub(super) fn card(
@@ -119,7 +127,7 @@ impl HelpScroll {
         }
         let layout = Layout::for_window(theme, session, window);
         if live {
-            self.advance(layout.page, layout.total, layout.row, now);
+            self.advance(&layout, now);
         }
         let moving = self.glide.is_some();
         let drawn = if moving {
@@ -127,8 +135,17 @@ impl HelpScroll {
         } else {
             self.drawn
         };
-        let offset = drawn.min((layout.total - layout.page) as f32 * layout.row);
+        let offset = drawn.min(layout.last_offset());
         Some((layout.top, card(theme, layout, offset, moving, live, cx)))
+    }
+}
+
+fn scroll_px(target: usize, row: f32, detail_rows: usize, detail_gap: f32) -> f32 {
+    let y = target as f32 * row;
+    if target >= detail_rows {
+        y + detail_gap
+    } else {
+        y
     }
 }
 
@@ -151,6 +168,15 @@ pub(super) struct Layout {
 }
 
 impl Layout {
+    fn last_offset(&self) -> f32 {
+        scroll_px(
+            self.total - self.page,
+            self.row,
+            self.detail_rows,
+            self.detail_gap,
+        )
+    }
+
     pub(super) fn for_window(theme: &Theme, session: &Session, window: &Window) -> Self {
         let error = session.detail_text().map(|text| (text, true));
         let subject_join = session
@@ -273,16 +299,10 @@ fn card(
 ) -> Div {
     let page_height = layout.page as f32 * layout.row;
     let body = page_height + layout.detail_gap;
-    let last = (layout.total - layout.page) as f32 * layout.row;
-    let first = (offset / layout.row).floor() as usize;
-    let end = ((offset + page_height) / layout.row).ceil() as usize;
-    // The detail gap can expose a sliver of the preceding row during a glide.
-    let action_offset = if moving {
-        offset - layout.detail_gap
-    } else {
-        offset
-    };
+    let last = layout.last_offset();
+    let action_offset = offset - layout.detail_gap;
     let action_start = ((action_offset / layout.row).floor() as usize).max(layout.detail_rows);
+    let end = ((action_offset + page_height) / layout.row).ceil() as usize;
     div()
         .w(px(layout.width))
         .h(px(layout.header + body + 2. * INSET + 2.))
@@ -334,7 +354,7 @@ fn card(
                         .right(px(RIGHT))
                         .h(px(body))
                         .overflow_hidden()
-                        .children((first < layout.detail_rows).then(|| {
+                        .children((offset < layout.detail_rows as f32 * layout.row).then(|| {
                             div()
                                 .absolute()
                                 .left_0()
@@ -475,6 +495,16 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    fn wide_layout() -> Layout {
+        Layout::measure(
+            15.,
+            gpui::size(px(520.), px(720.)),
+            &Keymap::default(),
+            None,
+            |_, _| 0,
+        )
+    }
+
     #[test]
     fn first_scroll_key_can_page_before_paint() {
         let now = Instant::now();
@@ -490,7 +520,7 @@ mod tests {
         assert!(scroll.on_key(KeyId::Ctrl('d'), &motion, now));
 
         let layout = measure();
-        scroll.advance(layout.page, layout.total, layout.row, now);
+        scroll.advance(&layout, now);
         assert_eq!(scroll.target, half_page);
         assert_eq!(scroll.drawn, half_page as f32 * layout.row);
     }
@@ -540,29 +570,62 @@ mod tests {
         let motion = Motion::new(false);
         let keymap = Keymap::default();
         for ui_px in [12., 18.] {
-            let layout = Layout::measure(
-                ui_px,
-                gpui::size(px(420.), px(380.)),
-                &keymap,
-                None,
-                |_, _| 0,
-            );
-            let header = layout
-                .rows
-                .iter()
-                .position(|row| *row == HelpRow::Section("Reading"))
-                .unwrap();
-            let mut scroll = HelpScroll::default();
-            scroll.advance(layout.page, layout.total, layout.row, now);
-            for first in [header + 1 - layout.page, header] {
-                scroll.scroll((first - scroll.target) as isize, &motion, now);
-                scroll.advance(layout.page, layout.total, layout.row, now);
-                assert_eq!(scroll.drawn, first as f32 * layout.row);
-                let header_top = header as f32 * layout.row - scroll.drawn;
-                assert!(header_top >= 0.);
-                assert!(header_top + layout.row <= layout.page as f32 * layout.row);
+            for detail in [None, Some(("A full detail line".into(), true))] {
+                let layout = Layout::measure(
+                    ui_px,
+                    gpui::size(px(420.), px(380.)),
+                    &keymap,
+                    detail,
+                    |_, _| 1,
+                );
+                let header = layout.detail_rows
+                    + layout
+                        .rows
+                        .iter()
+                        .position(|row| *row == HelpRow::Section("Reading"))
+                        .unwrap();
+                let mut scroll = HelpScroll::default();
+                scroll.advance(&layout, now);
+                for rows_above_header in [layout.page - 1, 0] {
+                    let first = header - rows_above_header;
+                    assert!(first >= layout.detail_rows);
+                    scroll.scroll((first - scroll.target) as isize, &motion, now);
+                    scroll.advance(&layout, now);
+                    let header_top = header as f32 * layout.row + layout.detail_gap - scroll.drawn;
+                    assert_eq!(header_top, rows_above_header as f32 * layout.row);
+                }
             }
         }
+    }
+
+    #[test]
+    fn a_single_row_scroll_glides_across_the_detail_gap() {
+        let start = Instant::now();
+        let motion = Motion::new(true);
+        let layout = Layout::measure(
+            15.,
+            gpui::size(px(520.), px(720.)),
+            &Keymap::default(),
+            Some(("A full detail line".into(), true)),
+            |_, _| 1,
+        );
+        let mut scroll = HelpScroll::default();
+        scroll.advance(&layout, start);
+        assert_eq!(scroll.drawn, 0.);
+        assert!(scroll.on_key(KeyId::Down, &motion, start));
+
+        let end = start + motion::SLIDE;
+        let destination = layout.row + DETAIL_GAP;
+        let glide = scroll.glide.unwrap();
+        assert_eq!(glide.value(start), 0.);
+        assert_eq!(glide.value(end), destination);
+        scroll.advance(&layout, end);
+        assert_eq!(scroll.drawn, destination);
+        assert!(!scroll.running(end));
+
+        scroll.scroll(scroll.last as isize, &Motion::new(false), end);
+        scroll.advance(&layout, end);
+        assert_eq!(scroll.drawn, scroll.last as f32 * layout.row + DETAIL_GAP);
     }
 
     #[test]
@@ -580,21 +643,22 @@ mod tests {
         let start = Instant::now();
         let motion = Motion::new(true);
         let mut scroll = HelpScroll::default();
-        scroll.advance(16, 41, 25., start);
+        let layout = wide_layout();
+        scroll.advance(&layout, start);
         assert!(scroll.on_key(KeyId::Char('j'), &motion, start));
 
         let next = start + Duration::from_millis(25);
-        scroll.advance(16, 41, 25., next);
+        scroll.advance(&layout, next);
         let drawn = scroll.drawn;
-        assert!(drawn > 0. && drawn < 25.);
+        assert!(drawn > 0. && drawn < layout.row);
         assert!(scroll.on_key(KeyId::Ctrl('d'), &motion, next));
-        scroll.advance(16, 41, 25., next);
+        scroll.advance(&layout, next);
         assert_eq!(scroll.drawn, drawn);
-        assert_eq!(scroll.target, 9);
+        assert_eq!(scroll.target, 1 + layout.page / 2);
 
         let end = next + motion::SLIDE;
-        scroll.advance(16, 41, 25., end);
-        assert_eq!(scroll.drawn, 225.);
+        scroll.advance(&layout, end);
+        assert_eq!(scroll.drawn, (1 + layout.page / 2) as f32 * layout.row);
         assert!(!scroll.running(end));
     }
 
@@ -603,23 +667,26 @@ mod tests {
         let now = Instant::now();
         let motion = Motion::new(false);
         let mut scroll = HelpScroll::default();
-        scroll.advance(16, 41, 25., now);
+        let layout = wide_layout();
+        scroll.advance(&layout, now);
         scroll.wheel(0.4, &motion, now);
         assert_eq!(scroll.target, 0);
         scroll.wheel(0.7, &motion, now);
         assert_eq!(scroll.target, 1);
-        for _ in 0..4 {
-            scroll.on_key(KeyId::Ctrl('d'), &motion, now);
-        }
-        scroll.advance(16, 41, 25., now);
-        assert_eq!(scroll.target + scroll.page, 41);
-        assert_eq!(scroll.drawn, 625.);
+        scroll.wheel(layout.total as f32, &motion, now);
+        scroll.advance(&layout, now);
+        assert_eq!(scroll.target + scroll.page, layout.total);
+        let bottom = (layout.total - layout.page) as f32 * layout.row;
+        assert_eq!(scroll.drawn, bottom);
         assert!(!scroll.running(now));
 
         scroll.on_key(KeyId::Ctrl('u'), &motion, now);
         scroll.on_key(KeyId::Up, &motion, now);
-        scroll.advance(16, 41, 25., now);
-        assert_eq!(scroll.drawn, 400.);
+        scroll.advance(&layout, now);
+        assert_eq!(
+            scroll.drawn,
+            bottom - (layout.page / 2 + 1) as f32 * layout.row
+        );
         assert!(!scroll.on_key(KeyId::Escape, &motion, now));
     }
 
@@ -628,7 +695,7 @@ mod tests {
         let now = Instant::now();
         let motion = Motion::new(false);
         let mut scroll = HelpScroll::default();
-        scroll.advance(16, 41, 25., now);
+        scroll.advance(&wide_layout(), now);
 
         scroll.wheel(-2.9, &motion, now);
         assert_eq!(scroll.target, 0);
