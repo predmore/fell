@@ -1,0 +1,15 @@
+Restore (r)
+$ fell account remove mail
+Field Desk: deletion was interrupted. [r] Restore · [f] Finish deleting · Enter to leave it: r
+Restored Field Desk · account and local mail
+
+Finish deleting (f, then y)
+$ fell account remove mail
+Field Desk: deletion was interrupted. [r] Restore · [f] Finish deleting · Enter to leave it: f
+Delete Field Desk's local mail for good? [y/N]: y
+Removed Field Desk. Local mail deleted.
+
+Leave the interrupted deletion (Enter)
+$ fell account remove mail
+Field Desk: deletion was interrupted. [r] Restore · [f] Finish deleting · Enter to leave it:
+Left the interrupted deletion as is.
