@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use fell_core::ImapSecurity;
 use gpui::{
     AnyElement, Context, CursorStyle, Div, FontWeight, KeyDownEvent, MouseButton, Render,
-    SharedString, Stateful, Window, div, prelude::*, px, rgb,
+    SharedString, Stateful, Window, div, prelude::*, px, rems, rgb,
 };
 
 use crate::motion::{self, ARRIVE_FROM, SwapFrame};
@@ -23,9 +23,24 @@ const STEP_HEIGHT: f32 = 520.;
 const CHOICE_PADDING: f32 = 16.;
 const CHOICE_GAP: f32 = 12.;
 const CHOICE_ARROW: f32 = 16.;
-const PORT_WIDTH: f32 = 62.;
+const SERVER_INPUT_PADDING_REM: f32 = 0.375;
 const SECURITY_WIDTH: f32 = 92.;
 const FIELD_GAP: f32 = 8.;
+
+fn port_width(window: &Window, theme: &crate::theme::Theme) -> f32 {
+    let mut style = window.text_style();
+    if let Some(family) = &theme.ui_family {
+        style.font_family = family.clone().into();
+    }
+    let sample = "65535";
+    let run = style.to_run(sample.len());
+    let line = window
+        .text_system()
+        .shape_line(sample.into(), px(theme.ui_px), &[run], None);
+    // Allow for the border, horizontal padding, and the caret at the end.
+    let padding = f32::from(window.rem_size()) * SERVER_INPUT_PADDING_REM;
+    (f32::from(line.width) + 2. * (padding + 1.) + 2.).ceil()
+}
 
 fn focus_ring(accent: u32, radius: f32) -> Div {
     div()
@@ -126,6 +141,7 @@ impl Onboarding {
         let compact_footer = window.viewport_size().width < px(400.);
         let side = if narrow { 20. } else { 44. };
         let measure = (f32::from(window.viewport_size().width) - 2. * side).clamp(1., STEP_WIDTH);
+        let layout = (window, measure, compact_footer);
         let top = (f32::from(window.viewport_size().height) * 0.08).clamp(23., 68.);
         div()
             .text_color(rgb(theme.foreground))
@@ -148,7 +164,7 @@ impl Onboarding {
                                     self.step_layer(
                                         step,
                                         false,
-                                        (measure, compact_footer),
+                                        layout,
                                         (1., 0.),
                                         (opacity, if shared_back { 0. } else { opacity }),
                                         cx,
@@ -161,7 +177,7 @@ impl Onboarding {
                             .child(self.step_layer(
                                 self.form.step,
                                 live,
-                                (measure, compact_footer),
+                                layout,
                                 (pulse, dy),
                                 (arrival, if shared_back { 1. } else { arrival }),
                                 cx,
@@ -185,7 +201,7 @@ impl Onboarding {
         &self,
         step: Step,
         live: bool,
-        measure: (f32, bool),
+        layout: (&Window, f32, bool),
         (pulse, dy): (f32, f32),
         opacity: (f32, f32),
         cx: &Context<Self>,
@@ -195,7 +211,7 @@ impl Onboarding {
         div()
             .id(("setup-step", step as usize))
             .w_full()
-            .child(self.step(step, live, measure, (pulse, dy), opacity, cx))
+            .child(self.step(step, live, layout, (pulse, dy), opacity, cx))
     }
 
     fn progress(&self) -> Div {
@@ -227,7 +243,7 @@ impl Onboarding {
         &self,
         step: Step,
         live: bool,
-        (measure, narrow): (f32, bool),
+        (window, measure, narrow): (&Window, f32, bool),
         (pulse, dy): (f32, f32),
         (opacity, back_opacity): (f32, f32),
         cx: &Context<Self>,
@@ -304,16 +320,19 @@ impl Onboarding {
                     ),
                 )
             }
-            Step::Servers => (
-                "Server settings",
-                self.form.provider.name(),
-                column().gap_4().children(
-                    Service::ALL
-                        .into_iter()
-                        .map(|service| self.server(service, measure, live, cx)),
-                ),
-                self.footer("Back", None, live, cx),
-            ),
+            Step::Servers => {
+                let port_width = port_width(window, &self.theme);
+                (
+                    "Server settings",
+                    self.form.provider.name(),
+                    column().gap_4().children(
+                        Service::ALL
+                            .into_iter()
+                            .map(|service| self.server(service, measure, port_width, live, cx)),
+                    ),
+                    self.footer("Back", None, live, cx),
+                )
+            }
             Step::Connection => (
                 "",
                 "",
@@ -836,7 +855,7 @@ impl Onboarding {
                     .id(SharedString::from(format!("{field:?}")))
                     .map(|el| {
                         if matches!(field, Field::Host(_) | Field::Port(_)) {
-                            el.px_1p5()
+                            el.px(rems(SERVER_INPUT_PADDING_REM))
                         } else {
                             el.px_2p5()
                         }
@@ -894,7 +913,14 @@ impl Onboarding {
             .child(label)
     }
 
-    fn server(&self, service: Service, width: f32, live: bool, cx: &Context<Self>) -> Div {
+    fn server(
+        &self,
+        service: Service,
+        width: f32,
+        port_width: f32,
+        live: bool,
+        cx: &Context<Self>,
+    ) -> Div {
         let field = Field::Security(service);
         let control = Control::Field(field);
         let focused = live && self.control == control;
@@ -906,13 +932,13 @@ impl Onboarding {
         };
         let issues = &self.feedback.servers[service as usize];
         let current = self
-            .server_issues(service, issues.value, live, cx)
+            .server_issues(service, issues.value, port_width, live, cx)
             .into_any_element();
         let feedback = match issues.frame {
             Some((old, shown)) => layered(
                 width,
                 [
-                    self.server_issues(service, old, false, cx)
+                    self.server_issues(service, old, port_width, false, cx)
                         .into_any_element(),
                     current,
                 ],
@@ -942,7 +968,8 @@ impl Onboarding {
                     )
                     .child(
                         self.field_box(Field::Port(service), "Port", "", live, cx)
-                            .w(px(PORT_WIDTH)),
+                            .flex_none()
+                            .w(px(port_width)),
                     )
                     .child(
                         div()
@@ -986,6 +1013,7 @@ impl Onboarding {
         &self,
         service: Service,
         [host, port, security]: ServerIssues,
+        port_width: f32,
         live: bool,
         cx: &Context<Self>,
     ) -> Div {
@@ -1019,7 +1047,7 @@ impl Onboarding {
                         .child(
                             div()
                                 .flex_none()
-                                .w(px(PORT_WIDTH + SECURITY_WIDTH + FIELD_GAP))
+                                .w(px(port_width + SECURITY_WIDTH + FIELD_GAP))
                                 .children(port.map(|issue| self.field_issue(&issue))),
                         ),
                 )
@@ -1111,6 +1139,33 @@ mod tests {
     use super::*;
     use crate::motion::Motion;
     use gpui::{EntityInputHandler, Modifiers, TestAppContext, point};
+
+    #[test]
+    fn port_width_reserves_room_for_five_digits_at_each_ui_size() {
+        let mut app = TestAppContext::single();
+        let (_, cx) = app.add_window_view(Onboarding::init);
+        cx.update(|window, _| {
+            let mut theme = crate::theme::load();
+            theme.ui_family = Some("DejaVu Sans".into());
+            let mut style = window.text_style();
+            style.font_family = "DejaVu Sans".into();
+            let mut previous_width = 0.;
+            for size in [12., 15., 18.] {
+                theme.ui_px = size;
+                let digits = window.text_system().shape_line(
+                    "65535".into(),
+                    px(size),
+                    &[style.to_run(5)],
+                    None,
+                );
+                let width = port_width(window, &theme);
+                let insets = 2. * (f32::from(window.rem_size()) * 0.375 + 1.);
+                assert!(width - insets >= f32::from(digits.width) + 2.);
+                assert!(width > previous_width);
+                previous_width = width;
+            }
+        });
+    }
 
     #[test]
     fn clicking_an_unfocused_field_inserts_text_at_the_click() {
