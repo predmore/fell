@@ -125,6 +125,7 @@ impl SlotMotion {
         &mut self,
         next: Option<FooterButton>,
         enabled: bool,
+        delay: Duration,
         motion: &Motion,
         now: Instant,
     ) -> bool {
@@ -134,7 +135,7 @@ impl SlotMotion {
             self.enable_fade = motion.start(motion::FADE, now).map(|fade| (before, fade));
         }
         if self.button != next {
-            let drawn = self.frame(now);
+            let drawn = self.frame(now).filter(|(_, alpha)| *alpha > 0.);
             self.button = next;
             self.incoming = None;
             self.leaving = None;
@@ -144,22 +145,20 @@ impl SlotMotion {
                         self.incoming = motion.start(motion::FADE, now).map(|fade| (alpha, fade));
                     }
                     Some((button, alpha)) => {
-                        let out = if next.is_some() {
-                            CONTENT_OUT
-                        } else {
-                            motion::FADE
-                        };
-                        self.leaving = motion.start(out, now).map(|fade| Leaving {
+                        self.leaving = motion.start(CONTENT_OUT, now).map(|fade| Leaving {
                             content: button,
                             alpha,
                             fade,
                         });
                         if next.is_some() {
-                            self.incoming = Some((0., Transition::new(now + out, CONTENT_OUT)));
+                            self.incoming =
+                                Some((0., Transition::new(now + CONTENT_OUT, CONTENT_OUT)));
                         }
                     }
                     None if next.is_some() => {
-                        self.incoming = motion.start(motion::FADE, now).map(|fade| (0., fade));
+                        self.incoming = motion
+                            .start(motion::FADE, now + delay)
+                            .map(|fade| (0., fade));
                     }
                     None => {}
                 }
@@ -243,24 +242,21 @@ impl ActivityMotion {
         let footer = Footer::of(activity, now_unix());
         if self.text != footer.text {
             let before = std::mem::replace(&mut self.text, footer.text);
-            let entering_confirm = self.text.consequence.is_some() && before.consequence.is_none();
             let alpha = motion::progress(self.text_in.as_ref(), now);
-            let (before, alpha) = match self.old_text.take() {
-                Some(old) if old.opacity(now) > alpha => {
-                    let opacity = old.opacity(now);
-                    (old.content, opacity)
+            self.old_text = match self.old_text.take() {
+                Some(old) if old.opacity(now) > alpha => Some(old),
+                _ if !before.text.is_empty() => {
+                    motion.start(CONTENT_OUT, now).map(|fade| Leaving {
+                        content: before,
+                        alpha,
+                        fade,
+                    })
                 }
-                _ => (before, alpha),
+                _ => None,
             };
-            self.old_text = (!before.text.is_empty())
-                .then(|| motion.start(CONTENT_OUT, now))
-                .flatten()
-                .map(|fade| Leaving {
-                    content: before,
-                    alpha,
-                    fade,
-                });
-            let delay = if self.old_text.is_some() || entering_confirm {
+            let delay = if self.text.consequence.is_some() || self.confirmation_leaving() {
+                CONTENT_OUT
+            } else if self.old_text.is_some() {
                 CONTENT_DELAY
             } else {
                 Duration::ZERO
@@ -269,10 +265,22 @@ impl ActivityMotion {
         }
         self.old_text = self.old_text.take().filter(|text| text.fade.running(now));
         self.page = self.page.take().filter(|page| page.fade.running(now));
+        let confirmation_leaving = self.confirmation_leaving();
         let mut slots_animating = false;
         for (index, slot) in self.slots.iter_mut().enumerate() {
-            slots_animating |=
-                slot.update(footer.buttons[index], footer.enabled[index], motion, now);
+            // The confirmation title uses the Undo slot's space.
+            let delay = if index == 0 && confirmation_leaving {
+                CONTENT_OUT
+            } else {
+                Duration::ZERO
+            };
+            slots_animating |= slot.update(
+                footer.buttons[index],
+                footer.enabled[index],
+                delay,
+                motion,
+                now,
+            );
         }
         slots_animating
             || self.page.is_some()
@@ -283,6 +291,12 @@ impl ActivityMotion {
                 .selection_fade
                 .is_some_and(|(_, fade)| fade.running(now))
             || self.undone.is_some_and(|(_, fade)| fade.running(now))
+    }
+
+    fn confirmation_leaving(&self) -> bool {
+        self.old_text
+            .as_ref()
+            .is_some_and(|text| text.content.consequence.is_some())
     }
 
     fn selection(&self, id: i64, selected: bool, now: Instant) -> f32 {
@@ -298,6 +312,18 @@ impl ActivityMotion {
 impl Inbox {
     pub(super) fn request_agent_activity(&mut self, request: Request, cx: &mut Context<Self>) {
         let generation = self.session.activity.generation;
+        let delay = cx.background_executor().timer(LOADING_DELAY);
+        cx.spawn(async move |this, cx| {
+            delay.await;
+            let _ = this.update(cx, |inbox, cx| {
+                let activity = &mut inbox.session.activity;
+                if activity.generation == generation && activity.pending {
+                    activity.loading_slow = true;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
         match request {
             Request::Load {
                 direction,
@@ -312,18 +338,6 @@ impl Inbox {
                     self.activity_scroll.set_offset(point(px(0.), px(0.)));
                 }
                 let account = self.account_id.clone();
-                let delay = cx.background_executor().timer(LOADING_DELAY);
-                cx.spawn(async move |this, cx| {
-                    delay.await;
-                    let _ = this.update(cx, |inbox, cx| {
-                        let activity = &mut inbox.session.activity;
-                        if activity.generation == generation && activity.pending {
-                            activity.loading_slow = true;
-                            cx.notify();
-                        }
-                    });
-                })
-                .detach();
                 let reply = self.store.call(move |store| request.load(store, &account));
                 cx.spawn(async move |this, cx| {
                     let reply = reply.await;
@@ -386,6 +400,8 @@ impl Inbox {
                         let current = activity.generation == generation;
                         if current {
                             activity.pending = false;
+                            activity.pending_bulk_undo = None;
+                            activity.loading_slow = false;
                         }
                         let (notice, error, changed) = match result {
                             Ok(action) => {
@@ -604,19 +620,20 @@ pub(super) fn card(
                 .border_t(px(1.))
                 .border_color(rgb(theme.border))
                 .overflow_hidden()
-                .child(footer.render(theme, compact, frame, live, window, cx)),
+                .child(footer.render(theme, compact, frame, live && !activity.pending, window, cx)),
         )
 }
 
 impl Footer {
     fn of(activity: &Activity, now: i64) -> Self {
+        let enabled = !activity.pending || !activity.loading_slow;
         let mut footer = Self {
             text: FooterText::default(),
             buttons: [None, Some(FooterButton::Newer), Some(FooterButton::Older)],
             enabled: [
                 false,
-                activity.page.has_newer && !activity.pending,
-                activity.page.has_older && !activity.pending,
+                activity.page.has_newer && enabled,
+                activity.page.has_older && enabled,
             ],
         };
         if let Some(prompt) = &activity.confirmation
@@ -652,20 +669,25 @@ impl Footer {
             return footer;
         }
         let entry = activity.selected_entry();
-        if !activity.pending
-            && entry.is_some_and(|entry| {
-                !entry.action.undone && !entry.draft_discarded && entry.blocker.is_none()
-            })
-        {
+        if entry.is_some_and(|entry| {
+            !entry.action.undone
+                && !entry.draft_discarded
+                && entry.blocker.is_none()
+                && activity.pending_bulk_undo != Some(entry.action.id)
+        }) {
             footer.buttons[0] = Some(FooterButton::Undo);
-            footer.enabled[0] = true;
+            footer.enabled[0] = enabled;
         }
         footer.text.text = if let Some(blocker) = &activity.blocker_notice {
             footer.text.compact = Some(blocker_notice(blocker, now, true));
             blocker_notice(blocker, now, false)
         } else if activity.load_failed && !activity.page.entries.is_empty() {
             "Could not load agent activity".into()
-        } else if activity.pending && activity.loading_slow && !activity.page.entries.is_empty() {
+        } else if activity.pending
+            && activity.loading_slow
+            && activity.loading_page
+            && !activity.page.entries.is_empty()
+        {
             "Loading activity…".into()
         } else {
             entry
@@ -699,14 +721,7 @@ impl Footer {
                 + 22.)
                 .max(minimum)
         };
-        let widths = [
-            width(
-                &[FooterButton::Undo.label(compact).0],
-                if compact { 76. } else { 108. },
-            ),
-            width(&["Newer", "Cancel"], if compact { 64. } else { 68. }),
-            width(&["Older", "Undo · y"], if compact { 64. } else { 68. }),
-        ];
+        let widths = footer_slot_widths(compact, width);
         let incoming = frame.map_or(1., |(motion, now)| {
             motion::progress(motion.text_in.as_ref(), now)
         });
@@ -781,6 +796,27 @@ impl Footer {
     }
 }
 
+fn footer_slot_widths(compact: bool, width: impl Fn(&[&str], f32) -> f32) -> [f32; 3] {
+    let paging = width(
+        &[
+            FooterButton::Newer,
+            FooterButton::Cancel,
+            FooterButton::Older,
+            FooterButton::Confirm,
+        ]
+        .map(|button| button.label(compact).0),
+        if compact { 64. } else { 68. },
+    );
+    [
+        width(
+            &[FooterButton::Undo.label(compact).0],
+            if compact { 76. } else { 108. },
+        ),
+        paging,
+        paging,
+    ]
+}
+
 impl FooterText {
     fn render(&self, theme: &Theme, compact: bool, room: f32, window: &Window) -> Div {
         let dim = ensure_all(theme.dimmed, &[theme.surface], 4.65);
@@ -847,6 +883,12 @@ fn blocker_notice(blocker: &ActivityBlocker, now: i64, compact: bool) -> String 
     }
 }
 
+fn footer_button_outline(theme: &Theme) -> u32 {
+    let outline = theme.label_outline(theme.surface);
+    let toward_text = crate::theme::mix(outline, theme.foreground, 0.08);
+    ensure_all(toward_text, &[theme.surface], 3.5)
+}
+
 fn button(
     theme: &Theme,
     label: &'static str,
@@ -855,9 +897,7 @@ fn button(
     live: bool,
     cx: &mut Context<Inbox>,
 ) -> Div {
-    let outline = theme.label_outline(theme.surface);
     let dim = motion::mix(theme.surface, theme.dimmed, 0.4);
-    let faint_outline = motion::mix(theme.surface, outline, 0.5);
     div()
         .px(px(10.))
         .h(px(28.))
@@ -866,7 +906,7 @@ fn button(
         .items_center()
         .rounded_md()
         .border_1()
-        .border_color(rgb(motion::mix(faint_outline, outline, strength)))
+        .border_color(rgb(footer_button_outline(theme)))
         .text_color(rgb(motion::mix(dim, theme.foreground, strength)))
         .text_size(px(theme.ui_px - 1.))
         .child(label)
@@ -1087,11 +1127,12 @@ fn action_name(kind: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fell_core::agent::{ActivityDirection, AgentActivityPage};
     use fell_core::{AccountId, RecordedAction};
+    use std::sync::Arc;
 
-    #[test]
-    fn activity_presentation_filters_agent_names_and_subjects() {
-        let entry = AgentActivity {
+    fn entry() -> AgentActivity {
+        AgentActivity {
             action: RecordedAction {
                 id: 1,
                 account_id: AccountId("demo".into()),
@@ -1107,7 +1148,145 @@ mod tests {
             draft_discarded: false,
             snooze_retired: false,
             agent_off: false,
-        };
+        }
+    }
+
+    fn bulk_activity() -> Activity {
+        let mut activity = Activity::default();
+        activity.page = Arc::new(AgentActivityPage {
+            entries: vec![AgentActivity {
+                conversations: 12,
+                ..entry()
+            }],
+            has_newer: true,
+            has_older: true,
+        });
+        activity
+    }
+
+    #[test]
+    fn paging_slots_reserve_the_widest_label_at_both_widths() {
+        for compact in [false, true] {
+            for (widest, paging) in [("Undo · y", 95.), ("Cancel", 100.), ("", 68.)] {
+                let widths = footer_slot_widths(compact, |labels, minimum| {
+                    if labels.contains(&widest) {
+                        paging
+                    } else {
+                        minimum
+                    }
+                });
+                let expected = if compact && widest.is_empty() {
+                    64.
+                } else {
+                    paging
+                };
+                assert_eq!(
+                    widths,
+                    [if compact { 76. } else { 108. }, expected, expected]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn footer_preserves_button_strength_until_a_request_is_slow() {
+        let mut activity = bulk_activity();
+        let motion = Motion::new(false);
+        let now = Instant::now();
+        let mut frame = ActivityMotion::for_open(&activity, now_unix());
+        let button_strength =
+            |frame: &ActivityMotion| frame.slots.each_ref().map(|slot| slot.enabled_at(now));
+
+        assert!(activity.page(true).is_some());
+        assert!(activity.page(true).is_none());
+        assert!(!frame.frame(&activity, &motion, now));
+        assert_eq!(button_strength(&frame), [1., 1., 1.]);
+
+        activity.pending = false;
+        let mut last_page = (*activity.page).clone();
+        last_page.has_older = false;
+        activity.loaded(last_page, ActivityDirection::Older(1));
+        frame.frame(&activity, &motion, now);
+        assert_eq!(button_strength(&frame), [1., 1., 0.]);
+
+        assert!(activity.undo().is_none());
+        assert!(activity.confirm(true).is_some());
+        frame.frame(&activity, &motion, now);
+        assert_eq!(button_strength(&frame), [0., 1., 0.]);
+        assert!(frame.slots[0].frame(now).is_none());
+        activity.loading_slow = true;
+        frame.frame(&activity, &motion, now);
+        assert_eq!(button_strength(&frame), [0., 0., 0.]);
+    }
+
+    #[test]
+    fn a_slow_undo_keeps_the_footer_time_instead_of_saying_loading() {
+        let mut activity = bulk_activity();
+        let now = now_unix();
+        let time = Footer::of(&activity, now).text.text;
+        assert!(activity.undo().is_none());
+        assert!(activity.confirm(true).is_some());
+        assert!(activity.pending && !activity.loading_page);
+        activity.loading_slow = true;
+        assert_eq!(Footer::of(&activity, now).text.text, time);
+
+        activity.pending = false;
+        activity.loading_slow = false;
+        assert!(activity.page(true).is_some());
+        assert!(activity.pending && activity.loading_page);
+        activity.loading_slow = true;
+        assert_eq!(Footer::of(&activity, now).text.text, "Loading activity…");
+    }
+
+    #[test]
+    fn confirmation_text_and_undo_slot_take_turns() {
+        let mut activity = bulk_activity();
+        let motion = Motion::new(true);
+        let start = Instant::now();
+        let mut frame = ActivityMotion::for_open(&activity, now_unix());
+        for confirming in [true, false] {
+            let start = if confirming {
+                activity.undo();
+                start
+            } else {
+                activity.confirm(false);
+                start + Duration::from_millis(200)
+            };
+            for elapsed in 0..=190 {
+                let now = start + Duration::from_millis(elapsed);
+                frame.frame(&activity, &motion, now);
+                let undo = frame.slots[0]
+                    .frame(now)
+                    .is_some_and(|(_, alpha)| alpha > 0.);
+                let confirm = (frame.text.consequence.is_some()
+                    && motion::progress(frame.text_in.as_ref(), now) > 0.)
+                    || frame.old_text.as_ref().is_some_and(|old| {
+                        old.content.consequence.is_some() && old.opacity(now) > 0.
+                    });
+                assert!(
+                    !(undo && confirm),
+                    "confirming={confirming}, elapsed={elapsed}"
+                );
+                if elapsed == 50 || elapsed == 100 {
+                    let entered = elapsed == 100;
+                    assert_eq!(undo, entered != confirming);
+                    assert_eq!(confirm, entered == confirming);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn activity_footer_button_outlines_reach_three_and_a_half_to_one() {
+        for theme in crate::theme::every_test_theme() {
+            let contrast = crate::theme::contrast(footer_button_outline(&theme), theme.surface);
+            assert!(contrast >= 3.5, "{}: {contrast:.3}", theme.name);
+        }
+    }
+
+    #[test]
+    fn activity_presentation_filters_agent_names_and_subjects() {
+        let entry = entry();
         assert_eq!(
             agent_name(entry.action.actor.strip_prefix("agent:").unwrap()),
             "Fern"
