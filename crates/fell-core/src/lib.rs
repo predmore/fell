@@ -37,7 +37,8 @@ pub const MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 
 pub use account::{Account, AccountId, BackendKind};
 pub use account_config::{
-    AccountConfig, NotificationMode, PasswordSource, SaveSent, SyncFailureKind, classify_sync_error,
+    AccountConfig, Identity, NotificationMode, PasswordSource, SaveSent, SyncFailureKind,
+    classify_sync_error,
 };
 pub use actions::{ActionKind, FlagChange, LabelChange, LocalAction};
 pub use agent::{
@@ -68,7 +69,7 @@ pub use send::{
     Draft, PendingSend, PendingSendId, SentMessage, SubmittedFile, UserSendConfirmation,
     message_digest,
 };
-pub use smtp::SmtpConfig;
+pub use smtp::{SmtpConfig, SmtpSenders};
 pub use store::PendingFlags;
 pub use store::{
     CidRepairBatch, CidRepairProgress, FolderPage, FolderSpan, FolderThread, ListFilter, ListKey,

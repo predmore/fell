@@ -171,7 +171,10 @@ pub(crate) fn send_account_config(
     send_config_at(&path, account).map(Some)
 }
 
-fn send_config_at(path: &Path, account: &AccountId) -> Result<AccountConfig, AccountConfigError> {
+pub(crate) fn send_config_at(
+    path: &Path,
+    account: &AccountId,
+) -> Result<AccountConfig, AccountConfigError> {
     let config = read_account_config(path)?.ok_or_else(|| {
         AccountConfigError::new(
             format!("{} does not exist", path.display()),
@@ -290,6 +293,56 @@ pub(crate) fn stage_account_config_at(
 ) -> Result<StagedAccountConfig, AccountFileError> {
     let lock = lock_account_dir(&path)?;
     stage_account_text_at(path, &config.render(), first_run, lock)
+}
+
+/// Import only the addresses the user checked, preserving comments and
+/// settings in the current file. Serializes with other Fell account writes.
+pub(crate) fn import_identities(
+    account: &AccountId,
+    addresses: Vec<String>,
+) -> Result<AccountConfig, String> {
+    let path = account_config_path().ok_or("No account file")?;
+    import_identities_at(path, account, addresses)
+}
+
+fn import_identities_at(
+    path: PathBuf,
+    account: &AccountId,
+    addresses: Vec<String>,
+) -> Result<AccountConfig, String> {
+    let lock = lock_account_dir(&path).map_err(|err| err.to_string())?;
+    let (config, mut text) = read_account_config_text(&path)
+        .map_err(|err| err.to_string())?
+        .ok_or("No account file")?;
+    if config.id != account.as_str() {
+        return Err("The account changed. Open Accounts and review the addresses again.".into());
+    }
+    let known = config.compose_identities();
+    let identities: Vec<_> = addresses
+        .into_iter()
+        .filter(|address| {
+            !known
+                .iter()
+                .any(|identity| identity.address.eq_ignore_ascii_case(address))
+        })
+        .map(|address| fell_core::Identity {
+            address,
+            name: String::new(),
+            signature: None,
+        })
+        .collect();
+    if identities.is_empty() {
+        return Ok(config);
+    }
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    AccountConfig::render_identities(&mut text, &identities);
+    let updated = AccountConfig::parse(&text).map_err(|err| err.to_string())?;
+    stage_account_text_at(path, &text, false, lock)
+        .and_then(StagedAccountConfig::publish)
+        .map_err(|err| err.to_string())?;
+    Ok(updated)
 }
 
 fn lock_account_dir(path: &Path) -> Result<fs::File, AccountFileError> {
@@ -646,6 +699,42 @@ mod tests {
         assert!(err.detail.contains("password"), "{err}");
         assert_eq!(err.recovery, "Fix the settings in account.toml.");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_appends_only_confirmed_new_aliases_and_keeps_the_account_text() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("fell/account.toml");
+        let original = "# Keep my notes\nemail = 'primary@example.com'\npassword = 'demo'";
+        let lock = lock_account_dir(&path).unwrap();
+        stage_account_text_at(path.clone(), original, true, lock)
+            .unwrap()
+            .publish()
+            .unwrap();
+        let account = AccountId("mail".into());
+        let updated = import_identities_at(
+            path.clone(),
+            &account,
+            vec!["primary@example.com".into(), "confirmed@example.com".into()],
+        )
+        .unwrap();
+        assert_eq!(updated.identities.len(), 1);
+        assert_eq!(updated.identities[0].address, "confirmed@example.com");
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.starts_with(original));
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(
+            import_identities_at(
+                path.clone(),
+                &AccountId("other".into()),
+                vec!["unconfirmed@example.com".into(),]
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), saved);
     }
 
     #[test]

@@ -39,6 +39,7 @@ pub(super) fn unused_smtp() -> crate::SmtpConfig {
         security: ImapSecurity::StartTls,
         accept_invalid_certs: false,
         append_sent: false,
+        senders: crate::SmtpSenders::Fixed(Vec::new()),
     }
 }
 
@@ -1054,6 +1055,7 @@ fn only_the_exact_message_id_in_the_same_accounts_sent_role_confirms_a_send() {
                 body: "Same body\n".into(),
                 files: Vec::new(),
                 identities: vec!["c@x".into()],
+                managed_signature: None,
                 owner: String::new(),
                 reply: Default::default(),
             })

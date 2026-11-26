@@ -44,16 +44,18 @@ pub(crate) use persist::{
 pub(crate) use reply::format_address;
 pub use reply::{
     ForwardSummary, MAX_REFERENCES, ReplyKind, ReplyParts, ReplyStart, build_references,
-    configured_from, forward_subject, own_addresses, reply_recipients, reply_subject, start_reply,
-    start_reply_in_zone,
+    configured_from, forward_subject, own_addresses, reply_identity, reply_recipients,
+    reply_subject, start_reply, start_reply_in_zone,
 };
 pub(crate) use server::server_draft_payload;
 pub use server::{
     DraftSaveStatus, SERVER_DRAFT_SAVE_FAILED, SERVER_DRAFT_SAVE_RETRYING, SaveReceipt,
     server_draft_open_notice,
 };
+pub(crate) use session::signature_range;
 pub use session::{
-    AddressView, AttachmentView, DraftSession, HunkView, ReplyContext, SendLock, SentCopy, Snapshot,
+    AddressView, AttachmentView, DraftSession, HunkView, ReplyContext, SendLock, SentCopy,
+    Snapshot, append_signature, signature_block,
 };
 pub(crate) use workspace::inline_image_paths;
 pub use workspace::{

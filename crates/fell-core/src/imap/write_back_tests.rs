@@ -3973,6 +3973,32 @@ fn sent_copy_survives_a_write_lock_past_both_old_save_attempts() {
 }
 
 #[test]
+fn the_alias_sent_over_smtp_is_the_local_and_appended_from() {
+    let fixture = sent_fixture();
+    let account = &fixture.account.id;
+    let mime = String::from_utf8(REPLY_MIME.to_vec())
+        .unwrap()
+        .replace("Robin <c@x>", "Studio <studio@example.com>")
+        .into_bytes();
+    let id = crate::MessageId::new("reply@compose.fell");
+    fixture
+        .store
+        .claim_compose_send(account, "alias-reply", Some(id.as_str()))
+        .unwrap();
+    crate::smtp::tests::confirm_fixture_delivery(&fixture.backend.config, account, &mime).unwrap();
+    let (_, local) = fixture
+        .store
+        .record_sent_message(account, "alias-reply", &id, &[], &mime, true)
+        .unwrap();
+    assert_eq!(local.headers.from.email, "studio@example.com");
+    assert_eq!(fixture.replay().sent, 1);
+    assert_eq!(
+        fixture.server.state.lock().unwrap().mailboxes[1].messages[0].raw,
+        mime
+    );
+}
+
+#[test]
 fn sent_copy_is_appended_after_smtp_even_if_sqlite_refuses_the_local_insert() {
     let fixture = sent_fixture();
     let account = &fixture.account.id;
@@ -4288,11 +4314,16 @@ fn server_draft_import_round_trips_and_confirmed_send_cleans_up() {
     let fx = draft_fixture(Store::open(dir.path().join("mail.db")).unwrap());
     let mut config = fx.account_config();
     config.name = "Caleb".into();
-    let mime = b"From: Robin <c@x>\r\nTo: Avery <avery@example.test>\r\n\
+    config.identities = vec![crate::Identity {
+        address: "studio@example.test".into(),
+        name: "Studio".into(),
+        signature: Some("**Studio**\nField office".into()),
+    }];
+    let mime = b"From: Robin <studio@example.test>\r\nTo: Avery <avery@example.test>\r\n\
         Cc: Blake <blake@example.test>\r\nBcc: Taylor <taylor@example.test>\r\n\
         Subject: Field notes\r\nMessage-ID: <remote-draft@example.test>\r\n\
         MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=notes\r\n\r\n\
-        --notes\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n# Field notes\r\n\r\nTwo routes.\r\n\
+        --notes\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n# Field notes\r\n\r\nTwo routes.\r\n\r\n-- \r\n**Studio**\r\nField office\r\n\
         --notes\r\nContent-Type: application/octet-stream\r\n\
         Content-Disposition: attachment; filename=map.txt\r\n\
         Content-Transfer-Encoding: base64\r\n\r\nbWFw\r\n--notes--\r\n";
@@ -4303,16 +4334,20 @@ fn server_draft_import_round_trips_and_confirmed_send_cleans_up() {
         .import_server_draft(&fx.store, &thread, "imported-draft")
         .unwrap();
     let stored = fx.store.load_compose(&id).unwrap().unwrap();
-    assert_eq!(stored.fields.from, "Caleb <c@x>");
-    assert_eq!(
-        stored.identities.as_slice(),
-        std::slice::from_ref(&fx.account.email)
-    );
+    assert_eq!(stored.fields.from, "Studio <studio@example.test>");
+    assert_eq!(stored.identities, ["c@x", "studio@example.test"]);
     assert_eq!(stored.fields.to, ["Avery <avery@example.test>"]);
     assert_eq!(stored.fields.cc, ["Blake <blake@example.test>"]);
     assert_eq!(stored.fields.bcc, ["Taylor <taylor@example.test>"]);
     assert_eq!(stored.fields.subject, "Field notes");
-    assert_eq!(stored.body.trim_end(), "# Field notes\n\nTwo routes.");
+    assert_eq!(
+        stored.body,
+        "# Field notes\n\nTwo routes.\n\n-- \n**Studio**\nField office\n"
+    );
+    assert_eq!(
+        stored.managed_signature.as_deref(),
+        Some("-- \n**Studio**\nField office\n")
+    );
     assert_eq!(stored.files[0].display_name, "map.txt");
     assert_eq!(stored.files[0].bytes, b"map");
     assert!(fx.subjects(SERVER_DRAFTS).is_empty());

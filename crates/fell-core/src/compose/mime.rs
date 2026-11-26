@@ -131,6 +131,7 @@ fn build_message(
     Outgoing {
         draft: Draft {
             account_id,
+            from: fields.from.clone(),
             to: fields.to.clone(),
             cc: fields.cc.clone(),
             bcc: fields.bcc.clone(),
@@ -655,6 +656,53 @@ mod tests {
     use super::*;
     use crate::AccountId;
     use mail_parser::MessageParser;
+
+    #[test]
+    fn account_display_name_is_validated_before_building_from_mime() {
+        use crate::{AccountConfig, Error, Result};
+
+        let message_from = |name: &str, primary_identity: &str| -> Result<_> {
+            let config = AccountConfig::parse(&format!(
+                "email = 'primary@example.com'\npassword = 'test'\nname = {name:?}\n{primary_identity}"
+            ))?;
+            let fields = DraftFields {
+                from: config.compose_identities()[0].from_header(),
+                to: vec!["recipient@example.com".into()],
+                ..DraftFields::default()
+            };
+            Ok(build_outgoing(
+                config.account().id,
+                &fields,
+                "Letter\n",
+                &[],
+                &ReplyParts::default(),
+            ))
+        };
+        for primary_identity in [
+            "",
+            "[[identities]]\naddress = 'primary@example.com'\nsignature = 'Team'\n",
+        ] {
+            for name in [
+                "Me\nBcc: attacker@example.com",
+                "PayPal <attacker@example.com>",
+            ] {
+                assert!(matches!(
+                    message_from(name, primary_identity),
+                    Err(Error::Invalid(message)) if message == "account name must be plain display text"
+                ));
+            }
+            let message = message_from("Primary Name", primary_identity).unwrap();
+            assert!(
+                message
+                    .mime
+                    .starts_with(b"From: Primary Name <primary@example.com>\r\n")
+            );
+            assert_eq!(
+                crate::smtp::sender(&message.mime).unwrap(),
+                "primary@example.com"
+            );
+        }
+    }
 
     #[test]
     fn a_second_angle_address_is_not_encoded_as_the_mailbox() {

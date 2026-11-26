@@ -895,8 +895,9 @@ impl Inbox {
             }
         })
         .detach();
-        cx.observe_window_activation(window, |_, window, cx| {
+        cx.observe_window_activation(window, |this, window, cx| {
             if window.is_window_active() {
+                this.refresh_settings_identities(cx);
                 cx.notify();
             }
         })
@@ -2139,7 +2140,7 @@ impl Inbox {
                 // here in render they would use GPUI's default text style,
                 // and their shaping would never be the list's.
                 parts.push(
-                    uniform_list("warm-rows", count, move |range, window, app| {
+                    fixed_inbox_rows("warm-rows", count, move |range, window, app| {
                         entity.update(app, |_, cx| {
                             range
                                 .map(|index| {
@@ -4259,6 +4260,17 @@ impl Inbox {
                 Ok::<_, fell_core::Error>((parent, parts))
             }
         });
+        let configured = cx.background_executor().spawn({
+            let account = account.clone();
+            async move {
+                crate::mailbox::send_account_config(&account)
+                    .ok()
+                    .flatten()
+                    .filter(|config| !config.identities.is_empty())
+                    .map(|config| config.compose_identities())
+                    .unwrap_or_default()
+            }
+        });
         cx.spawn(async move |this, cx| {
             let reply_note = suggestion.clone();
             let result = match read.await {
@@ -4275,10 +4287,15 @@ impl Inbox {
                         parent.has_attachment = !omitted.is_empty();
                         parent.attachment_names = omitted;
                     }
-                    let own = fell_core::compose::own_addresses(&parent, &email, &roles);
+                    let identities = configured.await;
+                    let mut own = fell_core::compose::own_addresses(&parent, &email, &roles);
+                    own.extend(identities.iter().map(|identity| identity.address.clone()));
+                    let from = fell_core::compose::reply_identity(&parent, &identities)
+                        .map(fell_core::Identity::from_header)
+                        .unwrap_or(email);
                     let offset = crate::present::local_offset(parent.headers.date_unix);
                     let start = fell_core::compose::start_reply_in_zone(
-                        kind, &parent, &email, &own, offset, &roles,
+                        kind, &parent, &from, &own, offset, &roles,
                     );
                     if start.parts.reply_to_unverified {
                         let id = parent.headers.message_id;
@@ -4754,8 +4771,13 @@ impl Inbox {
             let page = self.session.settings_nav.page;
             if settings_page != Some(page) {
                 self.settings_view.reset_scroll();
+                self.refresh_settings_identities(cx);
             }
-            if matches!(page, crate::model::settings::Page::Section(_)) {
+            if matches!(
+                page,
+                crate::model::settings::Page::Section(_)
+                    | crate::model::settings::Page::IdentityImport
+            ) {
                 self.settings_view
                     .scroll_to(self.session.settings_nav.selected);
             }
@@ -7135,7 +7157,7 @@ fn thread_list(
 
     let entity = cx.entity();
     let theme_for_rows = theme.clone();
-    let rows = uniform_list(
+    let rows = fixed_inbox_rows(
         "thread-rows",
         session.threads.len(),
         move |range, window, app| {
@@ -7152,15 +7174,10 @@ fn thread_list(
                 let viewport = inbox.list_viewport().unwrap_or(0.0);
                 let last = inbox.session.threads.len().saturating_sub(1);
                 let bar_dx = unread_bar_dx(inbox.motion.pane_entry(Pane::List, now).dx);
-                // The list also asks for row 0 alone to measure a row's
-                // height; only the rows it draws count as on screen.
-                let drawn = range.len() > 1 || inbox.session.threads.len() == 1;
-                let capture = drawn && inbox.session.list_label.is_some();
+                let capture = inbox.session.list_label.is_some();
                 let mut painted = Vec::new();
-                if drawn {
-                    let ids = inbox.session.threads.iter().map(|row| row.id.as_str());
-                    inbox.row_widths.keep_drawn(range.clone(), ids);
-                }
+                let ids = inbox.session.threads.iter().map(|row| row.id.as_str());
+                inbox.row_widths.keep_drawn(range.clone(), ids);
                 let visible = range.clone();
                 let rows: Vec<_> = range
                     .map(|index| {
@@ -7171,13 +7188,10 @@ fn thread_list(
                             (row.unread, row.starred),
                             |unread| line_px(window, &row.subject, row_weight(unread)),
                             now,
-                            drawn,
+                            true,
                         );
-                        let previous_labels = if drawn {
-                            inbox.row_widths.labels_frame(&row.id, &row.labels, now)
-                        } else {
-                            None
-                        };
+                        let previous_labels =
+                            inbox.row_widths.labels_frame(&row.id, &row.labels, now);
                         let selected = highlighted.contains(&row.id);
                         let regroup = inbox
                             .regroup_selection
@@ -7200,7 +7214,7 @@ fn thread_list(
                                 &row.id,
                                 row.has_attachment,
                                 now,
-                                drawn,
+                                true,
                             ),
                         };
                         let element =
@@ -7226,9 +7240,9 @@ fn thread_list(
                             // GPUI only asks for in-view slots. Paint rows still
                             // moving across an edge from the nearest drawn slot.
                             let extra = shift.overscan(ROW_PX);
-                            let above = (drawn && index == visible.start)
+                            let above = (index == visible.start)
                                 .then(|| visible.start.saturating_sub(extra)..visible.start);
-                            let below = (drawn && index + 1 == visible.end)
+                            let below = (index + 1 == visible.end)
                                 .then(|| visible.end..(visible.end + extra).min(last + 1));
                             let overflow = above
                                 .into_iter()
@@ -7379,6 +7393,43 @@ fn thread_list(
     .min_h(px(0.))
     .track_scroll(scroll);
     pane.child(rows)
+}
+
+/// GPUI asks for one row during layout and again during prepaint to find the
+/// list's row height. Its width is set by the pane, and the height is fixed.
+/// A single slot builds its contents in prepaint so both measurement passes
+/// can skip the row tree. A viewport that draws one row still builds it.
+fn fixed_inbox_rows(
+    id: &'static str,
+    count: usize,
+    render: impl Fn(std::ops::Range<usize>, &mut Window, &mut gpui::App) -> Vec<gpui::AnyElement>
+    + Clone
+    + 'static,
+) -> gpui::UniformList {
+    uniform_list(id, count, move |range, window, app| {
+        if range.len() != 1 {
+            return render(range, window, app);
+        }
+        let render = render.clone();
+        vec![
+            gpui::canvas(
+                move |bounds, window, app| {
+                    let mut row = render(range, window, app).pop()?;
+                    let space = bounds.size.map(AvailableSpace::Definite);
+                    row.prepaint_as_root(bounds.origin, space, window, app);
+                    Some(row)
+                },
+                |_, row, window, app| {
+                    if let Some(mut row) = row {
+                        row.paint(window, app);
+                    }
+                },
+            )
+            .h(px(ROW_PX))
+            .w_full()
+            .into_any_element(),
+        ]
+    })
 }
 
 /// Shape the leaving rows during list prepaint, where the same font and
@@ -8357,7 +8408,7 @@ fn clip_shaped(
     })
 }
 
-fn fit_shaped_line(
+pub(crate) fn fit_shaped_line(
     text: &str,
     max_px: f32,
     font_px: f32,
@@ -12890,6 +12941,65 @@ mod tests {
     use crate::present::Pane;
     use gpui::{IntoElement, Keystroke, Modifiers, div};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn inbox_list_builds_each_visible_row_only_once() {
+        use gpui::{Context, Render, Styled, TestAppContext, UniformListScrollHandle, Window, px};
+        use std::{cell::RefCell, rc::Rc};
+
+        #[derive(Default)]
+        struct Counts {
+            built: RefCell<Vec<usize>>,
+            painted: RefCell<Vec<usize>>,
+        }
+
+        struct TestList {
+            count: usize,
+            visible: usize,
+            scroll: UniformListScrollHandle,
+            counts: Rc<Counts>,
+        }
+
+        impl Render for TestList {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let counts = self.counts.clone();
+                super::fixed_inbox_rows("fixed-test-rows", self.count, move |range, _, _| {
+                    counts.built.borrow_mut().extend(range.clone());
+                    range
+                        .map(|index| {
+                            let counts = counts.clone();
+                            gpui::canvas(
+                                |_, _, _| (),
+                                move |_, (), _, _| counts.painted.borrow_mut().push(index),
+                            )
+                            .h(px(super::ROW_PX))
+                            .w_full()
+                            .into_any_element()
+                        })
+                        .collect()
+                })
+                .h(px(self.visible as f32 * super::ROW_PX))
+                .w_full()
+                .track_scroll(self.scroll.clone())
+            }
+        }
+
+        let mut app = TestAppContext::single();
+        for (count, visible, start) in [(1, 1, 0), (4, 1, 3), (4, 2, 0)] {
+            let counts = Rc::new(Counts::default());
+            let scroll = UniformListScrollHandle::new();
+            scroll.scroll_to_item_strict(start, gpui::ScrollStrategy::Top);
+            app.add_window(|_, _| TestList {
+                count,
+                visible,
+                scroll,
+                counts: counts.clone(),
+            });
+            let expected = (start..start + visible).collect::<Vec<_>>();
+            assert_eq!(*counts.built.borrow(), expected);
+            assert_eq!(*counts.painted.borrow(), expected);
+        }
+    }
 
     #[test]
     fn a_dropped_mailbox_reply_still_runs_failure_completion() {

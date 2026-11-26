@@ -889,7 +889,7 @@ impl DraftHub {
                 for edit in edits {
                     let old = edit.get("old").and_then(Value::as_str).unwrap_or("");
                     let new = edit.get("new").and_then(Value::as_str).unwrap_or("");
-                    if let Err(err) = session.edit(base, old, new) {
+                    if let Err(err) = session.edit_as_agent(base, old, new) {
                         error = Some(err);
                         break;
                     }
@@ -1167,7 +1167,7 @@ pub fn file_fallback_edit(
     let access = store
         .lock_agent_draft_access(session.account_id(), agent)
         .map_err(|err| err.to_string())?;
-    session.edit(session.revision(), old, new)?;
+    session.edit_as_agent(session.revision(), old, new)?;
     drop(access);
     session.flush()?;
     let snap = session.snapshot();
@@ -1575,6 +1575,7 @@ mod tests {
                 body: "alpha\n".into(),
                 files: Vec::new(),
                 identities: Vec::new(),
+                managed_signature: None,
                 owner: "agent:bot".into(),
                 reply: Default::default(),
             })
@@ -2051,6 +2052,7 @@ mod tests {
                 body: "hidden body\n".into(),
                 files: Vec::new(),
                 identities: vec!["jon@example.com".into()],
+                managed_signature: None,
                 owner: "agent:ada".into(),
                 reply: Default::default(),
             })

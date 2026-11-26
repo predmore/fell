@@ -598,6 +598,7 @@ fn create_draft(session: &Session, args: &Value) -> Result<Value, String> {
             identities: fell_core::compose::email_of(&fields.from)
                 .into_iter()
                 .collect(),
+            managed_signature: None,
             owner: actor_name(session),
             reply: Default::default(),
         })

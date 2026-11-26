@@ -2273,6 +2273,18 @@ impl Session {
                         ..Step::default()
                     };
                 }
+                if self.settings_nav.page == Page::IdentityImport {
+                    let index = self.settings_nav.selected;
+                    let request = if index < self.settings_nav.identity_candidates {
+                        Request::ToggleIdentityCandidate(index)
+                    } else {
+                        Request::ImportIdentities
+                    };
+                    return Step {
+                        settings: Some(request),
+                        ..Step::default()
+                    };
+                }
                 if let Some(row) = self.settings_nav.row() {
                     return self.activate_setting(row, page_rows);
                 }
@@ -2302,6 +2314,13 @@ impl Session {
                 preference, false,
             ))),
             Row::AccountSetup => Some(Request::AccountSetup),
+            Row::EditAccount => Some(Request::EditAccount),
+            Row::ImportIdentities => {
+                self.settings_nav.page = Page::IdentityImport;
+                self.settings_nav.selected = 0;
+                self.settings_nav.identity_candidates = 0;
+                Some(Request::ReadIdentityCandidates)
+            }
             Row::EditKeymap => Some(Request::EditKeymap),
             Row::EffectiveBindings => {
                 self.settings_nav.page = Page::Bindings;

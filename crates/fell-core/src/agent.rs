@@ -117,6 +117,7 @@ impl ReviewDraft {
     pub fn to_compose_draft(&self) -> crate::Draft {
         crate::Draft {
             account_id: self.account_id.clone(),
+            from: String::new(),
             to: self.to.clone(),
             cc: self.cc.clone(),
             bcc: self.bcc.clone(),
@@ -1832,6 +1833,7 @@ mod tests {
                 body: draft.draft.body.clone(),
                 files: vec![],
                 identities: vec![],
+                managed_signature: None,
                 owner: draft.draft.actor.clone(),
                 reply: Default::default(),
             })
@@ -3390,6 +3392,7 @@ mod tests {
             body: String::new(),
             files: Vec::new(),
             identities: Vec::new(),
+            managed_signature: None,
             owner: String::new(),
             reply: ReplyParts::default(),
         };

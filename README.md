@@ -149,6 +149,34 @@ in `settings.toml`. Private mode keeps one notice with
 an unread count and an **Open Inbox** action. When you mark a conversation read or
 archive it from a notice, the confirmation offers **Undo** for five seconds.
 
+### Sender identities and signatures
+
+Add one `[[identities]]` table per address at the end of `account.toml`.
+Use an entry for the account's top-level `email` to give that default
+address a signature. `name` and `signature` are optional. Write line
+breaks in a Markdown signature as `\n`. Fell accepts up to 2,000
+characters and 30 lines per signature, with tabs and line breaks allowed.
+Names use plain display text.
+
+```toml
+[[identities]]
+address = "studio@example.com"
+name = "Studio"
+signature = "**Studio**\nField Operations"
+```
+
+**Settings → Accounts** lists the current identities. **Import sender
+addresses** lets you select and confirm aliases from the mailbox's
+delivery history. Use **Edit account.toml** to add addresses manually or
+set their display names and signatures.
+
+Replies and forwards choose the configured identity the message arrived
+through, then check To and Cc, then use the default. Choose another
+sender with **Ctrl-f** from a compose header, **Space c f** from normal
+mode, or **Choose From** in the compose palette. A signature is editable
+Markdown. Changing From replaces the generated signature while it is
+untouched and keeps any edits you made to it.
+
 ### Sent mail
 
 A confirmed send appears in the conversation and in Sent immediately. The `save_sent` setting in `account.toml` controls who files the copy on the server.
