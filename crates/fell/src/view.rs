@@ -952,6 +952,7 @@ struct Inbox {
     warmed_folder: Option<String>,
     /// Prepared HTML bodies by message id, so reopening prepares nothing.
     bodies: BodyCache,
+    /// Each account owns its reader snapshots, consent and view overrides.
     web_mail: web_mail::Reader,
     /// Body revisions to load for the current conversation and work in flight.
     body_loads: BodyLoads,

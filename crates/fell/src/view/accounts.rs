@@ -1868,35 +1868,43 @@ mod tests {
     }
 
     #[test]
-    fn switching_restores_each_accounts_folder_selection_and_search() {
+    fn switching_restores_each_accounts_folder_selection_search_and_reader() {
         let Some(_temp) = fell_core::test_support::in_isolated_process() else {
             return;
         };
         let registry = Registry::resolve().unwrap();
         std::fs::create_dir_all(registry.directory()).unwrap();
-        for id in ["mail", "work"] {
-            let mut file = std::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .mode(0o600)
-                .open(registry.path(id).unwrap())
-                .unwrap();
-            writeln!(
-                file,
-                "email = '{id}@example.test'\npassword_command = 'exit 1'"
-            )
-            .unwrap();
-        }
+        write_account(&registry, "mail", "trust_verified_sender_header = true");
+        write_account(&registry, "work", "");
 
         let mut app = TestAppContext::single();
         let window = app.add_window(|window, cx| {
             AccountWindow::new(mailbox::startup(), false, None, window, cx)
         });
+        let stores = window
+            .update(&mut app, |view, _, cx| {
+                view.views
+                    .values()
+                    .map(|inbox| inbox.read(cx).store.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap();
+        for store in stores {
+            futures::executor::block_on(store.call(|_| ())).unwrap();
+        }
+        app.run_until_parked();
+
+        let sender = "dispatch@example.test";
         app.update(|cx| {
             window
                 .update(cx, |view, window, cx| {
                     let personal = view.active();
                     personal.update(cx, |inbox, _| {
+                        assert!(inbox.web_mail.trusted_delivery);
+                        inbox
+                            .web_mail
+                            .preferences
+                            .insert(sender.into(), (Some(false), true));
                         inbox.session.folder = "Sent".into();
                         inbox.session.on_key(KeyId::Char('/'), 10);
                         inbox.session.on_key(KeyId::Char('x'), 10);
@@ -1916,6 +1924,12 @@ mod tests {
                     let work = view.active();
                     assert_ne!(personal, work);
                     work.update(cx, |inbox, _| {
+                        assert!(!inbox.web_mail.trusted_delivery);
+                        assert!(!inbox.web_mail.preferences.contains_key(sender));
+                        inbox
+                            .web_mail
+                            .preferences
+                            .insert(sender.into(), (Some(true), false));
                         assert!(inbox.session.search.is_none());
                         inbox.session.folder = "Drafts".into();
                         inbox.session.cursor_id = Some("work-thread".into());
@@ -1929,12 +1943,18 @@ mod tests {
                     });
                     view.switch("mail", window, cx);
                     let personal = view.active();
-                    let session = &personal.read(cx).session;
+                    let personal = personal.read(cx);
+                    assert_eq!(personal.web_mail.preferences[sender], (Some(false), true));
+                    let session = &personal.session;
                     assert_eq!(session.folder, "Sent");
                     assert_eq!(session.cursor_id.as_deref(), Some("personal-thread"));
                     assert_eq!(session.search.as_ref().unwrap().query, "xg");
                     view.switch("work", window, cx);
                     let work = view.active();
+                    assert_eq!(
+                        work.read(cx).web_mail.preferences[sender],
+                        (Some(true), false)
+                    );
                     assert_eq!(work.read(cx).session.folder, "Drafts");
                     assert_eq!(
                         work.read(cx).session.cursor_id.as_deref(),
