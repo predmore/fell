@@ -736,6 +736,9 @@ mod tests {
                 .args(["--exact", TEST, "--nocapture"])
                 .env("GDK_BACKEND", "x11")
                 .env("LIBGL_ALWAYS_SOFTWARE", "1")
+                // Xvfb cannot supply a DRI device. Disable the backing
+                // store's EGL probe before WebKit constructs the view.
+                .env("WEBKIT_DISABLE_DMABUF_RENDERER", "1")
                 .env_remove("DBUS_SESSION_BUS_ADDRESS")
                 .output()
                 .expect("start WebKit test on the CI virtual display");
