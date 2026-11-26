@@ -3,6 +3,8 @@ use std::ops::{Deref, Range};
 
 use cssparser::{Delimiter, ParseError, Parser, ParserInput, Token};
 
+const MAX_ESTIMATED_HEIGHT: f32 = 8_192.;
+
 fn web_page(body: &str, scheme: &str) -> String {
     format!(
         r#"<!DOCTYPE html>
@@ -58,7 +60,9 @@ impl WebMail {
             0,
             Some(&mut images),
         );
-        let layout = Layout::from_node(*crate::html::parse_html(&body).root_element());
+        let mut layout_dom = crate::html::parse_html(&body);
+        crate::html::prune_hidden(&mut layout_dom);
+        let layout = Layout::from_node(*layout_dom.root_element());
         Self {
             body,
             images,
@@ -72,10 +76,12 @@ impl WebMail {
     }
 
     pub fn estimated_height(&self, width: f32) -> f32 {
-        self.layout
+        (self
+            .layout
             .as_ref()
             .map_or(0., |layout| layout.height(width, 20.))
-            + 12.
+            + 12.)
+            .min(MAX_ESTIMATED_HEIGHT)
     }
 
     pub fn has_remote_images(&self) -> bool {
@@ -205,7 +211,7 @@ impl Layout {
             Self::Image {
                 width: natural,
                 height,
-            } => height * (width / natural).min(1.),
+            } => (height * (width / natural).min(1.)).min(MAX_ESTIMATED_HEIGHT),
             Self::Flow {
                 children,
                 scale,
@@ -234,6 +240,43 @@ fn height_estimates_account_for_headings_image_hints_and_table_rows() {
     let height = mail.estimated_height(420.);
     assert!((260. ..300.).contains(&height), "{height}");
     assert!(mail.estimated_height(180.) < height);
+}
+
+#[cfg(test)]
+#[test]
+fn height_estimates_cap_image_hints_and_total_layout() {
+    let image = Layout::Image {
+        width: 1.,
+        height: 10_000_000.,
+    };
+    assert_eq!(image.height(440., 20.), MAX_ESTIMATED_HEIGHT);
+    for html in [
+        r#"<img width="1" height="10000000">"#.to_owned(),
+        "<p>Another line</p>".repeat(500),
+    ] {
+        assert_eq!(
+            WebMail::prepare(&html).estimated_height(440.),
+            MAX_ESTIMATED_HEIGHT
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn height_estimates_ignore_hidden_text_but_keep_visible_descendants() {
+    let hidden = "x".repeat(50_000);
+    let visible =
+        r#"<p>Story</p><span style="font-size:16px">More</span><img width="80" height="60">"#;
+    let html = format!(
+        r#"<p>Story</p><div style="display:none">{hidden}</div>
+        <div style="visibility:hidden !important">{hidden}</div>
+        <div style="max-height:0;overflow:hidden">{hidden}</div>
+        <div style="font-size:0">{hidden}<span style="font-size:16px">More</span><img width="80" height="60"></div>"#
+    );
+    assert_eq!(
+        WebMail::prepare(&html).estimated_height(440.),
+        WebMail::prepare(visible).estimated_height(440.)
+    );
 }
 
 pub fn sanitize_html(html: &str, allow_remote_images: bool) -> String {

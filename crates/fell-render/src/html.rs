@@ -2060,7 +2060,7 @@ fn is_zero_length(value: &str) -> bool {
 /// Prune once before the native walk, including text used by code blocks
 /// and the depth fallback. Zero font size hides inherited text but can
 /// leave images and explicitly sized descendants visible.
-fn prune_hidden(dom: &mut Html) {
+pub(crate) fn prune_hidden(dom: &mut Html) {
     let mut todo = vec![(*dom.root_element(), false)];
     let mut remove = Vec::new();
     while let Some((node, inherited_zero)) = todo.pop() {

@@ -1,6 +1,6 @@
 //! The only HTTP client that reads remote content for the message renderer.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 use std::io::Read;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -57,7 +57,7 @@ pub(crate) fn inline_page(
     allowed: impl Fn() -> bool,
 ) -> (String, Result<(), UnavailableImages>) {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-    inline_page_with(mail, scheme, &allowed, |url, limit| {
+    inline_page_with(mail, scheme, PAGE_BYTES, &allowed, |url, limit| {
         fetch(AGENT.get_or_init(agent), url, limit, &allowed)
     })
 }
@@ -65,13 +65,14 @@ pub(crate) fn inline_page(
 fn inline_page_with(
     mail: &fell_render::WebMail,
     scheme: &str,
+    mut remaining: usize,
     allowed: impl Fn() -> bool,
     mut fetch: impl FnMut(&str, usize) -> Result<String, Failure>,
 ) -> (String, Result<(), UnavailableImages>) {
     let deadline = Instant::now() + PAGE_TIME;
-    let mut remaining = PAGE_BYTES;
     let mut fetched: HashMap<String, Result<String, Failure>> = HashMap::new();
     let mut unavailable = None;
+    let mut limited = false;
     let mut failed = |error| {
         let failure = unavailable.get_or_insert(UnavailableImages {
             first: error,
@@ -81,19 +82,33 @@ fn inline_page_with(
         None
     };
     let html = mail.page(scheme, |url| {
+        if limited {
+            return None;
+        }
         if !allowed() || Instant::now() >= deadline || remaining == 0 {
+            limited = true;
             return failed(Failure::Limit);
         }
-        let image = fetched
-            .entry(url.to_owned())
-            .or_insert_with(|| fetch(url, remaining.min(IMAGE_BYTES)));
+        let image = match fetched.entry(url.to_owned()) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let image = entry.insert(fetch(url, remaining.min(IMAGE_BYTES)));
+                if let Err(error) = image {
+                    return failed(error.clone());
+                }
+                image
+            }
+        };
         match image {
             Ok(data) if data.len() <= remaining => {
                 remaining -= data.len();
                 Some(data.clone())
             }
-            Ok(_) => failed(Failure::Limit),
-            Err(error) => failed(error.clone()),
+            Ok(_) => {
+                limited = true;
+                failed(Failure::Limit)
+            }
+            Err(_) => None,
         }
     });
     (html, unavailable.map_or(Ok(()), Err))
@@ -237,6 +252,7 @@ mod tests {
             let (page, result) = inline_page_with(
                 &mail,
                 "light",
+                PAGE_BYTES,
                 || true,
                 |url, _| {
                     if url == urls[0] {
@@ -257,5 +273,37 @@ mod tests {
                 })
             ));
         }
+    }
+
+    #[test]
+    fn duplicate_failures_count_once_and_exhaustion_is_one_failure() {
+        let mail = fell_render::WebMail::prepare(concat!(
+            r#"<img src="https://example.test/bad"><img src="https://example.test/bad">"#,
+            r#"<img src="https://example.test/good"><img src="https://example.test/skipped">"#,
+            r#"<img src="https://example.test/good"><img src="https://example.test/also-skipped">"#,
+        ));
+        let data = "data:image/png;base64,AAAA";
+        let (page, result) = inline_page_with(
+            &mail,
+            "light",
+            data.len(),
+            || true,
+            |url, _| {
+                if url.ends_with("/bad") {
+                    Err(Failure::Response)
+                } else {
+                    assert!(url.ends_with("/good"), "{url}");
+                    Ok(data.into())
+                }
+            },
+        );
+        assert_eq!(page.matches(data).count(), 1);
+        assert!(matches!(
+            result,
+            Err(UnavailableImages {
+                first: Failure::Response,
+                count: 2
+            })
+        ));
     }
 }
