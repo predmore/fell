@@ -207,8 +207,15 @@ pub(super) fn link_controls(
         if state.handle.is_focused(window) {
             controls.focused = Some(link.range.clone());
         }
-        let mut control =
-            positioned_link(index, state, &rects, bounds, mail.palette.accent, window);
+        let scope = mail.id.as_ref().expect("interactive mail text has an ID");
+        let mut control = positioned_link(
+            (scope, index),
+            state,
+            &rects,
+            bounds,
+            mail.palette.accent,
+            window,
+        );
         control.layout_as_root(
             size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
             window,
@@ -248,7 +255,7 @@ fn link_state<'a>(
 }
 
 fn positioned_link(
-    index: usize,
+    (scope, index): (&ElementId, usize),
     state: &LinkState,
     rects: &[Bounds<Pixels>],
     bounds: Bounds<Pixels>,
@@ -262,10 +269,11 @@ fn positioned_link(
     let handle = &state.handle;
     let focused = handle.is_focused(window);
     let target = state.target.clone();
+    let id = ElementId::from((scope.clone(), format!("mail-link-{index}")));
     div()
         .relative()
         .size_0()
-        .id(ElementId::named_usize("mail-link", index))
+        .id(id.clone())
         .track_focus(handle)
         .on_key_down(move |event, window, cx| {
             if event.is_held || event.keystroke.modifiers != gpui::Modifiers::default() {
@@ -296,7 +304,7 @@ fn positioned_link(
                         .top(rect.top() - bounds.top())
                         .w(rect.size.width)
                         .h(rect.size.height)
-                        .id(ElementId::named_usize("link-fragment", at))
+                        .id(ElementId::from((id.clone(), format!("link-fragment-{at}"))))
                         .cursor(CursorStyle::PointingHand)
                         .when(focused, |hit| {
                             hit.child(fragment_outline(
@@ -405,8 +413,14 @@ impl gpui::Element for SnapshotLinks {
                         .place
                         .line
                         .set((first.top().into(), first.bottom().into()));
-                    let mut control =
-                        positioned_link(index, state, &rects, bounds, self.accent, window);
+                    let mut control = positioned_link(
+                        (&self.id, index),
+                        state,
+                        &rects,
+                        bounds,
+                        self.accent,
+                        window,
+                    );
                     control.layout_as_root(
                         size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
                         window,
@@ -508,6 +522,11 @@ fn open_command(target: &str) -> Command {
 }
 
 fn open(target: Arc<str>, window: &Window, cx: &mut App) {
+    #[cfg(test)]
+    if cx.has_global::<tests::OpenedLinks>() {
+        cx.global_mut::<tests::OpenedLinks>().0.push(target);
+        return;
+    }
     let task = cx.background_executor().spawn(async move {
         open_command(&target)
             .status()
@@ -531,47 +550,120 @@ mod tests {
     use crate::text_render::PlainText;
     use fell_render::{Block, Inline, html_to_document};
 
+    #[derive(Default)]
+    pub(super) struct OpenedLinks(pub Vec<Arc<str>>);
+
+    impl gpui::Global for OpenedLinks {}
+
     #[test]
-    fn a_snapshot_text_link_can_receive_focus_and_copy_its_destination() {
-        struct Preview;
-        impl gpui::Render for Preview {
-            fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
-                div()
-                    .relative()
-                    .w(px(240.))
-                    .h(px(80.))
-                    .child(SnapshotLinks {
-                        id: "snapshot-links".into(),
-                        links: Arc::new([crate::render::webview::WebLink {
-                            href: "https://example.test/route".into(),
-                            label: "Harbour office".into(),
-                            rects: vec![[12., 16., 130., 22.]],
-                        }]),
-                        width: 240.,
-                        height: 80.,
-                        drawn_width: 240.,
-                        accent: 0x2873ef,
-                    })
+    fn snapshot_links_keep_their_targets_across_cards_and_over_native_links() {
+        const FIRST: &str = "https://example.test/first";
+        const SECOND: &str = "https://example.test/second";
+        const NATIVE: &str = "https://example.test/native";
+
+        fn snapshot(href: &str) -> crate::render::webview::Snapshot {
+            crate::render::webview::Snapshot {
+                image: Arc::new(gpui::RenderImage::new(smallvec::smallvec![
+                    image::Frame::new(image::RgbaImage::new(3, 1),)
+                ])),
+                width: 240.,
+                height: 80.,
+                clipped: false,
+                document_height: 80.,
+                last_row_color: None,
+                links: Arc::new([crate::render::webview::WebLink {
+                    href: href.into(),
+                    label: "Harbour office".into(),
+                    rects: vec![[0., 0., 130., 22.]],
+                }]),
+                fallback_links: Arc::new([]),
             }
         }
 
-        let mut app = gpui::TestAppContext::single();
-        let preview = app.add_window(|_, _| Preview);
-        let window_handle: gpui::AnyWindowHandle = preview.into();
-        window_handle
-            .update(&mut app, |_, window, cx| {
+        struct Preview {
+            first: crate::render::webview::Snapshot,
+            second: crate::render::webview::Snapshot,
+            fade: bool,
+        }
+
+        impl gpui::Render for Preview {
+            fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+                let palette = crate::render::ThemeKind::Light.palette();
+                let card = |picture, id| {
+                    crate::render::web_snapshot(
+                        picture,
+                        240.,
+                        palette.surface,
+                        palette.dimmed,
+                        Some((id, palette.accent)),
+                    )
+                };
+                div()
+                    .flex()
+                    .flex_col()
+                    .w(px(240.))
+                    .child(
+                        div()
+                            .h(px(80.))
+                            .flex_shrink_0()
+                            .child(card(&self.first, "first")),
+                    )
+                    .child(
+                        div()
+                            .relative()
+                            .when(self.fade, |card| {
+                                card.child(
+                                    div().id("native-body-second").absolute().inset_0().child(
+                                        crate::render::plain_text(
+                                            &PlainText::from(NATIVE),
+                                            palette,
+                                            0,
+                                            true,
+                                        ),
+                                    ),
+                                )
+                            })
+                            .child(card(&self.second, "second")),
+                    )
+            }
+        }
+
+        for fade in [false, true] {
+            let mut app = gpui::TestAppContext::single();
+            let preview = app.add_window(|_, cx| {
+                cx.set_global(OpenedLinks::default());
+                Preview {
+                    first: snapshot(FIRST),
+                    second: snapshot(SECOND),
+                    fade,
+                }
+            });
+            let mut window = gpui::VisualTestContext::from_window(preview.into(), &app);
+            window.update(|window, cx| {
                 window.draw(cx).clear();
                 window.focus_next();
-                assert!(window.focused(cx).is_some());
-            })
-            .unwrap();
-        app.simulate_keystrokes(preview.into(), "y");
-        assert_eq!(
-            app.read_from_clipboard()
-                .and_then(|item| item.text())
-                .as_deref(),
-            Some("https://example.test/route"),
-        );
+            });
+            window.simulate_keystrokes("enter");
+            let point = point(px(12.), px(88.));
+            window.simulate_mouse_move(point, None, gpui::Modifiers::default());
+            window.simulate_click(point, gpui::Modifiers::default());
+            window.simulate_keystrokes("enter y");
+            assert_eq!(
+                app.read_from_clipboard()
+                    .and_then(|item| item.text())
+                    .as_deref(),
+                Some(SECOND),
+            );
+            window.update(|_, cx| {
+                let opened: Vec<_> = cx
+                    .global::<OpenedLinks>()
+                    .0
+                    .iter()
+                    .map(AsRef::as_ref)
+                    .collect();
+                assert_eq!(opened, [FIRST, SECOND, SECOND], "fade: {fade}");
+            });
+        }
     }
 
     #[test]

@@ -55,6 +55,7 @@ pub(crate) struct WebRequest {
     pub html: String,
     pub width: i32,
     pub background: Option<u32>,
+    pub fit_wide: bool,
 }
 
 impl WebRequest {
@@ -114,15 +115,17 @@ struct Load {
     cancel: gtk::gio::Cancellable,
     settling: bool,
     background: Option<u32>,
+    fit_wide: bool,
 }
 
 impl Load {
-    fn new(reply: Reply, background: Option<u32>) -> Self {
+    fn new(reply: Reply, background: Option<u32>, fit_wide: bool) -> Self {
         Self {
             reply,
             cancel: gtk::gio::Cancellable::new(),
             settling: false,
             background,
+            fit_wide,
         }
     }
 }
@@ -230,6 +233,7 @@ fn run(rx: glib::Receiver<()>, queue: Arc<JobQueue>) -> Result<(), Box<dyn std::
             html,
             width,
             background,
+            fit_wide,
         } = job.request;
         widget.set_size_request(width, 1);
         window.resize(width, UNLAID_HEIGHT);
@@ -242,7 +246,7 @@ fn run(rx: glib::Receiver<()>, queue: Arc<JobQueue>) -> Result<(), Box<dyn std::
         styles.add_style_sheet(&UserStyleSheet::new(
             &format!(
                 ":root {{ {root}; }}
-                 img {{ min-height: 0 !important; max-height: {image_limit}px !important; }}
+                 img, span[data-fell-image-tile] {{ min-height: 0 !important; max-height: {image_limit}px !important; }}
                  body[data-fell-collapsed] [data-fell-folded] {{ display: none !important; }}
                  html::-webkit-scrollbar {{ display: none; }}"
             ),
@@ -258,7 +262,7 @@ fn run(rx: glib::Receiver<()>, queue: Arc<JobQueue>) -> Result<(), Box<dyn std::
             channel(0),
             f64::from(u8::from(background.is_some())),
         ));
-        let load = Load::new(job.reply, background);
+        let load = Load::new(job.reply, background, fit_wide);
         let cancellable = load.cancel.clone();
         *active.borrow_mut() = Some(load);
         widget.load_html(&html, None);
@@ -300,7 +304,11 @@ impl TestWorker {
     pub(crate) fn start_next(&self) {
         let job = self.queue.next().expect("queued snapshot");
         stop_load(&self.active, Err(RenderError::Superseded));
-        *self.active.borrow_mut() = Some(Load::new(job.reply, job.request.background));
+        *self.active.borrow_mut() = Some(Load::new(
+            job.reply,
+            job.request.background,
+            job.request.fit_wide,
+        ));
     }
 
     pub(crate) fn finish(&self, snapshot: Snapshot) {
@@ -365,6 +373,22 @@ fn wait_for_images(
                 const ratio = getComputedStyle(image).aspectRatio;
                 if (ratio.startsWith('auto ')) image.style.aspectRatio = ratio.slice(5);
             }
+            // HTML width and height attributes are presentation hints on
+            // images. Give their offline tiles the same dimensions.
+            const dimension = (element, attr) =>
+                /^\s*(\d+(?:\.\d+)?)\s*(%|px)?\s*$/i.exec(element.getAttribute(attr) || '');
+            for (const tile of document.querySelectorAll('span[data-fell-image-tile]')) {
+                const width = dimension(tile, 'width');
+                const height = dimension(tile, 'height');
+                if (width) tile.style.setProperty('--fell-tile-width', width[1] + (width[2] || 'px'));
+                if (height && !width) {
+                    tile.style.setProperty('--fell-tile-height', height[1] + (height[2] || 'px'));
+                }
+                if (width && height && width[2] !== '%' && height[2] !== '%' &&
+                    Number(width[1]) > 0 && Number(height[1]) > 0) {
+                    tile.style.setProperty('--fell-tile-ratio', width[1] + ' / ' + height[1]);
+                }
+            }
             if (images.length > 0) {
                 const canvas = document.createElement('canvas');
                 canvas.width = canvas.height = 1;
@@ -412,8 +436,10 @@ fn wait_for_images(
                     const href = anchor.getAttribute('href');
                     if (!href || href.length > 4096) continue;
                     const text = anchor.innerText?.trim();
-                    const images = anchor.querySelectorAll('img');
-                    const label = text || Array.from(images).find(image => image.alt.trim())?.alt.trim()
+                    const images = anchor.querySelectorAll('img, span[data-fell-image-tile]');
+                    const imageLabel = Array.from(images)
+                        .map(image => (image.alt ?? image.getAttribute('aria-label') ?? '').trim()).find(Boolean);
+                    const label = text || imageLabel
                         || anchor.textContent.trim() || 'Open link';
                     const rects = [];
                     const append = candidate => {
@@ -461,14 +487,17 @@ fn wait_for_images(
         )
     });
     let view = widget.clone();
-    let colorless = active
-        .borrow()
-        .as_ref()
-        .is_some_and(|load| load.background.is_none());
+    let (colorless, fit_wide) = active.borrow().as_ref().map_or((false, false), |load| {
+        (load.background.is_none(), load.fit_wide)
+    });
     let collect_links = colorless && capture_height.is_some();
     let height = capture_height.unwrap_or(UNLAID_HEIGHT);
     let width = view.width_request();
-    let readable = fell_render::web_snapshot_readable_width(width as f32);
+    let readable = if fit_wide {
+        fell_render::WEB_SNAPSHOT_WIDTH_LIMIT as f32
+    } else {
+        fell_render::web_snapshot_readable_width(width as f32)
+    };
     let ready = format!("{ready}({width}, {height}, {collect_links}, {readable})");
     widget.run_javascript_in_world(
         &ready,
@@ -877,6 +906,7 @@ mod tests {
             html: mail.page("light", |_| None),
             width,
             background: Some(0xffffff),
+            fit_wide: false,
         }))
         .unwrap()
         .unwrap_or_else(|| panic!("WebKit painted {label}"));
@@ -895,6 +925,7 @@ mod tests {
                 html: html.into(),
                 width: 440,
                 background: Some(0xffffff),
+                fit_wide: false,
             })
         });
         for reply in [first, second] {
@@ -1069,6 +1100,7 @@ mod tests {
             html,
             width: 440,
             background: Some(0xffffff),
+            fit_wide: false,
         }))
         .unwrap()
         .expect("WebKit drew the hostile document");
@@ -1100,6 +1132,7 @@ mod tests {
                         html: too_wide.page("light", |_| None),
                         width: 440,
                         background: Some(0xffffff),
+                        fit_wide: false,
                     })),
                     Err(RenderError::TooWide)
                 ),
@@ -1129,6 +1162,7 @@ mod tests {
                     html: mail.page("light", |_| None),
                     width,
                     background: Some(0xffffff),
+                    fit_wide: false,
                 }));
                 if accepted {
                     assert!(
@@ -1140,9 +1174,31 @@ mod tests {
                         matches!(result, Err(RenderError::TooWide)),
                         "{newsletter}px in a {width}px card"
                     );
+                    let fitted = futures::executor::block_on(render(WebRequest {
+                        html: mail.page("light", |_| None),
+                        width,
+                        background: Some(0xffffff),
+                        fit_wide: true,
+                    }))
+                    .unwrap()
+                    .expect("explicit fit paints below the readability floor");
+                    assert!(width as f32 / fitted.width < 0.6);
                 }
             }
         }
+
+        let beyond_raster_limit = fell_render::WebMail::prepare(
+            "<div style='width:calc(9000px + 1%)'>Too wide to rasterize</div>",
+        );
+        assert!(matches!(
+            futures::executor::block_on(render(WebRequest {
+                html: beyond_raster_limit.page("light", |_| None),
+                width: 432,
+                background: None,
+                fit_wide: true,
+            })),
+            Err(RenderError::TooWide)
+        ));
 
         let blocked = fell_render::WebMail::prepare(
             r#"<style>@media (width:360px) { p { background:#7a163f; } }</style><p>Preview</p>
@@ -1312,6 +1368,7 @@ mod tests {
                         },
                         width,
                         background: Some(background),
+                        fit_wide: false,
                     }))
                     .unwrap()
                     .unwrap_or_else(|| panic!("WebKit painted {label}"));
@@ -1360,12 +1417,14 @@ mod tests {
                         size: 15.,
                         foreground: 0xa9b1d6,
                         link: 0x7aa2f7,
+                        border: 0x414868,
                         inset: true,
                     }),
                     |_| None,
                 ),
                 width: 440,
                 background: mail.has_author_colors().then_some(background),
+                fit_wide: false,
             }))
             .unwrap()
             .expect("WebKit painted mail in dark mode");
@@ -1412,6 +1471,7 @@ mod tests {
                 .all(|row| row[..14].iter().all(|pixel| *pixel == surface))
         );
 
+        check_colorless_rules();
         check_colorless_links();
         check_link_probe_budget();
         check_gmail_reply();
@@ -1469,6 +1529,7 @@ mod tests {
             html: "<!doctype html><style>body { height: 240px; }</style>".into(),
             width: 360,
             background: Some(0xffffff),
+            fit_wide: false,
         }));
         assert!(
             blank.unwrap().is_none(),
@@ -1481,9 +1542,29 @@ mod tests {
             html,
             width,
             background: None,
+            fit_wide: false,
         }))
         .unwrap()
         .expect("the colourless page produced a snapshot")
+    }
+
+    fn check_colorless_rules() {
+        let mail =
+            fell_render::WebMail::prepare("<div>Harbour schedule</div><hr><div>Saturday</div>");
+        for (scheme, border) in [("dark", 0x414868_u32), ("light", 0xbcc0cc_u32)] {
+            let style = fell_render::WebTextStyle {
+                family: None,
+                size: 15.,
+                foreground: 0xa9b1d6,
+                link: 0x7aa2f7,
+                border,
+                inset: false,
+            };
+            let picture =
+                colorless_snapshot(mail.page_with_style(scheme, Some(&style), |_| None), 432);
+            let [_, r, g, b] = border.to_be_bytes();
+            assert!(contains_display_color(&picture, [r, g, b]), "{scheme}");
+        }
     }
 
     fn check_colorless_links() {
@@ -1510,6 +1591,7 @@ mod tests {
             size: 15.,
             foreground: 0x4c4f69,
             link: 0x335500,
+            border: 0x414868,
             inset: true,
         };
         let picture =
@@ -1527,6 +1609,7 @@ mod tests {
             panic!("image rectangle")
         };
         assert_eq!((*w, *h), (80., 40.));
+        assert_eq!(picture.links[1].label, "Map");
         assert_eq!(
             fell_render::StyledDocument::blocks_text(&picture.fallback_links),
             "Open\nTransparent ancestor\nTransparent label\nNo ink\nNo fill\nShadow only\nHidden link\nCovered link"
@@ -1644,6 +1727,7 @@ mod tests {
                     size: 15.,
                     foreground: fg,
                     link: accent,
+                    border: 0x414868,
                     inset: false,
                 };
                 let closed = colorless_snapshot(
@@ -1679,6 +1763,7 @@ mod tests {
             size: 15.,
             foreground: 0x4c4f69,
             link: 0x1758ad,
+            border: 0x414868,
             inset: false,
         };
         let closed = colorless_snapshot(

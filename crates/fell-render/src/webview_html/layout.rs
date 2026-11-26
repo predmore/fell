@@ -2357,6 +2357,7 @@ fn gmail_reply_estimates_the_simple_reader_height_before_the_fold() {
         size: BODY_FONT_SIZE,
         foreground: 0x4c4f69,
         link: 0x1758ad,
+        border: 0x414868,
         inset: false,
     };
     let [reply, fold] = folded.sections.as_slice() else {

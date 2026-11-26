@@ -43,6 +43,7 @@ pub(super) struct Reader {
     allowed_once: HashMap<String, (Option<String>, Weak<WebMail>)>,
     show_images_for: HashMap<String, (Option<String>, Weak<WebMail>)>,
     show_native_for: HashSet<String>,
+    fit_wide_for: HashMap<String, Weak<WebMail>>,
     continue_at: HashMap<String, f32>,
     pending: Option<Pending>,
     cache: VecDeque<Cached>,
@@ -63,6 +64,7 @@ struct MeasuredHeight {
     mail: Weak<WebMail>,
     width: i32,
     images: bool,
+    fit_wide: bool,
     text: Option<WebTextStyle>,
     height: f32,
 }
@@ -72,6 +74,7 @@ impl MeasuredHeight {
         self.id == key.id
             && self.width == key.width
             && self.images == key.images
+            && self.fit_wide == key.fit_wide
             && self.text == key.text
             && Weak::ptr_eq(&self.mail, &Arc::downgrade(&key.mail))
     }
@@ -87,6 +90,7 @@ struct Key {
     background: Option<u32>,
     text: Option<WebTextStyle>,
     images: bool,
+    fit_wide: bool,
     folds_open: bool,
 }
 
@@ -110,6 +114,7 @@ impl Key {
             && self.scheme == other.scheme
             && self.background == other.background
             && self.text == other.text
+            && self.fit_wide == other.fit_wide
             && (self.folds_open == other.folds_open || self.mail.mapped_history())
     }
 
@@ -482,6 +487,9 @@ enum Prompt {
     Native {
         always: bool,
     },
+    RasterTooWide {
+        always: bool,
+    },
     Unavailable {
         verified: bool,
         always: bool,
@@ -614,9 +622,11 @@ impl Reader {
                     &[theme.background, theme.surface],
                     crate::theme::LINK_TEXT_CONTRAST,
                 ),
+                border: theme.border,
                 inset: body.suggested == RenderMode::Web,
             }),
             images,
+            fit_wide: self.fitting_wide(&message.id, body),
             folds_open: background.is_none() && folds_open && body.folded.has_folds(),
         }
     }
@@ -630,18 +640,26 @@ impl Reader {
 
     fn prefers_web(&self, id: &str, sender: Option<&str>, body: &HtmlBody) -> bool {
         !self.show_native_for.contains(id)
-            && (self
-                .show_images_for
-                .get(id)
-                .is_some_and(|(_, mail)| Weak::ptr_eq(mail, &Arc::downgrade(&body.web)))
+            && (self.fitting_wide(id, body)
+                || self
+                    .show_images_for
+                    .get(id)
+                    .is_some_and(|(_, mail)| Weak::ptr_eq(mail, &Arc::downgrade(&body.web)))
                 || self
                     .known_sender(sender)
                     .0
                     .unwrap_or(body.suggested == RenderMode::Web))
     }
 
+    fn fitting_wide(&self, id: &str, body: &HtmlBody) -> bool {
+        self.fit_wide_for
+            .get(id)
+            .is_some_and(|mail| Weak::ptr_eq(mail, &Arc::downgrade(&body.web)))
+    }
+
     pub(super) fn close_thread(&mut self) {
         self.show_native_for.clear();
+        self.fit_wide_for.clear();
         self.continue_at.clear();
     }
 
@@ -708,14 +726,16 @@ impl Reader {
     }
 
     fn too_wide(&self, key: &Key) -> bool {
-        self.entry(key).map_or_else(
-            || {
-                key.mail
-                    .estimated_height_with_style(key.width as f32, key.text.as_ref())
-                    .is_none()
-            },
-            |entry| entry.too_wide,
-        )
+        self.entry(key)
+            .or_else(|| self.cache.iter().find(|cached| cached.key.same_raster(key)))
+            .map_or_else(
+                || {
+                    key.mail
+                        .estimated_height_with_style(key.width as f32, key.text.as_ref())
+                        .is_none()
+                },
+                |entry| entry.too_wide,
+            )
     }
 
     fn image(&self, key: &Key) -> Option<(Snapshot, Key)> {
@@ -826,6 +846,7 @@ impl Reader {
         let task = cx.spawn(async move |this, cx| {
             let width = fetch.width;
             let background = fetch.background;
+            let fit_wide = fetch.fit_wide;
             let (html, image_failure) = cx
                 .background_spawn(async move {
                     if fetch.images {
@@ -850,6 +871,7 @@ impl Reader {
                 html,
                 width,
                 background,
+                fit_wide,
             })
             .await;
             let _ = this.update(cx, |inbox, cx| {
@@ -1035,6 +1057,7 @@ impl Reader {
                         mail: Arc::downgrade(&key.mail),
                         width: key.width,
                         images: key.images,
+                        fit_wide: key.fit_wide,
                         text: key.text.clone(),
                         height,
                     });
@@ -1085,14 +1108,20 @@ impl Reader {
             } else {
                 None
             };
-            too_wide |= web && entry.is_none() && image.is_none() && placeholder_height.is_none();
+            too_wide |= web
+                && !key.fit_wide
+                && entry.is_none()
+                && image.is_none()
+                && placeholder_height.is_none();
             // A predicted width fallback lays out the actual native body at
             // the pane width while the worker confirms the document width.
             let wait = placeholder_height.is_some() && !large;
             let stored = placeholder_height.is_some() && large;
             let verified = self.verified(body, key.sender.as_deref());
             let always = verified && self.known_sender(key.sender.as_deref()).1;
-            let prompt = if too_wide {
+            let prompt = if too_wide && key.fit_wide {
+                Some(Prompt::RasterTooWide { always })
+            } else if too_wide {
                 self.image_prompt(&key, false, verified, always)
             } else if retrying {
                 Some(Prompt::Retrying)
@@ -1305,6 +1334,13 @@ impl Inbox {
             return;
         }
         if action == Action::ToggleWebView {
+            if self.web_mail.fitting_wide(id, body) {
+                self.web_mail.fit_wide_for.remove(id);
+                self.web_mail.show_images_for.remove(id);
+                self.web_mail.show_native_for.insert(id.to_owned());
+                cx.notify();
+                return;
+            }
             if self.web_mail.continue_in_native(
                 id,
                 self.conv_scroll.bounds(),
@@ -1322,13 +1358,10 @@ impl Inbox {
                         .key(message, body, &self.theme, width, self.session.is_open(id));
                 self.web_mail.too_wide(&key)
             }) {
-                self.session
-                    .show_toast("Too wide for web view at this width", false);
-                self.dismiss_notice_after(
-                    self.session.toast_generation(),
-                    Duration::from_secs(2),
-                    cx,
-                );
+                self.web_mail.clear_native_override(id);
+                self.web_mail
+                    .fit_wide_for
+                    .insert(id.to_owned(), Arc::downgrade(&body.web));
                 cx.notify();
                 return;
             }
@@ -1487,6 +1520,11 @@ fn prompt_layer(
         Prompt::Native { always } => (
             "Images show in web view".into(),
             Some(("Web view", Action::ToggleWebView)),
+            always.then_some(("Revoke", Action::BlockSenderImages)),
+        ),
+        Prompt::RasterTooWide { always } => (
+            "Page too wide to render · showing simple view".into(),
+            None,
             always.then_some(("Revoke", Action::BlockSenderImages)),
         ),
         Prompt::Unavailable {
@@ -1747,6 +1785,7 @@ mod tests {
             text: None,
             folds_open: false,
             images: false,
+            fit_wide: false,
         };
         let second_key = Key {
             id: "second-account".into(),
@@ -2018,70 +2057,113 @@ mod tests {
     }
 
     #[test]
-    fn a_too_wide_body_keeps_its_image_prompt_and_sender_preference() {
+    fn explicitly_fitting_a_wide_message_is_temporary_and_honors_the_raster_limit() {
         super::super::tests::with_pending_inbox(|inbox, cx| {
             split_view(inbox);
-            let message = &inbox.session.messages[0];
+            let message = &mut inbox.session.messages[0];
+            message.rich = Rich::Html(Arc::new(crate::mail_body::prepare_html(
+                concat!(
+                    "<table role='presentation' width='1200'><tr><td><div style='display:flex'>",
+                    "Harbor news<img src='https://example.test/harbor'>",
+                    "</div></td></tr></table>",
+                ),
+                &[("Precedence".into(), "bulk".into())],
+            )));
             let Rich::Html(body) = &message.rich else {
                 panic!("HTML fixture")
             };
-            let mut reader = Reader::default();
-            reader
-                .preferences
-                .insert(message.email.clone(), (Some(true), false));
-            let key = reader.key(message, body, &inbox.theme, 460, false);
-            let now = Instant::now();
-            let old = Shown::new(Arc::downgrade(&key.mail), None, true, false, None);
-            old.height.set(Some(115.));
-            reader.shown.insert(message.id.clone(), old);
-            reader.cache.push_back(Cached {
-                key: key.clone(),
-                picture: None,
-                too_wide: true,
-                image_failure: None,
-            });
+            let body = body.clone();
+            assert_eq!(body.suggested, RenderMode::Web);
             let id = message.id.clone();
             let address = message.email.clone();
-            inbox.web_mail = reader;
-            let mut columns = super::super::ReaderColumns::split(518.);
-            columns.header.width = 460.;
+            let width = 432;
+            let mut columns = super::super::ReaderColumns::split(490.);
+            columns.header.width = width as f32;
             inbox.painted_reader = Some(super::super::ReaderLayout {
                 columns,
                 left: 0.,
                 focus: 1.,
                 message_cursor: 0,
             });
-            for preference in [true, false] {
+            let frame = |inbox: &mut Inbox, cx: &mut Context<Inbox>| {
+                let now = Instant::now();
                 inbox
                     .web_mail
-                    .preferences
-                    .insert(address.clone(), (Some(preference), false));
-                for press in [false, true] {
-                    if press {
-                        inbox.html_reading_action(&id, Action::ToggleWebView, cx);
-                        let toast = inbox.session.toast.as_ref().unwrap();
-                        assert_eq!(toast.text, "Too wide for web view at this width");
-                        assert!(toast.hint.is_none());
-                    }
-                    let frames = inbox.web_mail.frames(
+                    .frames(
                         &inbox.session.messages,
                         (Some(0), &[true, true], &HashSet::new()),
                         &inbox.theme,
-                        460.,
+                        width as f32,
                         (Motion::new(false), now, now),
                         cx,
-                    );
-                    let frame = &frames[&id];
-                    assert!(matches!(frame.body, Body::Native));
-                    let prompt = frame.prompt.as_ref().unwrap();
-                    assert!(matches!(prompt.incoming, Some(Prompt::Blocked { .. })));
-                    assert_eq!(prompt.height, 1.);
-                    assert_eq!(
-                        inbox.web_mail.known_sender(Some(&address)).0,
-                        Some(preference)
-                    );
-                }
-            }
+                    )
+                    .remove(&id)
+                    .unwrap()
+            };
+            assert!(matches!(frame(inbox, cx).body, Body::Native));
+            inbox.html_reading_action(&id, Action::AllowMessageImages, cx);
+            let consent = frame(inbox, cx);
+            assert!(matches!(consent.body, Body::Native));
+            assert!(matches!(
+                consent.prompt.unwrap().incoming,
+                Some(Prompt::Native { .. })
+            ));
+
+            inbox.html_reading_action(&id, Action::ToggleWebView, cx);
+            assert!(inbox.web_mail.fitting_wide(&id, &body));
+            assert!(matches!(frame(inbox, cx).body, Body::Native));
+            let key = inbox.web_mail.key(
+                &inbox.session.messages[0],
+                &body,
+                &inbox.theme,
+                width,
+                false,
+            );
+            assert!(key.fit_wide && key.images);
+            assert!(
+                inbox
+                    .web_mail
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.key == key)
+            );
+            let picture = snapshot();
+            inbox.web_mail.cache.push_back(Cached {
+                key: key.clone(),
+                picture: Some(picture.clone()),
+                too_wide: false,
+                image_failure: None,
+            });
+            assert!(
+                matches!(frame(inbox, cx).body, Body::Web(shown) if shown.image.id == picture.image.id)
+            );
+            inbox.html_reading_action(&id, Action::ToggleWebView, cx);
+            assert!(matches!(frame(inbox, cx).body, Body::Native));
+            assert!(!inbox.web_mail.fitting_wide(&id, &body));
+            assert_eq!(inbox.web_mail.known_sender(Some(&address)).0, None);
+
+            inbox.html_reading_action(&id, Action::ToggleWebView, cx);
+            inbox.web_mail.cache.pop_back();
+            assert!(matches!(frame(inbox, cx).body, Body::Native));
+            // Install the worker's width refusal for a fitted request. The
+            // WebKit corpus checks that fit_wide still refuses widths over 8192.
+            inbox.web_mail.cache.push_back(Cached {
+                key,
+                picture: None,
+                too_wide: true,
+                image_failure: None,
+            });
+            let refused = frame(inbox, cx);
+            assert!(matches!(refused.body, Body::Native));
+            assert!(matches!(
+                refused.prompt.unwrap().incoming,
+                Some(Prompt::RasterTooWide { .. })
+            ));
+
+            inbox.web_mail.close_thread();
+            assert!(!inbox.web_mail.fitting_wide(&id, &body));
+            assert_eq!(inbox.web_mail.known_sender(Some(&address)).0, None);
+            assert!(matches!(frame(inbox, cx).body, Body::Native));
         });
     }
 
@@ -2097,6 +2179,7 @@ mod tests {
             text: None,
             folds_open: false,
             images: false,
+            fit_wide: false,
         };
         let allowed = Key {
             images: true,
@@ -2136,6 +2219,7 @@ mod tests {
             text: None,
             folds_open: false,
             images: false,
+            fit_wide: false,
         };
         let mut reader = Reader::default();
         reader.cache.push_back(Cached {
@@ -2206,6 +2290,7 @@ mod tests {
             text: None,
             folds_open: false,
             images: false,
+            fit_wide: false,
         };
         let mut reader = Reader::default();
         let held = snapshot();

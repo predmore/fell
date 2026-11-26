@@ -105,6 +105,7 @@ impl Reader {
             size: 15.,
             foreground: palette.foreground,
             link: palette.accent,
+            border: palette.border,
             inset: true,
         };
         let allowed = self.model.remote_images_allowed();
@@ -143,6 +144,7 @@ impl Reader {
                 html,
                 width,
                 background,
+                fit_wide: false,
             })
             .await;
             let _ = this.update(cx, |reader, cx| {
@@ -512,7 +514,7 @@ pub(crate) fn web_snapshot(
         });
     let image = if let Some((id, accent)) = links.filter(|_| !snapshot.links.is_empty()) {
         image.child(native::SnapshotLinks {
-            id: gpui::ElementId::Name(format!("web-links-{id}").into()),
+            id: gpui::ElementId::from((gpui::ElementId::from("snapshot-links"), id.to_owned())),
             links: snapshot.links.clone(),
             width: snapshot.width,
             height,

@@ -11134,7 +11134,11 @@ fn message_body(
     } else {
         match present::missing_body_line(message.body_state, frame.syncing) {
             Some(line) => missing_message_body(theme, folds.columns, &line, alpha),
-            None => stored_message_body(theme, message, folds, frame, alpha, &markers, cx),
+            None => native_link_scope(&message.id)
+                .child(stored_message_body(
+                    theme, message, folds, frame, alpha, &markers, cx,
+                ))
+                .into_any_element(),
         }
     };
     let old = if let Some(line) = outgoing {
@@ -11252,16 +11256,18 @@ fn web_message_body(
             false,
             false,
         ),
-        Body::StoredText => plain_message_body(
-            theme,
-            &message.body,
-            FoldView { live, ..folds },
-            reveal,
-            markers,
-            cx,
-        ),
+        Body::StoredText => native_link_scope(&message.id)
+            .child(plain_message_body(
+                theme,
+                &message.body,
+                FoldView { live, ..folds },
+                reveal,
+                markers,
+                cx,
+            ))
+            .into_any_element(),
         Body::Native => {
-            let native = div()
+            let native = native_link_scope(&message.id)
                 // The card already paints this fill. A second copy would
                 // dim the outgoing text under a partially opaque layer.
                 .when(!colorless, |native| native.bg(rgb(folds.fill)))
@@ -11320,6 +11326,10 @@ fn web_message_body(
                 true,
             );
             div()
+                .id(ElementId::from((
+                    ElementId::from("snapshot-body"),
+                    message.id.clone(),
+                )))
                 .child(card)
                 .when(colorless && body.web.mapped_history(), |card| {
                     card.children(html_sections(
@@ -11346,6 +11356,13 @@ fn web_message_body(
     } else {
         incoming
     }
+}
+
+fn native_link_scope(message_id: &str) -> gpui::Stateful<gpui::Div> {
+    div().id(ElementId::from((
+        ElementId::from("native-body"),
+        message_id.to_owned(),
+    )))
 }
 
 fn web_placeholder(

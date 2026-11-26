@@ -30,6 +30,7 @@ pub struct WebTextStyle {
     pub size: f32,
     pub foreground: u32,
     pub link: u32,
+    pub border: u32,
     /// Whether a body without its own spacing should have a paper inset.
     pub inset: bool,
 }
@@ -46,17 +47,35 @@ fn web_page(content: &str, scheme: &str, body_css: &str, link_css: &str) -> Stri
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data: cid:; font-src data:; media-src 'none'; frame-src 'none'; script-src 'none'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none';">
 <style>
   html, body {{ margin: 0; padding: 0; }}
-  img {{ max-width: 100%; }}
+  img, span[data-fell-image-tile] {{ max-width: 100%; }}
   body {{ overflow-wrap: anywhere; {body_css} }}
   {link_css}
-  img[src=""] {{
+  span[data-fell-image-tile], img[src=""] {{
     background-color: rgba(128, 128, 128, 0.12);
     box-sizing: border-box;
-    padding: 4px;
     border: 0 !important;
+    border-radius: 4px;
     outline: 0 !important;
     color: color-mix(in srgb, currentColor 65%, gray) !important;
   }}
+  span[data-fell-image-tile] {{
+    display: inline-block;
+    position: relative;
+    vertical-align: baseline;
+    text-decoration: none;
+    overflow: hidden;
+    width: min(100%, var(--fell-tile-width, 120px));
+    height: var(--fell-tile-height, auto);
+    aspect-ratio: var(--fell-tile-ratio, 3 / 2);
+  }}
+  span[data-fell-image-tile]:not([width])[height] {{ width: auto; }}
+  span[data-fell-image-tile]::before {{
+    position: absolute;
+    inset: 0;
+    padding: 4px 6px;
+    content: attr(aria-label);
+  }}
+  img[src=""] {{ padding: 4px; }}
   img[src=""]:not([width][height]) {{ aspect-ratio: 3 / 2; }}
   img[src=""]:not([width], [height]) {{ width: 120px; }}
   img {{ height: auto; object-fit: contain; }}
@@ -82,12 +101,20 @@ pub struct WebMail {
 #[derive(Debug)]
 enum Slot {
     Image(String),
-    HideFold,
+    ImageTag { url: Option<String>, label: String },
+    ImageEnd,
+    HideFold { end: usize },
+}
+
+#[derive(Default)]
+struct PageImages {
+    resources: Vec<(usize, Slot)>,
+    tags: Vec<(usize, Slot)>,
 }
 
 struct HistoryStyles<'a> {
     nodes: &'a HashSet<ego_tree::NodeId>,
-    offsets: Vec<usize>,
+    styles: Vec<Range<usize>>,
 }
 
 impl WebMail {
@@ -134,10 +161,10 @@ impl WebMail {
             .and_then(|doc| history_nodes(&dom, doc));
         let mut history = nodes.as_ref().map(|nodes| HistoryStyles {
             nodes,
-            offsets: Vec::new(),
+            styles: Vec::new(),
         });
         let mut content = String::new();
-        let mut images = Vec::new();
+        let mut images = PageImages::default();
         // Keep the body's presentation attributes while replacing its wrapper.
         let mut author_background = false;
         if let Some(element) = dom
@@ -155,7 +182,7 @@ impl WebMail {
             if let Some(value) = element.attr("background") {
                 if let Some(url) = remote_image_url(value) {
                     content.push_str(" background=\"");
-                    images.push((content.len(), url));
+                    images.resources.push((content.len(), Slot::Image(url)));
                     content.push('"');
                 } else if keep_offline_attr(element.value(), "background", value) {
                     write!(content, " background=\"{}\"", escape_attr(value)).unwrap();
@@ -170,7 +197,7 @@ impl WebMail {
                         &rule.value,
                         Some(&rule.name),
                         &mut content,
-                        Some(&mut images),
+                        Some(&mut images.resources),
                         escape_attr,
                     );
                     if rule.important {
@@ -203,20 +230,18 @@ impl WebMail {
             });
         let layout =
             layout::Estimate::prepare(&layout_dom, metrics, author_background, history.is_some());
-        let has_remote_images = !images.is_empty();
-        let mut slots: Vec<_> = images
-            .into_iter()
-            .map(|(offset, url)| (offset, Slot::Image(url)))
-            .collect();
+        let has_remote_images = !images.resources.is_empty();
+        let mut slots = images.tags;
+        slots.extend(images.resources);
         if let Some(history) = history {
             slots.extend(
                 history
-                    .offsets
+                    .styles
                     .into_iter()
-                    .map(|offset| (offset, Slot::HideFold)),
+                    .map(|range| (range.start, Slot::HideFold { end: range.end })),
             );
-            slots.sort_unstable_by_key(|(offset, _)| *offset);
         }
+        slots.sort_unstable_by_key(|(offset, _)| *offset);
         Self {
             content,
             slots,
@@ -314,9 +339,11 @@ impl WebMail {
                 write!(
                     link_css,
                     "a:any-link {{ color: #{:06x}; }}
+                     hr {{ border: 0; border-top: 1px solid #{:06x}; }}
                      div:has(> br:only-child:where(:not([data-fell-folded]))) {{ min-height: {}px; }}
                      p:empty {{ min-height: {}px; margin: 0; }}",
                     text.link,
+                    text.border,
                     reader_paragraph_gap(text.size),
                     reader_paragraph_gap(text.size),
                 )
@@ -349,18 +376,54 @@ impl WebMail {
             );
         }
         let mut offset = 0;
+        let mut tile = false;
         for (at, slot) in &self.slots {
+            if *at < offset {
+                continue;
+            }
             content.push_str(&self.content[offset..*at]);
+            offset = *at;
             match slot {
                 Slot::Image(url) => {
                     if let Some(data) = image(url).filter(|data| data.starts_with("data:image/")) {
                         content.push_str(&escape_attr(&data));
                     }
                 }
-                Slot::HideFold if collapsed => content.push_str(";display:none !important"),
-                Slot::HideFold => {}
+                Slot::ImageTag { url, label } => {
+                    offset += "img".len();
+                    let data = url
+                        .as_deref()
+                        .and_then(&mut image)
+                        .filter(|data| data.starts_with("data:image/"));
+                    tile = data.is_none();
+                    if let Some(data) = data {
+                        write!(
+                            content,
+                            "img src=\"{}\" alt=\"{}\"",
+                            escape_attr(&data),
+                            escape_attr(label)
+                        )
+                        .unwrap();
+                    } else {
+                        write!(
+                            content,
+                            "span data-fell-image-tile role=\"img\" aria-label=\"{}\"",
+                            escape_attr(label)
+                        )
+                        .unwrap();
+                    }
+                }
+                Slot::ImageEnd if tile => {
+                    content.push_str("</span>");
+                    tile = false;
+                }
+                Slot::ImageEnd => {}
+                Slot::HideFold { end } if collapsed => {
+                    content.push_str("display:none !important");
+                    offset = *end;
+                }
+                Slot::HideFold { .. } => {}
             }
-            offset = *at;
         }
         content.push_str(&self.content[offset..]);
         web_page(&content, self.appearance(scheme, 0).0, &body_css, &link_css)
@@ -540,7 +603,7 @@ fn serialize_children(
     allow_remote_images: bool,
     allow_style: bool,
     depth: u32,
-    mut images: Option<&mut Vec<(usize, String)>>,
+    mut images: Option<&mut PageImages>,
     mut history: Option<&mut HistoryStyles<'_>>,
 ) {
     for child in node.children() {
@@ -562,7 +625,7 @@ fn serialize_node(
     allow_remote_images: bool,
     allow_style: bool,
     depth: u32,
-    mut images: Option<&mut Vec<(usize, String)>>,
+    mut images: Option<&mut PageImages>,
     mut history: Option<&mut HistoryStyles<'_>>,
 ) {
     if depth >= crate::html::MAX_HTML_DEPTH {
@@ -583,7 +646,7 @@ fn serialize_node(
             let wrapped = wrap.is_some();
             if let Some(history) = wrap {
                 out.push_str("<span data-fell-folded style=\"");
-                history.offsets.push(out.len());
+                history.styles.push(out.len()..out.len());
                 out.push_str("\">");
             }
             out.push_str(&escape(text.deref()));
@@ -663,7 +726,7 @@ fn serialize_node(
                 }
                 out.push('>');
                 if let Some(slots) = images.as_deref_mut() {
-                    serialize_css(&css, out, Some(slots), escape_style);
+                    serialize_css(&css, out, Some(&mut slots.resources), escape_style);
                 } else {
                     serialize_css(&css, out, None, escape_style);
                 }
@@ -671,27 +734,22 @@ fn serialize_node(
                 return;
             }
             let prepared_page = images.is_some();
-            // The snapshot has no MIME part provider. Keep the image's layout
-            // and link target while showing the same label as the simple view.
-            let missing_cid = prepared_page
-                && name == "img"
-                && element
-                    .attr("src")
-                    .and_then(|src| src.trim().split_once(':'))
-                    .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("cid"));
             out.push('<');
+            let image_tag = images
+                .as_mut()
+                .is_some_and(|slots| name == "img" && prepare_image_tag(element, out.len(), slots));
             out.push_str(name);
             if folded {
                 out.push_str(" data-fell-folded");
             }
-            if missing_cid {
-                out.push_str(" src=\"\" alt=\"Inline image\"");
-            }
             let mut wrote_style = false;
             for (name_attr, value) in &element.attrs {
                 let attr = name_attr.local.as_ref();
-                if matches!(attr, "data-fell-folded" | "data-fell-collapsed")
-                    || (missing_cid && matches!(attr, "src" | "srcset" | "alt"))
+                if matches!(
+                    attr,
+                    "data-fell-folded" | "data-fell-collapsed" | "data-fell-image-tile"
+                ) || (image_tag
+                    && matches!(attr, "src" | "srcset" | "alt" | "role" | "aria-label"))
                 {
                     continue;
                 }
@@ -699,30 +757,31 @@ fn serialize_node(
                 // may enter the fetch list.
                 if let Some(slots) = images.as_deref_mut() {
                     if name_attr.prefix.is_none()
-                        && (attr == "src" && name.eq_ignore_ascii_case("img")
-                            || attr == "background" && matches!(name, "table" | "tr" | "td" | "th"))
+                        && attr == "background"
+                        && matches!(name, "table" | "tr" | "td" | "th")
                         && let Some(url) = remote_image_url(value)
                     {
-                        if slots.len() < 48 {
+                        if slots.resources.len() < 48 {
                             out.push(' ');
                             out.push_str(attr);
                             out.push_str("=\"");
-                            slots.push((out.len(), url));
+                            slots.resources.push((out.len(), Slot::Image(url)));
                             out.push('"');
                         }
                         continue;
                     }
                     if attr == "style" {
                         let start = out.len();
-                        let first_slot = slots.len();
+                        let first_slot = slots.resources.len();
                         out.push_str(" style=\"");
-                        serialize_css(value, out, Some(slots), escape_attr);
+                        let style_start = out.len();
+                        serialize_css(value, out, Some(&mut slots.resources), escape_attr);
                         if contains_external_url(value) && contains_external_url(&out[start..]) {
                             out.truncate(start);
-                            slots.truncate(first_slot);
+                            slots.resources.truncate(first_slot);
                         } else {
                             if let Some(history) = history.as_mut().filter(|_| folded) {
-                                history.offsets.push(out.len());
+                                history.styles.push(style_start..out.len());
                             }
                             out.push('"');
                             wrote_style = true;
@@ -757,10 +816,13 @@ fn serialize_node(
             }
             if !wrote_style && let Some(history) = history.as_mut().filter(|_| folded) {
                 out.push_str(" style=\"");
-                history.offsets.push(out.len());
+                history.styles.push(out.len()..out.len());
                 out.push('"');
             }
             out.push('>');
+            if image_tag && let Some(slots) = images.as_mut() {
+                slots.tags.push((out.len(), Slot::ImageEnd));
+            }
             if !VOID.contains(&name) {
                 let child_style = allow_style && name != "svg" && name != "math";
                 for child in node.children() {
@@ -781,6 +843,42 @@ fn serialize_node(
         }
         _ => {}
     }
+}
+
+/// Save the image's tag separately so the offline page can draw a tile
+/// without giving WebKit a broken image to paint.
+fn prepare_image_tag(element: &scraper::node::Element, at: usize, slots: &mut PageImages) -> bool {
+    let src = element.attr("src").unwrap_or_default().trim();
+    if src
+        .get(..11)
+        .is_some_and(|head| head.eq_ignore_ascii_case("data:image/"))
+    {
+        return false;
+    }
+    let alt = element.attr("alt").unwrap_or_default();
+    let cid = src
+        .split_once(':')
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("cid"));
+    let label = if cid {
+        let alt = alt.trim();
+        if alt.is_empty() {
+            "Inline image".to_owned()
+        } else {
+            format!("Inline image · {alt}")
+        }
+    } else {
+        alt.to_owned()
+    };
+    let url = (slots.resources.len() < 48)
+        .then(|| remote_image_url(src))
+        .flatten();
+    let list = if url.is_some() {
+        &mut slots.resources
+    } else {
+        &mut slots.tags
+    };
+    list.push((at, Slot::ImageTag { url, label }));
+    true
 }
 
 const VOID: &[&str] = &["area", "br", "hr", "img", "wbr", "col"];
@@ -1274,7 +1372,7 @@ fn css_width_property(css: &str, start: usize) -> bool {
 fn serialize_css(
     css: &str,
     out: &mut String,
-    images: Option<&mut Vec<(usize, String)>>,
+    images: Option<&mut Vec<(usize, Slot)>>,
     escape: impl Fn(&str) -> String,
 ) {
     serialize_css_with_property(css, None, out, images, escape);
@@ -1284,7 +1382,7 @@ fn serialize_css_with_property(
     css: &str,
     property: Option<&str>,
     out: &mut String,
-    mut images: Option<&mut Vec<(usize, String)>>,
+    mut images: Option<&mut Vec<(usize, Slot)>>,
     escape: impl Fn(&str) -> String,
 ) {
     // Classify comment-split spellings before tokenizing. The tokenizer also
@@ -1332,7 +1430,7 @@ fn serialize_css_with_property(
                 && let Some(url) = remote_image_url(&value)
             {
                 out.push_str(&escape(if quoted { "\"" } else { "url(\"" }));
-                slots.push((out.len(), url));
+                slots.push((out.len(), Slot::Image(url)));
                 out.push_str(&escape(if quoted { "\"" } else { "\")" }));
             } else if quoted {
                 out.push_str(&escape("\"\""));
@@ -1685,6 +1783,7 @@ mod tests {
             size: 15.,
             foreground: 0,
             link: 0,
+            border: 0x414868,
             inset: false,
         };
         for (contents, wrapper_folds) in [
@@ -1724,6 +1823,7 @@ mod tests {
             size: 15.,
             foreground: 0,
             link: 0,
+            border: 0x414868,
             inset: false,
         };
         for (html, selector, original) in [
@@ -1731,6 +1831,16 @@ mod tests {
                 "<div>Thursday works.</div><blockquote style='display:block !important'>Could you share the pier map?</blockquote>",
                 "blockquote",
                 "display:block !important",
+            ),
+            (
+                r#"<div>Thursday works.</div><blockquote style="display:block !important;x:'">Could you share the pier map?</blockquote>"#,
+                "blockquote",
+                "display:block !important;x:'",
+            ),
+            (
+                r#"<div>Thursday works.</div><blockquote style="display:block !important;x:'\">Could you share the pier map?</blockquote>"#,
+                "blockquote",
+                "display:block !important;x:'\\",
             ),
             (
                 "<div>Thursday works.</div><style>span[data-fell-folded] {display:block !important}</style>-- <br>Jo<br>Harbor office<br>harbor.test<div class='gmail_quote'>On Monday, Lee wrote:<blockquote>Could you share the pier map?</blockquote></div>",
@@ -1747,15 +1857,8 @@ mod tests {
             let closed = closed.select(&selector).next().unwrap();
             let open = open.select(&selector).next().unwrap();
             assert!(closed.attr("data-fell-folded").is_some());
-            assert!(
-                closed
-                    .attr("style")
-                    .unwrap()
-                    .ends_with("display:none !important")
-            );
-            let style = open.attr("style").unwrap();
-            assert!(style.contains(original), "{style}");
-            assert!(!style.contains("display:none"), "{style}");
+            assert_eq!(closed.attr("style"), Some("display:none !important"));
+            assert_eq!(open.attr("style"), Some(original));
         }
     }
 
@@ -1858,6 +1961,7 @@ mod tests {
             size: 15.,
             foreground: 0,
             link: 0,
+            border: 0x414868,
             inset: false,
         };
         assert_eq!(
@@ -1874,6 +1978,7 @@ mod tests {
             size: 15.,
             foreground: 0xa9b1d6,
             link: 0x7aa2f7,
+            border: 0x414868,
             inset: true,
         };
         let page = plain.page_with_style("dark", Some(&style), |_| None);
@@ -2019,39 +2124,48 @@ mod tests {
 
     #[test]
     fn blocked_images_keep_layout_hints() {
-        let page = WebMail::prepare(
-            r#"<img src="https://cdn.example.test/hero" width="420" height="240" style="max-width: 90%"><img src="https://cdn.example.test/card" width="240">"#,
-        )
-        .page("light", |_| None);
+        let mail = WebMail::prepare(
+            r#"<img src="https://cdn.example.test/hero" width="420" height="240" style="max-width: 90%" alt="Harbor &amp; &quot;Pier&quot; &lt;map&gt;"><img src="https://cdn.example.test/card" width="240">"#,
+        );
+        let page = mail.page("light", |_| None);
         let dom = crate::html::parse_html(&page);
+        assert!(!page.contains("<img"));
         let images: Vec<_> = dom
-            .select(&scraper::Selector::parse("img").unwrap())
+            .select(&scraper::Selector::parse("span[role=img]").unwrap())
             .collect();
         assert_eq!(images.len(), 2);
-        assert_eq!(images[0].attr("src"), Some(""));
+        assert_eq!(
+            images[0].attr("aria-label"),
+            Some("Harbor & \"Pier\" <map>")
+        );
         assert_eq!(images[0].attr("width"), Some("420"));
         assert_eq!(images[0].attr("height"), Some("240"));
         assert_eq!(images[0].attr("style"), Some("max-width: 90%"));
-        assert_eq!(images[1].attr("src"), Some(""));
         assert_eq!(images[1].attr("width"), Some("240"));
-        assert!(page.contains("aspect-ratio: 3 / 2"));
-        assert!(!page.contains("content: url"));
+        let allowed = mail.page("light", |_| Some("data:image/png;base64,AAAA".into()));
+        assert_eq!(
+            allowed
+                .matches("<img src=\"data:image/png;base64,AAAA\"")
+                .count(),
+            2
+        );
+        assert!(!allowed.contains("<span data-fell-image-tile"));
     }
 
     #[test]
     fn unresolved_cid_uses_the_blocked_tile_without_adding_a_fetch() {
         let mail = WebMail::prepare(
-            "<img src='CID:map' srcset='cid:other' width='120' height='80' alt='Map'>",
+            "<img src='CID:map' srcset='cid:other' width='120' height='80' alt='Pier map'>",
         );
         assert!(!mail.has_remote_images());
         let page = html::parse_html(&mail.page("light", |_| panic!("CID is local")));
         let image = page
-            .select(&scraper::Selector::parse("img").unwrap())
+            .select(&scraper::Selector::parse("span[role=img]").unwrap())
             .next()
             .unwrap();
-        assert_eq!(image.attr("src"), Some(""));
+        assert_eq!(image.attr("src"), None);
         assert_eq!(image.attr("srcset"), None);
-        assert_eq!(image.attr("alt"), Some("Inline image"));
+        assert_eq!(image.attr("aria-label"), Some("Inline image · Pier map"));
         assert_eq!(image.attr("width"), Some("120"));
         assert_eq!(image.attr("height"), Some("80"));
     }
@@ -2185,7 +2299,7 @@ mod tests {
             "#local",
             "url(#accent)",
             "https://example.test",
-            "alt=\"Inline image\"",
+            "aria-label=\"Inline image\"",
             "//AA",
         ] {
             assert!(page.contains(local), "{page}");
