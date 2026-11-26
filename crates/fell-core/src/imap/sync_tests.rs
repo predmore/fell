@@ -39,7 +39,7 @@ pub(super) fn unused_smtp() -> crate::SmtpConfig {
         security: ImapSecurity::StartTls,
         accept_invalid_certs: false,
         append_sent: false,
-        senders: Vec::new(),
+        senders: crate::SmtpSenders::Fixed(Vec::new()),
     }
 }
 

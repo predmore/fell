@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use crate::imap::{ImapConfig, ImapSecurity, TlsStream, host_is_loopback, wrap_tcp_as_tls};
 use crate::send::{Draft, PendingSend, SentMessage, UserSendConfirmation, require_confirmation};
-use crate::{Error, RemoteId, Result};
+use crate::{AccountId, Error, RemoteId, Result};
 
 const TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -33,8 +33,15 @@ pub struct SmtpConfig {
     pub accept_invalid_certs: bool,
     /// Queue a server Sent copy after successful submission.
     pub append_sent: bool,
-    /// Canonical addresses from the account file. Empty for fixture backends.
-    pub senders: Vec<String>,
+    pub senders: SmtpSenders,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SmtpSenders {
+    /// Recheck the primary address and aliases in account.toml at confirmation.
+    AccountFile,
+    /// Canonical addresses, including the account address. An empty list permits no sender.
+    Fixed(Vec<String>),
 }
 
 impl SmtpConfig {
@@ -46,7 +53,7 @@ impl SmtpConfig {
             security: ImapSecurity::StartTls,
             accept_invalid_certs: true,
             append_sent: false,
-            senders: Vec::new(),
+            senders: SmtpSenders::Fixed(Vec::new()),
         }
     }
 }
@@ -74,6 +81,7 @@ impl Endpoint {
 }
 
 pub(crate) fn confirm_send(
+    account: &AccountId,
     config: &SmtpConfig,
     login: &ImapConfig,
     pending: PendingSend,
@@ -84,7 +92,13 @@ pub(crate) fn confirm_send(
     if crate::compose::email_of(&pending.draft.from).as_ref() != Some(&from) {
         return Err(smtp_err("smtp: draft and message From addresses differ"));
     }
-    if !config.senders.is_empty() && !config.senders.contains(&from) {
+    let allowed = match &config.senders {
+        SmtpSenders::AccountFile => {
+            crate::account_config::configured_sender(account, &from).is_ok()
+        }
+        SmtpSenders::Fixed(addresses) => addresses.contains(&from),
+    };
+    if !allowed {
         return Err(smtp_err("smtp: From is not configured in account.toml"));
     }
     let remote = deliver(
@@ -671,7 +685,11 @@ Bcc: this is body text\r\n"
         pending.draft.from = sender(mime)?;
         let confirmation = confirm(&pending);
         let sent = confirm_send(
-            &backend(port, ImapSecurity::Plain).smtp,
+            account,
+            &SmtpConfig {
+                senders: SmtpSenders::Fixed(vec![pending.draft.from.clone()]),
+                ..backend(port, ImapSecurity::Plain).smtp
+            },
             login,
             pending,
             confirmation,
@@ -702,7 +720,7 @@ Bcc: this is body text\r\n"
                 security,
                 accept_invalid_certs: true,
                 append_sent: false,
-                senders: Vec::new(),
+                senders: SmtpSenders::Fixed(vec!["jon@example.com".into()]),
             },
         }
     }
@@ -728,8 +746,8 @@ Bcc: this is body text\r\n"
     #[test]
     fn empty_username_does_not_open_smtp() {
         let pending = sample_pending();
-        let mut bridge = BridgeBackend::default();
-        bridge.smtp.port = 1;
+        let mut bridge = backend(1, ImapSecurity::Plain);
+        bridge.imap.username.clear();
         let err = bridge
             .confirm_send(pending.clone(), confirm(&pending))
             .unwrap_err();
@@ -739,24 +757,60 @@ Bcc: this is body text\r\n"
     }
 
     #[test]
-    fn a_configured_alias_is_the_envelope_and_message_sender() {
+    fn a_backend_uses_the_current_account_aliases_at_confirmation() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let Some(root) = crate::test_support::in_isolated_process() else {
+            return;
+        };
         let (port, captured, join) = serve(Wire::Clear, AfterData::Accept);
-        let mut backend = backend(port, ImapSecurity::Plain);
-        backend.smtp.senders = vec!["jon@example.com".into(), "alias@example.com".into()];
+        let config = format!(
+            "id = 'mailbox'\nemail = 'jon@example.com'\nusername = 'bridge-user'\n\
+             password = 'bridge-secret'\nsmtp_port = {port}\nsmtp_security = 'plain'\n"
+        );
+        let path = root.join("config/fell/account.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, &config).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let initial = crate::AccountConfig::parse(&config).unwrap();
+        let backend = crate::backend_for(&initial.account().id, Some(&initial)).unwrap();
         let mut pending = sample_pending();
         pending.draft.from = "Studio <alias@example.com>".into();
         pending.mime = String::from_utf8(pending.mime)
             .unwrap()
             .replace("jon@example.com", "alias@example.com")
             .into_bytes();
-        backend
-            .confirm_send(pending.clone(), confirm(&pending))
-            .unwrap();
+        let send = || backend.confirm_send(pending.clone(), confirm(&pending));
+        let assert_refused = |result: Result<SentMessage>| {
+            assert!(matches!(result, Err(Error::Backend(message))
+                if message == "smtp: From is not configured in account.toml"));
+        };
+        assert_refused(send());
+        fs::write(
+            &path,
+            format!("{config}[[identities]]\naddress = 'alias@example.com'\nname = 'Studio'\n"),
+        )
+        .unwrap();
+        send().unwrap();
         let captured = captured.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(captured.from, "alias@example.com");
         assert_eq!(sender(&captured.data).unwrap(), "alias@example.com");
         assert_eq!(captured.data, pending.mime);
         join.join().unwrap();
+        fs::write(&path, &config).unwrap();
+        assert_refused(send());
+    }
+
+    #[test]
+    fn an_empty_fixed_sender_list_refuses_before_connect() {
+        let mut bridge = backend(1, ImapSecurity::Plain);
+        bridge.smtp.senders = SmtpSenders::Fixed(Vec::new());
+        let pending = sample_pending();
+        assert!(matches!(
+            bridge.confirm_send(pending.clone(), confirm(&pending)),
+            Err(Error::Backend(message)) if message == "smtp: From is not configured in account.toml"
+        ));
     }
 
     #[test]
@@ -770,6 +824,14 @@ Bcc: this is body text\r\n"
     #[test]
     fn imap_account_uses_its_smtp_settings_and_classifies_delivery() {
         use crate::{AccountConfig, BackendKind, backend_for};
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let Some(root) = crate::test_support::in_isolated_process() else {
+            return;
+        };
+        let path = root.join("config/fell/account.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
 
         for after in [AfterData::Accept, AfterData::Hangup, AfterData::Reject] {
             let (port, rx, join) = serve(Wire::Clear, after);
@@ -780,6 +842,8 @@ Bcc: this is body text\r\n"
                  smtp_host = \"127.0.0.1\"\nsmtp_port = {port}\nsmtp_security = \"plain\"\n"
             ))
             .unwrap();
+            fs::write(&path, config.render()).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
             let backend = backend_for(&config.account().id, Some(&config)).unwrap();
             assert_eq!(backend.kind(), BackendKind::Imap);
             let pending = backend

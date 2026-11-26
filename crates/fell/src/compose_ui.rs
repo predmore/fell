@@ -249,8 +249,9 @@ impl Editor {
 
     /// The cursor after the last written text, or at the top of an empty
     /// body.
-    fn cursor_to_end_of_text(&mut self) {
-        match self.lines.iter().rposition(|line| !line.trim().is_empty()) {
+    fn cursor_to_end_of_text(&mut self, signature_lines: usize) {
+        let text = &self.lines[..self.lines.len().saturating_sub(signature_lines)];
+        match text.iter().rposition(|line| !line.trim().is_empty()) {
             Some(mut row) => {
                 if self.lines[row].starts_with("```")
                     && markdown_to_doc(&self.lines[..=row].join("\n"))
@@ -881,6 +882,18 @@ impl ComposeView {
             .unwrap_or(false)
     }
 
+    fn resume_body(&mut self) {
+        let signature_lines = self
+            .hub
+            .with_session(self.draft_id.as_ref(), |session| {
+                session
+                    .managed_signature()
+                    .map_or(0, |block| block.lines().count())
+            })
+            .unwrap_or(0);
+        self.editor.cursor_to_end_of_text(signature_lines);
+    }
+
     /// A draft with nobody to send it to yet starts on the To line, ready
     /// to type, as a new draft from `c` does.
     fn start_on_recipients_if_empty(&mut self, snap: &Snapshot) {
@@ -889,9 +902,7 @@ impl ComposeView {
             self.field = Field::To;
             self.status = "".into();
             // Tab from Subject carries the typing on after what is written.
-            if !self.signature_only() {
-                self.editor.cursor_to_end_of_text();
-            }
+            self.resume_body();
         }
     }
 
@@ -929,7 +940,7 @@ impl ComposeView {
         }
         if snap.send_requested_by.is_none() {
             // The person's own draft: pick up where the text ends.
-            self.editor.cursor_to_end_of_text();
+            self.resume_body();
             return;
         }
         // No edits yet: start on the first line of text, so the first view
@@ -7882,23 +7893,26 @@ mod tests {
     #[test]
     fn a_draft_started_on_its_header_resumes_after_its_text() {
         let mut editor = super::Editor::from_body("Hi Ada,\n\nThanks for the notes\n\n");
-        editor.cursor_to_end_of_text();
+        editor.cursor_to_end_of_text(0);
         assert_eq!((editor.row, editor.col), (2, "Thanks for the notes".len()));
         let mut empty = super::Editor::from_body("\n\n");
         empty.row = 1;
-        empty.cursor_to_end_of_text();
+        empty.cursor_to_end_of_text(0);
         assert_eq!((empty.row, empty.col), (0, 0));
     }
 
     #[test]
     fn verbatim_draft_resumes_before_its_closing_fence() {
         let plain = "use_snake_case\n- item";
-        let body = fell_core::compose::verbatim_markdown(plain);
-        let mut editor = super::Editor::from_body(&body);
-        assert_eq!(editor.lines[editor.row], "use_snake_case");
-        editor.cursor_to_end_of_text();
-        assert_eq!(editor.lines[editor.row], "- item");
-        assert_eq!(editor.col, "- item".len());
+        for signature in ["", "-- \nSigned\n"] {
+            let mut body = fell_core::compose::verbatim_markdown(plain);
+            fell_core::compose::append_signature(&mut body, signature);
+            let mut editor = super::Editor::from_body(&body);
+            assert_eq!(editor.lines[editor.row], "use_snake_case");
+            editor.cursor_to_end_of_text(signature.lines().count());
+            assert_eq!(editor.lines[editor.row], "- item");
+            assert_eq!(editor.col, "- item".len());
+        }
     }
 
     /// The text a source line shows with these fold settings, a link's
@@ -8623,11 +8637,11 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_account_keeps_the_drafts_saved_identity_addresses() {
+    fn an_unreadable_account_preserves_from_and_signature_after_reopen() {
         use super::*;
         use fell_core::{
             Account, BackendKind, Store,
-            compose::{DraftFields, DraftSession},
+            compose::{DraftFields, DraftSession, StoredCompose},
         };
         use std::{fs, os::unix::fs::PermissionsExt};
 
@@ -8650,12 +8664,20 @@ mod tests {
             to: vec!["recipient@example.com".into()],
             ..DraftFields::default()
         };
-        let folder = DraftSession::start_in(
+        let signature = "-- \nStudio team\n";
+        let folder = DraftSession::start_stored_in(
             &root.join("drafts"),
-            "config-edit",
-            account.clone(),
-            fields,
-            "Letter\n",
+            StoredCompose {
+                id: "config-edit".into(),
+                account_id: account.clone(),
+                fields,
+                body: format!("Letter\n\n{signature}"),
+                files: Vec::new(),
+                identities: vec!["primary@example.com".into(), "alias@example.com".into()],
+                managed_signature: Some(signature.into()),
+                owner: String::new(),
+                reply: Default::default(),
+            },
             &db,
         )
         .unwrap();
@@ -8663,7 +8685,9 @@ mod tests {
         let mut feedback = SendFeedbackState::default();
         let config = root.join("config/fell/account.toml");
         fs::create_dir_all(config.parent().unwrap()).unwrap();
-        let valid = "id = 'mail'\nemail = 'primary@example.com'\npassword = 'test'\n[[identities]]\naddress = 'alias@example.com'\nname = 'Studio'\n";
+        let valid = "id = 'mail'\nemail = 'primary@example.com'\nname = 'Primary'\npassword = 'test'\n\
+                     [[identities]]\naddress = 'primary@example.com'\nsignature = 'Primary team'\n\
+                     [[identities]]\naddress = 'alias@example.com'\nname = 'Studio'\nsignature = 'Studio team'\n";
         fs::write(&config, valid).unwrap();
         fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
         let read = || crate::mailbox::send_account_config(&account);
@@ -8680,16 +8704,30 @@ mod tests {
             })
         ));
         assert_eq!(session.identities().len(), 2);
-        session.set_body_from_user("Still writing\n".into());
+        let body = format!("Still writing\n\n{signature}");
+        session.set_body_from_user(body.clone());
         session.flush().unwrap();
 
         let mut reopened = DraftSession::open_folder(&folder, account.clone()).unwrap();
         reopened.mark_seen();
         assert_eq!(reopened.snapshot().send_block, None);
         assert_eq!(reopened.identities().len(), 2);
+        assert!(
+            reopened
+                .identities()
+                .iter()
+                .all(|identity| { identity.name.is_empty() && identity.signature.is_none() })
+        );
+        assert!(reopened.set_from_user("primary@example.com").is_err());
+        assert_eq!(reopened.fields().from, "Studio <alias@example.com>");
+        assert_eq!(reopened.body(), body);
+        assert_eq!(reopened.managed_signature(), Some(signature));
 
         fs::write(&config, valid).unwrap();
-        assert!(feedback.update_account_config(&mut session, 0, read()));
+        assert!(reopened.set_from_user("primary@example.com").unwrap());
+        assert_eq!(reopened.fields().from, "Primary <primary@example.com>");
+        assert_eq!(reopened.body(), "Still writing\n\n-- \nPrimary team\n");
+        assert!(feedback.update_account_config(&mut reopened, 0, read()));
         assert!(feedback.readiness.is_none());
     }
 

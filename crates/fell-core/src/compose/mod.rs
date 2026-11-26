@@ -55,7 +55,7 @@ pub use server::{
 pub(crate) use session::signature_range;
 pub use session::{
     AddressView, AttachmentView, DraftSession, HunkView, ReplyContext, SendLock, SentCopy,
-    Snapshot, signature_block,
+    Snapshot, append_signature, signature_block,
 };
 pub(crate) use workspace::inline_image_paths;
 pub use workspace::{

@@ -523,7 +523,7 @@ impl DraftSession {
             crate::account_config::configured_sender(&session.account_id, &session.fields.from);
         session.managed_signature = stored.managed_signature;
         session.check_signature();
-        if let Some(identity) = verified {
+        if let Ok(identity) = verified {
             if email_of(&previous_from) != email_of(&session.fields.from) {
                 session.swap_signature(signature_block(&identity));
             }
@@ -870,14 +870,19 @@ impl DraftSession {
 
     pub fn set_from_user(&mut self, address: &str) -> Result<bool, String> {
         self.ensure_editable()?;
-        let identity = self
+        let picked = self
             .identity_at_address(address)
             .ok_or("from is not one of your addresses")?;
+        let identity = if crate::is_demo_account(&self.account_id) {
+            picked.clone()
+        } else {
+            crate::account_config::configured_sender(&self.account_id, address)?
+        };
         let from = identity.from_header();
         let signature = self
             .managed_signature
             .as_ref()
-            .map(|_| signature_block(identity));
+            .map(|_| signature_block(&identity));
         if from == self.fields.from && signature == self.managed_signature {
             return Ok(false);
         }
@@ -912,16 +917,7 @@ impl DraftSession {
             return;
         }
         if block.is_empty() {
-            if !self.body.ends_with("\n") && !self.body.is_empty() {
-                self.body.push('\n');
-            }
-            if !self.body.ends_with("\n\n") {
-                self.body.push('\n');
-            }
-            if self.body == "\n" {
-                self.body.push('\n');
-            }
-            self.body.push_str(&next);
+            append_signature(&mut self.body, &next);
         } else if let Some(range) = signature_range(&self.body, block) {
             self.body.replace_range(range, &next);
         } else {
@@ -1078,7 +1074,7 @@ impl DraftSession {
             None
         } else {
             let configured = if verify_config {
-                crate::account_config::configured_sender(&self.account_id, &parsed.fields.from)
+                crate::account_config::configured_sender(&self.account_id, &parsed.fields.from).ok()
             } else {
                 self.identity(&parsed.fields.from).cloned()
             };
@@ -1799,7 +1795,7 @@ impl DraftSession {
         review::carry(&mut self.hunks, &text, &outcome.text);
         let identity = (parsed.fields.from != self.fields.from)
             .then(|| {
-                crate::account_config::configured_sender(&self.account_id, &parsed.fields.from)
+                crate::account_config::configured_sender(&self.account_id, &parsed.fields.from).ok()
             })
             .flatten();
         self.adopt_parsed(parsed, identity);
@@ -1942,6 +1938,20 @@ pub fn signature_block(identity: &Identity) -> String {
         .filter(|signature| !signature.trim().is_empty())
         .map(|signature| format!("-- \n{}\n", signature.trim_end_matches('\n')))
         .unwrap_or_default()
+}
+
+/// Place a generated signature after the draft's text with a blank line between them.
+pub fn append_signature(body: &mut String, signature: &str) {
+    if signature.is_empty() {
+        return;
+    }
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+    if !body.ends_with("\n\n") {
+        body.push('\n');
+    }
+    body.push_str(signature);
 }
 
 /// A review row belongs to the compose row it was saved with. One left by

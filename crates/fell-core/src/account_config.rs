@@ -59,7 +59,7 @@ use crate::backend::{BridgeBackend, DEMO_ACCOUNT_IDS, ImapBackend, MailBackend};
 use crate::credentials::{KeyringError, PasswordStore, SecretService};
 use crate::folders::FolderRole;
 use crate::imap::{ImapConfig, ImapSecurity};
-use crate::smtp::SmtpConfig;
+use crate::smtp::{SmtpConfig, SmtpSenders};
 use crate::{Error, Result};
 
 /// Where the shared IMAP and SMTP password comes from.
@@ -394,11 +394,12 @@ impl AccountConfig {
         if self.email.is_empty() {
             return Err(invalid("email is empty"));
         }
-        let valid_phrase = |name: &str| {
-            let header = crate::compose::configured_from(name, "placeholder@example.test");
-            !header.contains("=?")
+        let valid_name = |name: &str| {
+            !name.chars().any(char::is_control)
+                && !name.contains(['<', '>'])
+                && !crate::compose::configured_from(name, "placeholder@example.test").contains("=?")
         };
-        if !valid_phrase(&self.name) {
+        if !valid_name(&self.name) {
             return Err(invalid("account name must be plain display text"));
         }
         let mut addresses = std::collections::HashSet::new();
@@ -409,10 +410,7 @@ impl AccountConfig {
             if !addresses.insert(identity.address.to_ascii_lowercase()) {
                 return Err(invalid("identity address is set twice"));
             }
-            if identity.name.chars().any(char::is_control)
-                || identity.name.contains(['<', '>'])
-                || !valid_phrase(&identity.name)
-            {
+            if !valid_name(&identity.name) {
                 return Err(invalid("identity name must be plain display text"));
             }
             if let Some(text) = &identity.signature {
@@ -596,40 +594,44 @@ impl AccountConfig {
             // certificate check.
             accept_invalid_certs: self.backend == BackendKind::Bridge && literal_loopback(&host),
             append_sent: self.append_sent(),
-            senders: Vec::new(),
+            senders: SmtpSenders::Fixed(Vec::new()),
             host,
             port,
             security,
         }
     }
 
-    fn smtp_submission_config(&self) -> SmtpConfig {
-        SmtpConfig {
-            senders: std::iter::once(&self.email)
-                .chain(self.identities.iter().map(|identity| &identity.address))
-                .filter_map(|address| crate::compose::email_of(address))
-                .collect(),
-            ..self.smtp_config()
-        }
-    }
-
     /// Resolve the password and build the backend. Call off the UI thread.
     pub fn backend(&self) -> Result<Box<dyn MailBackend + Send>> {
-        Ok(match self.backend {
-            BackendKind::Imap => Box::new(ImapBackend {
-                account_id: AccountId(self.id.clone()),
-                config: self.imap_config()?,
-                smtp: self.smtp_submission_config(),
-            }),
-            _ => Box::new(self.bridge_backend()?),
-        })
+        let senders = std::iter::once(&self.email)
+            .chain(self.identities.iter().map(|identity| &identity.address))
+            .filter_map(|address| crate::compose::email_of(address))
+            .collect();
+        self.backend_with_senders(SmtpSenders::Fixed(senders))
     }
 
-    pub(crate) fn bridge_backend(&self) -> Result<BridgeBackend> {
-        Ok(BridgeBackend {
-            account_id: AccountId(self.id.clone()),
-            imap: self.imap_config()?,
-            smtp: self.smtp_submission_config(),
+    pub(crate) fn backend_from_account_file(&self) -> Result<Box<dyn MailBackend + Send>> {
+        self.backend_with_senders(SmtpSenders::AccountFile)
+    }
+
+    fn backend_with_senders(&self, senders: SmtpSenders) -> Result<Box<dyn MailBackend + Send>> {
+        let account_id = AccountId(self.id.clone());
+        let imap = self.imap_config()?;
+        let smtp = SmtpConfig {
+            senders,
+            ..self.smtp_config()
+        };
+        Ok(match self.backend {
+            BackendKind::Imap => Box::new(ImapBackend {
+                account_id,
+                config: imap,
+                smtp,
+            }),
+            _ => Box::new(BridgeBackend {
+                account_id,
+                imap,
+                smtp,
+            }),
         })
     }
 
@@ -918,16 +920,27 @@ impl Value {
 /// An agent can write draft.md but cannot grant itself permission to use
 /// another From address. Recheck the account file on address changes,
 /// including edits made while the editor is closed.
-pub(crate) fn configured_sender(account: &crate::AccountId, header: &str) -> Option<Identity> {
+pub(crate) fn configured_sender(
+    account: &AccountId,
+    header: &str,
+) -> std::result::Result<Identity, &'static str> {
+    let email = crate::compose::email_of(header).ok_or("from is not one of your addresses")?;
+    configured_account(account)
+        .ok_or("Could not read this account’s settings")?
+        .compose_identities()
+        .into_iter()
+        .find(|identity| identity.address.eq_ignore_ascii_case(&email))
+        .ok_or("from is not one of your addresses")
+}
+
+fn configured_account(account: &AccountId) -> Option<AccountConfig> {
     use std::io::Read;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::path::PathBuf;
 
-    let email = crate::compose::email_of(header)?;
     let directory = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-    use std::os::unix::fs::OpenOptionsExt;
 
     let mut file = std::fs::OpenOptions::new()
         .read(true)
@@ -941,13 +954,7 @@ pub(crate) fn configured_sender(account: &crate::AccountId, header: &str) -> Opt
     let mut text = String::new();
     file.read_to_string(&mut text).ok()?;
     let config = AccountConfig::parse(&text).ok()?;
-    if config.id != account.as_str() {
-        return None;
-    }
-    config
-        .compose_identities()
-        .into_iter()
-        .find(|identity| identity.address.eq_ignore_ascii_case(&email))
+    (config.id == account.as_str()).then_some(config)
 }
 
 fn take_field(fields: &mut Vec<(String, Value)>, key: &str) -> Option<Value> {

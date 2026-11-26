@@ -472,7 +472,10 @@ impl ComposeView {
                 self.flush_pending = true;
                 self.arm_debounced_flush(cx);
             }
-            Some(Err(error)) => self.status = error.into(),
+            Some(Err(error)) => {
+                self.status = error.into();
+                self.refresh_send_availability(cx);
+            }
             Some(Ok(false)) | None => {}
         }
         cx.notify();

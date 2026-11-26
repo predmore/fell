@@ -69,7 +69,7 @@ pub use send::{
     Draft, PendingSend, PendingSendId, SentMessage, SubmittedFile, UserSendConfirmation,
     message_digest,
 };
-pub use smtp::SmtpConfig;
+pub use smtp::{SmtpConfig, SmtpSenders};
 pub use store::PendingFlags;
 pub use store::{
     CidRepairBatch, CidRepairProgress, FolderPage, FolderSpan, FolderThread, ListFilter, ListKey,

@@ -539,17 +539,10 @@ fn new_compose_row(
         });
     let signature = identity.map(|identity| {
         fields.from = identity.from_header();
-        fell_core::compose::signature_block(identity)
+        let signature = fell_core::compose::signature_block(identity);
+        fell_core::compose::append_signature(&mut body, &signature);
+        signature
     });
-    if let Some(signature) = signature.as_ref().filter(|signature| !signature.is_empty()) {
-        if !body.ends_with('\n') {
-            body.push('\n');
-        }
-        if !body.ends_with("\n\n") {
-            body.push('\n');
-        }
-        body.push_str(signature);
-    }
     StoredCompose {
         id: id.to_string(),
         account_id: account.clone(),
@@ -770,6 +763,75 @@ pub(crate) mod tests {
     use super::*;
     use serde_json::{Value, json};
     use std::io::{BufRead, BufReader, Write};
+
+    #[test]
+    fn external_compose_uses_the_default_identity_and_signs_after_the_body() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Some(root) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let settings = "email = 'primary@example.com'\nname = 'Primary'\npassword = 'test'\n\
+                        [[identities]]\naddress = 'alias@example.com'\nname = 'Studio'\n\
+                        [[identities]]\naddress = 'primary@example.com'\nsignature = 'Primary team'\n";
+        let path = crate::mailbox::account_config_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, settings).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let account = fell_core::AccountConfig::parse(settings).unwrap().account();
+        let db = root.join("mail.db");
+        fell_core::Store::open(&db)
+            .unwrap()
+            .upsert_account(&account)
+            .unwrap();
+        let home = DraftHome::real(db);
+        let hub = DraftHub::new();
+        let mailto = crate::compose_launch::mailto(
+            "mailto:team@example.org?body=use_snake_case%0A%2A%2Anote%2A%2A",
+        )
+        .unwrap();
+        let cli = crate::compose_launch::cli(&[
+            "--to=team@example.org".into(),
+            "--body=use_snake_case\n**note**".into(),
+        ])
+        .unwrap();
+
+        for (launch, literal) in [(mailto, true), (cli, false)] {
+            let (fields, body) = launch.input.into_fields_and_body(account.email.clone());
+            let id = home
+                .new_seeded(
+                    &hub,
+                    &account.id,
+                    ReplyStart {
+                        fields,
+                        parts: ReplyParts::default(),
+                    },
+                    body.clone(),
+                    launch.files,
+                )
+                .unwrap();
+            hub.with_session(&id, |session| {
+                assert_eq!(session.fields().from, "Primary <primary@example.com>");
+                let signature = "-- \nPrimary team\n";
+                assert_eq!(session.managed_signature(), Some(signature));
+                let separator = if literal { "\n" } else { "\n\n" };
+                assert_eq!(session.body(), format!("{body}{separator}{signature}"));
+                session.mark_seen();
+                let outgoing = session.prepare_send().unwrap();
+                assert_eq!(
+                    outgoing.plain,
+                    format!("use_snake_case\n**note**\n\n{signature}")
+                );
+                assert_eq!(outgoing.html.contains("<strong>note</strong>"), !literal);
+                assert!(
+                    outgoing
+                        .mime
+                        .starts_with(b"From: Primary <primary@example.com>\r\n")
+                );
+            })
+            .unwrap();
+        }
+    }
 
     #[test]
     fn a_second_compose_invocation_delivers_a_personal_draft_to_the_inbox() {
