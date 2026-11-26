@@ -721,11 +721,16 @@ mod restart_tests {
         // when the rest of the workspace suite is busy.
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut restarting = false;
+        let mut expunge_disabled = false;
         loop {
             match events.try_recv() {
                 Ok(SyncEvent::Worker(WorkerEvent::Restarted(Worker::Sync))) => restarting = true,
+                Ok(SyncEvent::TrashExpungeAvailability(false)) => {
+                    assert!(!std::mem::replace(&mut expunge_disabled, true));
+                }
                 Ok(SyncEvent::Status(SyncKind::Failed(failure))) => {
                     assert!(restarting);
+                    assert!(expunge_disabled);
                     assert_eq!(failure.kind, SyncFailureKind::Password);
                     break;
                 }
