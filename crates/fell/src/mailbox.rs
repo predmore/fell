@@ -409,6 +409,9 @@ pub(crate) fn stage_connection_config(
         ) {
             return Err("The kept mailbox changed. Review the account and try again.".into());
         }
+        config.write_back = Store::open_existing_without_index(&mailbox)
+            .and_then(|store| store.write_back(&AccountId(config.id.clone())))
+            .map_err(|err| err.to_string())?;
     } else if let Some(email) = different_owner {
         if save != AccountSave::ReplaceMailbox {
             return Err(AccountFileError::MailboxAddressConflict {
@@ -456,54 +459,63 @@ pub(crate) struct StagedAccountConfig {
 
 impl StagedAccountConfig {
     pub(crate) fn publish(self) -> Result<PathBuf, AccountFileError> {
-        self.publish_then(|| {})
+        self.publish_then(|result, _| result)
     }
 
-    pub(crate) fn publish_then(
+    pub(crate) fn publish_then<T>(
         self,
-        after_publish: impl FnOnce(),
-    ) -> Result<PathBuf, AccountFileError> {
-        let marker = match self.original {
-            Some((registry, base, id)) => registry
-                .initialize_original(&self.lock, &base, &id)
-                .map_err(|err| err.to_string())?,
-            None => None,
-        };
-        let installed = if self.first_run {
-            self.file.persist_noclobber(&self.path)
-        } else {
-            self.file.persist(&self.path)
-        };
-        if let Err(error) = installed {
-            if let Some(marker) = marker {
-                fs::remove_file(&marker)
-                    .and_then(|()| self.lock.sync_all())
-                    .map_err(|err| format!("{}: {err}", marker.display()))?;
+        finish: impl FnOnce(Result<PathBuf, AccountFileError>, bool) -> T,
+    ) -> T {
+        let mut published = false;
+        let result = (|| {
+            let marker = match self.original {
+                Some((registry, base, id)) => registry
+                    .initialize_original(&self.lock, &base, &id)
+                    .map_err(|err| err.to_string())?,
+                None => None,
+            };
+            let installed = if self.first_run {
+                self.file.persist_noclobber(&self.path)
+            } else {
+                self.file.persist(&self.path)
+            };
+            if let Err(error) = installed {
+                if let Some(marker) = marker {
+                    fs::remove_file(&marker)
+                        .and_then(|()| self.lock.sync_all())
+                        .map_err(|err| format!("{}: {err}", marker.display()))?;
+                }
+                return Err(
+                    if self.first_run && error.error.kind() == std::io::ErrorKind::AlreadyExists {
+                        AccountFileError::AlreadyConfigured
+                    } else {
+                        format!("{}: {}", self.path.display(), error.error).into()
+                    },
+                );
             }
-            return Err(
-                if self.first_run && error.error.kind() == std::io::ErrorKind::AlreadyExists {
-                    AccountFileError::AlreadyConfigured
-                } else {
-                    format!("{}: {}", self.path.display(), error.error).into()
-                },
-            );
-        }
-        self.lock.sync_all().map_err(|err| err.to_string())?;
-        if let Some((registry, base, id, snapshot)) = self.keep
-            && let Err(error) = registry.keep_for_replacement(&self.lock, &base, &id, &snapshot)
-        {
-            // If disconnect never happened, roll back the new account file.
-            // A completed disconnect leaves the old mailbox available to reconnect.
-            let old = registry.path(&id).map_err(|err| err.to_string())?;
-            if accounts::path_exists(&old).map_err(|err| err.to_string())? {
-                fs::remove_file(&self.path)
-                    .and_then(|()| self.lock.sync_all())
-                    .map_err(|err| format!("{error}; couldn't roll back the new account: {err}"))?;
+            published = true;
+            self.lock.sync_all().map_err(|err| err.to_string())?;
+            if let Some((registry, base, id, snapshot)) = self.keep
+                && let Err(error) = registry.keep_for_replacement(&self.lock, &base, &id, &snapshot)
+            {
+                // If disconnect never happened, roll back the new account file.
+                // A completed disconnect leaves the old mailbox available to reconnect.
+                let old = registry.path(&id).map_err(|err| err.to_string())?;
+                if accounts::path_exists(&old).map_err(|err| err.to_string())? {
+                    fs::remove_file(&self.path).map_err(|err| {
+                        format!("{error}; couldn't roll back the new account: {err}")
+                    })?;
+                    published = false;
+                    self.lock.sync_all().map_err(|err| err.to_string())?;
+                }
+                return Err(error.into());
             }
-            return Err(error.into());
-        }
-        after_publish();
-        Ok(self.path)
+            Ok(self.path)
+        })();
+        // The registry lock also covers retiring or rolling back the credential.
+        let output = finish(result, published);
+        drop(self.lock);
+        output
     }
 }
 

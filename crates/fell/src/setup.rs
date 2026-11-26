@@ -293,9 +293,11 @@ fn setup(args: &[String]) -> Result<(), String> {
             .lock()
             .read_line(&mut line)
             .map_err(|err| format!("read password: {err}"))?;
-        Some(PasswordSource::Inline(
-            line.trim_end_matches(['\r', '\n']).to_string(),
-        ))
+        entered_password(
+            line.trim_end_matches(['\r', '\n']).to_owned(),
+            previous.is_some(),
+            flags.password_inline,
+        )?
     } else if tty {
         let password = prompt_hidden(if previous.is_some() {
             "IMAP password (leave blank to keep unchanged)"
@@ -304,7 +306,7 @@ fn setup(args: &[String]) -> Result<(), String> {
         } else {
             "IMAP password"
         })?;
-        (!password.is_empty() || previous.is_none()).then_some(PasswordSource::Inline(password))
+        entered_password(password, previous.is_some(), flags.password_inline)?
     } else if previous.is_some() {
         None
     } else {
@@ -374,10 +376,7 @@ fn setup(args: &[String]) -> Result<(), String> {
             return Err("Enter a password for the new mailbox.".into());
         }
     }
-    if !matches!(&config.password, PasswordSource::Inline(password) if !password.is_empty())
-        && flags.password_inline
-        && entered.is_none()
-    {
+    if flags.password_inline && entered.is_none() {
         return Err("--password-inline requires entering a new password".into());
     }
 
@@ -440,6 +439,22 @@ fn setup(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn entered_password(
+    password: String,
+    editing: bool,
+    inline: bool,
+) -> Result<Option<PasswordSource>, String> {
+    if !password.is_empty() {
+        Ok(Some(PasswordSource::Inline(password)))
+    } else if inline {
+        Err("--password-inline requires entering a new password".into())
+    } else if editing {
+        Ok(None)
+    } else {
+        Err("Enter a password for the new mailbox.".into())
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum SaveAccountError {
     File(AccountFileError),
@@ -471,6 +486,9 @@ pub(crate) fn save_account(
     keyring: &dyn PasswordStore,
     stage: impl FnOnce(&mut AccountConfig) -> Result<StagedAccountConfig, AccountFileError>,
 ) -> Result<PathBuf, SaveAccountError> {
+    config
+        .validate()
+        .map_err(|error| SaveAccountError::File(error.to_string().into()))?;
     let keyring_password = match (password_inline, config.password) {
         (false, PasswordSource::Inline(password)) => {
             config.password = PasswordSource::Keyring;
@@ -481,9 +499,6 @@ pub(crate) fn save_account(
             None
         }
     };
-    config
-        .validate()
-        .map_err(|error| SaveAccountError::File(error.to_string().into()))?;
     let staged = stage(&mut config).map_err(SaveAccountError::File)?;
     let old_key = previous
         .filter(|old| old.id == config.id && old.password == PasswordSource::Keyring)
@@ -507,31 +522,58 @@ pub(crate) fn save_account(
         ),
         _ => None,
     };
-    if let Some(password) = password {
-        config
-            .store_keyring_password(keyring, &password)
-            .map_err(key_error)?;
-        if previous.is_some()
-            && keyring
-                .read(&new_key)
-                .map_err(|err| key_error(err.into()))?
-                != password
-        {
-            return Err(key_error(
-                fell_core::credentials::KeyringError::Invalid.into(),
-            ));
+    let previous_secret = if password.is_some() && old_key.as_ref() == Some(&new_key) {
+        match keyring.read(&new_key) {
+            Ok(secret) => Some(secret),
+            Err(fell_core::credentials::KeyringError::Missing) => None,
+            Err(error) => return Err(key_error(error.into())),
+        }
+    } else {
+        None
+    };
+    let rollback_password = || {
+        let result = match &previous_secret {
+            Some(secret) => keyring.store(&new_key, secret),
+            None => keyring.remove(&new_key),
+        };
+        if result.is_err() {
+            fell_core::diagnostic!(WARN, "Could not roll back the account credential");
+        }
+    };
+    if let Some(password) = &password {
+        if let Err(error) = config.store_keyring_password(keyring, password) {
+            if previous_secret.is_some() {
+                rollback_password();
+            }
+            return Err(key_error(error));
+        }
+        if previous.is_some() {
+            let verified = keyring.read(&new_key).and_then(|saved| {
+                if saved == *password {
+                    Ok(())
+                } else {
+                    Err(fell_core::credentials::KeyringError::Invalid)
+                }
+            });
+            if let Err(error) = verified {
+                rollback_password();
+                return Err(key_error(error.into()));
+            }
         }
     }
-    staged
-        .publish_then(|| {
-            if let Some(old_key) = old_key
-                && (old_key != new_key || config.password != PasswordSource::Keyring)
-                && keyring.remove(&old_key).is_err()
+    staged.publish_then(|result, published| {
+        if result.is_ok() {
+            if let Some(old_key) = &old_key
+                && (old_key != &new_key || config.password != PasswordSource::Keyring)
+                && keyring.remove(old_key).is_err()
             {
                 fell_core::diagnostic!(WARN, "Could not retire the previous account credential");
             }
-        })
-        .map_err(SaveAccountError::File)
+        } else if password.is_some() && !published {
+            rollback_password();
+        }
+        result.map_err(SaveAccountError::File)
+    })
 }
 
 fn list() -> Result<(), String> {
@@ -931,6 +973,18 @@ mod tests {
     }
 
     #[test]
+    fn blank_password_keeps_only_an_existing_password_without_inline_override() {
+        assert_eq!(entered_password(String::new(), true, false).unwrap(), None);
+        for (editing, inline) in [(false, false), (false, true), (true, true)] {
+            assert!(entered_password(String::new(), editing, inline).is_err());
+        }
+        assert_eq!(
+            entered_password(" ".into(), true, true).unwrap(),
+            Some(PasswordSource::Inline(" ".into()))
+        );
+    }
+
+    #[test]
     fn flags_parse_and_conflict() {
         let flags = parse_flags(&args(&[
             "--imap",
@@ -1068,11 +1122,21 @@ mod tests {
             interrupt_read: Cell<bool>,
             interrupt_remove: Cell<bool>,
             new_key: String,
+            refuse_readback: Cell<bool>,
         }
 
         impl PasswordStore for Keyring {
             fn read(&self, key: &str) -> Result<String, KeyringError> {
                 assert!(!(key == self.new_key && self.interrupt_read.get()));
+                if self.refuse_readback.get()
+                    && self
+                        .keys
+                        .borrow()
+                        .get(key)
+                        .is_some_and(|value| value == "edited")
+                {
+                    return Err(KeyringError::Locked);
+                }
                 self.keys
                     .borrow()
                     .get(key)
@@ -1115,6 +1179,34 @@ mod tests {
                 .0
         };
         let save = || save_account(edited.clone(), false, Some(&original), &keyring, stage);
+
+        let blocked = dir.path().join("blocked.toml");
+        for mut candidate in [original.clone(), edited.clone()] {
+            candidate.password = PasswordSource::Inline("edited".into());
+            keyring.refuse_readback.set(true);
+            assert!(matches!(
+                save_account(candidate.clone(), false, Some(&original), &keyring, stage),
+                Err(SaveAccountError::Keyring { .. })
+            ));
+            keyring.refuse_readback.set(false);
+            assert_eq!(keyring.keys.borrow().len(), 1);
+            assert_eq!(original.resolve_password_with(&keyring).unwrap(), "fixture");
+
+            let blocked =
+                blocked.with_file_name(candidate.port.to_string() + &candidate.credential_key());
+            assert!(matches!(
+                save_account(candidate, false, Some(&original), &keyring, |config| {
+                    let staged =
+                        crate::mailbox::stage_account_config_at(blocked.clone(), config, true)?;
+                    std::fs::write(&blocked, "another account").unwrap();
+                    Ok(staged)
+                }),
+                Err(SaveAccountError::File(AccountFileError::AlreadyConfigured))
+            ));
+            assert_eq!(published(), original);
+            assert_eq!(keyring.keys.borrow().len(), 1);
+            assert_eq!(original.resolve_password_with(&keyring).unwrap(), "fixture");
+        }
 
         keyring.interrupt_read.set(true);
         assert!(catch_unwind(AssertUnwindSafe(save)).is_err());

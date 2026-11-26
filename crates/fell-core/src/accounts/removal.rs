@@ -268,7 +268,13 @@ impl Registry {
             .then(|| Store::open_existing_without_index(&mailbox))
             .transpose()
             .map_err(|err| err.to_string())?;
-        keep(&account, directory, &AccountId(id.into()), store.as_ref())
+        keep(
+            &account,
+            directory,
+            &AccountId(id.into()),
+            store.as_ref(),
+            snapshot,
+        )
     }
 
     pub fn remove_if_unchanged(
@@ -410,7 +416,7 @@ impl Registry {
             Err(err) => return Err(err.to_string()),
         };
         if !delete {
-            keep(&account, &directory, &id, store.as_ref())?;
+            keep(&account, &directory, &id, store.as_ref(), &config.1)?;
             return Ok(RemovalOutcome::Kept);
         }
 
@@ -734,13 +740,32 @@ fn keep(
     directory: &File,
     id: &AccountId,
     store: Option<&Store>,
+    snapshot: &str,
 ) -> Result<(), String> {
-    if let Some(store) = store {
-        store
-            .disable_account_grants(id)
+    let result = (|| -> Result<(), String> {
+        let Some(store) = store else {
+            return disconnect(account, directory).map_err(|err| err.to_string());
+        };
+        let tx = crate::store::immediate_transaction(store.connection())
             .map_err(|err| err.to_string())?;
+        crate::agent::disable_account_grants_on(&tx, id).map_err(|err| err.to_string())?;
+        // Preserve the grant rows and their revisions if disconnect fails.
+        disconnect(account, directory).map_err(|err| err.to_string())?;
+        tx.commit().map_err(|err| err.to_string())
+    })();
+    if let Err(error) = &result
+        && account
+            .symlink_metadata()
+            .is_err_and(|err| err.kind() == io::ErrorKind::NotFound)
+    {
+        let parent = account
+            .parent()
+            .expect("account file has a parent directory");
+        publish(parent, account, snapshot.as_bytes())
+            .and_then(|_| directory.sync_all())
+            .map_err(|restore| format!("{error}; couldn't restore the account file: {restore}"))?;
     }
-    disconnect(account, directory).map_err(|err| err.to_string())
+    result
 }
 
 fn sync_dir(path: &Path) -> io::Result<()> {
