@@ -290,6 +290,7 @@ fn merge_from_disk(hub: &DraftHub, id: &str, folder: &std::path::Path) {
 pub(crate) struct DraftHome {
     pub root: PathBuf,
     pub store: PathBuf,
+    account_file: Option<PathBuf>,
 }
 
 impl DraftHome {
@@ -298,7 +299,17 @@ impl DraftHome {
         Self {
             root: fell_core::compose::draft_root(),
             store,
+            account_file: crate::mailbox::account_config_path(),
         }
+    }
+
+    fn account_config(&self, account: &AccountId) -> Option<fell_core::AccountConfig> {
+        if fell_core::is_demo_account(account) {
+            return None;
+        }
+        self.account_file
+            .as_ref()
+            .and_then(|path| crate::mailbox::send_config_at(path, account).ok())
     }
 
     /// Start a new, empty draft from `from` on `account` and make it live
@@ -357,30 +368,19 @@ impl DraftHome {
         files: Vec<ResolvedFile>,
     ) -> Result<String, String> {
         let id = new_draft_id();
-        if files.is_empty() {
-            DraftSession::start_reply_in(
-                &self.root,
-                &id,
-                account.clone(),
-                start.fields,
-                &body,
-                &start.parts,
-                &self.store,
-            )?;
+        let draft = new_compose_row(
+            &id,
+            account,
+            start,
+            body,
+            files,
+            self.account_config(account).as_ref(),
+        );
+        if draft.files.is_empty() {
+            DraftSession::start_stored_in(&self.root, draft, &self.store)?;
         } else {
             let store = fell_core::Store::open(&self.store).map_err(|err| err.to_string())?;
-            store
-                .save_compose(&StoredCompose {
-                    id: id.clone(),
-                    account_id: account.clone(),
-                    fields: start.fields,
-                    body,
-                    files,
-                    identities: Vec::new(),
-                    owner: String::new(),
-                    reply: start.parts,
-                })
-                .map_err(|err| err.to_string())?;
+            store.save_compose(&draft).map_err(|err| err.to_string())?;
         }
         self.open(hub, &id, account)?;
         Ok(id)
@@ -433,16 +433,14 @@ impl DraftHome {
         let store = fell_core::Store::open(&self.store).map_err(|err| err.to_string())?;
         let action = store
             .save_suggested_reply(
-                &StoredCompose {
-                    id: id.to_owned(),
-                    account_id: account.clone(),
-                    fields: start.fields,
-                    body: String::new(),
-                    files: Vec::new(),
-                    identities: Vec::new(),
-                    owner: String::new(),
-                    reply: start.parts,
-                },
+                &new_compose_row(
+                    id,
+                    account,
+                    start,
+                    String::new(),
+                    Vec::new(),
+                    self.account_config(account).as_ref(),
+                ),
                 &fell_core::ThreadId(note.thread.clone()),
                 note.id,
                 position,
@@ -499,7 +497,10 @@ impl DraftHome {
         if refreshed.is_none() {
             return Err("the draft is no longer in the mailbox".into());
         }
-        let session = DraftSession::open_with_store(&folder, account.clone(), store)?;
+        let mut session = DraftSession::open_with_store(&folder, account.clone(), store)?;
+        if let Some(config) = self.account_config(account) {
+            session.set_identities(config.compose_identities());
+        }
         if hub.insert_new(session) {
             // The sync notification could have arrived after the lock was
             // read and before the session became visible to the hub.
@@ -510,6 +511,55 @@ impl DraftHome {
             hub.with_session(id, |live| live.flush()).transpose()?;
         }
         Ok(())
+    }
+}
+
+fn new_compose_row(
+    id: &str,
+    account: &AccountId,
+    start: ReplyStart,
+    mut body: String,
+    files: Vec<ResolvedFile>,
+    config: Option<&fell_core::AccountConfig>,
+) -> StoredCompose {
+    let ReplyStart { mut fields, parts } = start;
+    let configured = config.map(fell_core::AccountConfig::compose_identities);
+    let from = fell_core::compose::email_of(&fields.from);
+    let identity = config
+        .filter(|config| !config.identities.is_empty())
+        .and(configured.as_ref())
+        .and_then(|identities| {
+            identities
+                .iter()
+                .find(|identity| {
+                    from.as_ref()
+                        .is_some_and(|from| identity.address.eq_ignore_ascii_case(from))
+                })
+                .or_else(|| identities.first())
+        });
+    let signature = identity.map(|identity| {
+        fields.from = identity.from_header();
+        let signature = fell_core::compose::signature_block(identity);
+        fell_core::compose::append_signature(&mut body, &signature);
+        signature
+    });
+    StoredCompose {
+        id: id.to_string(),
+        account_id: account.clone(),
+        fields,
+        body,
+        files,
+        identities: configured
+            .map(|identities| {
+                identities
+                    .into_iter()
+                    .map(|identity| identity.address)
+                    .collect()
+            })
+            .unwrap_or_else(|| from.into_iter().collect()),
+        managed_signature: signature,
+        owner: String::new(),
+        reply: parts,
     }
 }
 
@@ -715,6 +765,75 @@ pub(crate) mod tests {
     use std::io::{BufRead, BufReader, Write};
 
     #[test]
+    fn external_compose_uses_the_default_identity_and_signs_after_the_body() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Some(root) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let settings = "email = 'primary@example.com'\nname = 'Primary'\npassword = 'test'\n\
+                        [[identities]]\naddress = 'alias@example.com'\nname = 'Studio'\n\
+                        [[identities]]\naddress = 'primary@example.com'\nsignature = 'Primary team'\n";
+        let path = crate::mailbox::account_config_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, settings).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let account = fell_core::AccountConfig::parse(settings).unwrap().account();
+        let db = root.join("mail.db");
+        fell_core::Store::open(&db)
+            .unwrap()
+            .upsert_account(&account)
+            .unwrap();
+        let home = DraftHome::real(db);
+        let hub = DraftHub::new();
+        let mailto = crate::compose_launch::mailto(
+            "mailto:team@example.org?body=use_snake_case%0A%2A%2Anote%2A%2A",
+        )
+        .unwrap();
+        let cli = crate::compose_launch::cli(&[
+            "--to=team@example.org".into(),
+            "--body=use_snake_case\n**note**".into(),
+        ])
+        .unwrap();
+
+        for (launch, literal) in [(mailto, true), (cli, false)] {
+            let (fields, body) = launch.input.into_fields_and_body(account.email.clone());
+            let id = home
+                .new_seeded(
+                    &hub,
+                    &account.id,
+                    ReplyStart {
+                        fields,
+                        parts: ReplyParts::default(),
+                    },
+                    body.clone(),
+                    launch.files,
+                )
+                .unwrap();
+            hub.with_session(&id, |session| {
+                assert_eq!(session.fields().from, "Primary <primary@example.com>");
+                let signature = "-- \nPrimary team\n";
+                assert_eq!(session.managed_signature(), Some(signature));
+                let separator = if literal { "\n" } else { "\n\n" };
+                assert_eq!(session.body(), format!("{body}{separator}{signature}"));
+                session.mark_seen();
+                let outgoing = session.prepare_send().unwrap();
+                assert_eq!(
+                    outgoing.plain,
+                    format!("use_snake_case\n**note**\n\n{signature}")
+                );
+                assert_eq!(outgoing.html.contains("<strong>note</strong>"), !literal);
+                assert!(
+                    outgoing
+                        .mime
+                        .starts_with(b"From: Primary <primary@example.com>\r\n")
+                );
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
     fn a_second_compose_invocation_delivers_a_personal_draft_to_the_inbox() {
         // TMPDIR can be longer than a Unix socket address can hold.
         let mut socket_dir = None;
@@ -809,6 +928,7 @@ pub(crate) mod tests {
         DraftHome {
             root: root.join("drafts"),
             store,
+            account_file: None,
         }
     }
 
@@ -920,6 +1040,7 @@ pub(crate) mod tests {
                     inline: false,
                 }],
                 identities: vec![account.email.clone()],
+                managed_signature: None,
                 owner: "agent:atlas".into(),
                 reply: ReplyParts {
                     references: vec!["<parent@example.com>".into()],
@@ -1319,6 +1440,7 @@ pub(crate) mod tests {
                 body: "Yes.\n".into(),
                 files: Vec::new(),
                 identities: vec![account.email.clone()],
+                managed_signature: None,
                 owner: String::new(),
                 reply: Default::default(),
             })
@@ -1373,6 +1495,7 @@ pub(crate) mod tests {
                 body: "Yes.\n".into(),
                 files: Vec::new(),
                 identities: vec![account.email.clone()],
+                managed_signature: None,
                 owner: String::new(),
                 reply: Default::default(),
             })

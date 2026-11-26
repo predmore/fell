@@ -414,7 +414,13 @@ impl MailBackend for BridgeBackend {
         pending: PendingSend,
         confirmation: UserSendConfirmation,
     ) -> Result<SentMessage> {
-        crate::smtp::confirm_send(&self.smtp, &self.imap, pending, confirmation)
+        crate::smtp::confirm_send(
+            &self.account_id,
+            &self.smtp,
+            &self.imap,
+            pending,
+            confirmation,
+        )
     }
 }
 
@@ -505,7 +511,13 @@ impl MailBackend for ImapBackend {
         pending: PendingSend,
         confirmation: UserSendConfirmation,
     ) -> Result<SentMessage> {
-        crate::smtp::confirm_send(&self.smtp, &self.config, pending, confirmation)
+        crate::smtp::confirm_send(
+            &self.account_id,
+            &self.smtp,
+            &self.config,
+            pending,
+            confirmation,
+        )
     }
 }
 
@@ -559,7 +571,7 @@ pub fn backend_for(
         return Ok(Box::new(FixtureBackend::default()));
     }
     match config {
-        Some(config) if config.id == account_id.as_str() => config.backend(),
+        Some(config) if config.id == account_id.as_str() => config.backend_from_account_file(),
         _ => Err(Error::UnknownAccount(format!(
             "{}: no account file entry for it; run fell account setup",
             account_id.as_str()
@@ -721,10 +733,9 @@ mod tests {
             PasswordSource::Command("printf 'from-command'".into()),
         );
         assert!(backend_for(&AccountId("mail".into()), Some(&file)).is_ok());
-        let bridge = file.bridge_backend().unwrap();
-        assert_eq!(bridge.imap.username, "a@b");
-        assert_eq!(bridge.imap.password, "from-command");
-        assert_eq!(bridge.smtp, SmtpConfig::bridge_local());
+        let imap = file.imap_config().unwrap();
+        assert_eq!(imap.username, "a@b");
+        assert_eq!(imap.password, "from-command");
     }
 
     #[test]
@@ -733,6 +744,7 @@ mod tests {
         let pending = backend
             .submit_draft(Draft {
                 account_id: AccountId("a".into()),
+                from: "jon@example.com".into(),
                 to: vec!["b@x".into()],
                 cc: vec![],
                 bcc: vec![],

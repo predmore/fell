@@ -254,6 +254,7 @@ pub fn markdown_to_doc(source: &str) -> StyledDoc {
     let lines = split_lines(source);
     let mut blocks = Vec::new();
     let mut index = 0;
+    let mut signature = false;
     while index < lines.len() {
         let line = &lines[index];
         if line.text.trim().is_empty() {
@@ -293,7 +294,14 @@ pub fn markdown_to_doc(source: &str) -> StyledDoc {
             index = next;
             continue;
         }
-        let (text, end, next) = take_paragraph(&lines, index);
+        // A mail signature starts at the delimiter and keeps its address,
+        // role and other short lines distinct in styled compose and HTML.
+        signature |= line.text == "-- ";
+        let (text, end, next) = if signature {
+            (line.text.to_string(), line.end, index + 1)
+        } else {
+            take_paragraph(&lines, index)
+        };
         let inlines = parse_inlines(text.trim());
         if let [Inline::Image { alt, src }] = inlines.as_slice() {
             blocks.push(Block {
@@ -742,6 +750,7 @@ fn take_paragraph(lines: &[SrcLine<'_>], start: usize) -> (String, usize, usize)
     while index < lines.len() {
         let line = lines[index].text;
         if line.trim().is_empty()
+            || line == "-- "
             || line.starts_with("```")
             || line.starts_with('>')
             || is_heading(line)
@@ -1181,6 +1190,17 @@ fn decode_entities(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_markdown_signature_keeps_its_lines() {
+        let html = doc_to_html(&markdown_to_doc(
+            "Two lines of\nnormal text\n\n-- \n**Studio**\n*Research*\n",
+        ));
+        assert!(html.contains(">Two lines of normal text</p>"));
+        assert!(html.contains(">--</p>"));
+        assert!(html.contains("><strong>Studio</strong></p>"));
+        assert!(html.contains("><em>Research</em></p>"));
+    }
 
     #[test]
     fn markdown_and_html_share_a_document() {

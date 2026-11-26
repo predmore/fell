@@ -8,7 +8,7 @@ use fell_core::embed::{
     LocalEmbedder, MINILM_L6_V2_INT8, ModelError, default_models_dir, load_local_embedder,
     model_dir, remove_model,
 };
-use fell_core::{AccountConfig, BackendKind};
+use fell_core::{AccountConfig, BackendKind, Identity};
 use futures::channel::mpsc;
 use futures::{FutureExt, StreamExt};
 use gpui::{
@@ -96,11 +96,20 @@ pub(super) struct View {
     page: Option<Page>,
     page_fade: Option<Transition>,
     server: Option<String>,
+    identities: Vec<Identity>,
+    identity_read: Option<gpui::Task<()>>,
+    identity_candidates: Option<Result<Vec<IdentityCandidate>, String>>,
+    importing_identities: bool,
     setup: Option<gpui::AnyWindowHandle>,
     model_root: Option<PathBuf>,
     model: ModelStatus,
     model_generation: u64,
     model_notice: Option<(String, bool)>,
+}
+
+struct IdentityCandidate {
+    address: String,
+    selected: bool,
 }
 
 impl View {
@@ -140,6 +149,12 @@ impl View {
                     BackendKind::ProtonApi => "Proton Mail".into(),
                 }
             }),
+            identities: account
+                .map(AccountConfig::compose_identities)
+                .unwrap_or_default(),
+            identity_read: None,
+            identity_candidates: None,
+            importing_identities: false,
             setup: None,
             model_root,
             model,
@@ -149,8 +164,11 @@ impl View {
     }
 
     pub fn availability(&self) -> Availability {
+        let configured = account_file_exists(mailbox::account_config_path().as_deref());
         Availability {
-            account_setup: !account_file_exists(mailbox::account_config_path().as_deref()),
+            account_setup: !configured,
+            edit_account: configured,
+            identity_count: if configured { self.identities.len() } else { 0 },
             install_model: matches!(
                 self.model,
                 ModelStatus::Checking | ModelStatus::Missing | ModelStatus::NeedsRepair
@@ -315,6 +333,7 @@ impl Inbox {
                 if this
                     .update(cx, |inbox, cx| {
                         inbox.apply_settings(snapshot, theme, motion, cx);
+                        inbox.refresh_settings_identities(cx);
                         if let Some(error) = save_error {
                             inbox.settings_notice(
                                 format!("Could not save settings · {error}"),
@@ -405,6 +424,17 @@ impl Inbox {
                 self.settings_notice("Could not save settings", true, cx);
             }
             Request::AccountSetup => self.open_account_setup(cx),
+            Request::EditAccount => self.open_account_editor(cx),
+            Request::ReadIdentityCandidates => self.read_identity_candidates(cx),
+            Request::ToggleIdentityCandidate(index) => {
+                if !self.settings_view.importing_identities
+                    && let Some(Ok(candidates)) = &mut self.settings_view.identity_candidates
+                    && let Some(candidate) = candidates.get_mut(index)
+                {
+                    candidate.selected = !candidate.selected;
+                }
+            }
+            Request::ImportIdentities => self.import_identities(cx),
             Request::EditKeymap => self.open_keymap(cx),
             Request::CheckModel => self.read_model_status(cx),
             Request::Scroll(lines) => {
@@ -472,6 +502,155 @@ impl Inbox {
             Ok(handle) => self.settings_view.setup = Some(handle.into()),
             Err(_) => self.settings_notice("Could not open account setup", true, cx),
         }
+    }
+
+    fn open_account_editor(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async {
+                    let path = mailbox::account_config_path()
+                        .ok_or_else(|| io::Error::other("No account file"))?;
+                    super::diagnostics::open_in_editor(&path)
+                })
+                .await;
+            if let Err(error) = result {
+                let _ = this.update(cx, |inbox, cx| {
+                    inbox.settings_notice(
+                        format!("Could not open account.toml · {error}"),
+                        true,
+                        cx,
+                    );
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub(super) fn refresh_settings_identities(&mut self, cx: &mut Context<Self>) {
+        if self.session.overlay != Overlay::Settings
+            || self.session.settings_nav.page != Page::Section(Section::Accounts)
+        {
+            return;
+        }
+        let account = self.account_id.clone();
+        let read = cx.background_executor().spawn(async move {
+            mailbox::send_account_config(&account)
+                .map(|config| config.map_or_else(Vec::new, |config| config.compose_identities()))
+        });
+        self.settings_view.identity_read = Some(cx.spawn(async move |this, cx| {
+            let result = read.await;
+            let _ = this.update(cx, |inbox, cx| {
+                if let Ok(identities) = result
+                    && inbox.settings_view.identities != identities
+                {
+                    inbox.settings_view.identities = identities;
+                    inbox.refresh_settings_availability();
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    fn read_identity_candidates(&mut self, cx: &mut Context<Self>) {
+        self.settings_view.identity_candidates = None;
+        let account = self.account_id.clone();
+        let history = self.store.call({
+            let account = account.clone();
+            move |store| store.delivery_addresses(&account)
+        });
+        let config = cx.background_executor().spawn(async move {
+            mailbox::send_account_config(&account)
+                .map_err(|err| err.to_string())?
+                .ok_or_else(|| "No account file".to_string())
+        });
+        cx.spawn(async move |this, cx| {
+            let result = async {
+                let config = config.await?;
+                let candidates = history
+                    .await
+                    .map_err(|_| "Mailbox reader stopped".to_string())?
+                    .map_err(|err| err.to_string())?;
+                let known = config.compose_identities();
+                Ok(candidates
+                    .into_iter()
+                    .filter(|address| {
+                        !known
+                            .iter()
+                            .any(|identity| identity.address.eq_ignore_ascii_case(address))
+                    })
+                    .map(|address| IdentityCandidate {
+                        address,
+                        selected: false,
+                    })
+                    .collect::<Vec<_>>())
+            }
+            .await;
+            let _ = this.update(cx, |inbox, cx| {
+                if inbox.session.overlay == Overlay::Settings
+                    && inbox.session.settings_nav.page == Page::IdentityImport
+                {
+                    inbox.session.settings_nav.identity_candidates =
+                        result.as_ref().map_or(0, Vec::len);
+                    inbox.session.settings_nav.selected = 0;
+                    inbox.settings_view.identity_candidates = Some(result);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn import_identities(&mut self, cx: &mut Context<Self>) {
+        if self.settings_view.importing_identities {
+            return;
+        }
+        let Some(Ok(candidates)) = &self.settings_view.identity_candidates else {
+            return;
+        };
+        let addresses: Vec<_> = candidates
+            .iter()
+            .filter(|candidate| candidate.selected)
+            .map(|candidate| candidate.address.clone())
+            .collect();
+        if addresses.is_empty() {
+            return;
+        }
+        self.settings_view.importing_identities = true;
+        let account = self.account_id.clone();
+        let count = addresses.len();
+        let task = cx
+            .background_executor()
+            .spawn(async move { mailbox::import_identities(&account, addresses) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |inbox, cx| {
+                inbox.settings_view.importing_identities = false;
+                match result {
+                    Ok(config) => {
+                        inbox.settings_view.identity_read = None;
+                        inbox.settings_view.identities = config.compose_identities();
+                        inbox.refresh_settings_availability();
+                        if inbox.session.settings_nav.page == Page::IdentityImport {
+                            inbox.session.settings_nav.back();
+                        }
+                        let notice = if count == 1 {
+                            "Imported 1 sender address".to_string()
+                        } else {
+                            format!("Imported {count} sender addresses")
+                        };
+                        inbox.settings_notice(notice, false, cx);
+                    }
+                    Err(error) => inbox.settings_notice(
+                        format!("Couldn't import addresses · {error}"),
+                        true,
+                        cx,
+                    ),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn open_keymap(&mut self, cx: &mut Context<Self>) {
@@ -687,6 +866,7 @@ const ACCOUNT_SUMMARY_HEIGHT: f32 = 80.;
 const BODY_PADDING: f32 = 16.;
 const BINDING_ROW_HEIGHT: f32 = 39.;
 const MAX_BINDING_ROWS: f32 = 9.;
+const IDENTITY_ROW_HEIGHT: f32 = 48.;
 const INDEX_FOOTER_HEIGHT: f32 = 21.;
 const SEARCH_SUMMARY_HEIGHT: f32 = 70.;
 const VALUE_TEXT_SIZE: f32 = 13.;
@@ -714,14 +894,21 @@ pub(super) fn card_height(nav: &nav::Nav, room: f32, narrow: bool) -> f32 {
                 })
                 .sum::<f32>()
                 + match section {
-                    Section::Accounts if nav.availability.account_setup => ACCOUNT_SUMMARY_HEIGHT,
-                    Section::Accounts => ACCOUNT_SUMMARY_HEIGHT - 10.,
+                    Section::Accounts => {
+                        ACCOUNT_SUMMARY_HEIGHT
+                            + if nav.availability.identity_count > 0 {
+                                28. + nav.availability.identity_count as f32 * IDENTITY_ROW_HEIGHT
+                            } else {
+                                0.
+                            }
+                    }
                     Section::Search => SEARCH_SUMMARY_HEIGHT,
                     _ => 0.,
                 }
         }
         Page::ConfirmModel { install: true } if narrow => 445.,
         Page::ConfirmModel { .. } => 370.,
+        Page::IdentityImport => 54. + (nav.identity_candidates + 1) as f32 * IDENTITY_ROW_HEIGHT,
         Page::Bindings => unreachable!(),
     };
     (HEADER_HEIGHT + rows + 18.).min(room.max(120.))
@@ -751,12 +938,14 @@ pub(super) fn card(
         Page::Index => None,
         Page::Section(_) => Some("Settings"),
         Page::Bindings => Some("Keymap"),
+        Page::IdentityImport => Some("Accounts"),
         Page::ConfirmModel { .. } => Some("Search"),
     };
     let title = match page {
         Page::Index => "Settings",
         Page::Section(section) => section.label(),
         Page::Bindings => "Effective bindings",
+        Page::IdentityImport => "Import sender addresses",
         Page::ConfirmModel { install: true } => "Install local search model",
         Page::ConfirmModel { install: false } => "Remove local search model",
     };
@@ -889,36 +1078,38 @@ pub(super) fn card(
                             )
                         });
                     control = control
-                        .child(row_label(theme, preference.label(), None, selected).child({
-                            let incoming =
-                                old_note.as_ref().map_or(1., |(_, _, incoming)| *incoming);
-                            let render = |(text, alert): (String, bool)| {
+                        .child(
+                            row_label(theme, preference.label(), None::<&str>, selected).child({
+                                let incoming =
+                                    old_note.as_ref().map_or(1., |(_, _, incoming)| *incoming);
+                                let render = |(text, alert): (String, bool)| {
+                                    div()
+                                        .text_size(px(12.))
+                                        .line_height(px(15.))
+                                        .text_color(rgb(if alert {
+                                            theme.error
+                                        } else if selected {
+                                            theme.on_selection_dim
+                                        } else {
+                                            theme.dimmed
+                                        }))
+                                        .child(text)
+                                };
                                 div()
-                                    .text_size(px(12.))
-                                    .line_height(px(15.))
-                                    .text_color(rgb(if alert {
-                                        theme.error
-                                    } else if selected {
-                                        theme.on_selection_dim
-                                    } else {
-                                        theme.dimmed
-                                    }))
-                                    .child(text)
-                            };
-                            div()
-                                .relative()
-                                .child(render(note).opacity(incoming))
-                                .when_some(old_note, |note, (old, outgoing, _)| {
-                                    note.child(
-                                        render(old)
-                                            .absolute()
-                                            .top_0()
-                                            .left_0()
-                                            .right_0()
-                                            .opacity(outgoing),
-                                    )
-                                })
-                        }))
+                                    .relative()
+                                    .child(render(note).opacity(incoming))
+                                    .when_some(old_note, |note, (old, outgoing, _)| {
+                                        note.child(
+                                            render(old)
+                                                .absolute()
+                                                .top_0()
+                                                .left_0()
+                                                .right_0()
+                                                .opacity(outgoing),
+                                        )
+                                    })
+                            }),
+                        )
                         .child(
                             div()
                                 .w(value_column_width(preference, theme, window))
@@ -934,6 +1125,18 @@ pub(super) fn card(
                         Row::AccountSetup => (
                             "Open account setup",
                             "Connect via Bridge or IMAP.",
+                            "›",
+                            false,
+                        ),
+                        Row::EditAccount => (
+                            "Edit account.toml",
+                            "Set display names and Markdown signatures.",
+                            "↗",
+                            false,
+                        ),
+                        Row::ImportIdentities => (
+                            "Import sender addresses",
+                            "Review addresses found in delivery history.",
                             "›",
                             false,
                         ),
@@ -991,6 +1194,52 @@ pub(super) fn card(
                         .child(suffix);
                 }
                 body = body.child(control);
+            }
+
+            if section == Section::Accounts && session.settings_nav.availability.identity_count > 0
+            {
+                body = body.child(
+                    div()
+                        .px(px(10.))
+                        .h(px(28.))
+                        .flex()
+                        .items_center()
+                        .text_color(rgb(theme.dimmed))
+                        .text_size(px(12.))
+                        .child("Sender identities"),
+                );
+                for (index, identity) in view.identities.iter().enumerate() {
+                    let label = if identity.name.is_empty() {
+                        &identity.address
+                    } else {
+                        &identity.name
+                    };
+                    let secondary =
+                        (!identity.name.is_empty()).then_some(identity.address.as_str());
+                    body = body.child(
+                        div()
+                            .h(px(IDENTITY_ROW_HEIGHT))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px(px(10.))
+                            .child(row_label(
+                                theme,
+                                crate::present::display_safe(label),
+                                secondary.map(crate::present::display_safe),
+                                false,
+                            ))
+                            .when(index == 0, |row| {
+                                row.child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(12.))
+                                        .text_color(rgb(theme.dimmed))
+                                        .child("Default"),
+                                )
+                            }),
+                    );
+                }
             }
 
             details = match section {
@@ -1071,7 +1320,7 @@ pub(super) fn card(
                         .flex()
                         .items_center()
                         .gap(px(8.))
-                        .child(row_label(theme, action.label(), None, false))
+                        .child(row_label(theme, action.label(), None::<&str>, false))
                         .child(
                             div()
                                 .flex()
@@ -1104,6 +1353,101 @@ pub(super) fn card(
             };
             binding_edges = (offset < -1., scrollable + offset > 1.);
         }
+        Page::IdentityImport => match &view.identity_candidates {
+            Some(Ok(candidates)) if !candidates.is_empty() => {
+                body = body.child(
+                    div()
+                        .px(px(10.))
+                        .py(px(6.))
+                        .text_size(px(12.))
+                        .line_height(px(17.))
+                        .text_color(rgb(theme.dimmed))
+                        .child("Found in delivered mail. Selected addresses go into account.toml."),
+                );
+                for (index, candidate) in candidates.iter().enumerate() {
+                    let label = crate::present::display_safe(&candidate.address);
+                    let focused = selected == index;
+                    let mark = if focused {
+                        theme.on_selection
+                    } else if candidate.selected {
+                        theme.accent
+                    } else {
+                        theme.dimmed
+                    };
+                    body = body.child(
+                        row(
+                            theme,
+                            index,
+                            selected == index,
+                            live,
+                            IDENTITY_ROW_HEIGHT,
+                            cx,
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .size(px(16.))
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(rgb(mark))
+                                .text_color(rgb(mark))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(12.))
+                                .line_height(px(14.))
+                                .when(candidate.selected, |box_| box_.child("✓")),
+                        )
+                        .child(row_label(
+                            theme,
+                            label,
+                            None::<&str>,
+                            focused,
+                        )),
+                    );
+                }
+                let count = candidates
+                    .iter()
+                    .filter(|candidate| candidate.selected)
+                    .count();
+                let label = if view.importing_identities {
+                    "Importing…".to_string()
+                } else if count == 0 {
+                    "Import selected addresses".to_string()
+                } else {
+                    format!("Import selected addresses ({count})")
+                };
+                body = body.child(
+                    row(
+                        theme,
+                        candidates.len(),
+                        selected == candidates.len(),
+                        live && count > 0 && !view.importing_identities,
+                        IDENTITY_ROW_HEIGHT,
+                        cx,
+                    )
+                    .child(row_label(
+                        theme,
+                        label,
+                        None::<&str>,
+                        selected == candidates.len(),
+                    )),
+                );
+            }
+            state => {
+                let label = match state {
+                    None => "Reading delivery history…",
+                    Some(Ok(_)) => "No new addresses in delivery history",
+                    Some(Err(error)) => error,
+                };
+                body = body.child(
+                    div()
+                        .p_2()
+                        .text_color(rgb(theme.dimmed))
+                        .child(label.to_string()),
+                );
+            }
+        },
         Page::ConfirmModel { install } => {
             body = body.child(if install {
                 install_plan(theme, view.model_root.as_deref())
@@ -1287,8 +1631,8 @@ fn row(
 
 fn row_label(
     theme: &theme::Theme,
-    label: &'static str,
-    description: Option<&'static str>,
+    label: impl Into<gpui::SharedString>,
+    description: Option<impl Into<gpui::SharedString>>,
     selected: bool,
 ) -> gpui::Div {
     div()
@@ -1301,7 +1645,7 @@ fn row_label(
             div()
                 .truncate()
                 .font_weight(FontWeight::MEDIUM)
-                .child(label),
+                .child(label.into()),
         )
         .when_some(description, |label, description| {
             label.child(
@@ -1313,7 +1657,7 @@ fn row_label(
                     } else {
                         theme.dimmed
                     }))
-                    .child(description),
+                    .child(description.into()),
             )
         })
 }

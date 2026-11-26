@@ -1,6 +1,7 @@
 //! Compose window. The buffer is plain markdown. Styling is a view of that
 //! text, through the same document model the conversation renderer uses.
 
+mod identity;
 mod recipient_rows;
 mod recipients;
 pub(crate) use recipients::RecipientStore;
@@ -55,6 +56,13 @@ struct Palette {
     hunk: u32,
     /// The focused agent edit: a stronger tint than the others.
     hunk_focus: u32,
+    signature: bool,
+}
+
+impl Palette {
+    fn strong(self) -> FontWeight {
+        FontWeight(if self.signature { 600. } else { 700. })
+    }
 }
 
 fn palette(kind: ThemeKind) -> Palette {
@@ -74,6 +82,7 @@ fn palette(kind: ThemeKind) -> Palette {
             rule: 0x6e675f,
             hunk: 0x243044,
             hunk_focus: 0x2e3f5c,
+            signature: false,
         },
         ThemeKind::Light => Palette {
             bg: 0xf7f5f2,
@@ -90,6 +99,7 @@ fn palette(kind: ThemeKind) -> Palette {
             rule: 0x8f877e,
             hunk: 0xe7eef8,
             hunk_focus: 0xd3e0f2,
+            signature: false,
         },
     }
 }
@@ -131,6 +141,7 @@ fn palette_from_theme(theme: &crate::theme::Theme) -> Palette {
         rule: theme.border,
         hunk,
         hunk_focus,
+        signature: false,
     }
 }
 
@@ -238,8 +249,9 @@ impl Editor {
 
     /// The cursor after the last written text, or at the top of an empty
     /// body.
-    fn cursor_to_end_of_text(&mut self) {
-        match self.lines.iter().rposition(|line| !line.trim().is_empty()) {
+    fn cursor_to_end_of_text(&mut self, signature_lines: usize) {
+        let text = &self.lines[..self.lines.len().saturating_sub(signature_lines)];
+        match text.iter().rposition(|line| !line.trim().is_empty()) {
             Some(mut row) => {
                 if self.lines[row].starts_with("```")
                     && markdown_to_doc(&self.lines[..=row].join("\n"))
@@ -339,6 +351,8 @@ pub struct ComposeView {
     leader_at: Option<std::time::Instant>,
     which_visible: bool,
     palette: Option<String>,
+    from_picker: Option<identity::Picker>,
+    identity_display: identity::Display,
     status: SharedString,
     sent: bool,
     /// The draft whose send is talking to the server. Another send of it
@@ -470,6 +484,8 @@ impl ComposeView {
             leader_at: None,
             which_visible: false,
             palette: None,
+            from_picker: None,
+            identity_display: identity::Display::default(),
             status: "".into(),
             sent: false,
             sending: None,
@@ -520,13 +536,20 @@ impl ComposeView {
                     break;
                 };
                 let account = account.clone();
-                let unavailable = cx
+                let result = cx
                     .background_executor()
-                    .spawn(async move { crate::mailbox::send_account_config(&account).err() })
+                    .spawn(async move { crate::mailbox::send_account_config(&account) })
                     .await;
                 if this
                     .update(cx, |this, cx| {
-                        if this.send_feedback.update_readiness(generation, unavailable) {
+                        let changed = this
+                            .hub
+                            .with_session(this.draft_id.as_ref(), |session| {
+                                this.send_feedback
+                                    .update_account_config(session, generation, result)
+                            })
+                            .unwrap_or(false);
+                        if changed {
                             cx.notify();
                         }
                     })
@@ -851,6 +874,26 @@ impl ComposeView {
         self.close_on_send = true;
     }
 
+    fn signature_only(&self) -> bool {
+        self.hub
+            .with_session(self.draft_id.as_ref(), |session| {
+                session.has_only_signature()
+            })
+            .unwrap_or(false)
+    }
+
+    fn resume_body(&mut self) {
+        let signature_lines = self
+            .hub
+            .with_session(self.draft_id.as_ref(), |session| {
+                session
+                    .managed_signature()
+                    .map_or(0, |block| block.lines().count())
+            })
+            .unwrap_or(0);
+        self.editor.cursor_to_end_of_text(signature_lines);
+    }
+
     /// A draft with nobody to send it to yet starts on the To line, ready
     /// to type, as a new draft from `c` does.
     fn start_on_recipients_if_empty(&mut self, snap: &Snapshot) {
@@ -859,7 +902,7 @@ impl ComposeView {
             self.field = Field::To;
             self.status = "".into();
             // Tab from Subject carries the typing on after what is written.
-            self.editor.cursor_to_end_of_text();
+            self.resume_body();
         }
     }
 
@@ -877,10 +920,11 @@ impl ComposeView {
             return;
         }
         self.start_on_recipients_if_empty(&snap);
+        let signature_only = self.signature_only();
         if snap.send_requested_by.is_none()
             && self.field == Field::Body
             && snap.in_reply_to.is_some()
-            && snap.body.trim().is_empty()
+            && (snap.body.trim().is_empty() || signature_only)
         {
             // A new reply: the next thing is always typing, as after `c`.
             self.editor.row = 0;
@@ -889,9 +933,14 @@ impl ComposeView {
             self.status = "insert".into();
             return;
         }
+        if signature_only {
+            self.editor.row = 0;
+            self.editor.col = 0;
+            return;
+        }
         if snap.send_requested_by.is_none() {
             // The person's own draft: pick up where the text ends.
-            self.editor.cursor_to_end_of_text();
+            self.resume_body();
             return;
         }
         // No edits yet: start on the first line of text, so the first view
@@ -984,6 +1033,8 @@ impl ComposeView {
         self.send_check = None;
         self.send_panel = SendPanel::Summary;
         self.palette = None;
+        self.from_picker = None;
+        self.identity_display = identity::Display::default();
         self.leader = false;
         self.which_visible = false;
         self.quote_open = false;
@@ -1445,6 +1496,7 @@ impl ComposeView {
         self.editor.count = 0;
         self.bracket = None;
         self.touched = true;
+        self.identity_display.settle();
         cx.notify();
     }
 
@@ -1454,6 +1506,7 @@ impl ComposeView {
             return;
         }
         self.touched = true;
+        self.identity_display.settle();
         let key = compose_key(&event.keystroke);
         let key = key.as_str();
         if self.send_panel != SendPanel::Summary {
@@ -1473,6 +1526,19 @@ impl ComposeView {
             event.keystroke.key_char.as_deref().filter(|_| {
                 !event.keystroke.modifiers.control && !event.keystroke.modifiers.platform
             });
+        if self
+            .from_picker
+            .as_ref()
+            .is_some_and(identity::Picker::active)
+        {
+            let key = match (key, event.keystroke.modifiers.control) {
+                ("p", true) => "up",
+                ("n", true) => "down",
+                _ => key,
+            };
+            self.identity_key(key, typed, cx);
+            return;
+        }
         if let Some(Some(lock)) = self.hub.with_session(&id, |session| session.send_lock())
             && key != "escape"
         {
@@ -1532,7 +1598,9 @@ impl ComposeView {
             return;
         }
         if self.field != Field::Body {
-            if palette_shortcut {
+            if key == "f" && event.keystroke.modifiers.control {
+                self.open_identity_picker();
+            } else if palette_shortcut {
                 self.palette = Some(String::new());
             } else if !self.recipient_key(key, &event.keystroke.modifiers) {
                 self.field_key(key, typed);
@@ -1588,12 +1656,13 @@ impl ComposeView {
             .with_session(self.draft_id.as_ref(), |session| session.send_lock())
             .flatten();
         if let Some(lock) = locked
-            && matches!(action, "quote" | "keep" | "reject" | "undo")
+            && matches!(action, "quote" | "keep" | "reject" | "undo" | "from")
         {
             self.status = lock.reason().into();
             return;
         }
         match action {
+            "from" => self.open_identity_picker(),
             "unlock" if locked == Some(SendLock::MaybeSent) => {
                 self.status = "".into();
                 self.send_panel = SendPanel::ConfirmUnlock;
@@ -1723,6 +1792,10 @@ impl ComposeView {
 
     fn leader_key(&mut self, key: &str, cx: &mut Context<Self>) {
         match key {
+            "c" => {
+                self.status = "compose: f From".into();
+                return;
+            }
             "m" => {
                 self.status =
                     "mail: d discard · s send · p preview · r raw · q quote · t theme".into();
@@ -1736,7 +1809,7 @@ impl ComposeView {
                 self.status = "help: l diagnostic log".into();
                 return;
             }
-            "d" | "s" | "p" | "r" | "q" | "t" | "k" | "x" | "l" => {}
+            "d" | "s" | "p" | "r" | "q" | "t" | "k" | "x" | "l" | "f" => {}
             "escape" => {
                 self.leader = false;
                 self.which_visible = false;
@@ -1759,6 +1832,8 @@ impl ComposeView {
                 "t" => "theme",
                 _ => "",
             }
+        } else if status.starts_with("compose:") && key == "f" {
+            "from"
         } else if status.starts_with("agent") {
             match key {
                 "k" => "keep",
@@ -1772,6 +1847,9 @@ impl ComposeView {
         };
         self.leader = false;
         self.which_visible = false;
+        if status.starts_with("compose:") {
+            self.status = "".into();
+        }
         if !action.is_empty() {
             self.run_action(action, cx);
         }
@@ -2152,7 +2230,9 @@ impl Render for ComposeView {
             }
         }
         window.focus(&self.focus);
-        let (mut snap, mut lock, reply_check) = self
+        let motion = self.motion;
+        let display = &mut self.identity_display;
+        let (mut snap, mut lock, reply_check, can_pick_from, kept_signature) = self
             .hub
             .with_session(self.draft_id.as_ref(), |session| {
                 let snap = session.snapshot();
@@ -2170,9 +2250,34 @@ impl Render for ComposeView {
                         ReplyCheck::Waiting
                     }
                 });
-                (snap, session.send_lock(), check)
+                let lock = session.send_lock();
+                let can_pick = lock.is_none() && identity::can_pick(session, &snap.from);
+                let default = session.identities().first().is_none_or(|identity| {
+                    fell_core::compose::email_of(&snap.from)
+                        .is_some_and(|email| identity.address.eq_ignore_ascii_case(&email))
+                });
+                let kept = display.update(
+                    &snap.from,
+                    default,
+                    session.managed_signature(),
+                    &snap.body,
+                    motion,
+                    window,
+                );
+                (snap, lock, check, can_pick, kept)
             })
-            .unwrap_or_else(|| (empty_snapshot(self.draft_id.as_ref()), None, None));
+            .unwrap_or_else(|| {
+                let snap = empty_snapshot(self.draft_id.as_ref());
+                display.update(&snap.from, true, None, &snap.body, motion, window);
+                (snap, None, None, false, false)
+            });
+        if kept_signature {
+            cx.spawn(async |this, cx| {
+                cx.background_executor().timer(identity::NOTICE_HOLD).await;
+                let _ = this.update(cx, |_, cx| cx.notify());
+            })
+            .detach();
+        }
         // The inbox gets a chance to lay out the reply before we close.
         // Keep the in-flight footer until it takes over.
         if self.close_on_send
@@ -2237,7 +2342,7 @@ impl Render for ComposeView {
             Mode::Visual => "visual",
         };
         // The mode word says it all; how to change mode is not news.
-        let hint: SharedString = if idle_status(&self.status) {
+        let mut hint: SharedString = if idle_status(&self.status) {
             self.recipient_errors
                 .iter()
                 .flatten()
@@ -2247,6 +2352,13 @@ impl Render for ComposeView {
         } else {
             self.status.clone()
         };
+        let notice_opacity = self
+            .identity_display
+            .kept_opacity(self.motion, window)
+            .filter(|_| idle_status(&hint));
+        if notice_opacity.is_some() {
+            hint = identity::KEPT_SIGNATURE.into();
+        }
         let header_matches = self.header_matches(&snap);
         let save_exit = &mut self.draft_save_exit;
         let motion = self.motion;
@@ -2287,6 +2399,17 @@ impl Render for ComposeView {
             .look
             .as_ref()
             .and_then(|theme| theme.mono_family.clone());
+        let can_pick_from = can_pick_from && lock.is_none();
+        let from_width = identity::header_width(window.viewport_size().width, window.rem_size());
+        let from_label = self.identity_display.label(
+            recipient_theme,
+            window,
+            from_width,
+            self.ui_px,
+            &ui_family,
+            can_pick_from,
+        );
+        let from_picker = self.identity_picker_view(recipient_theme, &ui_family, window, cx);
         let feedback = feedback.map(|feedback| {
             send_feedback_view(feedback, self.send_panel, &self.send_detail_scroll, colors)
         });
@@ -2326,7 +2449,7 @@ impl Render for ComposeView {
                     .size_0(),
                 )
             })
-            .child(header(&snap, colors).flex_shrink_0())
+            .child(header(&snap, from_label, from_width, colors, can_pick_from, cx).flex_shrink_0())
             // Everything between the header and the Attachments divider:
             // the HTML preview panel covers exactly this, so it never ends
             // partway into a row below.
@@ -2371,6 +2494,7 @@ impl Render for ComposeView {
                     ComposeStatus {
                         mode,
                         note: &hint,
+                        notice_opacity,
                         draft_save,
                         invalid_recipients: self.recipient_errors.iter().any(Option::is_some),
                     },
@@ -2394,6 +2518,7 @@ impl Render for ComposeView {
                     query,
                     palette_help,
                     matches!(lock, None | Some(SendLock::MaybeSent)),
+                    can_pick_from,
                     colors,
                 )
                 .when(self.recipients.has_matches(), |panel| {
@@ -2401,6 +2526,7 @@ impl Render for ComposeView {
                 })
             }))
             .children(self.preview.then(|| preview_scrim(colors)))
+            .children(from_picker)
             .when_some(self.frames.clone(), |root, frames| {
                 frames.borrow_mut().built(std::time::Instant::now());
                 let prepaint = frames.clone();
@@ -2634,38 +2760,39 @@ impl ComposeView {
         family: &str,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let body = if !self.raw && self.field != Field::Body {
-            let key = StyledBodyKey {
-                draft_id: self.draft_id.clone(),
-                revision: snap.revision,
-                hunk: self.focused_hunk,
-                colors,
-                family: family.to_owned(),
-                text_px: self.ui_px,
-            };
-            if self
-                .styled_cache
-                .as_ref()
-                .is_none_or(|(previous, _)| *previous != key)
-            {
-                let compose = cx.weak_entity();
-                let view = cx.new(|_| CachedStyledBody {
-                    compose,
+        let body =
+            if !self.raw && self.field != Field::Body && self.identity_display.footer().is_none() {
+                let key = StyledBodyKey {
+                    draft_id: self.draft_id.clone(),
+                    revision: snap.revision,
+                    hunk: self.focused_hunk,
                     colors,
                     family: family.to_owned(),
-                });
-                self.styled_cache = Some((key, view));
-            }
-            let view = self.styled_cache.as_ref().unwrap().1.clone();
-            let mut style = div().flex_1().min_h_0().min_w_0();
-            gpui::AnyView::from(view)
-                .cached(style.style().clone())
-                .into_any_element()
-        } else {
-            self.styled_cache = None;
-            self.body_area(snap, colors, window, family, cx)
-                .into_any_element()
-        };
+                    text_px: self.ui_px,
+                };
+                if self
+                    .styled_cache
+                    .as_ref()
+                    .is_none_or(|(previous, _)| *previous != key)
+                {
+                    let compose = cx.weak_entity();
+                    let view = cx.new(|_| CachedStyledBody {
+                        compose,
+                        colors,
+                        family: family.to_owned(),
+                    });
+                    self.styled_cache = Some((key, view));
+                }
+                let view = self.styled_cache.as_ref().unwrap().1.clone();
+                let mut style = div().flex_1().min_h_0().min_w_0();
+                gpui::AnyView::from(view)
+                    .cached(style.style().clone())
+                    .into_any_element()
+            } else {
+                self.styled_cache = None;
+                self.body_area(snap, colors, window, family, cx)
+                    .into_any_element()
+            };
         let mut column = div()
             .flex()
             .flex_col()
@@ -2714,6 +2841,7 @@ impl ComposeView {
             view: cx.weak_entity(),
             row: self.editor.row,
             window,
+            signature_swap: self.identity_display.footer(),
         };
         div()
             .id("compose-body")
@@ -3192,8 +3320,16 @@ impl PreparedSend {
     }
 }
 
-fn header(snap: &Snapshot, colors: Palette) -> gpui::Div {
+fn header(
+    snap: &Snapshot,
+    from_label: gpui::Div,
+    from_width: gpui::Pixels,
+    colors: Palette,
+    can_pick_from: bool,
+    cx: &mut Context<ComposeView>,
+) -> gpui::Div {
     let title = div()
+        .flex_1()
         .flex()
         .flex_wrap()
         .gap_x_2()
@@ -3222,9 +3358,22 @@ fn header(snap: &Snapshot, colors: Palette) -> gpui::Div {
         .child(title)
         .child(
             div()
-                .flex_shrink_0()
+                .id("compose-from")
+                .w(from_width)
+                .flex_none()
+                .justify_end()
+                .min_w_0()
+                .flex()
+                .items_center()
                 .text_color(rgb(colors.dim))
-                .child(format!("from {}", snap.from)),
+                .when(can_pick_from, |from| {
+                    from.cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.open_identity_picker();
+                            cx.notify();
+                        }))
+                })
+                .child(from_label),
         )
 }
 
@@ -3862,21 +4011,39 @@ fn styled_body(
     was_lines: &dyn Fn(&str) -> Vec<String>,
 ) -> gpui::Div {
     let text = editor.text();
-    let doc = markdown_to_doc(&text);
+    // Keep the normal block painter for a footer under agent review, so its
+    // changed text and the previous version stay visible together.
+    let (signature, body_end) = signature_start(editor)
+        .map(|row| (row, cursor_byte(&text, row, 0)))
+        .filter(|&(_, start)| hunks.iter().all(|(_, end, _, _)| *end <= start))
+        .map_or((None, text.len()), |(row, start)| (Some(row), start));
+    let body_text = &text[..body_end];
+    let doc = markdown_to_doc(body_text);
     let mut column = div().flex().flex_col();
     let mut previous: Option<&BlockBody> = None;
-    let items: Vec<BodyItem> = if editor.caret_hidden {
-        // Typing goes to a header field: every block shows styled, with
-        // no caret line, so there is one caret on screen.
-        (0..doc.blocks.len())
-            .map(|index| BodyItem::Block { index, raw: false })
-            .collect()
-    } else {
-        body_layout(&text, editor.row, editor.col, &doc)
-    };
+    let mut previous_blank = false;
+    let caret = (!editor.caret_hidden && signature.is_none_or(|row| editor.row < row))
+        .then_some((editor.row, editor.col));
+    let items = body_layout(
+        body_text,
+        caret,
+        &doc,
+        signature.is_some() || paint.signature_swap.is_some(),
+    );
     for (index, item) in items.into_iter().enumerate() {
+        let blank = matches!(item, BodyItem::BlankRow { .. });
         let (body, mut painted) = match item {
             BodyItem::CaretRow => (None, cursor_line_row(editor, paint)),
+            BodyItem::BlankRow { caret } => (
+                None,
+                if caret {
+                    cursor_line_row(editor, paint)
+                } else {
+                    div()
+                }
+                .h(paint.line_height())
+                .flex_none(),
+            ),
             BodyItem::Block { index, raw } => {
                 let block = &doc.blocks[index];
                 let edits: Vec<&(usize, usize, String, u64)> = block
@@ -3909,13 +4076,14 @@ fn styled_body(
                 ((!raw && edits.is_empty()).then_some(&block.body), painted)
             }
         };
-        if index > 0 && !joins_previous(previous, body) {
+        if index > 0 && !blank && !previous_blank && !joins_previous(previous, body) {
             painted = painted.mt_2();
         }
         previous = body;
+        previous_blank = blank;
         column = column.child(painted);
     }
-    column
+    column.children(signature_view(editor, signature, Some(links), paint))
 }
 
 /// One row of the styled body, top to bottom.
@@ -3923,29 +4091,60 @@ fn styled_body(
 enum BodyItem {
     /// The cursor line when no block covers it, such as a blank line.
     CaretRow,
+    /// A source line reserved above the signature, even without the cursor.
+    BlankRow { caret: bool },
     /// A block of the document, in source form when it holds the cursor.
     Block { index: usize, raw: bool },
 }
 
-fn body_layout(text: &str, row: usize, col: usize, doc: &StyledDoc) -> Vec<BodyItem> {
-    let cursor_at_col = cursor_byte(text, row, col);
-    let cursor_at = cursor_byte(text, row, 0);
-    let mut caret_placed = cursor_line_covered(text, row, doc);
-    let mut items = Vec::with_capacity(doc.blocks.len() + 1);
-    for (index, block) in doc.blocks.iter().enumerate() {
-        if !caret_placed && block.source.is_some_and(|(start, _)| cursor_at < start) {
-            items.push(BodyItem::CaretRow);
-            caret_placed = true;
+fn body_layout(
+    text: &str,
+    caret: Option<(usize, usize)>,
+    doc: &StyledDoc,
+    keep_blank_lines: bool,
+) -> Vec<BodyItem> {
+    let mut rows = Vec::new();
+    if keep_blank_lines {
+        let mut start = 0;
+        for (row, line) in text.split_inclusive('\n').enumerate() {
+            if line.trim().is_empty() {
+                rows.push((
+                    start,
+                    BodyItem::BlankRow {
+                        caret: caret.is_some_and(|(at, _)| row == at),
+                    },
+                ));
+            }
+            start += line.len();
         }
-        let raw = match block.source {
-            Some(range) => block_holds_cursor(range, cursor_at_col, text.len()),
-            None => row == 0,
-        };
+    }
+    if let Some((row, _)) = caret.filter(|(row, _)| !cursor_line_covered(text, *row, doc)) {
+        let start = cursor_byte(text, row, 0);
+        if let Err(index) = rows.binary_search_by_key(&start, |&(offset, _)| offset) {
+            rows.insert(index, (start, BodyItem::CaretRow));
+        }
+    }
+    let cursor = caret.map(|(row, col)| cursor_byte(text, row, col));
+    let mut items = Vec::with_capacity(doc.blocks.len() + rows.len());
+    let mut rows = rows.into_iter().peekable();
+    for (index, block) in doc.blocks.iter().enumerate() {
+        if let Some((start, end)) = block.source {
+            while rows.peek().is_some_and(|&(offset, _)| offset < end) {
+                let (offset, item) = rows.next().unwrap();
+                if offset < start {
+                    items.push(item);
+                }
+            }
+        }
+        let raw = cursor.is_some_and(|cursor| {
+            block.source.map_or_else(
+                || caret.is_some_and(|(row, _)| row == 0),
+                |range| block_holds_cursor(range, cursor, text.len()),
+            )
+        });
         items.push(BodyItem::Block { index, raw });
     }
-    if !caret_placed {
-        items.push(BodyItem::CaretRow);
-    }
+    items.extend(rows.map(|(_, item)| item));
     items
 }
 
@@ -3996,7 +4195,11 @@ fn cursor_line_row(editor: &Editor, paint: &SourcePaint) -> gpui::Div {
 
 fn raw_body(editor: &Editor, paint: &SourcePaint) -> gpui::Div {
     let mut column = div().flex().flex_col().font_family("monospace");
-    for (index, line) in editor.lines.iter().enumerate() {
+    let signature = signature_start(editor);
+    for (index, line) in editor.lines[..signature.unwrap_or(editor.lines.len())]
+        .iter()
+        .enumerate()
+    {
         let cursor = !editor.caret_hidden && index == editor.row;
         column = column.child(raw_line(
             line,
@@ -4007,7 +4210,84 @@ fn raw_body(editor: &Editor, paint: &SourcePaint) -> gpui::Div {
             paint,
         ));
     }
-    column
+    column.children(signature_view(editor, signature, None, paint))
+}
+
+fn signature_start(editor: &Editor) -> Option<usize> {
+    editor
+        .lines
+        .iter()
+        .rposition(|line| line == identity::SIGNATURE_SEPARATOR)
+}
+
+fn signature_view(
+    editor: &Editor,
+    start: Option<usize>,
+    links: Option<Links>,
+    paint: &SourcePaint,
+) -> Option<gpui::AnyElement> {
+    let mut footer_paint = SourcePaint {
+        font: paint.font.clone(),
+        view: paint.view.clone(),
+        ..*paint
+    };
+    footer_paint.colors.signature = true;
+    footer_paint.colors.fg = paint.colors.dim;
+    footer_paint.colors.accent = paint.colors.dim;
+    let rows = |lines: &mut dyn Iterator<Item = &str>, start: Option<usize>| {
+        let mut footer = div()
+            .flex()
+            .flex_col()
+            .pt(px(8.))
+            .line_height(footer_paint.line_height());
+        for (offset, line) in lines.enumerate() {
+            let cursor = start
+                .filter(|&row| !editor.caret_hidden && row + offset == editor.row)
+                .map(|_| editor.col);
+            let urls = match (cursor, links) {
+                (None, Some(links)) => Urls::Fold(links),
+                _ => Urls::Source,
+            };
+            footer = footer.child(raw_line(
+                line,
+                cursor,
+                urls,
+                editor.mode,
+                false,
+                &footer_paint,
+            ));
+        }
+        footer
+    };
+    let current = start.map(|start| {
+        rows(
+            &mut editor.lines[start..].iter().map(String::as_str),
+            Some(start),
+        )
+    });
+    if let Some(fade) = paint.signature_swap {
+        let old = if fade.text.is_empty() {
+            div()
+        } else {
+            rows(&mut fade.text.lines(), None)
+        };
+        let width =
+            (paint.window.viewport_size().width - paint.window.rem_size() * 2.5).max(px(1.));
+        Some(crate::view::disclosure::layered(
+            f32::from(width),
+            [
+                old.into_any_element(),
+                current.unwrap_or_else(div).into_any_element(),
+            ],
+            [fade.outgoing, fade.progress],
+            fade.progress,
+            // The outgoing text is the last content in the editor, so it
+            // can finish fading without its glyphs crossing the moving clip.
+            [false, true],
+        ))
+    } else {
+        current.map(IntoElement::into_any_element)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4207,6 +4487,17 @@ struct SourcePaint<'a> {
     view: gpui::WeakEntity<ComposeView>,
     row: usize,
     window: &'a Window,
+    signature_swap: Option<identity::FooterFade<'a>>,
+}
+
+impl SourcePaint<'_> {
+    fn line_height(&self) -> gpui::Pixels {
+        if self.colors.signature {
+            px((20. * self.text_px / 15.).round())
+        } else {
+            px(24.)
+        }
+    }
 }
 
 /// One source line. On an agent edit's `tinted` background, a link's URL
@@ -4233,7 +4524,7 @@ fn raw_line(
         .flex_row()
         .flex_wrap()
         .w_full()
-        .min_h(px(24.))
+        .min_h(paint.line_height())
         .items_center();
     let colors = paint.colors;
     source_pieces(
@@ -4299,7 +4590,7 @@ fn focused_link_text(
             }
             let mut font = font.clone();
             match kind {
-                StyleKind::Strong => font.weight = FontWeight(700.),
+                StyleKind::Strong => font.weight = colors.strong(),
                 StyleKind::Em => font.style = gpui::FontStyle::Italic,
                 StyleKind::Code => font.family = "monospace".into(),
                 _ => {}
@@ -4514,7 +4805,7 @@ fn focused_link_line(
         .flex_col()
         .w_full()
         .min_w(px(0.))
-        .min_h(px(24.))
+        .min_h(paint.line_height())
         .cursor_text()
         .when(flat_wrap, |row| row.whitespace_nowrap())
         .on_mouse_down(gpui::MouseButton::Left, move |event, _, cx| {
@@ -4661,7 +4952,7 @@ fn source_pieces(
             continue;
         }
         let weight = match span.kind {
-            StyleKind::Strong => FontWeight(700.),
+            StyleKind::Strong => colors.strong(),
             _ => FontWeight(400.),
         };
         let source = Source {
@@ -5640,6 +5931,22 @@ impl SendFeedbackState {
         true
     }
 
+    fn update_account_config(
+        &mut self,
+        session: &mut fell_core::compose::DraftSession,
+        generation: u64,
+        result: Result<Option<fell_core::AccountConfig>, AccountConfigError>,
+    ) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        let changed = match &result {
+            Ok(Some(config)) => session.set_identities(config.compose_identities()),
+            _ => false,
+        };
+        self.update_readiness(generation, result.err()) || changed
+    }
+
     fn feedback<'a>(
         &'a self,
         lock: Option<SendLock>,
@@ -5825,6 +6132,7 @@ fn idle_status(status: &str) -> bool {
 struct ComposeStatus<'a> {
     mode: &'a str,
     note: &'a str,
+    notice_opacity: Option<f32>,
     draft_save: Option<(DraftSaveStatus, f32)>,
     invalid_recipients: bool,
 }
@@ -5856,6 +6164,7 @@ fn status_bar(
     let ComposeStatus {
         mode,
         note,
+        notice_opacity,
         draft_save,
         invalid_recipients,
     } = status;
@@ -5901,7 +6210,7 @@ fn status_bar(
         Some((DraftSaveStatus::Server, alpha)) => ("saved to Drafts", colors.dim, alpha),
         Some((status, alpha)) => (status.warning().unwrap_or_default(), colors.error, alpha),
         None if idle => ("", colors.fg, 1.),
-        None => (note, colors.fg, 1.),
+        None => notice_opacity.map_or((note, colors.fg, 1.), |alpha| (note, colors.dim, alpha)),
     };
     let warning = saved.is_some_and(|(status, _)| status.warning().is_some());
     let message_measure = if warning { measure_warning } else { measure };
@@ -6158,6 +6467,8 @@ fn which_key(colors: Palette) -> gpui::Div {
                 .text_color(rgb(colors.dim))
                 .child("d discard   s send   p preview   r raw   q quote   t theme"),
         )
+        .child("space c  compose")
+        .child(div().text_color(rgb(colors.dim)).child("f  Choose From"))
         .child("space a  agent edit")
         .child(div().text_color(rgb(colors.dim)).child("k keep   x reject"))
         .child("space ?  help")
@@ -6170,9 +6481,11 @@ fn palette_view(
     query: &str,
     commands: &'static str,
     can_discard: bool,
+    can_pick_from: bool,
     colors: Palette,
 ) -> gpui::Div {
     let discard_selected = palette_action(query) == Some("discard");
+    let from_selected = palette_action(query) == Some("from");
     div()
         .absolute()
         .top(px(80.))
@@ -6201,6 +6514,29 @@ fn palette_view(
                         .when(discard_selected, |row| row.bg(rgb(colors.selection)))
                         .child(DISCARD_DRAFT_LABEL)
                         .child(div().text_color(rgb(colors.dim)).child("Space m d")),
+                )
+            },
+        )
+        .when(
+            can_pick_from && (query.trim().is_empty() || from_selected),
+            |panel| {
+                panel.child(
+                    div()
+                        .mt_2()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .text_sm()
+                        .when(from_selected, |row| row.bg(rgb(colors.selection)))
+                        .child("Choose From")
+                        .child(
+                            div()
+                                .text_color(rgb(colors.dim))
+                                .child("Ctrl-f · Space c f"),
+                        ),
                 )
             },
         )
@@ -6699,13 +7035,14 @@ fn palette_action(query: &str) -> Option<&'static str> {
     match query.as_str() {
         "complete recipient" | "complete" => return Some("complete recipient"),
         "details" => return Some("details"),
+        "choose from" => return Some("from"),
         "dismiss" => return Some("dismiss"),
         "diagnostic log" | "open diagnostic log" => return Some("diagnostic log"),
         _ => {}
     }
     let mut found = None;
     for name in [
-        "send", "preview", "raw", "quote", "theme", "keep", "reject", "undo", "close",
+        "send", "preview", "raw", "quote", "theme", "keep", "reject", "undo", "close", "from",
     ] {
         if name.starts_with(&query) {
             if found.is_some() {
@@ -7361,7 +7698,7 @@ mod tests {
         let text = "# Q3\n\nNext\n";
         let doc = markdown_to_doc(text);
         assert_eq!(
-            super::body_layout(text, 1, 0, &doc),
+            super::body_layout(text, Some((1, 0)), &doc, false),
             vec![
                 Block {
                     index: 0,
@@ -7375,7 +7712,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            super::body_layout(text, 0, 4, &doc),
+            super::body_layout(text, Some((0, 4)), &doc, false),
             vec![
                 Block {
                     index: 0,
@@ -7396,7 +7733,7 @@ mod tests {
         let doc = markdown_to_doc(text);
         assert_eq!(doc.blocks.len(), 2);
         assert_eq!(
-            super::body_layout(text, 1, 0, &doc),
+            super::body_layout(text, Some((1, 0)), &doc, false),
             vec![
                 Block {
                     index: 0,
@@ -7416,7 +7753,7 @@ mod tests {
         let text = "hello\n\n";
         let doc = markdown_to_doc(text);
         assert_eq!(
-            super::body_layout(text, 1, 0, &doc),
+            super::body_layout(text, Some((1, 0)), &doc, false),
             vec![
                 Block {
                     index: 0,
@@ -7426,7 +7763,80 @@ mod tests {
             ]
         );
         let empty = markdown_to_doc("\n");
-        assert_eq!(super::body_layout("\n", 0, 0, &empty), vec![CaretRow]);
+        assert_eq!(
+            super::body_layout("\n", Some((0, 0)), &empty, false),
+            vec![CaretRow]
+        );
+    }
+
+    #[test]
+    fn each_blank_line_above_the_signature_keeps_its_height() {
+        struct SignedBody {
+            blank_lines: usize,
+            row: usize,
+            caret_hidden: bool,
+        }
+
+        impl gpui::Render for SignedBody {
+            fn render(
+                &mut self,
+                window: &mut gpui::Window,
+                _: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                use super::*;
+                let mut editor =
+                    Editor::from_body(&format!("{}-- \nStudio\n", "\n".repeat(self.blank_lines)));
+                editor.row = self.row;
+                editor.caret_hidden = self.caret_hidden;
+                let paint = SourcePaint {
+                    colors: palette(ThemeKind::Dark),
+                    font: window.text_style().font(),
+                    text_px: 15.,
+                    view: gpui::WeakEntity::new_invalid(),
+                    row: self.row,
+                    window,
+                    signature_swap: None,
+                };
+                styled_body(
+                    &editor,
+                    Path::new(""),
+                    &[],
+                    None,
+                    Links::Label,
+                    &paint,
+                    &|_| Vec::new(),
+                )
+                .debug_selector(|| "signed-body".to_owned())
+            }
+        }
+
+        let mut app = gpui::TestAppContext::single();
+        let (view, cx) = app.add_window_view(|_, _| SignedBody {
+            blank_lines: 0,
+            row: 0,
+            caret_hidden: true,
+        });
+        let footer = cx.debug_bounds("signed-body").unwrap().size.height;
+        for blank_lines in [1, 3] {
+            for row in 0..=blank_lines {
+                for caret_hidden in [false, true] {
+                    view.update(cx, |view, cx| {
+                        *view = SignedBody {
+                            blank_lines,
+                            row,
+                            caret_hidden,
+                        };
+                        cx.notify();
+                    });
+                    cx.run_until_parked();
+                    assert_eq!(
+                        cx.debug_bounds("signed-body").unwrap().size.height - footer,
+                        gpui::px(24. * blank_lines as f32),
+                        "caret row {row}, hidden {caret_hidden}",
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -7483,23 +7893,26 @@ mod tests {
     #[test]
     fn a_draft_started_on_its_header_resumes_after_its_text() {
         let mut editor = super::Editor::from_body("Hi Ada,\n\nThanks for the notes\n\n");
-        editor.cursor_to_end_of_text();
+        editor.cursor_to_end_of_text(0);
         assert_eq!((editor.row, editor.col), (2, "Thanks for the notes".len()));
         let mut empty = super::Editor::from_body("\n\n");
         empty.row = 1;
-        empty.cursor_to_end_of_text();
+        empty.cursor_to_end_of_text(0);
         assert_eq!((empty.row, empty.col), (0, 0));
     }
 
     #[test]
     fn verbatim_draft_resumes_before_its_closing_fence() {
         let plain = "use_snake_case\n- item";
-        let body = fell_core::compose::verbatim_markdown(plain);
-        let mut editor = super::Editor::from_body(&body);
-        assert_eq!(editor.lines[editor.row], "use_snake_case");
-        editor.cursor_to_end_of_text();
-        assert_eq!(editor.lines[editor.row], "- item");
-        assert_eq!(editor.col, "- item".len());
+        for signature in ["", "-- \nSigned\n"] {
+            let mut body = fell_core::compose::verbatim_markdown(plain);
+            fell_core::compose::append_signature(&mut body, signature);
+            let mut editor = super::Editor::from_body(&body);
+            assert_eq!(editor.lines[editor.row], "use_snake_case");
+            editor.cursor_to_end_of_text(signature.lines().count());
+            assert_eq!(editor.lines[editor.row], "- item");
+            assert_eq!(editor.col, "- item".len());
+        }
     }
 
     /// The text a source line shows with these fold settings, a link's
@@ -8221,6 +8634,101 @@ mod tests {
         for wide in [false, true] {
             assert!(super::status_right(&snap, "insert", false, wide).is_empty());
         }
+    }
+
+    #[test]
+    fn an_unreadable_account_preserves_from_and_signature_after_reopen() {
+        use super::*;
+        use fell_core::{
+            Account, BackendKind, Store,
+            compose::{DraftFields, DraftSession, StoredCompose},
+        };
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        let Some(root) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let account = AccountId("mail".into());
+        let db = root.join("mail.db");
+        let store = Store::open(&db).unwrap();
+        store
+            .upsert_account(&Account {
+                id: account.clone(),
+                email: "primary@example.com".into(),
+                display_name: String::new(),
+                backend_kind: BackendKind::Bridge,
+            })
+            .unwrap();
+        let fields = DraftFields {
+            from: "Studio <alias@example.com>".into(),
+            to: vec!["recipient@example.com".into()],
+            ..DraftFields::default()
+        };
+        let signature = "-- \nStudio team\n";
+        let folder = DraftSession::start_stored_in(
+            &root.join("drafts"),
+            StoredCompose {
+                id: "config-edit".into(),
+                account_id: account.clone(),
+                fields,
+                body: format!("Letter\n\n{signature}"),
+                files: Vec::new(),
+                identities: vec!["primary@example.com".into(), "alias@example.com".into()],
+                managed_signature: Some(signature.into()),
+                owner: String::new(),
+                reply: Default::default(),
+            },
+            &db,
+        )
+        .unwrap();
+        let mut session = DraftSession::open_folder(&folder, account.clone()).unwrap();
+        let mut feedback = SendFeedbackState::default();
+        let config = root.join("config/fell/account.toml");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let valid = "id = 'mail'\nemail = 'primary@example.com'\nname = 'Primary'\npassword = 'test'\n\
+                     [[identities]]\naddress = 'primary@example.com'\nsignature = 'Primary team'\n\
+                     [[identities]]\naddress = 'alias@example.com'\nname = 'Studio'\nsignature = 'Studio team'\n";
+        fs::write(&config, valid).unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+        let read = || crate::mailbox::send_account_config(&account);
+        assert!(feedback.update_account_config(&mut session, 0, read()));
+        assert_eq!(session.identities().len(), 2);
+
+        fs::write(&config, "email = '").unwrap();
+        assert!(feedback.update_account_config(&mut session, 0, read()));
+        assert!(matches!(
+            feedback.feedback(None, None),
+            Some(SendFeedback::Unavailable {
+                attempted: false,
+                ..
+            })
+        ));
+        assert_eq!(session.identities().len(), 2);
+        let body = format!("Still writing\n\n{signature}");
+        session.set_body_from_user(body.clone());
+        session.flush().unwrap();
+
+        let mut reopened = DraftSession::open_folder(&folder, account.clone()).unwrap();
+        reopened.mark_seen();
+        assert_eq!(reopened.snapshot().send_block, None);
+        assert_eq!(reopened.identities().len(), 2);
+        assert!(
+            reopened
+                .identities()
+                .iter()
+                .all(|identity| { identity.name.is_empty() && identity.signature.is_none() })
+        );
+        assert!(reopened.set_from_user("primary@example.com").is_err());
+        assert_eq!(reopened.fields().from, "Studio <alias@example.com>");
+        assert_eq!(reopened.body(), body);
+        assert_eq!(reopened.managed_signature(), Some(signature));
+
+        fs::write(&config, valid).unwrap();
+        assert!(reopened.set_from_user("primary@example.com").unwrap());
+        assert_eq!(reopened.fields().from, "Primary <primary@example.com>");
+        assert_eq!(reopened.body(), "Still writing\n\n-- \nPrimary team\n");
+        assert!(feedback.update_account_config(&mut reopened, 0, read()));
+        assert!(feedback.readiness.is_none());
     }
 
     #[test]

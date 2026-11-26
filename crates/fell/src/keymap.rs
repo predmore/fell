@@ -245,6 +245,8 @@ const ALL_ACTIONS: &[Action] = &[
     Action::Setting(SettingsRow::Value(Preference::WhichKey)),
     Action::Setting(SettingsRow::Value(Preference::Notifications)),
     Action::Setting(SettingsRow::AccountSetup),
+    Action::Setting(SettingsRow::EditAccount),
+    Action::Setting(SettingsRow::ImportIdentities),
     Action::Setting(SettingsRow::EffectiveBindings),
     Action::Setting(SettingsRow::EditKeymap),
     Action::Setting(SettingsRow::InstallModel),

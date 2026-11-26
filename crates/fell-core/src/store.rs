@@ -234,6 +234,7 @@ CREATE TABLE IF NOT EXISTS compose_drafts (
     quote_text TEXT NOT NULL DEFAULT '',
     quote_html TEXT NOT NULL DEFAULT '',
     reply_to_unverified INTEGER NOT NULL DEFAULT 0,
+    managed_signature TEXT,
     discarded_action_id INTEGER,
     FOREIGN KEY(account_id) REFERENCES accounts(id)
 );
@@ -724,6 +725,26 @@ impl Store {
         upsert_account_on(&self.conn, account)?;
         self.seal_private_files()?;
         Ok(())
+    }
+
+    /// Distinct addresses recorded on this account's deliveries. These are
+    /// candidates for review and confer no permission to send.
+    pub fn delivery_addresses(&self, account: &AccountId) -> Result<Vec<String>> {
+        let mut statement = self.conn.prepare(
+            "SELECT DISTINCT arrived_via FROM messages
+             WHERE account_id = ?1 AND arrived_via <> ''",
+        )?;
+        let mut values = statement.query([account.as_str()])?;
+        let mut addresses = std::collections::BTreeSet::new();
+        while let Some(row) = values.next()? {
+            for address in split_field(&row.get::<_, String>(0)?) {
+                let address = address.trim().to_ascii_lowercase();
+                if crate::Identity::valid_address(&address) {
+                    addresses.insert(address);
+                }
+            }
+        }
+        Ok(addresses.into_iter().collect())
     }
 
     /// Install a configured account and retire the in-process demo mailbox
@@ -4659,6 +4680,10 @@ fn ensure_compose_columns(conn: &Connection) -> Result<()> {
         (
             "reply_to_unverified",
             "ALTER TABLE compose_drafts ADD COLUMN reply_to_unverified INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "managed_signature",
+            "ALTER TABLE compose_drafts ADD COLUMN managed_signature TEXT",
         ),
         (
             "discarded_action_id",

@@ -470,6 +470,9 @@ pub(crate) fn watched_dirs() -> Vec<PathBuf> {
     if let Some(path) = crate::settings::path() {
         dirs.extend(crate::settings::watched_dirs(&path));
     }
+    if let Some(path) = crate::mailbox::account_config_path() {
+        dirs.extend(crate::settings::watched_dirs(&path));
+    }
     dirs.sort();
     dirs.dedup();
     dirs
