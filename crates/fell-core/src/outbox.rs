@@ -1167,11 +1167,40 @@ pub(crate) fn mark_moves_sent(
 }
 
 /// Save the exclusive UID bound before further recovery commands can fail.
-pub(crate) fn record_move_recovery_end(store: &Store, id: i64, end: u32) -> Result<()> {
+/// Record what one recovery check learned about where a sent move could
+/// have landed. `first` is the target's UIDNEXT before the move.
+///
+/// Every UIDNEXT seen after the move was sent bounds where it landed, so a
+/// usable bound (`observed`, a span recovery could search in full) only ever
+/// narrows the window. A check whose span was too wide leaves an earlier
+/// usable bound in place and otherwise records the empty window `first`.
+/// A failed SELECT records nothing; [`clear_move_recovery_end`] handles a
+/// target whose UIDVALIDITY changed.
+pub(crate) fn record_move_recovery_end(
+    store: &Store,
+    id: i64,
+    first: u32,
+    observed: Option<u32>,
+) -> Result<()> {
+    store.connection().execute(
+        "UPDATE server_outbox SET move_recovery_end = CASE
+             WHEN move_recovery_end > ?2 AND ?3 IS NOT NULL THEN MIN(move_recovery_end, ?3)
+             WHEN move_recovery_end > ?2 THEN move_recovery_end
+             ELSE COALESCE(?3, ?2)
+         END
+         WHERE id = ?1 AND state = 'pending' AND sent = 1",
+        params![id, first, observed],
+    )?;
+    Ok(())
+}
+
+/// The target's UIDVALIDITY changed, so no UID bound for this move means
+/// anything any more: record the empty window `first`.
+pub(crate) fn clear_move_recovery_end(store: &Store, id: i64, first: u32) -> Result<()> {
     store.connection().execute(
         "UPDATE server_outbox SET move_recovery_end = ?2
          WHERE id = ?1 AND state = 'pending' AND sent = 1 AND move_recovery_end IS NOT ?2",
-        params![id, end],
+        params![id, first],
     )?;
     Ok(())
 }

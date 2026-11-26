@@ -1436,8 +1436,17 @@ impl Pass<'_> {
             .and_then(|next| recovery_uid_range(first, next));
         if let Some(id) = move_id {
             // Undo can use sync only for a span recovery could search in full.
-            let end = range.as_ref().map_or(first, |range| range.end() + 1);
-            outbox::record_move_recovery_end(self.store, id, end)?;
+            // A failed SELECT keeps whatever an earlier check recorded.
+            match &selected {
+                Ok((validity, _)) if *validity != bound_validity => {
+                    outbox::clear_move_recovery_end(self.store, id, first)?;
+                }
+                Ok(_) => {
+                    let observed = range.as_ref().map(|range| range.end() + 1);
+                    outbox::record_move_recovery_end(self.store, id, first, observed)?;
+                }
+                Err(_) => {}
+            }
         }
         let uidvalidity = match selected {
             Ok((validity, _)) => validity,

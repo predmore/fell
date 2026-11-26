@@ -1888,8 +1888,11 @@ fn undo_ignores_a_duplicate_synced_after_the_move_recovery_window() {
 }
 
 #[test]
-fn move_recovery_clears_the_window_when_it_can_no_longer_search_the_span() {
-    for unsearchable in ["wide", "missing", "reset"] {
+/// Each UIDNEXT seen after the move was sent bounds where it landed, so a
+/// later check that cannot search, or cannot SELECT at all, keeps the earlier
+/// usable window. Only a UIDVALIDITY change empties it.
+fn move_recovery_keeps_an_earlier_window_unless_the_uidvalidity_changes() {
+    for unsearchable in ["wide", "missing", "refused", "reset"] {
         let fx = move_with_lost_reply();
         let account = &fx.account.id;
         fx.server.writes.lock().unwrap().refuse_search = true;
@@ -1905,17 +1908,24 @@ fn move_recovery_clears_the_window_when_it_can_no_longer_search_the_span() {
                 "wide" => archive.uidnext = Some(super::write_back::RECOVERY_UID_LIMIT as u32 + 2),
                 "missing" => archive.omit_uidnext = true,
                 "reset" => archive.uidvalidity += 1,
+                "refused" => {}
                 _ => unreachable!(),
             }
         }
-        fx.server.writes.lock().unwrap().refuse_search = false;
+        let mut writes = fx.server.writes.lock().unwrap();
+        writes.refuse_search = false;
+        if unsearchable == "refused" {
+            writes.before_refusing_select = Some(Box::new(|| {}));
+        }
+        drop(writes);
         fx.clear_commands();
         fx.make_due();
 
         assert_eq!(fx.replay().waiting, 1);
         let row = &fx.store.outbox(account).unwrap()[0];
         assert_eq!((row.state, row.attempts), (OutboxState::Pending, 2));
-        assert_eq!(row.move_recovery_end, Some(1), "{unsearchable}");
+        let expected = if unsearchable == "reset" { 1 } else { 2 };
+        assert_eq!(row.move_recovery_end, Some(expected), "{unsearchable}");
         assert!(without_tags(&fx.commands()).iter().all(|command| {
             !command.starts_with("UID SEARCH") && !command.starts_with("UID MOVE")
         }));
