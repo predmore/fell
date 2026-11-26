@@ -65,8 +65,8 @@ use crate::render::READING_MEASURE_PX;
 use crate::reply_check::{ReplyCheck, ReplyChecks};
 use crate::row_widths::{self, RowFrame, RowWidths};
 use crate::scroll_anchor::{
-    LandingGlide, LandingHold, LayoutProbe, LayoutSlot, MessageProbes, ReaderLanding, Reveal,
-    RevealPhase, ScrollAnchor, clamped_offset,
+    Continuation, LandingGlide, LandingHold, LayoutProbe, LayoutSlot, MessageProbes, ReaderLanding,
+    Reveal, RevealPhase, ScrollAnchor, clamped_offset,
 };
 use crate::store_actor::StoreClient;
 use crate::sync_worker::{self, SyncEvent, SyncHandle};
@@ -10181,11 +10181,7 @@ fn conversation(
                     frame
                         .web
                         .values()
-                        .find_map(|web| {
-                            web.continuation
-                                .clone()
-                                .map(|(fraction, probe)| BodyLanding::Continuation(fraction, probe))
-                        })
+                        .find_map(|web| web.continuation.clone().map(BodyLanding::Continuation))
                         .or_else(|| chip_probe.map(BodyLanding::Attachment)),
                     padding.map(|padding| padding.viewport),
                     arrival,
@@ -10211,7 +10207,7 @@ fn expanded_card_fill(theme: &Theme, focus: f32) -> u32 {
 
 enum BodyLanding {
     Attachment(LayoutSlot),
-    Continuation(f32, LayoutSlot),
+    Continuation(Continuation),
 }
 
 fn conversation_body(
@@ -10250,8 +10246,8 @@ fn conversation_body(
         .children(children)
         .into_any_element();
     match (scroll, hold, landing) {
-        (Some(scroll), _, Some(BodyLanding::Continuation(fraction, probe))) => {
-            LandingHold::continue_body(body, scroll, probe, fraction, frames).into_any_element()
+        (Some(scroll), _, Some(BodyLanding::Continuation(continuation))) => {
+            LandingHold::continue_body(body, scroll, continuation, frames).into_any_element()
         }
         (Some(scroll), Some(hold), _) => hold.hold(body, scroll, bottom, frames).into_any_element(),
         (Some(scroll), _, Some(BodyLanding::Attachment(probe))) => {
@@ -11061,10 +11057,10 @@ fn measured_message_body(
             .inset_0(),
         )
         .into_any_element();
-    if let Some((_, slot)) = web.and_then(|web| web.continuation.as_ref()) {
+    if let Some(continuation) = web.and_then(|web| web.continuation.as_ref()) {
         LayoutProbe {
             inner: body,
-            slot: slot.clone(),
+            slot: continuation.body.clone(),
         }
         .into_any_element()
     } else {
@@ -11256,7 +11252,7 @@ fn web_message_body(
             .bg(rgb(folds.fill))
             .children(html_sections(
                 theme,
-                body,
+                (body, web.continuation.as_ref()),
                 FoldView { live, ..folds },
                 reveal,
                 markers,
@@ -11360,7 +11356,14 @@ fn stored_message_body(
     if let Rich::Html(body) = &message.rich {
         return div()
             .opacity(alpha)
-            .children(html_sections(theme, body, folds, reveal, markers, cx))
+            .children(html_sections(
+                theme,
+                (body, None),
+                folds,
+                reveal,
+                markers,
+                cx,
+            ))
             .into_any_element();
     }
     let body = match &message.rich {
@@ -11519,7 +11522,7 @@ fn plain_message_body(
 /// painted; quoted history and the signature fold to one line until `q`.
 fn html_sections(
     theme: &Theme,
-    body: &HtmlBody,
+    (body, continuation): (&HtmlBody, Option<&Continuation>),
     folds: FoldView,
     reveal: Option<f32>,
     markers: &crate::render::ListMarkerFont,
@@ -11571,13 +11574,13 @@ fn html_sections(
                         quiet.pt(px(16.)).text_color(rgb(theme.dimmed))
                     })
                     .child(
-                        crate::render::blocks_column_spaced(
+                        crate::render::blocks_column_with_headings(
                             blocks,
                             if section.quiet { &quiet } else { &palette },
                             folds.image_consent,
                             &body.gallery,
                             layout,
-                            crate::render::BLOCK_GAP,
+                            (crate::render::BLOCK_GAP, continuation),
                             &top_level_markers,
                         )
                         .line_height(line),

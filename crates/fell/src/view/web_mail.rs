@@ -27,6 +27,7 @@ const SNAPSHOT_BATCH: Duration = Duration::from_millis(550);
 const RENDERER_EXIT: Duration = Duration::from_millis(60);
 const RENDERER_CHANGE: Duration = Duration::from_millis(140);
 const RETRY_SWAP: Duration = Duration::from_millis(120);
+const RETRY_MINIMUM: Duration = Duration::from_millis(300);
 const MEASURED_HEIGHTS: usize = 4 * CACHE_SIZE;
 const PROMPT_HEIGHT: f32 = 30.;
 const PROMPT_GAP: f32 = 8.;
@@ -133,7 +134,7 @@ struct Shown {
     prompt_height_from: f32,
     prompt_fade: Option<Transition>,
     prompt_swap: Option<motion::LayerSwap>,
-    retrying: bool,
+    retry_until: Option<Instant>,
     reserves_tag: bool,
     image_consent: bool,
 }
@@ -174,7 +175,7 @@ impl Shown {
             prompt_height_from: 0.,
             prompt_fade: None,
             prompt_swap: None,
-            retrying: false,
+            retry_until: None,
             reserves_tag: false,
             image_consent: false,
         }
@@ -391,7 +392,7 @@ pub(super) struct Frame {
     pub leaving_clipped: bool,
     pub renderer_painted: Option<Rc<Cell<Option<Instant>>>>,
     pub snapshot_geometry: Rc<Cell<Option<(f32, f32)>>>,
-    pub continuation: Option<(f32, super::LayoutSlot)>,
+    pub continuation: Option<crate::scroll_anchor::Continuation>,
     pub prompt: Option<PromptFrame>,
     pub web_tag: Option<f32>,
     pub height: Option<Rc<Cell<Option<f32>>>>,
@@ -961,8 +962,13 @@ impl Reader {
                 .as_ref()
                 .is_some_and(|open| open.cards.contains(&key.id));
             let entry = web.then(|| self.entry(&key)).flatten();
-            let failed = entry.is_some_and(|entry| entry.picture.is_none());
-            let retrying = web && entry.is_none() && self.retrying(&key);
+            let retry_until = web
+                .then(|| self.retry_until(&key))
+                .flatten()
+                .filter(|until| real < *until || entry.is_none());
+            let failed =
+                retry_until.is_none() && entry.is_some_and(|entry| entry.picture.is_none());
+            let retrying = retry_until.is_some();
             let image = (web && !failed && !grouped && !retrying)
                 .then(|| self.image(&key))
                 .flatten();
@@ -987,7 +993,11 @@ impl Reader {
             });
             let verified = self.verified(body, key.sender.as_deref());
             let always = verified && self.known_sender(key.sender.as_deref()).1;
-            let prompt = self.image_prompt(&key, web, verified, always);
+            let prompt = if retrying {
+                Some(Prompt::Retrying)
+            } else {
+                self.image_prompt(&key, web, verified, always)
+            };
 
             let mail = Arc::downgrade(&key.mail);
             let initial = || {
@@ -1029,14 +1039,14 @@ impl Reader {
             }
             shown.start_painted_fade(motion, now, real);
             shown.update(next, prompt, web, motion, now);
-            shown.retrying = retrying;
+            shown.retry_until = retry_until;
             shown.image_consent = key.images;
             let mut frame = shown.frame(now);
             if matches!(frame.body, Body::Native)
                 && (frame.outgoing.is_none() || frame.body_alpha[0] == 0.)
                 && let Some(fraction) = shown.continue_at.take()
             {
-                frame.continuation = Some((fraction, super::LayoutSlot::default()));
+                frame.continuation = Some(crate::scroll_anchor::Continuation::new(fraction));
             }
             frames.insert(message.id.clone(), frame);
         }
@@ -1060,9 +1070,6 @@ impl Reader {
                 failure: cached.picture.as_ref().and(cached.image_failure.clone()),
             });
         }
-        if web && entry.is_none() && self.retrying(key) {
-            return Some(Prompt::Retrying);
-        }
         has_images.then(|| {
             if !key.images {
                 Prompt::Blocked { verified }
@@ -1078,11 +1085,12 @@ impl Reader {
         })
     }
 
-    fn retrying(&self, key: &Key) -> bool {
-        self.shown.get(&key.id).is_some_and(|shown| {
-            shown.retrying
-                && shown.image_consent == key.images
-                && Weak::ptr_eq(&shown.mail, &Arc::downgrade(&key.mail))
+    fn retry_until(&self, key: &Key) -> Option<Instant> {
+        self.shown.get(&key.id).and_then(|shown| {
+            (shown.image_consent == key.images
+                && Weak::ptr_eq(&shown.mail, &Arc::downgrade(&key.mail)))
+            .then_some(shown.retry_until)
+            .flatten()
         })
     }
 }
@@ -1146,7 +1154,7 @@ impl Inbox {
         if action == Action::AllowMessageImages
             && let Some(shown) = self.web_mail.shown.get_mut(id)
         {
-            if shown.retrying {
+            if shown.retry_until.is_some() {
                 return;
             }
             if let Some(Prompt::Unavailable {
@@ -1159,8 +1167,16 @@ impl Inbox {
                     .as_ref()
                     .is_none_or(remote_images::UnavailableImages::retryable)
                 {
-                    shown.retrying = true;
+                    let deadline = Instant::now() + RETRY_MINIMUM;
+                    shown.retry_until = Some(deadline);
                     self.web_mail.retry_images(id, images);
+                    cx.spawn(async move |this, cx| {
+                        cx.background_executor()
+                            .timer(deadline.saturating_duration_since(Instant::now()))
+                            .await;
+                        let _ = this.update(cx, |_, cx| cx.notify());
+                    })
+                    .detach();
                     cx.notify();
                 }
                 return;
@@ -1560,8 +1576,32 @@ mod tests {
     #[test]
     fn switching_accounts_reschedules_a_superseded_snapshot() {
         let worker = Rc::new(webview::TestWorker::default());
-        let (mut first_app, first) = super::super::tests::pending_inbox();
-        let (mut second_app, second) = super::super::tests::pending_inbox();
+        use gpui::AppContext as _;
+
+        let mut app = gpui::TestAppContext::single();
+        app.background_executor.allow_parking();
+        let mut inbox = |id: &str| {
+            app.new(|cx| {
+                let mut inbox = Inbox::with_startup(
+                    crate::mailbox::Startup {
+                        keymap: Default::default(),
+                        split: 0.4,
+                        read_dwell_ms: 0,
+                        error: None,
+                        account_missing: true,
+                        config: None,
+                        path: Err("in-memory test".into()),
+                    },
+                    false,
+                    None,
+                    cx,
+                );
+                inbox.account_id.0 = id.into();
+                inbox
+            })
+        };
+        let first = inbox("first");
+        let second = inbox("second");
         let first_key = Key {
             id: "first-account".into(),
             sender: None,
@@ -1584,47 +1624,37 @@ mod tests {
             });
         };
 
-        first
-            .update(&mut first_app, |inbox, _, cx| {
-                request(&mut inbox.web_mail, &first_key, cx);
-            })
-            .unwrap();
-        first_app.run_until_parked();
+        first.update(&mut app, |inbox, cx| {
+            request(&mut inbox.web_mail, &first_key, cx);
+        });
+        app.run_until_parked();
         worker.start_next();
 
-        second
-            .update(&mut second_app, |inbox, _, cx| {
-                request(&mut inbox.web_mail, &second_key, cx);
-            })
-            .unwrap();
-        second_app.run_until_parked();
+        second.update(&mut app, |inbox, cx| {
+            request(&mut inbox.web_mail, &second_key, cx);
+        });
+        app.run_until_parked();
         worker.start_next();
         worker.finish(snapshot());
-        second_app.run_until_parked();
+        app.run_until_parked();
 
-        first_app.run_until_parked();
-        first
-            .update(&mut first_app, |inbox, _, cx| {
-                assert!(inbox.web_mail.pending.is_none());
-                assert!(inbox.web_mail.entry(&first_key).is_none());
-                request(&mut inbox.web_mail, &first_key, cx);
-            })
-            .unwrap();
-        first_app.run_until_parked();
+        app.run_until_parked();
+        first.update(&mut app, |inbox, cx| {
+            assert!(inbox.web_mail.pending.is_none());
+            assert!(inbox.web_mail.entry(&first_key).is_none());
+            request(&mut inbox.web_mail, &first_key, cx);
+        });
+        app.run_until_parked();
         worker.start_next();
         worker.finish(snapshot());
-        first_app.run_until_parked();
+        app.run_until_parked();
 
-        first
-            .update(&mut first_app, |inbox, _, _| {
-                assert!(inbox.web_mail.image(&first_key).is_some());
-            })
-            .unwrap();
-        second
-            .update(&mut second_app, |inbox, _, _| {
-                assert!(inbox.web_mail.image(&second_key).is_some());
-            })
-            .unwrap();
+        first.update(&mut app, |inbox, _| {
+            assert!(inbox.web_mail.image(&first_key).is_some());
+        });
+        second.update(&mut app, |inbox, _| {
+            assert!(inbox.web_mail.image(&second_key).is_some());
+        });
     }
 
     #[test]
@@ -1637,7 +1667,7 @@ mod tests {
                 let mut body = crate::mail_body::prepare_html("<p>News</p>", &[]);
                 body.suggested = RenderMode::Web;
                 messages[0].rich = Rich::Html(Arc::new(body));
-                inbox.session.set_messages(messages.into());
+                inbox.session.set_messages(messages);
 
                 assert!(
                     inbox

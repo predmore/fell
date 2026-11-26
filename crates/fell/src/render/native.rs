@@ -625,6 +625,26 @@ pub(crate) fn blocks_column_spaced(
     gap: f32,
     markers: &ListMarkerFont,
 ) -> gpui::Div {
+    blocks_column_with_headings(
+        blocks,
+        palette,
+        allow_remote,
+        gallery,
+        layout,
+        (gap, None),
+        markers,
+    )
+}
+
+pub(crate) fn blocks_column_with_headings(
+    blocks: &[Block],
+    palette: &Palette,
+    allow_remote: bool,
+    gallery: &ImageGallery,
+    layout: impl Into<BlockColumns>,
+    (gap, continuation): (f32, Option<&crate::scroll_anchor::Continuation>),
+    markers: &ListMarkerFont,
+) -> gpui::Div {
     // A short letter should reach the lower part of the pane. The gaps and
     // line height do that without adding a fake closing rule.
     let mut column = div().flex().flex_col().line_height(px(22.));
@@ -667,6 +687,13 @@ pub(crate) fn blocks_column_spaced(
                 gap_between(above, &blocks[start]) * gap
             }
         });
+        let child = if let Some(continuation) = continuation
+            && matches!(blocks[start], Block::Heading { .. })
+        {
+            continuation.heading(child).into_any_element()
+        } else {
+            child
+        };
         column = column.child(div().mt(px(gap)).child(child));
         previous = Some(&blocks[end - 1]);
     }

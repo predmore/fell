@@ -16,7 +16,8 @@ pub use native::{
     BLOCK_GAP, ImageGallery, ListMarkerFont, blocks_column, document_column, is_right_to_left,
 };
 pub(crate) use native::{
-    BlockColumn, BlockColumns, READING_MEASURE_PX, blocks_column_spaced, plain_text,
+    BlockColumn, BlockColumns, READING_MEASURE_PX, blocks_column_spaced,
+    blocks_column_with_headings, plain_text,
 };
 pub use theme::{Palette, ThemeKind};
 
