@@ -2083,7 +2083,7 @@ impl Inbox {
                 // here in render they would use GPUI's default text style,
                 // and their shaping would never be the list's.
                 parts.push(
-                    uniform_list("warm-rows", count, move |range, window, app| {
+                    fixed_inbox_rows("warm-rows", count, move |range, window, app| {
                         entity.update(app, |_, cx| {
                             range
                                 .map(|index| {
@@ -7100,7 +7100,7 @@ fn thread_list(
 
     let entity = cx.entity();
     let theme_for_rows = theme.clone();
-    let rows = uniform_list(
+    let rows = fixed_inbox_rows(
         "thread-rows",
         session.threads.len(),
         move |range, window, app| {
@@ -7117,15 +7117,10 @@ fn thread_list(
                 let viewport = inbox.list_viewport().unwrap_or(0.0);
                 let last = inbox.session.threads.len().saturating_sub(1);
                 let bar_dx = unread_bar_dx(inbox.motion.pane_entry(Pane::List, now).dx);
-                // The list also asks for row 0 alone to measure a row's
-                // height; only the rows it draws count as on screen.
-                let drawn = range.len() > 1 || inbox.session.threads.len() == 1;
-                let capture = drawn && inbox.session.list_label.is_some();
+                let capture = inbox.session.list_label.is_some();
                 let mut painted = Vec::new();
-                if drawn {
-                    let ids = inbox.session.threads.iter().map(|row| row.id.as_str());
-                    inbox.row_widths.keep_drawn(range.clone(), ids);
-                }
+                let ids = inbox.session.threads.iter().map(|row| row.id.as_str());
+                inbox.row_widths.keep_drawn(range.clone(), ids);
                 let visible = range.clone();
                 let rows: Vec<_> = range
                     .map(|index| {
@@ -7136,13 +7131,10 @@ fn thread_list(
                             (row.unread, row.starred),
                             |unread| line_px(window, &row.subject, row_weight(unread)),
                             now,
-                            drawn,
+                            true,
                         );
-                        let previous_labels = if drawn {
-                            inbox.row_widths.labels_frame(&row.id, &row.labels, now)
-                        } else {
-                            None
-                        };
+                        let previous_labels =
+                            inbox.row_widths.labels_frame(&row.id, &row.labels, now);
                         let selected = highlighted.contains(&row.id);
                         let regroup = inbox
                             .regroup_selection
@@ -7165,7 +7157,7 @@ fn thread_list(
                                 &row.id,
                                 row.has_attachment,
                                 now,
-                                drawn,
+                                true,
                             ),
                         };
                         let element =
@@ -7191,9 +7183,9 @@ fn thread_list(
                             // GPUI only asks for in-view slots. Paint rows still
                             // moving across an edge from the nearest drawn slot.
                             let extra = shift.overscan(ROW_PX);
-                            let above = (drawn && index == visible.start)
+                            let above = (index == visible.start)
                                 .then(|| visible.start.saturating_sub(extra)..visible.start);
-                            let below = (drawn && index + 1 == visible.end)
+                            let below = (index + 1 == visible.end)
                                 .then(|| visible.end..(visible.end + extra).min(last + 1));
                             let overflow = above
                                 .into_iter()
@@ -7344,6 +7336,43 @@ fn thread_list(
     .min_h(px(0.))
     .track_scroll(scroll);
     pane.child(rows)
+}
+
+/// GPUI asks for one row during layout and again during prepaint to find the
+/// list's row height. Its width is set by the pane, and the height is fixed.
+/// A single slot builds its contents in prepaint so both measurement passes
+/// can skip the row tree. A viewport that draws one row still builds it.
+fn fixed_inbox_rows(
+    id: &'static str,
+    count: usize,
+    render: impl Fn(std::ops::Range<usize>, &mut Window, &mut gpui::App) -> Vec<gpui::AnyElement>
+    + Clone
+    + 'static,
+) -> gpui::UniformList {
+    uniform_list(id, count, move |range, window, app| {
+        if range.len() != 1 {
+            return render(range, window, app);
+        }
+        let render = render.clone();
+        vec![
+            gpui::canvas(
+                move |bounds, window, app| {
+                    let mut row = render(range, window, app).pop()?;
+                    let space = bounds.size.map(AvailableSpace::Definite);
+                    row.prepaint_as_root(bounds.origin, space, window, app);
+                    Some(row)
+                },
+                |_, row, window, app| {
+                    if let Some(mut row) = row {
+                        row.paint(window, app);
+                    }
+                },
+            )
+            .h(px(ROW_PX))
+            .w_full()
+            .into_any_element(),
+        ]
+    })
 }
 
 /// Shape the leaving rows during list prepaint, where the same font and
@@ -12855,6 +12884,65 @@ mod tests {
     use crate::present::Pane;
     use gpui::{IntoElement, Keystroke, Modifiers, div};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn inbox_list_builds_each_visible_row_only_once() {
+        use gpui::{Context, Render, Styled, TestAppContext, UniformListScrollHandle, Window, px};
+        use std::{cell::RefCell, rc::Rc};
+
+        #[derive(Default)]
+        struct Counts {
+            built: RefCell<Vec<usize>>,
+            painted: RefCell<Vec<usize>>,
+        }
+
+        struct TestList {
+            count: usize,
+            visible: usize,
+            scroll: UniformListScrollHandle,
+            counts: Rc<Counts>,
+        }
+
+        impl Render for TestList {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let counts = self.counts.clone();
+                super::fixed_inbox_rows("fixed-test-rows", self.count, move |range, _, _| {
+                    counts.built.borrow_mut().extend(range.clone());
+                    range
+                        .map(|index| {
+                            let counts = counts.clone();
+                            gpui::canvas(
+                                |_, _, _| (),
+                                move |_, (), _, _| counts.painted.borrow_mut().push(index),
+                            )
+                            .h(px(super::ROW_PX))
+                            .w_full()
+                            .into_any_element()
+                        })
+                        .collect()
+                })
+                .h(px(self.visible as f32 * super::ROW_PX))
+                .w_full()
+                .track_scroll(self.scroll.clone())
+            }
+        }
+
+        let mut app = TestAppContext::single();
+        for (count, visible, start) in [(1, 1, 0), (4, 1, 3), (4, 2, 0)] {
+            let counts = Rc::new(Counts::default());
+            let scroll = UniformListScrollHandle::new();
+            scroll.scroll_to_item_strict(start, gpui::ScrollStrategy::Top);
+            app.add_window(|_, _| TestList {
+                count,
+                visible,
+                scroll,
+                counts: counts.clone(),
+            });
+            let expected = (start..start + visible).collect::<Vec<_>>();
+            assert_eq!(*counts.built.borrow(), expected);
+            assert_eq!(*counts.painted.borrow(), expected);
+        }
+    }
 
     #[test]
     fn a_dropped_mailbox_reply_still_runs_failure_completion() {
