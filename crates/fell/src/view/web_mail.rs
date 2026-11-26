@@ -704,6 +704,7 @@ impl Reader {
     pub(super) fn stop(&mut self) {
         self.pending = None;
         self.shown.clear();
+        self.close_thread();
         self.release_opening();
     }
 
@@ -802,6 +803,7 @@ impl Reader {
         cx: &mut Context<Inbox>,
     ) {
         self.shown.clear();
+        self.close_thread();
         let width = width.round().clamp(1., 1600.) as i32;
         let key = message
             .and_then(|message| self.snapshot_key(message, theme, width))
@@ -1750,12 +1752,17 @@ mod tests {
         let mut shown = Shown::new(Weak::new(), None, false, false, None);
         shown.height.set(Some(350.));
         let now = Instant::now();
-        shown.update(Body::Web(snapshot()), None, true, Motion::new(true), now);
+        let motion = Motion::new(true);
+        shown.update(Body::Web(snapshot()), None, true, motion, now);
         let frame = shown.frame(now);
         assert_eq!(frame.from_height, Some(350.));
         assert!(matches!(frame.outgoing, Some(Body::Native)));
         assert_eq!(frame.web_tag, Some(0.));
-        let frame = shown.frame(now + RENDERER_CHANGE / 2);
+        let painted = now + Duration::from_millis(200);
+        assert_eq!(shown.frame(painted).web_tag, Some(0.));
+        frame.renderer_painted.unwrap().set(Some(painted));
+        shown.start_painted_fade(motion, painted, painted);
+        let frame = shown.frame(painted + RENDERER_CHANGE / 2);
         assert_eq!(frame.web_tag, Some(motion::ease_out(0.5)));
     }
 
