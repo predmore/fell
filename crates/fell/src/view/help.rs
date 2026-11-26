@@ -244,8 +244,9 @@ impl Layout {
         let detail_gap = if detail_rows > 0 { DETAIL_GAP } else { 0. };
         let rows = help_rows(keymap).collect::<Vec<_>>();
         let total = rows.len() + detail_rows;
-        let page =
-            (((height - header - 2. - 2. * INSET - detail_gap) / row) as usize).clamp(1, total);
+        let page = (((height - header - 2. - 2. * INSET - detail_gap) / row) as usize)
+            .max(1)
+            .min(total);
         Self {
             top,
             width,
