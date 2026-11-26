@@ -11248,17 +11248,28 @@ fn web_message_body(
             markers,
             cx,
         ),
-        Body::Native => div()
-            .bg(rgb(folds.fill))
-            .children(html_sections(
-                theme,
-                (body, web.continuation.as_ref()),
-                FoldView { live, ..folds },
-                reveal,
-                markers,
-                cx,
-            ))
-            .into_any_element(),
+        Body::Native => {
+            let native = div()
+                .bg(rgb(folds.fill))
+                .children(html_sections(
+                    theme,
+                    (body, web.continuation.as_ref()),
+                    FoldView { live, ..folds },
+                    reveal,
+                    markers,
+                    cx,
+                ))
+                .into_any_element();
+            if let Some(continuation) = &web.continuation {
+                LayoutProbe {
+                    inner: native,
+                    slot: continuation.native_body.clone(),
+                }
+                .into_any_element()
+            } else {
+                native
+            }
+        }
         Body::Web(picture) => {
             let snapshot = div()
                 .relative()

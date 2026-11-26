@@ -191,11 +191,14 @@ fn visible_top(view: Bounds<Pixels>, offset: Pixels, item: Bounds<Pixels>) -> Op
 fn continuation_landing(
     view: Bounds<Pixels>,
     body: Bounds<Pixels>,
-    mapped: Pixels,
+    native: Bounds<Pixels>,
+    fraction: f32,
     headings: impl Iterator<Item = Pixels>,
 ) -> Pixels {
+    let mapped = native.size.height * fraction;
     let fallback = (mapped - px(24.)).max(px(0.));
     let into_body = headings
+        .map(|top| top - native.top())
         .filter(|heading| *heading >= fallback && *heading <= mapped + view.size.height)
         .min_by(|a, b| f32::from(*a).total_cmp(&f32::from(*b)))
         .unwrap_or(fallback);
@@ -275,6 +278,7 @@ pub(super) type LayoutSlot = Rc<Cell<Option<LayoutId>>>;
 pub(super) struct Continuation {
     fraction: f32,
     pub body: LayoutSlot,
+    pub native_body: LayoutSlot,
     headings: Rc<RefCell<Vec<LayoutSlot>>>,
 }
 
@@ -283,6 +287,7 @@ impl Continuation {
         Self {
             fraction,
             body: LayoutSlot::default(),
+            native_body: LayoutSlot::default(),
             headings: Rc::default(),
         }
     }
@@ -464,13 +469,20 @@ impl gpui::Element for LandingHold {
             offset.y = match (&self.continuation, self.y) {
                 (Some(continuation), _) => {
                     let headings = continuation.headings.borrow();
+                    // During the fade the native layer is laid out as a
+                    // separate root, then painted at the body slot's origin.
+                    let native = continuation
+                        .native_body
+                        .get()
+                        .map_or(item, |id| window.layout_bounds(id));
                     continuation_landing(
                         bounds,
                         item,
-                        item.size.height * continuation.fraction,
-                        headings.iter().filter_map(|slot| {
-                            Some(window.layout_bounds(slot.get()?).top() - item.top())
-                        }),
+                        native,
+                        continuation.fraction,
+                        headings
+                            .iter()
+                            .filter_map(|slot| Some(window.layout_bounds(slot.get()?).top())),
                     )
                 }
                 (_, Some(y)) => {
@@ -594,9 +606,13 @@ mod tests {
     fn continuation_chooses_the_first_nearby_section() {
         let view = vertical_bounds(100., 600.);
         let body = vertical_bounds(250., 12_000.);
-        let headings = [5_850., 6_450., 6_080.].into_iter().map(px);
-        let offset = continuation_landing(view, body, px(6_000.), headings);
-        assert_eq!(body.top() + px(6_080.) + offset, view.top() + px(8.));
+        for native in [body, vertical_bounds(0., 12_000.)] {
+            let headings = [5_850., 6_450., 6_080.]
+                .into_iter()
+                .map(|y| native.top() + px(y));
+            let offset = continuation_landing(view, body, native, 0.5, headings);
+            assert_eq!(body.top() + px(6_080.) + offset, view.top() + px(8.));
+        }
     }
 
     #[test]
@@ -604,7 +620,13 @@ mod tests {
         let view = vertical_bounds(100., 600.);
         let body = vertical_bounds(250., 12_000.);
         for headings in [vec![px(0.)], vec![px(0.), px(6_601.)]] {
-            let offset = continuation_landing(view, body, px(6_000.), headings.into_iter());
+            let offset = continuation_landing(
+                view,
+                body,
+                body,
+                0.5,
+                headings.into_iter().map(|y| body.top() + y),
+            );
             assert_eq!(body.top() + px(5_976.) + offset, view.top() + px(8.));
         }
     }
@@ -614,7 +636,8 @@ mod tests {
         let body = vertical_bounds(250., 12_000.);
         for subject in [vertical_bounds(30., 68.), vertical_bounds(30., 104.)] {
             let view = vertical_bounds(f32::from(subject.bottom()), 600.);
-            let offset = continuation_landing(view, body, px(6_000.), [px(5_980.)].into_iter());
+            let offset =
+                continuation_landing(view, body, body, 0.5, [body.top() + px(5_980.)].into_iter());
             assert_eq!(body.top() + px(5_980.) + offset, subject.bottom() + px(8.));
         }
     }
