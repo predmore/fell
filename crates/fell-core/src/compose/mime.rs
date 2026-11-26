@@ -1,6 +1,7 @@
 //! Multipart message built from the markdown the editor is showing.
 //!
-//! `text/plain` is that markdown. `text/html` comes from the shared renderer.
+//! `text/plain` is that markdown with verbatim fences removed.
+//! `text/html` comes from the shared renderer.
 //! A reply or forward adds its quoted original after both.
 //! Inline images are CID parts. Remote URLs are not fetched.
 //!
@@ -8,6 +9,7 @@
 //! `Bcc` stays on [`crate::send::Draft`] for the envelope and is not a header
 //! of that message.
 
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -67,12 +69,24 @@ fn build_message(
     reply: &ReplyParts,
     draft: bool,
 ) -> Outgoing {
-    let mut plain = if body.ends_with('\n') || body.is_empty() {
+    let mut markdown = if body.ends_with('\n') || body.is_empty() {
         body.to_string()
     } else {
         format!("{body}\n")
     };
-    let mut html = doc_to_html(&markdown_to_doc(&plain));
+    let doc = markdown_to_doc(&markdown);
+    let mut html = doc_to_html(&doc);
+    let mut literal = false;
+    for ((start, end), text) in doc.verbatim_blocks().collect::<Vec<_>>().into_iter().rev() {
+        // Keep a line break between the block and any following Markdown.
+        if end < markdown.len() && !text.ends_with('\n') {
+            markdown.replace_range(start..end, &format!("{text}\n"));
+        } else {
+            markdown.replace_range(start..end, text);
+        }
+        literal = true;
+    }
+    let mut plain = markdown;
     // The quoted original goes after what the person wrote, in both parts.
     if !reply.quote_text.trim().is_empty() {
         if !plain.is_empty() {
@@ -93,10 +107,17 @@ fn build_message(
     }
     let digest = attachment_digest(files);
     let message_id = fresh_message_id();
+    // The last CRLF of a MIME part belongs to its boundary. Give a
+    // literal body with a final newline its own CRLF as well.
+    let wire_plain = if literal && plain.ends_with('\n') {
+        Cow::Owned(format!("{plain}\n"))
+    } else {
+        Cow::Borrowed(plain.as_str())
+    };
     let mime = render_mime(
         fields,
         &message_id,
-        &plain,
+        &wire_plain,
         &html,
         files,
         &reply.references,
@@ -701,6 +722,30 @@ mod tests {
         assert!(html.contains("<h1"));
         assert!(html.contains("<li>"));
         assert_smtp_lines(&outgoing.mime);
+    }
+
+    #[test]
+    fn alternative_preserves_verbatim_text_without_fences_or_markdown_escapes() {
+        for suffix in ["", "\n", "\n\n"] {
+            let plain = format!(
+                "\nuse_snake_case\n**note**\n# heading\n- item\n![photo](photo.png)\n```\n````\n\t<text> &  spaces{suffix}"
+            );
+            let body = super::super::verbatim_markdown(&plain);
+            assert!(super::super::inline_image_paths(&body).is_empty());
+            let outgoing = sample(&body, Vec::new());
+            assert_eq!(outgoing.plain, plain);
+            let message = parse(&outgoing.mime);
+            assert_eq!(message.body_text(0).unwrap().replace("\r\n", "\n"), plain);
+            let html = message.body_html(0).unwrap().replace("\r\n", "\n");
+            let escaped = plain
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+                .replace('\n', "<br>");
+            assert!(html.contains(&escaped), "{html}");
+            assert!(!html.contains("fell-plain-text"), "{html}");
+            assert_smtp_lines(&outgoing.mime);
+        }
     }
 
     #[test]

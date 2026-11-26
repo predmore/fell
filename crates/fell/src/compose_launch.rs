@@ -1,5 +1,6 @@
 //! Inputs for opening a personal draft from outside the editor.
 
+use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Read as _};
@@ -8,9 +9,9 @@ use std::path::Path;
 
 use fell_core::compose::{
     DraftFields, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_FILES, ResolvedFile, parse_address_line,
-    plain_text_to_markdown,
+    verbatim_markdown,
 };
-use percent_encoding::percent_decode_str;
+use fell_render::{UriComponentError, decode_uri_component, is_invisible};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,18 +21,25 @@ pub(crate) struct ComposeInput {
     bcc: Vec<String>,
     subject: String,
     body: String,
+    #[serde(default)]
+    plain_text: bool,
 }
 
 impl ComposeInput {
-    pub(crate) fn check_headers(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         check_header(&self.subject)?;
         for address in self.to.iter().chain(&self.cc).chain(&self.bcc) {
             check_header(address)?;
         }
-        Ok(())
+        check_body(&self.body)
     }
 
     pub(crate) fn into_fields_and_body(self, from: String) -> (DraftFields, String) {
+        let body = if self.plain_text {
+            verbatim_markdown(&self.body)
+        } else {
+            self.body
+        };
         (
             DraftFields {
                 from,
@@ -41,7 +49,7 @@ impl ComposeInput {
                 subject: self.subject,
                 ..DraftFields::default()
             },
-            self.body,
+            body,
         )
     }
 }
@@ -56,21 +64,37 @@ fn check_header(value: &str) -> Result<(), String> {
     if value.contains(['\u{2028}', '\u{2029}']) || value.chars().any(char::is_control) {
         return Err("compose fields must not contain control characters or line breaks".into());
     }
+    check_visible(value)
+}
+
+fn check_body(value: &str) -> Result<(), String> {
+    if value
+        .chars()
+        .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\t'))
+    {
+        return Err("compose body must not contain control characters".into());
+    }
+    check_visible(value)
+}
+
+fn check_visible(value: &str) -> Result<(), String> {
+    if value.chars().any(is_invisible) {
+        return Err("compose fields must not contain invisible characters".into());
+    }
     Ok(())
 }
 
-fn decode(raw: &str) -> Result<String, String> {
-    let bytes = raw.as_bytes();
-    if raw.match_indices('%').any(|(at, _)| {
-        !matches!(&bytes[at..], [b'%', a, b, ..] if a.is_ascii_hexdigit() && b.is_ascii_hexdigit())
-    }) {
-        return Err("invalid percent escape in mailto link".into());
-    }
-    let decoded = percent_decode_str(raw)
-        .decode_utf8()
-        .map_err(|_| "mailto fields must be UTF-8")?;
-    check_header(&decoded)?;
-    Ok(decoded.into_owned())
+fn normalize_body(value: &str) -> Result<String, String> {
+    let normalized = value.replace("\r\n", "\n");
+    check_body(&normalized)?;
+    Ok(normalized)
+}
+
+fn decode(raw: &str) -> Result<Cow<'_, str>, String> {
+    decode_uri_component(raw).map_err(|err| match err {
+        UriComponentError::InvalidPercentEscape => "invalid percent escape in mailto link".into(),
+        UriComponentError::InvalidUtf8 => "mailto fields must be UTF-8".into(),
+    })
 }
 
 pub fn is_mailto(arg: &str) -> bool {
@@ -84,10 +108,14 @@ pub fn mailto(uri: &str) -> Result<ComposeLaunch, String> {
     }
     let (_, rest) = uri.split_once(':').expect("mailto scheme");
     let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
-    let mut input = ComposeInput::default();
+    let mut input = ComposeInput {
+        plain_text: true,
+        ..ComposeInput::default()
+    };
     if !path.is_empty() {
         for raw in path.split(',') {
             let address = decode(raw)?;
+            check_header(&address)?;
             let parsed = mailto_addresses(&address)?;
             if parsed.len() != 1 {
                 return Err("invalid recipient in mailto path".into());
@@ -102,18 +130,21 @@ pub fn mailto(uri: &str) -> Result<ComposeLaunch, String> {
         let (name, value) = field
             .split_once('=')
             .ok_or("mailto fields must have a value after '='")?;
-        let name = decode(name)?.to_ascii_lowercase();
+        let name = decode(name)?;
+        check_header(&name)?;
+        let name = name.to_ascii_lowercase();
         let value = decode(value)?;
+        if name == "body" {
+            set_mailto_field(&mut body, normalize_body(&value)?)?;
+            continue;
+        }
+        check_header(&value)?;
         let slot = match name.as_str() {
             "to" => &mut input.to,
             "cc" => &mut input.cc,
             "bcc" => &mut input.bcc,
             "subject" => {
-                set_mailto_field(&mut subject, value)?;
-                continue;
-            }
-            "body" => {
-                set_mailto_field(&mut body, value)?;
+                set_mailto_field(&mut subject, value.into_owned())?;
                 continue;
             }
             _ => continue,
@@ -121,7 +152,7 @@ pub fn mailto(uri: &str) -> Result<ComposeLaunch, String> {
         slot.extend(mailto_addresses(&value)?);
     }
     input.subject = subject.unwrap_or_default();
-    input.body = body.map_or_else(String::new, |body| plain_text_to_markdown(&body));
+    input.body = body.unwrap_or_default();
     Ok(ComposeLaunch {
         input,
         files: Vec::new(),
@@ -198,7 +229,7 @@ pub fn cli(args: &[OsString]) -> Result<ComposeLaunch, String> {
             .to_str()
             .ok_or_else(|| format!("{flag} must be UTF-8"))?;
         if flag == "--body" {
-            launch.input.body = value.replace("\r\n", "\n");
+            launch.input.body = normalize_body(value)?;
             continue;
         }
         check_header(value)?;
@@ -354,19 +385,32 @@ mod tests {
 
     #[test]
     fn mailto_body_cannot_create_markdown_images_links_or_styling() {
-        use fell_core::compose::{BlockBody, Inline, markdown_to_doc};
+        use fell_core::compose::{BlockBody, markdown_to_doc};
 
-        let plain = "# ![photo](photo.png) and [link](https://example.org) **bold**";
-        let uri = format!(
-            "mailto:?body={}",
-            plain.replace('#', "%23").replace(' ', "%20")
+        let plain = "use_snake_case\n**note**\n# heading\n- item\n![photo](photo.png) [link](https://example.org)";
+        let uri = concat!(
+            "mailto:?body=use_snake_case%0A**note**%0A%23%20heading%0A-%20item",
+            "%0A![photo](photo.png)%20[link](https://example.org)"
         );
-        let body = mailto(&uri).unwrap().input.body;
+        let (_, body) = mailto(uri)
+            .unwrap()
+            .input
+            .into_fields_and_body(String::new());
         let doc = markdown_to_doc(&body);
         assert!(matches!(
-            &doc.blocks[0].body,
-            BlockBody::Paragraph { inlines } if *inlines == [Inline::Text(plain.into())]
+            doc.blocks.as_slice(),
+            [block] if matches!(&block.body, BlockBody::Verbatim { text } if text == plain)
         ));
+    }
+
+    #[test]
+    fn rfc_6068_body_accepts_line_breaks_and_tabs() {
+        let draft =
+            mailto("mailto:infobot@example.com?body=send%20current-issue%0D%0Asend%20index")
+                .unwrap();
+        assert_eq!(draft.input.body, "send current-issue\nsend index");
+        let draft = mailto("mailto:?body=one%09two%0Athree+four%250A").unwrap();
+        assert_eq!(draft.input.body, "one\ttwo\nthree+four%0A");
     }
 
     #[test]
@@ -378,7 +422,9 @@ mod tests {
             "mailto:one@example.org?bcc=one@example.org\nBcc:extra@example.org",
             "mailto:one@example.org?subject=Hi%0D%0ABcc:extra@example.org",
             "mailto:one@example.org?subject=Hi\rBcc:extra@example.org",
-            "mailto:one@example.org?body=Line%0D%0ALine",
+            "mailto:one@example.org?body=Line%0DLine",
+            "mailto:one@example.org?body=Line%00Line",
+            "mailto:one@example.org?body=Line%0CLine",
             "mailto:one@example.org?From=bad%0a",
             "mailto:one@example.org?u%0Dnknown=Hi",
             "mailto:one@example.org?subject=%FF",
@@ -392,6 +438,21 @@ mod tests {
         ] {
             assert!(mailto(uri).is_err(), "{uri}");
         }
+    }
+
+    #[test]
+    fn external_subjects_and_bodies_reject_invisible_characters() {
+        for (raw, encoded) in [
+            ("\u{202e}\u{202d}", "%E2%80%AE%E2%80%AD"),
+            ("\u{200b}", "%E2%80%8B"),
+            ("\u{00ad}", "%C2%AD"),
+        ] {
+            for field in ["subject", "body"] {
+                assert!(mailto(&format!("mailto:?{field}=a{encoded}b")).is_err());
+                assert!(parse_cli(&[&format!("--{field}=a{raw}b")]).is_err());
+            }
+        }
+        assert!(parse_cli(&["--subject=שלום", "--body=שלום"]).is_ok());
     }
 
     #[test]

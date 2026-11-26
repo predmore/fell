@@ -770,7 +770,7 @@ pub fn markdown_snippet(body: &str, subject: &str) -> String {
                     }
                 }
                 BlockBody::Quote { blocks: inner } => blocks(out, inner),
-                BlockBody::Code { text } => {
+                BlockBody::Code { text } | BlockBody::Verbatim { text } => {
                     out.push(text.clone());
                     out.push(" ".into());
                 }

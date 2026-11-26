@@ -187,7 +187,7 @@ fn serve_inbox_request(
 
 fn read_compose(header: &str, reader: &mut impl Read) -> io::Result<ComposeLaunch> {
     let (input, headers): (ComposeInput, Vec<AttachmentHeader>) = serde_json::from_str(header)?;
-    input.check_headers().map_err(io::Error::other)?;
+    input.validate().map_err(io::Error::other)?;
     if headers.len() > MAX_ATTACHMENT_FILES {
         return Err(io::Error::other("too many attachments"));
     }
@@ -716,7 +716,20 @@ pub(crate) mod tests {
 
     #[test]
     fn a_second_compose_invocation_delivers_a_personal_draft_to_the_inbox() {
-        let Some(root) = fell_core::test_support::in_isolated_process() else {
+        // TMPDIR can be longer than a Unix socket address can hold.
+        let mut socket_dir = None;
+        let Some(root) = fell_core::test_support::in_isolated_process_with(|child| {
+            let dir = socket_dir.insert(
+                tempfile::Builder::new()
+                    .prefix("fell-s")
+                    .tempdir_in("/tmp")
+                    .unwrap(),
+            );
+            child
+                .env("FELL_DRAFT_SOCK", dir.path().join("live.sock"))
+                .spawn()
+                .unwrap()
+        }) else {
             return;
         };
         let account = me();

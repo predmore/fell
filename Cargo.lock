@@ -1995,7 +1995,6 @@ dependencies = [
  "image",
  "libc",
  "notify",
- "percent-encoding",
  "psl",
  "raw-window-handle",
  "rusqlite",
