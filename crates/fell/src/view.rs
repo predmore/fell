@@ -3379,11 +3379,16 @@ impl Inbox {
     /// open the row that took their place. Rows below slide up together.
     fn take_out_of_list(&mut self, ids: &[String], cx: &mut Context<Self>) {
         self.pending_removals.extend(ids.iter().cloned());
+        self.remove_list_rows(ids, cx);
+    }
+
+    /// Slide departed rows away and open the next conversation.
+    fn remove_list_rows(&mut self, ids: &[String], cx: &mut Context<Self>) {
         let now = self.motion.clock.now();
         let mut drawn = self.drawn_rows(now);
         // The action may have cleared visual mode or the marks already.
         for row in &mut drawn {
-            row.selected |= self.pending_removals.contains(&row.row.id);
+            row.selected |= ids.contains(&row.row.id);
         }
         for id in ids {
             self.session.remove_thread(id);
@@ -7188,7 +7193,7 @@ fn thread_list(
                                 bar_dx,
                                 frame: still_frame(previous, window),
                                 previous_labels: None,
-                                label_scope: inbox.list_label.clone(),
+                                label_scope: inbox.session.list_label.clone(),
                                 unread_note: inbox
                                     .session
                                     .agent_notes

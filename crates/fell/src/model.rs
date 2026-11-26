@@ -806,7 +806,7 @@ impl Session {
                 ids => Some(format!("{} conversations", ids.len())),
             },
             FolderIntent::Move => self.move_selection.as_ref()?.subject.clone(),
-            FolderIntent::Go | FolderIntent::LabelList => None,
+            FolderIntent::Go | FolderIntent::LabelList | FolderIntent::Merge => None,
         }
     }
 

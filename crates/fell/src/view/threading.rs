@@ -1,6 +1,26 @@
 use fell_core::store::ThreadEditOutcome;
 
 use super::*;
+use fell_core::store::{MUTED, SNOOZED};
+
+fn hidden_destination(
+    store: &fell_core::Store,
+    account: &AccountId,
+    thread: &ThreadId,
+) -> Option<String> {
+    if store
+        .folder_key_of(account, MUTED, thread)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return Some("muted".into());
+    }
+    // The Snoozed list stores negative deadlines so the next wake sorts first.
+    let key = store.folder_key_of(account, SNOOZED, thread).ok()??;
+    let at = crate::model::snooze::toast_time(now_unix(), -key.date_unix);
+    Some(format!("snoozed until {at}"))
+}
 
 const MERGE_FEEDBACK_DELAY: Duration = Duration::from_millis(120);
 const TITLE_EXIT: Duration = Duration::from_millis(60);
@@ -186,15 +206,16 @@ impl Inbox {
         let select = current.clone();
         self.change_mailbox(
             move |store| {
-                let (outcome, follow, applied_notice, grouped_notice) = match edit {
+                let (outcome, follow, applied_notice, grouped_notice, mut departed) = match edit {
                     ThreadEdit::Split { message, .. } => {
                         let outcome =
                             store.split_thread(&account, &fell_core::MessageId(message))?;
                         (
                             outcome,
                             true,
-                            "Split into its own conversation · u".to_owned(),
+                            "Split into its own conversation".to_owned(),
                             "This message and its replies already make up the conversation",
+                            Vec::new(),
                         )
                     }
                     ThreadEdit::Merge {
@@ -208,36 +229,51 @@ impl Inbox {
                         let sources: Vec<_> = sources.into_iter().map(ThreadId).collect();
                         let target = ThreadId(target);
                         let outcome = store.merge_threads(&account, &sources, &target)?;
+                        let participants = sources.into_iter().chain([target]).map(|id| id.0);
                         let subject = present::display_safe(&subject).replace(['“', '”'], "'");
                         (
                             outcome,
                             follow,
-                            format!("Merged into “{subject}” · u"),
+                            format!("Merged into “{subject}”"),
                             "Already in one conversation",
+                            participants.collect(),
                         )
                     }
                 };
-                let (destination, notice) = match outcome {
-                    ThreadEditOutcome::Applied(thread) => (thread, applied_notice),
-                    ThreadEditOutcome::AlreadyGrouped(thread) => (thread, grouped_notice.into()),
+                let (destination, mut notice, applied) = match outcome {
+                    ThreadEditOutcome::Applied(thread) => (thread, applied_notice, true),
+                    ThreadEditOutcome::AlreadyGrouped(thread) => {
+                        (thread, grouped_notice.into(), false)
+                    }
                 };
-                let key = follow
-                    .then(|| {
-                        store
-                            .threading_list_key(
-                                &account,
-                                &destination,
-                                &reading.0,
-                                reading.1.as_deref(),
-                            )
-                            .ok()
-                            .flatten()
-                    })
-                    .flatten();
-                Ok((destination, key, follow, notice))
+                let key = store.threading_list_key(
+                    &account,
+                    &destination,
+                    &reading.0,
+                    reading.1.as_deref(),
+                );
+                if matches!(key, Ok(None)) {
+                    if let Some(detail) = hidden_destination(store, &account, &destination) {
+                        notice.push_str(" · ");
+                        notice.push_str(&detail);
+                    }
+                    if !departed.is_empty() && !departed.contains(&destination.0) {
+                        departed.push(destination.0.clone());
+                    }
+                } else {
+                    departed.clear();
+                }
+                Ok((
+                    destination,
+                    key.ok().flatten(),
+                    follow,
+                    notice,
+                    applied,
+                    departed,
+                ))
             },
             move |inbox, result, cx| match result {
-                Ok((destination, key, follow, notice)) => {
+                Ok((destination, key, follow, notice, applied, mut departed)) => {
                     let follow = follow
                         && inbox.session.cursor_id == current
                         && inbox.session.folder == folder
@@ -253,12 +289,33 @@ impl Inbox {
                     inbox.session.visual = false;
                     inbox.session.anchor_id = None;
                     inbox.note_generation = inbox.note_generation.wrapping_add(1);
-                    inbox.session.show_toast(notice, false);
+                    if follow
+                        && !choose
+                        && !departed.is_empty()
+                        && inbox.session.list_folder == folder
+                        && inbox.session.list_label == label
+                        && let Some(current) = &current
+                    {
+                        // Remove other departing rows first so the cursor goes to
+                        // the next surviving row, including across a page boundary.
+                        departed.retain(|id| id != current);
+                        departed.push(current.clone());
+                        inbox.remove_list_rows(&departed, cx);
+                    }
+                    if applied {
+                        inbox.session.set_toast(Toast::with_hint(
+                            notice,
+                            crate::keymap::binding_text(&inbox.session.keymap, Action::Undo),
+                            "",
+                        ));
+                    } else {
+                        inbox.session.show_toast(notice, false);
+                    }
                     inbox.expire_action_notice(cx);
                     Some(ReadIntent {
                         changed: true,
                         refresh_open: true,
-                        hold_selection: follow,
+                        hold_selection: follow && key.is_some(),
                         select: key.filter(|_| follow),
                         ..ReadIntent::default()
                     })
@@ -371,5 +428,153 @@ impl Inbox {
             selected: self.session.pane == Pane::Conversation,
         };
         self.finish_body_refresh(generation, true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fixtures::{fixture_account, seed_if_empty};
+    use fell_core::{Store, test_support::in_isolated_process};
+    use gpui::TestAppContext;
+
+    #[test]
+    fn merging_into_a_hidden_conversation_advances_inbox() {
+        let Some(root) = in_isolated_process() else {
+            return;
+        };
+        for muted in [false, true] {
+            for already_grouped in [false, true] {
+                let path = root.join(format!("{muted}-{already_grouped}.db"));
+                let store = Store::open(&path).unwrap();
+                let account = fixture_account();
+                store.upsert_account(&account).unwrap();
+                seed_if_empty(&store, &account).unwrap();
+                let inbox_folder = "INBOX";
+                let thread = |id| {
+                    store
+                        .thread_for_message(&account.id, &MessageId::new(id))
+                        .unwrap()
+                        .unwrap()
+                };
+                let target = thread("tickets@fell.test");
+                let source = thread("tiles@fell.test");
+                let marked_above = thread("dinner@fell.test");
+                let until = now_unix() + 86_400;
+                if muted {
+                    store
+                        .toggle_thread_mutes(&account.id, std::slice::from_ref(&target))
+                        .unwrap();
+                } else {
+                    store
+                        .set_thread_snoozes(&account.id, std::slice::from_ref(&target), Some(until))
+                        .unwrap();
+                }
+
+                let mut app = TestAppContext::single();
+                let view = app.new(|cx| {
+                    Inbox::with_startup(
+                        mailbox::Startup {
+                            keymap: Default::default(),
+                            split: 0.42,
+                            read_dwell_ms: 0,
+                            error: None,
+                            account_missing: true,
+                            config: None,
+                            path: Ok(path.clone()),
+                        },
+                        true,
+                        None,
+                        cx,
+                    )
+                });
+                let wait_for = |app: &mut TestAppContext, ready: &dyn Fn(&Inbox) -> bool| {
+                    let deadline = Instant::now() + Duration::from_secs(30);
+                    loop {
+                        app.run_until_parked();
+                        if view.read_with(app, |inbox, _| ready(inbox)) {
+                            break;
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "muted={muted}, already_grouped={already_grouped}"
+                        );
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                };
+                wait_for(&mut app, &|inbox| {
+                    inbox.session.threads.iter().any(|row| row.id == source.0)
+                });
+                let next = view.read_with(&app, |inbox, _| {
+                    let rows = &inbox.session.threads;
+                    let source_at = rows.iter().position(|row| row.id == source.0).unwrap();
+                    assert!(rows[..source_at].iter().any(|row| row.id == marked_above.0));
+                    assert!(!rows.iter().any(|row| row.id == target.0));
+                    rows[source_at + 1].id.clone()
+                });
+                view.update(&mut app, |inbox, cx| {
+                    // Exercise the next row when it is beyond the loaded page as well.
+                    if muted {
+                        let mut rows = inbox.session.threads.clone();
+                        rows.truncate(rows.iter().position(|row| row.id == source.0).unwrap() + 1);
+                        inbox
+                            .session
+                            .set_page(rows, false, true, inbox.session.unread_count);
+                    }
+                    assert!(inbox.session.select_if_present(source.as_str()));
+                    inbox.request_messages(true, cx);
+                });
+                wait_for(&mut app, &|inbox| {
+                    inbox.open_thread.as_ref() == Some(&source.0)
+                });
+
+                if already_grouped {
+                    // Leave header changes queued so the merge itself sees the automatic join.
+                    rusqlite::Connection::open(&path)
+                        .unwrap()
+                        .execute(
+                            "UPDATE messages SET in_reply_to = 'tickets@fell.test'
+                             WHERE message_id IN ('tiles@fell.test', 'dinner@fell.test')",
+                            [],
+                        )
+                        .unwrap();
+                }
+                view.update(&mut app, |inbox, cx| {
+                    inbox.edit_threading(
+                        ThreadEdit::Merge {
+                            sources: vec![marked_above.0, source.0.clone()],
+                            target: target.0,
+                            subject: "Tickets for Friday".into(),
+                        },
+                        cx,
+                    );
+                });
+                wait_for(&mut app, &|inbox| {
+                    !inbox.read_in_flight
+                        && inbox.session.status_notice().is_some()
+                        && inbox.open_thread.as_ref().is_some_and(|id| id != &source.0)
+                });
+                view.read_with(&app, |inbox, _| {
+                    assert_eq!(inbox.session.list_folder, inbox_folder);
+                    assert_eq!(inbox.session.cursor_id.as_deref(), Some(next.as_str()));
+                    assert_eq!(inbox.open_thread.as_deref(), Some(next.as_str()));
+                    assert!(inbox.regroup_selection.is_none());
+                    let notice = inbox.session.status_notice().unwrap();
+                    let action = if already_grouped {
+                        "Already in one conversation"
+                    } else {
+                        "Merged into “Tickets for Friday”"
+                    };
+                    let detail = if muted {
+                        "muted".into()
+                    } else {
+                        let time = crate::model::snooze::toast_time(now_unix(), until);
+                        format!("snoozed until {time}")
+                    };
+                    assert_eq!(notice.text, format!("{action} · {detail}"));
+                    assert_eq!(notice.hint, (!already_grouped).then(|| ("u".into(), "")));
+                });
+            }
+        }
     }
 }
