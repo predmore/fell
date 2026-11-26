@@ -39,11 +39,12 @@ use gpui::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use fell_core::actions::LabelUndoTarget;
-use fell_core::compose::{DraftSummary, ReplyKind};
+use fell_core::compose::{DraftSummary, ReplyKind, ReplyStart};
 
 use crate::attachments::{self, Download, Fetcher, Request as AttachmentRequest};
+use crate::compose_launch::ComposeLaunch;
 use crate::compose_ui::ComposeView;
-use crate::draft_host::DraftHome;
+use crate::draft_host::{self, AgentDrafts, DraftHome};
 use crate::frame_log::{FrameLog, SharedFrameLog};
 use crate::inbox_motion::{Disclosures, InboxMotion, PaneEntry, StatusMotion, ThreadGhost};
 use crate::keymap::{self, Action, KeyId};
@@ -76,7 +77,15 @@ use crate::worker::Worker;
 use self::agent_notes::NoteVisit;
 use self::disclosure::{GrowingMessage, disclosure};
 
-pub fn run(demo: bool, trace_start: Option<Instant>) {
+pub fn run(
+    demo: bool,
+    trace_start: Option<Instant>,
+    initial: Option<ComposeLaunch>,
+) -> Result<(), String> {
+    let hub = Arc::new(fell_core::compose::DraftHub::new());
+    let Some(requests) = draft_host::inbox_socket(hub.clone(), initial)? else {
+        return Ok(());
+    };
     fell_core::diagnostic!(INFO, "Opening inbox");
     Application::new().run(move |cx: &mut App| {
         let trace = trace_start.and_then(|start| match UiTrace::open(start) {
@@ -99,6 +108,8 @@ pub fn run(demo: bool, trace_start: Option<Instant>) {
             })
             .detach();
         }
+        cx.set_global(ExternalCompose(Some(requests)));
+        draft_host::host_agent_drafts(cx, hub);
         let startup = mailbox::startup();
         let (width, height) = window_size();
         let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
@@ -122,7 +133,6 @@ pub fn run(demo: bool, trace_start: Option<Instant>) {
             })
             .map(gpui::AnyWindowHandle::from)
         } else {
-            crate::draft_host::host_agent_drafts(cx);
             cx.open_window(options, |window, cx| {
                 if let Some(trace) = &trace {
                     trace.window_created(window);
@@ -152,7 +162,13 @@ pub fn run(demo: bool, trace_start: Option<Instant>) {
         }
         cx.activate(true);
     });
+    Ok(())
 }
+
+/// Keep external requests queued through onboarding and store startup.
+struct ExternalCompose(Option<futures::channel::mpsc::Receiver<ComposeLaunch>>);
+
+impl gpui::Global for ExternalCompose {}
 
 #[derive(Clone, Copy)]
 struct InboxWindow(gpui::AnyWindowHandle);
@@ -276,9 +292,6 @@ pub(crate) fn finish_onboarding(
     cx: &mut App,
 ) {
     let startup = mailbox::startup();
-    if cx.try_global::<crate::draft_host::AgentDrafts>().is_none() {
-        crate::draft_host::host_agent_drafts(cx);
-    }
     window.replace_root(cx, |window, cx| {
         let mut inbox = Inbox::focused(startup, false, window, cx);
         inbox.first_preview = FirstPreview::Handoff;
@@ -1118,7 +1131,61 @@ impl Inbox {
         }
         self.request_threads(ReadIntent::default(), cx);
         self.search_store_ready(cx);
+        self.watch_external_compose(cx);
         cx.notify();
+    }
+
+    fn watch_external_compose(&self, cx: &mut Context<Self>) {
+        if cx.try_global::<ExternalCompose>().is_none() {
+            return;
+        }
+        let Some(mut requests) = cx.global_mut::<ExternalCompose>().0.take() else {
+            return;
+        };
+        let home = self.draft_home.clone();
+        let hub = cx.global::<AgentDrafts>().0.clone();
+        let account = self.account_id.clone();
+        let from = fell_core::compose::configured_from(
+            &self.session.account_name,
+            &self.session.account_email,
+        );
+        cx.spawn(async move |this, cx| {
+            while let Some(request) = futures::StreamExt::next(&mut requests).await {
+                let result = if let Some(home) = home.clone() {
+                    let hub = hub.clone();
+                    let account = account.clone();
+                    let (fields, body) = request.input.into_fields_and_body(from.clone());
+                    let start = ReplyStart {
+                        fields,
+                        parts: Default::default(),
+                    };
+                    cx.background_executor()
+                        .spawn(async move {
+                            home.new_seeded(&hub, &account, start, body, request.files)
+                        })
+                        .await
+                } else {
+                    Err("The mailbox did not open, so a draft has nowhere to go".into())
+                };
+                if this
+                    .update(cx, |inbox, cx| {
+                        match result {
+                            Ok(id) => {
+                                draft_host::show_draft(&hub, &id);
+                            }
+                            Err(err) => inbox
+                                .session
+                                .show_toast(format!("Couldn't start a draft. {err}"), true),
+                        }
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     fn repair_cached_cids(

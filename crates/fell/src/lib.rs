@@ -6,6 +6,7 @@
 pub mod render;
 
 mod attachments;
+pub mod compose_launch;
 mod compose_ui;
 pub mod draft_host;
 mod embeddings;
@@ -42,17 +43,22 @@ use fell_core::{PendingSend, UserSendConfirmation};
 
 /// Open the inbox window.
 pub fn run() {
-    view::run(false, None);
+    let _ = view::run(false, None, None);
 }
 
 /// Open the inbox with startup and presentation tracing.
 pub fn run_traced(started: std::time::Instant) {
-    view::run(false, Some(started));
+    let _ = view::run(false, Some(started), None);
 }
 
 /// Open the inbox with fixture mail when no account is configured.
 pub fn run_demo(trace_start: Option<std::time::Instant>) {
-    view::run(true, trace_start);
+    let _ = view::run(true, trace_start, None);
+}
+
+/// Open a personal draft, handing it to an existing inbox when available.
+pub fn run_compose(request: compose_launch::ComposeLaunch) -> Result<(), String> {
+    view::run(false, None, Some(request))
 }
 
 pub use compose_ui::{ComposeView, SendFailure, ThemeKind, open_demo, send_from_editor};
