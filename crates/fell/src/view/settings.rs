@@ -778,14 +778,7 @@ impl Inbox {
                 let accounts = &self.settings_view.accounts;
                 let eligible =
                     |row: &&AccountRow| row.held_changes > 0 && row.can_edit_connection();
-                let target = match index {
-                    Some(index) => accounts.get(index).filter(eligible),
-                    None => accounts
-                        .iter()
-                        .filter(eligible)
-                        .max_by_key(|row| row.active),
-                };
-                if let Some(row) = target {
+                if let Some(row) = accounts.get(index).filter(eligible) {
                     let id = row.id.clone();
                     if let Some(window) = cx.try_global::<super::InboxWindow>().copied() {
                         cx.defer(move |cx| {

@@ -124,7 +124,7 @@ pub enum Request {
     OpenAccount(usize),
     EditConnection(usize),
     ReconnectAccount,
-    HeldChanges { index: Option<usize>, resend: bool },
+    HeldChanges { index: usize, resend: bool },
     ConfirmAccountRemoval(usize),
     RemoveAccount { delete: bool },
     EditAccount,
@@ -454,6 +454,38 @@ mod tests {
             items
                 .iter()
                 .any(|item| item.action == Action::Setting(Row::EditKeymap))
+        );
+    }
+
+    #[test]
+    fn palette_held_change_actions_target_the_selected_account() {
+        let mut session = Session::new("", "", SyncKind::LocalOffline, Keymap::default());
+        session.settings_nav.set_availability(Availability {
+            accounts: 3,
+            active_account: Some(0),
+            held_changes: true,
+            ..Availability::default()
+        });
+        session.settings_nav.select_row(Row::Account(2));
+        assert_eq!(
+            session
+                .perform(Action::Setting(Row::DiscardChanges), 10)
+                .settings,
+            Some(Request::HeldChanges {
+                index: 2,
+                resend: false
+            })
+        );
+
+        session.settings_nav.select_row(Row::AccountSetup);
+        assert_eq!(
+            session
+                .perform(Action::Setting(Row::ResendChanges), 10)
+                .settings,
+            Some(Request::HeldChanges {
+                index: 0,
+                resend: true
+            })
         );
     }
 

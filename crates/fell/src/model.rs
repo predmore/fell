@@ -2331,7 +2331,7 @@ impl Session {
         {
             return Step {
                 settings: Some(Request::HeldChanges {
-                    index: Some(index),
+                    index,
                     resend: key == settings::RESEND_CHANGES_KEY,
                 }),
                 ..Step::default()
@@ -2436,10 +2436,16 @@ impl Session {
             Row::AccountSetup => Some(Request::AccountSetup),
             Row::Account(index) => Some(Request::OpenAccount(index)),
             Row::ReconnectAccount => Some(Request::ReconnectAccount),
-            Row::ResendChanges | Row::DiscardChanges => Some(Request::HeldChanges {
-                index: None,
-                resend: row == Row::ResendChanges,
-            }),
+            Row::ResendChanges | Row::DiscardChanges => {
+                let index = match self.settings_nav.row() {
+                    Some(Row::Account(index)) => Some(index),
+                    _ => self.settings_nav.availability.active_account,
+                };
+                index.map(|index| Request::HeldChanges {
+                    index,
+                    resend: row == Row::ResendChanges,
+                })
+            }
             Row::EditConnection => {
                 let index = match self.settings_nav.row() {
                     Some(Row::Account(index)) => Some(index),
