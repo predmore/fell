@@ -1217,6 +1217,12 @@ mod tests {
         let window = app.add_window(|window, cx| {
             AccountWindow::new(mailbox::startup(), false, None, window, cx)
         });
+        let sibling_store = window
+            .update(&mut app, |view, _, cx| {
+                view.views["mail"].read(cx).store.clone()
+            })
+            .unwrap();
+        futures::executor::block_on(sibling_store.call(|_| ())).unwrap();
         let (entered, wait) = std::sync::mpsc::channel();
         let (release, blocked) = std::sync::mpsc::channel();
         let job = window
@@ -1264,10 +1270,14 @@ mod tests {
         futures::executor::block_on(job).unwrap();
         app.run_until_parked();
         window
-            .update(&mut app, |view, _, _| {
+            .update(&mut app, |view, _, cx| {
                 assert!(!view.stopping.contains("work"));
                 assert!(!view.removing.contains_key("work"));
-                assert!(!view.views.contains_key("work"));
+                assert!(
+                    !view.views.contains_key("work"),
+                    "{:?}",
+                    view.active.read(cx).session.toast
+                );
             })
             .unwrap();
         assert!(!path.exists());

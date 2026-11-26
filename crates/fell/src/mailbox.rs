@@ -353,22 +353,30 @@ pub(crate) struct StagedAccountConfig {
 
 impl StagedAccountConfig {
     pub(crate) fn publish(self) -> Result<PathBuf, AccountFileError> {
+        let marker = match self.original {
+            Some((registry, base, id)) => registry
+                .initialize_original(&self.lock, &base, &id)
+                .map_err(|err| err.to_string())?,
+            None => None,
+        };
         let installed = if self.first_run {
             self.file.persist_noclobber(&self.path)
         } else {
             self.file.persist(&self.path)
         };
-        installed.map_err(|err| {
-            if self.first_run && err.error.kind() == std::io::ErrorKind::AlreadyExists {
-                AccountFileError::AlreadyConfigured
-            } else {
-                format!("{}: {}", self.path.display(), err.error).into()
+        if let Err(error) = installed {
+            if let Some(marker) = marker {
+                fs::remove_file(&marker)
+                    .and_then(|()| self.lock.sync_all())
+                    .map_err(|err| format!("{}: {err}", marker.display()))?;
             }
-        })?;
-        if let Some((registry, base, id)) = self.original {
-            registry
-                .initialize_original(&self.lock, &base, &id)
-                .map_err(|err| err.to_string())?;
+            return Err(
+                if self.first_run && error.error.kind() == std::io::ErrorKind::AlreadyExists {
+                    AccountFileError::AlreadyConfigured
+                } else {
+                    format!("{}: {}", self.path.display(), error.error).into()
+                },
+            );
         }
         self.lock.sync_all().map_err(|err| err.to_string())?;
         Ok(self.path)

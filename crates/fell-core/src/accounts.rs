@@ -377,7 +377,7 @@ impl Registry {
         }
         if broken_legacy {
             let dir = self.directory();
-            if has_account_file(&dir, None).map_err(|err| FileError::access(&dir, err))? {
+            if has_account_file(&dir).map_err(|err| FileError::access(&dir, err))? {
                 return Ok(false);
             }
         }
@@ -388,30 +388,38 @@ impl Registry {
         )
     }
 
-    /// Record the first account's route once its config has been published.
-    /// The caller holds the exclusive account directory lock.
+    /// Record the first account's route immediately before publishing its
+    /// config. The caller holds the exclusive directory lock and rolls back
+    /// this new marker if account publication fails.
     pub fn initialize_original(
         &self,
         directory: &File,
         base: &Path,
         id: &str,
-    ) -> Result<(), FileError> {
-        let account = self.path(id)?;
+    ) -> Result<Option<PathBuf>, FileError> {
+        self.path(id)?;
         let dir = self.directory();
         let marker = dir.join(".original-id");
-        let initialize = || -> io::Result<()> {
+        let initialize = || -> io::Result<bool> {
             if path_exists(&marker)?
                 || path_exists(&self.config.join("account.toml.bak"))?
                 || mailbox_exists(base)?
-                || has_account_file(&dir, Some(&account))?
+                || has_account_file(&dir)?
             {
-                return Ok(());
+                return Ok(false);
             }
             publish(&dir, &marker, id.as_bytes())?;
-            directory.sync_all()?;
-            File::open(&self.config)?.sync_all()
+            if let Err(error) = directory
+                .sync_all()
+                .and_then(|()| File::open(&self.config)?.sync_all())
+            {
+                fs::remove_file(&marker)?;
+                return Err(error);
+            }
+            Ok(true)
         };
-        initialize().map_err(|err| FileError::access(&marker, err))
+        let initialized = initialize().map_err(|err| FileError::access(&marker, err))?;
+        Ok(initialized.then_some(marker))
     }
 
     fn original_marker(&self) -> Result<Option<String>, FileError> {
@@ -493,7 +501,7 @@ impl Registry {
     }
 }
 
-fn has_account_file(dir: &Path, except: Option<&Path>) -> io::Result<bool> {
+fn has_account_file(dir: &Path) -> io::Result<bool> {
     let files = match fs::read_dir(dir) {
         Ok(files) => files,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -501,7 +509,7 @@ fn has_account_file(dir: &Path, except: Option<&Path>) -> io::Result<bool> {
     };
     for entry in files {
         let path = entry?.path();
-        if path.extension().is_some_and(|ext| ext == "toml") && Some(path.as_path()) != except {
+        if path.extension().is_some_and(|ext| ext == "toml") {
             return Ok(true);
         }
     }
