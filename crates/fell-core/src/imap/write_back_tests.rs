@@ -1618,6 +1618,27 @@ fn an_unapplied_move_retries_only_after_confirming_both_folders() {
 }
 
 #[test]
+fn an_unapplied_move_retries_when_the_destination_fills_a_full_recovery_span() {
+    let fx = unapplied_move();
+    let limit = super::write_back::RECOVERY_UID_LIMIT as u32;
+    for uid in 1..=limit {
+        fx.deliver(
+            "Archive",
+            uid,
+            raw_with_message_id(&format!("Message-ID: <other-{uid}@x>\r\n"), "Other"),
+        );
+    }
+    assert_eq!(fx.replay().waiting, 1);
+    let row = &fx.store.outbox(&fx.account.id).unwrap()[0];
+    assert_eq!((row.state, row.sent), (OutboxState::Pending, false));
+
+    fx.make_due();
+    assert_eq!(fx.replay().sent, 1);
+    assert_eq!(fx.on_server("INBOX"), vec![(1, "Alpha".into())]);
+    assert_eq!(fx.on_server("Archive").len(), limit as usize + 1);
+}
+
+#[test]
 fn giving_up_with_a_live_source_restores_its_folder_and_clears_the_tombstone() {
     let fx = unapplied_move();
     fx.server.state.lock().unwrap().mailboxes[1].uidnext =

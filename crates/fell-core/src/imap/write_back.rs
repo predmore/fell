@@ -1462,8 +1462,9 @@ impl Pass<'_> {
         };
         let found =
             match session.search_message_id(message_id, RECOVERY_UID_LIMIT, Some(range.clone())) {
-                Ok(found) if !check_absence || found.len() < RECOVERY_UID_LIMIT => found,
-                Ok(_) | Err(WriteError::Refused(_)) => return Ok(Transfer::Unknown),
+                // search_uids refuses a reply past the limit, so a list is whole.
+                Ok(found) => found,
+                Err(WriteError::Refused(_)) => return Ok(Transfer::Unknown),
                 Err(WriteError::Connection(err)) => return Err(Stop::Connection(err)),
             };
         let mut candidates = Vec::new();
@@ -1500,8 +1501,9 @@ impl Pass<'_> {
         }
         let uids = match session.search_uid_range(*range.start(), *range.end(), RECOVERY_UID_LIMIT)
         {
-            Ok(uids) if uids.len() < RECOVERY_UID_LIMIT => uids,
-            Ok(_) | Err(WriteError::Refused(_)) => return Ok(Transfer::Unknown),
+            // The span holds at most RECOVERY_UID_LIMIT UIDs, so a full list is whole.
+            Ok(uids) => uids,
+            Err(WriteError::Refused(_)) => return Ok(Transfer::Unknown),
             Err(WriteError::Connection(error)) => return Err(Stop::Connection(error)),
         };
         // search_uids already sorted these UIDs, so sort the headers to match.
