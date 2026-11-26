@@ -3075,7 +3075,7 @@ impl Inbox {
                     if inbox.web_mail.open_thread(
                         &inbox.session.messages,
                         inbox.motion.motion,
-                        inbox.motion.clock.now(),
+                        Instant::now(),
                         cx,
                     ) {
                         inbox.motion.hold_thread_arrival();
@@ -6049,7 +6049,7 @@ impl Render for Inbox {
                 ),
                 &self.theme,
                 reader.columns.header.width,
-                (self.motion.motion, now),
+                (self.motion.motion, now, real),
                 cx,
             )
         } else {
@@ -6075,7 +6075,9 @@ impl Render for Inbox {
         {
             disclosure::follow_scroll_end(&self.conv_scroll);
         }
-        if !panes.1 || !self.web_mail.holding_arrival(now) || !self.motion.motion.enabled() {
+        let holding_arrival =
+            panes.1 && self.motion.motion.enabled() && self.web_mail.holding_arrival(real);
+        if !holding_arrival {
             self.motion.release_thread_arrival(now);
         }
         let conv = ConvFrame {
@@ -6162,6 +6164,7 @@ impl Render for Inbox {
             | self.account_arrival.is_some_and(|fade| fade.running(now))
             | conv.account_opacity.is_some()
             | link_fading
+            | holding_arrival
             | conv.web.values().any(web_mail::Frame::animating)
             | waiting_for_resize
             | self.note_view.running()
@@ -10820,7 +10823,11 @@ fn expanded_message(
                 .left(px(columns.card.inset))
                 .w(px(columns.card.width + 2.0 * MESSAGE_PAD_PX))
                 .rounded_md()
-                .bg(rgb(fill)),
+                .bg(rgb(fill))
+                .when(cursor > 0., |card| {
+                    card.border_1()
+                        .border_color(rgb(motion::mix(fill, theme.accent, cursor)))
+                }),
         )
         .when(live.0, |card| {
             card.on_mouse_down(
@@ -11229,16 +11236,7 @@ fn web_message_body(
             web.height_progress,
             web.from_height,
             [layer(outgoing, false), incoming],
-            if matches!(outgoing, Body::Placeholder) {
-                Some(0.4)
-            } else if theme.is_light()
-                && matches!(outgoing, Body::Web(_))
-                && matches!(web.body, Body::Native)
-            {
-                Some(0.35)
-            } else {
-                None
-            },
+            web.outgoing_alpha(theme.is_light()),
             matches!(web.body, Body::Native).then_some(folds.fill),
         )
     } else {

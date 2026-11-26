@@ -24,9 +24,11 @@ use crate::render::webview::{self, Snapshot, WebRequest};
 const CACHE_SIZE: usize = 12;
 const THREAD_HOLD: Duration = Duration::from_millis(150);
 const SNAPSHOT_BATCH: Duration = Duration::from_millis(550);
+const WEB_EXIT: Duration = Duration::from_millis(60);
 const MEASURED_HEIGHTS: usize = 4 * CACHE_SIZE;
 const PROMPT_HEIGHT: f32 = 30.;
 const PROMPT_GAP: f32 = 8.;
+const COMPACT_PROMPT_WIDTH: f32 = 560.;
 
 #[derive(Default)]
 pub(super) struct Reader {
@@ -243,6 +245,7 @@ impl Shown {
             body: self.body.clone(),
             outgoing: self.outgoing.clone(),
             progress,
+            linear_progress: self.fade.map_or(1., |fade| fade.linear(now)),
             height_progress,
             prompt: (self.prompt.is_some() || self.prompt_fade.is_some()).then(|| PromptFrame {
                 incoming: self.prompt.clone(),
@@ -300,6 +303,7 @@ pub(super) struct Frame {
     pub body: Body,
     pub outgoing: Option<Body>,
     pub progress: f32,
+    linear_progress: f32,
     pub height_progress: f32,
     pub prompt: Option<PromptFrame>,
     pub web_tag: Option<f32>,
@@ -310,6 +314,16 @@ pub(super) struct Frame {
 }
 
 impl Frame {
+    pub(super) fn outgoing_alpha(&self, light: bool) -> f32 {
+        match (&self.outgoing, &self.body) {
+            (Some(Body::Placeholder), _) => (1. - self.progress / motion::ease_out(0.4)).max(0.),
+            (Some(Body::Web(_)), Body::Native) if light => (1.
+                - self.linear_progress * motion::FADE.as_secs_f32() / WEB_EXIT.as_secs_f32())
+            .max(0.),
+            _ => 1.,
+        }
+    }
+
     pub(super) fn body_animating(&self) -> bool {
         self.height_progress < 1.0
     }
@@ -379,7 +393,7 @@ impl Reader {
         &mut self,
         messages: &[ConvMessage],
         motion: Motion,
-        now: Instant,
+        real: Instant,
         cx: &mut Context<Inbox>,
     ) -> bool {
         self.opening = None;
@@ -397,13 +411,13 @@ impl Reader {
             return false;
         }
         self.opening = Some(Opening {
-            started: now,
+            started: real,
             cards,
             has_layout: false,
         });
         cx.spawn(async move |this, cx| {
             let executor = cx.background_executor().clone();
-            for deadline in [now + THREAD_HOLD, now + SNAPSHOT_BATCH] {
+            for deadline in [real + THREAD_HOLD, real + SNAPSHOT_BATCH] {
                 executor
                     .timer(deadline.saturating_duration_since(Instant::now()))
                     .await;
@@ -414,10 +428,10 @@ impl Reader {
         true
     }
 
-    pub(super) fn holding_arrival(&self, now: Instant) -> bool {
+    pub(super) fn holding_arrival(&self, real: Instant) -> bool {
         self.opening
             .as_ref()
-            .is_some_and(|open| now.saturating_duration_since(open.started) < THREAD_HOLD)
+            .is_some_and(|open| real.saturating_duration_since(open.started) < THREAD_HOLD)
     }
 
     pub(super) fn release_opening(&mut self) {
@@ -699,7 +713,7 @@ impl Reader {
         (cursor, visible): (Option<usize>, &[bool]),
         theme: &Theme,
         width: f32,
-        (motion, now): (Motion, Instant),
+        (motion, now, real): (Motion, Instant, Instant),
         cx: &mut Context<Inbox>,
     ) -> HashMap<String, Frame> {
         let Some(cursor) = cursor else {
@@ -756,7 +770,7 @@ impl Reader {
             });
         }
         if self.opening.as_ref().is_some_and(|open| {
-            now.saturating_duration_since(open.started) >= SNAPSHOT_BATCH
+            real.saturating_duration_since(open.started) >= SNAPSHOT_BATCH
                 || keys
                     .iter()
                     .filter(|key| open.cards.contains(&key.id))
@@ -936,6 +950,7 @@ impl Inbox {
         {
             self.focus_message(index);
             self.html_reading_action(id, action, cx);
+            cx.notify();
         }
     }
 
@@ -1117,7 +1132,7 @@ fn prompt_layer(
 ) -> gpui::Div {
     let (label, once, sender): (gpui::SharedString, _, _) = match prompt {
         Prompt::Blocked { verified } => (
-            if width < 560. {
+            if width < COMPACT_PROMPT_WIDTH {
                 "Images blocked"
             } else {
                 "Remote images blocked"
@@ -1146,8 +1161,8 @@ fn prompt_layer(
             ..
         } => (
             failure.as_ref().map_or_else(
-                || "Showing simple view".into(),
-                |failure| failure.label().into(),
+                || "Couldn’t render web view · showing simple view".into(),
+                |failure| failure.label(width < COMPACT_PROMPT_WIDTH).into(),
             ),
             Some(("Retry", Action::AllowMessageImages)),
             if *always {
@@ -1230,7 +1245,20 @@ fn prompt_layer(
             }
             _ => theme.recipient_text.0,
         }))
-        .child(div().min_w_0().flex_1().truncate().child(label))
+        .child(
+            // Shape the text after flex allocates the space beside the buttons.
+            // GPUI can otherwise reuse an unconstrained nowrap measurement.
+            div().relative().min_w_0().flex_1().h_full().child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .flex_col()
+                    .justify_center()
+                    .truncate()
+                    .child(label),
+            ),
+        )
         .children(once.map(|action| button(action, cx)))
         .children(sender.map(|action| button(action, cx)))
 }
@@ -1238,6 +1266,23 @@ fn prompt_layer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arrival_hold_expires_at_150_ms_without_a_snapshot() {
+        let started = Instant::now();
+        let reader = Reader {
+            opening: Some(Opening {
+                started,
+                cards: HashSet::from(["newsletter".into()]),
+                has_layout: true,
+            }),
+            ..Reader::default()
+        };
+        assert!(reader.holding_arrival(started + Duration::from_millis(149)));
+        assert!(!reader.holding_arrival(started + Duration::from_millis(150)));
+        assert!(reader.opening.is_some());
+        assert!(reader.cache.is_empty());
+    }
 
     fn split_view(inbox: &mut Inbox) {
         let message = inbox.session.messages[0].clone();
@@ -1275,8 +1320,9 @@ mod tests {
             assert!(!inbox.web_mail.known_sender(Some("newer@example.test")).1);
             inbox.html_reading_key_action(Action::AllowMessageImages, cx);
             assert!(inbox.web_mail.allowed_once.contains_key("newer"));
-            inbox.session.pane = Pane::Conversation;
-            inbox.session.message_cursor = 0;
+            inbox.click_image_prompt("older", Action::AllowMessageImages, cx);
+            assert_eq!(inbox.session.pane, Pane::Conversation);
+            assert!(inbox.message_selected());
             assert_eq!(reading_key_target(&inbox.session), Some("older"));
         });
     }

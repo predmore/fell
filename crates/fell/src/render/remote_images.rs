@@ -45,9 +45,13 @@ pub(crate) struct UnavailableImages {
 }
 
 impl UnavailableImages {
-    pub(crate) fn label(&self) -> String {
+    pub(crate) fn label(&self, compact: bool) -> String {
         let noun = if self.count == 1 { "image" } else { "images" };
-        format!("{} {noun} unavailable · {}", self.count, self.first.label())
+        if compact {
+            format!("{} {noun} unavailable", self.count)
+        } else {
+            format!("{} {noun} unavailable · {}", self.count, self.first.label())
+        }
     }
 }
 

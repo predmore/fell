@@ -150,14 +150,13 @@ pub(super) fn crossfade(
     height_progress: f32,
     from_height: Option<f32>,
     layers: [AnyElement; 2],
-    fade_out_by: Option<f32>,
+    outgoing_alpha: f32,
     native_fill: Option<u32>,
 ) -> AnyElement {
-    let outgoing = fade_out_by.map_or(1.0, |end| (1.0 - progress / motion::ease_out(end)).max(0.0));
     let mut fade = layer_pair(
         width,
         layers,
-        [outgoing, progress],
+        [outgoing_alpha, progress],
         height_progress,
         [true; 2],
     );
@@ -377,7 +376,7 @@ mod tests {
                             div().h(px(self.from)).into_any_element(),
                             div().h(px(self.to)).into_any_element(),
                         ],
-                        Some(0.35),
+                        1.,
                         None,
                     ))
             }
