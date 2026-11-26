@@ -2496,6 +2496,10 @@ fn claim_mailbox_unix(requested: &Path) -> Result<ClaimedMailbox> {
                 return Err(crate::Error::Invalid(format!("cannot lock mailbox: {err}")));
             }
         };
+        #[cfg(test)]
+        if let Some(hook) = MAILBOX_CLAIM_HOOK.with(std::cell::RefCell::take) {
+            hook(exclusive);
+        }
         if !exclusive {
             // Block until the exclusive holder shares or exits. Replaying a
             // large WAL can take longer than a short poll.
@@ -2525,7 +2529,6 @@ fn claim_mailbox_unix(requested: &Path) -> Result<ClaimedMailbox> {
                 "mailbox is already open and its path was not published".into(),
             ));
         }
-        delay_publish_for_test();
         let (path, conn) = if let Some(published) = read_published_path(&db) {
             // Someone already chose the path. Do not checkpoint or open
             // another name, and do not replace it.
@@ -2682,22 +2685,18 @@ pub(crate) fn testing_divert_published_path_once(path: std::path::PathBuf) {
 }
 
 #[cfg(all(unix, test))]
-static DELAY_PUBLISH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+type MailboxClaimHook = Box<dyn FnOnce(bool)>;
 
-/// The next exclusive open waits before it publishes the shared path.
 #[cfg(all(unix, test))]
-pub(crate) fn testing_delay_publish_once(delay: bool) {
-    DELAY_PUBLISH.store(delay, std::sync::atomic::Ordering::Relaxed);
+thread_local! {
+    static MAILBOX_CLAIM_HOOK: std::cell::RefCell<Option<MailboxClaimHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(unix)]
-fn delay_publish_for_test() {
-    #[cfg(test)]
-    {
-        if DELAY_PUBLISH.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            std::thread::sleep(std::time::Duration::from_millis(300));
-        }
-    }
+/// Report whether this thread's next open took the exclusive mailbox lock.
+#[cfg(all(unix, test))]
+pub(crate) fn testing_on_mailbox_claim(hook: impl FnOnce(bool) + 'static) {
+    MAILBOX_CLAIM_HOOK.with(|cell| *cell.borrow_mut() = Some(Box::new(hook)));
 }
 
 #[cfg(unix)]
@@ -4968,13 +4967,20 @@ impl WriteTx<'_> {
 pub(crate) fn ensure_fts(conn: &Connection) -> Result<()> {
     // Most opens change nothing here. Check without the write lock, so an
     // open does not hold up sync or the indexer for two counts.
-    if fts_is_current(conn)? {
+    let snapshot =
+        rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Deferred)?;
+    let current = fts_is_current(&snapshot)?;
+    snapshot.commit()?;
+    if current {
         return Ok(());
     }
     // Drop, create, and copy commit together. A killed process rolls the
     // upgrade back, so the next open tries again instead of keeping an empty
     // index whose columns merely look current.
     let tx = begin_immediate(conn)?;
+    if fts_is_current(&tx)? {
+        return Ok(());
+    }
     let have = column_names(&tx, "messages_fts")?;
     let current = FTS_COLUMNS
         .iter()
@@ -5011,6 +5017,11 @@ const FTS_COLUMNS: [&str; 6] = [
 /// The index has the current columns, holds rows when messages do, and its
 /// triggers are exactly [`FTS_TRIGGERS`]. Reads only.
 fn fts_is_current(conn: &Connection) -> Result<bool> {
+    // Pin the read snapshot on an ordinary table before FTS5 prepares its
+    // internal config query. A concurrent opener may be committing DDL.
+    let messages: i64 = conn.query_row("SELECT EXISTS(SELECT 1 FROM messages)", [], |row| {
+        row.get(0)
+    })?;
     let have = column_names(conn, "messages_fts")?;
     if !FTS_COLUMNS
         .iter()
@@ -5018,9 +5029,6 @@ fn fts_is_current(conn: &Connection) -> Result<bool> {
     {
         return Ok(false);
     }
-    let messages: i64 = conn.query_row("SELECT EXISTS(SELECT 1 FROM messages)", [], |row| {
-        row.get(0)
-    })?;
     if messages != 0 {
         let indexed: i64 =
             conn.query_row("SELECT EXISTS(SELECT 1 FROM messages_fts)", [], |row| {
@@ -7413,6 +7421,59 @@ mod tests {
         assert_eq!(version, "5");
         drop(store);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fts_check_survives_concurrent_schema_setup() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mail.sqlite");
+        let writer = open_mailbox_db(&path).unwrap();
+        writer.execute_batch(SCHEMA).unwrap();
+        writer.execute_batch(FTS_TRIGGERS).unwrap();
+        let mut reader = open_mailbox_db(&path).unwrap();
+
+        // Change the schema as FTS5 prepares its nested config query. SQLite
+        // can recompile the outer PRAGMA once, so arrange a commit on that
+        // attempt too if the reader has no stable snapshot.
+        let mut changes = [
+            "CREATE INDEX startup_subject ON messages(subject)",
+            "CREATE INDEX startup_sender ON messages(from_email)",
+        ]
+        .into_iter();
+        let mut reading_config = false;
+        reader
+            .authorizer(Some(move |context: AuthContext<'_>| {
+                match context.action {
+                    AuthAction::Pragma {
+                        pragma_name: "table_info",
+                        pragma_value: Some("messages_fts"),
+                    } => reading_config = true,
+                    AuthAction::Read {
+                        table_name: "messages_fts_config",
+                        ..
+                    } if reading_config => {
+                        reading_config = false;
+                        if let Some(sql) = changes.next() {
+                            writer.execute_batch(sql).unwrap();
+                        }
+                    }
+                    _ => {}
+                }
+                Authorization::Allow
+            }))
+            .unwrap();
+
+        ensure_fts(&reader).unwrap();
+        let changed: bool = reader
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'startup_subject')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(changed);
     }
 
     #[test]
