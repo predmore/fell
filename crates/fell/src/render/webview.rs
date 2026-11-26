@@ -114,7 +114,7 @@ fn run(rx: glib::Receiver<()>, queue: Arc<JobQueue>) -> Result<(), Box<dyn std::
     gtk::init()?;
     let window = gtk::OffscreenWindow::new();
     window.set_accept_focus(false);
-    window.set_default_size(640, 240);
+    window.set_default_size(1, 240);
     let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
     window.add(&container);
     let port = super::proxy::port().ok_or("could not start the WebKit deny proxy")?;
@@ -160,6 +160,7 @@ fn run(rx: glib::Receiver<()>, queue: Arc<JobQueue>) -> Result<(), Box<dyn std::
             background,
             settle_images,
         } = job.request;
+        widget.set_size_request(width, 1);
         window.resize(width, 240);
         let channel = |shift| f64::from((background >> shift) & 255_u32) / 255.0;
         widget.set_background_color(&gtk::gdk::RGBA::new(
@@ -452,8 +453,8 @@ mod tests {
         let no_display =
             std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none();
         if no_display
-            && (std::env::var_os("CI").is_some_and(|ci| ci == "true")
-                || std::env::var_os("FELL_REQUIRE_ALL_TESTS").is_some_and(|set| set == "1"))
+            && (std::env::var_os("CI").is_some()
+                || std::env::var_os("FELL_REQUIRE_ALL_TESTS").is_some())
         {
             // The Ubuntu runner ships Xvfb. Give just this test a display,
             // leaving the rest of the suite independent of GTK.
@@ -524,8 +525,9 @@ mod tests {
             .image {{ background: image("{public}/image"); }}
             .cross-fade {{ background: cross-fade("{public}/cross-fade", red); }}
             .var {{ --y: image-set("{public}/variable" 1x); background: var(--y); }}
+            @media (width: 440px) {{ .width-probe {{ background-color: #7a163f; }} }}
             </style></head>
-            <body><p style="background-color:#7a163f">Offline preview</p><div>Probe</div>
+            <body><p class="width-probe">Offline preview</p><div>Probe</div>
             <p class="image-set">Image set</p><p class="webkit">WebKit image set</p>
             <p class="image">Image</p><p class="cross-fade">Cross fade</p>
             <p class="var">Custom property</p>
@@ -571,25 +573,41 @@ mod tests {
         }))
         .expect("WebKit drew the hostile document");
         let pixels = picture.image.as_bytes(0).unwrap().as_chunks::<4>().0;
-        assert!(pixels.contains(&[0x3f, 0x16, 0x7a, 255]));
+        assert!(
+            pixels.contains(&[0x3f, 0x16, 0x7a, 255]),
+            "the first snapshot uses a 440px CSS viewport",
+        );
         assert!(!pixels.contains(&[0x3f, 0xba, 0x15, 255]));
         assert_eq!(super::super::proxy::requests() - start, 0);
         for listener in [local_listener, public_listener] {
             assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
         }
-        eprintln!("hostile WebKit corpus drew a frame without proxy, origin or file loads ({public})");
+        eprintln!(
+            "hostile WebKit corpus drew a frame without proxy, origin or file loads ({public})"
+        );
 
         let blocked = fell_render::WebMail::prepare(
-            r#"<img src="https://cdn.example.test/width-only" width="300" alt="A photo" style="display:block">"#,
+            r#"<style>@media (width:360px) { p { background:#7a163f; } }</style><p>Preview</p>
+            <img src="https://cdn.example.test/width-only" width="300" alt="A photo" style="display:block">"#,
         );
         assert!(blocked.has_remote_images());
         let picture = futures::executor::block_on(render(WebRequest {
             html: blocked.page("light", |_| None),
-            width: 440,
+            width: 360,
             background: 0xffffff,
             settle_images: true,
         }))
         .expect("WebKit drew the blocked image placeholder");
+        assert!(
+            picture
+                .image
+                .as_bytes(0)
+                .unwrap()
+                .as_chunks::<4>()
+                .0
+                .contains(&[0x3f, 0x16, 0x7a, 255]),
+            "the reused snapshot uses a 360px CSS viewport",
+        );
         assert!(
             picture.height >= 190.,
             "placeholder height: {}",

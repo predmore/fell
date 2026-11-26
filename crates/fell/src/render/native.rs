@@ -2912,9 +2912,9 @@ fn image_el(
         }
         ImageSource::Remote(_) => {
             if alt.is_empty() {
-                "Remote image".to_string()
+                "Image".to_string()
             } else {
-                format!("Remote image · {alt}")
+                format!("Image · {alt}")
             }
         }
         // A `cid:` is the attachment's id, not a name: the alt says what it is.

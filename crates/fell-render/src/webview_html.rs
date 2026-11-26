@@ -206,7 +206,7 @@ fn serialize_node(
                 if let Some(slots) = images.as_deref_mut() {
                     if name_attr.prefix.is_none()
                         && (attr == "src" && name.eq_ignore_ascii_case("img")
-                        || attr == "background" && matches!(name, "table" | "tr" | "td" | "th"))
+                            || attr == "background" && matches!(name, "table" | "tr" | "td" | "th"))
                         && let Some(url) = remote_image_url(value)
                     {
                         if slots.len() < 48 {
@@ -219,9 +219,15 @@ fn serialize_node(
                         continue;
                     }
                     if attr == "style" {
+                        let start = out.len();
+                        let first_slot = slots.len();
                         out.push_str(" style=\"");
                         serialize_css(value, out, Some(slots), escape_attr);
                         out.push('"');
+                        if contains_external_url(value) && contains_external_url(&out[start..]) {
+                            out.truncate(start);
+                            slots.truncate(first_slot);
+                        }
                         continue;
                     }
                     let link = attr == "href"
@@ -272,9 +278,27 @@ const VOID: &[&str] = &["area", "br", "hr", "img", "wbr", "col"];
 fn resource_attr(name: &str) -> bool {
     matches!(
         name,
-        "href" | "xlink:href" | "src" | "srcset" | "imagesrcset" | "poster" | "background"
-            | "lowsrc" | "dynsrc" | "data" | "codebase" | "archive" | "classid" | "manifest"
-            | "profile" | "longdesc" | "usemap" | "action" | "formaction" | "cite" | "base"
+        "href"
+            | "xlink:href"
+            | "src"
+            | "srcset"
+            | "imagesrcset"
+            | "poster"
+            | "background"
+            | "lowsrc"
+            | "dynsrc"
+            | "data"
+            | "codebase"
+            | "archive"
+            | "classid"
+            | "manifest"
+            | "profile"
+            | "longdesc"
+            | "usemap"
+            | "action"
+            | "formaction"
+            | "cite"
+            | "base"
             | "xml:base"
     )
 }
@@ -285,7 +309,9 @@ fn local_resource(value: &str) -> bool {
     value.is_empty()
         || value.starts_with('#')
         || scheme.eq_ignore_ascii_case("cid")
-        || value.get(..11).is_some_and(|head| head.eq_ignore_ascii_case("data:image/"))
+        || value
+            .get(..11)
+            .is_some_and(|head| head.eq_ignore_ascii_case("data:image/"))
 }
 
 fn contains_external_url(value: &str) -> bool {
@@ -293,9 +319,9 @@ fn contains_external_url(value: &str) -> bool {
     if let Some((header, payload)) = value.split_once(',')
         && header.to_ascii_lowercase().starts_with("data:image/")
         && header.to_ascii_lowercase().ends_with(";base64")
-        && payload.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')
-        })
+        && payload
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
     {
         return false;
     }
@@ -318,9 +344,15 @@ fn keep_offline_attr(element: &scraper::node::Element, name: &str, value: &str) 
         return local_resource(value);
     }
     if matches!(name, "values" | "from" | "to" | "by")
-        && ["set", "animate", "animateColor", "animateTransform", "animateMotion"]
-            .iter()
-            .any(|tag| tag.eq_ignore_ascii_case(element.name()))
+        && [
+            "set",
+            "animate",
+            "animateColor",
+            "animateTransform",
+            "animateMotion",
+        ]
+        .iter()
+        .any(|tag| tag.eq_ignore_ascii_case(element.name()))
         && element.attr("attributeName").is_some_and(|target| {
             let target = target.to_ascii_lowercase();
             resource_attr(&target) || target == "style"
@@ -392,9 +424,7 @@ fn image_attr_is_remote(tag: &str, name: &str, value: &str) -> bool {
         "src" | "poster" | "background" | "lowsrc" | "dynsrc" => is_remote_url(value),
         "srcset" => srcset_is_remote(value),
         // HTML parses `<image>` as `<img>`, so a remote href on either is an image.
-        "href" | "xlink:href" if image_href_tag(tag) => {
-            is_remote_url(value)
-        }
+        "href" | "xlink:href" if image_href_tag(tag) => is_remote_url(value),
         _ => false,
     }
 }
@@ -1294,7 +1324,13 @@ mod tests {
             r##"<svg><use href="#local" fill="url(#accent)"/></svg><a href="https://example.test">Link</a><img src="cid:logo"><img src="data:image/png;base64,//AA">"##,
         )
         .page("light", |_| None);
-        for local in ["#local", "url(#accent)", "https://example.test", "cid:logo", "//AA"] {
+        for local in [
+            "#local",
+            "url(#accent)",
+            "https://example.test",
+            "cid:logo",
+            "//AA",
+        ] {
             assert!(page.contains(local), "{page}");
         }
     }

@@ -267,7 +267,7 @@ impl Inbox {
                 .filter(|message| message.expanded)
                 .all(|message| match message.rich {
                     Rich::Html(_) | Rich::PlainPart(_) => true,
-                    Rich::Pending => false,
+                    Rich::Pending | Rich::PendingWeb => false,
                     Rich::Plain | Rich::Missing => {
                         !self.body_loads.awaiting(&message.id)
                             && !self.reader_bodies.active.as_ref().is_some_and(|request| {

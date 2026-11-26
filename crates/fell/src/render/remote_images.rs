@@ -219,15 +219,20 @@ mod tests {
                 .map(|index| format!(r#"<img src="{}">"#, urls[index]))
                 .concat();
             let mail = fell_render::WebMail::prepare(&html);
-            let (page, result) = inline_page_with(&mail, "light", || true, |url, _| {
-                if url == urls[0] {
-                    Ok("data:image/png;base64,AAAA".into())
-                } else if url == urls[1] {
-                    Err(Failure::Response)
-                } else {
-                    Err(Failure::Format)
-                }
-            });
+            let (page, result) = inline_page_with(
+                &mail,
+                "light",
+                || true,
+                |url, _| {
+                    if url == urls[0] {
+                        Ok("data:image/png;base64,AAAA".into())
+                    } else if url == urls[1] {
+                        Err(Failure::Response)
+                    } else {
+                        Err(Failure::Format)
+                    }
+                },
+            );
             assert!(page.contains("data:image/png;base64,AAAA"));
             assert!(matches!(result, Err(Failure::Response)));
         }

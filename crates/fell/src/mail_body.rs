@@ -11,10 +11,10 @@
 //! prepares the bodies the reader could see above the message they land on,
 //! so nothing above it moves once the thread is on screen. Possible web
 //! bodies are prepared on the background executor before the first thread
-//! frame. The newest native body and messages opened later can fade in under
-//! a header that is already drawn. The store thread
-//! prepares at most [`STORE_PREPARE_BYTES`] of HTML per read, so one huge
-//! message cannot hold up the folder; the rest go to the background too.
+//! frame if they fit the compressed read budget. Larger bodies use the
+//! background store connection and arrive after the thread is on screen.
+//! The newest native body and messages opened later can fade in under
+//! a header that is already drawn.
 //! Prepared bodies are cached by message id and the stored parts' stamp,
 //! so reopening a thread prepares nothing and a resync that replaces a
 //! body is prepared again.
@@ -393,13 +393,17 @@ pub fn read_bodies_with_latest(
             Some(kinds) if kinds.html => {
                 message.rich = Rich::Pending;
                 reads.stamps.insert(message.id.clone(), kinds.stamp);
+                let wants_web = sender_mode(message).unwrap_or(kinds.has_delivery_headers);
+                let bytes = kinds.html_bytes.saturating_add(kinds.plain_bytes);
+                if wants_web && bytes > budget {
+                    message.rich = Rich::PendingWeb;
+                }
                 if !message.expanded || cached.get(&message.id) == Some(&kinds.stamp) {
                     continue;
                 }
-                let web_preview =
-                    !prepare_latest && sender_mode(message).unwrap_or(kinds.has_delivery_headers);
-                let fits = (index < last || prepare_latest) && kinds.html_bytes <= budget;
-                if (web_preview || fits)
+                let web_preview = !prepare_latest && wants_web;
+                if bytes <= budget
+                    && (web_preview || index < last || prepare_latest)
                     && let Ok(Some(job)) = read_job_at_stamp(
                         store,
                         account,
@@ -408,10 +412,10 @@ pub fn read_bodies_with_latest(
                         &message.mail_headers,
                     )
                 {
+                    budget -= bytes;
                     if web_preview {
                         reads.web_previews.push((index, job));
                     } else {
-                        budget -= kinds.html_bytes;
                         reads.prepared.push((index, job.prepare()));
                     }
                 }
@@ -671,6 +675,7 @@ mod tests {
                 .iter()
                 .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
                 .collect(),
+            trusted_sender_delivery: false,
             mime_parts: Vec::new(),
         }
     }
@@ -793,6 +798,7 @@ mod tests {
             html: None,
             plain: Some("plain".into()),
             bulk_headers: Vec::new(),
+            trusted_sender_delivery: false,
             mime_parts: Vec::new(),
         });
         let bare = mail("d@fell.test", "a@fell.test", 120, None);
@@ -1239,6 +1245,47 @@ mod tests {
         assert!(loads.begin("m0@fell.test").is_none());
         for id in ["m1@fell.test", "m2@fell.test", "last@fell.test"] {
             assert!(loads.begin(id).is_some());
+        }
+    }
+
+    #[test]
+    fn an_oversized_newsletter_opens_as_a_pending_web_body() {
+        let id = "large@fell.test";
+        let mut state = 1_u64;
+        let mut html = String::from("<table role='presentation'><tr><td>");
+        while html.len() < 1024 * 1024 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            html.push(char::from(b'a' + ((state >> 59) as u8 % 26)));
+            if state.is_multiple_of(13) {
+                html.push(' ');
+            }
+        }
+        html.push_str("</td></tr></table>");
+        let store = store_with(&[mail(
+            id,
+            id,
+            1,
+            Some(html_parts(&html, &[("Precedence", "bulk")])),
+        )]);
+        for sender_mode in [None, Some(true)] {
+            let mut view = open(&store, id);
+            let reads = read_bodies_with_latest(
+                &store,
+                &account().id,
+                &mut view,
+                &HashMap::new(),
+                false,
+                |_| sender_mode,
+            );
+            assert!(!reads.has_web_previews());
+            assert!(reads.prepared.is_empty());
+            assert_eq!(view[0].rich, Rich::PendingWeb);
+            let mut loads = BodyLoads::default();
+            loads.accept(reads, &mut BodyCache::default(), &mut view);
+            let load = loads.begin(id).unwrap();
+            assert!(job(&store, &view[0], load).is_some());
         }
     }
 

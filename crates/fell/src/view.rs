@@ -3118,7 +3118,7 @@ impl Inbox {
 
     /// Keep an existing body visible while its stored HTML is prepared.
     fn keep_shown_text(&self, view: &mut [ConvMessage]) {
-        for message in view.iter_mut().filter(|m| m.rich == Rich::Pending) {
+        for message in view.iter_mut().filter(|m| m.rich.is_pending()) {
             if let Some(old) = self
                 .session
                 .messages
@@ -3127,7 +3127,7 @@ impl Inbox {
                 && old.body_state == fell_core::BodyState::Stored
                 && message.body_state == fell_core::BodyState::Stored
             {
-                if old.rich != Rich::Pending && old.reader_parts == fell_core::ReaderParts::Ready {
+                if !old.rich.is_pending() && old.reader_parts == fell_core::ReaderParts::Ready {
                     message.rich = old.rich.clone();
                 } else if self.reader_bodies.fallback_since.contains_key(&old.id) {
                     message.body = old.body.clone();
@@ -3194,7 +3194,7 @@ impl Inbox {
             .map(|(messages, _)| messages.as_slice())
             .unwrap_or(&self.session.messages);
         if messages.iter().any(|message| {
-            message.id == id && matches!(message.rich, Rich::Pending | Rich::Missing)
+            message.id == id && (message.rich.is_pending() || message.rich == Rich::Missing)
         }) {
             self.body_refresh.rich.insert(id.to_owned(), Rich::Plain);
         }
@@ -3218,7 +3218,7 @@ impl Inbox {
             .map(|(id, load, _)| (id.clone(), *load))
             .collect();
         let account = self.account_id.clone();
-        let reply = self.store.call(move |store| {
+        let reply = self.store.call_body_read(move |store| {
             read.into_iter()
                 .map(|(id, load, headers)| {
                     mail_body::read_job_at_stamp(store, &account, &id, load.stamp, &headers)
@@ -6023,9 +6023,22 @@ impl Render for Inbox {
             .take()
             .filter(|motion| motion.running(now));
         let web = if self.open_thread.is_some() && panes.1 {
+            let viewport = self.conv_scroll.bounds();
+            let visible: Vec<_> = (0..self.session.messages.len())
+                .map(|index| {
+                    self.conv_layout_current
+                        && self
+                            .conv_scroll
+                            .bounds_for_item(index + usize::from(self.conv_note_slot))
+                            .is_some_and(|card| card.intersects(&viewport))
+                })
+                .collect();
             self.web_mail.frames(
                 &self.session.messages,
-                (reader_current && preview_current).then_some(self.session.message_cursor),
+                (
+                    (reader_current && preview_current).then_some(self.session.message_cursor),
+                    &visible,
+                ),
                 &self.theme,
                 reader.columns.header.width,
                 (self.motion.motion, now),
@@ -9430,7 +9443,7 @@ impl ReaderBodies {
                 if !managed {
                     return None;
                 }
-                let settled = parts == Ready && message.rich != Rich::Pending;
+                let settled = parts == Ready && !message.rich.is_pending();
                 let terminal = matches!(parts, Unavailable { .. })
                     || message.body_state == fell_core::BodyState::TooLarge
                     || self.failed.contains_key(&message.id);
@@ -9451,7 +9464,7 @@ impl ReaderBodies {
                 let html_ready = matches!(message.rich, Rich::Html(_) | Rich::PlainPart(_));
                 let text = !html_ready
                     && message.body_state == fell_core::BodyState::Stored
-                    && (message.rich != Rich::Pending
+                    && (!message.rich.is_pending()
                         || self.fallback_since.contains_key(&message.id))
                     && message.body.blocks.iter().any(|block| match block {
                         BodyBlock::Text(text)
@@ -9498,8 +9511,8 @@ impl ReaderBodies {
                     Listed { .. } if !message.needs_reader_parts() => None,
                     Listed { html: true } if text => Some(ReaderLabel::Formatted),
                     Listed { .. } => Some(ReaderLabel::Loading),
-                    Ready if message.rich == Rich::Pending && text => Some(ReaderLabel::Formatted),
-                    Ready if message.rich == Rich::Pending => Some(ReaderLabel::Loading),
+                    Ready if message.rich.is_pending() && text => Some(ReaderLabel::Formatted),
+                    Ready if message.rich.is_pending() => Some(ReaderLabel::Loading),
                     Ready => None,
                 };
                 let mut frame = self.statuses.entry(message.id.clone()).or_default().frame(
@@ -9687,7 +9700,7 @@ impl BodyRefresh {
                 if managed {
                     // Metadata and a staged HTML read leave the displayed text
                     // and the existing chips unchanged.
-                    if prepared || (new.rich != Rich::Pending && old.body != new.body) {
+                    if prepared || (!new.rich.is_pending() && old.body != new.body) {
                         let height = reader.body_arrival_height(old, new);
                         let outgoing =
                             (prepared && reader.fallback_was_visible(id)).then(|| old.body.clone());
@@ -10844,9 +10857,14 @@ fn expanded_message(
                 .get(&message.id)
                 .and_then(|frame| frame.prompt.as_ref())
                 .map(|prompt| {
-                    columns
-                        .card
-                        .place(web_mail::prompt(prompt, theme, &message.id, live.0, cx))
+                    columns.card.place(web_mail::prompt(
+                        prompt,
+                        theme,
+                        &message.id,
+                        live.0,
+                        columns.card.width,
+                        cx,
+                    ))
                 }),
         )
         // `q` opens every collapsed block in the message at once, so only
@@ -10875,6 +10893,10 @@ fn expanded_message(
                     fill,
                     index,
                     live: live.0,
+                    image_consent: frame
+                        .web
+                        .get(&message.id)
+                        .is_some_and(|frame| frame.image_consent),
                 },
                 frame,
                 window,
@@ -10977,6 +10999,7 @@ struct FoldView {
     index: usize,
     /// Drawn on screen, not as an unseen copy: a click opens the fold.
     live: bool,
+    image_consent: bool,
 }
 
 /// Height a folded line takes, its margin included.
@@ -10993,6 +11016,9 @@ fn message_body(
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
+    if message.rich == Rich::PendingWeb {
+        return web_placeholder(theme, message, folds.columns);
+    }
     if let Rich::Html(body) = &message.rich
         && let Some(web) = frame.web.get(&message.id).filter(|web| web.owns_body())
     {
@@ -11014,7 +11040,7 @@ fn message_body(
     let markers = crate::render::ListMarkerFont::new(window, style);
     let body = if managed
         && (message.body_state == fell_core::BodyState::Pending
-            || (message.rich == Rich::Pending && !frame.fallback_text.contains(&message.id)))
+            || (message.rich.is_pending() && !frame.fallback_text.contains(&message.id)))
     {
         div().into_any_element()
     } else {
@@ -11106,18 +11132,7 @@ fn web_message_body(
 ) -> gpui::AnyElement {
     use web_mail::Body;
     let mut layer = |shown: &Body, live| match shown {
-        Body::Placeholder => folds
-            .columns
-            .prose
-            .place(
-                div()
-                    .h(px(theme.ui_px * 1.45 + 8.))
-                    .line_height(px(theme.ui_px * 1.45))
-                    .text_color(rgb(theme.dimmed))
-                    .truncate()
-                    .child(present::display_safe(&message.snippet)),
-            )
-            .into_any_element(),
+        Body::Placeholder => web_placeholder(theme, message, folds.columns),
         Body::Native => div()
             .bg(rgb(folds.fill))
             .children(html_sections(
@@ -11168,10 +11183,49 @@ fn web_message_body(
             web.from_height,
             [layer(outgoing, false), incoming],
             matches!(outgoing, Body::Placeholder),
+            matches!(web.body, Body::Native).then_some(folds.fill),
         )
     } else {
         incoming
     }
+}
+
+fn web_placeholder(
+    theme: &Theme,
+    message: &ConvMessage,
+    columns: ReaderColumns,
+) -> gpui::AnyElement {
+    let line_height = theme.ui_px * 1.45;
+    let characters_per_line = (columns.card.width / (theme.ui_px * 0.55)).max(1.);
+    let estimated_lines: f32 = message
+        .body
+        .blocks
+        .iter()
+        .take(24)
+        .map(|block| match block {
+            BodyBlock::Text(text) => (text.len() as f32 / characters_per_line).ceil() + 1.,
+            _ => 2.,
+        })
+        .sum();
+    let height = (line_height * (estimated_lines + 3.)).clamp(100., 480.);
+    columns
+        .card
+        .place(
+            div()
+                .h(px(height))
+                .rounded_md()
+                .bg(rgb(theme.recipient_surface))
+                .px(px(12.))
+                .py(px(8.))
+                .line_height(px(line_height))
+                .text_color(rgb(theme.recipient_text.1))
+                .child(
+                    div()
+                        .truncate()
+                        .child(present::display_safe(&message.snippet)),
+                ),
+        )
+        .into_any_element()
 }
 
 fn stored_message_body(
@@ -11191,7 +11245,7 @@ fn stored_message_body(
             .into_any_element();
     }
     let blocks: Vec<gpui::AnyElement> = match &message.rich {
-        Rich::Html(_) => unreachable!(),
+        Rich::Html(_) | Rich::PendingWeb => unreachable!(),
         Rich::Pending if message.body.blocks.is_empty() => return div().into_any_element(),
         Rich::Pending | Rich::Plain | Rich::PlainPart(_) | Rich::Missing => {
             // A signature and the quote next to it fold as one, as in HTML.
@@ -11380,7 +11434,7 @@ fn html_sections(
                         None,
                         &quiet,
                         &body.gallery,
-                        (theme, rtl, layout, markers),
+                        (theme, rtl, layout, markers, folds.image_consent),
                     ))
                     .into_any_element(),
                 // A short signature shown in place ("Sent from my iPhone")
@@ -11395,7 +11449,7 @@ fn html_sections(
                         crate::render::blocks_column_spaced(
                             blocks,
                             if section.quiet { &quiet } else { &palette },
-                            false,
+                            folds.image_consent,
                             &body.gallery,
                             layout,
                             crate::render::BLOCK_GAP,
@@ -11423,7 +11477,7 @@ fn html_sections(
                                 Some(kind),
                                 &history,
                                 &body.gallery,
-                                (theme, rtl, layout, markers),
+                                (theme, rtl, layout, markers, folds.image_consent),
                             )
                         },
                         cx,
@@ -11439,11 +11493,12 @@ fn history_section(
     kind: Option<fell_render::Fold>,
     palette: &crate::render::Palette,
     gallery: &crate::render::ImageGallery,
-    (theme, rtl, layout, markers): (
+    (theme, rtl, layout, markers, image_consent): (
         &Theme,
         bool,
         crate::render::BlockColumns,
         &crate::render::ListMarkerFont,
+        bool,
     ),
 ) -> gpui::AnyElement {
     let (rule, layout) = layout.quote(
@@ -11459,7 +11514,7 @@ fn history_section(
             kind,
             palette,
             gallery,
-            (theme, rtl, layout, markers),
+            (theme, rtl, layout, markers, image_consent),
         ))
         .into_any_element()
 }
@@ -11488,11 +11543,12 @@ fn history_blocks(
     kind: Option<fell_render::Fold>,
     history: &crate::render::Palette,
     gallery: &crate::render::ImageGallery,
-    (theme, rtl, layout, markers): (
+    (theme, rtl, layout, markers, image_consent): (
         &Theme,
         bool,
         crate::render::BlockColumns,
         &crate::render::ListMarkerFont,
+        bool,
     ),
 ) -> gpui::AnyElement {
     use fell_render::{Block, Fold};
@@ -11502,8 +11558,16 @@ fn history_blocks(
     );
     let line_height = px(theme.ui_px * 1.4);
     let column = |run: &[Block], layout| {
-        crate::render::blocks_column_spaced(run, history, false, gallery, layout, 8., markers)
-            .line_height(line_height)
+        crate::render::blocks_column_spaced(
+            run,
+            history,
+            image_consent,
+            gallery,
+            layout,
+            8.,
+            markers,
+        )
+        .line_height(line_height)
     };
     div()
         .flex()
