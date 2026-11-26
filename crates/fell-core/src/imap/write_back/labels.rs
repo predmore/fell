@@ -184,15 +184,11 @@ impl Pass<'_> {
         entry: &OutboxEntry,
         target: &str,
     ) -> Result<(), Stop> {
-        match self.locate(session, index, target, &[])? {
+        match self.check_transfer(session, index, target, entry.target_bound, &[])? {
             Some((validity, uid)) => {
                 self.finish_label(index, entry, Applied::Copied(target, validity, uid))
             }
-            None => self.retry(
-                index,
-                DropReason::NotFound,
-                "cannot identify the label copy",
-            ),
+            None => Ok(()),
         }
     }
 
@@ -263,7 +259,7 @@ impl Pass<'_> {
             return Err(Stop::Stale);
         }
         entry.sent = true;
-        self.bounds.extend(marked.iter().copied());
+        entry.target_bound = marked[0].1;
         Ok(())
     }
 

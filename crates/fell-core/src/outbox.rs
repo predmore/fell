@@ -290,6 +290,8 @@ pub struct OutboxEntry {
     pub generation: i64,
     /// The write for this row may have reached the server.
     pub sent: bool,
+    /// The destination's UID state before sending the write.
+    pub(crate) target_bound: Option<Bound>,
     /// Undo's reverse of the row with this id, which was sent but not yet
     /// settled: this row moves the copy that one places.
     pub reverses: Option<i64>,
@@ -307,7 +309,7 @@ pub struct ReplayReport {
     /// Rows still queued: refused for now, waiting on an earlier row, or
     /// not due yet.
     pub waiting: usize,
-    /// Rows given up on. The local change stays; the server never got it.
+    /// Rows given up on. The local change stays, and the server outcome may be unknown.
     pub dropped: Vec<DroppedWrite>,
     /// A previous flag write reached the retry limit without confirmation.
     /// The newer edit still waits for that confirmation.
@@ -324,7 +326,7 @@ pub struct ReplayReport {
     pub interrupted: Option<String>,
 }
 
-/// An action the server will not get.
+/// A write that replay gave up on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DroppedWrite {
     pub kind: OutboxKind,
@@ -342,6 +344,8 @@ pub enum DropReason {
     Refused,
     /// The result of a Sent APPEND could not be verified.
     UnconfirmedAppend,
+    /// The destination copy of a possibly applied MOVE could not be verified.
+    UnconfirmedMove,
     /// The previous Drafts copy could not be removed.
     DraftCleanup,
     /// The folder, or the message in it, never turned up on the server.
@@ -357,7 +361,7 @@ pub enum DropReason {
 const ENTRY_COLS: &str = "id, kind, state, action_id, message_id, source_folder, source_mailbox,
     uidvalidity, uid, target_folder, target_mailbox, placed_uidvalidity, placed_uid,
     attempts, retry_unix, error, generation, sent, reverses,
-    flag_value, flag_modseq, flag_base";
+    flag_value, flag_modseq, flag_base, target_uidvalidity, target_uidnext";
 
 impl Store {
     /// Turn write-back on or off for the account (`write_back` in
@@ -928,6 +932,7 @@ fn select_entries(
                 row.get::<_, Option<bool>>(19)?,
                 row.get::<_, Option<[u8; 8]>>(20)?.map(u64::from_be_bytes),
                 row.get::<_, Option<bool>>(21)?,
+                (row.get::<_, u32>(22)?, row.get::<_, u32>(23)?),
             ),
         ))
     })?;
@@ -957,6 +962,7 @@ fn select_entries(
                 flag_value,
                 flag_modseq,
                 flag_base,
+                target_bound,
             ),
         ) = row?;
         out.push(OutboxEntry {
@@ -978,6 +984,7 @@ fn select_entries(
             error,
             generation,
             sent,
+            target_bound: (target_bound.1 > 0).then_some(target_bound),
             reverses: (reverses != 0).then_some(reverses),
             flag_value,
             flag_modseq,
@@ -1095,7 +1102,51 @@ pub(crate) fn is_claimed(
 /// A target's `(UIDVALIDITY, UIDNEXT)` before a move into it.
 pub(crate) type Bound = (u32, u32);
 
-/// Record that a MOVE for these rows is about to go out. `target` is the
+/// Claim unsent moves and record the exact source copies and destination
+/// bound before sending. A later pass can recover even a move whose source
+/// UID was initially deferred and has since disappeared from the source.
+pub(crate) fn mark_moves_sent(
+    store: &Store,
+    account_id: &AccountId,
+    moves: &[(i64, u32)],
+    (source, validity): (&str, u32),
+    target: &str,
+    bound: Bound,
+) -> Result<Vec<i64>> {
+    let tx = crate::store::immediate_transaction(store.connection())?;
+    ensure_schema(&tx)?;
+    let mut marked = Vec::new();
+    if enabled(&tx, account_id)? {
+        let generation = generation(&tx, account_id)?;
+        for &(id, uid) in moves {
+            let changed = tx.execute(
+                "UPDATE server_outbox
+                 SET sent = 1, source_mailbox = ?2, uidvalidity = ?3, uid = ?4,
+                     target_mailbox = ?5, target_uidvalidity = ?6, target_uidnext = ?7
+                 WHERE id = ?1 AND account_id = ?8 AND state = 'pending'
+                   AND generation = ?9 AND sent = 0",
+                params![
+                    id,
+                    source,
+                    validity,
+                    uid,
+                    target,
+                    bound.0,
+                    bound.1,
+                    account_id.as_str(),
+                    generation
+                ],
+            )?;
+            if changed != 0 {
+                marked.push(id);
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(marked)
+}
+
+/// Record that a label write for these rows is about to go out. `target` is the
 /// target's `(UIDVALIDITY, UIDNEXT)` just now; a row not sent before keeps
 /// it, so a later look for its copy there trusts only UIDs from it up.
 ///
@@ -1273,29 +1324,30 @@ pub(crate) fn settle(
     let tx = crate::store::immediate_transaction(store.connection())?;
     ensure_schema(&tx)?;
     let now = now_unix();
-    let live: Option<(i64, bool, bool)> = tx
+    let live: Option<(i64, bool, bool, bool)> = tx
         .query_row(
-            "SELECT generation, flag_superseded, sent FROM server_outbox
+            "SELECT generation, flag_superseded, sent, state = 'pending' FROM server_outbox
              WHERE id = ?1 AND (kind = 'move' OR state = 'pending')",
             params![entry.id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
     let current = enabled(&tx, account_id)?
         .then(|| generation(&tx, account_id))
         .transpose()?;
-    if Some(live.map_or(entry.generation, |(generation, _, _)| generation)) != current {
+    if Some(live.map_or(entry.generation, |(generation, ..)| generation)) != current {
         tx.commit()?;
         return Ok(Settled::Stale);
     }
-    if live.is_none() && entry.kind != OutboxKind::Move {
+    if matches!(live, Some((_, _, _, false))) || (live.is_none() && entry.kind != OutboxKind::Move)
+    {
         tx.commit()?;
         return Ok(Settled::Retired);
     }
     let recovering = entry.kind.flag_name().is_some()
-        && matches!(live, Some((_, true, true)))
+        && matches!(live, Some((_, true, true, _)))
         && matches!(outcome, Outcome::Retry { refused: false, .. });
-    if entry.kind.flag_name().is_some() && matches!(live, Some((_, true, _))) && !recovering {
+    if entry.kind.flag_name().is_some() && matches!(live, Some((_, true, _, _))) && !recovering {
         tx.execute(
             "UPDATE server_outbox SET state = 'dropped', error = 'superseded', settled_unix = ?2
              WHERE id = ?1 AND state = 'pending'",

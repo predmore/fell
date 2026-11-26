@@ -593,6 +593,7 @@ fn not_sent_detail(session: &Session, write: &DroppedWrite, count: usize) -> Str
         DropReason::NotFound => format!("{messages} not found in {folder} on the server"),
         DropReason::NoMove => "This server can't move mail; archive stays in Fell".to_string(),
         DropReason::Abandoned => format!("{messages} left half moved in {folder} on the server"),
+        DropReason::UnconfirmedMove => "Could not confirm the move".to_string(),
         DropReason::UnconfirmedAppend => "Sent · server copy unconfirmed".to_string(),
         DropReason::DraftCleanup => "An older draft copy remains on the server".to_string(),
     }
@@ -1248,13 +1249,18 @@ impl Inbox {
                                     write.kind == OutboxKind::AppendDraft
                                         && write.reason != DropReason::DraftCleanup
                                 });
+                                let move_unconfirmed = dropped
+                                    .iter()
+                                    .find(|write| write.reason == DropReason::UnconfirmedMove)
+                                    .map(|write| not_sent_detail(&inbox.session, write, 1));
                                 dropped.retain(|write| {
-                                    !matches!(
-                                        write.kind,
-                                        OutboxKind::AppendSent
-                                            | OutboxKind::AppendDraft
-                                            | OutboxKind::DeleteDraft
-                                    )
+                                    write.reason != DropReason::UnconfirmedMove
+                                        && !matches!(
+                                            write.kind,
+                                            OutboxKind::AppendSent
+                                                | OutboxKind::AppendDraft
+                                                | OutboxKind::DeleteDraft
+                                        )
                                 });
                                 let mut lines = Vec::new();
                                 let local_save_failed =
@@ -1263,6 +1269,9 @@ impl Inbox {
                                     });
                                 if sent_failed {
                                     lines.push("Sent · server copy unconfirmed".to_string());
+                                }
+                                if let Some(notice) = move_unconfirmed {
+                                    lines.push(notice);
                                 }
                                 if cleanup_failed {
                                     lines.push("An older draft copy may still be in Drafts".into());
@@ -14164,6 +14173,10 @@ mod tests {
         assert_eq!(
             notice(DropReason::Abandoned, 1),
             "1 message left half moved in Inbox on the server"
+        );
+        assert_eq!(
+            notice(DropReason::UnconfirmedMove, 1),
+            "Could not confirm the move"
         );
         for reason in [
             DropReason::FolderReset,

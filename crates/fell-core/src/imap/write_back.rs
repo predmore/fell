@@ -9,16 +9,14 @@
 //! and UIDNEXT (`STATUS`), then marks the row sent. When the reply is lost
 //! or has no `COPYUID`, the server may have moved the message without
 //! saying where, so a missing `COPYUID` is never taken as done. Replay
-//! looks in the target with `UID SEARCH HEADER Message-ID`, keeps only UIDs
-//! at or above the recorded UIDNEXT, and takes one only when its fetched
-//! Message-ID header is exactly the row's. Anything less (no match, a
-//! refused search, mail with no Message-ID) leaves the row to retry, and
-//! after [`MAX_ATTEMPTS`] it is dropped with a notice. The source copy stays
-//! on record until a new one is known.
+//! checks the bounded range of UIDs allocated since the recorded UIDNEXT
+//! and verifies the exact Message-ID. Inconclusive checks back off without
+//! sending MOVE again. After [`MAX_ATTEMPTS`], replay gives up with a notice.
+//! Recovery only replaces the recorded source copy once the target is known.
 //!
 //! A refusal (NO or BAD) is retried with backoff and the row is dropped
-//! after [`MAX_ATTEMPTS`]. A dropped connection ends the pass and costs the
-//! rows nothing; the next pass tries again. Moves keep their queue order
+//! after [`MAX_ATTEMPTS`]. A dropped connection ends the pass. An oversized
+//! line during recovery counts as an inconclusive check. Moves keep their queue order
 //! because a move can change a later write's UID. A refused STORE can
 //! retry on its own. A STORE with an unknown outcome holds its copy until
 //! replay can check what reached the server.
@@ -28,6 +26,7 @@
 //! server (refused, or given up), the reverse is dropped without a notice.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::RangeInclusive;
 
 use crate::Error;
 use crate::account::AccountId;
@@ -51,8 +50,15 @@ pub(crate) const MAX_ATTEMPTS: u32 = 5;
 const BACKOFF_SECS: [i64; 5] = [10, 30, 120, 600, 1800];
 /// Inconclusive checks are independent of explicit APPEND refusals.
 pub(super) const MAX_APPEND_CHECKS: u32 = 5;
-pub(super) const APPEND_UID_LIMIT: usize = 500;
-const APPEND_HEADER_BATCH: usize = 100;
+pub(super) const RECOVERY_UID_LIMIT: usize = 500;
+const RECOVERY_HEADER_BATCH: usize = 100;
+const UNCONFIRMED_MOVE: &str = "Could not confirm the move";
+
+/// The closed range of UIDs allocated between two UIDNEXT observations.
+fn recovery_uid_range(first: u32, next: u32) -> Option<RangeInclusive<u32>> {
+    (first != 0 && next > first && next - first <= RECOVERY_UID_LIMIT as u32)
+        .then(|| first..=next - 1)
+}
 
 /// Send every outbox row that is due. Returns what was sent and dropped.
 /// A connection that fails part way is in [`ReplayReport::interrupted`];
@@ -89,7 +95,6 @@ pub(super) fn replay_with(
         append_roles: FolderRoles::default(),
         overrides: &config.folder_overrides,
         selected: None,
-        bounds: HashMap::new(),
         before_send,
         report: &mut report,
     };
@@ -214,9 +219,6 @@ struct Pass<'a> {
     overrides: &'a [(FolderRole, String)],
     /// The mailbox selected now and its UIDVALIDITY.
     selected: Option<(String, u32)>,
-    /// Row id → the target's `(UIDVALIDITY, UIDNEXT)` before its first
-    /// MOVE, for rows marked sent in this pass.
-    bounds: HashMap<i64, Option<(u32, u32)>>,
     before_send: &'a dyn Fn(),
     report: &'a mut ReplayReport,
 }
@@ -231,7 +233,7 @@ impl Pass<'_> {
             outbox::note_move_missing(self.store, self.account_id, false)?;
         } else {
             for (index, entry) in self.entries.iter().enumerate() {
-                if entry.kind == OutboxKind::Move && entry.retry_unix <= self.now {
+                if entry.kind == OutboxKind::Move && !entry.sent && entry.retry_unix <= self.now {
                     self.drop_row(index, DropReason::NoMove, "server has no MOVE")?;
                     visited[index] = true;
                 }
@@ -239,11 +241,11 @@ impl Pass<'_> {
             self.held_moves.clear();
         }
         for index in 0..self.entries.len() {
-            if visited[index] || (!has_move && self.entries[index].kind == OutboxKind::Move) {
+            let entry = &self.entries[index];
+            if visited[index] || (!has_move && entry.kind == OutboxKind::Move && !entry.sent) {
                 continue;
             }
             visited[index] = true;
-            let entry = &self.entries[index];
             let held_move = self.held_moves.get(&entry.message_id);
             match entry.kind {
                 OutboxKind::Move if held_move.is_some() => {}
@@ -411,7 +413,7 @@ impl Pass<'_> {
             };
             let message_id = message_id.ok_or_else(unconfirmed)?;
             let candidates = session
-                .search_message_id(message_id, APPEND_UID_LIMIT)
+                .search_message_id(message_id, RECOVERY_UID_LIMIT, None)
                 .map_err(|error| match error {
                     WriteError::Refused(_) => unconfirmed(),
                     WriteError::Connection(error) => Stop::DraftCleanupDisconnected(error),
@@ -599,7 +601,7 @@ impl Pass<'_> {
         next: u32,
     ) -> Result<Option<u32>, Stop> {
         let candidates = session
-            .search_message_id(&entry.message_id, APPEND_UID_LIMIT)
+            .search_message_id(&entry.message_id, RECOVERY_UID_LIMIT, None)
             .map_err(append_check_error)?;
         if !candidates.is_empty() {
             let (found, _) = Self::check_append_headers(
@@ -629,16 +631,16 @@ impl Pass<'_> {
             // A successful APPEND allocates a UID even if it is expunged later.
             return Ok(None);
         }
-        if next - pending.next > APPEND_UID_LIMIT as u32 {
+        let Some(range) = recovery_uid_range(pending.next, next) else {
             return Err(Stop::AppendCheck(
                 "APPEND UID range is too large to verify".into(),
             ));
-        }
+        };
         // UIDNEXT may also advance for unrelated arrivals. List the existing
         // UIDs in the closed range so gaps are distinguished from missing
         // FETCH responses, and check every header before sending again.
         let uids = session
-            .search_uid_range(pending.next, next - 1, APPEND_UID_LIMIT)
+            .search_uid_range(*range.start(), *range.end(), RECOVERY_UID_LIMIT)
             .map_err(append_check_error)?;
         let (found, complete) = Self::check_append_headers(
             session,
@@ -665,7 +667,7 @@ impl Pass<'_> {
     ) -> Result<(Option<u32>, bool), Stop> {
         let mut complete = true;
         let mut found = None;
-        for batch in uids.chunks(APPEND_HEADER_BATCH) {
+        for batch in uids.chunks(RECOVERY_HEADER_BATCH) {
             let headers = session
                 .uid_fetch_message_ids(batch)
                 .map_err(append_check_error)?;
@@ -992,8 +994,10 @@ impl Pass<'_> {
         let entry = &entries[index];
         // Undo's reverse of a row that had not settled: the copy to move
         // back is the one that row placed.
+        let recorded_copy = entry.uidvalidity.zip(entry.uid);
         let reversing = match entry
             .reverses
+            .filter(|_| !entry.sent || recorded_copy.is_none())
             .map(|id| outbox::reversed(self.store, id))
             .transpose()?
         {
@@ -1005,26 +1009,42 @@ impl Pass<'_> {
                 return Ok(());
             }
             Some(Reversed::Gone) => {
-                self.drop_quietly(index, "the move it reverses never reached the server")?;
+                self.drop_quietly(index, "no confirmed destination for the move it reverses")?;
                 return Ok(());
             }
         };
-        let Some(source) = self.mailbox(
+        let source = self.mailbox(
             session,
             entry.source_mailbox.as_deref(),
             &entry.source_folder,
-        )?
-        else {
-            return self.retry(index, DropReason::NotFound, "folder is not on the server");
-        };
-        let Some(target) = self.mailbox(
+        )?;
+        let target = self.mailbox(
             session,
             entry.target_mailbox.as_deref(),
             &entry.target_folder,
-        )?
-        else {
+        )?;
+        let Some((source, target)) = source.zip(target) else {
+            if entry.sent {
+                return self.retry(index, DropReason::UnconfirmedMove, UNCONFIRMED_MOVE);
+            }
             return self.retry(index, DropReason::NotFound, "folder is not on the server");
         };
+        let queued_copy = reversing.or(recorded_copy);
+        if entry.sent {
+            // Even if the source mailbox changed or the copy vanished, the
+            // recorded destination can still confirm the original MOVE.
+            // Older rows with a deferred source UID cannot safely use a
+            // different copy that sync may have since found in the source.
+            let Some((validity, uid)) = queued_copy else {
+                return self.retry(index, DropReason::UnconfirmedMove, UNCONFIRMED_MOVE);
+            };
+            if let Some(placed) =
+                self.check_transfer(session, index, &target, entry.target_bound, &[])?
+            {
+                self.finish_move(index, (&source, validity, uid), &target, placed)?;
+            }
+            return Ok(());
+        }
         let roles = self.store.folder_roles(self.account_id)?;
         for (folder, raw) in [
             (&entry.source_folder, &source),
@@ -1048,7 +1068,7 @@ impl Pass<'_> {
             Ok(uidvalidity) => uidvalidity,
             Err(message) => return self.retry(index, DropReason::Refused, &message),
         };
-        let uid = match reversing.or(entry.uidvalidity.zip(entry.uid)) {
+        let uid = match queued_copy {
             Some((queued, uid)) if queued == uidvalidity => uid,
             Some(_) => {
                 return self.drop_row(index, DropReason::FolderReset, "UIDVALIDITY changed");
@@ -1090,6 +1110,7 @@ impl Pass<'_> {
             }
             let other = &entries[later];
             let fits = !self.held_moves.contains_key(&other.message_id)
+                && !other.sent
                 && !waiting.contains(other.message_id.as_str())
                 && !batch
                     .iter()
@@ -1117,16 +1138,33 @@ impl Pass<'_> {
             Err(WriteError::Connection(err)) => return Err(Stop::Connection(err)),
         };
         (self.before_send)();
-        let ids: Vec<i64> = batch.iter().map(|(row, _)| entries[*row].id).collect();
+        let moves: Vec<_> = batch
+            .iter()
+            .map(|(row, uid)| (entries[*row].id, *uid))
+            .collect();
         // Undo, or turning write-back off, may have retired rows since the
         // pass loaded them: only the rows still pending now are sent.
-        let marked = outbox::mark_sent(self.store, self.account_id, &ids, before)?;
-        batch.retain(|(row, _)| marked.iter().any(|(id, _)| *id == entries[*row].id));
-        self.bounds.extend(marked);
+        let marked = outbox::mark_moves_sent(
+            self.store,
+            self.account_id,
+            &moves,
+            (&source, uidvalidity),
+            &target,
+            before,
+        )?;
+        batch.retain(|(row, _)| {
+            let entry = &entries[*row];
+            let claimed = marked.contains(&entry.id);
+            if !claimed {
+                self.held_moves
+                    .insert(entry.message_id.clone(), MoveHold::EarlierMove);
+            }
+            claimed
+        });
         if batch.is_empty() {
             return Ok(());
         }
-        self.send_move(session, &batch, (&source, uidvalidity), &target)
+        self.send_move(session, &batch, (&source, uidvalidity), &target, before)
     }
 
     /// `UID MOVE` the batch. A row the reply does not place is looked for
@@ -1137,6 +1175,7 @@ impl Pass<'_> {
         batch: &[(usize, u32)],
         (source, uidvalidity): (&str, u32),
         target: &str,
+        bound: outbox::Bound,
     ) -> Result<(), Stop> {
         let uids: Vec<u32> = batch.iter().map(|(_, uid)| *uid).collect();
         let placed = match session.uid_move(&uids, target) {
@@ -1149,36 +1188,80 @@ impl Pass<'_> {
             .iter()
             .map(|(_, uid)| placed_for(&placed, *uid))
             .collect();
-        for at in 0..batch.len() {
-            if placements[at].is_none() {
-                placements[at] = self.locate(session, batch[at].0, target, &placements)?;
+        // Keep confirmed COPYUIDs even if a lookup for another row disconnects.
+        for (&(row, uid), &placed) in batch.iter().zip(&placements) {
+            if let Some(placed) = placed {
+                self.finish_move(row, (source, uidvalidity, uid), target, placed)?;
             }
         }
-        for (at, (row, uid)) in batch.iter().enumerate() {
-            // Moved, maybe, but to no copy anyone can name: retry, then drop.
-            let Some(placed) = placements[at] else {
-                self.retry(
-                    *row,
-                    DropReason::NotFound,
-                    "message is not in the target on the server",
-                )?;
-                continue;
-            };
-            self.settle(
-                *row,
-                (source, uidvalidity, *uid),
-                target,
-                Outcome::Done { placed },
-            )?;
-            self.settled[*row] = true;
-            self.report.sent += 1;
+        for (at, &(row, uid)) in batch.iter().enumerate() {
+            if placements[at].is_none() {
+                placements[at] =
+                    self.check_transfer(session, row, target, Some(bound), &placements)?;
+                if let Some(placed) = placements[at] {
+                    self.finish_move(row, (source, uidvalidity, uid), target, placed)?;
+                }
+            }
         }
         Ok(())
     }
 
+    fn finish_move(
+        &mut self,
+        row: usize,
+        source: (&str, u32, u32),
+        target: &str,
+        placed: (u32, u32),
+    ) -> Result<(), Stop> {
+        match outbox::settle(
+            self.store,
+            self.account_id,
+            &self.entries[row],
+            Some(source),
+            Some(target),
+            Outcome::Done { placed },
+        )? {
+            Settled::Recorded => self.report.sent += 1,
+            Settled::Stale => return Err(Stop::Stale),
+            Settled::Recovering | Settled::Retired => {}
+        }
+        self.settled[row] = true;
+        Ok(())
+    }
+
+    fn check_transfer(
+        &mut self,
+        session: &mut WriteSession,
+        row: usize,
+        target: &str,
+        bound: Option<outbox::Bound>,
+        taken: &[Option<(u32, u32)>],
+    ) -> Result<Option<(u32, u32)>, Stop> {
+        let entry = &self.entries[row];
+        let (reason, message) = if entry.kind == OutboxKind::Move {
+            (DropReason::UnconfirmedMove, UNCONFIRMED_MOVE)
+        } else {
+            (DropReason::NotFound, "cannot identify the label copy")
+        };
+        match self.locate(session, &entry.message_id, target, bound, taken) {
+            Ok(Some(placed)) => Ok(Some(placed)),
+            Ok(None) => {
+                self.retry(row, reason, message)?;
+                Ok(None)
+            }
+            Err(Stop::Connection(error @ Error::ImapLineLimit { .. })) => {
+                // The reader has closed the session. Spend the check before
+                // stopping the pass, so repeated oversized lines cannot stall it.
+                self.retry(row, reason, message)?;
+                Err(Stop::Connection(error))
+            }
+            Err(stop) => Err(stop),
+        }
+    }
+
     /// The copy of the row's message the move put in `target`, when the
-    /// server did not say. Only a UID at or above the target's UIDNEXT from
-    /// before the first MOVE counts, under the same UIDVALIDITY, and only
+    /// server did not say. Only the bounded UID range allocated since
+    /// the first write counts, under the same UIDVALIDITY, and only
     /// when its fetched Message-ID header is exactly the row's: `HEADER`
     /// search is a substring match and ignores case. The lowest such UID no
     /// other row moves is taken. `None` when nothing qualifies, the search
@@ -1187,55 +1270,66 @@ impl Pass<'_> {
     fn locate(
         &mut self,
         session: &mut WriteSession,
-        row: usize,
+        message_id: &str,
         target: &str,
+        bound: Option<outbox::Bound>,
         taken: &[Option<(u32, u32)>],
     ) -> Result<Option<(u32, u32)>, Stop> {
-        let entries = self.entries;
-        let entry = &entries[row];
-        if is_synthetic_message_id(&entry.message_id) {
+        if is_synthetic_message_id(message_id) {
             return Ok(None);
         }
-        let Some(&Some((bound_uidvalidity, uidnext))) = self.bounds.get(&entry.id) else {
+        let Some((bound_validity, first)) = bound else {
             return Ok(None);
         };
-        let uidvalidity = match self.select(session, target)? {
-            Ok(uidvalidity) if uidvalidity == bound_uidvalidity => uidvalidity,
-            Ok(_) | Err(_) => return Ok(None),
+        // Refresh UIDNEXT before searching, and use a closed upper bound so
+        // new arrivals cannot extend the range during the check.
+        self.selected = None;
+        let (uidvalidity, next) = match session.select_with_next(target) {
+            Ok(selected) => selected,
+            Err(WriteError::Refused(_)) => return Ok(None),
+            Err(WriteError::Connection(error)) => return Err(Stop::Connection(error)),
         };
-        let found = match session.search_message_id(&entry.message_id, usize::MAX) {
+        self.selected = Some((target.to_string(), uidvalidity));
+        let Some(range) = next
+            .filter(|_| uidvalidity == bound_validity)
+            .and_then(|next| recovery_uid_range(first, next))
+        else {
+            return Ok(None);
+        };
+        let found = match session.search_message_id(message_id, RECOVERY_UID_LIMIT, Some(range)) {
             Ok(found) => found,
             Err(WriteError::Refused(_)) => return Ok(None),
             Err(WriteError::Connection(err)) => return Err(Stop::Connection(err)),
         };
         let mut candidates = Vec::new();
         for uid in found {
-            if uid < uidnext
-                || taken.contains(&Some((uidvalidity, uid)))
+            if taken.contains(&Some((uidvalidity, uid)))
                 || outbox::is_claimed(self.store, self.account_id, target, uidvalidity, uid)?
             {
                 continue;
             }
             candidates.push(uid);
         }
-        if candidates.is_empty() {
-            return Ok(None);
+        for batch in candidates.chunks(RECOVERY_HEADER_BATCH) {
+            let headers = match session.uid_fetch_message_ids(batch) {
+                Ok(headers) => headers,
+                Err(WriteError::Refused(_)) => return Ok(None),
+                Err(WriteError::Connection(err)) => return Err(Stop::Connection(err)),
+            };
+            let exact = headers
+                .into_iter()
+                .filter(|(uid, header)| {
+                    batch.binary_search(uid).is_ok()
+                        && copy_message_id(target, uidvalidity, *uid, header, false).as_str()
+                            == message_id
+                })
+                .map(|(uid, _)| uid)
+                .min();
+            if let Some(uid) = exact {
+                return Ok(Some((uidvalidity, uid)));
+            }
         }
-        let headers = match session.uid_fetch_message_ids(&candidates) {
-            Ok(headers) => headers,
-            Err(WriteError::Refused(_)) => return Ok(None),
-            Err(WriteError::Connection(err)) => return Err(Stop::Connection(err)),
-        };
-        let exact = headers
-            .iter()
-            .filter(|(uid, header)| {
-                candidates.contains(uid)
-                    && copy_message_id(target, uidvalidity, *uid, header, false).as_str()
-                        == entry.message_id
-            })
-            .map(|(uid, _)| *uid)
-            .min();
-        Ok(exact.map(|uid| (uidvalidity, uid)))
+        Ok(None)
     }
 
     /// `refused`: the server answered the MOVE itself with NO or BAD.
@@ -1249,26 +1343,6 @@ impl Pass<'_> {
             self.retry_as(*row, DropReason::Refused, message, refused)?;
         }
         Ok(())
-    }
-
-    fn settle(
-        &mut self,
-        index: usize,
-        (source, uidvalidity, uid): (&str, u32, u32),
-        target: &str,
-        outcome: Outcome<'_>,
-    ) -> Result<(), Stop> {
-        match outbox::settle(
-            self.store,
-            self.account_id,
-            &self.entries[index],
-            Some((source, uidvalidity, uid)),
-            Some(target),
-            outcome,
-        )? {
-            Settled::Stale => Err(Stop::Stale),
-            Settled::Recorded | Settled::Recovering | Settled::Retired => Ok(()),
-        }
     }
 
     /// The raw name: as queued, else from the server's LIST.
