@@ -1093,6 +1093,7 @@ mod tests {
                         size: 15.,
                         foreground: 0xa9b1d6,
                         link: 0x7aa2f7,
+                        inset: true,
                     }),
                     |_| None,
                 ),

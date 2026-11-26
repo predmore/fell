@@ -102,6 +102,7 @@ impl Reader {
             size: 15.,
             foreground: palette.foreground,
             link: palette.accent,
+            inset: true,
         };
         let allowed = self.model.remote_images_allowed();
         let key = web.then_some((width, scheme, allowed));

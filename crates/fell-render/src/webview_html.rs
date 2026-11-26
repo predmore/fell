@@ -19,6 +19,8 @@ pub struct WebTextStyle {
     pub size: f32,
     pub foreground: u32,
     pub link: u32,
+    /// Whether a body without its own spacing should have a paper inset.
+    pub inset: bool,
 }
 
 fn web_page(body: &str, scheme: &str, body_attrs: &str, body_css: &str, link_css: &str) -> String {
@@ -171,8 +173,17 @@ impl WebMail {
 
     pub fn estimated_height_with_style(&self, width: f32, style: Option<&WebTextStyle>) -> f32 {
         let size = style.map_or(layout::BODY_FONT_SIZE, |style| style.size);
-        self.layout
-            .height_at_size(width, Self::image_height_limit(width), size)
+        self.layout.height_at_size(
+            width,
+            Self::image_height_limit(width),
+            size,
+            self.body_inset(style),
+        )
+    }
+
+    fn body_inset(&self, style: Option<&WebTextStyle>) -> bool {
+        self.layout.native_body_inset
+            && (self.has_author_colors() || style.is_none_or(|style| style.inset))
     }
 
     pub fn has_author_colors(&self) -> bool {
@@ -227,7 +238,7 @@ impl WebMail {
                 write!(link_css, "a:any-link {{ color: #{:06x}; }}", text.link).unwrap();
             }
         }
-        if self.layout.native_body_inset {
+        if self.body_inset(text) {
             write!(
                 body_css,
                 " padding: {}px {}px;",
@@ -1353,16 +1364,33 @@ mod tests {
             size: 15.,
             foreground: 0xa9b1d6,
             link: 0x7aa2f7,
+            inset: true,
         };
         let page = plain.page_with_style("dark", Some(&style), |_| None);
         assert_eq!(plain.appearance("dark", 0x24283b), ("dark", 0x24283b));
         assert!(page.contains(r#"font-family: "Inter", system-ui, sans-serif"#));
         assert!(page.contains("font-size: 15px; line-height: 1.4; color: #a9b1d6"));
         assert!(page.contains("a:any-link { color: #7aa2f7; }"));
-        let bigger = WebTextStyle { size: 20., ..style };
+        let bigger = WebTextStyle {
+            size: 20.,
+            ..style.clone()
+        };
         assert_eq!(
             plain.estimated_height_with_style(440., Some(&bigger)) - plain.estimated_height(440.),
             7.
+        );
+        let flush = WebTextStyle {
+            inset: false,
+            ..style
+        };
+        assert!(
+            !plain
+                .page_with_style("dark", Some(&flush), |_| None)
+                .contains("padding: 12px 14px")
+        );
+        assert_eq!(
+            plain.estimated_height(440.) - plain.estimated_height_with_style(440., Some(&flush)),
+            24.
         );
         assert!(page.contains("padding: 12px 14px"));
         for html in [

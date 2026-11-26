@@ -558,6 +558,7 @@ impl Reader {
                 size: theme.ui_px,
                 foreground: theme.foreground,
                 link: theme.accent,
+                inset: body.suggested == RenderMode::Web,
             }),
             images,
         }

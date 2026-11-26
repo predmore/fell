@@ -168,8 +168,7 @@ pub fn prepare_html(html: &str, headers_in: &[(String, String)]) -> HtmlBody {
         .iter()
         .map(|text| crate::render::is_right_to_left(text))
         .collect();
-    let mut web_links = Vec::new();
-    collect_web_links(&folded.document.blocks, &mut web_links, &mut HashSet::new());
+    let web_links = web_link_blocks(&folded.document.blocks);
     HtmlBody {
         folded,
         suggested,
@@ -184,9 +183,32 @@ pub fn prepare_html(html: &str, headers_in: &[(String, String)]) -> HtmlBody {
 
 // Reuse native link widgets below the snapshot. The image has no hit targets
 // of its own, and no WebKit event can activate a URL.
+fn web_link_blocks(blocks: &[fell_render::Block]) -> Vec<fell_render::Block> {
+    use fell_render::{Block, Inline};
+
+    let mut links = Vec::new();
+    collect_web_links(blocks, &mut links, &mut HashSet::new());
+    let single = links.len() == 1;
+    links
+        .into_iter()
+        .map(|(href, label)| Block::Paragraph {
+            inlines: vec![Inline::Link {
+                href,
+                // The snapshot already shows the caption. One destination
+                // needs only an action, with the URL available on focus.
+                children: vec![Inline::Text(if single {
+                    "Open link".into()
+                } else {
+                    label
+                })],
+            }],
+        })
+        .collect()
+}
+
 fn collect_web_links(
     blocks: &[fell_render::Block],
-    links: &mut Vec<fell_render::Block>,
+    links: &mut Vec<(String, String)>,
     seen: &mut HashSet<String>,
 ) {
     use fell_render::{Block, Inline};
@@ -206,7 +228,7 @@ fn collect_web_links(
         }
     }
 
-    fn visit(inlines: &[Inline], links: &mut Vec<Block>, seen: &mut HashSet<String>) {
+    fn visit(inlines: &[Inline], links: &mut Vec<(String, String)>, seen: &mut HashSet<String>) {
         for inline in inlines {
             match inline {
                 Inline::Link { href, children } => {
@@ -216,12 +238,7 @@ fn collect_web_links(
                         && let Some(target) = fell_render::reader_link_target(href)
                         && seen.insert(target)
                     {
-                        links.push(Block::Paragraph {
-                            inlines: vec![Inline::Link {
-                                href: href.clone(),
-                                children: vec![Inline::Text(label)],
-                            }],
-                        });
+                        links.push((href.clone(), label));
                     }
                 }
                 Inline::Emphasis(children)
@@ -641,18 +658,26 @@ fn mix(a: u32, b: u32, t: f32) -> u32 {
 mod tests {
 
     #[test]
+    fn one_web_link_shows_a_single_action_below_its_caption() {
+        let doc = fell_render::html_to_document(
+            r#"<a href="https://example.test">Harbor office</a>
+                <a href="https://example.test">Office hours</a>"#,
+        );
+        let links = super::web_link_blocks(&doc.blocks);
+        assert_eq!(
+            fell_render::StyledDocument::blocks_text(&links),
+            "Open link"
+        );
+    }
+
+    #[test]
     fn web_links_keep_the_first_text_label_and_skip_images() {
         let html = r#"<p><a href="https://example.test/route"><img src="https://example.test/image" alt="Map"></a>
             <a href="https://example.test/route"><strong>The route</strong></a>
             <a href="https://example.test/route">Map again</a>
             <a href="https://example.test/shops"><img src="https://example.test/logo" alt="Logo">Shops</a></p>"#;
         let doc = fell_render::prepare(html, &Default::default()).document;
-        let mut links = Vec::new();
-        super::collect_web_links(
-            &doc.blocks,
-            &mut links,
-            &mut std::collections::HashSet::new(),
-        );
+        let links = super::web_link_blocks(&doc.blocks);
         assert_eq!(
             fell_render::StyledDocument::blocks_text(&links),
             "The route\nShops"

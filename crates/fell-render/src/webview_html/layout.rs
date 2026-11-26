@@ -93,14 +93,24 @@ impl Estimate {
     }
 
     pub(super) fn height(&self, width: f32, image_limit: f32) -> f32 {
-        self.height_at_size(width, image_limit, BODY_FONT_SIZE)
+        self.height_at_size(width, image_limit, BODY_FONT_SIZE, self.native_body_inset)
     }
 
-    pub(super) fn height_at_size(&self, width: f32, image_limit: f32, font_size: f32) -> f32 {
-        let font_scale = if self.author_colors {
-            1.
-        } else {
-            font_size / BODY_FONT_SIZE
+    pub(super) fn height_at_size(
+        &self,
+        width: f32,
+        image_limit: f32,
+        font_size: f32,
+        body_inset: bool,
+    ) -> f32 {
+        let style = MeasureStyle {
+            image_limit,
+            font_scale: if self.author_colors {
+                1.
+            } else {
+                font_size / BODY_FONT_SIZE
+            },
+            body_inset,
         };
         let width = width.max(1.);
         let index = self
@@ -117,17 +127,15 @@ impl Estimate {
                 } else {
                     0.
                 };
-                let outer_width = (layout.overflow_width(width) - trailing_inset).max(width);
+                let outer_width =
+                    (layout.overflow_width(width, style.body_inset) - trailing_inset).max(width);
                 let scale = if outer_width <= super::WEB_SNAPSHOT_WIDTH_LIMIT as f32 {
                     width / outer_width
                 } else {
                     // The worker falls back to simple view above the raster limit.
                     1.
                 };
-                layout
-                    .measure(width, image_limit, font_scale)
-                    .outer_height()
-                    * scale
+                layout.measure(width, style).outer_height() * scale
             })
             + HEIGHT_ALLOWANCE)
             .min(MAX_ESTIMATED_HEIGHT)
@@ -1179,6 +1187,7 @@ struct Flow {
     max_width: Option<Length>,
     font: f32,
     padding: [Length; 4],
+    default_body_padding: bool,
     margin: [Length; 4],
     border: [f32; 4],
     gap: [Length; 2],
@@ -1187,6 +1196,13 @@ struct Flow {
     height: f32,
     min_height: f32,
     max_height: f32,
+}
+
+#[derive(Clone, Copy)]
+struct MeasureStyle {
+    image_limit: f32,
+    font_scale: f32,
+    body_inset: bool,
 }
 
 #[derive(Default)]
@@ -1563,7 +1579,8 @@ impl Layout {
         let margin = box_edges(&style, "margin");
         let border = border_edges(&style);
         let cell = matches!(name, "td" | "th");
-        let default_padding = if name == "body" && styles.native_body_inset {
+        let default_body_padding = name == "body" && styles.native_body_inset;
+        let default_padding = if default_body_padding {
             [
                 Length::Px(BODY_PAD_Y),
                 Length::Px(BODY_PAD_X),
@@ -1782,6 +1799,7 @@ impl Layout {
             max_width: html::declared_value(&style, "max-width").and_then(Length::parse),
             font: font.size,
             padding,
+            default_body_padding,
             margin,
             border,
             gap,
@@ -1792,15 +1810,21 @@ impl Layout {
         })))
     }
 
-    fn overflow_width(&self, width: f32) -> f32 {
+    fn overflow_width(&self, width: f32, body_inset: bool) -> f32 {
         match self {
-            Self::Flow(flow) => flow.overflow_width(width),
+            Self::Flow(flow) => flow.overflow_width(width, body_inset),
             _ => 0., // The wrapper fits images and wraps otherwise unbreakable text.
         }
     }
 
-    fn measure(&self, width: f32, image_limit: f32, font_scale: f32) -> Measured {
-        let scale = |value, relative| if relative { value * font_scale } else { value };
+    fn measure(&self, width: f32, style: MeasureStyle) -> Measured {
+        let scale = |value, relative| {
+            if relative {
+                value * style.font_scale
+            } else {
+                value
+            }
+        };
         match self {
             Self::Text {
                 words,
@@ -1836,14 +1860,14 @@ impl Layout {
                 Measured {
                     height: (height * (drawn.min(available) / natural))
                         .max(*min_height)
-                        .min(image_limit)
+                        .min(style.image_limit)
                         + top
                         + bottom,
                     above: margin[0].resolve(width, *font),
                     below: margin[2].resolve(width, *font),
                 }
             }
-            Self::Flow(flow) => flow.measure(width, image_limit, font_scale, false),
+            Self::Flow(flow) => flow.measure(width, style, false),
         }
     }
 
@@ -1952,13 +1976,13 @@ fn authored_gap(
 }
 
 impl Flow {
-    fn fixed_cell_width(child: &Layout, width: f32) -> Option<f32> {
+    fn fixed_cell_width(child: &Layout, width: f32, body_inset: bool) -> Option<f32> {
         let Layout::Flow(cell) = child else {
             return None;
         };
         (cell.kind == FlowKind::Cell && cell.width.is_some_and(Length::is_fixed)).then(|| {
-            let (preferred, _, edges) = cell.horizontal_size(width);
-            (preferred + edges).max(cell.overflow_width(width))
+            let (preferred, _, edges) = cell.horizontal_size(width, body_inset);
+            (preferred + edges).max(cell.overflow_width(width, body_inset))
         })
     }
 
@@ -1972,8 +1996,17 @@ impl Flow {
         })
     }
 
-    fn horizontal_size(&self, width: f32) -> (f32, f32, f32) {
-        let [_, right, _, left] = insets(self.padding, self.border, width, self.font);
+    fn box_insets(&self, width: f32, body_inset: bool) -> [f32; 4] {
+        let padding = if self.default_body_padding && !body_inset {
+            [ZERO; 4]
+        } else {
+            self.padding
+        };
+        insets(padding, self.border, width, self.font)
+    }
+
+    fn horizontal_size(&self, width: f32, body_inset: bool) -> (f32, f32, f32) {
+        let [_, right, _, left] = self.box_insets(width, body_inset);
         let margins =
             self.margin[1].resolve(width, self.font) + self.margin[3].resolve(width, self.font);
         let inset = left + right;
@@ -1998,8 +2031,8 @@ impl Flow {
         (preferred, required, inset + margins)
     }
 
-    fn overflow_width(&self, width: f32) -> f32 {
-        let (preferred, required, edges) = self.horizontal_size(width);
+    fn overflow_width(&self, width: f32, body_inset: bool) -> f32 {
+        let (preferred, required, edges) = self.horizontal_size(width, body_inset);
         let spacing = if self.kind == FlowKind::Table {
             2. * self.gap[1].resolve(preferred, self.font)
         } else {
@@ -2014,27 +2047,22 @@ impl Flow {
         {
             self.children
                 .iter()
-                .map(|child| child.overflow_width(space / self.children.len() as f32))
+                .map(|child| child.overflow_width(space / self.children.len() as f32, body_inset))
                 .sum()
         } else {
             self.children
                 .iter()
-                .map(|child| child.overflow_width(space))
+                .map(|child| child.overflow_width(space, body_inset))
                 .fold(0., f32::max)
         };
         (required.max(children + spacing) + edges).min(super::WEB_SNAPSHOT_WIDTH_LIMIT as f32 + 1.)
     }
 
-    fn inline_lines(
-        &self,
-        width: f32,
-        image_limit: f32,
-        font_scale: f32,
-    ) -> impl Iterator<Item = Measured> + '_ {
+    fn inline_lines(&self, width: f32, style: MeasureStyle) -> impl Iterator<Item = Measured> + '_ {
         let mut children = self.children.iter().peekable();
         std::iter::from_fn(move || {
             let child = children.next()?;
-            let line = child.measure(width, image_limit, font_scale);
+            let line = child.measure(width, style);
             let Some(mut used) = child.inline_box_width(width) else {
                 return Some(line);
             };
@@ -2044,7 +2072,7 @@ impl Flow {
                 && used + next_width <= width
             {
                 used += next_width;
-                tallest = tallest.max(next.measure(width, image_limit, font_scale).outer_height());
+                tallest = tallest.max(next.measure(width, style).outer_height());
                 children.next();
             }
             Some(Measured {
@@ -2054,14 +2082,8 @@ impl Flow {
         })
     }
 
-    fn measure(
-        &self,
-        width: f32,
-        image_limit: f32,
-        font_scale: f32,
-        in_table_row: bool,
-    ) -> Measured {
-        let [top, right, bottom, left] = insets(self.padding, self.border, width, self.font);
+    fn measure(&self, width: f32, style: MeasureStyle, in_table_row: bool) -> Measured {
+        let [top, right, bottom, left] = self.box_insets(width, style.body_inset);
         let [above, margin_right, below, margin_left] =
             self.margin.map(|edge| edge.resolve(width, self.font));
         let natural_width = (width - left - right - margin_left - margin_right).max(1.);
@@ -2086,8 +2108,13 @@ impl Flow {
         if self.kind == FlowKind::Table {
             // A fixed descendant or a cell's minimum can enlarge a table,
             // including one whose own width is a percentage or auto.
-            available = available
-                .max(self.overflow_width(width) - left - right - margin_left - margin_right);
+            available = available.max(
+                self.overflow_width(width, style.body_inset)
+                    - left
+                    - right
+                    - margin_left
+                    - margin_right,
+            );
         }
         let [row_gap, column_gap] = self.gap.map(|gap| gap.resolve(available, self.font));
         let mut measured = Measured {
@@ -2105,11 +2132,7 @@ impl Flow {
                 // blocks. The browser stacks them inside an anonymous cell.
                 self.children
                     .iter()
-                    .map(|child| {
-                        child
-                            .measure(available, image_limit, font_scale)
-                            .outer_height()
-                    })
+                    .map(|child| child.measure(available, style).outer_height())
                     .sum()
             }
             FlowKind::Row | FlowKind::TableRow => {
@@ -2118,10 +2141,10 @@ impl Flow {
                 let preferred: f32 = self
                     .children
                     .iter()
-                    .map(|child| child.inline_width(font_scale))
+                    .map(|child| child.inline_width(style.font_scale))
                     .sum();
                 let equal = width / count.max(1) as f32;
-                let fixed_width = |child| Self::fixed_cell_width(child, equal);
+                let fixed_width = |child| Self::fixed_cell_width(child, equal, style.body_inset);
                 let (fixed_count, fixed_total) = if self.kind == FlowKind::TableRow {
                     self.children
                         .iter()
@@ -2145,15 +2168,15 @@ impl Flow {
                         let share = if self.kind == FlowKind::TableRow {
                             fixed_width(child).map_or(fluid_width, |hint| hint * fixed_scale)
                         } else if preferred > width {
-                            width * child.inline_width(font_scale) / preferred
+                            width * child.inline_width(style.font_scale) / preferred
                         } else {
                             width
                         };
                         match child {
                             Layout::Flow(flow) if self.kind == FlowKind::TableRow => {
-                                flow.measure(share, image_limit, font_scale, true)
+                                flow.measure(share, style, true)
                             }
-                            _ => child.measure(share, image_limit, font_scale),
+                            _ => child.measure(share, style),
                         }
                         .outer_height()
                     })
@@ -2163,10 +2186,7 @@ impl Flow {
                 let collapses_through_edges = self.kind == FlowKind::Block;
                 let mut previous = 0_f32;
                 let mut height = 0.;
-                for (index, line) in self
-                    .inline_lines(available, image_limit, font_scale)
-                    .enumerate()
-                {
+                for (index, line) in self.inline_lines(available, style).enumerate() {
                     if index == 0 && collapses_through_edges && top == 0. {
                         measured.above = measured.above.max(line.above);
                     } else {
@@ -2196,7 +2216,7 @@ impl Flow {
                 let boxes = self
                     .children
                     .iter()
-                    .map(|child| child.measure(width, image_limit, font_scale).outer_height());
+                    .map(|child| child.measure(width, style).outer_height());
                 let rows = if table {
                     self.children
                         .iter()
@@ -2347,7 +2367,14 @@ fn height_estimates_cap_image_hints_and_total_layout() {
     };
     assert_eq!(
         image
-            .measure(440., WebMail::image_height_limit(440.), 1.)
+            .measure(
+                440.,
+                MeasureStyle {
+                    image_limit: WebMail::image_height_limit(440.),
+                    font_scale: 1.,
+                    body_inset: true,
+                }
+            )
             .outer_height(),
         660.
     );
