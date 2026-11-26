@@ -5,7 +5,7 @@ use gpui::prelude::*;
 use gpui::{Context, Div, FontWeight, MouseButton, Pixels, Size, Window, div, px, rgb};
 
 use super::{CARD_TOP_PX, FontOpt, Inbox, conversation_line_style};
-use crate::keymap::{ACTION_SECTIONS, Action, KeyId, binding_text};
+use crate::keymap::{ACTION_SECTIONS, Action, KeyId, Keymap, binding_text};
 use crate::model::{Overlay, Session};
 use crate::motion::{self, Glide, Motion};
 use crate::theme::Theme;
@@ -16,6 +16,7 @@ const INSET: f32 = 8.;
 const LEFT: f32 = 14.;
 const RIGHT: f32 = 24.;
 const DETAIL_GAP: f32 = 8.;
+const STACKED_KEY_INSET: f32 = 12.;
 
 #[derive(Default)]
 pub(super) struct HelpScroll {
@@ -127,10 +128,7 @@ impl HelpScroll {
             self.drawn
         };
         let offset = drawn.min((layout.total - layout.page) as f32 * layout.row);
-        Some((
-            layout.top,
-            card(theme, session, layout, offset, moving, live, cx),
-        ))
+        Some((layout.top, card(theme, layout, offset, moving, live, cx)))
     }
 }
 
@@ -168,6 +166,7 @@ impl Layout {
         Self::measure(
             theme.ui_px,
             window.viewport_size(),
+            &session.keymap,
             error
                 .into_iter()
                 .chain(subject_join.then(|| (SUBJECT_JOIN_HELP.into(), false))),
@@ -195,6 +194,7 @@ impl Layout {
     fn measure(
         ui_px: f32,
         viewport: Size<Pixels>,
+        keymap: &Keymap,
         details: impl IntoIterator<Item = (String, bool)>,
         count_detail_rows: impl Fn(&str, f32) -> usize,
     ) -> Self {
@@ -216,7 +216,7 @@ impl Layout {
             .collect();
         let detail_rows: usize = details.iter().map(|(_, _, lines)| *lines).sum();
         let detail_gap = if detail_rows > 0 { DETAIL_GAP } else { 0. };
-        let rows = help_rows().collect::<Vec<_>>();
+        let rows = help_rows(keymap).collect::<Vec<_>>();
         let total = rows.len() + detail_rows;
         let page =
             (((height - header - 2. - 2. * INSET - detail_gap) / row) as usize).clamp(1, total);
@@ -238,21 +238,23 @@ impl Layout {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 enum HelpRow {
     Section(&'static str),
-    Action(Action),
+    Action(Action, String),
 }
 
-fn help_rows() -> impl Iterator<Item = HelpRow> {
-    ACTION_SECTIONS.iter().flat_map(|&(section, actions)| {
-        std::iter::once(HelpRow::Section(section)).chain(
-            actions
-                .iter()
-                .copied()
-                .filter(|action| !matches!(action, Action::About | Action::Help))
-                .map(HelpRow::Action),
-        )
+fn help_rows(keymap: &Keymap) -> impl Iterator<Item = HelpRow> {
+    ACTION_SECTIONS.iter().flat_map(move |&(section, actions)| {
+        let mut rows = actions
+            .iter()
+            .filter_map(move |&action| {
+                let keys = binding_text(keymap, action);
+                (!keys.is_empty()).then_some(HelpRow::Action(action, keys))
+            })
+            .peekable();
+        let header = rows.peek().map(|_| HelpRow::Section(section));
+        header.into_iter().chain(rows)
     })
 }
 
@@ -263,7 +265,6 @@ fn thumb_height(body: f32, page: usize, total: usize, ui_px: f32) -> f32 {
 
 fn card(
     theme: &Theme,
-    session: &Session,
     layout: Layout,
     offset: f32,
     moving: bool,
@@ -377,10 +378,9 @@ fn card(
                                     layout
                                         .rows
                                         .iter()
-                                        .copied()
                                         .skip(action_start - layout.detail_rows)
                                         .take(end.saturating_sub(action_start))
-                                        .map(|row| help_row(theme, session, row, &layout)),
+                                        .map(|row| help_row(theme, row, &layout)),
                                 ),
                         )
                         .children((moving && offset > 0.).then(|| edge(theme, true, 14.)))
@@ -412,19 +412,20 @@ fn card(
         )
 }
 
-fn help_row(theme: &Theme, session: &Session, row: HelpRow, layout: &Layout) -> Div {
-    let action = match row {
+fn help_row(theme: &Theme, row: &HelpRow, layout: &Layout) -> Div {
+    let (action, keys) = match row {
         HelpRow::Section(label) => {
             return div()
                 .h(px(layout.row))
                 .flex()
-                .items_center()
-                .line_height(px(layout.line))
+                .items_end()
+                .pb(px(3.))
+                .line_height(px(theme.ui_px))
                 .text_color(rgb(theme.dimmed))
                 .font_weight(FontWeight::SEMIBOLD)
-                .child(label);
+                .child(*label);
         }
-        HelpRow::Action(action) => action,
+        HelpRow::Action(action, keys) => (action, keys),
     };
     div()
         .h(px(layout.row))
@@ -446,12 +447,14 @@ fn help_row(theme: &Theme, session: &Session, row: HelpRow, layout: &Layout) -> 
         .child(
             div()
                 .when(layout.stacked, |keys| {
-                    keys.w(px(layout.text_width)).h(px(layout.line))
+                    keys.ml(px(STACKED_KEY_INSET))
+                        .w(px((layout.text_width - STACKED_KEY_INSET).max(1.)))
+                        .h(px(layout.line))
                 })
                 .font_family_opt(theme.mono_family.clone())
                 .text_color(rgb(theme.dimmed))
                 .truncate()
-                .child(binding_text(&session.keymap, action)),
+                .child(keys.clone()),
         )
 }
 
@@ -470,7 +473,6 @@ pub(super) fn edge(theme: &Theme, top: bool, height: f32) -> Div {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keymap::Keymap;
     use std::time::Duration;
 
     #[test]
@@ -479,7 +481,9 @@ mod tests {
         let motion = Motion::new(false);
         let mut scroll = HelpScroll::default();
         assert_eq!(scroll.page, 0);
-        let measure = || Layout::measure(13., gpui::size(px(520.), px(720.)), None, |_, _| 0);
+        let keymap = Keymap::default();
+        let measure =
+            || Layout::measure(13., gpui::size(px(520.), px(720.)), &keymap, None, |_, _| 0);
         scroll.prepare(now, measure);
         let half_page = scroll.page / 2;
         assert!(half_page > 1);
@@ -492,40 +496,40 @@ mod tests {
     }
 
     #[test]
-    fn section_headers_and_actions_follow_the_palette_order() {
+    fn section_headers_and_bound_actions_follow_the_palette_order() {
         let keymap = Keymap::default();
-        let rows: Vec<_> = help_rows().collect();
+        let rows: Vec<_> = help_rows(&keymap).collect();
         let headings: Vec<_> = rows
             .iter()
             .filter_map(|row| match row {
                 HelpRow::Section(label) => Some(*label),
-                HelpRow::Action(_) => None,
+                HelpRow::Action(..) => None,
             })
             .collect();
         assert_eq!(
             headings,
             [
                 "Navigation",
+                "Search",
                 "Reading",
+                "Attachments",
                 "Compose",
                 "Organize",
-                "Attachments",
-                "Search",
                 "Agents",
-                "Settings and help",
+                "General",
             ]
         );
         let actions: Vec<_> = rows
             .into_iter()
             .filter_map(|row| match row {
                 HelpRow::Section(_) => None,
-                HelpRow::Action(action) => Some(action),
+                HelpRow::Action(action, keys) => Some((action, keys)),
             })
             .collect();
         let palette: Vec<_> = crate::keymap::palette_items(&keymap, "", &[])
             .into_iter()
-            .map(|item| item.action)
-            .filter(|action| !matches!(action, Action::About | Action::Help))
+            .filter(|item| !item.binding.is_empty())
+            .map(|item| (item.action, item.binding))
             .collect();
         assert_eq!(actions, palette);
     }
@@ -534,8 +538,15 @@ mod tests {
     fn scroll_can_settle_with_a_whole_header_on_either_edge() {
         let now = Instant::now();
         let motion = Motion::new(false);
+        let keymap = Keymap::default();
         for ui_px in [12., 18.] {
-            let layout = Layout::measure(ui_px, gpui::size(px(420.), px(380.)), None, |_, _| 0);
+            let layout = Layout::measure(
+                ui_px,
+                gpui::size(px(420.), px(380.)),
+                &keymap,
+                None,
+                |_, _| 0,
+            );
             let header = layout
                 .rows
                 .iter()

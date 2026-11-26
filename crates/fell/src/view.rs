@@ -11883,7 +11883,9 @@ fn which_key_popup(
     (opacity, rise): (f32, f32),
 ) -> gpui::Div {
     let items = session.which_items();
-    let mut key_style = conversation_line_style(window, theme, px(theme.ui_px));
+    let font_size = px(theme.ui_px);
+    let label_style = conversation_line_style(window, theme, font_size);
+    let mut key_style = label_style.clone();
     if let Some(family) = &theme.mono_family {
         key_style.font_family = family.clone().into();
     }
@@ -11892,14 +11894,21 @@ fn which_key_popup(
             .text_system()
             .shape_line(
                 key.to_owned().into(),
-                px(theme.ui_px),
+                font_size,
                 &[key_style.to_run(key.len())],
                 None,
             )
             .width
     });
     let has_groups = items.iter().any(|item| item.is_group);
-    let chevron_width = px(theme.ui_px);
+    let text = window.text_system();
+    let label_line = text.shape_line("x".into(), font_size, &[label_style.to_run(1)], None);
+    let x_height = label_line
+        .font_id_for_index(0)
+        .map(|font| text.x_height(font, font_size))
+        .filter(|height| *height > px(0.))
+        .unwrap_or(font_size * 0.55);
+    let chevron_offset = (label_line.ascent - label_line.descent - x_height) / 2.;
     div()
         .absolute()
         .bottom(px(40. - rise))
@@ -11938,16 +11947,38 @@ fn which_key_popup(
                 .when(has_groups, |row| {
                     row.child(
                         div()
-                            .ml(chevron_width)
-                            .w(chevron_width)
+                            .ml(font_size)
+                            .w(font_size)
                             .flex_none()
-                            .text_right()
-                            .text_color(rgb(theme.dimmed))
-                            .font_weight(FontWeight::BOLD)
-                            .children(item.is_group.then_some("›")),
+                            .flex()
+                            .justify_end()
+                            .children(item.is_group.then(|| {
+                                which_key_chevron(font_size, chevron_offset, theme.dimmed)
+                            })),
                     )
                 })
         }))
+}
+
+fn which_key_chevron(font_size: Pixels, offset: Pixels, color: u32) -> impl IntoElement {
+    gpui::canvas(
+        |_, _, _| (),
+        move |bounds, (), window, _| {
+            let center = bounds.center();
+            let y = center.y + offset;
+            let half_width = font_size * 0.15;
+            let half_height = font_size * 0.29;
+            let mut path = gpui::PathBuilder::stroke(font_size * 0.13);
+            path.move_to(point(center.x - half_width, y - half_height));
+            path.line_to(point(center.x + half_width, y));
+            path.line_to(point(center.x - half_width, y + half_height));
+            if let Ok(path) = path.build() {
+                window.paint_path(path, rgb(color));
+            }
+        },
+    )
+    .w(font_size * 0.5)
+    .h(font_size)
 }
 
 fn which_key_column_width(

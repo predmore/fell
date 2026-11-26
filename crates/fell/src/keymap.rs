@@ -213,6 +213,10 @@ pub const ACTION_SECTIONS: &[(&str, &[Action])] = &[
         ],
     ),
     (
+        "Search",
+        &[Action::Search, Action::NextHit, Action::PreviousHit],
+    ),
+    (
         "Reading",
         &[
             Action::PageDown,
@@ -220,6 +224,18 @@ pub const ACTION_SECTIONS: &[(&str, &[Action])] = &[
             Action::FullWidth,
             Action::ToggleQuotes,
             Action::FocusLinks,
+        ],
+    ),
+    (
+        "Attachments",
+        &[
+            Action::FocusAttachments,
+            Action::PreviousAttachment,
+            Action::NextAttachment,
+            Action::OpenAttachment,
+            Action::SaveAttachment,
+            Action::SaveAllAttachments,
+            Action::RetryAttachment,
         ],
     ),
     (
@@ -252,22 +268,6 @@ pub const ACTION_SECTIONS: &[(&str, &[Action])] = &[
         ],
     ),
     (
-        "Attachments",
-        &[
-            Action::FocusAttachments,
-            Action::PreviousAttachment,
-            Action::NextAttachment,
-            Action::OpenAttachment,
-            Action::SaveAttachment,
-            Action::SaveAllAttachments,
-            Action::RetryAttachment,
-        ],
-    ),
-    (
-        "Search",
-        &[Action::Search, Action::NextHit, Action::PreviousHit],
-    ),
-    (
         "Agents",
         &[
             Action::Agents,
@@ -283,7 +283,7 @@ pub const ACTION_SECTIONS: &[(&str, &[Action])] = &[
         ],
     ),
     (
-        "Settings and help",
+        "General",
         &[
             Action::Palette,
             Action::Help,
@@ -464,7 +464,7 @@ fn default_bindings() -> Vec<Binding> {
         bind(
             &[KeyId::Leader, KeyId::Char('?'), KeyId::Char(key)],
             action,
-            Some("Help / diagnostics"),
+            Some("General"),
         );
     }
     bind(
@@ -512,7 +512,7 @@ fn default_bindings() -> Vec<Binding> {
         bind(
             &[KeyId::Leader, KeyId::Char('b'), KeyId::Char(key)],
             action,
-            Some("Triage"),
+            Some("Organize"),
         );
     }
     bind(
@@ -570,12 +570,12 @@ fn default_bindings() -> Vec<Binding> {
     bind(
         &[KeyId::Leader, KeyId::Char('t'), KeyId::Char('z')],
         Action::FullWidth,
-        Some("Toggles"),
+        Some("Reading / notifications"),
     );
     bind(
         &[KeyId::Leader, KeyId::Char('t'), KeyId::Char('q')],
         Action::ToggleQuotes,
-        Some("Toggles"),
+        Some("Reading / notifications"),
     );
     for (key, mode) in [
         ('o', NotificationMode::On),
@@ -900,7 +900,11 @@ mod tests {
                 .any(|item| item.action == Action::Help && item.binding == "? · space ? ?")
         );
         let leader = which_key(&keymap, &[KeyId::Leader]);
-        assert!(leader.iter().any(|item| item.key == "?" && item.is_group));
+        assert!(
+            leader
+                .iter()
+                .any(|item| item.key == "?" && item.label == "General" && item.is_group)
+        );
         let help = [KeyId::Leader, KeyId::Char('?')];
         assert_eq!(match_seq(&keymap, &help), SeqMatch::Prefix);
         for (key, action) in [
@@ -923,10 +927,13 @@ mod tests {
                 .iter()
                 .any(|item| item.key == "f" && item.label == "Folders" && item.is_group)
         );
+        assert!(leader.iter().any(|item| item.key == "t"
+            && item.label == "Reading / notifications"
+            && item.is_group));
         assert!(
             leader
                 .iter()
-                .any(|item| item.key == "t" && item.label == "Toggles" && item.is_group)
+                .any(|item| item.key == "b" && item.label == "Organize" && item.is_group)
         );
         assert!(leader.iter().all(|item| item.key != "m"));
         let folders = which_key(&keymap, &[KeyId::Leader, KeyId::Char('f')]);
