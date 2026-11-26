@@ -3,6 +3,7 @@
 //! This crate renders. It does not speak IMAP or Proton. Compose edits plain
 //! markdown and sends only from this window.
 
+use fell::compose_launch::{self, ComposeLaunch};
 use fell::render::{self, Reader};
 use fell::{ComposeView, ThemeKind, open_demo};
 use fell_core::{diagnostic, diagnostics};
@@ -24,6 +25,11 @@ Usage:
   fell embeddings status|install|remove
                                the local search model
   fell mcp add|list|revoke     connect an agent (runs fell-mcp)
+  fell 'mailto:ADDRESS?subject=SUBJECT&body=TEXT'
+                               open a draft from a mailto link
+  fell compose [--to ADDRESS] [--cc ADDRESS] [--bcc ADDRESS]
+               [--subject TEXT] [--body MARKDOWN] [--attach FILE]…
+                               open a draft for editing
   fell --report                write a diagnostic report for review
   fell --version               print the build version
   fell --help                  print this help
@@ -37,7 +43,7 @@ Development previews:
                                the compose window on a demo draft";
 
 /// What the command line asks for.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 enum Command {
     Inbox { demo: bool, trace: bool },
     Help,
@@ -47,7 +53,8 @@ enum Command {
     Embeddings(Vec<String>),
     Mcp(Vec<OsString>),
     Fixture { name: String, light: bool },
-    Compose(ComposePreview),
+    Compose(ComposeLaunch),
+    ComposePreview(ComposePreview),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -60,11 +67,36 @@ struct ComposePreview {
 
 /// Parse everything after the program name. An `Err` is a message for
 /// stderr; the caller adds the usage text and exits 2.
-fn parse_args(args: &[String]) -> Result<Command, String> {
-    match args.first().map(String::as_str) {
-        Some("mcp") => {
-            return Ok(Command::Mcp(args[1..].iter().map(OsString::from).collect()));
+fn parse_args(args: &[OsString]) -> Result<Command, String> {
+    match args.first().and_then(|arg| arg.to_str()) {
+        Some("mcp") => return Ok(Command::Mcp(args[1..].to_vec())),
+        Some("compose") => {
+            if args.len() == 2 && (args[1] == "--help" || args[1] == "-h") {
+                return Ok(Command::Help);
+            }
+            return compose_launch::cli(&args[1..]).map(Command::Compose);
         }
+        Some(uri) if compose_launch::is_mailto(uri) => {
+            if args.len() != 1 {
+                return Err("expected a single mailto link".into());
+            }
+            return compose_launch::mailto(uri).map(Command::Compose);
+        }
+        _ => {}
+    }
+    let args = args
+        .iter()
+        .map(|arg| {
+            arg.to_str()
+                .map(str::to_owned)
+                .ok_or("arguments must be UTF-8")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    parse_text_args(&args)
+}
+
+fn parse_text_args(args: &[String]) -> Result<Command, String> {
+    match args.first().map(String::as_str) {
         Some("account") => return Ok(Command::Account(args[1..].to_vec())),
         Some("embeddings") => return Ok(Command::Embeddings(args[1..].to_vec())),
         _ => {}
@@ -136,8 +168,10 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     match (fixture, compose_flag) {
         (Some(_), Some(flag)) => Err(format!("{flag} is for the compose preview, not --fixture")),
         (Some(name), None) => Ok(Command::Fixture { name, light }),
-        (None, Some(_)) => Ok(Command::Compose(ComposePreview { light, ..compose })),
-        (None, None) if light_set => Ok(Command::Compose(ComposePreview { light, ..compose })),
+        (None, Some(_)) => Ok(Command::ComposePreview(ComposePreview { light, ..compose })),
+        (None, None) if light_set => {
+            Ok(Command::ComposePreview(ComposePreview { light, ..compose }))
+        }
         (None, None) => Ok(Command::Inbox { demo, trace }),
     }
 }
@@ -151,16 +185,11 @@ fn size_value(name: &str, raw: &str) -> Result<f32, String> {
 
 fn main() {
     let started = Instant::now();
-    // `fell mcp` passes its arguments through untouched, even non-UTF-8 paths.
     if diagnostics::init().is_err() {
         let _ = writeln!(io::stderr(), "Fell could not initialize its diagnostic log");
     }
     let raw: Vec<OsString> = std::env::args_os().skip(1).collect();
-    if raw.first().is_some_and(|arg| arg == "mcp") {
-        mcp(&raw[1..]);
-    }
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let command = match parse_args(&args) {
+    let command = match parse_args(&raw) {
         Ok(command) => command,
         Err(err) => {
             diagnostic!(WARN, "Fell command line rejected");
@@ -198,7 +227,13 @@ fn main() {
             }
         }
         Command::Fixture { name, light } => preview(name, light),
-        Command::Compose(preview) => compose_preview(preview),
+        Command::Compose(request) => {
+            if let Err(err) = fell::run_compose(request) {
+                let _ = writeln!(io::stderr(), "fell: {err}");
+                std::process::exit(1);
+            }
+        }
+        Command::ComposePreview(preview) => compose_preview(preview),
     }
 }
 
@@ -330,7 +365,7 @@ mod tests {
     use super::*;
 
     fn parse(list: &[&str]) -> Result<Command, String> {
-        parse_args(&list.iter().map(|arg| arg.to_string()).collect::<Vec<_>>())
+        parse_args(&list.iter().map(OsString::from).collect::<Vec<_>>())
     }
 
     #[test]
@@ -393,6 +428,21 @@ mod tests {
     }
 
     #[test]
+    fn compose_and_mailto_are_live_drafts() {
+        assert!(matches!(parse(&["compose"]), Ok(Command::Compose(_))));
+        assert!(matches!(
+            parse(&["compose", "--to", "reader@example.org"]),
+            Ok(Command::Compose(_))
+        ));
+        assert!(matches!(
+            parse(&["MAILTO:reader@example.org?subject=Hello"]),
+            Ok(Command::Compose(_))
+        ));
+        assert_eq!(parse(&["compose", "--help"]), Ok(Command::Help));
+        assert!(parse(&["mailto:reader@example.org", "--demo"]).is_err());
+    }
+
+    #[test]
     fn known_forms_still_parse() {
         assert_eq!(
             parse(&[]),
@@ -428,7 +478,7 @@ mod tests {
         );
         assert_eq!(
             parse(&["--theme", "light"]),
-            Ok(Command::Compose(ComposePreview {
+            Ok(Command::ComposePreview(ComposePreview {
                 light: true,
                 width: 1100.0,
                 height: 760.0,
@@ -437,7 +487,7 @@ mod tests {
         );
         assert_eq!(
             parse(&["--narrow", "--width", "500", "--play"]),
-            Ok(Command::Compose(ComposePreview {
+            Ok(Command::ComposePreview(ComposePreview {
                 light: false,
                 width: 500.0,
                 height: 900.0,

@@ -5,21 +5,27 @@
 //! mail goes out only from the compose window's own send action.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
 use fell_core::AccountId;
 use fell_core::compose::{
-    DraftFields, DraftHub, DraftSession, ReplyParts, ReplyStart, ResolvedFile, StoredCompose,
+    DraftFields, DraftHub, DraftSession, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_FILES, ReplyParts,
+    ReplyStart, ResolvedFile, StoredCompose,
 };
+use futures::channel::mpsc;
 use gpui::{
     App, AppContext, AsyncApp, Bounds, TitlebarOptions, WindowBounds, WindowHandle, WindowOptions,
     px, size,
 };
 use notify::{Event, RecursiveMode, Watcher};
+use serde::{Deserialize, Serialize};
 
+use crate::compose_launch::{ComposeInput, ComposeLaunch, attachment};
 use crate::compose_ui::ComposeView;
 
 /// Answer `fell-mcp` draft calls on the user's private socket. Another Fell
@@ -43,6 +49,159 @@ fn serve_socket_at(hub: Arc<DraftHub>, path: &std::path::Path) -> std::io::Resul
         }
     });
     Ok(())
+}
+
+const OPEN_COMPOSE: &str = "open-compose ";
+const MAX_REQUEST_LINE: u64 = 8 * 1024 * 1024;
+const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Inbox startup owns the socket before GPUI or the store opens. A compose
+/// invocation that loses the lock hands off its draft and exits.
+pub(crate) fn inbox_socket(
+    hub: Arc<DraftHub>,
+    initial: Option<ComposeLaunch>,
+) -> Result<Option<mpsc::Receiver<ComposeLaunch>>, String> {
+    let path = fell_core::compose::draft_socket_path();
+    let (mut queued, requests) = mpsc::channel(4);
+    match DraftHub::bind(&path) {
+        Ok(listener) => {
+            if let Some(initial) = initial {
+                queued.try_send(initial).expect("empty compose queue");
+            }
+            std::thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    serve_inbox_request(stream, &hub, &mut queued);
+                }
+            });
+        }
+        Err(err) => {
+            if let Some(initial) = initial {
+                if err.kind() == io::ErrorKind::AddrInUse {
+                    send_compose(&path, &initial).map_err(|err| err.to_string())?;
+                    return Ok(None);
+                }
+                return Err(format!("could not open the Fell socket: {err}"));
+            }
+            fell_core::diagnostic!(
+                WARN,
+                "Could not serve agent drafts or external compose requests",
+                error = &err as &dyn std::error::Error
+            );
+        }
+    }
+    Ok(Some(requests))
+}
+
+#[derive(Serialize, Deserialize)]
+struct AttachmentHeader {
+    name: String,
+    len: usize,
+}
+
+fn send_compose(path: &Path, draft: &ComposeLaunch) -> io::Result<()> {
+    let deadline = std::time::Instant::now() + SOCKET_TIMEOUT;
+    let mut stream = loop {
+        match UnixStream::connect(path) {
+            Ok(stream) => break stream,
+            // The winner can have the lock before it has bound the socket.
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => return Err(err),
+        }
+    };
+    stream.set_write_timeout(Some(SOCKET_TIMEOUT))?;
+    stream.set_read_timeout(Some(SOCKET_TIMEOUT))?;
+
+    let headers: Vec<_> = draft
+        .files
+        .iter()
+        .map(|file| AttachmentHeader {
+            name: file.display_name.clone(),
+            len: file.bytes.len(),
+        })
+        .collect();
+    let header = serde_json::to_string(&(&draft.input, headers))?;
+    if (OPEN_COMPOSE.len() + header.len() + 1) as u64 > MAX_REQUEST_LINE {
+        return Err(io::Error::other("compose request is too large"));
+    }
+    writeln!(stream, "{OPEN_COMPOSE}{header}")?;
+    for file in &draft.files {
+        stream.write_all(&file.bytes)?;
+    }
+    let mut reply = String::new();
+    BufReader::new(stream).take(4096).read_line(&mut reply)?;
+    match reply.trim_end() {
+        "ok" => Ok(()),
+        "" => Err(io::Error::other(
+            "Fell did not acknowledge the compose request",
+        )),
+        error => Err(io::Error::other(error.to_string())),
+    }
+}
+
+fn serve_inbox_request(
+    mut stream: UnixStream,
+    hub: &DraftHub,
+    queued: &mut mpsc::Sender<ComposeLaunch>,
+) {
+    if stream.set_read_timeout(Some(SOCKET_TIMEOUT)).is_err()
+        || stream.set_write_timeout(Some(SOCKET_TIMEOUT)).is_err()
+    {
+        return;
+    }
+    let mut reader = BufReader::new(&mut stream);
+    let mut line = String::new();
+    if reader
+        .by_ref()
+        .take(MAX_REQUEST_LINE)
+        .read_line(&mut line)
+        .is_err()
+        || !line.ends_with('\n')
+    {
+        return;
+    }
+    if let Some(header) = line.trim_end().strip_prefix(OPEN_COMPOSE) {
+        let result = read_compose(header, &mut reader).and_then(|draft| {
+            queued
+                .try_send(draft)
+                .map_err(|_| io::Error::other("Fell cannot accept another compose request yet"))
+        });
+        match result {
+            Ok(()) => {
+                let _ = writeln!(stream, "ok");
+            }
+            Err(err) => {
+                let _ = writeln!(stream, "{err}");
+            }
+        }
+    } else {
+        let _ = writeln!(stream, "{}", hub.handle_line(line.trim()));
+    }
+}
+
+fn read_compose(header: &str, reader: &mut impl Read) -> io::Result<ComposeLaunch> {
+    let (input, headers): (ComposeInput, Vec<AttachmentHeader>) = serde_json::from_str(header)?;
+    input.check_headers().map_err(io::Error::other)?;
+    if headers.len() > MAX_ATTACHMENT_FILES {
+        return Err(io::Error::other("too many attachments"));
+    }
+    let mut files = Vec::with_capacity(headers.len());
+    let mut remaining = MAX_ATTACHMENT_BYTES as usize;
+    for (index, header) in headers.into_iter().enumerate() {
+        remaining = remaining
+            .checked_sub(header.len)
+            .ok_or_else(|| io::Error::other("attachments exceed the sending limit"))?;
+        let mut bytes = vec![0; header.len];
+        reader.read_exact(&mut bytes)?;
+        files.push(attachment(index, Some(&header.name), bytes));
+    }
+    Ok(ComposeLaunch { input, files })
 }
 
 /// Merge outside writes to the focused draft's `draft.md`, such as an
@@ -186,6 +345,17 @@ impl DraftHome {
         start: ReplyStart,
         files: Vec<ResolvedFile>,
     ) -> Result<String, String> {
+        self.new_seeded(hub, account, start, String::new(), files)
+    }
+
+    pub(crate) fn new_seeded(
+        &self,
+        hub: &DraftHub,
+        account: &AccountId,
+        start: ReplyStart,
+        body: String,
+        files: Vec<ResolvedFile>,
+    ) -> Result<String, String> {
         let id = new_draft_id();
         if files.is_empty() {
             DraftSession::start_reply_in(
@@ -193,7 +363,7 @@ impl DraftHome {
                 &id,
                 account.clone(),
                 start.fields,
-                "",
+                &body,
                 &start.parts,
                 &self.store,
             )?;
@@ -204,7 +374,7 @@ impl DraftHome {
                     id: id.clone(),
                     account_id: account.clone(),
                     fields: start.fields,
-                    body: String::new(),
+                    body,
                     files,
                     identities: Vec::new(),
                     owner: String::new(),
@@ -367,15 +537,13 @@ pub(crate) fn show_draft(hub: &DraftHub, id: &str) -> bool {
 /// compose window that opens, or comes to the front, whenever an agent calls
 /// `request_send` or the person opens a draft. Saves still queued when Fell
 /// quits are waited for.
-pub fn host_agent_drafts(cx: &mut App) -> Arc<DraftHub> {
-    let hub = Arc::new(DraftHub::new());
+pub(crate) fn host_agent_drafts(cx: &mut App, hub: Arc<DraftHub>) {
     cx.set_global(AgentDrafts(hub.clone()));
     // Subscribe before the socket accepts anything, and count reveals from
     // zero, so a request_send that lands while the inbox is still opening
     // is not lost.
     let (tx, mut events) = futures::channel::mpsc::unbounded::<()>();
     hub.subscribe_with(move || tx.unbounded_send(()).is_ok());
-    serve_socket(hub.clone());
     // The watcher thread lives as long as the app.
     let _ = watch_folder(hub.clone(), None);
     let quitting = hub.clone();
@@ -404,7 +572,6 @@ pub fn host_agent_drafts(cx: &mut App) -> Arc<DraftHub> {
         }
     })
     .detach();
-    hub
 }
 
 /// Bring the compose window to the front on draft `id`, opening one if
@@ -546,6 +713,68 @@ pub(crate) mod tests {
     use super::*;
     use serde_json::{Value, json};
     use std::io::{BufRead, BufReader, Write};
+
+    #[test]
+    fn a_second_compose_invocation_delivers_a_personal_draft_to_the_inbox() {
+        let Some(root) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let account = me();
+        let home = temp_home("external-draft", &account);
+        let inbox = Arc::new(DraftHub::new());
+        let mut requests = inbox_socket(inbox.clone(), None).unwrap().unwrap();
+        let file = root.join("agenda.txt");
+        std::fs::write(&file, b"agenda\0\n").unwrap();
+        let launch = crate::compose_launch::cli(&[
+            "--to=team@example.org".into(),
+            "--cc=editor@example.org".into(),
+            "--bcc=archive@example.org".into(),
+            "--subject=Planning".into(),
+            "--body=First line\nSecond line".into(),
+            "--attach".into(),
+            file.into(),
+        ])
+        .unwrap();
+        assert!(
+            inbox_socket(Arc::new(DraftHub::new()), Some(launch))
+                .unwrap()
+                .is_none()
+        );
+        let queued = requests.try_recv().expect("draft reached the first inbox");
+        let (fields, body) = queued.input.into_fields_and_body(account.email.clone());
+        let id = home
+            .new_seeded(
+                &inbox,
+                &account.id,
+                ReplyStart {
+                    fields,
+                    parts: ReplyParts::default(),
+                },
+                body,
+                queued.files,
+            )
+            .unwrap();
+        assert!(show_draft(&inbox, &id));
+        let store = fell_core::Store::open(&home.store).unwrap();
+        let drafts = store.unsent_compose_drafts(&account.id).unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].id, id);
+        inbox
+            .with_session(&id, |session| {
+                let snap = session.snapshot();
+                assert_eq!(snap.to[0].raw, "team@example.org");
+                assert_eq!(snap.cc[0].raw, "editor@example.org");
+                assert_eq!(snap.bcc[0].raw, "archive@example.org");
+                assert_eq!(snap.subject, "Planning");
+                assert_eq!(snap.body.trim_end(), "First line\nSecond line");
+                assert_eq!(snap.attachments[0].name, "agenda.txt");
+                assert_eq!(
+                    std::fs::read(session.folder().join(&snap.attachments[0].path)).unwrap(),
+                    b"agenda\0\n"
+                );
+            })
+            .unwrap();
+    }
 
     /// A drafts root and a mailbox with `account` in it, under a fresh temp dir.
     pub(crate) fn temp_home(tag: &str, account: &fell_core::Account) -> DraftHome {

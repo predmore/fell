@@ -168,12 +168,23 @@ fn markdown_inlines(inlines: &[fell_render::Inline]) -> String {
     text
 }
 
+/// Insert literal text into the compose buffer without creating links,
+/// images, or other Markdown formatting.
+pub fn plain_text_to_markdown(text: &str) -> String {
+    text.split_inclusive('\n').map(escape_markdown).collect()
+}
+
 fn escape_markdown(text: &str) -> String {
     let mut escaped = String::new();
+    let trimmed = text.trim_start();
+    let start = text.len() - trimmed.len();
     for (index, ch) in text.char_indices() {
         if matches!(ch, '\\' | '*' | '_' | '`' | '[' | ']')
             || (index == 0 && matches!(ch, '#' | '>' | '-' | '+'))
-            || (ch == '.' && index > 0 && text[..index].bytes().all(|b| b.is_ascii_digit()))
+            || (index == start && ch == '-')
+            || (ch == '.'
+                && index > start
+                && text[start..index].bytes().all(|b| b.is_ascii_digit()))
         {
             escaped.push('\\');
         }
@@ -474,6 +485,22 @@ pub fn line_styles(line: &str) -> Vec<StyleSpan> {
         index = len;
     }
     while index < bytes.len() {
+        if bytes[index] == b'\\'
+            && let Some(ch) = line[index + 1..]
+                .chars()
+                .next()
+                .filter(|ch| markdown_escape(*ch))
+        {
+            push_span(&mut spans, index, index + 1, StyleKind::Marker);
+            push_span(
+                &mut spans,
+                index + 1,
+                index + 1 + ch.len_utf8(),
+                StyleKind::Plain,
+            );
+            index += 1 + ch.len_utf8();
+            continue;
+        }
         if bytes[index] == b'`'
             && let Some(end) = line[index + 1..].find('`')
         {
@@ -544,7 +571,7 @@ pub fn line_styles(line: &str) -> Vec<StyleSpan> {
         index += utf8_len(bytes[index]);
         while index < bytes.len() {
             let ch = bytes[index];
-            if ch == b'`' || ch == b'*' || ch == b'_' || ch == b'[' || ch == b'!' {
+            if matches!(ch, b'`' | b'*' | b'_' | b'[' | b'!' | b'\\') {
                 break;
             }
             index += utf8_len(ch);

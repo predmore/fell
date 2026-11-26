@@ -30,7 +30,7 @@ pub(crate) use markdown::content_id as draft_content_id;
 pub(crate) use markdown::document_to_markdown;
 pub use markdown::{
     Block, BlockBody, Inline, StyleKind, StyleSpan, StyledDoc, doc_to_html, html_to_doc,
-    line_styles, markdown_to_doc,
+    line_styles, markdown_to_doc, plain_text_to_markdown,
 };
 pub use merge::HunkKind;
 pub use mime::{Outgoing, ResolvedFile};
