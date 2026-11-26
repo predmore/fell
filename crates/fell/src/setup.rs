@@ -380,7 +380,11 @@ fn list() -> Result<(), String> {
         eprintln!("{error}");
     }
     for entry in accounts.entries {
-        if accounts.interrupted.iter().any(|pending| pending.path == entry.path) {
+        if accounts
+            .interrupted
+            .iter()
+            .any(|pending| pending.path == entry.path)
+        {
             continue;
         }
         match entry.config {
