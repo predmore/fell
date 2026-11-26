@@ -111,6 +111,7 @@ pub enum Request {
     EditKeymap,
     CheckModel,
     Scroll(i32),
+    ScrollToEdge { bottom: bool },
     ChangeModel { install: bool },
 }
 
@@ -183,12 +184,14 @@ pub struct Nav {
     pub selected: usize,
     pub identity_candidates: usize,
     pub availability: Availability,
+    bindings_g_pending: bool,
 }
 
 impl Nav {
     pub fn reset(&mut self) {
         self.page = Page::Index;
         self.selected = 0;
+        self.bindings_g_pending = false;
     }
 
     pub fn rows(&self, section: Section) -> impl Iterator<Item = Row> {
@@ -223,6 +226,7 @@ impl Nav {
     }
 
     pub fn select_row(&mut self, row: Row) {
+        self.bindings_g_pending = false;
         for section in Section::ALL {
             let index = self.rows(section).position(|item| item == row);
             if let Some(index) = index {
@@ -271,6 +275,19 @@ impl Nav {
         self.page = Page::Section(section);
         self.selected = 0;
         (section == Section::Search).then_some(Request::CheckModel)
+    }
+
+    pub fn bindings_scroll_edge(&mut self, key: KeyId) -> Option<Request> {
+        let pending = std::mem::take(&mut self.bindings_g_pending);
+        match key {
+            KeyId::Char('G') => Some(Request::ScrollToEdge { bottom: true }),
+            KeyId::Char('g') if pending => Some(Request::ScrollToEdge { bottom: false }),
+            KeyId::Char('g') => {
+                self.bindings_g_pending = true;
+                None
+            }
+            _ => None,
+        }
     }
 
     pub fn move_to(&mut self, key: KeyId) {
@@ -353,6 +370,33 @@ mod tests {
         session.on_key(KeyId::Char(','), 10);
         session.on_key(KeyId::Char(','), 10);
         assert_eq!(session.overlay, Overlay::Settings);
+    }
+
+    #[test]
+    fn effective_bindings_jump_with_gg_and_capital_g() {
+        let mut session = Session::new("", "", SyncKind::LocalOffline, Keymap::default());
+        let bindings = Action::Setting(Row::EffectiveBindings);
+        session.perform(bindings, 10);
+        let g = KeyId::Char('g');
+
+        assert_eq!(
+            session.on_key(KeyId::Char('G'), 10).settings,
+            Some(Request::ScrollToEdge { bottom: true })
+        );
+        assert_eq!(session.on_key(g, 10).settings, None);
+        assert_eq!(
+            session.on_key(g, 10).settings,
+            Some(Request::ScrollToEdge { bottom: false })
+        );
+        assert_eq!(session.on_key(g, 10).settings, None);
+        assert_eq!(
+            session.on_key(KeyId::Char('j'), 10).settings,
+            Some(Request::Scroll(2))
+        );
+        assert_eq!(session.on_key(g, 10).settings, None);
+        session.on_key(KeyId::Escape, 10);
+        session.perform(bindings, 10);
+        assert_eq!(session.on_key(g, 10).settings, None);
     }
 
     #[test]
