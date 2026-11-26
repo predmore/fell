@@ -221,6 +221,7 @@ fn message(account: &Account, rng: &mut Rng, index: usize, root: usize) -> Messa
     body.truncate(body_len);
     let has_attachment = index.is_multiple_of(5);
     let parts = MessageParts {
+        trusted_sender_delivery: false,
         mime_parts: if has_attachment {
             vec![MimePart {
                 section: "2".into(),

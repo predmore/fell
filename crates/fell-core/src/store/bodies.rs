@@ -261,6 +261,7 @@ pub(crate) struct StoredParts {
     html: Option<Vec<u8>>,
     plain: Option<Vec<u8>>,
     bulk_headers: String,
+    trusted_sender_delivery: bool,
     /// `None` when no source was parsed (nothing could be fetched), so the
     /// stored list, if any, stays.
     mime_parts: Option<Vec<MimePart>>,
@@ -272,6 +273,7 @@ impl StoredParts {
             html: parts.html.as_deref().map(compress),
             plain: parts.plain.as_deref().map(compress),
             bulk_headers: encode_headers(&parts.bulk_headers),
+            trusted_sender_delivery: parts.trusted_sender_delivery,
             mime_parts: Some(parts.mime_parts.clone()),
         }
     }
@@ -689,6 +691,15 @@ pub(super) fn write(
     parts: &StoredParts,
     mode: Write,
 ) -> Result<bool> {
+    let mut headers = std::borrow::Cow::Borrowed(parts.bulk_headers.as_str());
+    if mode == Write::Replace
+        && parts.has_body()
+        && !parts.trusted_sender_delivery
+        && let Some(previous) = read_headers(conn, account_id, message_id)?
+            .and_then(|headers| sender_attestation(&headers))
+    {
+        headers = with_attestation(&headers, Some(previous)).into();
+    }
     let sql = match mode {
         Write::Replace if parts.has_body() => {
             "INSERT INTO message_bodies (account_id, message_id, codec, html, plain, bulk_headers)
@@ -716,9 +727,12 @@ pub(super) fn write(
             CODEC_DEFLATE,
             parts.html,
             parts.plain,
-            parts.bulk_headers,
+            headers.as_ref(),
         ],
     )?;
+    if mode != Write::Replace || !parts.has_body() {
+        refresh_sender_attestation(conn, account_id, message_id, parts)?;
+    }
     let mut replaced = false;
     if let Some(list) = &parts.mime_parts
         && ((mode == Write::Replace && parts.has_body())
@@ -733,6 +747,54 @@ pub(super) fn write(
         params![account_id.as_str(), message_id, replaced],
     )?;
     Ok(replaced)
+}
+
+fn read_headers(conn: &Connection, account: &AccountId, id: &str) -> Result<Option<String>> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT bulk_headers FROM message_bodies
+            WHERE account_id = ?1 AND message_id = ?2",
+        )?
+        .query_row(params![account.as_str(), id], |row| row.get(0))
+        .optional()?)
+}
+
+fn sender_attestation(headers: &str) -> Option<(String, String)> {
+    decode_headers(headers)
+        .into_iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(crate::message::VERIFIED_SENDER_HEADER))
+}
+
+fn with_attestation(headers: &str, attestation: Option<(String, String)>) -> String {
+    let mut headers = decode_headers(headers);
+    headers.retain(|(name, _)| !name.eq_ignore_ascii_case(crate::message::VERIFIED_SENDER_HEADER));
+    headers.extend(attestation);
+    encode_headers(&headers)
+}
+
+pub(super) fn refresh_sender_attestation(
+    conn: &Connection,
+    account: &AccountId,
+    id: &str,
+    parts: &StoredParts,
+) -> Result<()> {
+    if parts.trusted_sender_delivery
+        && let Some(headers) = read_headers(conn, account, id)?
+    {
+        let attestation = sender_attestation(&parts.bulk_headers);
+        if sender_attestation(&headers) != attestation {
+            conn.execute(
+                "UPDATE message_bodies SET bulk_headers = ?3
+                 WHERE account_id = ?1 AND message_id = ?2",
+                params![
+                    account.as_str(),
+                    id,
+                    with_attestation(&headers, attestation)
+                ],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Insert a row, or fill each empty column of the stored one. Rows of
@@ -1089,6 +1151,7 @@ fn read_text(
         html: html.as_deref().map(decompress).transpose()?,
         plain: plain.as_deref().map(decompress).transpose()?,
         bulk_headers: decode_headers(&headers),
+        trusted_sender_delivery: false,
         mime_parts: Vec::new(),
     }))
 }
@@ -1107,6 +1170,8 @@ pub struct PartKinds {
     /// Bytes of compressed HTML as stored, for a caller deciding where to
     /// prepare it. 0 without HTML.
     pub html_bytes: u64,
+    /// Bytes of compressed plain text in the same read.
+    pub plain_bytes: u64,
     /// Whether there are delivery headers that can affect the renderer choice.
     pub has_delivery_headers: bool,
     /// Changes when the stored parts change: a resync that replaces them,
@@ -1124,6 +1189,7 @@ pub(super) fn kinds(
 ) -> Result<std::collections::HashMap<String, PartKinds>> {
     let mut stmt = conn.prepare_cached(
         "SELECT b.html IS NOT NULL, b.plain IS NOT NULL, coalesce(length(b.html), 0),
+                coalesce(length(b.plain), 0),
                 coalesce(s.stamp, zeroblob(16)), length(b.bulk_headers) > 0
          FROM message_bodies b LEFT JOIN message_body_stamps s USING (account_id, message_id)
          WHERE b.account_id = ?1 AND b.message_id = ?2",
@@ -1133,12 +1199,14 @@ pub(super) fn kinds(
         let found = stmt
             .query_row(params![account_id.as_str(), id], |row| {
                 let html_bytes: i64 = row.get(2)?;
+                let plain_bytes: i64 = row.get(3)?;
                 Ok(PartKinds {
                     html: row.get(0)?,
                     plain: row.get(1)?,
                     html_bytes: html_bytes.max(0) as u64,
-                    stamp: PartStamp(row.get(3)?),
-                    has_delivery_headers: row.get(4)?,
+                    plain_bytes: plain_bytes.max(0) as u64,
+                    stamp: PartStamp(row.get(4)?),
+                    has_delivery_headers: row.get(5)?,
                 })
             })
             .optional()?;
@@ -1521,6 +1589,7 @@ mod tests {
                     Some(MessageParts {
                         html: Some("<p>now with html</p>".into()),
                         plain: Some("now".into()),
+                        trusted_sender_delivery: false,
                         bulk_headers: Vec::new(),
                         mime_parts: Vec::new(),
                     }),
@@ -1798,6 +1867,7 @@ mod tests {
             mime_parts: Vec::new(),
             html: Some("<p>other</p>".into()),
             plain: Some("other".into()),
+            trusted_sender_delivery: false,
             bulk_headers: Vec::new(),
         };
         store

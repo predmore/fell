@@ -960,6 +960,7 @@ fn parts(row: &DraftMail) -> MessageParts {
                 })
                 .map(|(name, value)| (name.to_string(), value.to_string()))
                 .collect(),
+            trusted_sender_delivery: false,
             mime_parts: Vec::new(),
         };
     }
@@ -988,6 +989,7 @@ fn parts(row: &DraftMail) -> MessageParts {
             .iter()
             .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
             .collect(),
+        trusted_sender_delivery: false,
         mime_parts: attachment_parts(row),
     }
 }

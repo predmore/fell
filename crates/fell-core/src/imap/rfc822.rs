@@ -551,7 +551,8 @@ pub(crate) fn parts_from_trusted_raw(raw: &[u8]) -> MessageParts {
 }
 
 fn keep_sender_attestation(message: &mail_parser::Message<'_>, parts: &mut MessageParts) {
-    let attestation = "X-Fell-Verified-Sender";
+    parts.trusted_sender_delivery = true;
+    let attestation = crate::message::VERIFIED_SENDER_HEADER;
     let mut headers = message
         .headers()
         .iter()
@@ -589,6 +590,7 @@ fn body_parts(message: &mail_parser::Message<'_>) -> MessageParts {
         html,
         plain,
         bulk_headers: bulk_headers(message),
+        trusted_sender_delivery: false,
         mime_parts,
     }
 }

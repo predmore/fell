@@ -606,7 +606,9 @@ fn fetch_bodies(
     store: &Store,
     wanted: &[BodyRequest],
 ) -> Result<usize> {
-    let results = collect_bodies(wanted, false, |copies| backend.fetch_bodies(copies))?;
+    let results = collect_bodies(wanted, backend.trust_verified_sender_header(), |copies| {
+        backend.fetch_bodies(copies)
+    })?;
     store.store_fetched_parts(account_id, &results)?;
     Ok(results.len())
 }
@@ -719,5 +721,104 @@ mod tests {
         let report = sync_once(&account, &backend, &store).unwrap();
         assert_eq!(report.new_messages, Some(1));
         assert_eq!(store.list_threads(&account.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn body_fetches_keep_attestation_until_a_trusted_refresh_clears_it() {
+        struct Source<'a> {
+            raw: &'a [u8],
+            trusted: bool,
+        }
+
+        impl MailBackend for Source<'_> {
+            fn kind(&self) -> BackendKind {
+                BackendKind::Imap
+            }
+
+            fn trust_verified_sender_header(&self) -> bool {
+                self.trusted
+            }
+
+            fn fetch_changes(
+                &self,
+                _: Option<&crate::backend::SyncCursor>,
+            ) -> Result<crate::backend::MailboxDelta> {
+                Ok(Default::default())
+            }
+
+            fn fetch_bodies(
+                &self,
+                copies: &[RemoteId],
+            ) -> Result<Vec<crate::backend::FetchedBody>> {
+                Ok(copies
+                    .iter()
+                    .map(|remote_id| crate::backend::FetchedBody {
+                        remote_id: remote_id.clone(),
+                        raw: Some(self.raw.to_vec()),
+                    })
+                    .collect())
+            }
+
+            fn submit_draft(&self, _: crate::send::Draft) -> Result<crate::send::PendingSend> {
+                unreachable!()
+            }
+
+            fn confirm_send(
+                &self,
+                _: crate::send::PendingSend,
+                _: crate::send::UserSendConfirmation,
+            ) -> Result<crate::send::SentMessage> {
+                unreachable!()
+            }
+        }
+
+        let store = Store::open_in_memory().unwrap();
+        let account = Account {
+            id: AccountId("a1".into()),
+            display_name: "Reader".into(),
+            email: "reader@example.test".into(),
+            backend_kind: BackendKind::Imap,
+        };
+        store.upsert_account(&account).unwrap();
+        let plain = b"From: sender@example.test\r\nMessage-ID: <m@example.test>\r\n\r\nBody";
+        let verified = b"From: sender@example.test\r\nMessage-ID: <m@example.test>\r\nX-Fell-Verified-Sender: sender@example.test\r\n\r\nBody";
+        let mut message = crate::imap::to_message(&account.id, "INBOX", "INBOX", 1, 1, &[], plain);
+        let request = BodyRequest {
+            message_id: message.headers.message_id.clone(),
+            copies: vec![message.remote_id.clone()],
+        };
+        let attestation = || {
+            store
+                .message_body(&account.id, &request.message_id)
+                .unwrap()
+                .and_then(|parts| {
+                    parts
+                        .bulk_headers
+                        .into_iter()
+                        .find(|(name, _)| name == crate::message::VERIFIED_SENDER_HEADER)
+                        .map(|(_, address)| address)
+                })
+        };
+        message.parts = None;
+        store.upsert_message(&message).unwrap();
+        let fetch = |raw, trusted| {
+            fetch_bodies(
+                &account.id,
+                &Source { raw, trusted },
+                &store,
+                std::slice::from_ref(&request),
+            )
+            .unwrap();
+        };
+        fetch(verified, false);
+        assert_eq!(attestation(), None);
+        fetch(verified, true);
+        assert_eq!(attestation().as_deref(), Some("sender@example.test"));
+        fetch(plain, false);
+        message.parts = Some(crate::imap::parts_from_raw(plain));
+        store.upsert_message(&message).unwrap();
+        assert_eq!(attestation().as_deref(), Some("sender@example.test"));
+        fetch(plain, true);
+        assert_eq!(attestation(), None);
     }
 }

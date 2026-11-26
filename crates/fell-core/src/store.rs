@@ -1895,6 +1895,7 @@ impl Store {
                 continue;
             };
             if bodies::cid_upgrade::apply_fetched(&tx, account_id, &canonical, repair)? {
+                bodies::refresh_sender_attestation(&tx, account_id, &canonical, parts)?;
                 continue;
             }
             if parts.has_body() {
@@ -10499,6 +10500,7 @@ mod tests {
         assert_eq!(
             kept,
             crate::MessageParts {
+                trusted_sender_delivery: false,
                 mime_parts: Vec::new(),
                 html: Some("<p>hello body</p>".into()),
                 plain: Some("hello body".into()),
