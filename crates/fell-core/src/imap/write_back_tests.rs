@@ -1703,9 +1703,11 @@ fn giving_up_with_the_source_gone_leaves_the_destination_and_undo_waits_for_sync
         assert!(!fx.copy_recorded("Archive", 1));
         let waiting = fx.replay();
         assert_eq!((waiting.sent, waiting.waiting), (0, 1));
+        assert_eq!(fx.store.outbox(&fx.account.id).unwrap()[1].attempts, 1);
         fx.sync();
         assert!(fx.copy_recorded("Archive", 1));
         assert!(!fx.copy_recorded("INBOX", 2));
+        fx.make_due();
         if undo_before_give_up {
             // If the reverse itself loses its reply before applying, it
             // retries the Archive UID it already bound from sync.
@@ -1721,6 +1723,113 @@ fn giving_up_with_the_source_gone_leaves_the_destination_and_undo_waits_for_sync
         fx.sync();
         assert!(fx.subjects("Archive").is_empty());
         assert_eq!(fx.subjects("INBOX"), vec!["Alpha", "Bravo"]);
+    }
+}
+
+#[test]
+fn undo_uses_only_a_unique_synced_destination_after_the_source_resets() {
+    for destination_copies in [0, 1, 2] {
+        let fx = move_with_lost_reply();
+        let account = &fx.account.id;
+        {
+            let mut server = fx.server.state.lock().unwrap();
+            server.mailboxes[0].uidvalidity += 1;
+            server.mailboxes[1].uidnext = Some(super::write_back::RECOVERY_UID_LIMIT as u32 + 2);
+        }
+        let dropped = fx.replay_until_dropped();
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].reason, DropReason::UnconfirmedMove);
+        fx.store.undo(account).unwrap();
+        match destination_copies {
+            0 => {
+                // Another client removed the Archive copy. A separate Work
+                // copy still has the same identity and can receive the star.
+                fx.server.state.lock().unwrap().mailboxes[1]
+                    .messages
+                    .clear();
+                fx.deliver(
+                    "Work",
+                    1,
+                    raw_with_message_id("Message-ID: <bravo@x>\r\n", "Bravo"),
+                );
+            }
+            2 => fx.deliver(
+                "Archive",
+                2,
+                raw_with_message_id("Message-ID: <bravo@x>\r\n", "Bravo"),
+            ),
+            _ => {}
+        }
+        fx.sync();
+        assert!(!fx.copy_recorded("INBOX", 2));
+        assert_eq!(fx.copy_recorded("Archive", 1), destination_copies > 0);
+        assert_eq!(fx.copy_recorded("Archive", 2), destination_copies > 1);
+        let bravo = fx.thread("INBOX", "Bravo");
+        fx.flag(&bravo, FlagChange::Star);
+        let rows = fx.store.outbox(account).unwrap();
+        assert_eq!(rows[1].reverses, Some(rows[0].id));
+        assert_eq!(rows[2].kind, OutboxKind::Flagged);
+        assert_eq!(rows[1].message_id, rows[2].message_id);
+        fx.clear_commands();
+
+        if destination_copies == 1 {
+            let report = fx.replay_as_window();
+            assert_eq!((report.sent, report.waiting), (2, 0), "{report:?}");
+            assert!(report.dropped.is_empty(), "{report:?}");
+            assert!(without_tags(&fx.writes()).contains(&"UID MOVE 1 \"INBOX\"".into()));
+            assert!(fx.on_server("Archive").is_empty());
+            let (uid, _) = fx
+                .on_server("INBOX")
+                .into_iter()
+                .find(|(_, subject)| subject == "Bravo")
+                .unwrap();
+            assert!(fx.flags("INBOX", uid).contains(&"\\Flagged".into()));
+            continue;
+        }
+
+        for check in 1..=super::write_back::MAX_ATTEMPTS {
+            fx.make_due();
+            let report = fx.replay_as_window();
+            assert!(fx.stores().is_empty());
+            let reverse = &fx.store.outbox(account).unwrap()[1];
+            if check < super::write_back::MAX_ATTEMPTS {
+                assert!(report.dropped.is_empty(), "{report:?}");
+                assert_eq!(
+                    (reverse.state, reverse.attempts),
+                    (OutboxState::Pending, check)
+                );
+            } else {
+                assert_eq!(
+                    report.dropped,
+                    [crate::outbox::DroppedWrite {
+                        kind: OutboxKind::Move,
+                        source_folder: "Archive".into(),
+                        target_folder: "INBOX".into(),
+                        reason: DropReason::UnconfirmedReverse,
+                    }]
+                );
+                assert_eq!(reverse.state, OutboxState::Dropped);
+            }
+        }
+        assert!(
+            without_tags(&fx.writes())
+                .iter()
+                .all(|command| !command.starts_with("UID MOVE"))
+        );
+        let report = fx.replay_as_window();
+        assert_eq!(
+            (report.sent, report.waiting),
+            (destination_copies.max(1), 0),
+            "{report:?}"
+        );
+        let mailbox = if destination_copies == 0 {
+            "Work"
+        } else {
+            "Archive"
+        };
+        for (uid, _) in fx.on_server(mailbox) {
+            assert!(fx.flags(mailbox, uid).contains(&"\\Flagged".into()));
+        }
     }
 }
 
@@ -2195,6 +2304,23 @@ fn a_move_with_no_message_id_and_no_copyuid_is_never_done() {
     assert_eq!(row.state, OutboxState::Dropped);
     // Never recorded as moved, so the copy Fell knows of is still there.
     assert!(fx.copy_recorded("INBOX", 2));
+
+    fx.store.undo(&fx.account.id).unwrap();
+    fx.sync();
+    assert!(fx.copy_recorded("Archive", 1));
+    fx.clear_commands();
+    fx.replay();
+    assert_eq!(fx.store.outbox(&fx.account.id).unwrap()[1].attempts, 1);
+    let dropped = fx.replay_until_dropped();
+    assert_eq!(dropped.len(), 1);
+    assert_eq!(dropped[0].reason, DropReason::UnconfirmedReverse);
+    assert_eq!(fx.replay().waiting, 0);
+    assert!(
+        without_tags(&fx.writes())
+            .iter()
+            .all(|command| !command.starts_with("UID MOVE"))
+    );
+    assert_eq!(fx.on_server("Archive"), vec![(1, "Nameless".into())]);
 }
 
 #[test]

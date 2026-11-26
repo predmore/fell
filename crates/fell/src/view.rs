@@ -521,7 +521,10 @@ fn write_back_notice(
     for write in dropped {
         if matches!(
             write.reason,
-            DropReason::UnconfirmedMove | DropReason::MoveRestored | DropReason::MoveSourceGone
+            DropReason::UnconfirmedMove
+                | DropReason::MoveRestored
+                | DropReason::MoveSourceGone
+                | DropReason::UnconfirmedReverse
         ) {
             if let Some((_, count)) = moves.iter_mut().find(|(group, _)| *group == write) {
                 *count += 1;
@@ -619,15 +622,21 @@ fn not_sent_detail(session: &Session, write: &DroppedWrite, count: usize) -> Str
         DropReason::NotFound => format!("{messages} not found in {folder} on the server"),
         DropReason::NoMove => "This server can't move mail; archive stays in Fell".to_string(),
         DropReason::Abandoned => format!("{messages} left half moved in {folder} on the server"),
-        DropReason::UnconfirmedMove | DropReason::MoveRestored | DropReason::MoveSourceGone => {
+        DropReason::UnconfirmedMove
+        | DropReason::MoveRestored
+        | DropReason::MoveSourceGone
+        | DropReason::UnconfirmedReverse => {
             let target = session.folder_text(&write.target_folder);
             let moves = if count == 1 { "move" } else { "moves" };
+            if write.reason == DropReason::UnconfirmedReverse {
+                return format!("Couldn't undo {count} {moves} from {target} to {folder}");
+            }
             let detail = match write.reason {
                 DropReason::MoveRestored => format!("back in {folder}"),
                 DropReason::MoveSourceGone => format!("mail gone from {folder}"),
                 _ => format!("may still be in {folder} on the server"),
             };
-            format!("Couldn't confirm {count} {moves} to {target} · {detail}")
+            format!("Couldn't confirm {count} {moves} from {folder} to {target}, {detail}")
         }
         DropReason::UnconfirmedAppend => "Sent · server copy unconfirmed".to_string(),
         DropReason::DraftCleanup => "An older draft copy remains on the server".to_string(),
@@ -14215,16 +14224,38 @@ mod tests {
         );
         assert_eq!(
             notice(DropReason::UnconfirmedMove, 1),
-            "Couldn't confirm 1 move to Archive · may still be in Inbox on the server"
+            "Couldn't confirm 1 move from Inbox to Archive, may still be in Inbox on the server"
         );
         assert_eq!(
             notice(DropReason::MoveRestored, 2),
-            "Couldn't confirm 2 moves to Archive · back in Inbox"
+            "Couldn't confirm 2 moves from Inbox to Archive, back in Inbox"
         );
         assert_eq!(
             notice(DropReason::MoveSourceGone, 1),
-            "Couldn't confirm 1 move to Archive · mail gone from Inbox"
+            "Couldn't confirm 1 move from Inbox to Archive, mail gone from Inbox"
         );
+        let reverse = DroppedWrite {
+            kind: OutboxKind::Move,
+            source_folder: "Archive".into(),
+            target_folder: "INBOX".into(),
+            reason: DropReason::UnconfirmedReverse,
+        };
+        assert_eq!(
+            write_back_notice(&session, &[reverse.clone(), reverse], false),
+            "Couldn't undo 2 moves from Inbox to Archive"
+        );
+        for reason in [
+            DropReason::UnconfirmedMove,
+            DropReason::MoveRestored,
+            DropReason::MoveSourceGone,
+        ] {
+            let fitted =
+                crate::present::fit_notice(&notice(reason, 2), 47.0, |s| s.chars().count() as f32);
+            assert!(
+                fitted.starts_with("Couldn't confirm 2 moves from Inbox to Archive"),
+                "{fitted}"
+            );
+        }
         for reason in [
             DropReason::FolderReset,
             DropReason::Refused,

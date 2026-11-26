@@ -350,6 +350,8 @@ pub enum DropReason {
     MoveRestored,
     /// The MOVE could not be verified and the original UID is gone.
     MoveSourceGone,
+    /// Sync could not identify a unique copy to move back for undo.
+    UnconfirmedReverse,
     /// The previous Drafts copy could not be removed.
     DraftCleanup,
     /// The folder, or the message in it, never turned up on the server.
@@ -1608,10 +1610,8 @@ pub(crate) fn reversed(store: &Store, account: &AccountId, id: i64) -> Result<Re
 fn synced_reversal(store: &Store, account: &AccountId, entry: &OutboxEntry) -> Result<Reversed> {
     let source = if entry.error == UNCONFIRMED_SOURCE_GONE {
         None
-    } else if let Some(copy) = entry.uidvalidity.zip(entry.uid) {
-        Some(copy)
     } else {
-        return Ok(Reversed::Waiting);
+        entry.uidvalidity.zip(entry.uid)
     };
     let placed = if let Some((mailbox, (validity, first))) =
         entry.target_mailbox.as_deref().zip(entry.target_bound)

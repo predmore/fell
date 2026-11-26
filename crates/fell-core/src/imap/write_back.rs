@@ -1013,13 +1013,7 @@ impl Pass<'_> {
             .map(|id| outbox::reversed(self.store, self.account_id, id))
             .transpose()?;
         match reversal {
-            Some(
-                Reversed::Waiting
-                | Reversed::Unconfirmed {
-                    source: None,
-                    placed: None,
-                },
-            ) => {
+            Some(Reversed::Waiting) => {
                 self.held_moves
                     .insert(entry.message_id.clone(), MoveHold::EarlierMove);
                 return Ok(());
@@ -1047,34 +1041,32 @@ impl Pass<'_> {
                 .recover_move(session, index, source, target, &[])
                 .map(|_| ());
         }
-        let Some((source, target)) = source.zip(target) else {
-            return self.retry(index, DropReason::NotFound, "folder is not on the server");
-        };
         let queued_copy = match reversal {
             Some(Reversed::Placed(validity, uid)) => Some((validity, uid)),
             Some(Reversed::Unconfirmed { source, placed }) => {
-                if let Some(copy) = source {
-                    match self.move_source(session, Some((&target, copy)))? {
-                        MoveSource::Present => {
-                            self.drop_quietly(index, "the original copy is still on the server")?;
-                            return Ok(());
-                        }
-                        MoveSource::Gone => {}
-                        MoveSource::Unknown => {
-                            self.held_moves
-                                .insert(entry.message_id.clone(), MoveHold::EarlierMove);
-                            return Ok(());
-                        }
+                let original = target.as_deref().zip(source);
+                let message = "Sync did not identify a unique copy to move back";
+                match self.move_source(session, original) {
+                    Ok(MoveSource::Present) => {
+                        self.drop_quietly(index, "the original copy is still on the server")?;
+                        return Ok(());
                     }
+                    Ok(_) => {}
+                    Err(Stop::Connection(error @ Error::ImapLineLimit { .. })) => {
+                        self.retry(index, DropReason::UnconfirmedReverse, message)?;
+                        return Err(Stop::Connection(error));
+                    }
+                    Err(stop) => return Err(stop),
                 }
                 if placed.is_none() {
-                    self.held_moves
-                        .insert(entry.message_id.clone(), MoveHold::EarlierMove);
-                    return Ok(());
+                    return self.retry(index, DropReason::UnconfirmedReverse, message);
                 }
                 placed
             }
             _ => recorded_copy,
+        };
+        let Some((source, target)) = source.zip(target) else {
+            return self.retry(index, DropReason::NotFound, "folder is not on the server");
         };
         let roles = self.store.folder_roles(self.account_id)?;
         for (folder, raw) in [
