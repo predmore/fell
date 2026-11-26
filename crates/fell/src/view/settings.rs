@@ -96,6 +96,7 @@ pub(super) struct View {
     page: Option<Page>,
     page_fade: Option<Transition>,
     server: Option<String>,
+    other_accounts: Vec<(String, String, bool)>,
     identities: Vec<Identity>,
     identity_read: Option<gpui::Task<()>>,
     identity_candidates: Option<Result<Vec<IdentityCandidate>, String>>,
@@ -149,6 +150,7 @@ impl View {
                     BackendKind::ProtonApi => "Proton Mail".into(),
                 }
             }),
+            other_accounts: Vec::new(),
             identities: account
                 .map(AccountConfig::compose_identities)
                 .unwrap_or_default(),
@@ -163,12 +165,40 @@ impl View {
         }
     }
 
+    pub fn set_accounts(&mut self, catalog: &fell_core::accounts::Accounts, active: Option<&str>) {
+        self.other_accounts = catalog
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                let id = entry.path.file_stem()?.to_string_lossy();
+                if active == Some(id.as_ref()) {
+                    return None;
+                }
+                Some(match &entry.config {
+                    Ok(config) => (
+                        config.account().display_name,
+                        format!("{} · {}", id, config.email),
+                        false,
+                    ),
+                    Err(error) => (format!("{id} unavailable"), error.recovery.into(), true),
+                })
+            })
+            .collect();
+        if let Some(error) = &catalog.error {
+            self.other_accounts.push((
+                "Account configuration unavailable".into(),
+                error.recovery.into(),
+                true,
+            ));
+        }
+    }
+
     pub fn availability(&self) -> Availability {
-        let configured = account_file_exists(mailbox::account_config_path().as_deref());
         Availability {
-            account_setup: !configured,
-            edit_account: configured,
-            identity_count: if configured { self.identities.len() } else { 0 },
+            account_setup: true,
+            edit_account: self.server.is_some(),
+            identity_count: self.identities.len(),
+            other_accounts: self.other_accounts.len(),
             install_model: matches!(
                 self.model,
                 ModelStatus::Checking | ModelStatus::Missing | ModelStatus::NeedsRepair
@@ -468,10 +498,6 @@ impl Inbox {
     }
 
     fn open_account_setup(&mut self, cx: &mut Context<Self>) {
-        if account_file_exists(mailbox::account_config_path().as_deref()) {
-            self.settings_notice("An account file already exists", true, cx);
-            return;
-        }
         if let Some(handle) = self.settings_view.setup
             && handle
                 .update(cx, |_, window, _| window.activate_window())
@@ -496,8 +522,17 @@ impl Inbox {
         let Some(previous) = cx.try_global::<super::InboxWindow>().copied() else {
             return;
         };
+        let account_id = match mailbox::next_account_id() {
+            Ok(id) => id,
+            Err(error) => {
+                self.settings_notice(error, true, cx);
+                return;
+            }
+        };
         match cx.open_window(options, |window, cx| {
-            cx.new(|cx| crate::onboarding::Onboarding::from_inbox(previous.0, window, cx))
+            cx.new(|cx| {
+                crate::onboarding::Onboarding::from_inbox(previous.0, account_id, window, cx)
+            })
         }) {
             Ok(handle) => self.settings_view.setup = Some(handle.into()),
             Err(_) => self.settings_notice("Could not open account setup", true, cx),
@@ -505,19 +540,23 @@ impl Inbox {
     }
 
     fn open_account_editor(&mut self, cx: &mut Context<Self>) {
+        let account = self.account_id.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async {
-                    let path = mailbox::account_config_path()
-                        .ok_or_else(|| io::Error::other("No account file"))?;
+                .spawn(async move {
+                    let registry = fell_core::accounts::Registry::resolve()
+                        .map_err(|err| io::Error::other(err.to_string()))?;
+                    let path = registry
+                        .path(account.as_str())
+                        .map_err(|err| io::Error::other(err.to_string()))?;
                     super::diagnostics::open_in_editor(&path)
                 })
                 .await;
             if let Err(error) = result {
                 let _ = this.update(cx, |inbox, cx| {
                     inbox.settings_notice(
-                        format!("Could not open account.toml · {error}"),
+                        format!("Could not open account file · {error}"),
                         true,
                         cx,
                     );
@@ -805,12 +844,6 @@ impl Inbox {
     }
 }
 
-fn account_file_exists(path: Option<&Path>) -> bool {
-    path.is_some_and(|path| {
-        !matches!(fs::symlink_metadata(path), Err(error) if error.kind() == io::ErrorKind::NotFound)
-    })
-}
-
 fn shows_invalid_value(page: Page, snapshot: &Snapshot) -> bool {
     let Page::Section(section) = page else {
         return false;
@@ -863,6 +896,7 @@ const HEADER_HEIGHT: f32 = 64.;
 const SECTION_ROW_HEIGHT: f32 = 64.;
 const INDEX_ROW_HEIGHT: f32 = 49.;
 const ACCOUNT_SUMMARY_HEIGHT: f32 = 80.;
+const ACCOUNT_ROW_HEIGHT: f32 = 64.;
 const BODY_PADDING: f32 = 16.;
 const BINDING_ROW_HEIGHT: f32 = 39.;
 const MAX_BINDING_ROWS: f32 = 9.;
@@ -896,6 +930,7 @@ pub(super) fn card_height(nav: &nav::Nav, room: f32, narrow: bool) -> f32 {
                 + match section {
                     Section::Accounts => {
                         ACCOUNT_SUMMARY_HEIGHT
+                            + nav.availability.other_accounts as f32 * ACCOUNT_ROW_HEIGHT
                             + if nav.availability.identity_count > 0 {
                                 28. + nav.availability.identity_count as f32 * IDENTITY_ROW_HEIGHT
                             } else {
@@ -1122,14 +1157,11 @@ pub(super) fn card(
                         );
                 } else {
                     let (label, description, suffix, info) = match setting {
-                        Row::AccountSetup => (
-                            "Open account setup",
-                            "Connect via Bridge or IMAP.",
-                            "›",
-                            false,
-                        ),
+                        Row::AccountSetup => {
+                            ("Add account", "Connect via Bridge or IMAP.", "›", false)
+                        }
                         Row::EditAccount => (
-                            "Edit account.toml",
+                            "Edit account file",
                             "Set display names and Markdown signatures.",
                             "↗",
                             false,
@@ -1244,29 +1276,18 @@ pub(super) fn card(
 
             details = match section {
                 Section::Accounts => {
-                    let setup = session.settings_nav.availability.account_setup;
-                    let (title, description) = if setup && view.server.is_some() {
-                        (
-                            "Account file not found".to_owned(),
-                            "This mailbox stays open until you reopen Fell.",
-                        )
-                    } else if setup {
-                        (
-                            "No account configured".to_owned(),
-                            "Set up an account to sync your mailbox.",
-                        )
-                    } else if let Some(server) = &view.server {
+                    let (title, description) = if let Some(server) = &view.server {
                         (
                             crate::present::display_safe(&session.account_email),
                             server.as_str(),
                         )
                     } else {
                         (
-                            "Account unavailable".to_owned(),
-                            "Check account.toml or reopen Fell to connect.",
+                            "No active account".to_owned(),
+                            "Connect an account to sync your mailbox.",
                         )
                     };
-                    let sync = view.server.as_ref().filter(|_| !setup).map(|_| {
+                    let sync = view.server.as_ref().map(|_| {
                         session.last_sync_at.map_or_else(
                             || "Waiting for first sync".into(),
                             |at| {
@@ -1278,14 +1299,29 @@ pub(super) fn card(
                         )
                     });
                     Some(
-                        detail(theme, title, description, false, setup)
-                            .h(px(ACCOUNT_SUMMARY_HEIGHT))
-                            .children(sync.map(|label| {
-                                div()
-                                    .text_size(px(12.))
-                                    .text_color(rgb(theme.dimmed))
-                                    .child(label)
-                            })),
+                        div()
+                            .child(
+                                detail(theme, title, description, false, true)
+                                    .h(px(ACCOUNT_SUMMARY_HEIGHT))
+                                    .children(sync.map(|label| {
+                                        div()
+                                            .text_size(px(12.))
+                                            .text_color(rgb(theme.dimmed))
+                                            .child(label)
+                                    })),
+                            )
+                            .children(view.other_accounts.iter().map(
+                                |(title, description, alert)| {
+                                    detail(
+                                        theme,
+                                        crate::present::display_safe(title),
+                                        &crate::present::display_safe(description),
+                                        *alert,
+                                        true,
+                                    )
+                                    .h(px(ACCOUNT_ROW_HEIGHT))
+                                },
+                            )),
                     )
                 }
                 Section::Search => {
@@ -1362,7 +1398,7 @@ pub(super) fn card(
                         .text_size(px(12.))
                         .line_height(px(17.))
                         .text_color(rgb(theme.dimmed))
-                        .child("Found in delivered mail. Selected addresses go into account.toml."),
+                        .child("Found in delivered mail. Selected addresses go into this account’s file."),
                 );
                 for (index, candidate) in candidates.iter().enumerate() {
                     let label = crate::present::display_safe(&candidate.address);
@@ -1845,17 +1881,6 @@ mod tests {
         assert_eq!(ensure_keymap(&dir).unwrap(), path);
         assert!(path.is_symlink());
         assert_eq!(fs::metadata(&owned).unwrap().mode() & 0o777, 0o644);
-    }
-
-    #[test]
-    fn account_setup_guard_rechecks_the_file() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("account.toml");
-        assert!(!account_file_exists(Some(&path)));
-        fs::write(&path, "").unwrap();
-        assert!(account_file_exists(Some(&path)));
-        fs::rename(&path, temp.path().join("account.bak")).unwrap();
-        assert!(!account_file_exists(Some(&path)));
     }
 
     #[test]

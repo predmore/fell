@@ -1,4 +1,4 @@
-//! `fell account setup|show|check`: write and test `~/.config/fell/account.toml`.
+//! Account setup and management from the terminal.
 //!
 //! Setup asks for anything not given as a flag, checks the login against the
 //! server, and only then saves the credentials and writes the file (mode 0600).
@@ -7,6 +7,7 @@
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 
+use fell_core::accounts::{DEFAULT_ID, Registry, validate_id};
 use fell_core::credentials::{PasswordStore, SecretService};
 use fell_core::onboarding::{ConnectionProgress, check_connection, connection_recovery};
 use fell_core::{AccountConfig, BackendKind, ImapSecurity, PasswordSource};
@@ -16,9 +17,11 @@ use crate::mailbox::{
 };
 
 const USAGE: &str = "\
-fell account setup [options]   write ~/.config/fell/account.toml after a login check
-fell account show              print the account file without the password
-fell account check             log in to IMAP and SMTP with the account file, send nothing
+fell account setup [--id ID]   save an account after a login check
+fell account list              list configured accounts
+fell account remove ID         disconnect an account and offer to delete local mail
+fell account show [--id ID]    print account settings without the password
+fell account check [--id ID]   log in to IMAP and SMTP, send nothing
 
 setup options (anything missing is asked for on a terminal):
   Entered passwords are saved in the desktop keyring by default.
@@ -27,7 +30,7 @@ setup options (anything missing is asked for on a terminal):
   --name NAME                  display name
   --username USER              IMAP username (Bridge shows it under the account's mailbox details)
   --password-stdin             read the password from the first line of stdin
-  --password-inline            store the entered password in account.toml
+  --password-inline            store the entered password in the account file
   --password-command CMD       run CMD (sh -c) for the password at each sync
   --host HOST --port PORT      default 127.0.0.1:1143 for Bridge, PORT 993 for IMAP
   --security starttls|tls|plain
@@ -42,14 +45,18 @@ setup options (anything missing is asked for on a terminal):
 pub fn account_command(args: &[String]) -> i32 {
     let result = match args.first().map(String::as_str) {
         Some("setup") => setup(&args[1..]),
-        Some(cmd @ ("show" | "check")) => match args.get(1).map(String::as_str) {
-            Some("--help" | "-h" | "help") => {
+        Some("list") if args.len() == 1 => list(),
+        Some("remove") if args.len() == 2 => remove(&args[1]),
+        Some(cmd @ ("show" | "check")) => match &args[1..] {
+            [help] if matches!(help.as_str(), "--help" | "-h") => {
                 println!("{USAGE}");
                 Ok(())
             }
-            Some(other) => Err(format!("unknown option {other:?}\n\n{USAGE}")),
-            None if cmd == "show" => show(),
-            None => check(),
+            [] if cmd == "show" => show(None),
+            [] => check(None),
+            [flag, id] if flag == "--id" && cmd == "show" => show(Some(id)),
+            [flag, id] if flag == "--id" => check(Some(id)),
+            _ => Err(format!("Expected {cmd} [--id ID]\n\n{USAGE}")),
         },
         Some("--help" | "-h" | "help") | None => {
             println!("{USAGE}");
@@ -71,6 +78,7 @@ pub fn account_command(args: &[String]) -> i32 {
 
 #[derive(Debug, Default)]
 struct Flags {
+    id: Option<String>,
     imap: bool,
     email: Option<String>,
     name: Option<String>,
@@ -103,6 +111,7 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
                 .ok_or_else(|| format!("{name} needs a value\n\n{USAGE}"))
         };
         match arg.as_str() {
+            "--id" => flags.id = Some(value("--id")?),
             "--imap" => flags.imap = true,
             "--email" => flags.email = Some(value("--email")?),
             "--name" => flags.name = Some(value("--name")?),
@@ -203,6 +212,8 @@ fn setup(args: &[String]) -> Result<(), String> {
         println!("{USAGE}");
         return Ok(());
     }
+    let id = flags.id.as_deref().unwrap_or(DEFAULT_ID);
+    validate_id(id).map_err(|err| format!("{id:?}: {err}"))?;
     let tty = io::stdin().is_terminal() && !flags.password_stdin;
     let backend = if flags.imap {
         BackendKind::Imap
@@ -257,6 +268,7 @@ fn setup(args: &[String]) -> Result<(), String> {
     };
 
     let mut config = AccountConfig::bridge(email, username, password);
+    config.id = id.to_owned();
     config.name = name;
     config.backend = backend;
     config.host = host;
@@ -355,8 +367,106 @@ pub(crate) fn save_account(
     staged.publish().map_err(SaveAccountError::File)
 }
 
-fn show() -> Result<(), String> {
-    let (path, config) = load_account_file()?;
+fn list() -> Result<(), String> {
+    let accounts = Registry::resolve().map_err(|err| err.to_string())?.load();
+    if accounts.is_empty() {
+        println!("No accounts configured.");
+    }
+    if let Some(error) = accounts.error {
+        eprintln!("{error}");
+    }
+    for entry in accounts.entries {
+        match entry.config {
+            Ok(config) => println!("{}\t{}", config.id, config.email),
+            Err(error) => println!(
+                "{}\t{error}",
+                entry.path.file_stem().unwrap_or_default().to_string_lossy()
+            ),
+        }
+    }
+    Ok(())
+}
+
+fn remove(id: &str) -> Result<(), String> {
+    let registry = Registry::resolve().map_err(|err| err.to_string())?;
+    let path = registry.path(id).map_err(|err| err.to_string())?;
+    if !path.exists() {
+        registry.migrate().map_err(|err| err.to_string())?;
+    }
+    let base = crate::mailbox::store_path()?;
+    let store = registry.store_path(&base, id);
+    if !path
+        .symlink_metadata()
+        .is_ok_and(|meta| meta.is_file() || meta.is_symlink())
+    {
+        return Err(format!("No account file for {id:?}"));
+    }
+    let delete = store.is_file()
+        && io::stdin().is_terminal()
+        && matches!(
+            prompt(
+                "Delete the local mail, drafts and grants for this account? [y/N]",
+                Some("")
+            )?
+            .to_ascii_lowercase()
+            .as_str(),
+            "y" | "yes"
+        );
+    remove_account(&path, &store, delete)?;
+    println!("Removed {id}.");
+    Ok(())
+}
+
+fn remove_account(
+    path: &std::path::Path,
+    store: &std::path::Path,
+    delete: bool,
+) -> Result<(), String> {
+    use std::fs;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let parent = path.parent().expect("account file has a directory");
+    let dir = crate::mailbox::private_config_dir(parent).map_err(|err| err.to_string())?;
+    dir.try_lock().map_err(|err| err.to_string())?;
+    // An open store has a shared lock on its inode. SQLite files cannot
+    // be unlinked and recreated while another process still uses them.
+    let locked_store = if delete {
+        match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(store)
+        {
+            Ok(file) => {
+                file.try_lock().map_err(|err| format!("Close Fell and any fell-mcp sessions using this account before deleting local mail: {err}"))?;
+                if !file.metadata().map_err(|err| err.to_string())?.is_file() {
+                    return Err("Expected a regular mailbox file.".into());
+                }
+                Some(file)
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err.to_string()),
+        }
+    } else {
+        None
+    };
+    if locked_store.is_some() {
+        for suffix in ["-wal", "-shm", "-journal", ""] {
+            let mut path = store.as_os_str().to_os_string();
+            path.push(suffix);
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(format!("{}: {err}", std::path::Path::new(&path).display()));
+                }
+            }
+        }
+    }
+    fs::remove_file(path).map_err(|err| format!("{}: {err}", path.display()))
+}
+
+fn show(id: Option<&str>) -> Result<(), String> {
+    let (path, config) = load_account_file(id)?;
     println!("# {}", path.display());
     let mut redacted = config.clone();
     if let PasswordSource::Inline(_) = redacted.password {
@@ -366,8 +476,8 @@ fn show() -> Result<(), String> {
     Ok(())
 }
 
-fn check() -> Result<(), String> {
-    let (_, config) = load_account_file()?;
+fn check(id: Option<&str>) -> Result<(), String> {
+    let (_, config) = load_account_file(id)?;
     check_both(&config)
 }
 
@@ -530,6 +640,28 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    #[test]
+    fn removing_an_account_keeps_mail_unless_deletion_was_chosen() {
+        let temp = tempfile::tempdir().unwrap();
+        let configs = temp.path().join("config/fell/accounts");
+        std::fs::create_dir_all(&configs).unwrap();
+        for id in ["kept", "deleted"] {
+            let path = configs.join(format!("{id}.toml"));
+            std::fs::write(&path, "fixture").unwrap();
+            let db = temp.path().join(format!("{id}.db"));
+            let store = fell_core::Store::open(&db).unwrap();
+            if id == "deleted" {
+                assert!(remove_account(&path, &db, true).is_err());
+                assert!(path.exists() && db.exists());
+            }
+            drop(store);
+            let delete = id == "deleted";
+            remove_account(&path, &db, delete).unwrap();
+            assert!(!path.exists());
+            assert_eq!(db.exists(), !delete);
+        }
     }
 
     #[test]

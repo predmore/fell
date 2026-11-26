@@ -370,18 +370,33 @@ fn resolve(path: &Path) -> io::Result<PathBuf> {
         return Ok(path.to_path_buf());
     }
     let target = path.canonicalize()?;
-    if target
-        .file_name()
-        .is_some_and(|name| name == "account.toml")
-    {
+    if account_files(path).any(|account| {
+        account
+            .canonicalize()
+            .is_ok_and(|account| account == target)
+    }) {
         return Err(io::Error::other(
-            "settings.toml must not link to account.toml",
+            "settings.toml must not link to an account file",
         ));
     }
     Ok(target)
 }
 
-fn read_source(path: &Path, account: &Path) -> io::Result<Option<Source>> {
+fn account_files(settings: &Path) -> impl Iterator<Item = PathBuf> {
+    let config = settings.parent().unwrap_or_else(|| Path::new("."));
+    let registry = fell_core::accounts::Registry::at(config.to_path_buf());
+    [config.join("account.toml"), config.join("account.toml.bak")]
+        .into_iter()
+        .chain(
+            fs::read_dir(registry.directory())
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.path()),
+        )
+}
+
+fn read_source(path: &Path, settings: &Path) -> io::Result<Option<Source>> {
     let mut file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -396,11 +411,12 @@ fn read_source(path: &Path, account: &Path) -> io::Result<Option<Source>> {
     let user = unsafe { libc::geteuid() };
     if !before.is_file()
         || before.uid() != user
-        || fs::metadata(account).is_ok_and(|meta| same_file(&before, &meta))
+        || account_files(settings)
+            .any(|account| fs::metadata(account).is_ok_and(|meta| same_file(&before, &meta)))
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "settings.toml must be a regular file owned by you and separate from account.toml",
+            "settings.toml must be a regular file owned by you and separate from account files",
         ));
     }
     let mut bytes = Vec::new();
@@ -437,7 +453,7 @@ fn changed_while_saving() -> io::Error {
 
 fn read_complete(path: &Path) -> io::Result<(DocumentMut, Option<Source>)> {
     let target = resolve(path)?;
-    let source = read_source(&target, &path.with_file_name("account.toml"))?;
+    let source = read_source(&target, path)?;
     let document = if let Some(source) = &source {
         source.text.parse().map_err(|error: toml_edit::TomlError| {
             let offset = error.span().map_or(0, |span| span.start);
@@ -501,9 +517,7 @@ pub fn save(path: &Path, defaults: Values, edit: Edit) -> io::Result<Snapshot> {
     file.write_all(text.as_bytes())?;
     file.as_file().sync_all()?;
     if resolve(path)? != target
-        || read_source(&target, &path.with_file_name("account.toml"))
-            .map_err(|_| changed_while_saving())?
-            != before
+        || read_source(&target, path).map_err(|_| changed_while_saving())? != before
     {
         return Err(changed_while_saving());
     }

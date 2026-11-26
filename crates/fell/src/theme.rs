@@ -470,8 +470,10 @@ pub(crate) fn watched_dirs() -> Vec<PathBuf> {
     if let Some(path) = crate::settings::path() {
         dirs.extend(crate::settings::watched_dirs(&path));
     }
-    if let Some(path) = crate::mailbox::account_config_path() {
-        dirs.extend(crate::settings::watched_dirs(&path));
+    if let Ok(registry) = fell_core::accounts::Registry::resolve() {
+        dirs.extend(crate::settings::watched_dirs(
+            &registry.directory().join("mail.toml"),
+        ));
     }
     dirs.sort();
     dirs.dedup();

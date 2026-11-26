@@ -14,16 +14,41 @@ pub(crate) enum ReplyCheck {
 }
 
 #[derive(Default)]
-pub(crate) struct ReplyChecks {
+pub(crate) struct AccountReplyChecks {
     account: Option<AccountId>,
     offline: bool,
     active: HashSet<String>,
     watched: HashMap<String, ReplyCheck>,
 }
 
+#[derive(Default)]
+pub(crate) struct ReplyChecks(pub HashMap<AccountId, AccountReplyChecks>);
+
 impl gpui::Global for ReplyChecks {}
 
 impl ReplyChecks {
+    pub fn for_account_mut(&mut self, account: &AccountId) -> &mut AccountReplyChecks {
+        self.0.entry(account.clone()).or_default()
+    }
+
+    pub fn pending(&self, account: &AccountId) -> Vec<MessageId> {
+        self.0
+            .get(account)
+            .map_or_else(Vec::new, AccountReplyChecks::pending)
+    }
+
+    pub fn for_message(&self, account: &AccountId, id: &str) -> Option<ReplyCheck> {
+        self.0.get(account)?.for_message(id)
+    }
+
+    pub fn for_draft(&self, account: &AccountId, id: &str) -> ReplyCheck {
+        self.0
+            .get(account)
+            .map_or(ReplyCheck::Waiting, |checks| checks.for_draft(account, id))
+    }
+}
+
+impl AccountReplyChecks {
     pub fn start(&mut self, account: AccountId, offline: bool) {
         *self = Self {
             account: Some(account),
@@ -111,7 +136,7 @@ mod tests {
 
     #[test]
     fn reply_checks_report_partial_progress_and_keep_ready_cues_scoped() {
-        let mut checks = ReplyChecks::default();
+        let mut checks = AccountReplyChecks::default();
         let account = AccountId("local".into());
         let one = MessageId::new("a@x");
         let two = MessageId::new("b@x");

@@ -6,6 +6,8 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
+pub(crate) use fell_core::accounts::FileError as AccountConfigError;
+use fell_core::accounts::{self, Registry};
 use fell_core::{Account, AccountConfig, AccountId, Store};
 
 use crate::fixtures::{fixture_account, seed_if_empty};
@@ -34,16 +36,43 @@ pub struct Opened {
 }
 
 pub fn startup() -> Startup {
+    let registry = Registry::resolve();
+    let accounts = registry.as_ref().ok().map(Registry::load);
+    let config = accounts
+        .as_ref()
+        .and_then(|accounts| accounts.default_config())
+        .cloned();
+    let account_missing = accounts.as_ref().is_some_and(accounts::Accounts::is_empty);
+    let config_error = registry
+        .as_ref()
+        .err()
+        .or_else(|| {
+            accounts.as_ref().and_then(|accounts| {
+                accounts.error.as_ref().or_else(|| {
+                    accounts
+                        .entries
+                        .iter()
+                        .find_map(|entry| entry.config.as_ref().err())
+                })
+            })
+        })
+        .map(ToString::to_string);
+    let path = store_path().map(|base| match (&registry, &config) {
+        (Ok(registry), Some(config)) => registry.store_path(&base, &config.id),
+        _ => base,
+    });
+    startup_for(config, account_missing, config_error, path)
+}
+
+pub fn startup_for(
+    config: Option<AccountConfig>,
+    account_missing: bool,
+    config_error: Option<String>,
+    path: Result<PathBuf, String>,
+) -> Startup {
     let (keymap, keymap_error) = load_keymap();
     let split = load_split();
     let read_dwell_ms = load_read_dwell();
-    let (config, account_missing, config_error) = match load_account_config() {
-        Ok(config) => {
-            let missing = config.is_none();
-            (config, missing, None)
-        }
-        Err(err) => (None, false, Some(err)),
-    };
     Startup {
         keymap,
         split,
@@ -51,7 +80,7 @@ pub fn startup() -> Startup {
         error: join_errors([keymap_error, config_error]),
         account_missing,
         config,
-        path: store_path(),
+        path,
     }
 }
 
@@ -83,77 +112,29 @@ fn join_errors<const N: usize>(errors: [Option<String>; N]) -> Option<String> {
     }
 }
 
-pub fn account_config_path() -> Option<PathBuf> {
-    config_dir().map(|dir| dir.join("account.toml"))
-}
-
-/// `Ok(None)` when there is no account file. An unreadable, malformed, or
-/// group/world-readable file is an error so the window can say so.
-fn load_account_config() -> Result<Option<AccountConfig>, String> {
-    let Some(path) = account_config_path() else {
-        return Ok(None);
-    };
-    read_account_config(&path).map_err(|err| err.to_string())
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AccountConfigError {
-    pub(crate) detail: String,
-    pub(crate) recovery: &'static str,
-}
-
-impl AccountConfigError {
-    fn new(detail: impl Into<String>, recovery: &'static str) -> Self {
-        Self {
-            detail: detail.into(),
-            recovery,
+pub(crate) fn next_account_id() -> Result<String, String> {
+    let registry = Registry::resolve().map_err(|err| err.to_string())?;
+    registry.migrate().map_err(|err| err.to_string())?;
+    let base = store_path()?;
+    for number in 1.. {
+        let id = if number == 1 {
+            "mail".into()
+        } else {
+            format!("mail-{number}")
+        };
+        let path = registry.path(&id).map_err(|err| err.to_string())?;
+        if !path.symlink_metadata().is_ok()
+            && (number == 1 || !registry.store_path(&base, &id).exists())
+        {
+            return Ok(id);
         }
     }
+    unreachable!()
 }
 
-impl std::fmt::Display for AccountConfigError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.detail)
-    }
-}
-
+#[cfg(test)]
 fn read_account_config(path: &Path) -> Result<Option<AccountConfig>, AccountConfigError> {
-    Ok(read_account_config_text(path)?.map(|(config, _)| config))
-}
-
-fn read_account_config_text(
-    path: &Path,
-) -> Result<Option<(AccountConfig, String)>, AccountConfigError> {
-    let shown = path.display();
-    let unreadable = |err: std::io::Error| {
-        AccountConfigError::new(
-            format!("{shown}: {err}"),
-            "Restore read access to account.toml.",
-        )
-    };
-    let meta = match fs::metadata(path) {
-        Ok(meta) => meta,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(unreadable(err)),
-    };
-    let mode = meta.permissions().mode();
-    if mode & 0o077 != 0 {
-        return Err(AccountConfigError::new(
-            format!(
-                "{shown} is open to other users (mode {:o}); run chmod 600 on it",
-                mode & 0o777
-            ),
-            "Set account.toml permissions to 600.",
-        ));
-    }
-    let text = fs::read_to_string(path).map_err(unreadable)?;
-    let config = AccountConfig::parse(&text).map_err(|err| {
-        AccountConfigError::new(
-            format!("{shown}: {err}"),
-            "Fix the settings in account.toml.",
-        )
-    })?;
-    Ok(Some((config, text)))
+    Ok(accounts::read(path, None)?.map(|(config, _)| config))
 }
 
 /// The account file a send from `account` takes its login and SMTP settings
@@ -165,47 +146,49 @@ pub(crate) fn send_account_config(
     if fell_core::is_demo_account(account) {
         return Ok(None);
     }
-    let path = account_config_path().ok_or_else(|| {
-        AccountConfigError::new("no config directory", "Set HOME or XDG_CONFIG_HOME.")
-    })?;
-    send_config_at(&path, account).map(Some)
+    let registry = Registry::resolve()?;
+    registry.get(account)?.map(Some).ok_or_else(|| {
+        registry
+            .path(account.as_str())
+            .map_or_else(|err| err, |path| accounts::missing(&path))
+    })
 }
 
-pub(crate) fn send_config_at(
-    path: &Path,
-    account: &AccountId,
-) -> Result<AccountConfig, AccountConfigError> {
-    let config = read_account_config(path)?.ok_or_else(|| {
-        AccountConfigError::new(
-            format!("{} does not exist", path.display()),
-            "Run fell account setup.",
-        )
-    })?;
-    if config.id != account.as_str() {
-        return Err(AccountConfigError::new(
-            format!(
-                "{} has no entry for account {}",
-                path.display(),
-                account.as_str()
-            ),
-            "Restore this draft’s account ID in account.toml.",
-        ));
-    }
-    Ok(config)
+#[cfg(test)]
+fn send_config_at(path: &Path, account: &AccountId) -> Result<AccountConfig, AccountConfigError> {
+    accounts::read(path, Some(account.as_str()))?
+        .map(|(config, _)| config)
+        .ok_or_else(|| accounts::missing(path))
 }
 
-/// The account file for `fell account show|check`, with the same mode check
-/// the window applies. Nothing in a file other users can change is run.
-pub fn load_account_file() -> Result<(PathBuf, AccountConfig), String> {
-    let path = account_config_path()
-        .ok_or_else(|| "no config directory; set HOME or XDG_CONFIG_HOME".to_string())?;
-    match read_account_config(&path).map_err(|err| err.to_string())? {
-        Some(config) => Ok((path, config)),
-        None => Err(format!(
-            "{} does not exist; run fell account setup",
-            path.display()
-        )),
+pub fn load_account_file(id: Option<&str>) -> Result<(PathBuf, AccountConfig), String> {
+    let registry = Registry::resolve().map_err(|err| err.to_string())?;
+    if let Some(id) = id {
+        let path = registry.path(id).map_err(|err| err.to_string())?;
+        return registry
+            .get(&AccountId(id.to_owned()))
+            .map_err(|err| err.to_string())?
+            .map(|config| (path.clone(), config))
+            .ok_or_else(|| accounts::missing(&path).to_string());
     }
+    let accounts = registry.load();
+    if let Some(config) = accounts.default_config() {
+        let path = registry.path(&config.id).map_err(|err| err.to_string())?;
+        return Ok((path, config.clone()));
+    }
+    Err(accounts
+        .error
+        .as_ref()
+        .or_else(|| {
+            accounts
+                .entries
+                .iter()
+                .find_map(|entry| entry.config.as_ref().err())
+        })
+        .map_or_else(
+            || "No account file. Run fell account setup.".into(),
+            ToString::to_string,
+        ))
 }
 
 #[derive(Debug)]
@@ -256,8 +239,9 @@ fn stage_config(
     config: &AccountConfig,
     first_run: bool,
 ) -> Result<StagedAccountConfig, AccountFileError> {
-    let path = account_config_path()
-        .ok_or_else(|| "no config directory; set HOME or XDG_CONFIG_HOME".to_string())?;
+    let registry = Registry::resolve().map_err(|err| err.to_string())?;
+    registry.migrate().map_err(|err| err.to_string())?;
+    let path = registry.path(&config.id).map_err(|err| err.to_string())?;
     stage_account_config_at(path, config, first_run)
 }
 
@@ -301,7 +285,11 @@ pub(crate) fn import_identities(
     account: &AccountId,
     addresses: Vec<String>,
 ) -> Result<AccountConfig, String> {
-    let path = account_config_path().ok_or("No account file")?;
+    let registry = Registry::resolve().map_err(|err| err.to_string())?;
+    registry.get(account).map_err(|err| err.to_string())?;
+    let path = registry
+        .path(account.as_str())
+        .map_err(|err| err.to_string())?;
     import_identities_at(path, account, addresses)
 }
 
@@ -311,7 +299,7 @@ fn import_identities_at(
     addresses: Vec<String>,
 ) -> Result<AccountConfig, String> {
     let lock = lock_account_dir(&path).map_err(|err| err.to_string())?;
-    let (config, mut text) = read_account_config_text(&path)
+    let (config, mut text) = accounts::read(&path, Some(account.as_str()))
         .map_err(|err| err.to_string())?
         .ok_or("No account file")?;
     if config.id != account.as_str() {
@@ -338,7 +326,8 @@ fn import_identities_at(
         text.push('\n');
     }
     AccountConfig::render_identities(&mut text, &identities);
-    let updated = AccountConfig::parse(&text).map_err(|err| err.to_string())?;
+    let updated =
+        accounts::parse(&path, &text, Some(account.as_str())).map_err(|err| err.to_string())?;
     stage_account_text_at(path, &text, false, lock)
         .and_then(StagedAccountConfig::publish)
         .map_err(|err| err.to_string())?;
@@ -670,10 +659,8 @@ mod tests {
 
     #[test]
     fn account_file_must_be_private_and_valid() {
-        let dir = std::env::temp_dir().join(format!("fell-acct-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("account.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mail.toml");
         let account = AccountId("mail".into());
         assert_eq!(read_account_config(&path).unwrap(), None);
         let missing = send_config_at(&path, &account).unwrap_err();
@@ -682,29 +669,25 @@ mod tests {
         fs::write(&path, "email = \"a@b\"\npassword = \"x\"\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         let err = send_config_at(&path, &account).unwrap_err();
-        assert!(err.detail.contains("chmod 600"), "{err}");
-        assert_eq!(err.recovery, "Set account.toml permissions to 600.");
+        assert!(err.detail.contains("mode 600"), "{err}");
+        assert_eq!(err.recovery, "Set account file permissions to 600.");
 
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         let config = send_config_at(&path, &account).unwrap();
         assert_eq!(config.email, "a@b");
         let mismatch = send_config_at(&path, &AccountId("other".into())).unwrap_err();
-        assert_eq!(
-            mismatch.recovery,
-            "Restore this draft’s account ID in account.toml."
-        );
+        assert_eq!(mismatch.recovery, "Fix the settings in the account file.");
 
         fs::write(&path, "email = \"a@b\"\n").unwrap();
         let err = send_config_at(&path, &account).unwrap_err();
         assert!(err.detail.contains("password"), "{err}");
-        assert_eq!(err.recovery, "Fix the settings in account.toml.");
-        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(err.recovery, "Fix the settings in the account file.");
     }
 
     #[test]
     fn import_appends_only_confirmed_new_aliases_and_keeps_the_account_text() {
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("fell/account.toml");
+        let path = root.path().join("fell/accounts/mail.toml");
         let original = "# Keep my notes\nemail = 'primary@example.com'\npassword = 'demo'";
         let lock = lock_account_dir(&path).unwrap();
         stage_account_text_at(path.clone(), original, true, lock)

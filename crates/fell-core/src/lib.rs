@@ -7,6 +7,7 @@
 
 pub mod account;
 pub mod account_config;
+pub mod accounts;
 pub mod actions;
 pub mod agent;
 pub mod backend;

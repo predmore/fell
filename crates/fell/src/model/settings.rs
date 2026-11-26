@@ -79,8 +79,8 @@ impl Row {
     pub fn command(self) -> &'static str {
         match self {
             Self::Value(preference) => preference.command(),
-            Self::AccountSetup => "Settings: Open account setup",
-            Self::EditAccount => "Settings: Edit account.toml",
+            Self::AccountSetup => "Settings: Add account",
+            Self::EditAccount => "Settings: Edit account file",
             Self::ImportIdentities => "Settings: Import sender addresses",
             Self::EffectiveBindings => "Settings: Show effective bindings",
             Self::EditKeymap => "Settings: Edit keymap.toml",
@@ -122,6 +122,7 @@ pub struct Availability {
     pub account_setup: bool,
     pub edit_account: bool,
     pub identity_count: usize,
+    pub other_accounts: usize,
     pub install_model: bool,
     pub remove_model: bool,
 }
@@ -132,6 +133,7 @@ impl Default for Availability {
             account_setup: true,
             edit_account: false,
             identity_count: 0,
+            other_accounts: 0,
             install_model: true,
             remove_model: false,
         }

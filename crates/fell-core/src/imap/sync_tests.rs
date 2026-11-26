@@ -6087,3 +6087,58 @@ fn legacy_reply_to_checks_the_whole_copy_set_before_accepting_absence() {
     assert_eq!(recovered.fields.to, ["Ann <ann@x>"]);
     assert_read_only(&server);
 }
+
+#[test]
+fn registry_accounts_sync_in_parallel_into_separate_stores() {
+    use crate::accounts::Registry;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::Barrier;
+
+    let fixture = sample_state();
+    let username = fixture.username.clone();
+    let password = fixture.password.clone();
+    let server = TestServer::spawn_parallel(fixture, Default::default());
+    let root = tempfile::tempdir().unwrap();
+    let registry = Registry::at(root.path().join("config/fell"));
+    std::fs::create_dir_all(registry.directory()).unwrap();
+    let base = root.path().join("mail.db");
+    for id in ["mail", "work"] {
+        let path = registry.path(id).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        writeln!(file, "email = '{id}@example.test'\nusername = '{username}'\npassword = '{password}'\nport = {}\nsecurity = 'plain'", server.addr.port()).unwrap();
+    }
+    let configs = registry
+        .load()
+        .entries
+        .into_iter()
+        .map(|entry| entry.config)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(configs.len(), 2);
+    let ready = Barrier::new(configs.len());
+    std::thread::scope(|scope| {
+        for config in configs {
+            let path = registry.store_path(&base, &config.id);
+            let ready = &ready;
+            scope.spawn(move || {
+                ready.wait();
+                let account = config.account();
+                let backend = config.backend().unwrap();
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let store = Store::open(path).unwrap();
+                sync_once(&account, backend.as_ref(), &store).unwrap();
+                assert_eq!(
+                    store.list_accounts().unwrap(),
+                    std::slice::from_ref(&account)
+                );
+                assert!(stored(&store, &account, "reply@x").is_some());
+            });
+        }
+    });
+}

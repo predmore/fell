@@ -4990,7 +4990,7 @@ fn draft_hub(home: &std::path::Path, fixture: &Fixture) -> crate::compose::Draft
     let mut session = DraftSession::open_with_store(&folder, account, &fixture.store).unwrap();
     session.bind_store(db);
     let hub = DraftHub::new();
-    hub.on_server_draft_queued(|| {});
+    hub.on_server_draft_queued(fixture.account.id.clone(), || {});
     hub.insert(session);
     hub
 }

@@ -99,7 +99,7 @@ pub(crate) fn confirm_send(
         SmtpSenders::Fixed(addresses) => addresses.contains(&from),
     };
     if !allowed {
-        return Err(smtp_err("smtp: From is not configured in account.toml"));
+        return Err(smtp_err("smtp: From is not configured for this account"));
     }
     let remote = deliver(
         &Endpoint::new(config, &login.username, &login.password),
@@ -769,7 +769,7 @@ Bcc: this is body text\r\n"
             "id = 'mailbox'\nemail = 'jon@example.com'\nusername = 'bridge-user'\n\
              password = 'bridge-secret'\nsmtp_port = {port}\nsmtp_security = 'plain'\n"
         );
-        let path = root.join("config/fell/account.toml");
+        let path = root.join("config/fell/accounts/mailbox.toml");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, &config).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -784,7 +784,7 @@ Bcc: this is body text\r\n"
         let send = || backend.confirm_send(pending.clone(), confirm(&pending));
         let assert_refused = |result: Result<SentMessage>| {
             assert!(matches!(result, Err(Error::Backend(message))
-                if message == "smtp: From is not configured in account.toml"));
+                if message == "smtp: From is not configured for this account"));
         };
         assert_refused(send());
         fs::write(
@@ -809,7 +809,7 @@ Bcc: this is body text\r\n"
         let pending = sample_pending();
         assert!(matches!(
             bridge.confirm_send(pending.clone(), confirm(&pending)),
-            Err(Error::Backend(message)) if message == "smtp: From is not configured in account.toml"
+            Err(Error::Backend(message)) if message == "smtp: From is not configured for this account"
         ));
     }
 
@@ -830,7 +830,7 @@ Bcc: this is body text\r\n"
         let Some(root) = crate::test_support::in_isolated_process() else {
             return;
         };
-        let path = root.join("config/fell/account.toml");
+        let path = root.join("config/fell/accounts/mailbox.toml");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
 
         for after in [AfterData::Accept, AfterData::Hangup, AfterData::Reject] {

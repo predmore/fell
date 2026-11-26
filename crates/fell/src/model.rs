@@ -191,6 +191,7 @@ pub enum Overlay {
 pub enum FolderIntent {
     /// `gf` switches the list to the chosen folder.
     Go,
+    Account,
     /// `m` moves the selected conversations to the chosen folder.
     Move,
     Label,
@@ -404,6 +405,7 @@ pub struct Step {
 
     pub action: Option<Action>,
     pub reload_threads: bool,
+    pub switch_account: Option<String>,
     pub reload_messages: bool,
     pub arm_which: bool,
     /// Conversation pages, in viewport heights. Positive moves down.
@@ -565,6 +567,7 @@ pub struct Session {
     label_selection: LabelSelection,
     pub merge_sources: Vec<String>,
     pub merge_choices: Vec<PickerChoice>,
+    pub account_choices: Vec<PickerChoice>,
     pub merge_search: u64,
     pub merge_loading: bool,
     merge_confirm_pending: bool,
@@ -674,6 +677,7 @@ impl Session {
             label_selection: LabelSelection::default(),
             merge_sources: Vec::new(),
             merge_choices: Vec::new(),
+            account_choices: Vec::new(),
             merge_search: 0,
             merge_loading: false,
             merge_confirm_pending: false,
@@ -792,6 +796,7 @@ impl Session {
             }
             FolderIntent::Merge => "Merge into",
             FolderIntent::Go => "Folder",
+            FolderIntent::Account => "Switch account",
             FolderIntent::Label => "Label",
             FolderIntent::LabelList => "Go to label",
         }
@@ -809,7 +814,10 @@ impl Session {
                 ids => Some(format!("{} conversations", ids.len())),
             },
             FolderIntent::Move => self.move_selection.as_ref()?.subject.clone(),
-            FolderIntent::Go | FolderIntent::LabelList | FolderIntent::Merge => None,
+            FolderIntent::Go
+            | FolderIntent::Account
+            | FolderIntent::LabelList
+            | FolderIntent::Merge => None,
         }
     }
 
@@ -1116,6 +1124,22 @@ impl Session {
     }
 
     pub fn picker_choices(&self) -> Vec<PickerChoice> {
+        if self.folder_intent == FolderIntent::Account {
+            let query = self.folder_query.trim().to_ascii_lowercase();
+            return self
+                .account_choices
+                .iter()
+                .filter(|choice| {
+                    choice.name.to_ascii_lowercase().contains(&query)
+                        || choice.title.to_ascii_lowercase().contains(&query)
+                        || choice
+                            .detail
+                            .as_deref()
+                            .is_some_and(|detail| detail.to_ascii_lowercase().contains(&query))
+                })
+                .cloned()
+                .collect();
+        }
         if self.folder_intent == FolderIntent::Merge {
             return self.merge_choices.clone();
         }
@@ -2593,6 +2617,10 @@ impl Session {
         self.folder_query.clear();
         self.folder_intent = FolderIntent::Go;
         match intent {
+            FolderIntent::Account => Step {
+                switch_account: Some(name),
+                ..Step::default()
+            },
             FolderIntent::Merge => Step {
                 threading: Some(ThreadEdit::Merge {
                     sources: std::mem::take(&mut self.merge_sources),
@@ -2712,6 +2740,7 @@ impl Session {
                     | Action::Snoozed
                     | Action::Muted
                     | Action::FolderPicker
+                    | Action::AccountPicker
                     | Action::LabelList
                     | Action::Palette
                     | Action::Help
@@ -2877,6 +2906,17 @@ impl Session {
                     };
                     step.triage = Some(snooze::TriageEdit { ids, kind });
                 }
+            }
+            Action::AccountPicker => {
+                self.count.clear();
+                self.folder_intent = FolderIntent::Account;
+                self.overlay = Overlay::Folders;
+                self.folder_query.clear();
+                self.folder_index = self
+                    .account_choices
+                    .iter()
+                    .position(|choice| choice.mark.is_some())
+                    .unwrap_or(0);
             }
             Action::FolderPicker => {
                 self.count.clear();

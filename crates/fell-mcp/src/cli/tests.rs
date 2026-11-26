@@ -115,6 +115,7 @@ impl Ctx {
                 home: (!self.no_home).then(|| self.home()),
                 ..Env::default()
             },
+            registry: None,
             default_store: Some(self.store()),
             exe: Some(EXE.into()),
             appimage: self.appimage.clone(),

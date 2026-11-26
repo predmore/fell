@@ -72,6 +72,7 @@ impl ClosedDraftSave {
 
 /// A notice whose result can be checked on the mailbox worker after close.
 pub struct DraftCloseNotice {
+    account: crate::AccountId,
     text: String,
     alert: bool,
     server_save: Option<ClosedDraftSave>,
@@ -125,7 +126,7 @@ impl DraftCloseNotice {
 }
 
 pub struct DraftHub {
-    server_draft_wake: Mutex<Option<super::server::Wake>>,
+    server_draft_wake: Mutex<HashMap<crate::AccountId, super::server::Wake>>,
     sessions: Mutex<HashMap<String, DraftSession>>,
     listeners: Mutex<Vec<Listener>>,
     focused: Mutex<Option<String>>,
@@ -181,7 +182,7 @@ impl Default for DraftHub {
 impl DraftHub {
     pub fn new() -> Self {
         Self {
-            server_draft_wake: Mutex::new(None),
+            server_draft_wake: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             listeners: Mutex::new(Vec::new()),
             focused: Mutex::new(None),
@@ -372,10 +373,9 @@ impl DraftHub {
         }
         drop(opening);
         drop(sessions);
-        if let Some(wake) = self.server_draft_wake() {
-            wake();
-        }
+        self.wake_server_draft(account);
         self.closed.lock().expect("closed").push(DraftCloseNotice {
+            account: account.clone(),
             text: format!("{}  ·  u", action.summary),
             alert: false,
             server_save: None,
@@ -426,15 +426,36 @@ impl DraftHub {
     }
 
     /// The GUI's sync worker wakes once an editor save reaches the outbox.
-    pub fn on_server_draft_queued(&self, wake: impl Fn() + Send + Sync + 'static) {
-        *self.server_draft_wake.lock().expect("server draft wake") = Some(Arc::new(wake));
-    }
-
-    fn server_draft_wake(&self) -> Option<super::server::Wake> {
+    pub fn on_server_draft_queued(
+        &self,
+        account: crate::AccountId,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) {
         self.server_draft_wake
             .lock()
             .expect("server draft wake")
-            .clone()
+            .insert(account, Arc::new(wake));
+    }
+
+    pub fn remove_server_draft_wake(&self, account: &crate::AccountId) {
+        self.server_draft_wake
+            .lock()
+            .expect("server draft wake")
+            .remove(account);
+    }
+
+    pub fn wake_server_draft(&self, account: &crate::AccountId) {
+        if let Some(wake) = self.server_draft_wake(account) {
+            wake();
+        }
+    }
+
+    fn server_draft_wake(&self, account: &crate::AccountId) -> Option<super::server::Wake> {
+        self.server_draft_wake
+            .lock()
+            .expect("server draft wake")
+            .get(account)
+            .cloned()
     }
 
     /// Called only by the compose window. Agent request_send can reveal a
@@ -443,18 +464,17 @@ impl DraftHub {
         if self.shown.lock().expect("shown").as_deref() != Some(id) {
             return;
         }
-        if let Some(wake) = self.server_draft_wake() {
-            self.with_session(id, |session| {
-                session.flush_server_if_due(Some(now_ms), &wake)
-            });
-        }
+        self.with_session(id, |session| {
+            if let Some(wake) = self.server_draft_wake(session.account_id()) {
+                session.flush_server_if_due(Some(now_ms), &wake);
+            }
+        });
     }
 
     /// Queue every save still waiting on the editor's debounce, then wait
     /// until each live draft's saves are on disk. The app calls this when it
     /// quits.
     pub fn settle_all(&self) {
-        let wake = self.server_draft_wake();
         let shown = self.shown.lock().expect("shown").clone();
         let waiters: Vec<super::SaveWaiter> = self
             .sessions
@@ -462,10 +482,10 @@ impl DraftHub {
             .expect("sessions")
             .values_mut()
             .filter_map(|session| {
-                if let Some(wake) = &wake
-                    && shown.as_deref() == Some(session.id())
+                if shown.as_deref() == Some(session.id())
+                    && let Some(wake) = self.server_draft_wake(session.account_id())
                 {
-                    session.flush_server_if_due(None, wake);
+                    session.flush_server_if_due(None, &wake);
                 }
                 let _ = session.flush_pending();
                 session.save_waiter()
@@ -499,8 +519,10 @@ impl DraftHub {
         };
         // No window has it open for editing any more. Typing still waiting
         // on the save debounce is saved now.
-        let wake = was_shown.then(|| self.server_draft_wake()).flatten();
         let summary = self.with_session(id, |session| {
+            let wake = was_shown
+                .then(|| self.server_draft_wake(session.account_id()))
+                .flatten();
             if let Some(wake) = &wake {
                 session.flush_server_if_due(None, wake);
             }
@@ -563,6 +585,7 @@ impl DraftHub {
                 id,
                 sent,
                 DraftCloseNotice {
+                    account: account.clone(),
                     text: line,
                     alert: failed || locked == Some(SendLock::MaybeSent.reason()),
                     server_save,
@@ -614,10 +637,14 @@ impl DraftHub {
     /// Queue `line` for the inbox. Mail that went out is not offered again
     /// by reopen; anything else is the draft reopen brings back.
     fn push_closed(&self, id: &str, line: String, sent: bool, warn: bool) {
+        let Some(account) = self.with_session(id, |session| session.account_id().clone()) else {
+            return;
+        };
         self.push_notice(
             id,
             sent,
             DraftCloseNotice {
+                account,
                 text: line,
                 alert: warn,
                 server_save: None,
@@ -687,6 +714,14 @@ impl DraftHub {
 
     pub fn take_close_notices(&self) -> Vec<DraftCloseNotice> {
         std::mem::take(&mut *self.closed.lock().expect("closed"))
+    }
+
+    pub fn take_close_notices_for(&self, account: &crate::AccountId) -> Vec<DraftCloseNotice> {
+        self.closed
+            .lock()
+            .expect("closed")
+            .extract_if(.., |notice| &notice.account == account)
+            .collect()
     }
 
     fn wait_shown(&self, id: &str) -> bool {

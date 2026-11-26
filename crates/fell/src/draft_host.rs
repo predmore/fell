@@ -290,7 +290,7 @@ fn merge_from_disk(hub: &DraftHub, id: &str, folder: &std::path::Path) {
 pub(crate) struct DraftHome {
     pub root: PathBuf,
     pub store: PathBuf,
-    account_file: Option<PathBuf>,
+    registry: Option<fell_core::accounts::Registry>,
 }
 
 impl DraftHome {
@@ -299,7 +299,7 @@ impl DraftHome {
         Self {
             root: fell_core::compose::draft_root(),
             store,
-            account_file: crate::mailbox::account_config_path(),
+            registry: fell_core::accounts::Registry::resolve().ok(),
         }
     }
 
@@ -307,9 +307,9 @@ impl DraftHome {
         if fell_core::is_demo_account(account) {
             return None;
         }
-        self.account_file
+        self.registry
             .as_ref()
-            .and_then(|path| crate::mailbox::send_config_at(path, account).ok())
+            .and_then(|registry| registry.get(account).ok().flatten())
     }
 
     /// Start a new, empty draft from `from` on `account` and make it live
@@ -774,7 +774,8 @@ pub(crate) mod tests {
         let settings = "email = 'primary@example.com'\nname = 'Primary'\npassword = 'test'\n\
                         [[identities]]\naddress = 'alias@example.com'\nname = 'Studio'\n\
                         [[identities]]\naddress = 'primary@example.com'\nsignature = 'Primary team'\n";
-        let path = crate::mailbox::account_config_path().unwrap();
+        let registry = fell_core::accounts::Registry::resolve().unwrap();
+        let path = registry.path("mail").unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, settings).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -928,7 +929,7 @@ pub(crate) mod tests {
         DraftHome {
             root: root.join("drafts"),
             store,
-            account_file: None,
+            registry: None,
         }
     }
 

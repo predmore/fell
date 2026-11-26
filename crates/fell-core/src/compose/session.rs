@@ -2178,9 +2178,9 @@ mod tests {
         assert_eq!(session.fields().from, "jon@example.com");
         assert_eq!(session.body(), "Body edit\n");
 
-        let config = isolated.join("config/fell");
+        let config = isolated.join("config/fell/accounts");
         fs::create_dir_all(&config).unwrap();
-        let path = config.join("account.toml");
+        let path = config.join("mail.toml");
         fs::write(&path, format!(
             "id = {:?}\nemail = \"jon@example.com\"\npassword = \"test\"\n[[identities]]\naddress = \"other@example.com\"\nname = \"Studio\"\n",
             session.account_id().as_str()

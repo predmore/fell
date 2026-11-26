@@ -407,7 +407,7 @@ impl Onboarding {
                             SaveState::Ready => self.meta("Fell keeps your password in the desktop keyring."),
                             SaveState::SavingKeyring => self.meta("Approve any keyring prompt to continue."),
                             SaveState::ConfirmFile => self.meta(
-                                "Your password will be saved as plain text in account.toml. Fell restricts access to the file to your user account.",
+                                "Your password will be saved as plain text in the account file. Fell restricts access to the file to your user account.",
                             ),
                             SaveState::Failed { title, detail, .. } => self.error(title, detail.as_deref()),
                         }).min_h(px((self.theme.ui_px + 4.) * 5.)),

@@ -16,7 +16,7 @@ ui-confirm = ["dep:fell-confirm"]
 # `Store::testing_search_warm_asked`, for other crates' tests: the first two
 # rewrite the vector index and swap the search ranker. Also requires explicit
 # draft paths when testing from other crates. Enable only for tests and benches.
-test-utils = ["dep:tempfile"]
+test-utils = []
 
 [dependencies]
 backtrace = "0.3"
@@ -36,7 +36,7 @@ rustls = { version = "0.23.46", default-features = false, features = ["ring", "s
 rustls-native-certs = "0.8.5"
 saphyr = { version = "0.3.4", default-features = false }
 similar = { version = "3.2.1", default-features = false, features = ["std", "text"] }
-tempfile = { version = "3", optional = true }
+tempfile = "3"
 thiserror.workspace = true
 time = { version = "0.3", features = ["formatting", "local-offset"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
@@ -56,7 +56,6 @@ fell-confirm.workspace = true
 prost = "0.14"
 rcgen = "0.13"
 rusqlite = { workspace = true, features = ["hooks"] }
-tempfile = "3"
 
 [lints.rust]
 unsafe_code = "forbid"

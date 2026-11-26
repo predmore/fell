@@ -85,9 +85,17 @@ cargo run -p fell -- account setup   # asks for email, username, Bridge password
 cargo run -p fell                    # syncs in the background, then every 60 s
 ```
 
-Setup writes `~/.config/fell/account.toml` (mode 0600) and saves the entered password in the desktop keyring via Secret Service. Use `--password-command 'pass show bridge'` to read it from a command or `--password-inline` to save it in the file. If you change the login or server settings for a keyring-backed account, run setup again to save the password for those settings.
+Setup writes `~/.config/fell/accounts/mail.toml` (mode 0600) and saves the entered password in the desktop keyring via Secret Service. Use `--password-command 'pass show bridge'` to read it from a command or `--password-inline` to save it in the file. If you change the login or server settings for a keyring-backed account, run setup again to save the password for those settings.
 
 Use `--imap --host imap.example.com` for an IMAP account other than Bridge. Setup also shows where mail is sent (`--smtp-host`, `--smtp-port`, `--smtp-security`; an IMAP account is asked on a terminal) and logs in there without sending anything. `fell account check` tests both logins again. Sync is read-only (`EXAMINE` and `BODY.PEEK`), so nothing changes on the server. `space s` syncs now. When Bridge is down or rejects the login, the status line and the empty inbox say so. `--fixture` opens one stored message so the HTML renderer can be seen. IMAP sync and confirmed SMTP delivery live in `fell-core`. Both ordinary IMAP accounts and Bridge use their configured SMTP settings for sending. The protocol tests use loopback IMAP and SMTP servers. Message bodies are indexed locally with a lexical hash. `fell embeddings install` downloads a small local sentence model (all-MiniLM-L6-v2, 23 MB, Apache-2.0) after showing what it fetches and asking. `fell embeddings status` and `fell embeddings remove` report on it and delete it. With the model installed, search also finds mail close in meaning to the query (hybrid ranking); without it, search is keyword search. The window follows the active Omarchy theme when `~/.local/state/omarchy/current/theme/colors.toml` is present, and otherwise uses the built-in dark or light theme.
+
+### Use multiple accounts
+
+Use **Settings → Accounts → Add account** or `fell account setup --id work` to connect another mailbox. Account IDs use letters, digits, hyphens and underscores. `fell account list` lists them and identifies unreadable files. Use `fell account show --id work` or `fell account check --id work` to inspect or test a particular account.
+
+Press `Space A` or `gA` to switch accounts. Each account keeps its own folder, selection and search while it syncs. New drafts, including those made from a mailto link or `fell compose`, use the current account. On launch Fell opens `mail` if configured or the first readable account by ID.
+
+Fell moves an existing `account.toml` into the accounts directory on first use and keeps `account.toml.bak`. The original mailbox and its credential keep their existing account ID. `fell account remove work` disconnects the account and keeps its local mail by default. Close Fell and any MCP sessions using that account before choosing to delete its local store.
 
 ### Open a draft from another app
 
@@ -133,7 +141,7 @@ writes the changed key and preserves comments and unfamiliar keys.
 
 Missing or invalid values fall back to the previous defaults. That includes
 `FELL_REDUCE_MOTION`, `read_dwell_ms` in `ui.toml`, `which_key_ms` in
-`keymap.toml`, and the notification mode in `account.toml`. An explicit
+`keymap.toml`, and the notification mode in the account file. An explicit
 `"system"` for motion follows GTK. Fell keeps the last readable settings if an edit introduces a syntax error.
 Delete individual keys to restore their fallbacks, or empty or remove the file
 to restore all fallbacks. Keymap leader changes, plus the search
@@ -151,7 +159,7 @@ archive it from a notice, the confirmation offers **Undo** for five seconds.
 
 ### Sender identities and signatures
 
-Add one `[[identities]]` table per address at the end of `account.toml`.
+Add one `[[identities]]` table per address at the end of the account file.
 Use an entry for the account's top-level `email` to give that default
 address a signature. `name` and `signature` are optional. Write line
 breaks in a Markdown signature as `\n`. Fell accepts up to 2,000
@@ -167,7 +175,7 @@ signature = "**Studio**\nField Operations"
 
 **Settings → Accounts** lists the current identities. **Import sender
 addresses** lets you select and confirm aliases from the mailbox's
-delivery history. Use **Edit account.toml** to add addresses manually or
+delivery history. Use **Edit account file** to add addresses manually or
 set their display names and signatures.
 
 Replies and forwards choose the configured identity the message arrived
@@ -179,7 +187,7 @@ untouched and keeps any edits you made to it.
 
 ### Sent mail
 
-A confirmed send appears in the conversation and in Sent immediately. The `save_sent` setting in `account.toml` controls who files the copy on the server.
+A confirmed send appears in the conversation and in Sent immediately. The `save_sent` setting in the account file controls who files the copy on the server.
 
 | Setting | Server Sent copy |
 | --- | --- |

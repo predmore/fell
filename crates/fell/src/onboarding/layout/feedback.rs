@@ -89,7 +89,7 @@ impl SaveState {
                         Some("Quit and reopen Fell to use it."),
                     ),
                     SaveAccountError::File(AccountFileError::Write(detail)) => {
-                        ("Couldn’t save account.toml", Some(detail.as_str()))
+                        ("Couldn’t save the account file", Some(detail.as_str()))
                     }
                 };
                 Self::Failed {

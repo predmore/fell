@@ -1,5 +1,6 @@
 //! Two-pane inbox. The window reads the local store and never talks to IMAP.
 
+mod accounts;
 mod activity;
 mod agent_notes;
 mod agents;
@@ -137,7 +138,7 @@ pub fn run(
                 if let Some(trace) = &trace {
                     trace.window_created(window);
                 }
-                cx.new(|cx| Inbox::focused(startup, demo, window, cx))
+                cx.new(|cx| accounts::AccountWindow::new(startup, demo, None, window, cx))
             })
             .map(gpui::AnyWindowHandle::from)
         };
@@ -177,8 +178,8 @@ impl gpui::Global for InboxWindow {}
 
 impl InboxWindow {
     fn update(self, cx: &mut App, update: impl FnOnce(&mut Inbox, &mut Context<Inbox>)) {
-        let _ = self.0.update(cx, |root, _, cx| {
-            if let Ok(inbox) = root.downcast::<Inbox>() {
+        let _ = self.0.update(cx, |_, window, cx| {
+            if let Some(inbox) = accounts::active_inbox(window, cx) {
                 inbox.update(cx, update);
             }
         });
@@ -275,17 +276,6 @@ pub(crate) fn compose_draft_window_failed(id: &str, cx: &mut App) {
     }
 }
 
-pub(crate) fn wake_sent_copy_sync(cx: &mut App) {
-    if let Some(inbox) = cx.try_global::<InboxWindow>().copied() {
-        inbox.update(cx, |inbox, _| {
-            // A failed local insert can still have queued the server copy.
-            if let Some(sync) = &inbox.sync {
-                sync.write_back_now();
-            }
-        });
-    }
-}
-
 pub(crate) fn finish_onboarding(
     setup: gpui::Entity<Onboarding>,
     window: &mut Window,
@@ -293,17 +283,7 @@ pub(crate) fn finish_onboarding(
 ) {
     let startup = mailbox::startup();
     window.replace_root(cx, |window, cx| {
-        let mut inbox = Inbox::focused(startup, false, window, cx);
-        inbox.first_preview = FirstPreview::Handoff;
-        inbox.waiting_for_first_rows = true;
-        inbox.waiting_for_inbox_total = true;
-        let now = inbox.motion.clock.now();
-        inbox
-            .motion
-            .observe_header(&inbox.session.list_folder, None, None, now);
-        inbox.setup_exit = LayerSwap::start(inbox.motion.motion, now, motion::QUICK, motion::FADE)
-            .map(|swap| (setup, swap));
-        inbox
+        accounts::AccountWindow::new(startup, false, Some(setup), window, cx)
     });
 }
 
@@ -867,6 +847,7 @@ struct Inbox {
     conv_gen: Arc<AtomicU64>,
     /// Where `c` keeps a new draft. `None` when the mailbox did not open.
     draft_home: Option<DraftHome>,
+    reviews: Option<gpui::Task<()>>,
     opening_draft: Option<OpeningServerDraft>,
     /// The compose drafts at the top of the Drafts list, as last read.
     drafts: Vec<DraftSummary>,
@@ -918,9 +899,15 @@ impl Inbox {
     ) -> Self {
         let inbox = Self::with_startup(startup, demo, Some(window), cx);
         window.focus(&inbox.focus);
-        cx.on_focus_lost(window, |inbox, window, _| {
+        cx.on_focus_lost(window, |inbox, window, _cx| {
             // A focused link can disappear when its message closes.
-            window.focus(&inbox.focus);
+            let current = accounts::active_inbox(window, _cx);
+            if current
+                .as_ref()
+                .is_some_and(|entity| entity == &_cx.entity())
+            {
+                window.focus(&inbox.focus);
+            }
         })
         .detach();
         cx.set_global(InboxWindow(window.window_handle()));
@@ -942,6 +929,17 @@ impl Inbox {
         })
         .detach();
         inbox
+    }
+
+    fn account_setup_handoff(&mut self, setup: gpui::Entity<Onboarding>) {
+        self.first_preview = FirstPreview::Handoff;
+        self.waiting_for_first_rows = true;
+        self.waiting_for_inbox_total = true;
+        let now = self.motion.clock.now();
+        self.motion
+            .observe_header(&self.session.list_folder, None, None, now);
+        self.setup_exit = LayerSwap::start(self.motion.motion, now, motion::QUICK, motion::FADE)
+            .map(|swap| (setup, swap));
     }
 
     fn with_startup(
@@ -972,7 +970,6 @@ impl Inbox {
             },
             notices,
         );
-        cx.set_global(crate::compose_ui::RecipientStore(store.clone()));
         let (name, email) = match &config {
             Some(config) => {
                 let account = config.account();
@@ -1006,8 +1003,12 @@ impl Inbox {
                 config.account().id,
             );
             Self::watch_notifications(window.window_handle(), invoked, cx);
-            cx.observe_window_activation(window, Self::notification_window_activation)
-                .detach();
+            cx.observe_window_activation(window, |inbox, window, cx| {
+                if accounts::active_inbox(window, cx).as_ref() == Some(&cx.entity()) {
+                    inbox.notification_window_activation(window, cx);
+                }
+            })
+            .detach();
             queue
         });
         let mut inbox = Self {
@@ -1098,6 +1099,7 @@ impl Inbox {
             row_widths: RowWidths::new(motion),
             conv_gen: Arc::new(AtomicU64::new(0)),
             draft_home,
+            reviews: None,
             opening_draft: None,
             drafts: Vec::new(),
             motion: InboxMotion::new(motion),
@@ -1123,7 +1125,6 @@ impl Inbox {
         inbox.watch_store_restarts(store_restarts, cx);
         inbox.refresh_settings_availability();
         inbox.watch_settings(legacy, cx);
-        inbox.watch_reviews(cx);
         inbox.watch_notes(cx);
         inbox.watch_dates(cx);
         inbox
@@ -1134,6 +1135,7 @@ impl Inbox {
             return;
         }
         let account = self.account_id.clone();
+        let self_account = account.clone();
         let read = self.store.call(move |store| {
             let mut verified = Vec::new();
             for id in ids {
@@ -1152,6 +1154,7 @@ impl Inbox {
             {
                 let _ = this.update(cx, |_, cx| {
                     cx.global_mut::<ReplyChecks>()
+                        .for_account_mut(&self_account)
                         .apply(fell_core::ReplyToProgress::Verified(verified));
                     cx.notify();
                 });
@@ -1170,6 +1173,9 @@ impl Inbox {
             trace.store_opened(opened.error.as_deref());
         }
         self.account_id = opened.account.id.clone();
+        cx.default_global::<crate::compose_ui::RecipientStore>()
+            .0
+            .insert(self.account_id.clone(), self.store.clone());
         self.session.account_name = opened.account.display_name.clone();
         self.session.account_email = opened.account.email.clone();
         if let Some(error) = opened.error {
@@ -1195,6 +1201,7 @@ impl Inbox {
             );
         }
         cx.default_global::<ReplyChecks>()
+            .for_account_mut(&self.account_id)
             .start(self.account_id.clone(), sync_with.is_none() || store_failed);
         if !store_failed {
             self.cid_repair = Some(self.store.call(fell_core::Store::cid_repair_progress));
@@ -1209,13 +1216,14 @@ impl Inbox {
                 let sync = handle.clone();
                 drafts
                     .0
-                    .on_server_draft_queued(move || sync.write_back_now());
+                    .on_server_draft_queued(self.account_id.clone(), move || sync.write_back_now());
             }
             self.sync = Some(handle);
             self.watch_sync(events, cx);
         }
         self.request_threads(ReadIntent::default(), cx);
         self.search_store_ready(cx);
+        self.watch_reviews(cx);
         self.watch_external_compose(cx);
         cx.notify();
     }
@@ -1227,19 +1235,34 @@ impl Inbox {
         let Some(mut requests) = cx.global_mut::<ExternalCompose>().0.take() else {
             return;
         };
-        let home = self.draft_home.clone();
         let hub = cx.global::<AgentDrafts>().0.clone();
-        let account = self.account_id.clone();
-        let from = fell_core::compose::configured_from(
-            &self.session.account_name,
-            &self.session.account_email,
-        );
-        cx.spawn(async move |this, cx| {
+        cx.spawn(async move |_, cx| {
             while let Some(request) = futures::StreamExt::next(&mut requests).await {
-                let result = if let Some(home) = home.clone() {
+                let target = cx
+                    .update(|cx| {
+                        let window = cx.try_global::<InboxWindow>().copied()?;
+                        window
+                            .0
+                            .update(cx, |_, window, cx| {
+                                let inbox = accounts::active_inbox(window, cx)?;
+                                let inbox = inbox.read(cx);
+                                Some((
+                                    inbox.draft_home.clone()?,
+                                    inbox.account_id.clone(),
+                                    fell_core::compose::configured_from(
+                                        &inbox.session.account_name,
+                                        &inbox.session.account_email,
+                                    ),
+                                ))
+                            })
+                            .ok()
+                            .flatten()
+                    })
+                    .ok()
+                    .flatten();
+                let result = if let Some((home, account, from)) = target {
                     let hub = hub.clone();
-                    let account = account.clone();
-                    let (fields, body) = request.input.into_fields_and_body(from.clone());
+                    let (fields, body) = request.input.into_fields_and_body(from);
                     let start = ReplyStart {
                         fields,
                         parts: Default::default(),
@@ -1252,21 +1275,22 @@ impl Inbox {
                 } else {
                     Err("The mailbox did not open, so a draft has nowhere to go".into())
                 };
-                if this
-                    .update(cx, |inbox, cx| {
-                        match result {
-                            Ok(id) => {
-                                draft_host::show_draft(&hub, &id);
+                match result {
+                    Ok(id) => {
+                        draft_host::show_draft(&hub, &id);
+                    }
+                    Err(err) => {
+                        let _ = cx.update(|cx| {
+                            if let Some(window) = cx.try_global::<InboxWindow>().copied() {
+                                window.update(cx, |inbox, cx| {
+                                    inbox
+                                        .session
+                                        .show_toast(format!("Couldn't start a draft. {err}"), true);
+                                    cx.notify();
+                                });
                             }
-                            Err(err) => inbox
-                                .session
-                                .show_toast(format!("Couldn't start a draft. {err}"), true),
-                        }
-                        cx.notify();
-                    })
-                    .is_err()
-                {
-                    break;
+                        });
+                    }
                 }
             }
         })
@@ -1385,11 +1409,13 @@ impl Inbox {
                             SyncEvent::ReplyTo(progress) => {
                                 let finished =
                                     matches!(progress, fell_core::ReplyToProgress::Finished);
-                                cx.global_mut::<ReplyChecks>().apply(progress);
+                                cx.global_mut::<ReplyChecks>()
+                                    .for_account_mut(&inbox.account_id)
+                                    .apply(progress);
                                 if finished {
                                     // Also resolve watched drafts whose parent has since become an alias.
                                     inbox.refresh_reply_checks(
-                                        cx.global::<ReplyChecks>().pending(),
+                                        cx.global::<ReplyChecks>().pending(&inbox.account_id),
                                         cx,
                                     );
                                 }
@@ -1507,7 +1533,9 @@ impl Inbox {
                         let wrote = matches!(kind, SyncKind::Syncing { .. })
                             || matches!(kind, SyncKind::Synced { changed: true, .. });
                         if matches!(kind, SyncKind::Failed(_)) {
-                            cx.global_mut::<ReplyChecks>().set_offline(true);
+                            cx.global_mut::<ReplyChecks>()
+                                .for_account_mut(&inbox.account_id)
+                                .set_offline(true);
                         }
                         let active =
                             matches!(kind, SyncKind::Connecting | SyncKind::Syncing { .. });
@@ -1527,10 +1555,14 @@ impl Inbox {
                                 .wait_for_read(inbox.conv_gen.load(Ordering::SeqCst));
                         }
                         if matches!(kind, SyncKind::Synced { .. }) {
-                            cx.global_mut::<ReplyChecks>().set_offline(false);
+                            cx.global_mut::<ReplyChecks>()
+                                .for_account_mut(&inbox.account_id)
+                                .set_offline(false);
                             if wrote {
-                                inbox
-                                    .refresh_reply_checks(cx.global::<ReplyChecks>().pending(), cx);
+                                inbox.refresh_reply_checks(
+                                    cx.global::<ReplyChecks>().pending(&inbox.account_id),
+                                    cx,
+                                );
                             }
                             inbox.reader_bodies.failed.retain(|_, failure| {
                                 !matches!(failure, reader_body_worker::Failure::Connection)
@@ -3277,7 +3309,7 @@ impl Inbox {
 
     /// Say so in the status bar when a review window an agent opened closes,
     /// so the person knows the draft was kept and nothing was sent.
-    fn watch_reviews(&self, cx: &mut Context<Self>) {
+    fn watch_reviews(&mut self, cx: &mut Context<Self>) {
         let Some(hub) = cx
             .try_global::<crate::draft_host::AgentDrafts>()
             .map(|drafts| drafts.0.clone())
@@ -3287,10 +3319,11 @@ impl Inbox {
         let (tx, mut events) = futures::channel::mpsc::unbounded::<()>();
         hub.subscribe_with(move || tx.unbounded_send(()).is_ok());
         let store = self.store.clone();
-        cx.spawn(async move |this, cx| {
+        let account = self.account_id.clone();
+        self.reviews = Some(cx.spawn(async move |this, cx| {
             while events.next().await.is_some() {
                 while events.try_recv().is_ok() {}
-                let closed = if let Some(notice) = hub.take_close_notices().pop() {
+                let closed = if let Some(notice) = hub.take_close_notices_for(&account).pop() {
                     let notice = if notice.needs_local_write() {
                         cx.background_executor()
                             .spawn(async move { notice.after_local_write() })
@@ -3328,8 +3361,7 @@ impl Inbox {
                     break;
                 }
             }
-        })
-        .detach();
+        }));
     }
 
     fn show_sent_copy(&mut self, thread: ThreadId, mut message: fell_core::Message, rich: Rich) {
@@ -4050,7 +4082,11 @@ impl Inbox {
     }
 
     fn watch_reply_check(&self, id: fell_core::MessageId, cx: &mut Context<Self>) {
-        if cx.global_mut::<ReplyChecks>().watch(id.clone()) {
+        if cx
+            .global_mut::<ReplyChecks>()
+            .for_account_mut(&self.account_id)
+            .watch(id.clone())
+        {
             self.refresh_reply_checks(vec![id], cx);
             cx.notify();
         }
@@ -4644,6 +4680,15 @@ impl Inbox {
             overlay,
             settings_page,
         } = before;
+        if let Some(id) = step.switch_account.clone()
+            && let Some(window) = cx.try_global::<InboxWindow>().copied()
+        {
+            cx.defer(move |cx| {
+                let _ = window
+                    .0
+                    .update(cx, |_, window, cx| accounts::switch(&id, window, cx));
+            });
+        }
         if pane_before != Pane::Conversation && self.session.pane == Pane::Conversation {
             self.reader_entered_conversation();
         }
@@ -5796,7 +5841,7 @@ impl Render for Inbox {
             let selected = self.session.reply_target().filter(|_| {
                 self.open_thread.is_some() && self.open_thread == self.session.cursor_id
             });
-            selected.and_then(|target| checks.for_message(&target.id))
+            selected.and_then(|target| checks.for_message(&self.account_id, &target.id))
         });
         let status =
             if self.opening_draft.as_ref().is_some_and(|open| {
@@ -12133,7 +12178,10 @@ fn card_fit(
             let empty_label = choices.is_empty()
                 && matches!(
                     session.folder_intent,
-                    FolderIntent::Label | FolderIntent::LabelList | FolderIntent::Merge
+                    FolderIntent::Label
+                        | FolderIntent::LabelList
+                        | FolderIntent::Merge
+                        | FolderIntent::Account
                 );
             Some(picker_card_height(
                 choices
@@ -12489,9 +12537,10 @@ fn folder_picker(
         FolderIntent::Label | FolderIntent::LabelList
     );
     let merging = session.folder_intent == FolderIntent::Merge;
+    let accounts = session.folder_intent == FolderIntent::Account;
     let selected = session.folder_index;
     let match_query = session.folder_query.trim().to_ascii_lowercase();
-    let inset = if labeling || merging {
+    let inset = if labeling || merging || accounts {
         2.0 * MARGIN
     } else {
         0.0
@@ -12537,7 +12586,7 @@ fn folder_picker(
     div()
         .w(px(width))
         .max_w_full()
-        .when(labeling || merging, |card| card.mx(px(MARGIN)))
+        .when(labeling || merging || accounts, |card| card.mx(px(MARGIN)))
         .min_w_0()
         .max_h(px(PICKER_MAX_PX))
         .bg(rgb(theme.surface))
@@ -12616,32 +12665,36 @@ fn folder_picker(
                 .overflow_y_scroll()
                 .track_scroll(scroll)
                 .my(px(present::CARD_ROW_INSET_PX))
-                .children(((labeling || merging) && choices.is_empty()).then(|| {
-                    div()
-                        .h(px(PICKER_ROW_PX))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .px(px(14.))
-                        .text_color(rgb(theme.dimmed))
-                        .child(if merging {
-                            if !session.merge_loading {
-                                "No matching conversations"
-                            } else if merge_feedback > 0. {
-                                "Searching…"
+                .children(
+                    ((labeling || merging || accounts) && choices.is_empty()).then(|| {
+                        div()
+                            .h(px(PICKER_ROW_PX))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .px(px(14.))
+                            .text_color(rgb(theme.dimmed))
+                            .child(if merging {
+                                if !session.merge_loading {
+                                    "No matching conversations"
+                                } else if merge_feedback > 0. {
+                                    "Searching…"
+                                } else {
+                                    ""
+                                }
+                            } else if accounts {
+                                "No matching accounts"
+                            } else if session.folder_query.is_empty() {
+                                "No labels yet"
                             } else {
-                                ""
-                            }
-                        } else if session.folder_query.is_empty() {
-                            "No labels yet"
-                        } else {
-                            "No matching labels"
-                        })
-                }))
+                                "No matching labels"
+                            })
+                    }),
+                )
                 .children(choices.iter().enumerate().map(|(index, choice)| {
                     let label = present::display_safe(&choice.title);
                     let room = label_room
-                        - if session.folder_intent == crate::model::FolderIntent::Label {
+                        - if session.folder_intent == FolderIntent::Label || accounts {
                             16.0 + 8.0
                         } else {
                             0.0
@@ -12655,7 +12708,7 @@ fn folder_picker(
                         clip_shaped(window, &style, text, room, FontWeight::NORMAL, None)
                             .filter(|line| f32::from(line.width).ceil() <= room)
                     };
-                    let label = if labeling || merging {
+                    let label = if labeling || merging || accounts {
                         clip(&label)
                     } else {
                         fit_folder_path(&label, FolderFit::Picker(&match_query), clip, |line| {
@@ -12724,24 +12777,27 @@ fn folder_picker(
                         )
                         .gap(px(if merging { 0.0 } else { GAP }))
                         .overflow_hidden()
-                        .when(session.folder_intent == FolderIntent::Label, |row| {
-                            row.child(
-                                div()
-                                    .w(px(16.))
-                                    .flex_none()
-                                    .opacity(if choice.mark == Some("+") {
-                                        1.0
-                                    } else {
-                                        mark_opacity
-                                    })
-                                    .text_color(rgb(if index == selected {
-                                        theme.on_selection
-                                    } else {
-                                        theme.accent
-                                    }))
-                                    .children(choice.mark),
-                            )
-                        })
+                        .when(
+                            session.folder_intent == FolderIntent::Label || accounts,
+                            |row| {
+                                row.child(
+                                    div()
+                                        .w(px(16.))
+                                        .flex_none()
+                                        .opacity(if accounts || choice.mark == Some("+") {
+                                            1.0
+                                        } else {
+                                            mark_opacity
+                                        })
+                                        .text_color(rgb(if index == selected {
+                                            theme.on_selection
+                                        } else {
+                                            theme.accent
+                                        }))
+                                        .children(choice.mark),
+                                )
+                            },
+                        )
                         .children(label.map(|line| {
                             let matched = folder_match(&line.text, &match_query);
                             let (label_dim, match_color) = if index == selected {

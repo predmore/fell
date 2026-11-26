@@ -70,6 +70,7 @@ pub(crate) struct Onboarding {
     check_started: Instant,
     checked: Option<FinishedCheck>,
     return_to_inbox: Option<gpui::AnyWindowHandle>,
+    account_id: String,
 }
 
 impl Onboarding {
@@ -86,11 +87,13 @@ impl Onboarding {
 
     pub(crate) fn from_inbox(
         inbox: gpui::AnyWindowHandle,
+        account_id: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut view = Self::new(window, cx);
         view.return_to_inbox = Some(inbox);
+        view.account_id = account_id;
         view
     }
 
@@ -123,6 +126,7 @@ impl Onboarding {
             check_started: Instant::now(),
             checked: None,
             return_to_inbox: None,
+            account_id: fell_core::accounts::DEFAULT_ID.into(),
         }
     }
 
@@ -407,11 +411,12 @@ impl Onboarding {
     }
 
     fn save(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let Some((config, inline)) = self.form.begin_save() else {
+        let Some((mut config, inline)) = self.form.begin_save() else {
             return;
         };
         self.select(Control::Next);
         cx.notify();
+        config.id = self.account_id.clone();
         let work = cx.background_executor().spawn(async move {
             save_account(config, inline, &SecretService, stage_new_account_config)
         });
@@ -422,9 +427,11 @@ impl Onboarding {
                     let setup = cx.entity();
                     let previous = view.return_to_inbox.take();
                     window.defer(cx, move |window, cx| {
-                        crate::view::finish_onboarding(setup, window, cx);
                         if let Some(previous) = previous {
-                            let _ = previous.update(cx, |_, window, _| window.remove_window());
+                            let _ = previous.update(cx, |_, window, _| window.activate_window());
+                            window.remove_window();
+                        } else {
+                            crate::view::finish_onboarding(setup, window, cx);
                         }
                     });
                 }

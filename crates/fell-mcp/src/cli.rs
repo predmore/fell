@@ -85,6 +85,7 @@ pub(crate) struct Io<'a> {
     pub env: Env,
     /// Fell's own mailbox, when the environment names one.
     pub default_store: Option<PathBuf>,
+    pub registry: Option<fell_core::accounts::Registry>,
     /// This program, as a harness should start it.
     pub exe: Option<PathBuf>,
     /// The AppImage file when this runs inside one: harnesses start
@@ -133,6 +134,7 @@ where
         tty,
         env: Env::from_process(),
         default_store: fell_core::compose::mailbox_db_path(),
+        registry: fell_core::accounts::Registry::resolve().ok(),
         exe,
         appimage,
         name,
@@ -375,7 +377,8 @@ fn arg_str(value: &OsString) -> Result<&str, CliError> {
 /// opening it here must not create an empty one.
 fn open_store(opts: &Opts, io: &Io<'_>) -> Result<(PathBuf, Store), CliError> {
     let path = match (&opts.store, &io.default_store) {
-        (Some(path), _) | (None, Some(path)) => path.clone(),
+        (Some(path), _) => path.clone(),
+        (None, Some(base)) => registry_store(io.registry.as_ref(), base, opts.account.as_deref())?,
         (None, None) => {
             return Err(CliError::new(
                 "no mailbox path; set HOME, XDG_DATA_HOME, or FELL_STORE, or pass --store",
@@ -392,6 +395,31 @@ fn open_store(opts: &Opts, io: &Io<'_>) -> Result<(PathBuf, Store), CliError> {
     let store = Store::open(&path).map_err(store_err)?;
     store.finish_cid_repair().map_err(store_err)?;
     Ok((path, store))
+}
+
+fn registry_store(
+    registry: Option<&fell_core::accounts::Registry>,
+    base: &Path,
+    id: Option<&str>,
+) -> Result<PathBuf, CliError> {
+    let Some(registry) = registry else {
+        return Ok(base.to_owned());
+    };
+    let accounts = registry.load();
+    if accounts.is_empty() && !registry.directory().exists() {
+        // A demo or standalone store may have no account file.
+        return Ok(base.to_owned());
+    }
+    let config = match id {
+        Some(id) => registry
+            .get(&AccountId(id.into()))
+            .map_err(|err| CliError::new(err.to_string()))?
+            .ok_or_else(|| CliError::new(format!("unknown account {id}")))?,
+        None => accounts.default_config().cloned().ok_or_else(|| {
+            CliError::new("No readable account configuration. Try `fell account list`.")
+        })?,
+    };
+    Ok(registry.store_path(base, &config.id))
 }
 
 fn ask(io: &mut Io<'_>, question: &str, default: bool) -> Result<bool, CliError> {
@@ -522,7 +550,7 @@ fn path_text(path: &Path) -> Result<String, CliError> {
 
 fn server_spec(
     io: &Io<'_>,
-    store: &Path,
+    store: Option<&Path>,
     account: &AccountId,
     agent: &str,
 ) -> Result<ServerSpec, CliError> {
@@ -538,9 +566,10 @@ fn server_spec(
         }
         (None, None) => return Err(CliError::new("cannot find the fell-mcp program")),
     };
+    if let Some(store) = store {
+        args.extend(["--store".into(), path_text(store)?]);
+    }
     args.extend([
-        "--store".into(),
-        path_text(store)?,
         "--account".into(),
         account.as_str().to_string(),
         "--agent".into(),
@@ -593,7 +622,12 @@ fn add(opts: &Opts, io: &mut Io<'_>) -> Result<(), CliError> {
         scope_names(grant),
         account_label(&account)
     )?;
-    let spec = server_spec(io, &store_path, &account.id, &agent)?;
+    let spec = server_spec(
+        io,
+        (opts.store.is_some() || io.registry.is_none()).then_some(store_path.as_path()),
+        &account.id,
+        &agent,
+    )?;
     let snippet = setup::snippet(harness, &spec);
     let revoke_hint = format!(
         "Revoke any time with `{} revoke {agent}`.",
