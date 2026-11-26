@@ -20,6 +20,7 @@ use crate::model::Session;
 use crate::motion::{self, Motion, Transition};
 use crate::render::remote_images;
 use crate::render::webview::{self, RenderError, Snapshot, WebRequest};
+use crate::scroll_anchor::ScrollAnchor;
 
 const CACHE_SIZE: usize = 12;
 const THREAD_HOLD: Duration = Duration::from_millis(150);
@@ -317,8 +318,12 @@ impl Shown {
         self.outgoing.as_ref().is_some_and(|outgoing| {
             outgoing.is_web() != self.body.is_web()
                 && !matches!(outgoing, Body::Placeholder)
-                && !outgoing.is_colorless()
-                && !self.body.is_colorless()
+                && (!self.colorless_change()
+                    || (!self.image_consent
+                        && self
+                            .mail
+                            .upgrade()
+                            .is_some_and(|mail| mail.has_remote_images())))
         })
     }
 
@@ -806,6 +811,10 @@ impl Reader {
         self.pending = None;
         self.shown.clear();
         self.release_opening();
+    }
+
+    pub(super) fn awaiting_snapshot(&self) -> bool {
+        self.pending.is_some()
     }
 
     pub(super) fn release(&mut self, app: &mut gpui::App) {
@@ -1334,7 +1343,21 @@ impl Inbox {
             return;
         }
         if action == Action::ToggleWebView {
-            if self.web_mail.fitting_wide(id, body) {
+            let body = Arc::clone(body);
+            self.release_landing();
+            self.reveal.cancel_pending();
+            let selected = self.session.message_cursor;
+            if self.conv_layout_current
+                && let Some(anchor) = ScrollAnchor::capture_message(
+                    &self.conv_scroll,
+                    selected,
+                    usize::from(self.conv_note_slot),
+                )
+            {
+                self.landing
+                    .hold_position(&self.session.messages[selected].id, anchor.y);
+            }
+            if self.web_mail.fitting_wide(id, &body) {
                 self.web_mail.fit_wide_for.remove(id);
                 self.web_mail.show_images_for.remove(id);
                 self.web_mail.show_native_for.insert(id.to_owned());
@@ -1353,9 +1376,13 @@ impl Inbox {
             }
             if self.painted_reader.is_some_and(|reader| {
                 let width = reader.columns.header.width.round().clamp(1., 1600.) as i32;
-                let key =
-                    self.web_mail
-                        .key(message, body, &self.theme, width, self.session.is_open(id));
+                let key = self.web_mail.key(
+                    &self.session.messages[index],
+                    &body,
+                    &self.theme,
+                    width,
+                    self.session.is_open(id),
+                );
                 self.web_mail.too_wide(&key)
             }) {
                 self.web_mail.clear_native_override(id);
@@ -1365,7 +1392,7 @@ impl Inbox {
                 cx.notify();
                 return;
             }
-            let next = !self.web_mail.prefers_web(id, sender.as_deref(), body);
+            let next = !self.web_mail.prefers_web(id, sender.as_deref(), &body);
             self.web_mail.show_images_for.remove(id);
             self.web_mail.clear_native_override(id);
             if let Some(sender) = sender {
@@ -1376,7 +1403,7 @@ impl Inbox {
                     .0 = Some(next);
                 self.persist_html_choice(sender, action, next, cx);
             } else if next {
-                self.web_mail.show_web_for(id.to_owned(), None, body);
+                self.web_mail.show_web_for(id.to_owned(), None, &body);
             } else {
                 self.web_mail.show_native_for.insert(id.to_owned());
             }
@@ -1747,6 +1774,84 @@ mod tests {
     }
 
     #[test]
+    fn toggling_to_a_taller_web_view_keeps_the_selected_header_in_place() {
+        let (mut app, window) = super::super::tests::pending_inbox();
+        window
+            .update(&mut app, |inbox, window, cx| {
+                split_view(inbox);
+                inbox.session.pane = Pane::Conversation;
+                inbox.session.message_cursor = 1;
+                inbox.session.loading = false;
+                inbox.session.messages[0].rich =
+                    Rich::Html(Arc::new(crate::mail_body::prepare_html(
+                        &"<p>The path leads down to the pier.</p>".repeat(24),
+                        &[],
+                    )));
+                inbox.land_on_reader();
+                window.focus(&inbox.focus);
+                cx.notify();
+            })
+            .unwrap();
+        app.run_until_parked();
+        let geometry = |inbox: &Inbox| {
+            let card = inbox.conv_scroll.bounds_for_item(1).unwrap();
+            (card.top() + inbox.conv_scroll.offset().y, card.size.height)
+        };
+        let (original_y, original_height) = window
+            .update(&mut app, |inbox, _, _| {
+                let (y, height) = geometry(inbox);
+                assert!(y > inbox.conv_scroll.bounds().top());
+                assert!(inbox.conv_scroll.offset().y < px(0.));
+                assert_eq!(
+                    inbox.conv_scroll.offset().y,
+                    -inbox.conv_scroll.max_offset().height
+                );
+                let message = &inbox.session.messages[1];
+                let Rich::Html(body) = &message.rich else {
+                    panic!("HTML fixture");
+                };
+                let width = inbox.painted_reader.unwrap().columns.header.width.round();
+                let key = inbox
+                    .web_mail
+                    .key(message, body, &inbox.theme, width as i32, false);
+                inbox.web_mail.cache.push_back(Cached {
+                    key,
+                    picture: Some(Snapshot {
+                        width,
+                        height: f32::from(height) + 160.,
+                        ..snapshot()
+                    }),
+                    too_wide: false,
+                    image_failure: None,
+                });
+                (y, height)
+            })
+            .unwrap();
+        app.dispatch_keystroke(window.into(), gpui::Keystroke::parse("w").unwrap());
+        app.run_until_parked();
+        for elapsed in [RENDERER_CHANGE / 2, RENDERER_CHANGE] {
+            window
+                .update(&mut app, |inbox, _, cx| {
+                    let now = inbox.motion.clock.now();
+                    let shown = inbox.web_mail.shown.get_mut("newer").unwrap();
+                    assert!(matches!(shown.body, Body::Web(_)));
+                    shown.renderer_painted = None;
+                    shown.fade = Some(Transition::new(now - elapsed, RENDERER_CHANGE));
+                    cx.notify();
+                })
+                .unwrap();
+            app.run_until_parked();
+            window
+                .update(&mut app, |inbox, _, _| {
+                    let (y, height) = geometry(inbox);
+                    assert!(height > original_height);
+                    assert_eq!(y, original_y);
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
     fn switching_accounts_reschedules_a_superseded_snapshot() {
         let worker = Rc::new(webview::TestWorker::default());
         use gpui::AppContext as _;
@@ -1999,6 +2104,27 @@ mod tests {
                 last = [outgoing, incoming];
             }
             assert_eq!(shown.frame(painted + COLORLESS_CHANGE).body_alpha, [0., 1.]);
+        }
+    }
+
+    #[test]
+    fn blocked_image_tiles_and_the_native_caption_do_not_overlap() {
+        let now = Instant::now();
+        let motion = Motion::new(true);
+        let mail = Arc::new(WebMail::prepare(
+            "<img src='https://example.test/pier' alt='Pier'>",
+        ));
+        let mut picture = snapshot();
+        picture.last_row_color = None;
+        let mut shown = Shown::new(Arc::downgrade(&mail), None, false, false, None);
+        for (target, web) in [(Body::Web(picture), true), (Body::Native, false)] {
+            shown.update(target, None, web, motion, now);
+            shown.renderer_painted.as_ref().unwrap().set(Some(now));
+            shown.start_painted_fade(motion, now, now);
+            for ms in 0..=140 {
+                let [outgoing, incoming] = shown.frame(now + Duration::from_millis(ms)).body_alpha;
+                assert_eq!(outgoing * incoming, 0., "{ms} ms");
+            }
         }
     }
 

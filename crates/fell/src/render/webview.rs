@@ -438,7 +438,8 @@ fn wait_for_images(
                     const text = anchor.innerText?.trim();
                     const images = anchor.querySelectorAll('img, span[data-fell-image-tile]');
                     const imageLabel = Array.from(images)
-                        .map(image => (image.alt ?? image.getAttribute('aria-label') ?? '').trim()).find(Boolean);
+                        .map(image => (image.alt ?? image.getAttribute('data-fell-image-alt')
+                            ?? image.getAttribute('aria-label') ?? '').trim()).find(Boolean);
                     const label = text || imageLabel
                         || anchor.textContent.trim() || 'Open link';
                     const rects = [];
@@ -1475,6 +1476,7 @@ mod tests {
         check_colorless_links();
         check_link_probe_budget();
         check_gmail_reply();
+        check_thunderbird_paragraphs();
 
         let hero = fell_render::WebMail::prepare(
             r#"<div style="height:1000px;background:#7a163f">A tall hero</div>"#,
@@ -1777,5 +1779,52 @@ mod tests {
         };
         assert_eq!((*width, *height), (80., 40.));
         assert!(closed.fallback_links.is_empty());
+    }
+
+    fn check_thunderbird_paragraphs() {
+        let paragraphs =
+            include_str!("../../../fell-render/fixtures/web-thunderbird-paragraphs.html");
+        let separated_divs = paragraphs
+            .replace("<p>", "<div>")
+            .replace("</p>\n<div>", "</div><div><br></div><div>")
+            .replace("</p>", "</div>");
+        let line_tops = |picture: &Snapshot| {
+            let pixels = picture.image.as_bytes(0).unwrap().as_chunks::<4>().0;
+            let mut last_ink = false;
+            pixels
+                .chunks_exact(picture.width as usize)
+                .enumerate()
+                .filter_map(|(y, row)| {
+                    let ink = row.iter().any(|pixel| pixel[3] != 0);
+                    let starts_line = ink && !last_ink;
+                    last_ink = ink;
+                    starts_line.then_some(y)
+                })
+                .collect::<Vec<_>>()
+        };
+        for (scheme, foreground) in [("dark", 0xa9b1d6), ("light", 0x4c4f69)] {
+            let style = fell_render::WebTextStyle {
+                family: Some("Inter".into()),
+                size: 15.,
+                foreground,
+                link: foreground,
+                border: 0x414868,
+                inset: false,
+            };
+            let page = |html| {
+                fell_render::WebMail::prepare(html).page_with_style(scheme, Some(&style), |_| None)
+            };
+            for width in [432, 530] {
+                let paragraphs = colorless_snapshot(page(paragraphs), width);
+                let separated_divs = colorless_snapshot(page(&separated_divs), width);
+                let lines = line_tops(&paragraphs);
+                assert_eq!(lines.len(), 3, "{scheme}, {width}px: {lines:?}");
+                assert_eq!(lines, line_tops(&separated_divs), "{scheme}, {width}px");
+                assert_eq!(
+                    paragraphs.height, separated_divs.height,
+                    "{scheme}, {width}px"
+                );
+            }
+        }
     }
 }

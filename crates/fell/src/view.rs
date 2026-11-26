@@ -6072,18 +6072,25 @@ impl Render for Inbox {
             }
             HashMap::new()
         };
-        // A scroll at the end follows the height drawn in this frame. A
-        // previous header landing would otherwise keep using the old top
-        // when the body grows, then land again when the layout settles.
+        // A passive web refresh at the end follows the height drawn in this
+        // frame. An explicit renderer switch keeps the reader's header in
+        // place while the height eases, subject to the current scroll range.
         if reader_current
             && self.conv_layout_current
             && !scrolling_to_target
+            && !self.landing.preserves_position()
             && !web
                 .values()
                 .any(|frame| frame.leaving_clipped || frame.continuation.is_some())
             && web.values().any(web_mail::Frame::body_animating)
         {
             disclosure::follow_scroll_end(&self.conv_scroll);
+        }
+        if self.landing.preserves_position()
+            && !self.web_mail.awaiting_snapshot()
+            && !web.values().any(web_mail::Frame::animating)
+        {
+            self.landing.hold(None);
         }
         let holding_arrival =
             panes.1 && self.motion.motion.enabled() && self.web_mail.holding_arrival(real);

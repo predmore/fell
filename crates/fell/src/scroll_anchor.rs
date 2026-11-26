@@ -26,21 +26,36 @@ pub(super) struct ScrollAnchor {
 #[derive(Default)]
 pub(super) struct ReaderLanding {
     id: Option<String>,
+    position: Option<Pixels>,
 }
 
 impl ReaderLanding {
     pub fn hold(&mut self, id: Option<&str>) {
         self.id = id.map(str::to_owned);
+        self.position = None;
+    }
+
+    pub fn hold_position(&mut self, id: &str, y: Pixels) {
+        self.id = Some(id.to_owned());
+        self.position = Some(y);
+    }
+
+    pub fn preserves_position(&self) -> bool {
+        self.position.is_some()
     }
 
     pub fn anchor(
         &mut self,
         id: Option<&str>,
-        anchor: ScrollAnchor,
+        mut anchor: ScrollAnchor,
         gliding: bool,
     ) -> Option<ScrollAnchor> {
         if self.id.as_deref() != id {
             self.hold(None);
+        }
+        if let Some(y) = self.position {
+            anchor.y = y;
+            anchor.snap_headers = false;
         }
         (!gliding && self.id.is_some()).then_some(anchor)
     }

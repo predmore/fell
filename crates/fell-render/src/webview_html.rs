@@ -101,9 +101,15 @@ pub struct WebMail {
 #[derive(Debug)]
 enum Slot {
     Image(String),
-    ImageTag { url: Option<String>, label: String },
+    ImageTag {
+        url: Option<String>,
+        label: String,
+        remote: bool,
+    },
     ImageEnd,
-    HideFold { end: usize },
+    HideFold {
+        end: usize,
+    },
 }
 
 #[derive(Default)]
@@ -336,16 +342,18 @@ impl WebMail {
             .unwrap();
             if let Some(text) = text {
                 write!(body_css, " color: #{:06x};", text.foreground).unwrap();
+                let paragraph_gap = reader_paragraph_gap(text.size);
                 write!(
                     link_css,
                     "a:any-link {{ color: #{:06x}; }}
                      hr {{ border: 0; border-top: 1px solid #{:06x}; }}
-                     div:has(> br:only-child:where(:not([data-fell-folded]))) {{ min-height: {}px; }}
-                     p:empty {{ min-height: {}px; margin: 0; }}",
+                     div:has(> br:only-child:where(:not([data-fell-folded]))) {{ min-height: {paragraph_gap}px; }}
+                     p {{ margin: 0 0 {paragraph_gap}px; }}
+                     p:where(:last-child) {{ margin-bottom: 0; }}
+                     body > :first-child, p:first-child {{ margin-top: 0; }}
+                     p:empty {{ min-height: {paragraph_gap}px; margin: 0; }}",
                     text.link,
                     text.border,
-                    reader_paragraph_gap(text.size),
-                    reader_paragraph_gap(text.size),
                 )
                 .unwrap();
             }
@@ -389,7 +397,7 @@ impl WebMail {
                         content.push_str(&escape_attr(&data));
                     }
                 }
-                Slot::ImageTag { url, label } => {
+                Slot::ImageTag { url, label, remote } => {
                     offset += "img".len();
                     let data = url
                         .as_deref()
@@ -402,6 +410,18 @@ impl WebMail {
                             "img src=\"{}\" alt=\"{}\"",
                             escape_attr(&data),
                             escape_attr(label)
+                        )
+                        .unwrap();
+                    } else if *remote {
+                        let alt = escape_attr(label);
+                        let suffix = if alt.trim().is_empty() {
+                            String::new()
+                        } else {
+                            format!(" · {alt}")
+                        };
+                        write!(
+                            content,
+                            "span data-fell-image-tile role=\"img\" aria-label=\"Image blocked{suffix}\" data-fell-image-alt=\"{alt}\""
                         )
                         .unwrap();
                     } else {
@@ -747,7 +767,10 @@ fn serialize_node(
                 let attr = name_attr.local.as_ref();
                 if matches!(
                     attr,
-                    "data-fell-folded" | "data-fell-collapsed" | "data-fell-image-tile"
+                    "data-fell-folded"
+                        | "data-fell-collapsed"
+                        | "data-fell-image-tile"
+                        | "data-fell-image-alt"
                 ) || (image_tag
                     && matches!(attr, "src" | "srcset" | "alt" | "role" | "aria-label"))
                 {
@@ -869,15 +892,15 @@ fn prepare_image_tag(element: &scraper::node::Element, at: usize, slots: &mut Pa
     } else {
         alt.to_owned()
     };
-    let url = (slots.resources.len() < 48)
-        .then(|| remote_image_url(src))
-        .flatten();
+    let url = remote_image_url(src);
+    let remote = url.is_some();
+    let url = url.filter(|_| slots.resources.len() < 48);
     let list = if url.is_some() {
         &mut slots.resources
     } else {
         &mut slots.tags
     };
-    list.push((at, Slot::ImageTag { url, label }));
+    list.push((at, Slot::ImageTag { url, label, remote }));
     true
 }
 
@@ -2136,11 +2159,12 @@ mod tests {
         assert_eq!(images.len(), 2);
         assert_eq!(
             images[0].attr("aria-label"),
-            Some("Harbor & \"Pier\" <map>")
+            Some("Image blocked · Harbor & \"Pier\" <map>")
         );
         assert_eq!(images[0].attr("width"), Some("420"));
         assert_eq!(images[0].attr("height"), Some("240"));
         assert_eq!(images[0].attr("style"), Some("max-width: 90%"));
+        assert_eq!(images[1].attr("aria-label"), Some("Image blocked"));
         assert_eq!(images[1].attr("width"), Some("240"));
         let allowed = mail.page("light", |_| Some("data:image/png;base64,AAAA".into()));
         assert_eq!(
@@ -2149,7 +2173,32 @@ mod tests {
                 .count(),
             2
         );
+        assert!(allowed.contains("alt=\"Harbor &amp; &quot;Pier&quot; &lt;map&gt;\""));
         assert!(!allowed.contains("<span data-fell-image-tile"));
+    }
+
+    #[test]
+    fn image_tiles_leave_no_text_after_the_closing_tag() {
+        let remote = WebMail::prepare(
+            "<p>Before<img src='https://cdn.example.test/map' width='100%'>After</p>",
+        );
+        let cid = WebMail::prepare("<p>Before<img src='cid:map' width='100%'>After</p>");
+        for (label, page) in [
+            ("blocked remote", remote.page("light", |_| None)),
+            (
+                "unresolved CID",
+                cid.page("light", |_| panic!("CID is local")),
+            ),
+            (
+                "failed download",
+                remote.page("light", |url| {
+                    assert_eq!(url, "https://cdn.example.test/map");
+                    None
+                }),
+            ),
+        ] {
+            assert!(page.contains("</span>After</p>"), "{label}\n{page}");
+        }
     }
 
     #[test]
