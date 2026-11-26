@@ -8,7 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-test-utils = ["dep:ttf-parser"]
+test-utils = ["dep:skrifa"]
 
 [dependencies]
 base64 = "0.22"
@@ -20,7 +20,7 @@ pulldown-cmark = "0.13"
 scraper = "0.22"
 selectors = "0.26"
 tendril = "0.4"
-ttf-parser = { version = "0.25", optional = true, default-features = false }
+skrifa = { version = "0.44", optional = true }
 url = "2.5"
 
 [lints.rust]

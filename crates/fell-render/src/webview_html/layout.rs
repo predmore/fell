@@ -1069,30 +1069,44 @@ pub(super) const CALIBRATION_FONT: &[u8] =
     include_bytes!("../../fixtures/calibration-font/fell-calibration-sans.ttf");
 
 #[cfg(feature = "test-utils")]
-fn calibration_face() -> &'static ttf_parser::Face<'static> {
-    static FONT: std::sync::OnceLock<ttf_parser::Face<'static>> = std::sync::OnceLock::new();
-    FONT.get_or_init(|| ttf_parser::Face::parse(CALIBRATION_FONT, 0).unwrap())
+fn calibration_face() -> skrifa::FontRef<'static> {
+    skrifa::FontRef::new(CALIBRATION_FONT).expect("bundled calibration font parses")
+}
+
+#[cfg(feature = "test-utils")]
+fn calibration_metrics() -> skrifa::metrics::Metrics {
+    use skrifa::MetadataProvider;
+    calibration_face().metrics(
+        skrifa::instance::Size::unscaled(),
+        skrifa::instance::LocationRef::default(),
+    )
 }
 
 #[cfg(feature = "test-utils")]
 fn calibration_advance(ch: char) -> f32 {
+    use skrifa::MetadataProvider;
     let font = calibration_face();
-    font.glyph_index(ch)
-        .and_then(|glyph| font.glyph_hor_advance(glyph))
+    let glyphs = font.glyph_metrics(
+        skrifa::instance::Size::unscaled(),
+        skrifa::instance::LocationRef::default(),
+    );
+    font.charmap()
+        .map(ch)
+        .and_then(|glyph| glyphs.advance_width(glyph))
         .map_or_else(
             || approximate_advance(ch),
-            |advance| f32::from(advance) / f32::from(font.units_per_em()),
+            |advance| advance / f32::from(calibration_metrics().units_per_em),
         )
 }
 
 #[cfg(feature = "test-utils")]
 fn calibration_line_height(size: f32) -> f32 {
-    let font = calibration_face();
-    let scale = size / f32::from(font.units_per_em());
+    let metrics = calibration_metrics();
+    let scale = size / f32::from(metrics.units_per_em);
     // WebKit rounds the three font metrics separately for a normal line.
-    (f32::from(font.ascender()) * scale).round()
-        + (f32::from(-font.descender()) * scale).round()
-        + (f32::from(font.line_gap()) * scale).round()
+    (metrics.ascent * scale).round()
+        + (-metrics.descent * scale).round()
+        + (metrics.leading * scale).round()
 }
 
 fn css_pixels(value: &str) -> Option<f32> {

@@ -2093,8 +2093,8 @@ dependencies = [
  "pulldown-cmark",
  "scraper",
  "selectors 0.26.0",
+ "skrifa",
  "tendril 0.4.3",
- "ttf-parser 0.25.1",
  "url",
 ]
 
