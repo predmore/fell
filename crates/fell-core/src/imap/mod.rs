@@ -32,7 +32,7 @@ pub(crate) use rfc822::to_message;
 pub(crate) use rfc822::{
     CidReferences, SNIPPET_BYTES, attachment_names, cap_snippet, has_attachment,
     html_only_snippet_text, html_snippet_text, is_bidi_control, parts_from_raw,
-    snippet as plain_snippet,
+    parts_from_trusted_raw, snippet as plain_snippet,
 };
 pub(crate) use stored_metadata::{fetch_internal_dates, fetch_reply_to};
 pub use structure::BodyStructure;
@@ -727,6 +727,7 @@ fn catch_up(
         known: pass.known,
     };
     let done = &pass.done;
+    let trusted = session.trust_verified_sender_header;
     let stop = stream_bodies(session, &plan, &copies, mailbox, mode, |streamed| {
         let item = match streamed {
             Streamed::Linked(links) => {
@@ -778,6 +779,7 @@ fn catch_up(
             uidvalidity,
             &item,
             !mode.keywords,
+            trusted,
         ));
         batch_bytes += raw_len;
         if batch.len() >= batch_message_limit() || batch_bytes >= BATCH_BYTES {
@@ -1227,6 +1229,7 @@ fn walk_down(
             // Header rows whose body is too large to keep: marked so, in
             // the write that moves the floor below them.
             let mut too_large: Vec<crate::MessageId> = Vec::new();
+            let trusted = session.trust_verified_sender_header;
             let stop = session.uid_fetch_each(
                 &uid_set(&uids),
                 None,
@@ -1254,6 +1257,7 @@ fn walk_down(
                         checkpoint.uidvalidity,
                         &item,
                         !mode.keywords,
+                        trusted,
                     ));
                     // Bodies show as they come, whether or not the fetch ends.
                     if batch.len() >= batch_message_limit() || batch_bytes >= BATCH_BYTES {
@@ -2216,6 +2220,7 @@ pub struct ImapConfig {
     /// Folders `account.toml` names for a role. They win over what the
     /// server marks.
     pub folder_overrides: Vec<(FolderRole, String)>,
+    pub trust_verified_sender_header: bool,
 }
 
 impl fmt::Debug for ImapConfig {
@@ -2243,6 +2248,7 @@ impl ImapConfig {
             security: ImapSecurity::StartTls,
             accept_invalid_certs: true,
             folder_overrides: Vec::new(),
+            trust_verified_sender_header: false,
         }
     }
 }

@@ -142,6 +142,15 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     message_id UNINDEXED
 );
 
+CREATE TABLE IF NOT EXISTS sender_reading (
+    account_id TEXT NOT NULL,
+    sender TEXT NOT NULL,
+    web_view INTEGER,
+    remote_images INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (account_id, sender),
+    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS agent_grants (
     agent_id TEXT NOT NULL,
     account_id TEXT NOT NULL,
@@ -449,6 +458,44 @@ pub use bodies::ReaderParts;
 pub use bodies::cid_upgrade::{CidRepairBatch, CidRepairProgress};
 
 impl Store {
+    /// UI-only account preferences. The reader is responsible for providing
+    /// an authenticated sender when it applies remote-image permission.
+    pub fn sender_reading(
+        &self,
+        account: &AccountId,
+    ) -> Result<HashMap<String, (Option<bool>, bool)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT sender, web_view, remote_images FROM sender_reading WHERE account_id = ?1",
+        )?;
+        let rows = stmt.query_map([&account.0], |row| {
+            Ok((row.get(0)?, (row.get(1)?, row.get(2)?)))
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    pub fn set_sender_web_view(&self, account: &AccountId, sender: &str, web: bool) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO sender_reading (account_id, sender, web_view) VALUES (?1, ?2, ?3)
+             ON CONFLICT (account_id, sender) DO UPDATE SET web_view = excluded.web_view",
+            params![account.0, sender, web],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_sender_remote_images(
+        &self,
+        account: &AccountId,
+        sender: &str,
+        allow: bool,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO sender_reading (account_id, sender, remote_images) VALUES (?1, ?2, ?3)
+             ON CONFLICT (account_id, sender) DO UPDATE SET remote_images = excluded.remote_images",
+            params![account.0, sender, allow],
+        )?;
+        Ok(())
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_mailbox(path.as_ref(), true, true)
     }
@@ -5399,6 +5446,45 @@ mod tests {
             email: "c@x".into(),
             backend_kind: BackendKind::Bridge,
         }
+    }
+
+    #[test]
+    fn sender_reading_keeps_mode_and_image_consent_separate() {
+        let store = Store::open_in_memory().unwrap();
+        let account = account();
+        let sender = "verified@example.test";
+        store.upsert_account(&account).unwrap();
+        assert!(store.sender_reading(&account.id).unwrap().is_empty());
+        store
+            .set_sender_web_view(&account.id, sender, true)
+            .unwrap();
+        assert_eq!(
+            store.sender_reading(&account.id).unwrap()[sender],
+            (Some(true), false)
+        );
+        store
+            .set_sender_remote_images(&account.id, sender, true)
+            .unwrap();
+        store
+            .set_sender_web_view(&account.id, sender, false)
+            .unwrap();
+        assert_eq!(
+            store.sender_reading(&account.id).unwrap()[sender],
+            (Some(false), true)
+        );
+        store
+            .set_sender_remote_images(&account.id, sender, false)
+            .unwrap();
+        assert_eq!(
+            store.sender_reading(&account.id).unwrap()[sender],
+            (Some(false), false)
+        );
+        assert!(
+            store
+                .sender_reading(&AccountId("other".into()))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

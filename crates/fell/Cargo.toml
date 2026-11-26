@@ -23,6 +23,7 @@ fell-render.workspace = true
 fell-version.workspace = true
 gpui.workspace = true
 async-io = "2"
+base64 = "0.22"
 futures = "0.3"
 gtk = "0.18"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
@@ -30,7 +31,7 @@ libc = "0.2"
 notify = { version = "=8.2.2", default-features = false }
 psl = "2"
 raw-window-handle = "0.6"
-# HTTPS for `fell embeddings install` only. No webpki-roots (its CDLA license is
+# HTTPS for embeddings and user-authorized remote images. No webpki-roots (its CDLA license is
 # not on the allow list): the system trust store, through rustls with ring,
 # like the IMAP client in fell-core.
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }

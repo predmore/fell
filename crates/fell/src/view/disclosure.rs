@@ -136,6 +136,16 @@ pub(crate) fn reflow(
     layered(width, layers, frame.alpha, frame.height, [true; 2])
 }
 
+pub(super) fn crossfade(width: f32, progress: f32, layers: [AnyElement; 2]) -> AnyElement {
+    layered(
+        width,
+        layers,
+        [1.0 - progress, progress],
+        progress,
+        [false, true],
+    )
+}
+
 /// Reveal a measured child at its natural width while its slot grows or closes.
 pub(super) fn reveal(width: f32, height: f32, alpha: f32, child: AnyElement) -> AnyElement {
     if height >= 1.0 {

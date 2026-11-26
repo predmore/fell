@@ -15,6 +15,7 @@ mod search;
 mod settings;
 mod snooze;
 mod threading;
+mod web_mail;
 
 use std::cell::{Cell, OnceCell};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -951,6 +952,7 @@ struct Inbox {
     warmed_folder: Option<String>,
     /// Prepared HTML bodies by message id, so reopening prepares nothing.
     bodies: BodyCache,
+    web_mail: web_mail::Reader,
     /// Body revisions to load for the current conversation and work in flight.
     body_loads: BodyLoads,
     /// Messages whose parts were asked of sync, and what came back.
@@ -1170,12 +1172,15 @@ impl Inbox {
             warm: None,
             warmed_folder: None,
             bodies: BodyCache::default(),
+            web_mail: web_mail::Reader::default(),
             body_loads: BodyLoads::default(),
             reader_fetcher: None,
             reader_bodies: ReaderBodies::default(),
             landing: ReaderLanding::default(),
         };
         let sync_with = config.zip(startup.path.ok());
+        cx.on_release(|inbox, app| inbox.web_mail.release(app))
+            .detach();
         cx.spawn(async move |this, cx| {
             let Ok(opened) = ready.await else {
                 return;
@@ -1311,10 +1316,31 @@ impl Inbox {
         if let Some(trace) = cx.try_global::<UiTrace>() {
             trace.store_opened(opened.error.as_deref());
         }
+        self.web_mail.release(cx);
+        self.web_mail = web_mail::Reader::default();
         self.account_id = opened.account.id.clone();
         cx.default_global::<crate::compose_ui::RecipientStore>()
             .0
             .insert(self.account_id.clone(), self.store.clone());
+        self.web_mail.trusted_delivery = sync_with
+            .as_ref()
+            .is_some_and(|(config, _)| config.trust_verified_sender_header);
+        if opened.sync != SyncKind::StoreError {
+            let account = self.account_id.clone();
+            let prefs = self.store.call(move |store| store.sender_reading(&account));
+            cx.spawn(async move |this, cx| {
+                if let Ok(Ok(prefs)) = prefs.await {
+                    let _ = this.update(cx, |inbox, cx| {
+                        for (sender, choice) in prefs {
+                            inbox.web_mail.preferences.entry(sender).or_insert(choice);
+                        }
+                        cx.notify();
+                    });
+                }
+            })
+            .detach();
+            crate::render::webview::prewarm();
+        }
         self.session.account_name = opened.account.display_name.clone();
         self.session.account_email = opened.account.email.clone();
         if let Some(error) = opened.error {
@@ -4873,6 +4899,15 @@ impl Inbox {
         {
             self.queue_link_focus(false);
         }
+        if let Some(
+            action @ (Action::ToggleWebView
+            | Action::AllowMessageImages
+            | Action::AllowSenderImages
+            | Action::BlockSenderImages),
+        ) = step.action
+        {
+            self.html_reading_action(action, cx);
+        }
         if overlay != Overlay::Help && self.session.overlay == Overlay::Help {
             self.help_scroll = help::HelpScroll::default();
         }
@@ -5958,8 +5993,22 @@ impl Render for Inbox {
             .regroup_motion
             .take()
             .filter(|motion| motion.running(now));
+        let web = if reader_current && panes.1 && preview_current {
+            self.web_mail.frames(
+                &self.session.messages,
+                self.session.message_cursor,
+                &self.theme,
+                reader.columns.header.width,
+                (self.motion.motion, now),
+                cx,
+            )
+        } else {
+            self.web_mail.stop();
+            HashMap::new()
+        };
         let conv = ConvFrame {
             account_opacity: self.account_reader_opacity(real, now),
+            web,
             syncing: self.pending_bodies.downloading(&self.session.sync),
             missing_fade: self.pending_bodies.fade(now),
             feedback,
@@ -6041,6 +6090,7 @@ impl Render for Inbox {
             | self.account_arrival.is_some_and(|fade| fade.running(now))
             | conv.account_opacity.is_some()
             | link_fading
+            | conv.web.values().any(|frame| frame.progress < 1.0)
             | waiting_for_resize
             | self.note_view.running()
             | self.note_pin.running()
@@ -6418,6 +6468,7 @@ struct ListContent {
 #[derive(Default)]
 struct ConvFrame {
     account_opacity: Option<f32>,
+    web: HashMap<String, web_mail::Frame>,
     agent_note: Option<agent_notes::NoteFrame>,
     pin: Option<agent_notes::PinnedFrame>,
     note_details_only: bool,
@@ -10729,6 +10780,17 @@ fn expanded_message(
                     })),
             ),
         )
+        .children(
+            frame
+                .web
+                .get(&message.id)
+                .and_then(|frame| frame.prompt)
+                .map(|prompt| {
+                    columns
+                        .card
+                        .place(web_mail::prompt(prompt, theme, index, live.0, cx))
+                }),
+        )
         // `q` opens every collapsed block in the message at once, so only
         // the first fold of the reader's message names the key.
         .child(measured_message_body(
@@ -10961,10 +11023,64 @@ fn stored_message_body(
 ) -> gpui::AnyElement {
     let reveal = frame.disclosures().quotes.get(&message.id).copied();
     if let Rich::Html(body) = &message.rich {
-        return div()
-            .opacity(alpha)
-            .children(html_sections(theme, body, folds, reveal, markers, cx))
-            .into_any_element();
+        let Some(web) = frame
+            .web
+            .get(&message.id)
+            .filter(|web| web.image.is_some() || web.outgoing.is_some())
+        else {
+            return div()
+                .opacity(alpha)
+                .children(html_sections(theme, body, folds, reveal, markers, cx))
+                .into_any_element();
+        };
+        let web_body = |picture: &crate::render::webview::Snapshot, live| {
+            div()
+                .child(
+                    folds
+                        .columns
+                        .card
+                        .place(div().overflow_hidden().rounded_sm().child(
+                            crate::render::web_snapshot(picture, folds.columns.card.width),
+                        )),
+                )
+                .when(!body.web_links.is_empty(), |pane| {
+                    let palette = mail_body::palette(theme);
+                    pane.child(div().mt(px(7.)).child(crate::render::blocks_column_spaced(
+                        &body.web_links,
+                        &palette,
+                        false,
+                        &body.gallery,
+                        folds.columns.blocks(folds.fill).with_links(live),
+                        3.0,
+                        markers,
+                    )))
+                })
+                .into_any_element()
+        };
+        let mut layer = |picture: Option<&crate::render::webview::Snapshot>, live| {
+            if let Some(picture) = picture {
+                web_body(picture, live)
+            } else {
+                div()
+                    .children(html_sections(
+                        theme,
+                        body,
+                        FoldView { live, ..folds },
+                        reveal,
+                        markers,
+                        cx,
+                    ))
+                    .into_any_element()
+            }
+        };
+        let incoming = layer(web.image.as_ref(), folds.live);
+        let contents = if web.progress < 1.0 {
+            let outgoing = layer(web.outgoing.as_ref(), false);
+            disclosure::crossfade(folds.columns.pane_right, web.progress, [outgoing, incoming])
+        } else {
+            incoming
+        };
+        return div().opacity(alpha).child(contents).into_any_element();
     }
     let blocks: Vec<gpui::AnyElement> = match &message.rich {
         Rich::Html(_) => unreachable!(),
@@ -13256,7 +13372,9 @@ fn should_follow_visible(overlay: &Overlay, chord_empty: bool, pane: Pane, key: 
     match key {
         KeyId::Char('j' | 'k' | 'q') => true,
         // Expand, reply, reply all, and forward act on the message on screen.
-        KeyId::Enter | KeyId::Char('o' | 'r' | 'R' | 'f' | 'a') => pane == Pane::Conversation,
+        KeyId::Enter | KeyId::Char('o' | 'r' | 'R' | 'f' | 'a' | 'w' | 'i' | 'I') => {
+            pane == Pane::Conversation
+        }
         _ => false,
     }
 }

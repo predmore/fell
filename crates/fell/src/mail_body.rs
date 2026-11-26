@@ -30,9 +30,13 @@ use crate::render::{ImageGallery, Palette};
 use crate::text_render::{RenderedBody, render_stored_body};
 use crate::theme::Theme;
 
-/// One message's HTML, prepared for the native painter.
+/// One message's prepared HTML for both painters.
 pub struct HtmlBody {
     pub folded: FoldedDocument,
+    pub suggested: fell_render::RenderMode,
+    pub web: Arc<fell_render::WebMail>,
+    pub web_links: Vec<fell_render::Block>,
+    pub sender_attestation: Option<String>,
     /// Lines of text in each section, for a folded section's label.
     pub fold_lines: Vec<usize>,
     /// Each section is written right to left: its rule and fold line are
@@ -127,6 +131,9 @@ pub fn prepare_html(html: &str, headers_in: &[(String, String)]) -> HtmlBody {
         headers.add(name.as_str(), value.as_str());
     }
     let prepared = prepare(html, &headers);
+    let suggested = prepared.suggested;
+    let web = Arc::new(fell_render::WebMail::prepare(&prepared.source_html));
+    let sender_attestation = headers.get("X-Fell-Verified-Sender").map(str::to_owned);
     let folded = if headers.is_bulk() {
         FoldedDocument::unfolded(prepared.document)
     } else {
@@ -160,11 +167,61 @@ pub fn prepare_html(html: &str, headers_in: &[(String, String)]) -> HtmlBody {
         .iter()
         .map(|text| crate::render::is_right_to_left(text))
         .collect();
+    let mut web_links = Vec::new();
+    collect_web_links(&folded.document.blocks, &mut web_links);
     HtmlBody {
         folded,
+        suggested,
+        web,
+        web_links,
+        sender_attestation,
         fold_lines,
         rtl,
         gallery,
+    }
+}
+
+// Reuse native link widgets below the snapshot. The image has no hit targets
+// of its own, and no WebKit event can activate a URL.
+fn collect_web_links(blocks: &[fell_render::Block], links: &mut Vec<fell_render::Block>) {
+    use fell_render::{Block, Inline};
+
+    fn visit(inlines: &[Inline], links: &mut Vec<Block>) {
+        for inline in inlines {
+            match inline {
+                Inline::Link { href, .. } if fell_render::reader_link_target(href).is_some() => {
+                    links.push(Block::Paragraph {
+                        inlines: vec![inline.clone()],
+                    });
+                }
+                Inline::Emphasis(children)
+                | Inline::Strong(children)
+                | Inline::Strike(children) => {
+                    visit(children, links);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    for block in blocks {
+        match block {
+            Block::Paragraph { inlines } | Block::Heading { inlines, .. } => visit(inlines, links),
+            Block::Quote { blocks } | Block::Small { blocks } | Block::ReplyHeader { blocks } => {
+                collect_web_links(blocks, links);
+            }
+            Block::List { items, .. } => {
+                for item in items {
+                    collect_web_links(&item.blocks, links);
+                }
+            }
+            Block::Table { header, rows, .. } => {
+                for cell in header.iter().chain(rows.iter().flatten()) {
+                    collect_web_links(cell, links);
+                }
+            }
+            _ => {}
+        }
     }
 }
 

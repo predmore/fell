@@ -1,44 +1,85 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::Deref;
 
-/// HTML handed to WebKit. Scripts are removed, remote images are stripped
-/// until the reader allows them, and a content-security policy blocks
-/// everything else.
-pub struct WebFrame {
-    pub scheme: &'static str,
-    pub allow_remote_images: bool,
-}
-
-pub fn wrap_for_webview(source_html: &str, frame: &WebFrame) -> String {
-    let body = sanitize_html(source_html, frame.allow_remote_images);
-    let img_src = if frame.allow_remote_images {
-        "img-src data: blob: https: http:;"
-    } else {
-        "img-src data: blob:;"
-    };
+fn web_page(body: &str, scheme: &str) -> String {
     format!(
         r#"<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
 <meta name="color-scheme" content="{scheme}">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; {img_src} font-src data:; media-src 'none'; frame-src 'none'; script-src 'none'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none';">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="x-dns-prefetch-control" content="off">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data: cid:; font-src data:; media-src 'none'; frame-src 'none'; script-src 'none'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none';">
 <style>
   html, body {{ margin: 0; padding: 0; background: transparent; }}
+  table, img {{ max-width: 100%; }}
+  body {{ overflow-wrap: anywhere; }}
+  img[src=""] {{ background-color: rgba(128, 128, 128, 0.12); }}
+  img {{ object-fit: contain; }}
 </style>
 </head>
 <body>{body}</body>
 </html>"#,
-        scheme = frame.scheme,
-        img_src = img_src,
+        scheme = scheme,
         body = body,
     )
+}
+
+/// A sanitized page with slots for remote raster images. The browser only ever
+/// sees local bytes. The caller supplies a slot value after the user consents.
+#[derive(Debug)]
+pub struct WebMail {
+    body: String,
+    images: Vec<(usize, String)>,
+}
+
+impl WebMail {
+    pub fn prepare(html: &str) -> Self {
+        let dom = crate::html::parse_html(html);
+        let mut body = String::new();
+        let mut images = Vec::new();
+        serialize_children(
+            dom.root_element(),
+            &mut body,
+            false,
+            true,
+            0,
+            Some(&mut images),
+        );
+        Self { body, images }
+    }
+
+    pub fn has_remote_images(&self) -> bool {
+        !self.images.is_empty()
+    }
+
+    pub fn page(&self, scheme: &str, mut image: impl FnMut(&str) -> Option<String>) -> String {
+        let mut body = String::with_capacity(self.body.len());
+        let mut offset = 0;
+        for (at, url) in &self.images {
+            body.push_str(&self.body[offset..*at]);
+            if let Some(data) = image(url).filter(|data| data.starts_with("data:image/")) {
+                body.push_str(&escape_attr(&data));
+            }
+            offset = *at;
+        }
+        body.push_str(&self.body[offset..]);
+        web_page(&body, scheme)
+    }
 }
 
 pub fn sanitize_html(html: &str, allow_remote_images: bool) -> String {
     let dom = crate::html::parse_html(html);
     let mut out = String::new();
-    serialize_children(dom.root_element(), &mut out, allow_remote_images, true, 0);
+    serialize_children(
+        dom.root_element(),
+        &mut out,
+        allow_remote_images,
+        true,
+        0,
+        None,
+    );
     out
 }
 
@@ -48,9 +89,17 @@ fn serialize_children(
     allow_remote_images: bool,
     allow_style: bool,
     depth: u32,
+    mut images: Option<&mut Vec<(usize, String)>>,
 ) {
     for child in node.children() {
-        serialize_node(child, out, allow_remote_images, allow_style, depth + 1);
+        serialize_node(
+            child,
+            out,
+            allow_remote_images,
+            allow_style,
+            depth + 1,
+            images.as_deref_mut(),
+        );
     }
 }
 
@@ -60,6 +109,7 @@ fn serialize_node(
     allow_remote_images: bool,
     allow_style: bool,
     depth: u32,
+    mut images: Option<&mut Vec<(usize, String)>>,
 ) {
     if depth >= crate::html::MAX_HTML_DEPTH {
         out.push_str(&escape(&subtree_text(node)));
@@ -80,6 +130,7 @@ fn serialize_node(
                     allow_remote_images,
                     allow_style,
                     depth,
+                    images,
                 );
                 return;
             }
@@ -105,7 +156,14 @@ fn serialize_node(
                     "html" | "body" | "head" | "form" | "noscript" | "object"
                 ) {
                     for child in node.children() {
-                        serialize_node(child, out, allow_remote_images, allow_style, depth + 1);
+                        serialize_node(
+                            child,
+                            out,
+                            allow_remote_images,
+                            allow_style,
+                            depth + 1,
+                            images.as_deref_mut(),
+                        );
                     }
                 }
                 return;
@@ -121,15 +179,44 @@ fn serialize_node(
                         _ => None,
                     })
                     .collect::<String>();
-                let css = sanitize_css(&css, allow_remote_images);
                 out.push_str("<style>");
-                out.push_str(&escape_style(&css));
+                if let Some(slots) = images.as_deref_mut() {
+                    serialize_css(&css, out, slots, escape_style);
+                } else {
+                    out.push_str(&escape_style(&sanitize_css(&css, allow_remote_images)));
+                }
                 out.push_str("</style>");
                 return;
             }
             out.push('<');
             out.push_str(name);
             for (attr, value) in element.attrs() {
+                // Only image attributes and image-valued CSS declarations
+                // may enter the fetch list.
+                if let Some(slots) = images.as_deref_mut() {
+                    if (attr == "src" && name == "img"
+                        || attr == "background" && matches!(name, "table" | "tr" | "td" | "th"))
+                        && let Some(url) = remote_image_url(value)
+                    {
+                        if slots.len() < 48 {
+                            out.push(' ');
+                            out.push_str(attr);
+                            out.push_str("=\"");
+                            slots.push((out.len(), url));
+                            out.push('"');
+                        }
+                        continue;
+                    }
+                    if attr == "style" {
+                        out.push_str(" style=\"");
+                        serialize_css(value, out, slots, escape_attr);
+                        out.push('"');
+                        continue;
+                    }
+                    if matches!(attr, "ping" | "attributionsrc") {
+                        continue;
+                    }
+                }
                 if !keep_attr(name, attr, value, allow_remote_images) {
                     continue;
                 }
@@ -144,7 +231,14 @@ fn serialize_node(
             if !VOID.contains(&name) {
                 let child_style = allow_style && name != "svg" && name != "math";
                 for child in node.children() {
-                    serialize_node(child, out, allow_remote_images, child_style, depth + 1);
+                    serialize_node(
+                        child,
+                        out,
+                        allow_remote_images,
+                        child_style,
+                        depth + 1,
+                        images.as_deref_mut(),
+                    );
                 }
                 out.push_str("</");
                 out.push_str(name);
@@ -217,6 +311,23 @@ fn image_attr_is_remote(tag: &str, name: &str, value: &str) -> bool {
 
 fn srcset_is_remote(value: &str) -> bool {
     value.split(',').any(is_remote_url)
+}
+
+fn remote_image_url(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.len() > 4096 {
+        return None;
+    }
+    let url = if value.starts_with("//") {
+        url::Url::parse(&format!("https:{value}")).ok()?
+    } else {
+        url::Url::parse(value).ok()?
+    };
+    (matches!(url.scheme(), "http" | "https")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && !targets_private_network(url.as_str()))
+    .then(|| url.into())
 }
 
 fn is_remote_url(value: &str) -> bool {
@@ -390,6 +501,50 @@ fn sanitize_css(css: &str, allow_remote_images: bool) -> String {
     strip_css_urls(&without_import, allow_remote_images)
 }
 
+fn serialize_css(
+    css: &str,
+    out: &mut String,
+    images: &mut Vec<(usize, String)>,
+    escape: impl Fn(&str) -> String,
+) {
+    let css = strip_css_imports(&decode_css_escapes(css), false);
+    let lower = css.to_ascii_lowercase();
+    let mut from = 0;
+    let mut search = 0;
+    while let Some(relative) = lower[search..].find("url(") {
+        let start = search + relative;
+        let url_start = start + 4;
+        let Some(end) = css[url_start..].find(')').map(|i| i + url_start) else {
+            break;
+        };
+        search = end + 1;
+        let property = lower[..start]
+            .rsplit([';', '{', '}'])
+            .next()
+            .unwrap_or_default();
+        let name = property.split_once(':').map(|(name, _)| name.trim());
+        if !matches!(
+            name,
+            Some("background" | "background-image" | "border-image" | "list-style-image")
+        ) {
+            continue;
+        }
+        let value = css[url_start..end].trim().trim_matches(['"', '\'']);
+        let Some(url) = remote_image_url(value) else {
+            continue;
+        };
+        if images.len() >= 48 {
+            break;
+        }
+        out.push_str(&escape(&strip_css_urls(&css[from..start], false)));
+        out.push_str(&escape("url(\""));
+        images.push((out.len(), url));
+        out.push_str(&escape("\")"));
+        from = end + 1;
+    }
+    out.push_str(&escape(&strip_css_urls(&css[from..], false)));
+}
+
 fn strip_css_imports(css: &str, allow_remote_images: bool) -> String {
     let mut out = String::with_capacity(css.len());
     let mut rest = css;
@@ -485,18 +640,7 @@ fn resource_is_disallowed(value: &str, allow_remote_images: bool) -> bool {
     !allow_remote_images && is_remote_url(value)
 }
 
-/// Whether WebKit should be refused this request.
-///
-/// The host is the one in the parsed URL. A hostname is refused when any
-/// resolved address, or a failure to resolve, is loopback, link-local,
-/// private, unique-local, or unspecified. The same check applies to the
-/// request that follows a redirect.
-pub fn request_is_blocked(uri: &str) -> bool {
-    request_is_blocked_with(uri, resolve_host)
-}
-
-/// [`request_is_blocked`] with a caller-supplied resolver, so tests do not
-/// use the network.
+#[cfg(test)]
 pub fn request_is_blocked_with(uri: &str, resolve: impl Fn(&str) -> Vec<IpAddr>) -> bool {
     let Ok(url) = url::Url::parse(uri) else {
         return false;
@@ -509,18 +653,10 @@ pub fn request_is_blocked_with(uri: &str, resolve: impl Fn(&str) -> Vec<IpAddr>)
         Some(url::Host::Ipv6(ip)) => ipv6_is_blocked(ip),
         Some(url::Host::Domain(name)) => {
             let addresses = resolve(name);
-            addresses.is_empty() || addresses.into_iter().any(ip_is_blocked)
+            addresses.is_empty() || addresses.into_iter().any(address_is_blocked)
         }
         None => false,
     }
-}
-
-fn resolve_host(host: &str) -> Vec<IpAddr> {
-    use std::net::ToSocketAddrs;
-    (host, 0)
-        .to_socket_addrs()
-        .map(|addrs| addrs.map(|addr| addr.ip()).collect())
-        .unwrap_or_default()
 }
 
 pub fn address_is_blocked(ip: IpAddr) -> bool {
@@ -528,10 +664,6 @@ pub fn address_is_blocked(ip: IpAddr) -> bool {
         IpAddr::V4(ip) => ipv4_is_blocked(ip),
         IpAddr::V6(ip) => ipv6_is_blocked(ip),
     }
-}
-
-fn ip_is_blocked(ip: IpAddr) -> bool {
-    address_is_blocked(ip)
 }
 
 fn ipv4_is_blocked(ip: Ipv4Addr) -> bool {
@@ -810,13 +942,7 @@ mod tests {
         assert!(!clean.contains("javascript:"));
         assert!(clean.contains("data:image/png"));
         assert!(clean.contains("hero"));
-        let wrapped = wrap_for_webview(
-            html,
-            &WebFrame {
-                scheme: "dark",
-                allow_remote_images: false,
-            },
-        );
+        let wrapped = WebMail::prepare(html).page("dark", |_| None);
         assert!(wrapped.contains("script-src 'none'"));
         assert!(!wrapped.contains("fell-chrome"));
         assert!(!wrapped.contains("<title>"));
@@ -840,6 +966,37 @@ mod tests {
         assert!(!fallback.contains("<iframe"), "{fallback}");
         assert!(!fallback.contains("<object"), "{fallback}");
         assert!(!fallback.contains("example.com"), "{fallback}");
+    }
+
+    #[test]
+    fn only_image_locations_enter_the_explicit_fetch_path() {
+        let mail = WebMail::prepare(
+            r#"
+           <style>@import url(https://example.test/style);
+             @font-face { font-family: test; src: url(https://example.test/font); }
+             p { background: url(https://example.test/background); }</style>
+           <link rel=prefetch href=https://example.test/prefetch>
+           <p><img src=https://example.test/hero><a href=https://example.test/link>Link</a></p>
+        "#,
+        );
+        assert!(mail.has_remote_images());
+        let blocked = mail.page("light", |_| None);
+        assert!(!blocked.contains("example.test/hero"));
+        assert!(!blocked.contains("example.test/background"));
+        let mut urls = Vec::new();
+        let allowed = mail.page("light", |url| {
+            urls.push(url.to_owned());
+            Some("data:image/png;base64,AAAA".into())
+        });
+        assert_eq!(
+            urls,
+            [
+                "https://example.test/background",
+                "https://example.test/hero"
+            ]
+        );
+        assert_eq!(allowed.matches("data:image/png").count(), 2);
+        assert!(allowed.contains("img-src data: cid:"));
     }
 
     #[test]

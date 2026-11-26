@@ -308,6 +308,7 @@ pub(super) fn fetched_message(
     uidvalidity: u32,
     item: &session::Fetched,
     bridge: bool,
+    trusted: bool,
 ) -> FetchedMessage {
     let mut message = parse_message(
         account_id,
@@ -317,6 +318,12 @@ pub(super) fn fetched_message(
         &item.body,
         bridge,
     );
+    if trusted
+        && let Some(parts) = &mut message.parts
+        && let Some(parsed) = MessageParser::new().parse(&item.body)
+    {
+        keep_sender_attestation(&parsed, parts);
+    }
     let latest = crate::latest_mail_date();
     let header = message.headers.date_unix;
     let arrival = item.internal_date;
@@ -475,7 +482,7 @@ pub(super) fn headers_message(
     item: &session::Fetched,
     bridge: bool,
 ) -> FetchedMessage {
-    let mut fetched = fetched_message(account_id, mailbox, uidvalidity, item, bridge);
+    let mut fetched = fetched_message(account_id, mailbox, uidvalidity, item, bridge, false);
     let message = &mut fetched.message;
     message.snippet.clear();
     message.body_text = None;
@@ -532,6 +539,39 @@ pub(crate) fn parts_from_raw(raw: &[u8]) -> MessageParts {
         .as_ref()
         .map(body_parts)
         .unwrap_or_default()
+}
+
+pub(crate) fn parts_from_trusted_raw(raw: &[u8]) -> MessageParts {
+    let Some(message) = MessageParser::new().parse(raw) else {
+        return MessageParts::default();
+    };
+    let mut parts = body_parts(&message);
+    keep_sender_attestation(&message, &mut parts);
+    parts
+}
+
+fn keep_sender_attestation(message: &mail_parser::Message<'_>, parts: &mut MessageParts) {
+    let attestation = "X-Fell-Verified-Sender";
+    let mut headers = message
+        .headers()
+        .iter()
+        .filter(|h| h.raw_name().eq_ignore_ascii_case(attestation));
+    if let Some(first) = headers.next()
+        && headers.next().is_none()
+        && message
+            .headers()
+            .iter()
+            .filter(|h| h.raw_name().eq_ignore_ascii_case("from"))
+            .count()
+            == 1
+        && message.from().is_some_and(|from| from.iter().count() == 1)
+        && let Ok(value) = std::str::from_utf8(first.raw_value())
+        && value.trim().len() <= 254
+    {
+        parts
+            .bulk_headers
+            .push((attestation.into(), value.trim().into()));
+    }
 }
 
 /// The HTML and plain-text body parts as sent, and the bulk-mail headers.
@@ -1094,6 +1134,36 @@ mod tests {
             Some("-- \nStudio footer\n")
         );
         assert!(untouched.body.ends_with("-- \nStudio footer\n"));
+    }
+
+    #[test]
+    fn sender_attestation_is_kept_only_from_a_trusted_delivery_with_one_from() {
+        let mail = |headers: &str| {
+            format!(
+                "From: verified@example.test\r\n{headers}Content-Type: text/html\r\n\r\n<p>Message</p>"
+            )
+        };
+        let header = "X-Fell-Verified-Sender: verified@example.test\r\n";
+        let supplied = mail(header);
+        assert!(parts_from_raw(supplied.as_bytes()).bulk_headers.is_empty());
+        let parts = parts_from_trusted_raw(supplied.as_bytes());
+        assert_eq!(
+            parts.bulk_headers,
+            [(
+                "X-Fell-Verified-Sender".into(),
+                "verified@example.test".into()
+            )]
+        );
+        for headers in [
+            format!("{header}{header}"),
+            format!("{header}From: forgery@example.test\r\n"),
+        ] {
+            assert!(
+                parts_from_trusted_raw(mail(&headers).as_bytes())
+                    .bulk_headers
+                    .is_empty()
+            );
+        }
     }
 
     #[test]

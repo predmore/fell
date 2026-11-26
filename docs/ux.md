@@ -50,7 +50,8 @@ Decided with Jon on 2026-11-16. This is the bar the UX judges score against (eve
 - A dimmed “joined by subject” marker appears on replies whose subject and participants supplied the link. Help explains the marker. `Space c s` splits at the focused message and takes its replies along. `Space c m` opens a conversation picker for the current thread or the `x` or `V` selection. `u` undoes either edit.
 - Messages stacked oldest to newest; read messages collapsed to one line (sender, snippet, date), unread and the latest expanded.
 - Quoted history and signatures collapsed by default with a key to expand.
-- Native styled text by default; a key toggles to the web view for complex HTML; remote images blocked with a one-line, per-sender allow prompt.
+- Native styled text by default. A bulk message with a complex layout opens in the web view. In the conversation, `w` switches the focused message between native and web and remembers the choice for its sender.
+- Remote images start blocked. `i` loads them for the focused message. `I` grants permission for a verified sender, and `Space t B` revokes it. The actions are also in the palette and under `Space t`.
 - `Tab` opens the reader on the selected conversation and focuses a link. `Tab` and `Shift-Tab` move through links in order and scroll to them. A link with a different label shows its destination in the status bar on hover or focus. Click, press `Enter`, or press `o` to open a focused link. `y` copies its destination.
 - `j`/`k` move between messages when the conversation has focus; `Ctrl-d`/`Ctrl-u` page (Space is the leader).
 - Attachments wrap beneath each expanded message. `a` focuses its files, `h`/`l` move between them, and `Esc` returns to the message. `Enter` or `o` opens the focused file in the desktop's default app. `S` saves it to Downloads, and `Space a s` saves all files on the current message. `Space a R` retries a failed attachment action.

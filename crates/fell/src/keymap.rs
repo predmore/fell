@@ -84,6 +84,10 @@ pub enum Action {
     Visual,
     FullWidth,
     ToggleQuotes,
+    ToggleWebView,
+    AllowMessageImages,
+    AllowSenderImages,
+    BlockSenderImages,
     Palette,
     Help,
     About,
@@ -162,6 +166,10 @@ impl Action {
             Self::ToggleSelect => "Toggle select",
             Self::Visual => "Visual select",
             Self::FullWidth => "Full-width conversation",
+            Self::ToggleWebView => "Toggle web view",
+            Self::AllowMessageImages => "Allow images for this message",
+            Self::AllowSenderImages => "Always allow images from this sender",
+            Self::BlockSenderImages => "Revoke image permission for this sender",
             Self::ToggleQuotes => "Quoted text and recipients",
             Self::Palette => "Command palette",
             Self::Help => "Help",
@@ -226,6 +234,10 @@ pub const ACTION_SECTIONS: &[(&str, &[Action])] = &[
             Action::PageUp,
             Action::FullWidth,
             Action::ToggleQuotes,
+            Action::ToggleWebView,
+            Action::AllowMessageImages,
+            Action::AllowSenderImages,
+            Action::BlockSenderImages,
             Action::FocusLinks,
         ],
     ),
@@ -583,6 +595,21 @@ fn default_bindings() -> Vec<Binding> {
             &[KeyId::Leader, KeyId::Char('a'), KeyId::Char(key)],
             action,
             Some("Agents"),
+        );
+    }
+    for (key, action) in [
+        ('w', Action::ToggleWebView),
+        ('i', Action::AllowMessageImages),
+        ('I', Action::AllowSenderImages),
+        ('B', Action::BlockSenderImages),
+    ] {
+        if action != Action::BlockSenderImages {
+            bind(&[KeyId::Char(key)], action, None);
+        }
+        bind(
+            &[KeyId::Leader, KeyId::Char('t'), KeyId::Char(key)],
+            action,
+            Some("Reading / notifications"),
         );
     }
     bind(

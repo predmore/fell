@@ -501,10 +501,11 @@ impl ReaderBodyFetcher {
             .filter_map(|(request, state)| (state != BodyState::TooLarge).then_some(request))
             .collect();
         while !wanted.is_empty() {
-            let mut fetched = collect_bodies(&wanted, |copies| {
-                self.connection
-                    .bodies(|| config.imap_config(), cancel, copies)
-            })?;
+            let mut fetched =
+                collect_bodies(&wanted, config.trust_verified_sender_header, |copies| {
+                    self.connection
+                        .bodies(|| config.imap_config(), cancel, copies)
+                })?;
             if cancel.is_cancelled() {
                 return Err(crate::imap::body_fetch_cancelled());
             }
@@ -605,13 +606,14 @@ fn fetch_bodies(
     store: &Store,
     wanted: &[BodyRequest],
 ) -> Result<usize> {
-    let results = collect_bodies(wanted, |copies| backend.fetch_bodies(copies))?;
+    let results = collect_bodies(wanted, false, |copies| backend.fetch_bodies(copies))?;
     store.store_fetched_parts(account_id, &results)?;
     Ok(results.len())
 }
 
 fn collect_bodies(
     wanted: &[BodyRequest],
+    trusted: bool,
     mut fetch: impl FnMut(&[RemoteId]) -> Result<Vec<crate::backend::FetchedBody>>,
 ) -> Result<Vec<(MessageId, Option<MessageParts>)>> {
     let mut results: Vec<(MessageId, Option<MessageParts>)> = Vec::new();
@@ -640,7 +642,11 @@ fn collect_bodies(
                 // Parsed one at a time, so each source is dropped once read.
                 Some(Some(raw)) => results.push((
                     request.message_id.clone(),
-                    Some(crate::imap::parts_from_raw(&raw)),
+                    Some(if trusted {
+                        crate::imap::parts_from_trusted_raw(&raw)
+                    } else {
+                        crate::imap::parts_from_raw(&raw)
+                    }),
                 )),
                 Some(None) if round + 1 < request.copies.len() => next.push(request),
                 Some(None) => results.push((request.message_id.clone(), None)),

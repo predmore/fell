@@ -1,17 +1,15 @@
-//! Message body for the inbox to embed.
-//!
-//! This module paints one message. It does not own the thread list, the
-//! keymap, or the command palette. The preview window below is only so the
-//! renderer can be seen before that shell lands; its `w` / `t` / `i` keys
-//! are local to the preview.
+//! Native message painting, the offscreen WebKit worker, and the fixture
+//! preview. The inbox owns received-mail preferences and the keymap.
 
 mod body;
 mod native;
 #[cfg(target_os = "linux")]
 mod proxy;
+#[cfg(target_os = "linux")]
+pub(crate) mod remote_images;
 mod theme;
 #[cfg(target_os = "linux")]
-mod webview;
+pub(crate) mod webview;
 
 pub use body::{BodyModel, MessageBody, prepare_stored, round_trip_body};
 pub use native::{
@@ -24,14 +22,10 @@ pub use theme::{Palette, ThemeKind};
 
 use std::sync::Arc;
 
-use fell_render::{RenderMode, WebFrame, fixture, prepare, wrap_for_webview};
-use gpui::{
-    Context, FocusHandle, KeyDownEvent, Render, RenderImage, SharedString, Window, div, prelude::*,
-    px,
-};
+use fell_render::{RenderMode, WebMail, fixture, prepare};
+use gpui::{Context, FocusHandle, KeyDownEvent, Render, SharedString, Window, div, prelude::*, px};
 
 use body::BodyModel as Model;
-use native::{decode_image, edge_color};
 use theme::{ThemeKind as Theme, paint};
 
 pub struct Reader {
@@ -42,17 +36,11 @@ pub struct Reader {
     date_line: SharedString,
     model: Model,
     theme: Theme,
-    web_open: bool,
-    /// Wrapped HTML is rebuilt only when one of these three inputs changes.
-    web_source: String,
-    web_scheme: &'static str,
-    web_images: bool,
-    web_token: u64,
-    web_image: Option<Arc<RenderImage>>,
-    /// Page color of the snapshot, so the pane below it is not window color.
-    web_page: u32,
-    web_generation: u64,
-    web_settled: bool,
+    web_mail: Arc<WebMail>,
+    web_key: Option<(i32, &'static str, bool)>,
+    web_image: Option<webview::Snapshot>,
+    web_job: Option<gpui::Task<()>>,
+    web_allowed: Arc<std::sync::atomic::AtomicBool>,
     web_failed: bool,
     gallery: ImageGallery,
     _release: gpui::Subscription,
@@ -68,11 +56,15 @@ pub struct Opened {
 
 impl Reader {
     pub fn new(opened: Opened, cx: &mut Context<Self>) -> Self {
+        webview::prewarm();
         let gallery = ImageGallery::from_document(opened.model.document());
+        let web_mail = Arc::new(WebMail::prepare(opened.model.source_html()));
         let release = cx.on_release(|this, app| {
+            this.web_allowed
+                .store(false, std::sync::atomic::Ordering::Release);
             this.gallery.release(app);
             if let Some(image) = this.web_image.take() {
-                app.drop_image(image, None);
+                app.drop_image(image.image, None);
             }
         });
         Self {
@@ -83,131 +75,69 @@ impl Reader {
             date_line: opened.date_line,
             model: opened.model,
             theme: opened.theme,
-            web_open: false,
-            web_source: String::new(),
-            web_scheme: "",
-            web_images: false,
-            web_token: 0,
+            web_mail,
+            web_key: None,
             web_image: None,
-            web_page: 0,
-            web_generation: 0,
-            web_settled: false,
+            web_job: None,
+            web_allowed: Default::default(),
             web_failed: false,
             gallery,
             _release: release,
         }
     }
 
-    fn clear_web_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(image) = self.web_image.take() {
-            cx.drop_image(image, Some(window));
-        }
-    }
-
     fn sync_web(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        #[cfg(not(target_os = "linux"))]
-        {
+        use std::sync::atomic::Ordering;
+        let web = self.model.mode() == RenderMode::Web;
+        let width = f32::from(window.viewport_size().width)
+            .round()
+            .clamp(1., 1600.) as i32;
+        let palette = self.theme.palette();
+        let allowed = self.model.remote_images_allowed();
+        let key = web.then_some((width, palette.scheme(), allowed));
+        if self.web_key == key {
             return;
         }
-        #[cfg(target_os = "linux")]
-        {
-            if self.model.mode() != RenderMode::Web {
-                if self.web_open {
-                    webview::hide();
-                    self.web_open = false;
-                    self.web_source.clear();
-                    self.web_scheme = "";
-                    self.web_images = false;
-                    self.clear_web_image(window, cx);
-                    self.web_page = 0;
-                    self.web_generation = 0;
-                    self.web_settled = false;
-                    self.web_failed = false;
-                }
-                return;
-            }
-            let palette = self.theme.palette();
-            let scheme = palette.scheme();
-            let allow_images = self.model.remote_images_allowed();
-            let unchanged = web_frame_is_current(
-                self.web_open,
-                &self.web_source,
-                self.model.source_html(),
-                self.web_scheme,
-                scheme,
-                self.web_images,
-                allow_images,
-            );
-            if unchanged {
-                self.poll_web_frame(window, cx);
-                return;
-            }
-            let source = self.model.source_html().to_string();
-            let html = wrap_for_webview(
-                &source,
-                &WebFrame {
-                    scheme,
-                    allow_remote_images: allow_images,
-                },
-            );
-            self.web_token = self.web_token.wrapping_add(1);
-            self.clear_web_image(window, cx);
-            self.web_page = 0;
-            self.web_generation = 0;
-            self.web_settled = false;
-            self.web_failed = false;
-            webview::ensure_started();
-            webview::show(webview::WebRequest {
+        self.web_key = key;
+        self.web_job = None;
+        self.web_allowed.store(false, Ordering::Release);
+        if let Some(old) = self.web_image.take() {
+            cx.drop_image(old.image, Some(window));
+        }
+        self.web_failed = false;
+        let Some((width, scheme, allowed)) = key else {
+            return;
+        };
+        self.web_allowed = Arc::new(std::sync::atomic::AtomicBool::new(allowed));
+        let permission = Arc::clone(&self.web_allowed);
+        let mail = Arc::clone(&self.web_mail);
+        self.web_job = Some(cx.spawn(async move |this, cx| {
+            let html = cx
+                .background_spawn(async move {
+                    if allowed {
+                        remote_images::inline_page(&mail, scheme, || {
+                            permission.load(Ordering::Acquire)
+                        })
+                        .0
+                    } else {
+                        mail.page(scheme, |_| None)
+                    }
+                })
+                .await;
+            let image = webview::render(webview::WebRequest {
                 html,
-                token: self.web_token,
-                background: channels(palette.background),
-                allow_images,
+                width,
+                background: palette.background,
+                settle_images: allowed,
+            })
+            .await;
+            let _ = this.update(cx, |reader, cx| {
+                reader.web_failed = image.is_none();
+                reader.web_image = image;
+                cx.notify();
             });
-            self.web_source = source;
-            self.web_scheme = scheme;
-            self.web_images = allow_images;
-            self.web_open = true;
-        }
+        }));
     }
-
-    #[cfg(target_os = "linux")]
-    fn poll_web_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.web_failed || self.web_settled {
-            return;
-        }
-        let seen = self.web_image.is_some().then_some(self.web_generation);
-        match webview::status_for(self.web_token, seen) {
-            webview::WebStatus::Ready {
-                png,
-                generation,
-                settled,
-            } => match decode_image(&png) {
-                Some(image) => {
-                    self.clear_web_image(window, cx);
-                    self.web_page = edge_color(&png).unwrap_or(0);
-                    self.web_image = Some(image);
-                    self.web_generation = generation;
-                    self.web_settled = settled;
-                }
-                None => self.web_failed = true,
-            },
-            webview::WebStatus::Unchanged { settled } => self.web_settled = settled,
-            webview::WebStatus::Failed => self.web_failed = true,
-            webview::WebStatus::Pending => {}
-        }
-    }
-}
-
-fn web_frame_is_current(
-    open: bool,
-    cached_source: &str,
-    source: &str,
-    cached_scheme: &str,
-    scheme: &str,
-    cached_images: bool,
-    allow_images: bool,
-) -> bool {
-    open && cached_source == source && cached_scheme == scheme && cached_images == allow_images
 }
 
 fn display_address(addr: &fell_core::Address) -> String {
@@ -313,9 +243,6 @@ impl Render for Reader {
                 .detach();
         }
         self.sync_web(window, cx);
-        if self.model.mode() == RenderMode::Web && !self.web_failed && !self.web_settled {
-            window.request_animation_frame();
-        }
         let palette = self.theme.palette();
         let web = self.model.mode() == RenderMode::Web;
         let edge = banner_edge(self.theme, web, palette.border);
@@ -472,19 +399,15 @@ fn message_body(
         .flex_1()
         .min_h(px(0.))
         .overflow_y_scroll();
-    if web {
-        let page = if reader.web_page == 0 {
-            palette.background
-        } else {
-            reader.web_page
-        };
-        body = body.bg(paint(page));
-    } else {
+    if !web {
         body = body.p(px(NATIVE_BODY_PAD_PX));
     }
     if web {
         if let Some(image) = reader.web_image.clone() {
-            body.child(native::embedded_web(image))
+            body.child(web_snapshot(
+                &image,
+                f32::from(window.viewport_size().width),
+            ))
         } else if reader.web_failed {
             body.child(
                 div()
@@ -528,17 +451,19 @@ fn banner_edge(theme: Theme, web: bool, border: u32) -> u32 {
     }
 }
 
-fn channels(hex: u32) -> (u8, u8, u8) {
-    (
-        ((hex >> 16) & 0xff) as u8,
-        ((hex >> 8) & 0xff) as u8,
-        (hex & 0xff) as u8,
+pub(crate) fn web_snapshot(snapshot: &webview::Snapshot, width: f32) -> gpui::Div {
+    let height = snapshot.height * width / snapshot.width;
+    div().w(px(width)).h(px(height)).child(
+        gpui::img(snapshot.image.clone())
+            .w(px(width))
+            .h(px(height))
+            .object_fit(gpui::ObjectFit::Fill),
     )
 }
 
 #[cfg(test)]
-mod cache_tests {
-    use super::{Theme, banner_edge, web_frame_is_current};
+mod tests {
+    use super::{Theme, banner_edge};
 
     #[test]
     fn dark_newsletter_edge_is_darker_than_the_banner() {
@@ -549,24 +474,5 @@ mod cache_tests {
         assert_eq!(banner_edge(Theme::Dark, false, dark.border), dark.border);
         let light = Theme::Light.palette();
         assert_eq!(banner_edge(Theme::Light, true, light.border), light.border);
-    }
-
-    #[test]
-    fn web_html_is_rebuilt_only_when_inputs_change() {
-        assert!(web_frame_is_current(
-            true, "<p>a</p>", "<p>a</p>", "dark", "dark", false, false
-        ));
-        assert!(!web_frame_is_current(
-            false, "<p>a</p>", "<p>a</p>", "dark", "dark", false, false
-        ));
-        assert!(!web_frame_is_current(
-            true, "<p>a</p>", "<p>b</p>", "dark", "dark", false, false
-        ));
-        assert!(!web_frame_is_current(
-            true, "<p>a</p>", "<p>a</p>", "dark", "light", false, false
-        ));
-        assert!(!web_frame_is_current(
-            true, "<p>a</p>", "<p>a</p>", "dark", "dark", false, true
-        ));
     }
 }

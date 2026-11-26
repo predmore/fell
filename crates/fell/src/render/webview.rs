@@ -1,634 +1,332 @@
-//! WebKitGTK via wry, painted into the conversation.
-//!
-//! wry 0.57 can child-embed only into an Xlib window, and GPUI on Wayland
-//! does not provide one. The newsletter is laid out in a GTK offscreen
-//! window, which Wayland does not map, then snapshotted with JavaScript
-//! still disabled and drawn in the message body. The snapshot waits until
-//! the document and its images have finished; a load that never finishes
-//! becomes a terminal failure instead of an endless poll. There is no title
-//! bar and no second copy of the subject. The library stays dynamically linked.
+//! One reusable WebKitGTK view on a GTK thread. Mail is snapshotted offscreen
+//! so GPUI can keep its own focus, scrolling, and link activation.
 
-use std::cell::Cell;
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use futures::channel::oneshot;
+use gpui::RenderImage;
+use gtk::glib;
 use gtk::prelude::*;
-use wry::WebViewBuilderExtUnix;
-use wry::WebViewExtUnix;
+use webkit2gtk::{PolicyDecisionExt, SettingsExt, WebViewExt};
+use wry::{WebViewBuilderExtUnix, WebViewExtUnix};
 
 #[derive(Clone)]
-pub struct WebRequest {
+pub(crate) struct Snapshot {
+    pub image: Arc<RenderImage>,
+    pub width: f32,
+    pub height: f32,
+}
+
+pub(crate) struct WebRequest {
     pub html: String,
-    pub token: u64,
-    pub background: (u8, u8, u8),
-    pub allow_images: bool,
+    pub width: i32,
+    pub background: u32,
+    pub settle_images: bool,
 }
 
-enum Cmd {
-    Show(WebRequest),
-    Hide,
+struct Job {
+    request: WebRequest,
+    reply: oneshot::Sender<Snapshot>,
 }
 
-struct Host {
-    window: gtk::OffscreenWindow,
-    webview: wry::WebView,
-    token: Cell<u64>,
-    /// Bumped on every load. A snapshot callback from the previous load
-    /// no longer matches.
-    capture: Cell<u64>,
-    /// Bumped whenever a snapshot is scheduled or abandoned, so a picture
-    /// taken while images were still loading cannot be stored.
-    shot: Cell<u64>,
-    progress: Cell<LoadProgress>,
-    pending: RefCell<Option<gtk::glib::SourceId>>,
-    fail_safe: RefCell<Option<gtk::glib::SourceId>>,
+struct Load {
+    reply: oneshot::Sender<Snapshot>,
+    cancel: gtk::gio::Cancellable,
+    settle_images: bool,
 }
 
-thread_local! {
-    static HOST: RefCell<Option<Host>> = const { RefCell::new(None) };
+type Active = Rc<RefCell<Option<Load>>>;
+
+#[allow(deprecated)]
+fn worker() -> Option<&'static glib::Sender<Job>> {
+    static WORKER: OnceLock<Option<glib::Sender<Job>>> = OnceLock::new();
+    WORKER
+        .get_or_init(|| {
+            let (tx, rx) = glib::MainContext::channel(glib::Priority::DEFAULT);
+            std::thread::Builder::new()
+                .name("fell-webview".into())
+                .spawn(move || {
+                    if let Err(error) = run(rx) {
+                        #[cfg(test)]
+                        eprintln!("WebKit initialization: {error}");
+                        fell_core::diagnostic!(
+                            WARN,
+                            "Could not initialize the mail web view",
+                            error = &*error
+                        );
+                    }
+                })
+                .ok()?;
+            Some(tx)
+        })
+        .as_ref()
 }
 
-struct StoredPng {
-    bytes: Arc<[u8]>,
-    generation: u64,
-    settled: bool,
+pub(crate) fn prewarm() {
+    worker();
 }
 
-enum StoredFrame {
-    Png(StoredPng),
-    Failed,
-}
-
-static FRAME: Mutex<Option<(u64, StoredFrame)>> = Mutex::new(None);
-
-pub enum WebStatus {
-    Pending,
-    Ready {
-        png: Arc<[u8]>,
-        generation: u64,
-        settled: bool,
-    },
-    /// The reader already holds this generation, so the PNG is not cloned.
-    Unchanged {
-        settled: bool,
-    },
-    Failed,
-}
-
-pub fn show(request: WebRequest) {
-    match boot() {
-        WebTransport::Live(tx) => {
-            let token = request.token;
-            if tx.send(Cmd::Show(request)).is_err() {
-                publish_failed(token);
-            }
-        }
-        WebTransport::Failed => publish_failed(request.token),
+pub(crate) async fn render(request: WebRequest) -> Option<Snapshot> {
+    let (reply, done) = oneshot::channel();
+    worker()?.send(Job { request, reply }).ok()?;
+    // The worker can fail during setup, before GLib attaches its receiver.
+    // Bound the wait even when GLib keeps an already queued request alive.
+    let timeout = async_io::Timer::after(Duration::from_secs(6));
+    match futures::future::select(done, timeout).await {
+        futures::future::Either::Left((result, _)) => result.ok(),
+        futures::future::Either::Right(_) => None,
     }
 }
 
-pub fn hide() {
-    if let WebTransport::Live(tx) = boot() {
-        let _ = tx.send(Cmd::Hide);
-    }
-}
-
-/// Latest full-document PNG for `token`, or a terminal failure.
-///
-/// `Pending` means the load is still settling. The reader polls this on its
-/// own; it does not rebuild the HTML to find out. Pass the generation already
-/// on screen so an unchanged frame is not cloned.
-pub fn status_for(token: u64, seen_generation: Option<u64>) -> WebStatus {
-    let Ok(slot) = FRAME.lock() else {
-        return WebStatus::Pending;
-    };
-    match slot.as_ref() {
-        Some((got, StoredFrame::Png(png))) if *got == token => {
-            if seen_generation == Some(png.generation) {
-                WebStatus::Unchanged {
-                    settled: png.settled,
-                }
-            } else {
-                WebStatus::Ready {
-                    png: Arc::clone(&png.bytes),
-                    generation: png.generation,
-                    settled: png.settled,
-                }
-            }
-        }
-        Some((got, StoredFrame::Failed)) if *got == token => WebStatus::Failed,
-        _ => WebStatus::Pending,
-    }
-}
-
-enum WebTransport {
-    Live(gtk::glib::Sender<Cmd>),
-    Failed,
-}
-
-static SENDER: OnceLock<WebTransport> = OnceLock::new();
-
-fn boot() -> &'static WebTransport {
-    SENDER.get_or_init(|| {
-        let (ready_tx, ready_rx) = mpsc::channel();
-        if std::thread::Builder::new()
-            .name("fell-webview".into())
-            .spawn(move || gtk_thread(ready_tx))
-            .is_err()
-        {
-            return WebTransport::Failed;
-        }
-        // gtk::init failure returns without sending, which closes this channel.
-        // That is a failed web view, not a panic on the message window.
-        match ready_rx.recv() {
-            Ok(tx) => WebTransport::Live(tx),
-            Err(_) => WebTransport::Failed,
-        }
-    })
-}
-
-fn publish_failed(token: u64) {
-    if let Ok(mut frame) = FRAME.lock() {
-        *frame = Some((token, StoredFrame::Failed));
-    }
-}
-
-fn gtk_thread(ready: mpsc::Sender<gtk::glib::Sender<Cmd>>) {
-    if let Err(err) = gtk::init() {
-        fell_core::diagnostic!(
-            WARN,
-            "Could not initialize GTK for HTML mail",
-            error = &err as &dyn std::error::Error
-        );
-        return;
-    }
-    #[allow(deprecated)]
-    let (tx, rx) = gtk::glib::MainContext::channel(gtk::glib::Priority::DEFAULT);
-    if ready.send(tx).is_err() {
-        return;
-    }
-    // The returned id removes its source when dropped. It has to outlive
-    // gtk::main, or Show and Hide are never delivered.
-    let _source = rx.attach(None, |cmd| {
-        match cmd {
-            Cmd::Show(request) => present(request),
-            Cmd::Hide => HOST.with(|slot| {
-                if let Some(host) = slot.borrow().as_ref() {
-                    cancel_source(&host.pending);
-                    cancel_source(&host.fail_safe);
-                    host.capture.set(host.capture.get().wrapping_add(1));
-                    host.shot.set(host.shot.get().wrapping_add(1));
-                    let widget = host.webview.webview();
-                    webkit2gtk::WebViewExt::stop_loading(&widget);
-                    host.window.hide();
-                }
-            }),
-        }
-        gtk::glib::ControlFlow::Continue
-    });
-    gtk::main();
-}
-
-fn present(request: WebRequest) {
-    fell_core::diagnostic!(DEBUG, "Rendering mail in the web view");
-    let created = HOST.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if slot.is_none() {
-            match open_host(&request) {
-                Ok(host) => *slot = Some(host),
-                Err(err) => {
-                    fell_core::diagnostic!(
-                        WARN,
-                        "Could not open the web view",
-                        error = &err as &dyn std::error::Error
-                    );
-                    publish_failed(request.token);
-                    return None;
-                }
-            }
-        }
-        let host = slot.as_mut()?;
-        cancel_source(&host.pending);
-        cancel_source(&host.fail_safe);
-        host.token.set(request.token);
-        host.capture.set(host.capture.get().wrapping_add(1));
-        host.shot.set(host.shot.get().wrapping_add(1));
-        host.progress.set(LoadProgress::new());
-        Some(host.capture.get())
-    });
-    let Some(capture) = created else {
-        return;
-    };
-    let (window, widget) = HOST.with(|slot| {
-        let slot = slot.borrow();
-        let host = slot.as_ref().expect("webview host");
-        (host.window.clone(), host.webview.webview())
-    });
-    window.show_all();
-    webkit2gtk::WebViewExt::load_html(&widget, &request.html, None);
-    tighten_widget(&widget, request.allow_images);
-    arm_fail_safe(request.token, capture);
-}
-
-fn open_host(request: &WebRequest) -> wry::Result<Host> {
+#[allow(deprecated)]
+fn run(rx: glib::Receiver<Job>) -> Result<(), Box<dyn std::error::Error>> {
+    gtk::init()?;
     let window = gtk::OffscreenWindow::new();
-    window.set_focus_on_map(false);
     window.set_accept_focus(false);
-    window.set_can_focus(false);
-    // The preview pane is 960 wide. A narrower snapshot is scaled up on
-    // screen, which softens the type. The height covers the pane, so the
-    // visible page is the bitmap itself and not a painted strip under it.
-    window.set_default_size(960, 1400);
-    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    window.add(&vbox);
-    window.show_all();
-    let (red, green, blue) = request.background;
+    window.set_default_size(640, 240);
+    let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    window.add(&container);
+    let port = super::proxy::port().ok_or("could not start the WebKit deny proxy")?;
     let webview = wry::WebViewBuilder::new()
-        .with_html("<!DOCTYPE html><html><body></body></html>")
+        .with_proxy_config(wry::ProxyConfig::Http(wry::ProxyEndpoint {
+            host: "127.0.0.1".into(),
+            port: port.to_string(),
+        }))
+        .with_incognito(true)
         .with_javascript_disabled()
         .with_autoplay(false)
         .with_clipboard(false)
-        .with_background_color((red, green, blue, 255))
-        .with_navigation_handler(|uri| !remote_navigation(&uri))
-        .with_new_window_req_handler(|_url, _features| wry::NewWindowResponse::Deny)
-        .build_gtk(&vbox)?;
-    tighten(&webview, request.allow_images);
-    install_proxy(&webview.webview())?;
-    watch_loads(&webview.webview());
-    Ok(Host {
-        window,
-        webview,
-        token: Cell::new(request.token),
-        capture: Cell::new(0),
-        shot: Cell::new(0),
-        progress: Cell::new(LoadProgress::new()),
-        pending: RefCell::new(None),
-        fail_safe: RefCell::new(None),
-    })
-}
-
-fn install_proxy(widget: &webkit2gtk::WebView) -> wry::Result<()> {
-    use gtk::glib::translate::{IntoGlib, ToGlibPtr, ToGlibPtrMut};
-    use webkit2gtk::{NetworkProxyMode, WebViewExt};
-    let port = super::proxy::port();
-    let uri = format!("http://127.0.0.1:{port}");
-    let mut settings = webkit2gtk::NetworkProxySettings::new(Some(&uri), &[]);
-    let Some(context) = widget.context() else {
-        return Err(wry::Error::InitScriptError);
-    };
-    // WebContextExtManual is not re-exported by webkit2gtk 2.0.2.
-    unsafe {
-        webkit2gtk::ffi::webkit_web_context_set_network_proxy_settings(
-            context.to_glib_none().0,
-            NetworkProxyMode::Custom.into_glib(),
-            settings.to_glib_none_mut().0,
-        );
-    }
+        .with_new_window_req_handler(|_, _| wry::NewWindowResponse::Deny)
+        .build_gtk(&container)?;
+    let widget = webview.webview();
+    secure(&widget)?;
+    let active: Active = Rc::default();
+    widget.connect_load_changed({
+        let active = active.clone();
+        move |widget, event| {
+            if event == webkit2gtk::LoadEvent::Finished {
+                schedule_capture(widget, &active);
+            }
+        }
+    });
+    widget.connect_web_process_terminated({
+        let active = active.clone();
+        move |_, _| cancel(&active)
+    });
+    window.show_all();
+    // Start the web process before the first conversation needs it.
+    widget.load_html("<!doctype html>", None);
+    let _source = rx.attach(None, move |job| {
+        if job.reply.is_canceled() {
+            return glib::ControlFlow::Continue;
+        }
+        cancel(&active);
+        widget.stop_loading();
+        let WebRequest {
+            html,
+            width,
+            background,
+            settle_images,
+        } = job.request;
+        window.resize(width, 240);
+        let channel = |shift| f64::from((background >> shift) & 255_u32) / 255.0;
+        widget.set_background_color(&gtk::gdk::RGBA::new(
+            channel(16),
+            channel(8),
+            channel(0),
+            1.0,
+        ));
+        let cancellable = gtk::gio::Cancellable::new();
+        *active.borrow_mut() = Some(Load {
+            reply: job.reply,
+            cancel: cancellable.clone(),
+            settle_images,
+        });
+        widget.load_html(&html, None);
+        glib::timeout_add_local_once(Duration::from_secs(4), {
+            let active = active.clone();
+            let widget = widget.clone();
+            move || {
+                if active
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|load| load.cancel == cancellable)
+                {
+                    cancel(&active);
+                    widget.stop_loading();
+                }
+            }
+        });
+        glib::ControlFlow::Continue
+    });
+    gtk::main();
     Ok(())
 }
 
-fn watch_loads(widget: &webkit2gtk::WebView) {
-    use webkit2gtk::{LoadEvent, WebViewExt};
-    widget.connect_load_changed(|_, event| {
-        if event == LoadEvent::Finished {
-            apply_progress(LoadProgress::document_finished);
-        }
-    });
-    widget.connect_load_failed(|_, _, _, err| {
-        if !load_was_cancelled(err) {
-            apply_progress(LoadProgress::timed_out);
-        }
-        false
-    });
-    widget.connect_web_process_terminated(|_, _| {
-        apply_progress(LoadProgress::timed_out);
-    });
-    widget.connect_decide_policy(|_, decision, kind| deny_blocked_request(decision, kind));
-    widget.connect_resource_load_started(|_, resource, _| track_resource(resource));
-}
-
-fn deny_blocked_request(
-    decision: &webkit2gtk::PolicyDecision,
-    kind: webkit2gtk::PolicyDecisionType,
-) -> bool {
-    use webkit2gtk::{
-        NavigationPolicyDecisionExt, PolicyDecisionExt, PolicyDecisionType,
-        ResponsePolicyDecisionExt, URIRequestExt, URIResponseExt,
-    };
-    let uri = match kind {
-        PolicyDecisionType::NavigationAction | PolicyDecisionType::NewWindowAction => decision
-            .clone()
-            .downcast::<webkit2gtk::NavigationPolicyDecision>()
-            .ok()
-            .and_then(|decision| decision.navigation_action())
-            .and_then(|action| action.request())
-            .and_then(|request| request.uri()),
-        PolicyDecisionType::Response => decision
-            .clone()
-            .downcast::<webkit2gtk::ResponsePolicyDecision>()
-            .ok()
-            .and_then(|decision| {
-                decision
-                    .request()
-                    .and_then(|request| request.uri())
-                    .or_else(|| decision.response().and_then(|response| response.uri()))
-            }),
-        PolicyDecisionType::__Unknown(_) | _ => None,
-    };
-    if uri.as_deref().is_some_and(fell_render::request_is_blocked) {
-        decision.ignore();
-        return true;
-    }
-    false
-}
-
-fn track_resource(resource: &webkit2gtk::WebResource) {
-    use webkit2gtk::WebResourceExt;
-    apply_progress(LoadProgress::start_resource);
-    let Some(capture) = current_capture() else {
-        return;
-    };
-    let done = Rc::new(Cell::new(false));
-    resource.connect_finished({
-        let done = Rc::clone(&done);
-        move |_| finish_resource(&done, capture)
-    });
-    resource.connect_failed({
-        let done = Rc::clone(&done);
-        move |_, _| finish_resource(&done, capture)
-    });
-    resource.connect_failed_with_tls_errors({
-        let done = Rc::clone(&done);
-        move |_, _, _| finish_resource(&done, capture)
-    });
-}
-
-fn finish_resource(done: &Rc<Cell<bool>>, capture: u64) {
-    if done.replace(true) || current_capture() != Some(capture) {
-        return;
-    }
-    apply_progress(LoadProgress::end_resource);
-}
-
-fn current_capture() -> Option<u64> {
-    HOST.with(|slot| slot.borrow().as_ref().map(|host| host.capture.get()))
-}
-
-fn load_was_cancelled(err: &webkit2gtk::Error) -> bool {
-    err.matches(webkit2gtk::NetworkError::Cancelled)
-        || err.message().to_ascii_lowercase().contains("cancel")
-}
-
-fn apply_progress(update: impl FnOnce(&mut LoadProgress) -> Settle) {
-    let Some((token, capture, action)) = HOST.with(|slot| {
-        let slot = slot.borrow();
-        let host = slot.as_ref()?;
-        let mut progress = host.progress.get();
-        let action = update(&mut progress);
-        host.progress.set(progress);
-        Some((host.token.get(), host.capture.get(), action))
-    }) else {
-        return;
-    };
-    match action {
-        Settle::Wait => {}
-        Settle::Snapshot { delay_ms } => {
-            schedule_snapshot(token, capture, Duration::from_millis(delay_ms));
-        }
-        Settle::Failed => publish_failure(token, capture),
-        Settle::Finish => mark_settled(token, capture),
+fn cancel(active: &Active) {
+    let old = active.borrow_mut().take();
+    if let Some(load) = old {
+        load.cancel.cancel();
     }
 }
 
-fn schedule_snapshot(token: u64, capture: u64, delay: Duration) {
-    let Some((widget, shot)) = HOST.with(|slot| {
-        let slot = slot.borrow();
-        let host = slot.as_ref()?;
-        let progress = host.progress.get();
-        if host.token.get() != token || host.capture.get() != capture || progress.settled {
-            return None;
-        }
-        cancel_source(&host.pending);
-        let shot = host.shot.get().wrapping_add(1);
-        host.shot.set(shot);
-        Some((host.webview.webview(), shot))
-    }) else {
+fn schedule_capture(widget: &webkit2gtk::WebView, active: &Active) {
+    let Some((token, settle_images)) = active
+        .borrow()
+        .as_ref()
+        .map(|load| (load.cancel.clone(), load.settle_images))
+    else {
         return;
     };
-    let id = gtk::glib::timeout_add_local(delay, move || {
-        let still = HOST.with(|slot| {
-            slot.borrow().as_ref().is_some_and(|host| {
-                let progress = host.progress.get();
-                host.token.get() == token
-                    && host.capture.get() == capture
-                    && host.shot.get() == shot
-                    && !progress.settled
-                    && progress.document_done
-            })
+    if settle_images {
+        // WebKit emits Finished before a decoded image's next paint. Give
+        // local image decoders a refresh interval before asking for pixels.
+        let widget = widget.clone();
+        let active = active.clone();
+        glib::timeout_add_local_once(Duration::from_millis(80), move || {
+            capture(&widget, active, token);
         });
-        if still {
-            HOST.with(|slot| {
-                if let Some(host) = slot.borrow().as_ref()
-                    && let Some(id) = host.pending.borrow_mut().take()
-                {
-                    // Break retires this source. Forget the id so a Drop
-                    // that calls remove cannot retire it a second time.
-                    #[allow(clippy::forget_non_drop)]
-                    std::mem::forget(id);
-                }
-            });
-            snapshot(widget.clone(), token, capture, shot);
-        }
-        gtk::glib::ControlFlow::Break
-    });
-    HOST.with(|slot| {
-        if let Some(host) = slot.borrow().as_ref() {
-            if host.token.get() == token && host.capture.get() == capture && host.shot.get() == shot
-            {
-                *host.pending.borrow_mut() = Some(id);
-            } else {
-                id.remove();
-            }
-        } else {
-            id.remove();
-        }
-    });
+    } else {
+        capture(widget, active.clone(), token);
+    }
 }
 
-fn snapshot(widget: webkit2gtk::WebView, token: u64, capture: u64, shot: u64) {
-    use webkit2gtk::{SnapshotOptions, SnapshotRegion, WebViewExt};
+fn capture(widget: &webkit2gtk::WebView, active: Active, token: gtk::gio::Cancellable) {
+    if token.is_cancelled() {
+        return;
+    }
     widget.snapshot(
-        SnapshotRegion::FullDocument,
-        SnapshotOptions::NONE,
-        None::<&gtk::gio::Cancellable>,
+        webkit2gtk::SnapshotRegion::FullDocument,
+        webkit2gtk::SnapshotOptions::NONE,
+        Some(&token.clone()),
         move |result| {
-            let current = HOST.with(|slot| {
-                slot.borrow().as_ref().is_some_and(|host| {
-                    let progress = host.progress.get();
-                    host.token.get() == token
-                        && host.capture.get() == capture
-                        && host.shot.get() == shot
-                        && !progress.settled
-                        && progress.document_done
-                })
-            });
-            if !current {
+            if token.is_cancelled() {
                 return;
             }
-            let settled = HOST.with(|slot| {
-                slot.borrow().as_ref().is_some_and(|host| {
-                    let progress = host.progress.get();
-                    progress.document_done && progress.inflight == 0
-                })
-            });
-            if let Ok(surface) = result
-                && let Some(png) = surface_png(surface)
+            if let Some(load) = active.borrow_mut().take()
+                && let Some(image) = result.ok().and_then(surface_image)
             {
-                let generation = HOST.with(|slot| {
-                    slot.borrow().as_ref().map(|host| {
-                        let generation = host.shot.get();
-                        let mut progress = host.progress.get();
-                        progress.note_snapshot(settled);
-                        host.progress.set(progress);
-                        if settled {
-                            cancel_source(&host.fail_safe);
-                            host.window.hide();
-                        }
-                        generation
-                    })
-                });
-                if let Some(generation) = generation
-                    && let Ok(mut frame) = FRAME.lock()
-                {
-                    *frame = Some((
-                        token,
-                        StoredFrame::Png(StoredPng {
-                            bytes: Arc::from(png),
-                            generation,
-                            settled,
-                        }),
-                    ));
-                }
-                return;
+                let _ = load.reply.send(image);
             }
-            apply_progress(LoadProgress::snapshot_empty);
         },
     );
 }
 
-fn mark_settled(token: u64, capture: u64) {
-    let still = HOST.with(|slot| {
-        slot.borrow().as_ref().is_some_and(|host| {
-            host.token.get() == token
-                && host.capture.get() == capture
-                && host.progress.get().settled
-        })
-    });
-    if !still {
-        return;
-    }
-    if let Ok(mut frame) = FRAME.lock()
-        && let Some((got, StoredFrame::Png(png))) = frame.as_mut()
-        && *got == token
-    {
-        png.settled = true;
-    }
-    HOST.with(|slot| {
-        if let Some(host) = slot.borrow().as_ref()
-            && host.token.get() == token
-            && host.capture.get() == capture
-        {
-            cancel_source(&host.pending);
-            cancel_source(&host.fail_safe);
-            host.window.hide();
-        }
-    });
-}
-
-fn publish_failure(token: u64, capture: u64) {
-    let still = HOST.with(|slot| {
-        slot.borrow().as_ref().is_some_and(|host| {
-            host.token.get() == token
-                && host.capture.get() == capture
-                && host.progress.get().published
-        })
-    });
-    if !still {
-        return;
-    }
-    if let Ok(mut frame) = FRAME.lock() {
-        *frame = Some((token, StoredFrame::Failed));
-    }
-    HOST.with(|slot| {
-        if let Some(host) = slot.borrow().as_ref()
-            && host.token.get() == token
-            && host.capture.get() == capture
-        {
-            cancel_source(&host.pending);
-            cancel_source(&host.fail_safe);
-            host.window.hide();
-        }
-    });
-}
-
-fn arm_fail_safe(token: u64, capture: u64) {
-    let id = gtk::glib::timeout_add_local(Duration::from_secs(8), move || {
-        // Take the id before GLib retires this source. A later Show must not
-        // call remove on a source that has already finished.
-        HOST.with(|slot| {
-            if let Some(host) = slot.borrow().as_ref()
-                && let Some(id) = host.fail_safe.borrow_mut().take()
-            {
-                #[allow(clippy::forget_non_drop)]
-                std::mem::forget(id);
+fn secure(widget: &webkit2gtk::WebView) -> Result<(), Box<dyn std::error::Error>> {
+    let settings = WebViewExt::settings(widget).ok_or("missing WebKit settings")?;
+    settings.set_enable_javascript(false);
+    settings.set_enable_developer_extras(false);
+    settings.set_enable_dns_prefetching(false);
+    settings.set_enable_html5_local_storage(false);
+    settings.set_enable_page_cache(false);
+    settings.set_enable_webaudio(false);
+    settings.set_enable_webgl(false);
+    widget.connect_decide_policy(|_, decision, kind| {
+        use webkit2gtk::{
+            NavigationPolicyDecisionExt, NavigationType, PolicyDecisionType, URIRequestExt,
+        };
+        match kind {
+            PolicyDecisionType::Response => false,
+            PolicyDecisionType::NavigationAction => {
+                let internal = decision
+                    .downcast_ref::<webkit2gtk::NavigationPolicyDecision>()
+                    .and_then(|decision| decision.navigation_action())
+                    .is_some_and(|action| {
+                        action.navigation_type() == NavigationType::Other
+                            && action.request().and_then(|req| req.uri()).as_deref()
+                                == Some("about:blank")
+                    });
+                if !internal {
+                    decision.ignore();
+                }
+                !internal
             }
-        });
-        let should_stop = HOST.with(|slot| {
-            slot.borrow().as_ref().is_some_and(|host| {
-                host.token.get() == token
-                    && host.capture.get() == capture
-                    && !host.progress.get().settled
-            })
-        });
-        if should_stop {
-            apply_progress(LoadProgress::timed_out);
+            _ => {
+                decision.ignore();
+                true
+            }
         }
-        gtk::glib::ControlFlow::Break
     });
-    HOST.with(|slot| {
-        if let Some(host) = slot.borrow().as_ref() {
-            if host.token.get() == token && host.capture.get() == capture {
-                *host.fail_safe.borrow_mut() = Some(id);
+    install_filter(widget)
+}
+
+fn install_filter(widget: &webkit2gtk::WebView) -> Result<(), Box<dyn std::error::Error>> {
+    use glib::translate::{ToGlibPtr, from_glib_full};
+    use webkit2gtk::ffi;
+
+    const RULES: &[u8] = br#"[
+      {"trigger":{"url-filter":".*"},"action":{"type":"block"}},
+      {"trigger":{"url-filter":"^data:"},"action":{"type":"ignore-previous-rules"}},
+      {"trigger":{"url-filter":"^cid:"},"action":{"type":"ignore-previous-rules"}},
+      {"trigger":{"url-filter":"^about:blank$","resource-type":["document"]},"action":{"type":"ignore-previous-rules"}}
+    ]"#;
+    let dir = tempfile::tempdir()?;
+    let path = std::ffi::CString::new(dir.path().as_os_str().as_encoded_bytes())?;
+    let manager = widget
+        .user_content_manager()
+        .ok_or("missing WebKit content manager")?;
+    let main = glib::MainLoop::new(None, false);
+    let done = Rc::new(RefCell::new(None));
+    struct Save {
+        main: glib::MainLoop,
+        manager: webkit2gtk::UserContentManager,
+        done: Rc<RefCell<Option<Result<(), glib::Error>>>>,
+    }
+    unsafe extern "C" fn ready(
+        source: *mut glib::gobject_ffi::GObject,
+        result: *mut gtk::gio::ffi::GAsyncResult,
+        data: glib::ffi::gpointer,
+    ) {
+        // GLib calls this once on the GTK thread. The boxed state and the
+        // returned filter/error are transfer-full.
+        unsafe {
+            let state = Box::from_raw(data.cast::<Save>());
+            let mut error = std::ptr::null_mut();
+            let filter = ffi::webkit_user_content_filter_store_save_finish(
+                source.cast(),
+                result,
+                &mut error,
+            );
+            *state.done.borrow_mut() = Some(if filter.is_null() {
+                Err(from_glib_full(error))
             } else {
-                id.remove();
-            }
-        } else {
-            id.remove();
+                ffi::webkit_user_content_manager_add_filter(state.manager.to_glib_none().0, filter);
+                ffi::webkit_user_content_filter_unref(filter);
+                Ok(())
+            });
+            state.main.quit();
         }
-    });
-}
-
-fn cancel_source(slot: &RefCell<Option<gtk::glib::SourceId>>) {
-    if let Some(id) = slot.borrow_mut().take() {
-        id.remove();
     }
-}
-
-fn tighten_widget(widget: &webkit2gtk::WebView, allow_images: bool) {
-    use webkit2gtk::{SettingsExt, WebViewExt};
-    if let Some(settings) = WebViewExt::settings(widget) {
-        settings.set_enable_javascript(false);
-        settings.set_auto_load_images(allow_images);
-        settings.set_enable_developer_extras(false);
-        settings.set_javascript_can_open_windows_automatically(false);
-        settings.set_enable_webaudio(false);
-        settings.set_enable_webgl(false);
+    let state = Save {
+        main: main.clone(),
+        manager,
+        done: done.clone(),
+    };
+    let source = glib::Bytes::from_static(RULES);
+    // The store belongs to this call until the asynchronous save finishes.
+    unsafe {
+        let store: glib::Object =
+            from_glib_full(ffi::webkit_user_content_filter_store_new(path.as_ptr()).cast());
+        ffi::webkit_user_content_filter_store_save(
+            store.as_ptr().cast(),
+            c"mail-offline".as_ptr(),
+            source.to_glib_none().0,
+            std::ptr::null_mut(),
+            Some(ready),
+            Box::into_raw(Box::new(state)).cast(),
+        );
+        main.run();
     }
+    done.borrow_mut()
+        .take()
+        .ok_or("WebKit content filter did not finish")??;
+    Ok(())
 }
 
-fn surface_png(surface: gtk::cairo::Surface) -> Option<Vec<u8>> {
+fn surface_image(surface: gtk::cairo::Surface) -> Option<Snapshot> {
     let mut image = gtk::cairo::ImageSurface::try_from(surface).ok()?;
     image.flush();
     let width = image.width();
@@ -649,361 +347,90 @@ fn surface_png(surface: gtk::cairo::Surface) -> Option<Vec<u8>> {
     let src_h = height as usize;
     let dst_w_us = dst_w as usize;
     let dst_h_us = dst_h as usize;
-    let mut rgba = Vec::with_capacity(dst_w_us * dst_h_us * 4);
+    let mut bgra = Vec::with_capacity(dst_w_us * dst_h_us * 4);
     for y in 0..dst_h_us {
         let src_y = y * src_h / dst_h_us;
-        for x in 0..dst_w_us {
-            let src_x = x * src_w / dst_w_us;
-            let offset = src_y * stride + src_x * 4;
-            let px = data.get(offset..offset + 4)?;
-            let (b, g, r, a) = (px[0], px[1], px[2], px[3]);
-            if a == 0 || a == 255 {
-                rgba.extend_from_slice(&[r, g, b, a]);
-            } else {
-                rgba.extend_from_slice(&[
-                    ((u16::from(r) * 255) / u16::from(a)) as u8,
-                    ((u16::from(g) * 255) / u16::from(a)) as u8,
-                    ((u16::from(b) * 255) / u16::from(a)) as u8,
-                    a,
-                ]);
+        let row = data.get(src_y * stride..src_y * stride + src_w * 4)?;
+        if src_w == dst_w_us {
+            bgra.extend_from_slice(row);
+        } else {
+            for x in 0..dst_w_us {
+                let offset = (x * src_w / dst_w_us) * 4;
+                bgra.extend_from_slice(&row[offset..offset + 4]);
             }
         }
     }
-    // A short page still has to cover the pane. Cutting it shorter leaves a
-    // join, and that join reads as a band of a different color.
-    let dst_h = super::native::trim_uniform_bottom(&rgba, dst_w, dst_h)
-        .max(640)
-        .min(dst_h);
-    rgba.truncate(dst_w as usize * dst_h as usize * 4);
-    let buffer = image::RgbaImage::from_raw(dst_w, dst_h, rgba)?;
-    let mut png = Vec::new();
-    image::DynamicImage::ImageRgba8(buffer)
-        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
-        .ok()?;
-    Some(png)
-}
-
-fn tighten(webview: &wry::WebView, allow_images: bool) {
-    use webkit2gtk::{SettingsExt, WebViewExt};
-    let widget = webview.webview();
-    if let Some(settings) = WebViewExt::settings(&widget) {
-        settings.set_enable_javascript(false);
-        settings.set_auto_load_images(allow_images);
-        settings.set_enable_developer_extras(false);
-        settings.set_javascript_can_open_windows_automatically(false);
-        settings.set_enable_webaudio(false);
-        settings.set_enable_webgl(false);
-    }
-}
-
-fn remote_navigation(uri: &str) -> bool {
-    if fell_render::request_is_blocked(uri) || fell_render::targets_private_network(uri) {
-        return true;
-    }
-    let uri = uri.to_ascii_lowercase();
-    uri.starts_with("http://") || uri.starts_with("https://") || uri.starts_with("file:")
-}
-
-pub fn ensure_started() {
-    boot();
-}
-
-/// When a web-view load may be snapshotted.
-///
-/// The document finishing schedules a picture immediately. If images were
-/// still loading, another picture is scheduled once they settle, and that
-/// one replaces the first. An empty picture is retried, then reported as
-/// failure. A load that never produces a frame fails on the timeout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Settle {
-    Wait,
-    Snapshot {
-        delay_ms: u64,
-    },
-    Failed,
-    /// Keep the picture we have and stop waiting.
-    Finish,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct LoadProgress {
-    inflight: u32,
-    document_done: bool,
-    published: bool,
-    settled: bool,
-    empty_snapshots: u32,
-}
-
-impl LoadProgress {
-    fn new() -> Self {
-        Self {
-            inflight: 0,
-            document_done: false,
-            published: false,
-            settled: false,
-            empty_snapshots: 0,
+    // Cairo pixels are premultiplied. GPUI takes unpremultiplied BGRA.
+    for [b, g, r, a] in bgra.as_chunks_mut::<4>().0 {
+        if *a != 0 && *a != 255 {
+            let alpha = u16::from(*a);
+            *b = ((u16::from(*b) * 255) / alpha) as u8;
+            *g = ((u16::from(*g) * 255) / alpha) as u8;
+            *r = ((u16::from(*r) * 255) / alpha) as u8;
         }
     }
-
-    fn start_resource(&mut self) -> Settle {
-        self.inflight = self.inflight.saturating_add(1);
-        Settle::Wait
-    }
-
-    fn end_resource(&mut self) -> Settle {
-        self.inflight = self.inflight.saturating_sub(1);
-        if self.document_done && self.inflight == 0 && !self.settled {
-            Settle::Snapshot { delay_ms: 120 }
-        } else {
-            Settle::Wait
-        }
-    }
-
-    fn document_finished(&mut self) -> Settle {
-        self.document_done = true;
-        if self.settled {
-            Settle::Wait
-        } else {
-            Settle::Snapshot { delay_ms: 120 }
-        }
-    }
-
-    fn note_snapshot(&mut self, settled: bool) {
-        self.published = true;
-        self.empty_snapshots = 0;
-        if settled {
-            self.settled = true;
-        }
-    }
-
-    fn snapshot_empty(&mut self) -> Settle {
-        if self.settled {
-            return Settle::Wait;
-        }
-        self.empty_snapshots = self.empty_snapshots.saturating_add(1);
-        if self.empty_snapshots < 4 {
-            return Settle::Snapshot {
-                delay_ms: 200 * u64::from(self.empty_snapshots),
-            };
-        }
-        self.settled = true;
-        if self.published {
-            Settle::Finish
-        } else {
-            self.published = true;
-            Settle::Failed
-        }
-    }
-
-    fn timed_out(&mut self) -> Settle {
-        if self.settled {
-            Settle::Wait
-        } else if self.published {
-            self.settled = true;
-            Settle::Finish
-        } else {
-            self.published = true;
-            self.settled = true;
-            Settle::Failed
-        }
-    }
+    let dst_h = super::native::trim_uniform_bottom(&bgra, dst_w, dst_h).clamp(1, dst_h);
+    bgra.truncate(dst_w as usize * dst_h as usize * 4);
+    let pixels = image::RgbaImage::from_raw(dst_w, dst_h, bgra)?;
+    Some(Snapshot {
+        image: Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(
+            pixels
+        )])),
+        width: dst_w as f32,
+        height: dst_h as f32,
+    })
 }
 
 #[cfg(test)]
-mod settle_tests {
-    use super::{LoadProgress, Settle};
-
-    #[test]
-    fn snapshot_again_after_images_finish() {
-        let mut load = LoadProgress::new();
-        assert_eq!(load.start_resource(), Settle::Wait);
-        assert_eq!(load.start_resource(), Settle::Wait);
-        assert_eq!(load.document_finished(), Settle::Snapshot { delay_ms: 120 });
-        load.note_snapshot(false);
-        assert_eq!(load.end_resource(), Settle::Wait);
-        assert_eq!(
-            load.end_resource(),
-            Settle::Snapshot { delay_ms: 120 },
-            "replace the early picture once every image has finished"
-        );
-        load.note_snapshot(true);
-        assert_eq!(load.end_resource(), Settle::Wait);
-        assert_eq!(load.timed_out(), Settle::Wait);
-    }
-
-    #[test]
-    fn timeout_without_a_frame_fails() {
-        let mut load = LoadProgress::new();
-        assert_eq!(load.timed_out(), Settle::Failed);
-        assert_eq!(load.timed_out(), Settle::Wait);
-        assert_eq!(load.document_finished(), Settle::Wait);
-
-        let mut early = LoadProgress::new();
-        early.document_finished();
-        early.note_snapshot(false);
-        assert_eq!(early.timed_out(), Settle::Finish);
-        assert_eq!(early.timed_out(), Settle::Wait);
-    }
-
-    #[test]
-    fn empty_snapshots_stop_instead_of_polling() {
-        let mut retry = LoadProgress::new();
-        retry.document_finished();
-        assert_eq!(retry.snapshot_empty(), Settle::Snapshot { delay_ms: 200 });
-        assert_eq!(retry.snapshot_empty(), Settle::Snapshot { delay_ms: 400 });
-        assert_eq!(retry.snapshot_empty(), Settle::Snapshot { delay_ms: 600 });
-        assert_eq!(retry.snapshot_empty(), Settle::Failed);
-        assert_eq!(retry.snapshot_empty(), Settle::Wait);
-    }
-}
-
-#[cfg(test)]
-mod frame_tests {
-    use std::sync::Arc;
-
-    use super::{FRAME, StoredFrame, StoredPng, WebStatus, status_for};
-
-    #[test]
-    fn unchanged_generation_does_not_clone_the_png() {
-        let bytes: Arc<[u8]> = Arc::from(&b"not-a-real-png"[..]);
-        let token = 9_001_001_u64;
-        {
-            let mut slot = FRAME.lock().expect("frame lock");
-            *slot = Some((
-                token,
-                StoredFrame::Png(StoredPng {
-                    bytes: Arc::clone(&bytes),
-                    generation: 4,
-                    settled: false,
-                }),
-            ));
-        }
-        let WebStatus::Ready {
-            png,
-            generation,
-            settled,
-        } = status_for(token, None)
-        else {
-            panic!("first poll should hand over the arc");
-        };
-        assert_eq!(generation, 4);
-        assert!(!settled);
-        assert!(Arc::ptr_eq(&png, &bytes));
-        let holders = Arc::strong_count(&bytes);
-        match status_for(token, Some(4)) {
-            WebStatus::Unchanged { settled } => assert!(!settled),
-            WebStatus::Pending => panic!("expected no copy, got pending"),
-            WebStatus::Ready { .. } => panic!("expected no copy, got another png"),
-            WebStatus::Failed => panic!("expected no copy, got failure"),
-        }
-        assert_eq!(Arc::strong_count(&bytes), holders);
-        drop(png);
-        if let Ok(mut slot) = FRAME.lock()
-            && slot.as_ref().is_some_and(|(got, _)| *got == token)
-        {
-            *slot = None;
-        }
-    }
-}
-
-#[cfg(test)]
-mod fetch_proof {
-    use std::io::{Read, Write};
+mod tests {
+    use std::io::ErrorKind;
     use std::net::TcpListener;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
 
-    use gtk::prelude::*;
-    use wry::WebViewExtUnix;
+    use super::*;
 
-    use super::{WebRequest, open_host};
-
-    /// Remote images are allowed. The mail names 127.0.0.1 from an img, a
-    /// comment-wrapped CSS url(), an @import, and a font, and it also names a
-    /// public-looking host that redirects there. Neither server is allowed to
-    /// see the private target.
     #[test]
-    fn private_targets_receive_no_requests() {
-        if std::env::var_os("DISPLAY").is_none() {
-            eprintln!("skip private_targets_receive_no_requests: no DISPLAY");
+    fn hostile_email_makes_zero_webkit_requests() {
+        if std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none() {
+            eprintln!("headless WebKit proof requires the isolated display");
             return;
         }
-        if fell_core::test_support::skip_unless_available(
-            "private_targets_receive_no_requests",
-            fell_core::test_support::test_net_missing(),
-        ) {
-            return;
-        }
-        let private_hits = Arc::new(AtomicUsize::new(0));
-        let private_port = serve_private(Arc::clone(&private_hits));
-        let redirect_hits = Arc::new(AtomicUsize::new(0));
-        let redirect_port = serve_redirect(private_port, Arc::clone(&redirect_hits));
-        let html = format!(
-            r#"<!DOCTYPE html><html><head><style>
-@import url("http://127.0.0.1:{private_port}/import.css");
-@font-face {{ font-family: Probe; src: url("http://127.0.0.1:{private_port}/font.woff"); }}
-body {{ background-image: url(/*x*/"http://127.0.0.1:{private_port}/bg.png"); }}
-</style></head><body>
-<img src="http://127.0.0.1:{private_port}/img.png">
-<img src="http://192.0.2.1:{redirect_port}/go">
-</body></html>"#
-        );
-        gtk::init().expect("gtk");
-        let host = open_host(&WebRequest {
-            html: html.clone(),
-            token: 1,
-            background: (255, 255, 255),
-            allow_images: true,
-        })
-        .expect("webview");
-        host.window.show_all();
-        let widget = host.webview.webview();
-        webkit2gtk::WebViewExt::load_html(&widget, &html, None);
-        super::tighten_widget(&widget, true);
-        let _timer = gtk::glib::timeout_add_local(Duration::from_secs(4), || {
-            gtk::main_quit();
-            gtk::glib::ControlFlow::Break
-        });
-        gtk::main();
-        let private = private_hits.load(Ordering::SeqCst);
-        let redirect = redirect_hits.load(Ordering::SeqCst);
-        eprintln!("proof private_hits={private} redirect_hits={redirect}");
-        assert_eq!(private, 0, "127.0.0.1 received a request");
-        assert!(
-            redirect > 0,
-            "the public-looking redirect host was never asked"
-        );
-    }
-
-    fn serve_private(hits: Arc<AtomicUsize>) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            for conn in listener.incoming().flatten() {
-                hits.fetch_add(1, Ordering::SeqCst);
-                let mut conn = conn;
-                let _ = conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
-            }
-        });
-        port
-    }
-
-    fn serve_redirect(private_port: u16, hits: Arc<AtomicUsize>) -> u16 {
-        let listener = TcpListener::bind("192.0.2.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            for conn in listener.incoming().flatten() {
-                hits.fetch_add(1, Ordering::SeqCst);
-                let mut conn = conn;
-                let mut buf = [0u8; 1024];
-                let _ = conn.read(&mut buf);
-                let body = format!(
-                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{private_port}/from-redirect\r\nContent-Length: 0\r\n\r\n"
-                );
-                let _ = conn.write_all(body.as_bytes());
-            }
-        });
-        port
+        listener.set_nonblocking(true).unwrap();
+        let local = format!("http://{}", listener.local_addr().unwrap());
+        let public = "http://192.0.2.1:33449";
+        let probe = format!(
+            r#"<head>
+            <link rel="preconnect" href="{public}">
+            <link rel="dns-prefetch" href="//render-probe.invalid">
+            <link rel="prefetch" href="{public}/prefetch">
+            <link rel="icon" href="{local}/favicon">
+            <meta http-equiv="refresh" content="0; url={local}/refresh">
+            <style>@import "{public}/style";
+            @font-face {{ font-family: Probe; src: url({public}/font); }}
+            p {{ font-family: Probe; background: image-set(url({public}/bg) 1x); }}
+            </style></head>
+            <body><p style="background-color:#7a163f">Offline preview</p>
+            <img src="{local}/pixel" srcset="{public}/srcset 2x">
+            <iframe src="{public}/frame"></iframe>
+            <form action="{local}/form"><input></form>
+            <script>fetch("{local}/script");</script>
+            <a href="{public}/link" ping="{local}/ping">Link</a>
+            <svg xmlns="http://www.w3.org/2000/svg"><image href="{public}/svg"/></svg>
+            </body>"#
+        );
+        let start = super::super::proxy::requests();
+        let page = fell_render::WebMail::prepare(&probe);
+        let picture = futures::executor::block_on(render(WebRequest {
+            html: page.page("light", |_| None),
+            width: 440,
+            background: 0xffffff,
+            settle_images: false,
+        }))
+        .expect("WebKit drew the hostile document");
+        let pixels = picture.image.as_bytes(0).unwrap();
+        assert!(pixels.as_chunks::<4>().0.contains(&[0x3f, 0x16, 0x7a, 255]));
+        assert_eq!(super::super::proxy::requests() - start, 0);
+        assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+        eprintln!("hostile WebKit corpus drew a frame with zero proxy and loopback requests");
     }
 }

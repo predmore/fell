@@ -147,6 +147,9 @@ pub struct AccountConfig {
     /// Allow server moves, flag changes and Sent appends.
     pub write_back: bool,
     pub notifications: NotificationMode,
+    /// The configured receiver strips inbound copies of X-Fell-Verified-Sender
+    /// and sets its own only after authenticating the complete From mailbox.
+    pub trust_verified_sender_header: bool,
 }
 
 impl AccountConfig {
@@ -242,6 +245,7 @@ impl AccountConfig {
             save_sent: SaveSent::Auto,
             write_back: false,
             notifications: NotificationMode::On,
+            trust_verified_sender_header: false,
         }
     }
 
@@ -389,6 +393,10 @@ impl AccountConfig {
             .unwrap_or(false);
         let notifications =
             NotificationMode::parse(get("notifications"), get("notification_content"))?;
+        let trust_verified_sender_header = get("trust_verified_sender_header")
+            .map(|value| value.flag("trust_verified_sender_header"))
+            .transpose()?
+            .unwrap_or(false);
         if let Some((key, _)) = fields.first() {
             return Err(invalid(format!("unknown key {key}")));
         }
@@ -411,6 +419,7 @@ impl AccountConfig {
             save_sent,
             write_back,
             notifications,
+            trust_verified_sender_header,
         };
         config.validate()?;
         Ok(config)
@@ -503,6 +512,9 @@ impl AccountConfig {
         };
         let security = security_name(self.security);
         push(&mut out, "backend", backend);
+        if self.trust_verified_sender_header {
+            out.push_str("trust_verified_sender_header = true\n");
+        }
         if self.id != "mail" {
             push(&mut out, "id", &self.id);
         }
@@ -796,6 +808,7 @@ impl AccountConfig {
             // other host must present a certificate a public CA vouches for.
             accept_invalid_certs: self.backend == BackendKind::Bridge && self.is_loopback(),
             folder_overrides: self.folders.clone(),
+            trust_verified_sender_header: self.trust_verified_sender_header,
         }
     }
 

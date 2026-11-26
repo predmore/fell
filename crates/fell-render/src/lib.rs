@@ -39,6 +39,5 @@ pub use plain_links::{
 };
 pub use typed_list::plain_list_runs;
 pub use webview_html::{
-    WebFrame, address_is_blocked, request_is_blocked, request_is_blocked_with, sanitize_html,
-    strip_remote_css_urls, targets_private_network, wrap_for_webview,
+    WebMail, address_is_blocked, sanitize_html, strip_remote_css_urls, targets_private_network,
 };

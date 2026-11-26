@@ -2897,6 +2897,10 @@ impl Session {
                     | Action::SaveAllAttachments
                     | Action::RetryAttachment
                     | Action::ToggleQuotes
+                    | Action::ToggleWebView
+                    | Action::AllowMessageImages
+                    | Action::AllowSenderImages
+                    | Action::BlockSenderImages
                     | Action::Reply
                     | Action::ReplyAll
                     | Action::Forward
@@ -3326,6 +3330,12 @@ impl Session {
                 } else if self.pane == Pane::Conversation {
                     self.pane = self.reading_return_pane;
                 }
+            }
+            Action::ToggleWebView
+            | Action::AllowMessageImages
+            | Action::AllowSenderImages
+            | Action::BlockSenderImages => {
+                self.count.clear();
             }
             Action::ToggleQuotes => {
                 self.count.clear();

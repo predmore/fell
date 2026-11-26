@@ -2935,14 +2935,6 @@ fn image_el(
     placeholder.into_any_element()
 }
 
-pub(crate) fn embedded_web(image: Arc<RenderImage>) -> AnyElement {
-    // Native pixels. Stretching the snapshot to the pane softens the type.
-    div()
-        .w_full()
-        .child(img(image).object_fit(gpui::ObjectFit::None))
-        .into_any_element()
-}
-
 /// Drop trailing rows that are a flat page color, so a short newsletter
 /// does not keep the empty viewport under the card. A short run of that
 /// color stays, matching the page's own top inset. The pane below the
@@ -3043,21 +3035,26 @@ fn image_limits() -> image::Limits {
     limits
 }
 
+#[cfg(test)]
 pub(crate) fn decode_image(bytes: &[u8]) -> Option<Arc<RenderImage>> {
     decode_rgba(bytes).map(render_frame)
 }
 
-/// A corner of a newsletter snapshot. The pane under the snapshot is painted
-/// this color so the page runs to the window edge.
-pub(crate) fn edge_color(bytes: &[u8]) -> Option<u32> {
-    let image = image::ImageReader::new(std::io::Cursor::new(bytes))
-        .with_guessed_format()
-        .ok()?
-        .decode()
-        .ok()?;
-    let rgba = image.to_rgba8();
-    let pixel = rgba.get_pixel(0, 0).0;
-    Some(u32::from(pixel[0]) << 16 | u32::from(pixel[1]) << 8 | u32::from(pixel[2]))
+pub(super) fn raster_bytes_allowed(bytes: &[u8], mime: &str) -> bool {
+    let format = match mime {
+        "image/png" => image::ImageFormat::Png,
+        "image/jpeg" => image::ImageFormat::Jpeg,
+        "image/gif" => image::ImageFormat::Gif,
+        _ => return false,
+    };
+    if image::guess_format(bytes).ok() != Some(format) {
+        return false;
+    }
+    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
+    reader.limits(image_limits());
+    reader
+        .into_dimensions()
+        .is_ok_and(|(w, h)| raster_allowed(w, h))
 }
 
 fn decode_rgba(bytes: &[u8]) -> Option<image::RgbaImage> {
