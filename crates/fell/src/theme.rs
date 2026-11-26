@@ -38,6 +38,9 @@ pub struct Theme {
     pub on_selection_accent: u32,
     pub search_match: (u32, u32),
     pub selected_search_match: (u32, u32),
+    /// Surrounding label text and its match in a picker row.
+    pub picker_match: (u32, u32),
+    pub selected_picker_match: (u32, u32),
     label_outline: u32,
     selected_label_outline: u32,
     pub error: u32,
@@ -274,6 +277,8 @@ fn map_palette(
         on_selection_accent,
         search_match: search_match(accent, background),
         selected_search_match: search_match(on_selection, selection),
+        picker_match: picker_match(dimmed, accent, surface, dark),
+        selected_picker_match: picker_match(on_selection_dim, on_selection_accent, selection, dark),
         label_outline: label_outline(background, dimmed),
         selected_label_outline: label_outline(selection, on_selection),
         // A warning chip sits on a selected row too, so the error colour
@@ -804,6 +809,14 @@ pub fn contrast(a: u32, b: u32) -> f64 {
     (hi + 0.05) / (lo + 0.05)
 }
 
+fn picker_match(dim: u32, accent: u32, row: u32, dark: bool) -> (u32, u32) {
+    let dim = ensure(dim, row, if dark { TEXT_CONTRAST } else { 6.0 });
+    // Increase the match's contrast against the row until it is also
+    // distinguishable in luminance from the surrounding label text.
+    let accent = ensure(accent, row, 1.3 * contrast(dim, row));
+    (dim, accent)
+}
+
 pub(crate) fn mix(a: u32, b: u32, t: f64) -> u32 {
     fn mix_channel(a: u32, b: u32, shift: u32, t: f64) -> u32 {
         let av = (a >> shift) & 255;
@@ -1203,6 +1216,25 @@ mod tests {
                     "{}: {plain:.3} unselected, {selected:.3} selected",
                     theme.name
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn picker_matches_are_distinct_in_luminance_on_every_stock_theme() {
+        for theme in every_test_theme() {
+            for (row, (dim, matched)) in [
+                (theme.surface, theme.picker_match),
+                (theme.selection, theme.selected_picker_match),
+            ] {
+                let minimum = if theme.is_light() { 6.0 } else { TEXT_CONTRAST };
+                let (surrounding, separation) = (contrast(dim, row), contrast(dim, matched));
+                assert!(surrounding >= minimum, "{}: {surrounding:.3}", theme.name);
+                assert!(contrast(matched, row) >= TEXT_CONTRAST, "{}", theme.name);
+                assert!(separation >= 1.3, "{}: {separation:.3}", theme.name);
+                if theme.is_light() {
+                    assert!(luminance(matched) < luminance(dim), "{}", theme.name);
+                }
             }
         }
     }
