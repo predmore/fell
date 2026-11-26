@@ -57,7 +57,9 @@ use crate::model::{
     PickerChoice, QueryFault, ReadDwell, Session, Step, SyncKind, ThreadEdit, Toast, grouped,
     row_key,
 };
-use crate::motion::{self, Glide, LayerSwap, ListShift, Motion, RowMotion, SwapFrame, Transition};
+use crate::motion::{
+    self, Glide, LayerSwap, ListChange, ListShift, Motion, RowMotion, SwapFrame, Transition,
+};
 use crate::onboarding::Onboarding;
 use crate::present::{self, ConvMessage, Pane, Rich, ThreadRow, now_unix};
 use crate::reader_body_worker;
@@ -2200,7 +2202,12 @@ impl Inbox {
             self.fade_regroup_selection(regroup_previous, now);
         }
         if !emptied && (switched || had_rows || !self.session.threads.is_empty()) {
-            self.start_list_shift(drawn, switched, intent.select.is_some(), top_arrival);
+            let change = if switched {
+                ListChange::Replace
+            } else {
+                ListChange::Shift
+            };
+            self.start_list_shift(drawn, change, intent.select.is_some(), top_arrival);
         }
         if self.session.list_label.is_some() {
             self.warm = None;
@@ -2581,16 +2588,16 @@ impl Inbox {
 
     /// Animate the rows from where `drawn` had them to where they are now.
     /// Rows among them that left the list fade out where they were, and
-    /// scroll with the list from there. `replace`: the list is another
-    /// folder's; it fades in and nothing of the old one lingers.
+    /// scroll with the list from there. A different folder fades in.
     fn start_list_shift(
         &mut self,
         drawn: Vec<Drawn>,
-        replace: bool,
+        change: ListChange,
         reveal_selection: bool,
         top_arrival: bool,
     ) {
         let now = self.motion.clock.now();
+        let replace = matches!(change, ListChange::Replace);
         // Ghosts keep their place in the list's content, as of the offset
         // the next frame draws at.
         let offset = self.list_offset();
@@ -2646,7 +2653,12 @@ impl Inbox {
             })
             .collect();
         let mut reach = viewport;
-        let batch = left.len() > 1
+        let change = match change {
+            ListChange::Shift if left.len() > 1 => ListChange::BatchLeave { row_height: ROW_PX },
+            _ => change,
+        };
+        let batch_leave = matches!(change, ListChange::BatchLeave { .. });
+        let batch = batch_leave
             || self
                 .motion
                 .list
@@ -2670,18 +2682,18 @@ impl Inbox {
                 before.extend(arrivals(visible_start..index.min(visible_end), dy));
                 reach = reach.max(-dy);
             }
-            let (after, previous_bottom) = drawn
+            if let Some((index, top)) = drawn
                 .iter()
                 .filter_map(tracked)
                 .max_by_key(|&(index, _)| index)
-                .map_or((0, viewport), |(index, top)| (index + 1, top + ROW_PX));
-            let first = after.max(visible_start);
-            let first_slot = slot(first);
-            let dy =
-                InboxMotion::batch_bottom_arrival_offset(viewport, previous_bottom, first_slot);
-            before.extend(arrivals(first..visible_end, dy));
-            // The last tracked row can itself start past the viewport.
-            reach = reach.max(dy);
+            {
+                let first = (index + 1).max(visible_start);
+                let dy =
+                    InboxMotion::batch_bottom_arrival_offset(viewport, top + ROW_PX, slot(first));
+                before.extend(arrivals(first..visible_end, dy));
+                // The last tracked row can itself start past the viewport.
+                reach = reach.max(dy);
+            }
         }
         // A row that is back (a quick undo) stops fading where it was.
         let mut carried = self.motion.carried_ghosts();
@@ -2706,14 +2718,14 @@ impl Inbox {
             left,
             carried,
             reach,
-            replace,
+            change,
             now,
         )
         .map(|shift| {
             let shift = shift.fading_below(below);
-            if top_arrival {
+            if top_arrival && !batch_leave {
                 shift.top_arrival()
-            } else if reveal_selection && !replace {
+            } else if reveal_selection && !replace && !batch_leave {
                 shift.show_restored_selection()
             } else {
                 shift
@@ -3767,7 +3779,12 @@ impl Inbox {
             self.session.remove_thread(id);
         }
         self.scroll_list_to_cursor();
-        self.start_list_shift(drawn, false, false, false);
+        let change = if ids.len() > 1 {
+            ListChange::BatchLeave { row_height: ROW_PX }
+        } else {
+            ListChange::Shift
+        };
+        self.start_list_shift(drawn, change, false, false);
         self.request_messages(true, cx);
         // The removed row was the last one loaded: load the row after it.
         self.issue_fetch(cx);
@@ -7643,6 +7660,19 @@ fn thread_list(
                 let ids = inbox.session.threads.iter().map(|row| row.id.as_str());
                 inbox.row_widths.keep_drawn(range.clone(), ids);
                 let visible = range.clone();
+                let selection_bands = inbox
+                    .motion
+                    .list
+                    .as_ref()
+                    .filter(|shift| shift.batch_arrivals())
+                    .map(|shift| {
+                        shift
+                            .ghosts()
+                            .iter()
+                            .filter(|ghost| ghost.row.selected && ghost.running(now))
+                            .map(|ghost| (ghost.top, ghost.opacity(now)))
+                            .collect::<Vec<_>>()
+                    });
                 let rows: Vec<_> = range
                     .map(|index| {
                         let row = inbox.session.threads[index].clone();
@@ -7661,7 +7691,7 @@ fn thread_list(
                             .regroup_selection
                             .as_ref()
                             .filter(|fade| selected && fade.selected == row.id);
-                        let look = RowLook {
+                        let mut look = RowLook {
                             content_only: regroup.is_some(),
                             selected,
                             fading: inbox
@@ -7681,8 +7711,6 @@ fn thread_list(
                                 true,
                             ),
                         };
-                        let element =
-                            thread_row(&theme_for_rows, &row, index, &look, text_width, window, cx);
                         let top = index as f32 * ROW_PX + offset;
                         let (moving, ghosts, overflow, batch) = if let Some(shift) =
                             inbox.motion.list.as_mut()
@@ -7754,11 +7782,19 @@ fn thread_list(
                         } else {
                             (RowMotion::STILL, Vec::new(), Vec::new(), false)
                         };
+                        let arrival_bands =
+                            selection_bands.as_deref().filter(|_| moving.opacity < 1.0);
+                        look.content_only |= arrival_bands.is_some();
+                        let element =
+                            thread_row(&theme_for_rows, &row, index, &look, text_width, window, cx);
                         if capture {
                             painted.push(LeavingRow {
                                 row,
                                 index,
-                                look,
+                                look: RowLook {
+                                    content_only: regroup.is_some(),
+                                    ..look
+                                },
                                 top,
                                 motion: moving,
                             });
@@ -7815,6 +7851,16 @@ fn thread_list(
                                     cx,
                                 )))
                                 .child(slot_layer(0.0, progress).child(element))
+                        } else if let Some(bands) = arrival_bands {
+                            batch_arrival_layer(
+                                &theme_for_rows,
+                                index as f32 * ROW_PX,
+                                moving.opacity,
+                                selected,
+                                bands,
+                                element,
+                                window.scale_factor(),
+                            )
                         } else {
                             moving_row_layer(
                                 0.0,
@@ -8016,6 +8062,32 @@ fn fading_row_layer(
     } else {
         slot_layer(top, opacity).child(element)
     }
+}
+
+/// Cover the outgoing ink and carry its selection fill under the new text.
+/// Band tops are in content pixels, like the ghosts they came from.
+fn batch_arrival_layer(
+    theme: &Theme,
+    top: f32,
+    opacity: f32,
+    selected: bool,
+    bands: &[(f32, f32)],
+    element: gpui::AnyElement,
+    scale: f32,
+) -> gpui::Div {
+    let selection = rgb(theme.selection);
+    slot_layer(0.0, 1.0)
+        .bg(rgb(theme.background))
+        .overflow_hidden()
+        .children(bands.iter().filter_map(|&(band_top, alpha)| {
+            let dy = motion::snap(band_top - top, scale);
+            (dy.abs() < ROW_PX).then(|| slot_layer(dy, alpha).bg(selection))
+        }))
+        .child(
+            slot_layer(0.0, opacity)
+                .when(selected, |layer| layer.bg(selection))
+                .child(element),
+        )
 }
 
 /// Paint a row that left, at its last position and with no input handlers.
@@ -14488,7 +14560,7 @@ mod tests {
 
     #[test]
     fn archive_undo_selects_each_restored_row_and_the_first_of_a_batch() {
-        use super::{ListShift, Motion, ROW_PX, restored_folder_key};
+        use super::{ListChange, ListShift, Motion, ROW_PX, restored_folder_key};
         use crate::fixtures::{fixture_account, seed_if_empty};
         use crate::keymap::{KeyId, Keymap};
         use crate::model::{Session, SyncKind};
@@ -14559,7 +14631,7 @@ mod tests {
                 vec![],
                 vec![],
                 640.0,
-                false,
+                ListChange::Shift,
                 first,
             )
             .unwrap()

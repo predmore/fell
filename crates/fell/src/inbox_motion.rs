@@ -2316,7 +2316,7 @@ mod tests {
                 vec![("a", 0.0), ("b", 68.0)],
                 vec![],
                 viewport,
-                false,
+                motion::ListChange::BatchLeave { row_height: 68.0 },
                 now,
             )
             .unwrap();
@@ -2355,7 +2355,7 @@ mod tests {
                 vec![("d", 68.0), ("e", 136.0)],
                 vec![],
                 600.0,
-                false,
+                motion::ListChange::BatchLeave { row_height: 68.0 },
                 now,
             )
             .unwrap();

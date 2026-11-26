@@ -493,6 +493,13 @@ impl<R> Ghost<R> {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum ListChange {
+    Shift,
+    Replace,
+    BatchLeave { row_height: f32 },
+}
+
 /// Where the rows of a fixed-height list were before a change, and how
 /// they travel to where they are now (FLIP: first, last, invert, play).
 ///
@@ -518,6 +525,7 @@ pub struct ListShift<R> {
     resolved: HashMap<String, Option<f32>>,
     ghosts: Vec<Ghost<R>>,
     replaced: bool,
+    batch_leave: bool,
     /// Furthest a row slides; one further away fades in instead.
     reach: f32,
 }
@@ -528,19 +536,26 @@ impl<R: Clone> ListShift<R> {
     /// slide instead of fading). `left`: rows among them that are gone,
     /// with their top in list content as of now. `carried`: ghosts of an
     /// earlier shift still fading, kept so a quick second change does not
-    /// cut them off. `replace`: the list is another one (a folder switch):
-    /// every row arrives in place, and nothing of the old list lingers.
+    /// cut them off. A replacement fades in the new list. A batch leave
+    /// keeps its ghosts even when every tracked row leaves and only slides
+    /// rows within three row heights of their slots.
     pub fn start(
         motion: &Motion,
         before: Vec<(String, f32)>,
         left: Vec<(R, f32)>,
         carried: Vec<Ghost<R>>,
         reach: f32,
-        replace: bool,
+        change: ListChange,
         now: Instant,
     ) -> Option<ListShift<R>> {
         let transition = motion.start(SLIDE, now)?;
-        let replaced = replace || (!before.is_empty() && left.len() == before.len());
+        let batch_leave = matches!(change, ListChange::BatchLeave { .. });
+        let replaced = matches!(change, ListChange::Replace)
+            || (!batch_leave && !before.is_empty() && left.len() == before.len());
+        let reach = match change {
+            ListChange::BatchLeave { row_height } => 3.0 * row_height,
+            _ => reach,
+        };
         let fade = motion.start(FADE, now)?;
         let mut ghosts: Vec<Ghost<R>> = Vec::new();
         if !replaced {
@@ -559,6 +574,7 @@ impl<R: Clone> ListShift<R> {
             resolved: HashMap::new(),
             ghosts,
             replaced,
+            batch_leave,
             reach,
         })
     }
@@ -643,7 +659,7 @@ impl<R: Clone> ListShift<R> {
                 // first surviving row below them. Reveal each slot only
                 // as that row passes it.
                 let reach = self.reach + height;
-                let opening = (!self.replaced)
+                let opening = (!self.replaced && !self.batch_leave)
                     .then(|| {
                         below
                             .into_iter()
@@ -664,7 +680,11 @@ impl<R: Clone> ListShift<R> {
                     // Arriving in a slot nothing slides into (another
                     // folder, a `G` landing): softened, never blinked
                     // through empty.
-                    let duration = if self.replaced { FADE } else { QUICK };
+                    let duration = if self.replaced || self.batch_leave {
+                        FADE
+                    } else {
+                        QUICK
+                    };
                     let arrive = *self
                         .arrive
                         .get_or_insert_with(|| Transition::new(now, duration));
@@ -718,7 +738,15 @@ impl<R: Clone> ListShift<R> {
     }
 
     pub fn has_batch_ghosts(&self) -> bool {
-        !self.replaced && self.ghosts.len() > 1
+        !self.replaced && (self.ghosts.len() > 1 || (self.batch_leave && !self.ghosts.is_empty()))
+    }
+
+    pub fn batch_arrivals(&self) -> bool {
+        self.batch_leave
+    }
+
+    pub fn ghosts(&self) -> &[Ghost<R>] {
+        &self.ghosts
     }
 
     /// Ghost tops relative to this slot, in list content pixels. A single
@@ -790,7 +818,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             640.0,
-            false,
+            ListChange::Shift,
             now,
         )
         .unwrap()
@@ -884,7 +912,7 @@ mod tests {
             vec![],
             vec![],
             600.0,
-            false,
+            ListChange::BatchLeave { row_height: 68.0 },
             now,
         );
         assert!(shift.is_none());
@@ -939,7 +967,11 @@ mod tests {
             left.to_vec(),
             carried,
             600.0,
-            replace,
+            if replace {
+                ListChange::Replace
+            } else {
+                ListChange::Shift
+            },
             now,
         )
         .unwrap()
@@ -1025,7 +1057,7 @@ mod tests {
             vec![],
             vec![],
             300.0,
-            false,
+            ListChange::Shift,
             start,
         )
         .unwrap();
@@ -1045,6 +1077,74 @@ mod tests {
             shift.row("new", 0.0, 68.0, None, at(start, 80)).opacity,
             1.0
         );
+    }
+
+    #[test]
+    fn batch_leaves_slide_up_to_three_rows_and_fade_farther_arrivals() {
+        let start = Instant::now();
+        let h = 68.0;
+        let mut shift = ListShift::start(
+            &Motion::new(true),
+            vec![
+                ("far".into(), 10.0 * h),
+                ("near".into(), 4.0 * h),
+                ("edge".into(), -h),
+            ],
+            vec![("left one", 0.0), ("left two", h)],
+            vec![],
+            800.0,
+            ListChange::BatchLeave { row_height: h },
+            start,
+        )
+        .unwrap();
+        assert_eq!(shift.overscan(h), 3);
+        assert_eq!(
+            shift.row("far", 0.0, h, [("edge", 2.0 * h)], start),
+            RowMotion {
+                dy: 0.0,
+                opacity: ARRIVE_FROM,
+                reveal: None,
+            },
+            "a far survivor fades even when a moving row crosses its slot"
+        );
+        assert_eq!(
+            shift.row("unseen", 3.0 * h, h, None, start).opacity,
+            ARRIVE_FROM
+        );
+        for (id, top, dy) in [("near", h, 3.0 * h), ("edge", 2.0 * h, -3.0 * h)] {
+            assert_eq!(shift.row(id, top, h, None, start).dy, dy);
+            for ms in [0, 16, 60, 120] {
+                let frame = shift.row(id, top, h, None, at(start, ms));
+                assert!(frame.dy.abs() <= 3.0 * h);
+                assert_eq!(frame.opacity, 1.0);
+            }
+        }
+        let mid = at(start, 60);
+        assert!((ARRIVE_FROM..1.0).contains(&shift.row("far", 0.0, h, None, mid).opacity));
+        assert!((0.0..1.0).contains(&shift.ghosts()[0].opacity(mid)));
+        let end = start + FADE;
+        assert_eq!(shift.row("far", 0.0, h, None, end), RowMotion::STILL);
+        assert!(!shift.running(end));
+    }
+
+    #[test]
+    fn batch_leaves_keep_their_ghosts_when_no_tracked_row_survives() {
+        let start = Instant::now();
+        let mut shift = ListShift::start(
+            &Motion::new(true),
+            vec![("a".into(), 0.0), ("b".into(), 68.0)],
+            vec![("a", 0.0), ("b", 68.0)],
+            vec![],
+            136.0,
+            ListChange::BatchLeave { row_height: 68.0 },
+            start,
+        )
+        .unwrap();
+        assert_eq!(
+            shift.row("new", 0.0, 68.0, None, start).opacity,
+            ARRIVE_FROM
+        );
+        assert_eq!(shift.ghosts_for_slot(0.0, 68.0, true, start).len(), 2);
     }
 
     #[test]

@@ -915,7 +915,7 @@ impl Inbox {
                     self.motion.land_selection(self.session.cursor_id.clone());
                     let now = self.motion.clock.now();
                     self.fade_regroup_selection(regroup_previous, now);
-                    self.start_list_shift(drawn, false, false, false);
+                    self.start_list_shift(drawn, ListChange::Shift, false, false);
                 }
                 let same_scope = old_id == self.session.cursor_id
                     && self.session.cursor_id == self.open_thread
