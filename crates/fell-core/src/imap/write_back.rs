@@ -100,24 +100,22 @@ pub(super) fn replay_bound(
     if guard.is_none() && store.db_path().is_some() {
         return Ok(ReplayReport::default());
     }
-    let mut verified = None;
-    if let Some(config_file) = expected
+    let verified = if let Some(config_file) = expected
         && outbox::endpoint::can_resume(store, config_file)?
     {
-        let mut session = WriteSession::open(config)?;
+        let mut connection = ReplayConnection::open(config)?;
         let server = store.observe_imap_server(config_file)?;
-        resume_held(&mut session, store, config_file, &server)?;
-        verified = Some(session);
-    }
+        resume_held(&mut connection.session, store, config_file, &server)?;
+        Some(connection)
+    } else {
+        None
+    };
     let mut entries = outbox::unfinished(store, account_id, write_back, expected)?;
     if !append_sent {
         entries.retain(|entry| entry.kind != OutboxKind::AppendSent);
     }
     let mut report = ReplayReport::default();
     if entries.is_empty() {
-        if let Some(mut session) = verified {
-            session.logout();
-        }
         return Ok(report);
     }
     let now = outbox::now_unix();
@@ -145,25 +143,24 @@ pub(super) fn replay_bound(
         before_send,
         report: &mut report,
     };
-    let result = match verified.map_or_else(|| WriteSession::open(config), Ok) {
-        Ok(mut session) => {
+    let result = match verified.map_or_else(|| ReplayConnection::open(config), Ok) {
+        Ok(mut connection) => {
             if let Some(config) = expected
                 && !store.imap_server_matches(config)?
             {
                 // Bind the authenticated endpoint, then reload the queue
                 // before sending any writes.
                 store.observe_imap_server(config)?;
-                session.logout();
                 return Ok(ReplayReport::default());
             }
-            let result = pass.run(config, &mut session);
-            if !matches!(
+            // Replay can disconnect or leave a Trash delete mark behind.
+            // Enter it with LOGOUT disabled until the outcome is known.
+            connection.logout = false;
+            let result = pass.run(config, &mut connection.session);
+            connection.logout = !matches!(
                 &result,
                 Err(Stop::Connection(_) | Stop::Store(_) | Stop::AppendCheckDisconnected(_))
-            ) && pass.safe_to_logout()
-            {
-                session.logout();
-            }
+            ) && pass.safe_to_logout();
             result
         }
         Err(err)
@@ -216,6 +213,28 @@ pub(super) fn replay_bound(
     }
     report.waiting = entries.len() - settled;
     Ok(report)
+}
+
+struct ReplayConnection {
+    session: WriteSession,
+    logout: bool,
+}
+
+impl ReplayConnection {
+    fn open(config: &ImapConfig) -> crate::Result<Self> {
+        Ok(Self {
+            session: WriteSession::open(config)?,
+            logout: true,
+        })
+    }
+}
+
+impl Drop for ReplayConnection {
+    fn drop(&mut self) {
+        if self.logout {
+            self.session.logout();
+        }
+    }
 }
 
 fn resume_held(

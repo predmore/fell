@@ -568,6 +568,56 @@ fn endpoint_change_releases_resends_or_discards_held_moves() {
 }
 
 #[test]
+fn replay_logs_out_of_resume_session_when_pending_writes_are_in_backoff() {
+    let fx = Fixture::new();
+    let store = &fx.store;
+    let account = &fx.account.id;
+    let original = fx.account_config();
+    store
+        .archive_thread(account, &fx.thread("INBOX", "Alpha"), "INBOX")
+        .unwrap();
+    store
+        .configure_connection(&crate::AccountConfig {
+            port: 1,
+            ..original.clone()
+        })
+        .unwrap();
+    store.configure_connection(&original).unwrap();
+    crate::sync_connection_until(&original, store, &mut |_| {}, None, &|| false).unwrap();
+    store
+        .archive_thread(account, &fx.thread("INBOX", "Bravo"), "INBOX")
+        .unwrap();
+    store
+        .connection()
+        .execute(
+            "UPDATE server_outbox SET retry_unix = ?1 WHERE state = 'pending'",
+            [i64::MAX],
+        )
+        .unwrap();
+    fx.server.writes.lock().unwrap().refuse_select_mailbox = Some("INBOX".into());
+
+    fx.clear_commands();
+    for _ in 0..2 {
+        let report = fx.replay_as_window();
+        assert_eq!(report.waiting, 1);
+        assert_eq!(report.sent, 0);
+        assert!(report.interrupted.is_none());
+        assert_eq!(store.held_write_count(account).unwrap(), 1);
+    }
+    assert_eq!(
+        without_tags(&fx.writes()),
+        [
+            r#"SELECT "INBOX""#,
+            r#"SELECT "Archive""#,
+            r#"SELECT "INBOX""#,
+            r#"SELECT "Archive""#,
+        ]
+    );
+    let commands = without_tags(&fx.commands());
+    assert_eq!(commands.iter().filter(|line| *line == "LOGOUT").count(), 2);
+}
+
+#[test]
 fn resending_uses_the_listed_folder_and_the_current_archive_destination() {
     let fx = Fixture::with(
         Store::open_in_memory().unwrap(),
