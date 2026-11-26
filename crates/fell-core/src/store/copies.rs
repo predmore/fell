@@ -944,6 +944,75 @@ pub(super) fn write_folders(
     Ok(true)
 }
 
+/// Put a verified live source back on a locally moved message. Another
+/// copy in the destination, or a separate move into it, keeps that folder.
+pub(crate) fn restore_move_source(
+    conn: &Connection,
+    account: &AccountId,
+    entry: &crate::outbox::OutboxEntry,
+    mailbox: &str,
+    uidvalidity: u32,
+    uid: u32,
+) -> Result<bool> {
+    let id = MessageId(entry.message_id.clone());
+    let Some((stored, _)) = find_stored(conn, account, &id)? else {
+        return Ok(false);
+    };
+    if let Some(action) = entry.action_id {
+        conn.execute(
+            "DELETE FROM local_folder_tombstones
+             WHERE account_id = ?1 AND action_id = ?2 AND message_id IN (?3, ?4)
+               AND folder = ?5 COLLATE NOCASE",
+            params![
+                account.as_str(),
+                action,
+                id.as_str(),
+                stored.canonical_id,
+                entry.source_folder
+            ],
+        )?;
+    }
+    let source = &entry.source_folder;
+    if crate::actions::tombstoned_folders(conn, account, &stored.canonical_id)?
+        .iter()
+        .any(|folder| folder.eq_ignore_ascii_case(source))
+    {
+        return Ok(false);
+    }
+    link(
+        conn,
+        account,
+        &crate::imap::RemoteCopy {
+            mailbox: crate::imap::escape_mailbox(mailbox),
+            folder: source.clone(),
+            uidvalidity,
+            uid,
+        },
+        &id,
+    )?;
+    let target = &entry.target_folder;
+    let has_target = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM message_copies
+                        WHERE account_id = ?1 AND message_id = ?2 AND folder = ?3 COLLATE NOCASE)
+             OR EXISTS (SELECT 1 FROM local_sent
+                        WHERE account_id = ?1 AND message_id = ?2 AND folder = ?3 COLLATE NOCASE)",
+        params![account.as_str(), stored.canonical_id, target],
+        |row| row.get::<_, bool>(0),
+    )? || moving_into(conn, account, &stored.canonical_id, target)?;
+    let mut folders = split_field(&stored.folders);
+    if !has_target {
+        folders.retain(|folder| !folder.eq_ignore_ascii_case(target));
+    }
+    if !folders
+        .iter()
+        .any(|folder| folder.eq_ignore_ascii_case(source))
+    {
+        folders.push(source.clone());
+    }
+    write_folders(conn, account, &stored, &folders)?;
+    Ok(true)
+}
+
 /// A positive observation on any live copy supplies a star. A pending
 /// change made in Fell wins until the existing write-back path settles it.
 pub(super) fn reconcile_star(

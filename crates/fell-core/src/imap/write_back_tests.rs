@@ -1562,6 +1562,168 @@ fn a_move_whose_message_is_in_neither_folder_waits() {
     assert_eq!((row.state, row.attempts), (OutboxState::Pending, 1));
 }
 
+fn unapplied_move() -> Fixture {
+    let fx = Fixture::new();
+    let bravo = fx.thread("INBOX", "Bravo");
+    fx.store
+        .archive_thread(&fx.account.id, &bravo, "INBOX")
+        .unwrap();
+    fx.server.writes.lock().unwrap().lose_before_move = true;
+    assert!(fx.replay().interrupted.is_some());
+    assert!(fx.store.outbox(&fx.account.id).unwrap()[0].sent);
+    assert!(fx.on_server("Archive").is_empty());
+    assert_eq!(fx.on_server("INBOX").len(), 2);
+    fx.clear_commands();
+    fx
+}
+
+#[test]
+fn an_unapplied_move_retries_only_after_confirming_both_folders() {
+    for advanced in [false, true] {
+        let fx = unapplied_move();
+        if advanced {
+            fx.deliver(
+                "Archive",
+                1,
+                raw_with_message_id("Message-ID: <new@x>\r\n", "New"),
+            );
+        }
+        assert_eq!(fx.replay().waiting, 1);
+        let row = &fx.store.outbox(&fx.account.id).unwrap()[0];
+        assert_eq!(
+            (row.state, row.sent, row.attempts),
+            (OutboxState::Pending, false, 1)
+        );
+        let commands = without_tags(&fx.commands());
+        assert!(
+            commands.contains(&"UID FETCH 2 (UID FLAGS)".into()),
+            "{commands:?}"
+        );
+        assert_eq!(
+            commands.contains(&"UID FETCH 1 (UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])".into()),
+            advanced
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| command.starts_with("UID MOVE"))
+        );
+
+        fx.make_due();
+        assert_eq!(fx.replay().sent, 1);
+        assert_eq!(fx.on_server("INBOX"), vec![(1, "Alpha".into())]);
+        assert_eq!(fx.on_server("Archive").last().unwrap().1, "Bravo");
+        assert_eq!(fx.on_server("Archive").len(), 1 + usize::from(advanced));
+    }
+}
+
+#[test]
+fn giving_up_with_a_live_source_restores_its_folder_and_clears_the_tombstone() {
+    let fx = unapplied_move();
+    fx.server.state.lock().unwrap().mailboxes[1].uidnext =
+        Some(super::write_back::RECOVERY_UID_LIMIT as u32 + 2);
+
+    let dropped = fx.replay_until_dropped();
+    assert_eq!(dropped.len(), 1);
+    assert_eq!(dropped[0].reason, DropReason::MoveRestored);
+    let rows = fx.store.outbox(&fx.account.id).unwrap();
+    assert_eq!((rows[0].state, rows[0].sent), (OutboxState::Dropped, false));
+    assert!(
+        crate::actions::tombstoned_folders(fx.store.connection(), &fx.account.id, "bravo@x")
+            .unwrap()
+            .is_empty()
+    );
+    assert!(fx.copy_recorded("INBOX", 2));
+    assert_eq!(fx.subjects("INBOX"), vec!["Alpha", "Bravo"]);
+    assert!(fx.subjects("Archive").is_empty());
+    assert!(
+        !without_tags(&fx.commands())
+            .iter()
+            .any(|command| command.starts_with("UID MOVE"))
+    );
+    fx.sync();
+    assert_eq!(fx.subjects("INBOX"), vec!["Alpha", "Bravo"]);
+    assert!(fx.subjects("Archive").is_empty());
+    fx.store.undo(&fx.account.id).unwrap();
+    assert_eq!(fx.replay(), Default::default());
+}
+
+#[test]
+fn an_incomplete_destination_fetch_does_not_authorize_a_retry() {
+    let fx = unapplied_move();
+    fx.deliver(
+        "Archive",
+        1,
+        raw_with_message_id("Message-ID: <new@x>\r\n", "New"),
+    );
+    fx.server.writes.lock().unwrap().omit_message_id_header = Some(1);
+    assert_eq!(fx.replay().waiting, 1);
+    assert!(fx.store.outbox(&fx.account.id).unwrap()[0].sent);
+    assert_eq!(fx.on_server("INBOX").len(), 2);
+    assert!(
+        !without_tags(&fx.commands())
+            .iter()
+            .any(|command| command.starts_with("UID MOVE"))
+    );
+}
+
+#[test]
+fn a_reset_source_is_never_treated_as_the_original_uid() {
+    let fx = unapplied_move();
+    fx.server.state.lock().unwrap().mailboxes[0].uidvalidity += 1;
+    let dropped = fx.replay_until_dropped();
+    assert_eq!(dropped.len(), 1);
+    assert_eq!(dropped[0].reason, DropReason::UnconfirmedMove);
+    assert!(fx.store.outbox(&fx.account.id).unwrap()[0].sent);
+    assert!(
+        !without_tags(&fx.commands())
+            .iter()
+            .any(|command| command.starts_with("UID MOVE"))
+    );
+    assert_eq!(fx.subjects("Archive"), vec!["Bravo"]);
+}
+
+#[test]
+fn giving_up_with_the_source_gone_leaves_the_destination_and_undo_waits_for_sync() {
+    for undo_before_give_up in [false, true] {
+        let fx = move_with_lost_reply();
+        fx.server.state.lock().unwrap().mailboxes[1].uidnext =
+            Some(super::write_back::RECOVERY_UID_LIMIT as u32 + 2);
+        if undo_before_give_up {
+            fx.store.undo(&fx.account.id).unwrap();
+        }
+        let dropped = fx.replay_until_dropped();
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].reason, DropReason::MoveSourceGone);
+        if !undo_before_give_up {
+            assert_eq!(fx.subjects("Archive"), vec!["Bravo"]);
+            assert_eq!(fx.subjects("INBOX"), vec!["Alpha"]);
+            fx.store.undo(&fx.account.id).unwrap();
+        }
+        assert!(!fx.copy_recorded("Archive", 1));
+        let waiting = fx.replay();
+        assert_eq!((waiting.sent, waiting.waiting), (0, 1));
+        fx.sync();
+        assert!(fx.copy_recorded("Archive", 1));
+        assert!(!fx.copy_recorded("INBOX", 2));
+        if undo_before_give_up {
+            // If the reverse itself loses its reply before applying, it
+            // retries the Archive UID it already bound from sync.
+            fx.server.writes.lock().unwrap().lose_before_move = true;
+            assert!(fx.replay().interrupted.is_some());
+            assert_eq!(fx.replay().waiting, 1);
+            assert!(!fx.store.outbox(&fx.account.id).unwrap()[1].sent);
+            fx.make_due();
+        }
+        let report = fx.replay();
+        assert_eq!((report.sent, report.waiting), (1, 0));
+        assert!(fx.on_server("Archive").is_empty());
+        fx.sync();
+        assert!(fx.subjects("Archive").is_empty());
+        assert_eq!(fx.subjects("INBOX"), vec!["Alpha", "Bravo"]);
+    }
+}
+
 #[test]
 fn move_recovery_skips_a_uid_span_wider_than_the_limit() {
     let fx = move_with_lost_reply();
@@ -1626,7 +1788,7 @@ fn oversized_move_searches_disconnect_and_exhaust_the_budget_without_stalling_ot
         );
         assert!(commands.iter().all(|command| {
             command != "LOGOUT"
-                && !command.starts_with("UID FETCH")
+                && !command.contains("HEADER.FIELDS")
                 && !command.starts_with("UID MOVE")
         }));
         let rows = fx.store.outbox(&fx.account.id).unwrap();
@@ -1640,9 +1802,12 @@ fn oversized_move_searches_disconnect_and_exhaust_the_budget_without_stalling_ot
         } else {
             assert_eq!(report.waiting, 0);
             assert_eq!(report.dropped.len(), 1);
-            assert_eq!(report.dropped[0].reason, DropReason::UnconfirmedMove);
+            assert_eq!(report.dropped[0].reason, DropReason::MoveSourceGone);
             assert_eq!(rows[0].state, OutboxState::Dropped);
-            assert_eq!(rows[0].error, "Could not confirm the move");
+            assert_eq!(
+                rows[0].error,
+                "Destination UID unconfirmed. The source copy is gone"
+            );
         }
         if check == 1 {
             // Bravo is now backing off. Alpha can move on a fresh session.
@@ -1806,6 +1971,11 @@ fn a_half_done_copy_from_an_earlier_build_is_never_expunged() {
             .is_empty()
     );
     // Undo of that archive has nothing to reverse on the server.
+    // An older build could have already reported it and left sent set.
+    fx.store
+        .connection()
+        .execute("UPDATE server_outbox SET sent = 1", [])
+        .unwrap();
     fx.store.undo(&fx.account.id).unwrap();
     fx.make_due();
     fx.clear_commands();
@@ -1863,7 +2033,7 @@ fn a_move_that_found_nothing_takes_no_look_alike_and_no_older_copy() {
 
     let dropped = fx.replay_until_dropped();
     assert_eq!(dropped.len(), 1);
-    assert_eq!(dropped[0].reason, DropReason::UnconfirmedMove);
+    assert_eq!(dropped[0].reason, DropReason::MoveSourceGone);
     assert_eq!(fx.on_server("Archive").len(), 2);
 }
 
@@ -2020,7 +2190,7 @@ fn a_move_with_no_message_id_and_no_copyuid_is_never_done() {
 
     let dropped = fx.replay_until_dropped();
     assert_eq!(dropped.len(), 1);
-    assert_eq!(dropped[0].reason, DropReason::UnconfirmedMove);
+    assert_eq!(dropped[0].reason, DropReason::MoveSourceGone);
     let row = &fx.store.outbox(&fx.account.id).unwrap()[0];
     assert_eq!(row.state, OutboxState::Dropped);
     // Never recorded as moved, so the copy Fell knows of is still there.
@@ -2090,9 +2260,7 @@ fn an_undo_of_an_unconfirmed_move_sends_no_reverse() {
 
     fx.clear_commands();
     let dropped = fx.replay_until_dropped();
-    assert_eq!(dropped.len(), 1);
-    assert_eq!(dropped[0].reason, DropReason::UnconfirmedMove);
-    // The reverse needs one pass after its predecessor settles.
+    assert!(dropped.is_empty());
     assert_eq!(fx.replay().waiting, 0);
     let rows = fx.store.outbox(&fx.account.id).unwrap();
     assert!(

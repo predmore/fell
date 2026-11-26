@@ -35,6 +35,8 @@ pub(in crate::imap) struct WriteFixture {
     pub lose_append_before_commit: bool,
     /// Drop the connection after this many `UID MOVE` replies.
     pub close_after_moves: Option<u32>,
+    /// Disconnect without applying the next `UID MOVE`.
+    pub lose_before_move: bool,
     /// Apply the next command with this verb (`"MOVE"`), then drop the
     /// connection before any reply.
     pub lose_reply_to: Option<&'static str>,
@@ -160,6 +162,10 @@ pub(super) fn handle(
                 if !writes.moves {
                     format!("{tag} BAD MOVE not offered\r\n")
                 } else {
+                    if std::mem::take(&mut writes.lose_before_move) {
+                        let _ = out.stream.shutdown(std::net::Shutdown::Both);
+                        return true;
+                    }
                     let reply = place(tag, args, &mut state, &writes, true);
                     if let Some(left) = writes.close_after_moves.as_mut() {
                         *left = left.saturating_sub(1);
