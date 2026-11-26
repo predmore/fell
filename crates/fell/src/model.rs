@@ -2043,8 +2043,10 @@ impl Session {
         if self.search_editing() && key != KeyId::CtrlShiftP {
             return self.search_key(key);
         }
-        if key == KeyId::Tab && self.search.is_some() {
-            return self.accept_search_suggestion();
+        if key == KeyId::Tab
+            && let Some(step) = self.try_accept_search_suggestion()
+        {
+            return step;
         }
         // The question is asked once: any key answers it. `y` deletes;
         // Escape and `n` only let it go; any other key does what it does.
@@ -3078,6 +3080,18 @@ impl Session {
                     compose: true,
                     ..Step::default()
                 };
+            }
+            Action::FocusLinks => {
+                self.count.clear();
+                self.leave_attachments();
+                if self.pane == Pane::List
+                    && !self.in_drafts()
+                    && self.cursor_id.is_some()
+                    && self.cursor_draft().is_none()
+                {
+                    self.pane = Pane::Conversation;
+                    self.opened(&mut step);
+                }
             }
             Action::FocusAttachments => {
                 self.count.clear();

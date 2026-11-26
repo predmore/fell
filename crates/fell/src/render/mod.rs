@@ -309,6 +309,8 @@ impl Render for Reader {
         if !self.did_focus {
             self.did_focus = true;
             self.focus.focus(window);
+            cx.on_focus_lost(window, |reader, window, _| reader.focus.focus(window))
+                .detach();
         }
         self.sync_web(window, cx);
         if self.model.mode() == RenderMode::Web && !self.web_failed && !self.web_settled {
@@ -331,8 +333,17 @@ impl Render for Reader {
             .bg(paint(palette.background))
             .text_color(paint(palette.foreground))
             .font_family("Inter")
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 let mods = &event.keystroke.modifiers;
+                if !mods.control && !mods.alt && !mods.platform && event.keystroke.key == "tab" {
+                    if mods.shift {
+                        window.focus_prev();
+                    } else {
+                        window.focus_next();
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
                 if mods.control || mods.alt || mods.platform || mods.shift {
                     return;
                 }

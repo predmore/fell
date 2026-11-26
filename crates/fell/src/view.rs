@@ -9,6 +9,7 @@ mod diagnostics;
 pub(crate) mod disclosure;
 mod help;
 mod notification_actions;
+pub(crate) mod reader_links;
 mod search;
 mod settings;
 mod snooze;
@@ -687,6 +688,7 @@ struct Inbox {
     waiting_for_first_rows: bool,
     waiting_for_inbox_total: bool,
     status_labels: StatusLabels,
+    reader_links: reader_links::ReaderLinks,
     list_scroll: UniformListScrollHandle,
     conv_scroll: ScrollHandle,
     // Keep the extra scroll range on the first preview thread after input,
@@ -810,6 +812,11 @@ impl Inbox {
     ) -> Self {
         let inbox = Self::with_startup(startup, demo, Some(window), cx);
         window.focus(&inbox.focus);
+        cx.on_focus_lost(window, |inbox, window, _| {
+            // A focused link can disappear when its message closes.
+            window.focus(&inbox.focus);
+        })
+        .detach();
         cx.set_global(InboxWindow(window.window_handle()));
         let mut viewport = (window.viewport_size(), window.scale_factor());
         cx.observe_window_bounds(window, move |_, window, cx| {
@@ -928,6 +935,7 @@ impl Inbox {
             waiting_for_first_rows: false,
             waiting_for_inbox_total: false,
             status_labels: StatusLabels::default(),
+            reader_links: reader_links::ReaderLinks::default(),
             store,
             startup_crash: None,
             worker_restart_notice: None,
@@ -4212,9 +4220,36 @@ impl Inbox {
             window.defer(cx, |window, cx| window.draw(cx).clear());
             return;
         }
+        let stroke = &event.keystroke;
+        if self.session.pane == Pane::Conversation
+            && self.session.overlay == Overlay::None
+            && self.session.chord.is_empty()
+            && !stroke.modifiers.control
+            && !stroke.modifiers.alt
+            && !stroke.modifiers.platform
+        {
+            match stroke.key.as_str() {
+                "tab" => {
+                    self.focus_message_links(stroke.modifiers.shift, window, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "escape" if !self.focus.is_focused(window) => {
+                    self.reader_links.pending = None;
+                    self.reader_links.clear_hover();
+                    window.focus(&self.focus);
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
+                _ => {}
+            }
+        }
         let Some(key) = key_from(&event.keystroke) else {
             return;
         };
+        self.reader_links.pending = None;
+        self.reader_links.clear_hover();
         // A held key that started before a prompt appeared cannot confirm it.
         if key == KeyId::Char('y') && event.is_held {
             return;
@@ -4314,6 +4349,12 @@ impl Inbox {
         } = before;
         if pane_before != Pane::Conversation && self.session.pane == Pane::Conversation {
             self.reader_entered_conversation();
+        }
+        if step.action == Some(Action::FocusLinks)
+            && self.session.pane == Pane::Conversation
+            && self.session.overlay == Overlay::None
+        {
+            self.queue_link_focus(false);
         }
         if overlay != Overlay::Help && self.session.overlay == Overlay::Help {
             self.help_scroll = help::HelpScroll::default();
@@ -5440,7 +5481,17 @@ impl Render for Inbox {
                 StatusLabel::new(&self.theme, &self.session, reply_check, width)
             };
         let status_labels = self.status_labels.update(status, self.motion.motion, now);
+        self.update_link_focus(refreshing_body && self.body_refresh.is_empty(), window, cx);
+        let (link_preview, link_fading) = self.reader_links.frame(
+            &self.focus,
+            panes.1 && preview_current && self.session.overlay == Overlay::None,
+            self.motion.motion,
+            now,
+            window,
+            cx,
+        );
         let animating = self.motion.tick(now)
+            | link_fading
             | waiting_for_resize
             | self.note_view.running()
             | self.note_pin.running()
@@ -5662,6 +5713,7 @@ impl Render for Inbox {
                     cached_results: cached_search_rows,
                 },
                 status_labels,
+                link_preview,
                 recipient_popup,
             },
             width,
@@ -5745,6 +5797,7 @@ struct Shown {
     cached_preview: Option<(u64, gpui::AnyView)>,
     list: ListContent,
     status_labels: StatusLabelsFrame,
+    link_preview: reader_links::PreviewFrame,
     recipient_popup: Option<gpui::Deferred>,
 }
 
@@ -5899,6 +5952,7 @@ fn observe_wheel(scroll: ScrollHandle, showing: bool, cx: &mut Context<Inbox>) -
                             if !moved {
                                 return;
                             }
+                            inbox.reader_links.clear_hover();
                             inbox.reader_took_over(false);
                         } else {
                             inbox.reveal.cancel_pending();
@@ -5946,6 +6000,7 @@ fn shell(
         cached_preview,
         list,
         status_labels,
+        link_preview,
         recipient_popup,
     } = shown;
     let frames = conv.frames.clone();
@@ -6223,6 +6278,7 @@ fn shell(
             session,
             status,
             status_labels,
+            link_preview,
             width,
             window,
         ))
@@ -10031,7 +10087,11 @@ fn stored_message_body(
             // A draft's markdown is painted as its compose window shows it.
             let palette = mail_body::palette(theme);
             let quiet = mail_body::history_palette(theme);
-            let mut runs: Vec<(usize, Option<fell_render::Fold>, Vec<&str>)> = Vec::new();
+            let mut runs: Vec<(
+                usize,
+                Option<fell_render::Fold>,
+                Vec<&crate::text_render::PlainText>,
+            )> = Vec::new();
             let body = match &message.rich {
                 Rich::PlainPart(plain) => plain,
                 _ => &message.body,
@@ -10047,15 +10107,13 @@ fn stored_message_body(
             );
             for (at, block) in body.blocks.iter().enumerate() {
                 let (kind, text) = match block {
-                    BodyBlock::Text(text) => (None, text.as_str()),
+                    BodyBlock::Text(text) => (None, text),
                     BodyBlock::List(_) | BodyBlock::Markdown { .. } => {
                         runs.push((at, None, Vec::new()));
                         continue;
                     }
-                    BodyBlock::Quote(text) => (Some(fell_render::Fold::Quote), text.as_str()),
-                    BodyBlock::Signature(text) => {
-                        (Some(fell_render::Fold::Signature), text.as_str())
-                    }
+                    BodyBlock::Quote(text) => (Some(fell_render::Fold::Quote), text),
+                    BodyBlock::Signature(text) => (Some(fell_render::Fold::Signature), text),
                 };
                 match (runs.last_mut(), kind) {
                     (Some((_, Some(above), texts)), Some(next)) => {
@@ -10081,37 +10139,46 @@ fn stored_message_body(
                                 &palette,
                                 false,
                                 &crate::render::ImageGallery::default(),
-                                folds.columns.blocks(folds.fill),
+                                folds.columns.blocks(folds.fill).with_links(folds.live),
                                 crate::render::BLOCK_GAP,
                                 &markers,
                             )
                             .line_height(px(theme.ui_px * 1.45)),
                         )
                         .into_any_element(),
-                    None => {
-                        let text = texts.concat();
-                        folds.columns.flow(
-                            |columns| columns.prose,
-                            |_, _| {
-                                div()
-                                    .pb(px(8.))
-                                    .line_height(px(theme.ui_px * 1.45))
-                                    .map(|block| match &body.blocks[at] {
-                                        BodyBlock::Markdown { doc, agent } => block.child(
-                                            crate::compose_ui::render_draft_doc(doc, *agent, theme),
-                                        ),
-                                        _ => block.child(crate::render::plain_text(
-                                            text.clone(),
+                    None => folds.columns.flow(
+                        |columns| columns.prose,
+                        |_, live| {
+                            div()
+                                .pb(px(8.))
+                                .line_height(px(theme.ui_px * 1.45))
+                                .map(|block| match &body.blocks[at] {
+                                    BodyBlock::Markdown { doc, agent } => block.child(
+                                        crate::compose_ui::render_draft_doc(doc, *agent, theme),
+                                    ),
+                                    BodyBlock::Text(text) => {
+                                        block.child(crate::render::plain_text(
+                                            text,
                                             palette,
-                                        )),
-                                    })
-                                    .into_any_element()
-                            },
-                        )
-                    }
+                                            at,
+                                            folds.live && live,
+                                        ))
+                                    }
+                                    _ => block,
+                                })
+                                .into_any_element()
+                        },
+                    ),
                     Some(kind) => {
-                        let text = texts.join("\n\n");
-                        let lines = text.lines().filter(|line| !line.trim().is_empty()).count();
+                        let lines = texts
+                            .iter()
+                            .flat_map(|text| text.lines())
+                            .filter(|line| !line.trim().is_empty())
+                            .count();
+                        let rtl = texts
+                            .iter()
+                            .find(|text| text.chars().any(char::is_alphabetic))
+                            .is_some_and(|text| crate::render::is_right_to_left(text));
                         let line_height = px(theme.ui_px * 1.4);
                         fold_section(
                             theme,
@@ -10119,7 +10186,7 @@ fn stored_message_body(
                                 kind,
                                 lines,
                                 show_key: Some(run) == first_hidden,
-                                rtl: crate::render::is_right_to_left(&text),
+                                rtl,
                             },
                             folds,
                             (folds.columns.moving_prose(), folds.columns.pane_right),
@@ -10127,16 +10194,24 @@ fn stored_message_body(
                             || {
                                 folds.columns.flow(
                                     |columns| columns.prose,
-                                    |_, _| {
-                                        history_rule(
-                                            div(),
-                                            crate::render::is_right_to_left(&text),
-                                            crate::theme::strong_border(theme),
-                                        )
-                                        .text_color(rgb(theme.dimmed))
-                                        .line_height(line_height)
-                                        .child(crate::render::plain_text(text.clone(), quiet))
-                                        .into_any_element()
+                                    |_, live| {
+                                        history_rule(div(), rtl, crate::theme::strong_border(theme))
+                                            .text_color(rgb(theme.dimmed))
+                                            .line_height(line_height)
+                                            .flex()
+                                            .flex_col()
+                                            .gap(line_height)
+                                            .children(texts.iter().enumerate().map(
+                                                |(index, text)| {
+                                                    crate::render::plain_text(
+                                                        text,
+                                                        quiet,
+                                                        at + index,
+                                                        folds.live && folds.open && live,
+                                                    )
+                                                },
+                                            ))
+                                            .into_any_element()
                                     },
                                 )
                             },
@@ -10178,7 +10253,9 @@ fn html_sections(
         .map(|(at, section)| {
             let rtl = body.rtl.get(at).copied().unwrap_or(false);
             let blocks = folded.blocks(section);
-            let layout = columns.blocks(folds.fill);
+            let layout = columns
+                .blocks(folds.fill)
+                .with_links(folds.live && (section.fold.is_none() || folds.open));
             match section.fold {
                 // A quote the sender answers under it: open, under the
                 // history rule, in the dimmed colour.
@@ -10915,6 +10992,7 @@ fn status_bar(
     session: &Session,
     status: StatusMotion,
     labels: StatusLabelsFrame,
+    link_preview: reader_links::PreviewFrame,
     width: f32,
     window: &Window,
 ) -> gpui::Div {
@@ -11117,6 +11195,11 @@ fn status_bar(
             .when(hint_opacity < 1.0, |hints| hints.opacity(hint_opacity))
             .child(format!("{count}{hint}"))
     });
+    let link_preview = link_preview.filter(|_| hints.is_none() && (!narrow || !status_has_details));
+    let link_opacity = link_preview.as_ref().map_or(0.0, |(_, alpha)| *alpha);
+    let link_layer = link_preview
+        .map(|(preview, alpha)| (preview, alpha * (1.0 - status.notice_slot)))
+        .filter(|(_, alpha)| *alpha > 0.0);
     let text = status
         .leaving
         .filter(|(_, opacity)| *opacity > 0.0)
@@ -11183,13 +11266,65 @@ fn status_bar(
                             .inset_0()
                             .flex()
                             .items_center()
-                            .opacity(status.sync)
+                            .opacity(status.sync * (1.0 - link_opacity))
                             .child(narrow_sync.unwrap().min_w_0().truncate()),
                     )
                 })
                 .when_some(text, |cell, (toast, opacity, dy)| {
                     cell.child(notice_text(&toast, opacity, dy))
-                }),
+                })
+                .children(link_layer.map(|(preview, alpha)| {
+                    // Keep the right slot clear of the link action notices
+                    // throughout the fade, including the first and last frame.
+                    let notice_room = bar_px(window, reader_links::OPEN_FAILED, size, ui).ceil();
+                    let link_room = width - used - notice_room - gap - 2.;
+                    let title_width = bar_px(window, &preview.destination, size, ui)
+                        + dot_width
+                        + 8.
+                        + if preview.mismatch {
+                            bar_px(window, "Opens", size, ui) + 4.
+                        } else {
+                            0.
+                        };
+                    let url = clip_line(
+                        window,
+                        &conversation_line_style(window, theme, px(size)),
+                        &preview.target,
+                        (link_room - title_width).max(0.).floor(),
+                        FontWeight::NORMAL,
+                    );
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_end()
+                        .opacity(alpha)
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex()
+                                .items_center()
+                                .gap(px(4.))
+                                .text_color(rgb(theme.dimmed))
+                                .when(preview.mismatch, |line| {
+                                    line.child(div().flex_none().child("Opens"))
+                                })
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .whitespace_nowrap()
+                                        .text_color(rgb(if preview.mismatch {
+                                            theme.error
+                                        } else {
+                                            theme.foreground
+                                        }))
+                                        .child(preview.destination),
+                                )
+                                .child(div().flex_none().child("·"))
+                                .child(div().whitespace_nowrap().child(url)),
+                        )
+                })),
         )
         .map(|bar| match hints {
             Some(hints) if !noticed => bar.child(hints),
@@ -12486,7 +12621,17 @@ mod tests {
         cx.draw(
             point(px(0.), px(0.)),
             size(px(width), px(30.)),
-            |window, _| super::status_bar(theme, session, status, labels, width, window),
+            |window, _| {
+                super::status_bar(
+                    theme,
+                    session,
+                    status,
+                    labels,
+                    Default::default(),
+                    width,
+                    window,
+                )
+            },
         );
         (
             STATUS_NOTICE_TEXT.take().unwrap(),
