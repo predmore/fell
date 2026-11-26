@@ -810,11 +810,24 @@ pub fn contrast(a: u32, b: u32) -> f64 {
 }
 
 fn picker_match(dim: u32, accent: u32, row: u32, dark: bool) -> (u32, u32) {
+    const MATCH_CONTRAST: f64 = 1.3;
     let dim = ensure(dim, row, if dark { TEXT_CONTRAST } else { 6.0 });
     // Increase the match's contrast against the row until it is also
     // distinguishable in luminance from the surrounding label text.
-    let accent = ensure(accent, row, 1.3 * contrast(dim, row));
-    (dim, accent)
+    let target = MATCH_CONTRAST * contrast(dim, row);
+    let matched = ensure(accent, row, target);
+    if contrast(matched, row) >= target {
+        return (dim, matched);
+    }
+
+    // The match is already black or white. Fade the label toward the row,
+    // stopping at the AA limit if there is too little room for 1.3:1.
+    let quietest = fade_toward(matched, row);
+    let dim = push_toward(dim, matched, MATCH_CONTRAST, quietest)
+        .map(|(color, _)| color)
+        .filter(|&color| contrast(color, row) >= TEXT_CONTRAST)
+        .unwrap_or(quietest);
+    (dim, matched)
 }
 
 pub(crate) fn mix(a: u32, b: u32, t: f64) -> u32 {
@@ -1236,6 +1249,33 @@ mod tests {
                     assert!(luminance(matched) < luminance(dim), "{}", theme.name);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn picker_matches_stay_distinct_on_gray_selections_in_light_themes() {
+        let fonts = Fonts {
+            ui_family: None,
+            ui_px: 15.0,
+            mono_family: None,
+            mono_px: 13.0,
+        };
+        for (selection, can_separate) in [(0x767676, false), (0x939393, true)] {
+            let palette = format!(
+                "mode = \"light\"\nbackground = \"#ffffff\"\nforeground = \"#000000\"\naccent = \"#1e66f5\"\nselection = \"#{selection:06x}\"\n"
+            );
+            let theme = theme_from_palette(&palette, &fonts, "gray selection".into()).unwrap();
+            assert_eq!(theme.selection, selection);
+            let (dim, matched) = theme.selected_picker_match;
+            let separation = contrast(dim, matched);
+            assert!(contrast(dim, selection) >= TEXT_CONTRAST);
+            assert_eq!(matched, 0x000000);
+            assert!(separation > 1.0, "#{selection:06x}: {separation:.3}");
+            assert_eq!(
+                separation >= 1.3,
+                can_separate,
+                "#{selection:06x}: {separation:.3}"
+            );
         }
     }
 }

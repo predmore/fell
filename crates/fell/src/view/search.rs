@@ -2036,6 +2036,12 @@ fn clipped_subject_repeats_match(
     else {
         return false;
     };
+    let Some(remainder) = subject.strip_prefix(visible_subject) else {
+        return false;
+    };
+    if remainder.starts_with(char::is_alphanumeric) {
+        return false;
+    }
     let visible_subject = visible_subject.to_lowercase();
     let fitted_excerpt = fitted_excerpt.strip_suffix('…').unwrap_or(fitted_excerpt);
     highlights.iter().any(|range| {
@@ -2334,6 +2340,7 @@ mod tests {
         let matches = [4..10, 18..26];
         for (full, fitted, excerpt, repeats) in [
             (subject, "Survey…", excerpt, true),
+            ("Surveying the coast", "Survey…", excerpt, false),
             (subject, "Survey p…", excerpt, false),
             (subject, "Surv…", excerpt, false),
             (subject, "Survey…", "The surv…", false),
