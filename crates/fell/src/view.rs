@@ -817,6 +817,7 @@ struct Inbox {
     retired: bool,
     compose_ready: futures::future::Shared<futures::channel::oneshot::Receiver<()>>,
     account_arrival: Option<Transition>,
+    ignore_enter_until: Option<Instant>,
     /// Visible label rows as they looked in the last list prepaint.
     painted_label_rows: Vec<LeavingRow>,
     leaving_rows: Option<Arc<[LeavingRow]>>,
@@ -1050,6 +1051,7 @@ impl Inbox {
             retired: false,
             compose_ready: futures::FutureExt::shared(compose_ready),
             account_arrival: None,
+            ignore_enter_until: None,
             painted_label_rows: Vec::new(),
             leaving_rows: None,
             leaving_reader: None,
@@ -1100,6 +1102,32 @@ impl Inbox {
         inbox.watch_notes(cx);
         inbox.watch_dates(cx);
         inbox
+    }
+
+    fn adopt_account_view(&mut self, previous: &Self) {
+        let mut session = previous.session.clone();
+        session.reset_after_account_reload();
+        session.account_name = std::mem::take(&mut self.session.account_name);
+        session.account_email = std::mem::take(&mut self.session.account_email);
+        session.startup_error = self.session.startup_error.take();
+        session.sync = self.session.sync.clone();
+        self.session = session;
+        self.open_thread.clone_from(&previous.open_thread);
+        self.open_subject.clone_from(&previous.open_subject);
+        self.list_scroll = previous.list_scroll.clone();
+        self.conv_scroll = previous.conv_scroll.clone();
+        self.preview_laid_out = previous.preview_laid_out;
+        self.reveal = previous.reveal;
+        self.split = previous.split;
+        self.frames.clone_from(&previous.frames);
+    }
+
+    fn account_opacity(&self, now: Instant) -> f32 {
+        motion::lerp(
+            motion::ARRIVE_FROM,
+            1.0,
+            motion::progress(self.account_arrival.as_ref(), now),
+        )
     }
 
     fn refresh_reply_checks(&self, ids: Vec<fell_core::MessageId>, cx: &mut Context<Self>) {
@@ -4441,6 +4469,12 @@ impl Inbox {
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let started = Instant::now();
+        if key_from(&event.keystroke) == Some(KeyId::Enter)
+            && (event.is_held || self.ignore_enter_until.is_some_and(|until| started < until))
+        {
+            cx.stop_propagation();
+            return;
+        }
         if self.reveal == Reveal::Preview {
             self.reader_took_over(false);
             cx.notify();
@@ -4494,6 +4528,7 @@ impl Inbox {
             log.borrow_mut().key(started, event.keystroke.unparse());
         }
         // Input never waits on an animation.
+        self.account_arrival = None;
         self.settle_motion();
         self.regroup_motion = None;
         self.regroup_selection = None;
@@ -5765,7 +5800,9 @@ impl Render for Inbox {
             cx,
         );
         let (merge_feedback, merge_animating) = self.merge_feedback(real);
+        self.account_arrival = self.account_arrival.filter(|fade| fade.running(now));
         let animating = self.motion.tick(now)
+            | self.account_arrival.is_some_and(|fade| fade.running(now))
             | link_fading
             | waiting_for_resize
             | self.note_view.running()
@@ -5973,6 +6010,7 @@ impl Render for Inbox {
         let background = theme.background;
         let leaving_banner = self.motion.leaving_banner(now);
         let recipient_popup = self.search_recipient_popup(window, cx);
+        let account_opacity = self.account_opacity(now);
         let root = shell(
             theme,
             &self.session,
@@ -5997,13 +6035,7 @@ impl Render for Inbox {
                 status_labels,
                 link_preview,
                 recipient_popup,
-                account_opacity: {
-                    self.account_arrival = self.account_arrival.filter(|fade| fade.running(now));
-                    self.account_arrival.map_or(1.0, |fade| {
-                        window.request_animation_frame();
-                        motion::lerp(motion::ARRIVE_FROM, 1.0, fade.progress(now))
-                    })
-                },
+                account_opacity,
             },
             width,
             (list_width, split_width),

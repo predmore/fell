@@ -602,6 +602,13 @@ pub struct Session {
 }
 
 impl Session {
+    pub fn reset_after_account_reload(&mut self) {
+        self.fetch = None;
+        self.pending = None;
+        self.cancel_read_delay();
+        self.worker_outages.clear();
+    }
+
     pub fn new(
         account_name: impl Into<String>,
         account_email: impl Into<String>,
@@ -1142,8 +1149,7 @@ impl Session {
                 .account_choices
                 .iter()
                 .filter(|choice| {
-                    choice.name.to_ascii_lowercase().contains(&query)
-                        || choice.title.to_ascii_lowercase().contains(&query)
+                    choice.title.to_ascii_lowercase().contains(&query)
                         || choice
                             .detail
                             .as_deref()
@@ -2271,19 +2277,27 @@ impl Session {
     }
 
     fn settings_key(&mut self, key: KeyId, page_rows: usize) -> Step {
-        use settings::{Page, Request, Row, Section};
+        use settings::{AccountRemovalKind, Page, Request, Row, Section};
 
-        if let Page::ConfirmAccountRemoval { delete } = self.settings_nav.page {
-            let request = match (delete, key) {
-                (_, KeyId::Escape | KeyId::Char('n')) => {
+        if let Page::ConfirmAccountRemoval { delete, kind } = self.settings_nav.page {
+            let request = match (delete, kind, key) {
+                (_, _, KeyId::Escape | KeyId::Char('n')) => {
                     self.settings_nav.back();
                     None
                 }
-                (false, KeyId::Char('d')) => {
-                    self.settings_nav.page = Page::ConfirmAccountRemoval { delete: true };
+                (false, AccountRemovalKind::Account, KeyId::Char('d'))
+                | (false, AccountRemovalKind::Interrupted { .. }, KeyId::Char('f')) => {
+                    self.settings_nav.page = Page::ConfirmAccountRemoval { delete: true, kind };
                     None
                 }
-                (false, KeyId::Enter | KeyId::Space) | (true, KeyId::Char('y')) => {
+                (
+                    false,
+                    AccountRemovalKind::Account
+                    | AccountRemovalKind::Interrupted { can_restore: true },
+                    KeyId::Enter | KeyId::Space,
+                )
+                | (false, AccountRemovalKind::BrokenFile, KeyId::Char('y'))
+                | (true, _, KeyId::Char('y')) => {
                     self.settings_nav.page = Page::Section(Section::Accounts);
                     Some(Request::RemoveAccount { delete })
                 }
@@ -2400,7 +2414,10 @@ impl Session {
                 };
                 index.map(|index| {
                     self.settings_nav.select_row(Row::Account(index));
-                    self.settings_nav.page = Page::ConfirmAccountRemoval { delete: false };
+                    self.settings_nav.page = Page::ConfirmAccountRemoval {
+                        delete: false,
+                        kind: settings::AccountRemovalKind::Account,
+                    };
                     Request::ConfirmAccountRemoval(index)
                 })
             }

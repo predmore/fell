@@ -149,6 +149,14 @@ pub struct AccountConfig {
     pub notifications: NotificationMode,
 }
 
+impl AccountConfig {
+    pub fn same_except_identities(&self, other: &Self) -> bool {
+        let mut current = self.clone();
+        current.identities.clone_from(&other.identities);
+        &current == other
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NotificationMode {
     #[default]

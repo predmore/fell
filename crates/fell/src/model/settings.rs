@@ -123,10 +123,18 @@ pub enum Page {
     IdentityImport,
     ConfirmAccountRemoval {
         delete: bool,
+        kind: AccountRemovalKind,
     },
     ConfirmModel {
         install: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccountRemovalKind {
+    Account,
+    BrokenFile,
+    Interrupted { can_restore: bool },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -237,10 +245,13 @@ impl Nav {
             }
             Page::Bindings => self.select_row(Row::EffectiveBindings),
             Page::IdentityImport => self.select_row(Row::ImportIdentities),
-            Page::ConfirmAccountRemoval { delete: true } => {
-                self.page = Page::ConfirmAccountRemoval { delete: false };
+            Page::ConfirmAccountRemoval { delete: true, kind } => {
+                self.page = Page::ConfirmAccountRemoval {
+                    delete: false,
+                    kind,
+                };
             }
-            Page::ConfirmAccountRemoval { delete: false } => {
+            Page::ConfirmAccountRemoval { delete: false, .. } => {
                 self.page = Page::Section(Section::Accounts);
             }
             Page::ConfirmModel { install } => {

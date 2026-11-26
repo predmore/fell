@@ -368,7 +368,8 @@ pub(crate) fn save_account(
 }
 
 fn list() -> Result<(), String> {
-    let accounts = Registry::resolve().map_err(|err| err.to_string())?.load();
+    let registry = Registry::resolve().map_err(|err| err.to_string())?;
+    let accounts = registry.load_with_removals(&crate::mailbox::store_path()?);
     if accounts.is_empty() {
         println!("No accounts configured.");
     }
@@ -376,6 +377,13 @@ fn list() -> Result<(), String> {
         eprintln!("{error}");
     }
     for entry in accounts.entries {
+        if accounts
+            .interrupted
+            .iter()
+            .any(|pending| registry.path(&pending.id).as_ref() == Ok(&entry.path))
+        {
+            continue;
+        }
         match entry.config {
             Ok(config) => println!("{}\t{}", config.id, config.email),
             Err(error) => println!(
@@ -384,40 +392,79 @@ fn list() -> Result<(), String> {
             ),
         }
     }
+    for pending in accounts.interrupted {
+        println!("{}\t{} · Delete interrupted", pending.id, pending.name);
+    }
     Ok(())
 }
 
 fn remove(id: &str) -> Result<(), String> {
+    use fell_core::accounts::RemovalOutcome;
+
     let registry = Registry::resolve().map_err(|err| err.to_string())?;
     let path = registry.path(id).map_err(|err| err.to_string())?;
-    registry.migrate().map_err(|err| err.to_string())?;
     let base = crate::mailbox::store_path()?;
+    let catalog = registry.load_with_removals(&base);
+    let pending = catalog.interrupted.iter().find(|pending| pending.id == id);
+    let entry = catalog.entries.iter().find(|entry| entry.path == path);
+    let name = pending
+        .map(|pending| pending.name.clone())
+        .or_else(|| {
+            entry?
+                .config
+                .as_ref()
+                .ok()
+                .map(|config| config.account().display_name)
+        })
+        .unwrap_or_else(|| id.to_owned());
+    if let Some(entry) = entry
+        && pending.is_none()
+        && entry.config.is_err()
+    {
+        registry.remove_broken_file(
+            &path,
+            entry.file_identity.ok_or("The account file changed.")?,
+        )?;
+        println!("Deleted {id}.toml.");
+        return Ok(());
+    }
     let store = registry
         .mailbox_path(&base, id)
         .map_err(|err| err.to_string())?;
-    let finishing_delete = registry.store_path(&base, id).is_err();
-    if !finishing_delete
-        && !path
-            .symlink_metadata()
-            .is_ok_and(|meta| meta.is_file() || meta.is_symlink())
-    {
+    if pending.is_none() && entry.is_none() {
         return Err(format!("No account file for {id:?}"));
     }
-    let delete = finishing_delete
-        || (store.is_file()
-            && io::stdin().is_terminal()
-            && matches!(
-                prompt(
-                    "Delete the local mail, drafts and grants for this account? [y/N]",
-                    Some("")
-                )?
-                .to_ascii_lowercase()
-                .as_str(),
-                "y" | "yes"
+    let question = if pending.is_some() {
+        "Finish deleting local mail and drafts? [y/N]"
+    } else {
+        "Delete the local mail, drafts and grants for this account? [y/N]"
+    };
+    let delete = (pending.is_some() || store.is_file())
+        && io::stdin().is_terminal()
+        && matches!(
+            prompt(question, Some(""))?.to_ascii_lowercase().as_str(),
+            "y" | "yes"
+        );
+    let expected = entry.and_then(|entry| entry.file_identity);
+    let outcome = if let Some(pending) = pending {
+        if !delete && !pending.can_restore {
+            return Err(format!(
+                "Delete interrupted for {name}. Confirm Finish deleting in Settings → Accounts."
             ));
-    registry.remove(&base, id, delete)?;
-    let local = if delete { "deleted" } else { "kept" };
-    println!("Removed {id}. Local mail {local}.");
+        }
+        registry.recover_removal(&base, id, delete, expected)?
+    } else {
+        registry.remove_if_unchanged(&base, id, delete, expected)?
+    };
+    match outcome {
+        RemovalOutcome::Kept => println!("Removed {name}. Local mail kept."),
+        RemovalOutcome::Deleted => println!("Removed {name}. Local mail deleted."),
+        RemovalOutcome::Restored { connected: true } => println!("Restored local mail for {name}."),
+        RemovalOutcome::Restored { connected: false } => {
+            println!("Restored local mail for {name}. The account is disconnected.")
+        }
+        RemovalOutcome::Cleared => println!("Cleared the interrupted removal for {name}."),
+    }
     Ok(())
 }
 

@@ -37,14 +37,18 @@ pub struct Opened {
 
 pub fn startup() -> Startup {
     let registry = Registry::resolve();
-    let accounts = registry.as_ref().ok().map(Registry::load);
+    let base = store_path();
+    let accounts = registry.as_ref().ok().map(|registry| match &base {
+        Ok(base) => registry.load_with_removals(base),
+        Err(_) => registry.load(),
+    });
     let config = accounts
         .as_ref()
         .and_then(|accounts| accounts.default_config())
         .cloned();
     let account_missing = accounts.as_ref().is_some_and(accounts::Accounts::is_empty);
     let config_error = registry.as_ref().err().map(ToString::to_string);
-    let path = store_path().and_then(|base| match (&registry, &config) {
+    let path = base.and_then(|base| match (&registry, &config) {
         (Ok(registry), Some(config)) => registry
             .store_path(&base, &config.id)
             .map_err(|err| err.to_string()),
@@ -95,7 +99,7 @@ pub fn open_registered_store(
             .get(&account)
             .map_err(|err| err.to_string())?
             .as_ref()
-            != Some(config)
+            .is_none_or(|current| !config.same_except_identities(&current))
         {
             return Err("The account file changed while opening the mailbox.".into());
         }
@@ -146,12 +150,12 @@ pub(crate) fn next_account_id() -> Result<String, String> {
             format!("mail-{number}")
         };
         let path = registry.path(&id).map_err(|err| err.to_string())?;
-        if !path.symlink_metadata().is_ok()
-            && (number == 1
-                || !registry
-                    .store_path(&base, &id)
-                    .map_err(|err| err.to_string())?
-                    .exists())
+        let mailbox = registry
+            .mailbox_path(&base, &id)
+            .map_err(|err| err.to_string())?;
+        if path.symlink_metadata().is_err()
+            && registry.store_path(&base, &id).is_ok()
+            && (number == 1 || !mailbox.exists())
         {
             return Ok(id);
         }
