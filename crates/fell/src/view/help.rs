@@ -168,12 +168,16 @@ pub(super) struct Layout {
 }
 
 impl Layout {
-    /// The clip keeps the banner's gap only while part of it is in view, so a
-    /// resting row past the banner fills the clip flush at both edges. The
-    /// card keeps its height, and the spare space becomes bottom padding.
+    /// The clip grows by the banner's gap only as far as the gap is in view,
+    /// entering at the bottom or leaving at the top, so every resting offset
+    /// fills the clip with whole lines. The card keeps its height, and the
+    /// spare space becomes bottom padding.
     fn clip_height(&self, offset: f32) -> f32 {
-        let gap_bottom = self.detail_rows as f32 * self.row + self.detail_gap;
-        self.page as f32 * self.row + (gap_bottom - offset).clamp(0., self.detail_gap)
+        let page = self.page as f32 * self.row;
+        let gap_top = self.detail_rows as f32 * self.row;
+        let entered = (offset + page - gap_top).clamp(0., self.detail_gap);
+        let remaining = (gap_top + self.detail_gap - offset).clamp(0., self.detail_gap);
+        page + entered.min(remaining)
     }
 
     fn last_offset(&self) -> f32 {
@@ -418,20 +422,20 @@ fn card(
                 )
                 .when(last > 0., |viewport| {
                     // This gutter is reserved at every scroll position.
-                    let thumb = thumb_height(clip, layout.page, layout.total, theme.ui_px);
+                    let thumb = thumb_height(body, layout.page, layout.total, theme.ui_px);
                     viewport.child(
                         div()
                             .absolute()
                             .right(px(9.))
                             .top(px(INSET))
                             .w(px(4.))
-                            .h(px(clip))
+                            .h(px(body))
                             .rounded_full()
                             .bg(rgb(theme.border))
                             .child(
                                 div()
                                     .absolute()
-                                    .top(px((clip - thumb) * (offset / last)))
+                                    .top(px((body - thumb) * (offset / last)))
                                     .w_full()
                                     .h(px(thumb))
                                     .rounded_full()
@@ -639,25 +643,44 @@ mod tests {
     }
 
     #[test]
-    fn resting_rows_fill_the_clip_after_the_detail_banner_leaves() {
-        let layout = Layout::measure(
-            15.,
-            gpui::size(px(520.), px(720.)),
-            &Keymap::default(),
-            Some(("A full detail line".into(), true)),
-            |_, _| 1,
-        );
-        let page = layout.page as f32 * layout.row;
-        let content = layout.total as f32 * layout.row + DETAIL_GAP;
-        assert_eq!(layout.clip_height(0.), page + DETAIL_GAP);
-        let last = layout.total - layout.page;
-        for target in layout.detail_rows..=last {
-            let offset = scroll_px(target, layout.row, layout.detail_rows, DETAIL_GAP);
-            assert_eq!(layout.clip_height(offset), page, "{target}");
-            assert!(offset + page <= content, "{target}");
+    fn every_resting_offset_fills_the_clip_with_whole_lines() {
+        for banner_lines in [1, 20] {
+            let layout = Layout::measure(
+                15.,
+                gpui::size(px(520.), px(720.)),
+                &Keymap::default(),
+                Some(("A detail banner".into(), true)),
+                |_, _| banner_lines,
+            );
+            let (row, banner) = (layout.row, layout.detail_rows as f32 * layout.row);
+            let content = layout.total as f32 * row + DETAIL_GAP;
+            // Line edges in content coordinates: banner lines, then shortcut
+            // rows below the gap.
+            let on_edge = |y: f32| {
+                let lines = if y <= banner {
+                    y
+                } else {
+                    y - banner - DETAIL_GAP
+                };
+                lines >= 0. && (lines / row - (lines / row).round()).abs() < 1e-4
+            };
+            let last = layout.total - layout.page;
+            for target in 0..=last {
+                let offset = scroll_px(target, row, layout.detail_rows, DETAIL_GAP);
+                let bottom = offset + layout.clip_height(offset);
+                assert!(on_edge(offset), "{banner_lines} lines, target {target} top");
+                assert!(
+                    on_edge(bottom) || (bottom - banner - DETAIL_GAP).abs() < 1e-4,
+                    "{banner_lines} lines, target {target} bottom {bottom}"
+                );
+                assert!(
+                    bottom <= content + 1e-4,
+                    "{banner_lines} lines, target {target}"
+                );
+            }
+            let bottom = layout.last_offset();
+            assert_eq!(bottom + layout.clip_height(bottom), content);
         }
-        let bottom = layout.last_offset();
-        assert_eq!(bottom + layout.clip_height(bottom), content);
     }
 
     #[test]
