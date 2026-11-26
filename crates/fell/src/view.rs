@@ -535,6 +535,26 @@ fn write_back_notice(
     let Some(first) = dropped.first() else {
         return "Read/star sync delayed. Retrying".to_string();
     };
+    let is_expunge = |write: &DroppedWrite| write.kind == OutboxKind::Expunge;
+    if let Some(expunge) = dropped.iter().find(|write| is_expunge(write)) {
+        let other: Vec<_> = dropped
+            .iter()
+            .filter(|write| !is_expunge(write))
+            .cloned()
+            .collect();
+        let notice = match expunge.reason {
+            DropReason::NoUidPlus => "This server can't delete from Trash. Deletion stays in Fell",
+            DropReason::FolderReset => "Trash was reset on the server. Deletion stayed in Fell",
+            _ => "Deletion from Trash failed to sync",
+        };
+        if other.is_empty() && !flag_recovery_delayed {
+            return notice.into();
+        }
+        return format!(
+            "{notice}. {}",
+            write_back_notice(session, &other, flag_recovery_delayed)
+        );
+    }
     let mut moves = Vec::<(&DroppedWrite, usize)>::new();
     let mut other = Vec::new();
     for write in dropped {
@@ -640,6 +660,7 @@ fn not_sent_detail(session: &Session, write: &DroppedWrite, count: usize) -> Str
         DropReason::Refused => format!("The server refused to move {messages}"),
         DropReason::NotFound => format!("{messages} not found in {folder} on the server"),
         DropReason::NoMove => "This server can't move mail; archive stays in Fell".to_string(),
+        DropReason::NoUidPlus => unreachable!("handled with the Trash expunge notices"),
         DropReason::Abandoned => format!("{messages} left half moved in {folder} on the server"),
         DropReason::UnconfirmedMove
         | DropReason::MoveRestored
@@ -12784,7 +12805,7 @@ enum Removal {
     Delete,
     /// To Spam, or from Spam to the inbox.
     Spam,
-    /// Out of Trash for good, in Fell only.
+    /// Out of Trash for good.
     Purge,
 }
 
@@ -15179,6 +15200,16 @@ mod tests {
         assert_eq!(
             write_back_notice(&session, &[], true),
             "Read/star sync delayed. Retrying"
+        );
+        let expunge = DroppedWrite {
+            reason: DropReason::NoUidPlus,
+            kind: OutboxKind::Expunge,
+            source_folder: "Trash".into(),
+            target_folder: String::new(),
+        };
+        assert_eq!(
+            write_back_notice(&session, &[expunge.clone(), expunge], false),
+            "This server can't delete from Trash. Deletion stays in Fell"
         );
     }
 

@@ -311,6 +311,7 @@ pub(crate) fn clear_flag(
         OutboxKind::Seen => "unread",
         OutboxKind::Flagged => "starred",
         OutboxKind::Move
+        | OutboxKind::Expunge
         | OutboxKind::AppendDraft
         | OutboxKind::DeleteDraft
         | OutboxKind::AppendSent

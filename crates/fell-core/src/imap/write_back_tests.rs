@@ -212,9 +212,11 @@ impl Fixture {
             .into_iter()
             .filter(|command| {
                 let upper = command.to_ascii_uppercase();
-                [" SELECT ", " MOVE ", " COPY ", " STORE ", " EXPUNGE"]
-                    .iter()
-                    .any(|verb| upper.contains(verb))
+                [
+                    " SELECT ", " MOVE ", " COPY ", " STORE ", " EXPUNGE", " CLOSE",
+                ]
+                .iter()
+                .any(|verb| upper.contains(verb))
             })
             .collect()
     }
@@ -1352,7 +1354,7 @@ fn delete_and_spam_of_a_selection_are_server_moves_and_undo_reverses_them() {
 }
 
 #[test]
-fn permanent_delete_never_reaches_the_server() {
+fn purge_uses_only_already_recorded_trash_uids_and_undo_skips_purged_mail() {
     for state in ["queued", "sent", "settled"] {
         let fx = with_trash_and_junk();
         let alpha = fx.thread("INBOX", "Alpha");
@@ -1372,7 +1374,18 @@ fn permanent_delete_never_reaches_the_server() {
         fx.store
             .purge_threads(&fx.account.id, &[alpha], "Deleted Items")
             .unwrap();
-        assert_eq!(fx.store.outbox(&fx.account.id).unwrap(), before_purge);
+        let rows = fx.store.outbox(&fx.account.id).unwrap();
+        let (previous, purges) = rows.split_at(before_purge.len());
+        assert_eq!(previous, before_purge);
+        if state == "settled" {
+            assert_eq!(purges.len(), 1);
+            assert_eq!(
+                (purges[0].kind, purges[0].uid),
+                (OutboxKind::Expunge, Some(1))
+            );
+        } else {
+            assert!(purges.is_empty(), "{state}");
+        }
         assert_eq!(fx.store.undo(&fx.account.id).unwrap().id, batch.id);
         assert_eq!(fx.subjects("INBOX"), vec!["Bravo"], "{state}");
         assert!(fx.subjects("Deleted Items").is_empty(), "{state}");
@@ -1381,17 +1394,21 @@ fn permanent_delete_never_reaches_the_server() {
         let report = fx.replay();
         assert_eq!(report.waiting, 0, "{state}: {report:?}");
         fx.sync();
-        assert!(
-            fx.writes()
-                .iter()
-                .all(|command| !command.contains("STORE") && !command.contains("EXPUNGE")),
-            "{state}"
-        );
-        assert_eq!(
-            fx.on_server("Deleted Items"),
-            vec![(1, "Alpha".to_string())],
-            "{state}"
-        );
+        if state == "settled" {
+            assert!(fx.on_server("Deleted Items").is_empty());
+        } else {
+            assert!(
+                fx.writes()
+                    .iter()
+                    .all(|command| !command.contains("STORE") && !command.contains("EXPUNGE")),
+                "{state}"
+            );
+            assert_eq!(
+                fx.on_server("Deleted Items"),
+                vec![(1, "Alpha".to_string())],
+                "{state}"
+            );
+        }
         assert_eq!(fx.subjects("INBOX"), vec!["Bravo"], "{state}");
         assert!(fx.subjects("Deleted Items").is_empty(), "{state}");
     }
@@ -1427,6 +1444,222 @@ fn queued_moves_can_still_carry_a_purged_message_to_server_trash() {
         vec![(1, "Alpha".to_string())]
     );
     assert!(fx.subjects("Deleted Items").is_empty());
+}
+
+const SERVER_TRASH: &str = "Deleted Items";
+
+fn with_trash_copies(role: &str, folder: &str) -> Fixture {
+    let mut trash = mailbox(folder, role, 50, &[(11, "Alpha"), (12, "Bravo")]);
+    let alpha = raw_message(
+        "alpha@x",
+        None,
+        "Alpha",
+        "Ann <ann@x>",
+        "Alpha body",
+        "Bcc: hidden@example.test\r\n",
+    );
+    trash.messages[0].raw = alpha.clone();
+    let mut folders = vec![mailbox("INBOX", "", 7, &[]), trash];
+    if folder != "Trash" {
+        let mut ordinary = mailbox("Trash", "", 60, &[(11, "Alpha")]);
+        ordinary.messages[0].raw = alpha;
+        folders.push(ordinary);
+    }
+    Fixture::with(Store::open_in_memory().unwrap(), state_with(folders))
+}
+
+fn purge_from_server_trash(fx: &Fixture, subject: &str) {
+    let thread = fx.thread(SERVER_TRASH, subject);
+    fx.store
+        .purge_threads(&fx.account.id, &[thread], SERVER_TRASH)
+        .unwrap();
+}
+
+#[test]
+fn purge_expunges_only_the_recorded_trash_uid_and_leaves_no_undo_copy() {
+    let fx = with_trash_copies("\\Trash", SERVER_TRASH);
+    let account = &fx.account.id;
+    let alpha = fx.thread(SERVER_TRASH, "Alpha");
+    fx.store.set_write_back(account, false).unwrap();
+    fx.store
+        .label_thread(account, &alpha, crate::LabelChange::Add("work".into()))
+        .unwrap();
+    let saved: (String, String) = fx
+        .store
+        .connection()
+        .query_row(
+            "SELECT body_text, bcc_line FROM local_action_messages",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(saved.0.contains("Alpha body"));
+    assert!(saved.1.contains("hidden@example.test"));
+    fx.store.set_write_back(account, true).unwrap();
+    {
+        let mut state = fx.server.state.lock().unwrap();
+        state.mailboxes[1].messages[1]
+            .flags
+            .push("\\Deleted".into());
+    }
+
+    purge_from_server_trash(&fx, "Alpha");
+    let rows = fx.store.outbox(account).unwrap();
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row.kind, OutboxKind::Expunge);
+    assert_eq!((row.uidvalidity, row.uid), (Some(50), Some(11)));
+    assert_eq!(row.source_mailbox.as_deref(), Some(SERVER_TRASH));
+    fx.clear_commands();
+
+    assert_eq!(fx.replay().sent, 1);
+    assert_eq!(
+        without_tags(&fx.writes()),
+        [
+            r#"SELECT "Deleted Items""#,
+            "UID STORE 11 +FLAGS.SILENT (\\Deleted)",
+            "UID EXPUNGE 11",
+        ]
+    );
+    assert_eq!(fx.on_server(SERVER_TRASH), [(12, "Bravo".into())]);
+    assert!(fx.flags(SERVER_TRASH, 12).contains(&"\\Deleted".into()));
+    assert_eq!(fx.on_server("Trash"), [(11, "Alpha".into())]);
+    assert_eq!(
+        fx.store.outbox(account).unwrap()[0].state,
+        OutboxState::Done
+    );
+    let (copies, snapshots): (i64, i64) = fx
+        .store
+        .connection()
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM message_copies WHERE uidvalidity = 50 AND uid = 11),
+                    (SELECT COUNT(*) FROM local_action_messages)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((copies, snapshots), (0, 0));
+    assert!(fx.store.undo(account).is_err());
+    fx.sync();
+    assert_eq!(fx.subjects(SERVER_TRASH), ["Bravo"]);
+    assert_eq!(fx.subjects("Trash"), ["Alpha"]);
+}
+
+#[test]
+fn purge_keeps_server_copies_when_write_back_is_off_or_trash_is_inferred() {
+    for (role, folder, enabled) in [("\\Trash", SERVER_TRASH, false), ("", "Trash", true)] {
+        let fx = with_trash_copies(role, folder);
+        let account = &fx.account.id;
+        fx.store.set_write_back(account, enabled).unwrap();
+        fx.store
+            .purge_scoped_threads(account, &[(fx.thread(folder, "Alpha"), folder.into())])
+            .unwrap();
+        assert_eq!(fx.subjects(folder), ["Bravo"]);
+        assert!(fx.store.outbox(account).unwrap().is_empty());
+        fx.clear_commands();
+        assert_eq!(fx.replay(), Default::default());
+        assert!(fx.commands().is_empty());
+        assert_eq!(fx.on_server(folder).len(), 2);
+    }
+}
+
+#[test]
+fn purge_without_uidplus_stays_local_and_reports_it_once() {
+    let fx = with_trash_copies("\\Trash", SERVER_TRASH);
+    fx.server.writes.lock().unwrap().uidplus = false;
+    fx.clear_commands();
+    purge_from_server_trash(&fx, "Alpha");
+    let report = fx.replay_as_window();
+    assert_eq!((report.sent, report.waiting), (0, 0));
+    assert_eq!(report.dropped.len(), 1);
+    assert_eq!(report.dropped[0].reason, DropReason::NoUidPlus);
+    purge_from_server_trash(&fx, "Bravo");
+    assert_eq!(fx.replay_as_window(), Default::default());
+    assert!(fx.writes().is_empty());
+    assert!(fx.subjects(SERVER_TRASH).is_empty());
+    assert_eq!(fx.on_server(SERVER_TRASH).len(), 2);
+}
+
+#[test]
+fn purge_retries_a_refusal_but_drops_the_uid_after_a_folder_reset() {
+    let fx = with_trash_copies("\\Trash", SERVER_TRASH);
+    purge_from_server_trash(&fx, "Alpha");
+    fx.server.writes.lock().unwrap().refuse_store_uid = Some(11);
+    let report = fx.replay();
+    assert_eq!((report.sent, report.waiting), (0, 1));
+    let row = &fx.store.outbox(&fx.account.id).unwrap()[0];
+    assert_eq!((row.state, row.attempts), (OutboxState::Pending, 1));
+    assert!(row.retry_unix > 0);
+    assert!(!fx.flags(SERVER_TRASH, 11).contains(&"\\Deleted".into()));
+
+    fx.server.state.lock().unwrap().mailboxes[1].uidvalidity += 1;
+    fx.server.writes.lock().unwrap().refuse_store_uid = None;
+    fx.make_due();
+    fx.clear_commands();
+    let report = fx.replay();
+    assert_eq!((report.sent, report.waiting), (0, 0));
+    assert_eq!(report.dropped[0].reason, DropReason::FolderReset);
+    assert_eq!(without_tags(&fx.writes()), [r#"SELECT "Deleted Items""#]);
+    assert_eq!(fx.on_server(SERVER_TRASH).len(), 2);
+}
+
+#[test]
+fn purge_recovers_lost_store_and_expunge_replies_without_spending_retries() {
+    for verb in ["STORE", "EXPUNGE"] {
+        let fx = with_trash_copies("\\Trash", SERVER_TRASH);
+        purge_from_server_trash(&fx, "Alpha");
+        fx.server.writes.lock().unwrap().lose_reply_to = Some(verb);
+        let report = fx.replay();
+        assert!(report.interrupted.is_some(), "{verb}");
+        assert_eq!((report.sent, report.waiting), (0, 1), "{verb}");
+        assert_eq!(
+            fx.on_server(SERVER_TRASH).len(),
+            if verb == "STORE" { 2 } else { 1 }
+        );
+        if verb == "STORE" {
+            assert!(fx.flags(SERVER_TRASH, 11).contains(&"\\Deleted".into()));
+        } else {
+            // Some servers refuse STORE once the UID is gone.
+            fx.server.writes.lock().unwrap().refuse_store_uid = Some(11);
+        }
+        let row = &fx.store.outbox(&fx.account.id).unwrap()[0];
+        assert!(row.sent);
+        assert_eq!((row.attempts, row.retry_unix), (0, 0));
+        assert_eq!(fx.replay().sent, 1, "{verb}");
+        assert_eq!(fx.on_server(SERVER_TRASH), [(12, "Bravo".into())], "{verb}");
+    }
+}
+
+#[test]
+fn purge_rechecks_write_back_before_both_mutating_commands() {
+    for disable_on in [1, 2] {
+        let fx = with_trash_copies("\\Trash", SERVER_TRASH);
+        let account = &fx.account.id;
+        purge_from_server_trash(&fx, "Alpha");
+        fx.clear_commands();
+        let commands = std::cell::Cell::new(0);
+        let report =
+            super::write_back::replay_with(&fx.backend.config, account, &fx.store, true, &|| {
+                commands.set(commands.get() + 1);
+                if commands.get() == disable_on {
+                    fx.store.set_write_back(account, false).unwrap();
+                    fx.store.set_write_back(account, true).unwrap();
+                }
+            })
+            .unwrap();
+        assert_eq!(report.sent, 0);
+        let writes = without_tags(&fx.writes());
+        assert_eq!(
+            writes
+                .iter()
+                .filter(|command| command.starts_with("UID STORE"))
+                .count(),
+            disable_on - 1
+        );
+        assert!(writes.iter().all(|command| !command.contains("EXPUNGE")));
+        assert!(fx.store.outbox(account).unwrap().is_empty());
+        assert_eq!(fx.on_server(SERVER_TRASH).len(), 2);
+    }
 }
 
 #[test]

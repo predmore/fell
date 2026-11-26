@@ -1,4 +1,4 @@
-//! The write-back session: `SELECT`, `UID MOVE` and single-flag `UID STORE`.
+//! The write-back session exposes only the commands used by the outbox.
 //!
 //! Sync never holds one of these. It reads with a plain [`Session`], whose
 //! commands are all read-only (`EXAMINE`, `BODY.PEEK`). A [`WriteSession`]
@@ -8,7 +8,7 @@
 use std::ops::RangeInclusive;
 
 use crate::Error;
-use crate::outbox::OutboxKind;
+use crate::outbox::{OutboxEntry, OutboxKind};
 use crate::store::copies::CopyFlags;
 
 use super::super::ImapConfig;
@@ -41,6 +41,22 @@ pub(in crate::imap) struct WriteSession {
     conditional: bool,
 }
 
+/// Both writes are bound to the same UID in the selected Trash mailbox.
+pub(in crate::imap) struct TrashExpunge<'a> {
+    session: &'a mut WriteSession,
+    uid: u32,
+}
+
+impl TrashExpunge<'_> {
+    pub(in crate::imap) fn mark_deleted(&mut self) -> Result<(), WriteError> {
+        self.session.mark_deleted(self.uid)
+    }
+
+    pub(in crate::imap) fn expunge(&mut self) -> Result<(), WriteError> {
+        self.session.expunge_uid(self.uid)
+    }
+}
+
 pub(in crate::imap) enum FlagReply {
     Stored(Option<u64>),
     Modified,
@@ -60,7 +76,20 @@ impl WriteSession {
     }
 
     pub(in crate::imap) fn has_uid_expunge(&self) -> bool {
-        self.session.has_cap("UIDPLUS") || self.session.has_cap("IMAP4REV2")
+        self.has_uidplus() || self.session.has_cap("IMAP4REV2")
+    }
+
+    pub(in crate::imap) fn has_uidplus(&self) -> bool {
+        self.session.has_cap("UIDPLUS")
+    }
+
+    pub(in crate::imap) fn trash_expunge(
+        &mut self,
+        entry: &OutboxEntry,
+    ) -> Option<TrashExpunge<'_>> {
+        let uid = entry.uid.filter(|uid| *uid != 0)?;
+        (entry.kind == OutboxKind::Expunge && self.has_uidplus())
+            .then_some(TrashExpunge { session: self, uid })
     }
 
     pub(in crate::imap) fn gmail_labels(&self) -> bool {
@@ -124,7 +153,7 @@ impl WriteSession {
         .map(|_| ())
     }
 
-    /// Expunge a single UID inside the already verified label mailbox.
+    /// Expunge a single UID inside the already verified mailbox.
     pub(in crate::imap) fn expunge_uid(&mut self, uid: u32) -> Result<(), WriteError> {
         self.run("UID EXPUNGE", &format!("UID EXPUNGE {uid}"))
             .map(|_| ())

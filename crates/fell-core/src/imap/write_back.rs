@@ -34,8 +34,8 @@ use crate::Error;
 use crate::account::AccountId;
 use crate::folders::{FolderRole, FolderRoles};
 use crate::outbox::{
-    self, DropReason, DroppedWrite, MoveSource, OutboxEntry, OutboxKind, Outcome, ReplayReport,
-    Reversed, Settled, drafts,
+    self, Capability, DropReason, DroppedWrite, MoveSource, OutboxEntry, OutboxKind, Outcome,
+    ReplayReport, Reversed, Settled, drafts,
     flags::{self, FetchReason, Observation, Progress},
 };
 use crate::store::{Store, copies::CopyFlags};
@@ -242,8 +242,17 @@ impl Pass<'_> {
         // (`outbox::report_for_status`): that notice is said once.
         let mut visited = vec![false; self.entries.len()];
         let has_move = session.has_move();
+        let has_uidplus = session.has_uidplus();
+        if has_uidplus {
+            outbox::note_capability_missing(
+                self.store,
+                self.account_id,
+                Capability::UidPlus,
+                false,
+            )?;
+        }
         if has_move {
-            outbox::note_move_missing(self.store, self.account_id, false)?;
+            outbox::note_capability_missing(self.store, self.account_id, Capability::Move, false)?;
         } else {
             for (index, entry) in self.entries.iter().enumerate() {
                 if entry.kind == OutboxKind::Move && !entry.sent && entry.retry_unix <= self.now {
@@ -272,7 +281,19 @@ impl Pass<'_> {
                         self.replay_append(session, index)?;
                     }
                 }
+                OutboxKind::Expunge if !has_uidplus && entry.retry_unix <= self.now => {
+                    self.drop_row(index, DropReason::NoUidPlus, "server has no UIDPLUS")?;
+                }
                 _ if matches!(held_move, Some(MoveHold::EarlierMove)) => {}
+                OutboxKind::Expunge => {
+                    if entry.retry_unix <= self.now {
+                        self.replay_expunge(session, index)?;
+                    }
+                    if !self.settled[index] {
+                        self.held_moves
+                            .insert(entry.message_id.clone(), MoveHold::EarlierMove);
+                    }
+                }
                 OutboxKind::Seen | OutboxKind::Flagged => self.replay_flag(session, index)?,
                 OutboxKind::Keyword | OutboxKind::BridgeLabel => {
                     self.replay_label(session, index)?;
@@ -283,6 +304,72 @@ impl Pass<'_> {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn replay_expunge(&mut self, session: &mut WriteSession, index: usize) -> Result<(), Stop> {
+        let entry = &self.entries[index];
+        let (Some(mailbox), Some(validity), Some(uid)) =
+            (&entry.source_mailbox, entry.uidvalidity, entry.uid)
+        else {
+            return Err(Error::Action("invalid Trash expunge in outbox".into()).into());
+        };
+        if self.store_unconfirmed(mailbox, validity, uid) {
+            return Ok(());
+        }
+        match self.select(session, mailbox)? {
+            Ok(current) if current != validity => {
+                return self.drop_row(index, DropReason::FolderReset, "UIDVALIDITY changed");
+            }
+            Err(message) => return self.retry(index, DropReason::Refused, &message),
+            Ok(_) => {}
+        }
+        let mut expunge = session
+            .trash_expunge(entry)
+            .ok_or_else(|| Error::Action("invalid Trash expunge in write session".into()))?;
+        let mark_sent = || {
+            (self.before_send)();
+            if outbox::mark_expunge_sent(self.store, self.account_id, entry)? {
+                Ok(())
+            } else {
+                Err(Stop::Stale)
+            }
+        };
+        // After a lost reply either the UID is gone or it can still be
+        // flagged and expunged. Repeating both commands is safe.
+        mark_sent()?;
+        let result = match expunge.mark_deleted() {
+            Ok(()) => {
+                mark_sent()?;
+                expunge.expunge()
+            }
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(()) => {}
+            Err(WriteError::Connection(error)) => return Err(Stop::Connection(error)),
+            Err(WriteError::Refused(message)) => {
+                // Some servers refuse writes against a UID that's already gone.
+                match session.search_uid_range(uid, uid, 1) {
+                    Ok(uids) if uids.is_empty() => {}
+                    Err(WriteError::Connection(error)) => return Err(Stop::Connection(error)),
+                    _ => return self.retry(index, DropReason::Refused, &message),
+                }
+            }
+        }
+        match outbox::settle(
+            self.store,
+            self.account_id,
+            entry,
+            Some((mailbox, validity, uid)),
+            None,
+            Outcome::Expunged,
+        )? {
+            Settled::Recorded => self.report.sent += 1,
+            Settled::Stale => return Err(Stop::Stale),
+            Settled::Retired | Settled::Recovering => {}
+        }
+        self.settled[index] = true;
         Ok(())
     }
 

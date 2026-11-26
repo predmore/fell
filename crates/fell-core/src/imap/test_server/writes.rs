@@ -1,7 +1,7 @@
 //! The test server's write-back verbs: `SELECT` and `UID MOVE`, plus the
 //! `STATUS`, `UID SEARCH HEADER Message-ID`, and Message-ID header fetch
 //! replay uses to find a moved message. The selected write connection also
-//! supports UID STORE for Seen and Flagged, with conditional conflicts.
+//! supports UID STORE, with conditional conflicts, and UID EXPUNGE.
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -16,7 +16,7 @@ use super::{
 pub(in crate::imap) struct WriteFixture {
     /// Advertise MOVE (RFC 6851).
     pub moves: bool,
-    /// Advertise UIDPLUS (RFC 4315): `UID MOVE` reports COPYUID.
+    /// Advertise UIDPLUS (RFC 4315): enable UID EXPUNGE and MOVE's COPYUID.
     pub uidplus: bool,
     /// Answer every `UID MOVE` with this NO text.
     pub refuse: Option<String>,
@@ -37,7 +37,7 @@ pub(in crate::imap) struct WriteFixture {
     pub close_after_moves: Option<u32>,
     /// Disconnect without applying the next `UID MOVE`.
     pub lose_before_move: bool,
-    /// Apply the next command with this verb (`"MOVE"`), then drop the
+    /// Apply the next UID command with this verb, then drop the
     /// connection before any reply.
     pub lose_reply_to: Option<&'static str>,
     pub lose_before_store: bool,

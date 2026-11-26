@@ -14,7 +14,7 @@
 //! With write-back on for the account (`write_back` in `account.toml`),
 //! moves and label edits also queue the server change in the same
 //! transaction, and undo takes it back (see [`crate::outbox`]). A permanent
-//! delete from Trash ([`Store::purge_threads`]) stays local.
+//! delete from Trash ([`Store::purge_threads`]) can also expunge recorded server copies.
 //!
 //! A folder those calls remove is recorded on that message. A later
 //! [`Store::apply_delta`] still unions other folders and labels, and leaves
@@ -693,12 +693,12 @@ impl Store {
         Ok((action, seen.len()))
     }
 
-    /// Delete the messages in `threads` from Trash for good, in Fell only.
+    /// Delete the messages in `threads` from Trash for good.
     ///
     /// Trash is dropped from those rows; a row it was the last folder of is
-    /// deleted with its body. Nothing is queued for the server: its copy
-    /// stays in its Trash, and the tombstone this records keeps a later sync
-    /// from bringing it back here.
+    /// deleted with its body. A tombstone keeps sync from bringing it back.
+    /// With write-back on, recorded copies in the account's confirmed
+    /// Trash mailbox also queue a UID-scoped server expunge.
     ///
     /// Undo skips the purge and any earlier changes to the messages it
     /// affected. Other messages in an earlier action can still be restored.
@@ -1271,6 +1271,7 @@ fn record_and_apply(
         }
     }
     if kind == ActionKind::Purge {
+        crate::outbox::queue_expunges(conn, account_id, id)?;
         finish_purge(conn, id, account_id)?;
     }
     for plan in plans {

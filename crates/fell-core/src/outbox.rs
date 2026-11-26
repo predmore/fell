@@ -26,8 +26,8 @@
 //! both rows are retired without a notice.
 //!
 //! Moves go out only as `UID MOVE` (RFC 6851). A server without MOVE keeps
-//! the move in Fell. Bridge labeling separately copies to a label mailbox
-//! and uses UID EXPUNGE only inside that mailbox.
+//! the move in Fell. A permanent delete queues only known Trash UIDs,
+//! which are expunged individually on servers that advertise UIDPLUS.
 //!
 //! Turning write-back off starts a new generation, and rows not sent yet
 //! are deleted. No row from an earlier generation is ever sent or
@@ -35,14 +35,14 @@
 //! wire when it went off is answered late.
 //!
 //! Label, read, and star edits share the queue. Read and star keep one pending value per copy
-//! and flag. A permanent delete from Trash is never queued.
+//! and flag.
 //!
 //! [`WriteTx`]: crate::store::WriteTx
 
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::account::AccountId;
-use crate::folders::FolderRoles;
+use crate::folders::{FolderRole, FolderRoles, RoleSource};
 use crate::store::Store;
 use crate::{Error, Result};
 
@@ -56,8 +56,9 @@ CREATE TABLE IF NOT EXISTS write_back_accounts (
     enabled INTEGER NOT NULL,
     -- Bumped each time write-back is turned off; see the module doc.
     generation INTEGER NOT NULL DEFAULT 0,
-    -- 1 once the user was told the server has no MOVE.
-    move_missing INTEGER NOT NULL DEFAULT 0
+    -- 1 once the user was told the corresponding capability is missing.
+    move_missing INTEGER NOT NULL DEFAULT 0,
+    uidplus_missing INTEGER NOT NULL DEFAULT 0
 ) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS server_outbox (
@@ -135,6 +136,11 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
         "move_missing",
         "INTEGER NOT NULL DEFAULT 0",
     ),
+    (
+        "write_back_accounts",
+        "uidplus_missing",
+        "INTEGER NOT NULL DEFAULT 0",
+    ),
     ("server_outbox", "generation", "INTEGER NOT NULL DEFAULT 0"),
     ("server_outbox", "sent", "INTEGER NOT NULL DEFAULT 0"),
     (
@@ -178,6 +184,8 @@ pub enum OutboxKind {
     /// Move one copy from `source` to `target` (archive, move, delete to
     /// Trash, spam, and not spam).
     Move,
+    /// Permanently delete one recorded Trash copy.
+    Expunge,
     AppendSent,
     AppendDraft,
     DeleteDraft,
@@ -191,6 +199,7 @@ impl OutboxKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::Move => "move",
+            Self::Expunge => "expunge",
             Self::AppendSent => "append_sent",
             Self::AppendDraft => "append_draft",
             Self::DeleteDraft => "delete_draft",
@@ -204,6 +213,7 @@ impl OutboxKind {
     fn parse(raw: &str) -> Result<Self> {
         match raw {
             "move" => Ok(Self::Move),
+            "expunge" => Ok(Self::Expunge),
             "append_sent" => Ok(Self::AppendSent),
             "append_draft" => Ok(Self::AppendDraft),
             "delete_draft" => Ok(Self::DeleteDraft),
@@ -222,6 +232,7 @@ impl OutboxKind {
     pub(crate) fn flag_name(self) -> Option<&'static str> {
         match self {
             Self::Move
+            | Self::Expunge
             | Self::AppendSent
             | Self::AppendDraft
             | Self::DeleteDraft
@@ -365,6 +376,8 @@ pub enum DropReason {
     /// The server has no MOVE. Fell does not copy and expunge instead, so
     /// the change stays in Fell.
     NoMove,
+    /// The server has no UIDPLUS, so permanent deletion stays in Fell.
+    NoUidPlus,
     /// An earlier build copied the message to the target on a server
     /// without MOVE and never expunged the source copy. Fell leaves it.
     Abandoned,
@@ -679,6 +692,47 @@ pub(crate) fn queue_moves(
             )?;
         }
     }
+    Ok(())
+}
+
+/// Queue only concrete Trash copies, using the purge's new tombstones
+/// before it inherits any tombstones from earlier actions.
+pub(crate) fn queue_expunges(conn: &Connection, account: &AccountId, action_id: i64) -> Result<()> {
+    if !enabled(conn, account)? {
+        return Ok(());
+    }
+    let Some(roles) = crate::store::listed_folder_roles(conn, account)? else {
+        return Ok(());
+    };
+    let Some(trash) = roles.get(FolderRole::Trash).filter(|trash| {
+        trash.source != RoleSource::Name
+            && roles.is(FolderRole::Trash, &trash.name)
+            && !roles.is_view(&trash.name)
+    }) else {
+        return Ok(());
+    };
+    conn.execute(
+        "INSERT INTO server_outbox
+             (account_id, kind, state, action_id, message_id, source_folder,
+              source_mailbox, uidvalidity, uid, target_folder, created_unix, generation)
+         SELECT DISTINCT c.account_id, 'expunge', 'pending', t.action_id, c.message_id, c.folder,
+                ?4, c.uidvalidity, c.uid, '', ?6, ?7
+         FROM local_folder_tombstones t JOIN message_copies c
+           ON c.account_id = t.account_id AND c.message_id = t.message_id
+           AND c.folder = t.folder COLLATE NOCASE
+         WHERE t.action_id = ?1 AND t.account_id = ?2 AND t.folder = ?3 COLLATE NOCASE
+           AND c.mailbox = ?5 AND c.uidvalidity > 0 AND c.uid > 0
+         ORDER BY c.message_id, c.uidvalidity, c.uid",
+        params![
+            action_id,
+            account.as_str(),
+            trash.name,
+            trash.raw,
+            crate::imap::escape_mailbox(&trash.raw),
+            now_unix(),
+            generation(conn, account)?,
+        ],
+    )?;
     Ok(())
 }
 
@@ -1249,9 +1303,29 @@ pub(crate) fn mark_sent(
     Ok(marked)
 }
 
-/// `report` as the status line should have it. Two notices are said only once:
+/// Check the generation again before each mutating command of a Trash purge.
+pub(crate) fn mark_expunge_sent(
+    store: &Store,
+    account: &AccountId,
+    entry: &OutboxEntry,
+) -> Result<bool> {
+    let tx = crate::store::immediate_transaction(store.connection())?;
+    let changed = tx.execute(
+        "UPDATE server_outbox SET sent = 1
+         WHERE id = ?1 AND account_id = ?2 AND kind = 'expunge' AND state = 'pending'
+           AND generation = ?3 AND EXISTS (
+               SELECT 1 FROM write_back_accounts w WHERE w.account_id = ?2
+                 AND w.enabled AND w.generation = ?3
+           )",
+        params![entry.id, account.as_str(), entry.generation],
+    )?;
+    tx.commit()?;
+    Ok(changed != 0)
+}
+
+/// `report` as the status line should have it. These notices are said only once:
 ///
-/// - "no MOVE": recorded as told when it appears, and left out after that;
+/// - missing MOVE or UIDPLUS: recorded as told when they appear;
 /// - a half-done copy from an earlier build ([`take_abandoned`]): taken only
 ///   by a report with nothing else to say, so it waits for the next pass.
 pub(crate) fn report_for_status(
@@ -1259,14 +1333,16 @@ pub(crate) fn report_for_status(
     account_id: &AccountId,
     mut report: ReplayReport,
 ) -> Result<ReplayReport> {
-    let no_move = report
-        .dropped
-        .iter()
-        .any(|dropped| dropped.reason == DropReason::NoMove);
-    if no_move && note_move_missing(store, account_id, true)? {
-        report
+    for capability in [Capability::Move, Capability::UidPlus] {
+        let reason = capability.drop_reason();
+        if report
             .dropped
-            .retain(|dropped| dropped.reason != DropReason::NoMove);
+            .iter()
+            .any(|dropped| dropped.reason == reason)
+            && note_capability_missing(store, account_id, capability, true)?
+        {
+            report.dropped.retain(|dropped| dropped.reason != reason);
+        }
     }
     if report.dropped.is_empty() && !report.flag_recovery_delayed && !report.sent_append_delayed {
         report.dropped = take_abandoned(store, account_id)?;
@@ -1274,19 +1350,40 @@ pub(crate) fn report_for_status(
     Ok(report)
 }
 
-/// Whether the user was already told this account's server has no MOVE,
-/// after recording that it has (`missing`) or has not. The notice is shown
-/// once, not on every archive.
-pub(crate) fn note_move_missing(
+#[derive(Clone, Copy)]
+pub(crate) enum Capability {
+    Move,
+    UidPlus,
+}
+
+impl Capability {
+    fn drop_reason(self) -> DropReason {
+        match self {
+            Self::Move => DropReason::NoMove,
+            Self::UidPlus => DropReason::NoUidPlus,
+        }
+    }
+}
+
+/// Whether a missing capability was already reported for this account.
+/// Observing the capability again resets the notice.
+pub(crate) fn note_capability_missing(
     store: &Store,
     account_id: &AccountId,
+    capability: Capability,
     missing: bool,
 ) -> Result<bool> {
     let tx = crate::store::immediate_transaction(store.connection())?;
     ensure_schema(&tx)?;
+    let column = match capability {
+        Capability::Move => "move_missing",
+        Capability::UidPlus => "uidplus_missing",
+    };
     let changed = tx.execute(
-        "UPDATE write_back_accounts SET move_missing = ?2
-         WHERE account_id = ?1 AND move_missing != ?2",
+        &format!(
+            "UPDATE write_back_accounts SET {column} = ?2
+             WHERE account_id = ?1 AND {column} != ?2"
+        ),
         params![account_id.as_str(), i64::from(missing)],
     )?;
     tx.commit()?;
@@ -1331,6 +1428,8 @@ pub(crate) enum Outcome<'a> {
     /// done: it stays [`Outcome::Retry`] until it is dropped, so the source
     /// copy stays in `message_copies` until a new one replaces it.
     Done { placed: (u32, u32) },
+    /// The recorded Trash UID is gone.
+    Expunged,
     /// Try again at `retry_unix`. `counts` is false for a dropped connection,
     /// which says nothing about the row. `refused`: a NO or BAD reply or
     /// recovery confirmed the MOVE did not land. The next try can send again.
@@ -1417,6 +1516,27 @@ pub(crate) fn settle(
     }
     let placed = match outcome {
         Outcome::Done { placed } => placed,
+        Outcome::Expunged => {
+            let (mailbox, uidvalidity, uid) =
+                resolved.ok_or_else(|| Error::Action("a Trash expunge needs its copy".into()))?;
+            tx.execute(
+                "DELETE FROM message_copies
+                 WHERE account_id = ?1 AND mailbox = ?2 AND uidvalidity = ?3 AND uid = ?4",
+                params![
+                    account_id.as_str(),
+                    crate::imap::escape_mailbox(mailbox),
+                    uidvalidity,
+                    uid
+                ],
+            )?;
+            tx.execute(
+                "UPDATE server_outbox SET state = 'done', error = '', settled_unix = ?2
+                 WHERE id = ?1",
+                params![entry.id, now],
+            )?;
+            tx.commit()?;
+            return Ok(Settled::Recorded);
+        }
         Outcome::Retry {
             error,
             retry_unix,

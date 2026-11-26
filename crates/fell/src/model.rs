@@ -3041,7 +3041,7 @@ impl Session {
                 };
                 self.show_toast(
                     format!(
-                        "Remove from Fell only?{NOTICE_DOT}{target}{NOTICE_DOT}No undo{NOTICE_DOT}y"
+                        "Delete from Trash for good?{NOTICE_DOT}{target}{NOTICE_DOT}No undo{NOTICE_DOT}y"
                     ),
                     true,
                 );
@@ -5337,7 +5337,7 @@ mod tests {
         assert!(!step.delete && !step.purge, "nothing happens before y");
         assert_eq!(
             session.toast.as_ref().map(|toast| toast.text.as_str()),
-            Some("Remove from Fell only?  ·  “a”  ·  No undo  ·  y")
+            Some("Delete from Trash for good?  ·  “a”  ·  No undo  ·  y")
         );
         assert!(session.toast.as_ref().unwrap().alert);
         assert_eq!(session.highlighted(), HashSet::from(["a".to_string()]));
@@ -5355,7 +5355,7 @@ mod tests {
         session.on_key(KeyId::Char('#'), 4);
         assert_eq!(
             session.toast.as_ref().map(|toast| toast.text.as_str()),
-            Some("Remove from Fell only?  ·  2 marked  ·  No undo  ·  y")
+            Some("Delete from Trash for good?  ·  2 marked  ·  No undo  ·  y")
         );
     }
 
