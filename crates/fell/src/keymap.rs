@@ -833,6 +833,7 @@ pub fn binding_text(keymap: &Keymap, action: Action) -> String {
 
 pub fn key_label(key: KeyId, leader_name: &str) -> String {
     match key {
+        KeyId::Char('I') => "⇧I".into(),
         KeyId::Char(ch) => ch.to_string(),
         KeyId::Space => "space".into(),
         KeyId::Leader => leader_name.to_string(),

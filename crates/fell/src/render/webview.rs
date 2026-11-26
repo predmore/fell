@@ -10,8 +10,13 @@ use futures::channel::oneshot;
 use gpui::RenderImage;
 use gtk::glib;
 use gtk::prelude::*;
+use javascriptcore::ValueExt;
 use webkit2gtk::{PolicyDecisionExt, SettingsExt, WebViewExt};
 use wry::{WebViewBuilderExtUnix, WebViewExtUnix};
+
+const UNLAID_HEIGHT: i32 = 1;
+const PAINT_SETTLE: Duration = Duration::from_millis(80);
+pub(crate) const LARGE_HTML_BYTES: usize = 256 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct Snapshot {
@@ -24,7 +29,16 @@ pub(crate) struct WebRequest {
     pub html: String,
     pub width: i32,
     pub background: u32,
-    pub settle_images: bool,
+}
+
+impl WebRequest {
+    fn load_budget(&self) -> Duration {
+        Duration::from_secs(if self.html.len() > LARGE_HTML_BYTES {
+            12
+        } else {
+            4
+        })
+    }
 }
 
 struct Job {
@@ -59,7 +73,7 @@ struct Worker {
 struct Load {
     reply: oneshot::Sender<Snapshot>,
     cancel: gtk::gio::Cancellable,
-    settle_images: bool,
+    settling: bool,
 }
 
 type Active = Rc<RefCell<Option<Load>>>;
@@ -98,11 +112,12 @@ pub(crate) fn prewarm() {
 pub(crate) async fn render(request: WebRequest) -> Option<Snapshot> {
     let (reply, done) = oneshot::channel();
     let worker = worker()?;
+    let budget = request.load_budget();
     worker.queue.submit(Job { request, reply });
     worker.wake.send(()).ok()?;
     // The worker can fail during setup, before GLib attaches its receiver.
     // Bound the wait even when GLib keeps an already queued request alive.
-    let timeout = async_io::Timer::after(Duration::from_secs(6));
+    let timeout = async_io::Timer::after(budget + Duration::from_secs(2));
     match futures::future::select(done, timeout).await {
         futures::future::Either::Left((result, _)) => result.ok(),
         futures::future::Either::Right(_) => None,
@@ -114,7 +129,7 @@ fn run(rx: glib::Receiver<()>, queue: Arc<JobQueue>) -> Result<(), Box<dyn std::
     gtk::init()?;
     let window = gtk::OffscreenWindow::new();
     window.set_accept_focus(false);
-    window.set_default_size(1, 240);
+    window.set_default_size(1, UNLAID_HEIGHT);
     let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
     window.add(&container);
     let port = super::proxy::port().ok_or("could not start the WebKit deny proxy")?;
@@ -124,7 +139,6 @@ fn run(rx: glib::Receiver<()>, queue: Arc<JobQueue>) -> Result<(), Box<dyn std::
             port: port.to_string(),
         }))
         .with_incognito(true)
-        .with_javascript_disabled()
         // Leave Wry's opt-in Allow policy off. secure() supplies Deny for each load.
         .with_autoplay(false)
         .with_clipboard(false)
@@ -154,14 +168,14 @@ fn run(rx: glib::Receiver<()>, queue: Arc<JobQueue>) -> Result<(), Box<dyn std::
         };
         cancel(&active);
         widget.stop_loading();
+        let budget = job.request.load_budget();
         let WebRequest {
             html,
             width,
             background,
-            settle_images,
         } = job.request;
         widget.set_size_request(width, 1);
-        window.resize(width, 240);
+        window.resize(width, UNLAID_HEIGHT);
         let channel = |shift| f64::from((background >> shift) & 255_u32) / 255.0;
         widget.set_background_color(&gtk::gdk::RGBA::new(
             channel(16),
@@ -173,10 +187,10 @@ fn run(rx: glib::Receiver<()>, queue: Arc<JobQueue>) -> Result<(), Box<dyn std::
         *active.borrow_mut() = Some(Load {
             reply: job.reply,
             cancel: cancellable.clone(),
-            settle_images,
+            settling: false,
         });
         widget.load_html(&html, None);
-        glib::timeout_add_local_once(Duration::from_secs(4), {
+        glib::timeout_add_local_once(budget, {
             let active = active.clone();
             let widget = widget.clone();
             move || {
@@ -204,30 +218,76 @@ fn cancel(active: &Active) {
 }
 
 fn schedule_capture(widget: &webkit2gtk::WebView, active: &Active) {
-    let Some((token, settle_images)) = active
-        .borrow()
-        .as_ref()
-        .map(|load| (load.cancel.clone(), load.settle_images))
-    else {
-        return;
+    let token = {
+        let mut current = active.borrow_mut();
+        let Some(load) = current.as_mut().filter(|load| !load.settling) else {
+            return;
+        };
+        load.settling = true;
+        load.cancel.clone()
     };
-    if settle_images {
-        // WebKit emits Finished before a decoded image's next paint. Give
-        // local image decoders a refresh interval before asking for pixels.
-        let widget = widget.clone();
-        let active = active.clone();
-        glib::timeout_add_local_once(Duration::from_millis(80), move || {
-            capture(&widget, active, token);
-        });
-    } else {
-        capture(widget, active.clone(), token);
-    }
+    wait_for_images(widget, active.clone(), token);
 }
 
-fn capture(widget: &webkit2gtk::WebView, active: Active, token: gtk::gio::Cancellable) {
+#[allow(deprecated)] // run_javascript_in_world is available on WebKitGTK 2.38.
+fn wait_for_images(widget: &webkit2gtk::WebView, active: Active, token: gtk::gio::Cancellable) {
+    const READY: &str = r#"
+        if (globalThis.fellImagesReady === undefined) {
+            const images = Array.from(document.images).filter(image =>
+                /^data:image\//i.test(image.currentSrc || image.getAttribute('src') || ''));
+            globalThis.fellImagesReady = images.length === 0 ? 1 : 0;
+            if (images.length !== 0) {
+                for (const image of images) image.loading = 'eager';
+                Promise.all(images.map(image => image.decode())).then(
+                    () => { globalThis.fellImagesReady = 1; },
+                    () => { globalThis.fellImagesReady = -1; });
+            }
+        }
+        globalThis.fellImagesReady;
+    "#;
     if token.is_cancelled() {
         return;
     }
+    let view = widget.clone();
+    widget.run_javascript_in_world(
+        READY,
+        "fell-snapshot",
+        Some(&token.clone()),
+        move |result| {
+            if token.is_cancelled() {
+                return;
+            }
+            match result
+                .ok()
+                .and_then(|result| result.js_value())
+                .map(|value| value.to_int32())
+            {
+                Some(0) => {
+                    glib::timeout_add_local_once(PAINT_SETTLE, move || {
+                        wait_for_images(&view, active, token);
+                    });
+                }
+                Some(1) => {
+                    glib::timeout_add_local_once(PAINT_SETTLE, move || {
+                        capture(&view, active, token, true);
+                    });
+                }
+                _ => cancel(&active),
+            }
+        },
+    );
+}
+
+fn capture(
+    widget: &webkit2gtk::WebView,
+    active: Active,
+    token: gtk::gio::Cancellable,
+    retry: bool,
+) {
+    if token.is_cancelled() {
+        return;
+    }
+    let view = widget.clone();
     widget.snapshot(
         webkit2gtk::SnapshotRegion::FullDocument,
         webkit2gtk::SnapshotOptions::NONE,
@@ -236,10 +296,18 @@ fn capture(widget: &webkit2gtk::WebView, active: Active, token: gtk::gio::Cancel
             if token.is_cancelled() {
                 return;
             }
-            if let Some(load) = active.borrow_mut().take()
-                && let Some(image) = result.ok().and_then(surface_image)
-            {
-                let _ = load.reply.send(image);
+            match result.ok().and_then(surface_image) {
+                Some(image) => {
+                    if let Some(load) = active.borrow_mut().take() {
+                        let _ = load.reply.send(image);
+                    }
+                }
+                None if retry => {
+                    glib::timeout_add_local_once(PAINT_SETTLE, move || {
+                        capture(&view, active, token, false);
+                    });
+                }
+                None => cancel(&active),
             }
         },
     );
@@ -247,7 +315,9 @@ fn capture(widget: &webkit2gtk::WebView, active: Active, token: gtk::gio::Cancel
 
 fn secure(widget: &webkit2gtk::WebView) -> Result<(), Box<dyn std::error::Error>> {
     let settings = WebViewExt::settings(widget).ok_or("missing WebKit settings")?;
-    settings.set_enable_javascript(false);
+    // Only the fixed decode probe runs, in a separate script world. Mail
+    // cannot supply scripts or handlers, and its CSP also denies scripts.
+    settings.set_enable_javascript_markup(false);
     settings.set_enable_developer_extras(false);
     settings.set_enable_dns_prefetching(false);
     settings.set_enable_html5_local_storage(false);
@@ -367,7 +437,7 @@ fn surface_image(surface: gtk::cairo::Surface) -> Option<Snapshot> {
     image.flush();
     let width = image.width();
     let height = image.height();
-    if width <= 0 || height <= 0 {
+    if width <= 0 || height <= UNLAID_HEIGHT {
         return None;
     }
     let Ok(width) = u32::try_from(width) else {
@@ -396,8 +466,18 @@ fn surface_image(surface: gtk::cairo::Surface) -> Option<Snapshot> {
             }
         }
     }
-    // Cairo pixels are premultiplied. GPUI takes unpremultiplied BGRA.
-    for [b, g, r, a] in bgra.as_chunks_mut::<4>().0 {
+    let (pixels, _) = bgra.as_chunks_mut::<4>();
+    let first = *pixels.first()?;
+    if pixels.iter().all(|pixel| *pixel == first) {
+        return None;
+    }
+    // Cairo stores native-endian, premultiplied ARGB32. GPUI uploads Frame's
+    // backing bytes directly to a BGRA texture; the image wrapper is storage.
+    for pixel in pixels {
+        if cfg!(target_endian = "big") {
+            pixel.reverse();
+        }
+        let [b, g, r, a] = pixel;
         if *a != 0 && *a != 255 {
             let alpha = u16::from(*a);
             *b = ((u16::from(*b) * 255) / alpha) as u8;
@@ -423,6 +503,18 @@ mod tests {
     use std::net::{TcpListener, UdpSocket};
 
     use super::*;
+    use base64::Engine;
+
+    fn contains_display_color(picture: &Snapshot, rgb: [u8; 3]) -> bool {
+        picture
+            .image
+            .as_bytes(0)
+            .unwrap()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|&[blue, green, red, alpha]| alpha == 255 && [red, green, blue] == rgb)
+    }
 
     #[test]
     fn only_the_latest_queued_snapshot_is_loaded() {
@@ -434,7 +526,6 @@ mod tests {
                     html: html.into(),
                     width: 440,
                     background: 0xffffff,
-                    settle_images: false,
                 },
                 reply,
             });
@@ -505,6 +596,10 @@ mod tests {
             .save(&image_path)
             .unwrap();
         let file = url::Url::from_file_path(image_path).unwrap();
+        let svg_https = public.replacen("http:", "https:", 1);
+        let data_svg = base64::engine::general_purpose::STANDARD.encode(format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="16"><image href="{svg_https}/svg-data" width="16" height="16"/><image href="{file}" x="16" width="16" height="16"/></svg>"#
+        ));
 
         // Deliberately bypass the sanitizer and CSP. The WebKit defenses
         // must still render the document without issuing a resource request.
@@ -528,6 +623,8 @@ mod tests {
             @media (width: 440px) {{ .width-probe {{ background-color: #7a163f; }} }}
             </style></head>
             <body><p class="width-probe">Offline preview</p><div>Probe</div>
+            <script>document.querySelector('.width-probe').style.background = '#02e503';</script>
+            <img src="data:image/svg+xml;base64,{data_svg}" width="32" height="16">
             <p class="image-set">Image set</p><p class="webkit">WebKit image set</p>
             <p class="image">Image</p><p class="cross-fade">Cross fade</p>
             <p class="var">Custom property</p>
@@ -569,15 +666,15 @@ mod tests {
             html,
             width: 440,
             background: 0xffffff,
-            settle_images: true,
         }))
         .expect("WebKit drew the hostile document");
-        let pixels = picture.image.as_bytes(0).unwrap().as_chunks::<4>().0;
         assert!(
-            pixels.contains(&[0x3f, 0x16, 0x7a, 255]),
-            "the first snapshot uses a 440px CSS viewport",
+            contains_display_color(&picture, [0x7a, 0x16, 0x3f]),
+            "the 440px CSS viewport paints #7a163f",
         );
-        assert!(!pixels.contains(&[0x3f, 0xba, 0x15, 255]));
+        assert!(!contains_display_color(&picture, [0x3f, 0x16, 0x7a]));
+        assert!(!contains_display_color(&picture, [0x02, 0xe5, 0x03]));
+        assert!(!contains_display_color(&picture, [0x15, 0xba, 0x3f]));
         assert_eq!(super::super::proxy::requests() - start, 0);
         for listener in [local_listener, public_listener] {
             assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
@@ -595,17 +692,10 @@ mod tests {
             html: blocked.page("light", |_| None),
             width: 360,
             background: 0xffffff,
-            settle_images: true,
         }))
         .expect("WebKit drew the blocked image placeholder");
         assert!(
-            picture
-                .image
-                .as_bytes(0)
-                .unwrap()
-                .as_chunks::<4>()
-                .0
-                .contains(&[0x3f, 0x16, 0x7a, 255]),
+            contains_display_color(&picture, [0x7a, 0x16, 0x3f]),
             "the reused snapshot uses a 360px CSS viewport",
         );
         assert!(
@@ -613,5 +703,30 @@ mod tests {
             "placeholder height: {}",
             picture.height
         );
+
+        let mut png = std::io::Cursor::new(Vec::new());
+        let image = image::RgbImage::from_fn(1024, 768, |x, _| {
+            image::Rgb(if x < 512 {
+                [0xd1, 0x63, 0x26]
+            } else {
+                [0x25, 0x79, 0x9d]
+            })
+        });
+        image.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let png = base64::engine::general_purpose::STANDARD.encode(png.get_ref());
+        let picture = futures::executor::block_on(render(WebRequest {
+            html: format!(r#"<p>Local image below</p><img loading="lazy" src="data:image/png;base64,{png}" width="320" height="240">"#),
+            width: 360,
+            background: 0xffffff,
+        })).expect("paint after the lazy image decodes");
+        assert!(contains_display_color(&picture, [0xd1, 0x63, 0x26]));
+        assert!(contains_display_color(&picture, [0x25, 0x79, 0x9d]));
+
+        let blank = futures::executor::block_on(render(WebRequest {
+            html: "<!doctype html><style>body { height: 240px; }</style>".into(),
+            width: 360,
+            background: 0xffffff,
+        }));
+        assert!(blank.is_none(), "a uniform capture is a failed snapshot");
     }
 }

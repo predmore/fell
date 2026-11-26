@@ -1994,6 +1994,7 @@ dependencies = [
  "gpui",
  "gtk",
  "image",
+ "javascriptcore-rs",
  "libc",
  "notify",
  "psl",

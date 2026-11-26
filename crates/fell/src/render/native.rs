@@ -2928,7 +2928,12 @@ fn image_el(
     };
     let placeholder = div()
         .text_sm()
-        .text_color(paint(palette.dimmed))
+        .text_color(paint(crate::theme::note_text(
+            palette.dimmed,
+            layout
+                .reader
+                .map_or(palette.background, |reader| reader.fill),
+        )))
         .child(label);
     let mut placeholder = layout.prose(placeholder);
     placeholder.style().align_self = Some(gpui::AlignItems::FlexStart);

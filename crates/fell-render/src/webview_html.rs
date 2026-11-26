@@ -41,6 +41,8 @@ fn web_page(body: &str, scheme: &str) -> String {
 pub struct WebMail {
     body: String,
     images: Vec<(usize, String)>,
+    layout: Option<Layout>,
+    source_bytes: usize,
 }
 
 impl WebMail {
@@ -56,7 +58,24 @@ impl WebMail {
             0,
             Some(&mut images),
         );
-        Self { body, images }
+        let layout = Layout::from_node(*crate::html::parse_html(&body).root_element());
+        Self {
+            body,
+            images,
+            layout,
+            source_bytes: html.len(),
+        }
+    }
+
+    pub fn source_bytes(&self) -> usize {
+        self.source_bytes
+    }
+
+    pub fn estimated_height(&self, width: f32) -> f32 {
+        self.layout
+            .as_ref()
+            .map_or(0., |layout| layout.height(width, 20.))
+            + 12.
     }
 
     pub fn has_remote_images(&self) -> bool {
@@ -76,6 +95,145 @@ impl WebMail {
         body.push_str(&self.body[offset..]);
         web_page(&body, scheme)
     }
+}
+
+#[derive(Debug)]
+enum Layout {
+    Text(usize),
+    Image {
+        width: f32,
+        height: f32,
+    },
+    Flow {
+        children: Vec<Layout>,
+        scale: f32,
+        padding: f32,
+    },
+    Row(Vec<Layout>),
+}
+
+impl Layout {
+    fn from_node(node: ego_tree::NodeRef<'_, scraper::node::Node>) -> Option<Self> {
+        let element = match node.value() {
+            scraper::node::Node::Text(text) => {
+                let chars = text.trim().chars().count();
+                return (chars > 0).then_some(Self::Text(chars));
+            }
+            scraper::node::Node::Element(element) => element,
+            _ => return None,
+        };
+        let name = element.name();
+        let attr = |name| element.attr(name);
+        if matches!(name, "head" | "script" | "style" | "title" | "svg") || attr("hidden").is_some()
+        {
+            return None;
+        }
+        if name == "img" {
+            let dimension = |name| {
+                let pixels = |value: &str| {
+                    let value = value.trim();
+                    value
+                        .trim_end_matches("px")
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|px| px.is_finite() && *px > 0.)
+                };
+                attr("style")
+                    .into_iter()
+                    .flat_map(|style| style.split(';'))
+                    .filter_map(|rule| rule.split_once(':'))
+                    .find_map(|(property, value)| {
+                        property
+                            .trim()
+                            .eq_ignore_ascii_case(name)
+                            .then(|| pixels(value))
+                            .flatten()
+                    })
+                    .or_else(|| attr(name).and_then(pixels))
+            };
+            let width = dimension("width");
+            let height = dimension("height");
+            return Some(Self::Image {
+                width: width
+                    .or_else(|| height.map(|height| height * 1.5))
+                    .unwrap_or(120.),
+                height: height
+                    .or_else(|| width.map(|width| width / 1.5))
+                    .unwrap_or(80.),
+            });
+        }
+        if matches!(name, "br" | "hr") {
+            return Some(Self::Flow {
+                children: Vec::new(),
+                scale: 1.,
+                padding: 20.,
+            });
+        }
+        let mut children: Vec<Layout> = Vec::new();
+        for child in node.children().filter_map(Self::from_node) {
+            if let (Some(Self::Text(before)), Self::Text(after)) = (children.last_mut(), &child) {
+                *before += 1 + after;
+            } else {
+                children.push(child);
+            }
+        }
+        if children.is_empty() {
+            return None;
+        }
+        let (scale, padding) = match name {
+            "tr" => return Some(Self::Row(children)),
+            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => (1.9, 18.),
+            "td" | "th" => (1., 12.),
+            "p" | "ul" | "ol" | "blockquote" => (1., 12.),
+            "a" | "b" | "em" | "font" | "i" | "small" | "span" | "strong" | "u"
+                if children.len() == 1 =>
+            {
+                return children.pop();
+            }
+            _ => (1., 0.),
+        };
+        Some(Self::Flow {
+            children,
+            scale,
+            padding,
+        })
+    }
+
+    fn height(&self, width: f32, line: f32) -> f32 {
+        match self {
+            Self::Text(chars) => (*chars as f32 * line * 0.44 / width.max(1.)).ceil() * line,
+            Self::Image {
+                width: natural,
+                height,
+            } => height * (width / natural).min(1.),
+            Self::Flow {
+                children,
+                scale,
+                padding,
+            } => {
+                children
+                    .iter()
+                    .map(|node| node.height(width, line * scale))
+                    .sum::<f32>()
+                    + padding
+            }
+            Self::Row(cells) => cells
+                .iter()
+                .map(|node| node.height((width / cells.len() as f32 - 12.).max(1.), line))
+                .fold(0., f32::max),
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn height_estimates_account_for_headings_image_hints_and_table_rows() {
+    let mail = WebMail::prepare(
+        r#"<table><tr><td><h1>Today</h1></td><td><h1>News</h1></td></tr><tr><td colspan="2"><img width="300" src="https://example.test/photo"></td></tr></table>"#,
+    );
+    let height = mail.estimated_height(420.);
+    assert!((260. ..300.).contains(&height), "{height}");
+    assert!(mail.estimated_height(180.) < height);
 }
 
 pub fn sanitize_html(html: &str, allow_remote_images: bool) -> String {

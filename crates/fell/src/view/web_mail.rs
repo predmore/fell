@@ -1,11 +1,11 @@
 //! Conversation policy and snapshots for received HTML.
 
 use std::cell::Cell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use fell_render::{RenderMode, WebMail};
 use gpui::{
@@ -14,25 +14,52 @@ use gpui::{
 };
 
 use super::{ConvMessage, FontOpt, Inbox, Pane, Rich, Theme};
-use crate::keymap::Action;
+use crate::keymap::{self, Action};
 use crate::mail_body::HtmlBody;
+use crate::model::Session;
 use crate::motion::{self, Motion, Transition};
 use crate::render::remote_images;
 use crate::render::webview::{self, Snapshot, WebRequest};
 
 const CACHE_SIZE: usize = 12;
+const THREAD_HOLD: Duration = Duration::from_millis(150);
+const SNAPSHOT_BATCH: Duration = Duration::from_millis(420);
+const MEASURED_HEIGHTS: usize = 4 * CACHE_SIZE;
 
 #[derive(Default)]
 pub(super) struct Reader {
     pub trusted_delivery: bool,
     pub preferences: HashMap<String, (Option<bool>, bool)>,
     allowed_once: HashMap<String, (Option<String>, Weak<WebMail>)>,
-    show_images_for: Option<String>,
-    transition_native: Option<String>,
+    show_images_for: HashMap<String, (Option<String>, Weak<WebMail>)>,
     pending: Option<Pending>,
     cache: VecDeque<Cached>,
+    measured: VecDeque<MeasuredHeight>,
+    opening: Option<Opening>,
     shown: HashMap<String, Shown>,
     retired: Vec<Arc<gpui::RenderImage>>,
+}
+
+struct Opening {
+    started: Instant,
+    cards: HashSet<String>,
+}
+
+struct MeasuredHeight {
+    id: String,
+    mail: Weak<WebMail>,
+    width: i32,
+    images: bool,
+    height: f32,
+}
+
+impl MeasuredHeight {
+    fn matches(&self, key: &Key) -> bool {
+        self.id == key.id
+            && self.width == key.width
+            && self.images == key.images
+            && Weak::ptr_eq(&self.mail, &Arc::downgrade(&key.mail))
+    }
 }
 
 #[derive(Clone)]
@@ -65,7 +92,7 @@ impl Key {
 struct Cached {
     key: Key,
     picture: Option<Snapshot>,
-    image_failure: Option<remote_images::Failure>,
+    image_failure: Option<remote_images::UnavailableImages>,
 }
 
 struct Pending {
@@ -88,6 +115,7 @@ struct Shown {
     fade: Option<Transition>,
     height: Rc<Cell<Option<f32>>>,
     from_height: Option<f32>,
+    placeholder_height: f32,
     prompt: Option<Prompt>,
     outgoing_prompts: Vec<(Prompt, f32)>,
     prompt_from: f32,
@@ -119,6 +147,7 @@ impl Shown {
             fade: None,
             height: Rc::default(),
             from_height: None,
+            placeholder_height: 100.,
             prompt,
             outgoing_prompts: Vec::new(),
             prompt_from: 0.,
@@ -205,6 +234,7 @@ impl Shown {
                 .then(|| motion::lerp(previous_tag, current_tag, progress)),
             height: Some(self.height.clone()),
             from_height: self.from_height,
+            placeholder_height: self.placeholder_height,
             image_consent: self.image_consent,
         }
     }
@@ -245,6 +275,7 @@ pub(super) struct Frame {
     pub web_tag: Option<f32>,
     pub height: Option<Rc<Cell<Option<f32>>>>,
     pub from_height: Option<f32>,
+    pub placeholder_height: f32,
     pub image_consent: bool,
 }
 
@@ -284,7 +315,7 @@ enum Prompt {
         verified: bool,
         always: bool,
         images: bool,
-        failure: Option<remote_images::Failure>,
+        failure: Option<remote_images::UnavailableImages>,
     },
 }
 
@@ -308,6 +339,54 @@ pub(super) fn sender_address(address: &str) -> Option<String> {
 }
 
 impl Reader {
+    pub(super) fn open_thread(
+        &mut self,
+        messages: &[ConvMessage],
+        motion: Motion,
+        now: Instant,
+        cx: &mut Context<Inbox>,
+    ) -> bool {
+        self.opening = None;
+        if !motion.enabled() {
+            return false;
+        }
+        let cards: HashSet<_> = messages.iter().rev()
+            .filter(|message| message.expanded)
+            .take(4)
+            .filter(|message| matches!(&message.rich, Rich::Html(body)
+                if body.web.source_bytes() <= webview::LARGE_HTML_BYTES && self.prefers_message_web(message)))
+            .map(|message| message.id.clone())
+            .collect();
+        if cards.is_empty() {
+            return false;
+        }
+        self.opening = Some(Opening {
+            started: now,
+            cards,
+        });
+        cx.spawn(async move |this, cx| {
+            let executor = cx.background_executor().clone();
+            for deadline in [now + THREAD_HOLD, now + SNAPSHOT_BATCH] {
+                executor
+                    .timer(deadline.saturating_duration_since(Instant::now()))
+                    .await;
+                let _ = this.update(cx, |_, cx| cx.notify());
+            }
+        })
+        .detach();
+        true
+    }
+
+    pub(super) fn holding_arrival(&self, now: Instant) -> bool {
+        self.opening
+            .as_ref()
+            .is_some_and(|open| now.saturating_duration_since(open.started) < THREAD_HOLD)
+    }
+
+    pub(super) fn release_opening(&mut self) {
+        self.opening = None;
+    }
+
     fn known_sender(&self, address: Option<&str>) -> (Option<bool>, bool) {
         address
             .and_then(|sender| self.preferences.get(sender).copied())
@@ -355,22 +434,29 @@ impl Reader {
         }
     }
 
-    fn prefers_web(&self, id: &str, sender: Option<&str>, suggested: RenderMode) -> bool {
-        self.show_images_for.as_deref() == Some(id)
+    fn prefers_web(&self, id: &str, sender: Option<&str>, body: &HtmlBody) -> bool {
+        self.show_images_for
+            .get(id)
+            .is_some_and(|(_, mail)| Weak::ptr_eq(mail, &Arc::downgrade(&body.web)))
             || self
                 .known_sender(sender)
                 .0
-                .unwrap_or(suggested == RenderMode::Web)
+                .unwrap_or(body.suggested == RenderMode::Web)
+    }
+
+    fn show_web_for(&mut self, id: String, sender: Option<String>, body: &HtmlBody) {
+        self.show_images_for
+            .retain(|_, (_, mail)| mail.strong_count() > 0);
+        self.show_images_for
+            .insert(id, (sender, Arc::downgrade(&body.web)));
     }
 
     pub(super) fn prefers_message_web(&self, message: &ConvMessage) -> bool {
         match &message.rich {
             Rich::PendingWeb => true,
-            Rich::Html(body) => self.prefers_web(
-                &message.id,
-                sender_address(&message.email).as_deref(),
-                body.suggested,
-            ),
+            Rich::Html(body) => {
+                self.prefers_web(&message.id, sender_address(&message.email).as_deref(), body)
+            }
             _ => false,
         }
     }
@@ -446,6 +532,7 @@ impl Reader {
     pub(super) fn stop(&mut self) {
         self.pending = None;
         self.shown.clear();
+        self.release_opening();
     }
 
     pub(super) fn release(&mut self, app: &mut gpui::App) {
@@ -494,7 +581,6 @@ impl Reader {
                 html,
                 width,
                 background,
-                settle_images: install.images,
             })
             .await;
             let _ = this.update(cx, |inbox, cx| {
@@ -532,7 +618,7 @@ impl Reader {
             return None;
         };
         let key = self.key(message, body, theme, width);
-        self.prefers_web(&key.id, key.sender.as_deref(), body.suggested)
+        self.prefers_web(&key.id, key.sender.as_deref(), body)
             .then_some(key)
     }
 
@@ -607,14 +693,67 @@ impl Reader {
         queue.sort_by_key(|(other, unseen, index, _)| (*other, *unseen, *index));
         let keys: Vec<_> = queue.into_iter().map(|(_, _, _, key)| key).collect();
         self.request_snapshot(&keys, cx);
+        if self.opening.as_ref().is_some_and(|open| {
+            now.saturating_duration_since(open.started) >= SNAPSHOT_BATCH
+                || keys
+                    .iter()
+                    .filter(|key| open.cards.contains(&key.id))
+                    .all(|key| self.entry(key).is_some())
+        }) {
+            self.release_opening();
+        }
+        for shown in self.shown.values() {
+            if let (Some(key), Some(height), None) =
+                (&shown.picture_key, shown.height.get(), shown.fade)
+            {
+                if let Some(measured) = self
+                    .measured
+                    .iter_mut()
+                    .find(|measured| measured.matches(key))
+                {
+                    measured.height = height;
+                } else {
+                    if self.measured.len() == MEASURED_HEIGHTS {
+                        self.measured.pop_front();
+                    }
+                    self.measured.push_back(MeasuredHeight {
+                        id: key.id.clone(),
+                        mail: Arc::downgrade(&key.mail),
+                        width: key.width,
+                        images: key.images,
+                        height,
+                    });
+                }
+            }
+        }
         let mut frames = HashMap::new();
         for message in messages.iter().filter(|message| message.expanded) {
             let Rich::Html(body) = &message.rich else {
                 continue;
             };
             let key = self.key(message, body, theme, width);
-            let web = self.prefers_web(&key.id, key.sender.as_deref(), body.suggested);
-            let image = web.then(|| self.image(&key)).flatten();
+            let web = self.prefers_web(&key.id, key.sender.as_deref(), body);
+            let grouped = self
+                .opening
+                .as_ref()
+                .is_some_and(|open| open.cards.contains(&key.id));
+            let failed = web
+                && self
+                    .entry(&key)
+                    .is_some_and(|entry| entry.picture.is_none());
+            let image = (web && !failed && !grouped)
+                .then(|| self.image(&key))
+                .flatten();
+            let wait = web && !failed && key.mail.source_bytes() <= webview::LARGE_HTML_BYTES;
+            let placeholder_height = (wait && image.is_none()).then(|| {
+                self.measured
+                    .iter()
+                    .find(|measured| measured.matches(&key))
+                    .map_or_else(
+                        || body.web.estimated_height(width as f32).max(48.),
+                        |measured| measured.height,
+                    )
+            });
             let verified = self.verified(body, key.sender.as_deref());
             let always = verified && self.known_sender(key.sender.as_deref()).1;
             let prompt = self.image_prompt(&key, web, verified, always);
@@ -622,7 +761,7 @@ impl Reader {
             let mail = Arc::downgrade(&key.mail);
             let initial = || {
                 let picture = image.as_ref().map(|(image, _)| image.clone());
-                Shown::new(mail.clone(), picture, web, prompt.clone())
+                Shown::new(mail.clone(), picture, wait, prompt.clone())
             };
             let shown = self
                 .shown
@@ -635,17 +774,17 @@ impl Reader {
                 shown.picture_key = Some(picture_key);
                 Body::Web(image)
             } else if web
+                && !failed
                 && shown.picture_key.as_ref().is_some_and(|picture| {
                     picture.same_page(&key) && (!picture.images || key.images)
                 })
             {
                 shown.body.clone()
-            } else if web {
+            } else if wait {
+                shown.picture_key = None;
                 // The current native card can fade directly into its first
                 // snapshot when the reader explicitly switches renderers.
-                if matches!(shown.body, Body::Native)
-                    && self.transition_native.as_deref() == Some(&message.id)
-                {
+                if matches!(shown.body, Body::Native) {
                     Body::Native
                 } else {
                     Body::Placeholder
@@ -654,6 +793,9 @@ impl Reader {
                 shown.picture_key = None;
                 Body::Native
             };
+            if let Some(height) = placeholder_height {
+                shown.placeholder_height = height;
+            }
             shown.update(next, prompt, web, motion, now);
             shown.image_consent = key.images;
             frames.insert(message.id.clone(), shown.frame(now));
@@ -681,10 +823,10 @@ impl Reader {
                 Prompt::Blocked { verified }
             } else if !web {
                 Prompt::Native { always }
-            } else if entry.is_none() {
-                Prompt::Loading
             } else if always {
                 Prompt::AllowedSender
+            } else if entry.is_none() {
+                Prompt::Loading
             } else {
                 Prompt::AllowedOnce
             }
@@ -692,45 +834,54 @@ impl Reader {
     }
 }
 
+pub(super) fn reading_key_target(session: &Session) -> Option<&str> {
+    let message = if session.pane == Pane::Conversation {
+        session.messages.get(session.message_cursor)
+    } else {
+        session
+            .messages
+            .iter()
+            .rfind(|message| message.expanded && matches!(message.rich, Rich::Html(_)))
+    }?;
+    Some(&message.id)
+}
+
 impl Inbox {
-    pub(super) fn html_reading_action(&mut self, action: Action, cx: &mut Context<Self>) {
+    pub(super) fn html_reading_key_action(&mut self, action: Action, cx: &mut Context<Self>) {
+        if (self.session.pane == Pane::Conversation || self.conv_layout_current)
+            && let Some(id) = reading_key_target(&self.session).map(str::to_owned)
+        {
+            self.html_reading_action(&id, action, cx);
+        }
+    }
+
+    fn html_reading_action(&mut self, id: &str, action: Action, cx: &mut Context<Self>) {
         if !self.search_conversation_live() || self.open_thread != self.session.cursor_id {
             return;
         }
-        let index = if self.session.pane == Pane::Conversation {
-            self.session.message_cursor
-        } else {
-            if !self.conv_layout_current {
-                return;
-            }
-            let Some(index) = self
-                .session
-                .messages
-                .iter()
-                .rposition(|message| message.expanded && matches!(message.rich, Rich::Html(_)))
-            else {
-                return;
-            };
-            index
-        };
-        let Some(message) = self.session.messages.get(index) else {
+        let Some(index) = self
+            .session
+            .messages
+            .iter()
+            .position(|message| message.id == id)
+        else {
             return;
         };
+        let message = &self.session.messages[index];
         let Rich::Html(body) = &message.rich else {
             self.session
                 .show_toast("This message has no formatted body", false);
             return;
         };
         let sender = sender_address(&message.email);
-        let id = message.id.clone();
         if action == Action::AllowMessageImages
             && let Some(Prompt::Unavailable { images, .. }) = self
                 .web_mail
                 .shown
-                .get(&id)
+                .get(id)
                 .and_then(|shown| shown.prompt.as_ref())
         {
-            self.web_mail.retry_images(&id, *images);
+            self.web_mail.retry_images(id, *images);
             cx.notify();
             return;
         }
@@ -741,11 +892,8 @@ impl Inbox {
             return;
         }
         if action == Action::ToggleWebView {
-            let next = !self
-                .web_mail
-                .prefers_web(&id, sender.as_deref(), body.suggested);
-            self.web_mail.show_images_for = None;
-            self.web_mail.transition_native = next.then(|| id.clone());
+            let next = !self.web_mail.prefers_web(id, sender.as_deref(), body);
+            self.web_mail.show_images_for.remove(id);
             if let Some(sender) = sender {
                 self.web_mail
                     .preferences
@@ -754,7 +902,7 @@ impl Inbox {
                     .0 = Some(next);
                 self.persist_html_choice(sender, action, next, cx);
             } else if next {
-                self.web_mail.show_images_for = Some(id);
+                self.web_mail.show_web_for(id.to_owned(), None, body);
             }
         } else if action == Action::AllowMessageImages {
             self.web_mail
@@ -762,10 +910,9 @@ impl Inbox {
                 .retain(|_, (_, mail)| mail.strong_count() > 0);
             self.web_mail
                 .allowed_once
-                .insert(id.clone(), (sender, Arc::downgrade(&body.web)));
-            self.web_mail.show_images_for = Some(id.clone());
-            self.web_mail.transition_native = Some(id.clone());
-            self.web_mail.retry_images(&id, true);
+                .insert(id.to_owned(), (sender.clone(), Arc::downgrade(&body.web)));
+            self.web_mail.show_web_for(id.to_owned(), sender, body);
+            self.web_mail.retry_images(id, true);
         } else if let Some(sender) = sender {
             let allow = action == Action::AllowSenderImages;
             if allow && !self.web_mail.verified(body, Some(&sender)) {
@@ -781,16 +928,16 @@ impl Inbox {
                 .or_default()
                 .1 = allow;
             if allow {
-                self.web_mail.retry_images(&id, true);
-                self.web_mail.transition_native = Some(id.clone());
-                self.web_mail.show_images_for = Some(id);
+                self.web_mail.retry_images(id, true);
+                self.web_mail
+                    .show_web_for(id.to_owned(), Some(sender.clone()), body);
             } else {
                 self.web_mail
                     .allowed_once
                     .retain(|_, (address, _)| address.as_deref() != Some(&sender));
-                if self.web_mail.show_images_for.as_deref() == Some(&id) {
-                    self.web_mail.show_images_for = None;
-                }
+                self.web_mail
+                    .show_images_for
+                    .retain(|_, (address, _)| address.as_deref() != Some(&sender));
                 self.web_mail.evict_sender(&sender, cx);
             }
             self.persist_html_choice(sender, action, allow, cx);
@@ -832,7 +979,7 @@ pub(super) fn prompt(
     frame: &PromptFrame,
     theme: &Theme,
     message_id: &str,
-    live: bool,
+    (live, target_keys): (bool, Option<&keymap::Keymap>),
     width: f32,
     cx: &mut Context<Inbox>,
 ) -> AnyElement {
@@ -852,15 +999,22 @@ pub(super) fn prompt(
                 .iter()
                 .enumerate()
                 .map(|(index_out, (outgoing, alpha))| {
-                    prompt_layer(outgoing, theme, message_id, false, width, cx)
+                    prompt_layer(outgoing, theme, message_id, (false, target_keys), width, cx)
                         .id(("outgoing-prompt", index_out))
                         .opacity(*alpha)
                 }),
         )
         .child(
-            prompt_layer(&frame.incoming, theme, message_id, live, width, cx)
-                .id("incoming-prompt")
-                .opacity(frame.incoming_alpha),
+            prompt_layer(
+                &frame.incoming,
+                theme,
+                message_id,
+                (live, target_keys),
+                width,
+                cx,
+            )
+            .id("incoming-prompt")
+            .opacity(frame.incoming_alpha),
         )
         .into_any_element()
 }
@@ -869,7 +1023,7 @@ fn prompt_layer(
     prompt: &Prompt,
     theme: &Theme,
     message_id: &str,
-    live: bool,
+    (live, target_keys): (bool, Option<&keymap::Keymap>),
     width: f32,
     cx: &mut Context<Inbox>,
 ) -> gpui::Div {
@@ -881,20 +1035,20 @@ fn prompt_layer(
                 "Remote images blocked"
             }
             .into(),
-            Some(("Load images", Action::AllowMessageImages, Some("i"))),
-            verified.then_some(("Always allow", Action::AllowSenderImages, Some("⇧I"))),
+            Some(("Load images", Action::AllowMessageImages)),
+            verified.then_some(("Always allow", Action::AllowSenderImages)),
         ),
         Prompt::Loading => ("Loading remote images…".into(), None, None),
         Prompt::AllowedOnce => ("Remote images allowed for this message".into(), None, None),
         Prompt::AllowedSender => (
             "Remote images allowed for this sender".into(),
             None,
-            Some(("Revoke", Action::BlockSenderImages, None)),
+            Some(("Revoke", Action::BlockSenderImages)),
         ),
         Prompt::Native { always } => (
             "Images show in web view".into(),
-            Some(("", Action::ToggleWebView, Some("w"))),
-            always.then_some(("Revoke", Action::BlockSenderImages, None)),
+            Some(("Web view", Action::ToggleWebView)),
+            always.then_some(("Revoke", Action::BlockSenderImages)),
         ),
         Prompt::Unavailable {
             verified,
@@ -903,65 +1057,76 @@ fn prompt_layer(
             ..
         } => (
             failure.as_ref().map_or_else(
-                || "Couldn’t display the web view".into(),
-                |failure| format!("Images unavailable · {}", failure.label()).into(),
+                || "Showing simple view".into(),
+                |failure| failure.label().into(),
             ),
-            Some(("Retry", Action::AllowMessageImages, Some("i"))),
+            Some(("Retry", Action::AllowMessageImages)),
             if *always {
-                Some(("Revoke", Action::BlockSenderImages, None))
+                Some(("Revoke", Action::BlockSenderImages))
             } else {
-                verified.then_some(("Always allow", Action::AllowSenderImages, Some("⇧I")))
+                verified.then_some(("Always allow", Action::AllowSenderImages))
             },
         ),
     };
-    let button =
-        |(label, action, key): (&'static str, Action, Option<&str>), cx: &mut Context<Inbox>| {
-            div()
-                .id(action.label())
-                .flex_none()
-                .flex()
-                .items_center()
-                .gap(px(4.))
-                .px(px(6.))
-                .rounded_sm()
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(rgb(theme.accent))
-                .when(live, |button| {
-                    let message_id = message_id.to_owned();
-                    button
-                        .cursor_pointer()
-                        .hover(|style| style.bg(rgb(theme.background)))
-                        .on_click(cx.listener(move |inbox, _, window: &mut Window, cx| {
-                            if !inbox.search_conversation_live()
-                                || inbox.open_thread != inbox.session.cursor_id
-                            {
-                                return;
-                            }
-                            let Some(index) =
-                                inbox.session.messages.iter().position(|message| {
-                                    message.id == message_id && message.expanded
-                                })
-                            else {
-                                return;
-                            };
-                            window.focus(&inbox.focus);
-                            inbox.focus_message(index);
-                            inbox.html_reading_action(action, cx);
-                        }))
-                })
-                .children((!label.is_empty() && (width >= 420. || key.is_none())).then_some(label))
-                .children(key.map(|key| {
-                    div()
-                        .rounded_sm()
-                        .px(px(5.))
-                        .bg(rgb(theme.surface))
-                        .border_1()
-                        .border_color(rgb(theme.border))
-                        .text_color(rgb(crate::theme::note_text(theme.dimmed, theme.surface)))
-                        .font_family_opt(theme.mono_family.clone())
-                        .child(key.to_owned())
-                }))
+    let button = |(label, action): (&'static str, Action), cx: &mut Context<Inbox>| {
+        let key = target_keys
+            .filter(|_| action != Action::BlockSenderImages)
+            .map(|keys| keymap::binding_text(keys, action))
+            .filter(|key| !key.is_empty());
+        let label = match (action, width, key.is_some()) {
+            (Action::AllowMessageImages, width, _) if width < 420. && label == "Load images" => {
+                "Load"
+            }
+            (Action::AllowSenderImages, width, true) if width < 420. => "",
+            _ => label,
         };
+        div()
+            .id(action.label())
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .px(px(6.))
+            .rounded_sm()
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(rgb(theme.accent))
+            .when(live, |button| {
+                let message_id = message_id.to_owned();
+                button
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(theme.background)))
+                    .on_click(cx.listener(move |inbox, _, window: &mut Window, cx| {
+                        if !inbox.search_conversation_live()
+                            || inbox.open_thread != inbox.session.cursor_id
+                        {
+                            return;
+                        }
+                        let Some(index) = inbox
+                            .session
+                            .messages
+                            .iter()
+                            .position(|message| message.id == message_id && message.expanded)
+                        else {
+                            return;
+                        };
+                        window.focus(&inbox.focus);
+                        inbox.focus_message(index);
+                        inbox.html_reading_action(&message_id, action, cx);
+                    }))
+            })
+            .children((!label.is_empty()).then_some(label))
+            .children(key.map(|key| {
+                div()
+                    .rounded_sm()
+                    .px(px(5.))
+                    .bg(rgb(theme.surface))
+                    .border_1()
+                    .border_color(rgb(theme.border))
+                    .text_color(rgb(crate::theme::note_text(theme.dimmed, theme.surface)))
+                    .font_family_opt(theme.mono_family.clone())
+                    .child(key)
+            }))
+    };
     div()
         .absolute()
         .inset_0()
@@ -984,6 +1149,74 @@ fn prompt_layer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn split_view(inbox: &mut Inbox) {
+        let message = inbox.session.messages[0].clone();
+        let messages = ["older", "newer"].map(|id| {
+            let mut message = message.clone();
+            message.id = id.into();
+            message.email = format!("{id}@example.test");
+            message.expanded = true;
+            message.rich = crate::present::Rich::Html(Arc::new(crate::mail_body::prepare_html(
+                r#"<p>Personal note</p><img src="https://example.test/image" alt="Photo">"#,
+                &[("X-Fell-Verified-Sender".into(), message.email.clone())],
+            )));
+            message
+        });
+        inbox.session.set_messages(messages.into());
+        inbox.session.pane = Pane::List;
+        inbox.conv_layout_current = true;
+        inbox.web_mail.trusted_delivery = true;
+    }
+
+    #[test]
+    fn prompt_actions_keep_the_clicked_id_with_list_focus() {
+        super::super::tests::with_pending_inbox(|inbox, cx| {
+            split_view(inbox);
+            assert_eq!(reading_key_target(&inbox.session), Some("newer"));
+            // The prompt forwards its own stable ID even when the keyboard
+            // still targets the newest card in the split view.
+            inbox.html_reading_action("older", Action::AllowMessageImages, cx);
+            assert!(inbox.web_mail.allowed_once.contains_key("older"));
+            assert!(!inbox.web_mail.allowed_once.contains_key("newer"));
+            inbox.html_reading_action("older", Action::AllowSenderImages, cx);
+            assert!(inbox.web_mail.known_sender(Some("older@example.test")).1);
+            assert!(!inbox.web_mail.known_sender(Some("newer@example.test")).1);
+            inbox.html_reading_key_action(Action::AllowMessageImages, cx);
+            assert!(inbox.web_mail.allowed_once.contains_key("newer"));
+            inbox.session.pane = Pane::Conversation;
+            inbox.session.message_cursor = 0;
+            assert_eq!(reading_key_target(&inbox.session), Some("older"));
+        });
+    }
+
+    #[test]
+    fn one_time_web_views_survive_actions_on_another_message() {
+        super::super::tests::with_pending_inbox(|inbox, cx| {
+            split_view(inbox);
+            inbox.html_reading_action("older", Action::AllowMessageImages, cx);
+            inbox.html_reading_action("newer", Action::AllowMessageImages, cx);
+            assert!(
+                inbox
+                    .session
+                    .messages
+                    .iter()
+                    .all(|message| inbox.web_mail.prefers_message_web(message))
+            );
+            inbox.html_reading_action("newer", Action::ToggleWebView, cx);
+            assert!(
+                inbox
+                    .web_mail
+                    .prefers_message_web(&inbox.session.messages[0])
+            );
+            assert!(
+                !inbox
+                    .web_mail
+                    .prefers_message_web(&inbox.session.messages[1])
+            );
+            assert!(inbox.web_mail.allowed_once.contains_key("older"));
+        });
+    }
 
     fn snapshot() -> Snapshot {
         Snapshot {

@@ -27,7 +27,7 @@ pub(crate) enum Failure {
 }
 
 impl Failure {
-    pub(crate) fn label(&self) -> String {
+    fn label(&self) -> String {
         match self {
             Self::Unreachable(host) => format!("Couldn’t reach {host}"),
             Self::Address => "Image address blocked".into(),
@@ -38,11 +38,24 @@ impl Failure {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct UnavailableImages {
+    first: Failure,
+    count: usize,
+}
+
+impl UnavailableImages {
+    pub(crate) fn label(&self) -> String {
+        let noun = if self.count == 1 { "image" } else { "images" };
+        format!("{} {noun} unavailable · {}", self.count, self.first.label())
+    }
+}
+
 pub(crate) fn inline_page(
     mail: &fell_render::WebMail,
     scheme: &str,
     allowed: impl Fn() -> bool,
-) -> (String, Result<(), Failure>) {
+) -> (String, Result<(), UnavailableImages>) {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     inline_page_with(mail, scheme, &allowed, |url, limit| {
         fetch(AGENT.get_or_init(agent), url, limit, &allowed)
@@ -54,15 +67,22 @@ fn inline_page_with(
     scheme: &str,
     allowed: impl Fn() -> bool,
     mut fetch: impl FnMut(&str, usize) -> Result<String, Failure>,
-) -> (String, Result<(), Failure>) {
+) -> (String, Result<(), UnavailableImages>) {
     let deadline = Instant::now() + PAGE_TIME;
     let mut remaining = PAGE_BYTES;
     let mut fetched: HashMap<String, Result<String, Failure>> = HashMap::new();
-    let mut failure = None;
+    let mut unavailable = None;
+    let mut failed = |error| {
+        let failure = unavailable.get_or_insert(UnavailableImages {
+            first: error,
+            count: 0,
+        });
+        failure.count += 1;
+        None
+    };
     let html = mail.page(scheme, |url| {
         if !allowed() || Instant::now() >= deadline || remaining == 0 {
-            failure.get_or_insert(Failure::Limit);
-            return None;
+            return failed(Failure::Limit);
         }
         let image = fetched
             .entry(url.to_owned())
@@ -72,16 +92,11 @@ fn inline_page_with(
                 remaining -= data.len();
                 Some(data.clone())
             }
-            _ => {
-                failure.get_or_insert_with(|| match image {
-                    Err(error) => error.clone(),
-                    Ok(_) => Failure::Limit,
-                });
-                None
-            }
+            Ok(_) => failed(Failure::Limit),
+            Err(error) => failed(error.clone()),
         }
     });
-    (html, failure.map_or(Ok(()), Err))
+    (html, unavailable.map_or(Ok(()), Err))
 }
 
 fn agent() -> ureq::Agent {
@@ -234,7 +249,13 @@ mod tests {
                 },
             );
             assert!(page.contains("data:image/png;base64,AAAA"));
-            assert!(matches!(result, Err(Failure::Response)));
+            assert!(matches!(
+                result,
+                Err(UnavailableImages {
+                    first: Failure::Response,
+                    count: 2
+                })
+            ));
         }
     }
 }

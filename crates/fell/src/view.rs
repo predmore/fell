@@ -3072,6 +3072,14 @@ impl Inbox {
                         motion::QUICK
                     };
                     inbox.motion.show_thread(&mut inbox.session, view, fade);
+                    if inbox.web_mail.open_thread(
+                        &inbox.session.messages,
+                        inbox.motion.motion,
+                        inbox.motion.clock.now(),
+                        cx,
+                    ) {
+                        inbox.motion.hold_thread_arrival();
+                    }
                     inbox.finish_body_refresh(generation, false);
                     // Keep the initial header landing while the
                     // preview's pending bodies fill in.
@@ -4935,7 +4943,7 @@ impl Inbox {
             | Action::BlockSenderImages),
         ) = step.action
         {
-            self.html_reading_action(action, cx);
+            self.html_reading_key_action(action, cx);
         }
         if overlay != Overlay::Help && self.session.overlay == Overlay::Help {
             self.help_scroll = help::HelpScroll::default();
@@ -6057,6 +6065,9 @@ impl Render for Inbox {
             }
             HashMap::new()
         };
+        if !panes.1 || !self.web_mail.holding_arrival(now) || !self.motion.motion.enabled() {
+            self.motion.release_thread_arrival(now);
+        }
         let conv = ConvFrame {
             account_opacity: self.account_reader_opacity(real, now),
             web,
@@ -10546,7 +10557,7 @@ fn expanded_message_header(
     columns: ReaderColumns,
     status: Option<ReaderStatusSlot<'_>>,
     marker: GroupingMarker<'_>,
-    web_alpha: Option<f32>,
+    (web_alpha, fill): (Option<f32>, u32),
     window: &Window,
 ) -> gpui::Div {
     let style = conversation_line_style(window, theme, px(theme.ui_px - 1.));
@@ -10562,7 +10573,7 @@ fn expanded_message_header(
             &style,
             "web",
             FontWeight::NORMAL,
-            Some(theme.dimmed),
+            Some(crate::theme::note_text(theme.dimmed, fill)),
         )
     });
     let web_width = web.as_ref().map_or(0., |line| {
@@ -10811,7 +10822,10 @@ fn expanded_message(
             columns,
             status.filter(|_| message.recipients.is_none()),
             marker,
-            frame.web.get(&message.id).and_then(|frame| frame.web_tag),
+            (
+                frame.web.get(&message.id).and_then(|frame| frame.web_tag),
+                fill,
+            ),
             window,
         ))
         .children(message.recipients.as_ref().map(|line| {
@@ -10861,7 +10875,14 @@ fn expanded_message(
                         prompt,
                         theme,
                         &message.id,
-                        live.0,
+                        (
+                            live.0,
+                            (live.0
+                                && frame.preview_current
+                                && web_mail::reading_key_target(session)
+                                    == Some(message.id.as_str()))
+                            .then_some(&session.keymap),
+                        ),
                         columns.card.width,
                         cx,
                     ))
@@ -11016,9 +11037,6 @@ fn message_body(
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
-    if message.rich == Rich::PendingWeb {
-        return web_placeholder(theme, message, folds.columns);
-    }
     if let Rich::Html(body) = &message.rich
         && let Some(web) = frame.web.get(&message.id).filter(|web| web.owns_body())
     {
@@ -11040,7 +11058,7 @@ fn message_body(
     let markers = crate::render::ListMarkerFont::new(window, style);
     let body = if managed
         && (message.body_state == fell_core::BodyState::Pending
-            || (message.rich.is_pending() && !frame.fallback_text.contains(&message.id)))
+            || (message.rich == Rich::Pending && !frame.fallback_text.contains(&message.id)))
     {
         div().into_any_element()
     } else {
@@ -11132,7 +11150,7 @@ fn web_message_body(
 ) -> gpui::AnyElement {
     use web_mail::Body;
     let mut layer = |shown: &Body, live| match shown {
-        Body::Placeholder => web_placeholder(theme, message, folds.columns),
+        Body::Placeholder => web_placeholder(theme, message, folds.columns, web.placeholder_height),
         Body::Native => div()
             .bg(rgb(folds.fill))
             .children(html_sections(
@@ -11182,7 +11200,16 @@ fn web_message_body(
             web.progress,
             web.from_height,
             [layer(outgoing, false), incoming],
-            matches!(outgoing, Body::Placeholder),
+            if matches!(outgoing, Body::Placeholder) {
+                Some(0.4)
+            } else if theme.is_light()
+                && matches!(outgoing, Body::Web(_))
+                && matches!(web.body, Body::Native)
+            {
+                Some(0.6)
+            } else {
+                None
+            },
             matches!(web.body, Body::Native).then_some(folds.fill),
         )
     } else {
@@ -11194,20 +11221,9 @@ fn web_placeholder(
     theme: &Theme,
     message: &ConvMessage,
     columns: ReaderColumns,
+    height: f32,
 ) -> gpui::AnyElement {
     let line_height = theme.ui_px * 1.45;
-    let characters_per_line = (columns.card.width / (theme.ui_px * 0.55)).max(1.);
-    let estimated_lines: f32 = message
-        .body
-        .blocks
-        .iter()
-        .take(24)
-        .map(|block| match block {
-            BodyBlock::Text(text) => (text.len() as f32 / characters_per_line).ceil() + 1.,
-            _ => 2.,
-        })
-        .sum();
-    let height = (line_height * (estimated_lines + 3.)).clamp(100., 480.);
     columns
         .card
         .place(
@@ -11218,7 +11234,10 @@ fn web_placeholder(
                 .px(px(12.))
                 .py(px(8.))
                 .line_height(px(line_height))
-                .text_color(rgb(theme.recipient_text.1))
+                .text_color(rgb(crate::theme::note_text(
+                    theme.recipient_text.1,
+                    theme.recipient_surface,
+                )))
                 .child(
                     div()
                         .truncate()
@@ -11245,9 +11264,9 @@ fn stored_message_body(
             .into_any_element();
     }
     let blocks: Vec<gpui::AnyElement> = match &message.rich {
-        Rich::Html(_) | Rich::PendingWeb => unreachable!(),
+        Rich::Html(_) => unreachable!(),
         Rich::Pending if message.body.blocks.is_empty() => return div().into_any_element(),
-        Rich::Pending | Rich::Plain | Rich::PlainPart(_) | Rich::Missing => {
+        Rich::Pending | Rich::PendingWeb | Rich::Plain | Rich::PlainPart(_) | Rich::Missing => {
             // A signature and the quote next to it fold as one, as in HTML.
             // A draft's markdown is painted as its compose window shows it.
             let palette = mail_body::palette(theme);
@@ -15463,7 +15482,7 @@ mod tests {
                             ReaderColumns::split(600.),
                             None,
                             super::GroupingMarker::default(),
-                            None,
+                            (None, theme.surface),
                             window,
                         )
                     });

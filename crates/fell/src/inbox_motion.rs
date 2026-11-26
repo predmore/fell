@@ -280,6 +280,7 @@ pub struct InboxMotion {
     /// They arrived since the last frame: the fade starts with the frame
     /// that first draws them, so a late frame cannot eat it.
     arrival_pending: Option<Duration>,
+    arrival_held: bool,
     /// Bodies settling into the open thread, by message id.
     bodies: HashMap<String, BodyArrival>,
     attachment_fades: HashMap<String, (Transition, f32)>,
@@ -421,6 +422,7 @@ impl InboxMotion {
             last_selected: None,
             arrival: None,
             arrival_pending: None,
+            arrival_held: false,
             list_from: None,
             conv_from: None,
             card_to: None,
@@ -451,7 +453,9 @@ impl InboxMotion {
     pub fn observe(&mut self, session: &Session, panes: (bool, bool), now: Instant) {
         self.observe_notice(session.status_notice(), now);
         let start = |duration| self.motion.start(duration, now);
-        if let Some(duration) = self.arrival_pending.take() {
+        if !self.arrival_held
+            && let Some(duration) = self.arrival_pending.take()
+        {
             self.arrival = start(duration);
         }
         let outage = session.worker_outage();
@@ -669,11 +673,24 @@ impl InboxMotion {
         session.set_messages(messages);
         self.arrival = None;
         self.arrival_pending = Some(fade);
+        self.arrival_held = false;
         self.bodies.clear();
         self.attachment_fades.clear();
         self.message_fades.clear();
         self.messages_pending.clear();
         self.arrival_frame = None;
+    }
+
+    pub fn hold_thread_arrival(&mut self) {
+        self.arrival_held = self.arrival_pending.is_some();
+    }
+
+    pub fn release_thread_arrival(&mut self, now: Instant) {
+        if std::mem::take(&mut self.arrival_held)
+            && let Some(duration) = self.arrival_pending.take()
+        {
+            self.arrival = self.motion.start(duration, now);
+        }
     }
 
     /// Jump every transition to its end state: a key acts on what the
@@ -709,6 +726,7 @@ impl InboxMotion {
         self.selection_out = None;
         self.arrival = None;
         self.arrival_pending = None;
+        self.arrival_held = false;
         self.finish_empty_list_entry();
         self.bodies.clear();
         self.attachment_fades.clear();
@@ -1278,6 +1296,9 @@ impl InboxMotion {
     /// thread's arrive from [`motion::ARRIVE_FROM`], so the pane never
     /// blinks to empty.
     pub fn arrival(&self, now: Instant) -> f32 {
+        if self.arrival_held && self.motion.enabled() {
+            return motion::ARRIVE_FROM;
+        }
         motion::lerp(
             motion::ARRIVE_FROM,
             1.0,

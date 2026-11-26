@@ -128,7 +128,6 @@ impl Reader {
                 html,
                 width,
                 background: palette.background,
-                settle_images: allowed,
             })
             .await;
             let _ = this.update(cx, |reader, cx| {
