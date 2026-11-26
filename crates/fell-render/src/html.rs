@@ -2046,6 +2046,14 @@ pub(crate) fn parse_declarations(input: &mut Parser<'_, '_>) -> Vec<Declaration>
         .collect()
 }
 
+pub(crate) fn parse_stylesheet_declarations<'i>(
+    input: &mut Parser<'i, '_>,
+) -> Result<Vec<Declaration>, ParseError<'i, ()>> {
+    RuleBodyParser::new(input, &mut Declarations)
+        .map(|result| result.map_err(|(error, _)| error))
+        .collect()
+}
+
 struct Declarations;
 
 impl<'i> DeclarationParser<'i> for Declarations {
@@ -2159,10 +2167,16 @@ pub(crate) fn prune_hidden(dom: &mut Html) {
 }
 
 pub(crate) fn is_hidden(element: &scraper::node::Element, style: &[Declaration]) -> bool {
+    is_hidden_from_layout(element, style) || declared_value(style, "visibility") == Some("hidden")
+}
+
+pub(crate) fn is_hidden_from_layout(
+    element: &scraper::node::Element,
+    style: &[Declaration],
+) -> bool {
     // mso-hide is Outlook-specific. Its ordinary HTML fallback is visible here.
     element.attr("hidden").is_some()
         || declared_value(style, "display") == Some("none")
-        || declared_value(style, "visibility") == Some("hidden")
         || (declared_value(style, "max-height").is_some_and(is_zero_length)
             && clips_vertical_overflow(style))
 }

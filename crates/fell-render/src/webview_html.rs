@@ -4,7 +4,7 @@ use std::ops::{Deref, Range};
 
 use cssparser::{
     AtRuleParser, Delimiter, ParseError, Parser, ParserInput, ParserState, QualifiedRuleParser,
-    StyleSheetParser, Token,
+    RuleBodyItemParser, RuleBodyParser, Token,
 };
 use scraper::node::{Element, Node};
 
@@ -204,16 +204,39 @@ impl<'i> QualifiedRuleParser<'i> for LayoutRules {
         input: &mut Parser<'i, 't>,
     ) -> Result<LayoutRule, ParseError<'i, ()>> {
         let mut rules = Vec::new();
-        for (order, declaration) in html::parse_declarations(input).into_iter().enumerate() {
+        for (order, declaration) in html::parse_stylesheet_declarations(input)?
+            .into_iter()
+            .enumerate()
+        {
+            // The estimator cannot resolve shorthands that reset properties
+            // across the cascade.
+            if matches!(declaration.name.as_str(), "all" | "font") {
+                return Err(input.new_custom_error(()));
+            }
             if matches!(
                 declaration.name.as_str(),
-                "display" | "visibility" | "font-size" | "max-height" | "overflow" | "overflow-y"
+                "display" | "font-size" | "max-height" | "overflow" | "overflow-y"
             ) {
                 add_declaration(&mut rules, order, declaration);
             }
         }
         Ok((selectors, rules))
     }
+}
+
+impl<'i> RuleBodyItemParser<'i, LayoutRule, ()> for LayoutRules {
+    fn parse_declarations(&self) -> bool {
+        false
+    }
+
+    fn parse_qualified(&self) -> bool {
+        true
+    }
+}
+
+impl<'i> cssparser::DeclarationParser<'i> for LayoutRules {
+    type Declaration = LayoutRule;
+    type Error = ();
 }
 
 impl LayoutStyles {
@@ -229,9 +252,12 @@ impl LayoutStyles {
             let css = node.text().collect::<String>();
             let mut input = ParserInput::new(&css);
             let mut parser = Parser::new(&mut input);
-            for (selectors, declarations) in
-                StyleSheetParser::new(&mut parser, &mut LayoutRules).flatten()
-            {
+            // A rule we cannot model may undo one that hid content. Only
+            // apply the author cascade when we understand the entire sheet.
+            for rule in RuleBodyParser::new(&mut parser, &mut LayoutRules) {
+                let Ok((selectors, declarations)) = rule else {
+                    return Self::default();
+                };
                 let Some(last) = declarations.iter().map(|(index, _)| *index).max() else {
                     continue;
                 };
@@ -318,7 +344,7 @@ impl Layout {
         }
         let style = styles.declarations(element);
         let max_height = html::declared_value(&style, "max-height");
-        if html::is_hidden(element, &style) || max_height.is_some_and(html::is_zero_length) {
+        if html::is_hidden_from_layout(element, &style) {
             return None;
         }
         let zero = html::has_zero_font_size(element, &style, inherited_zero);
@@ -474,7 +500,6 @@ fn height_estimates_ignore_hidden_text_but_keep_visible_descendants() {
         r#"<p>Story</p><span style="font-size:16px">More</span><img width="80" height="60">"#;
     let html = format!(
         r#"<p>Story</p><div style="display:none">{hidden}</div>
-        <div style="visibility:hidden !important">{hidden}</div>
         <div style="max-height:0;overflow:hidden">{hidden}</div>
         <div style="font-size:0">{hidden}<span style="font-size:16px">More</span><img width="80" height="60"></div>"#
     );
@@ -491,14 +516,12 @@ fn height_estimates_respect_stylesheets_escapes_and_clipped_height() {
     let html = format!(
         r#"<style>
             div {{ display: none !important }}
-            .quiet {{ visibility: hidden }}
             #zero {{ font-size: 0 }}
             .clipped {{ max-height: 10px; overflow: hidden }}
         </style>
         <p>Hi</p><div style="display:block">{hidden}</div>
-        <aside class="quiet">{hidden}</aside><aside id="zero">{hidden}</aside>
+        <aside id="zero">{hidden}</aside>
         <aside style="display:\6e one">{hidden}</aside>
-        <aside style="max-height:0">{hidden}</aside>
         <aside class="clipped">{hidden}</aside>
         <aside style="max-height:10px;overflow:hidden">{hidden}</aside>"#
     );
@@ -515,16 +538,40 @@ fn height_estimates_keep_stylesheet_overrides_and_visible_overflow() {
             .hide {{ visibility: hidden }}
             .show {{ display: block }}
             .hide {{ display: none }}
-            @media print {{ p {{ display: none }} }}
         </style>
         <p id="first" class="hide" style="display:block">{visible}</p>
         <p class="hide show" id="second" style="display:block">{visible}</p>
-        <p style="max-height:10px">{visible}</p>"#
+        <p style="max-height:0">{visible}</p>
+        <p style="visibility:hidden !important">{visible}</p>"#
     );
     assert_eq!(
         WebMail::prepare(&html).estimated_height(440.),
-        WebMail::prepare(&format!("<p>{visible}</p>").repeat(3)).estimated_height(440.)
+        WebMail::prepare(&format!("<p>{visible}</p>").repeat(4)).estimated_height(440.)
     );
+}
+
+#[cfg(test)]
+#[test]
+fn height_estimates_discard_a_partial_author_cascade() {
+    let visible = "x".repeat(80_000);
+    let body = format!(r#"<div class="show"><span>{visible}</span></div>"#);
+    let inline = r#"<div style="display:none">Hidden</div>"#;
+    let expected = WebMail::prepare(&body).estimated_height(440.);
+    for (weaker, unmodeled) in [
+        ("div {display:none}", "div.show {display:block}"),
+        ("div {display:none}", "@media screen {div {display:block}}"),
+        ("div {display:none}", "@charset \"utf-8\";"),
+        ("div {display:none}", ".bad {display block}"),
+        ("span {font-size:0}", "div span {font-size:16px}"),
+        ("span {font-size:0}", "span {font:16px sans-serif}"),
+    ] {
+        let html = format!("<style>{unmodeled}</style><style>{weaker}</style>{inline}{body}");
+        assert_eq!(
+            WebMail::prepare(&html).estimated_height(440.),
+            expected,
+            "{unmodeled}"
+        );
+    }
 }
 
 pub fn sanitize_html(html: &str, allow_remote_images: bool) -> String {
