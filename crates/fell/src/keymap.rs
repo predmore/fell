@@ -303,6 +303,7 @@ pub const ACTION_SECTIONS: &[(&str, &[Action])] = &[
             Action::Setting(SettingsRow::Value(Preference::Notifications)),
             Action::Setting(SettingsRow::AccountSetup),
             Action::Setting(SettingsRow::RemoveAccount),
+            Action::Setting(SettingsRow::EditConnection),
             Action::Setting(SettingsRow::EditAccount),
             Action::Setting(SettingsRow::ImportIdentities),
             Action::Setting(SettingsRow::EffectiveBindings),
@@ -759,6 +760,13 @@ pub fn binding_text(keymap: &Keymap, action: Action) -> String {
     if action == Action::Setting(SettingsRow::RemoveAccount) {
         let key = key_label(
             crate::model::settings::REMOVE_ACCOUNT_KEY,
+            &keymap.leader_name,
+        );
+        return format!("{key} in Accounts");
+    }
+    if action == Action::Setting(SettingsRow::EditConnection) {
+        let key = key_label(
+            crate::model::settings::EDIT_CONNECTION_KEY,
             &keymap.leader_name,
         );
         return format!("{key} in Accounts");

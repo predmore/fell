@@ -2,6 +2,7 @@ use crate::keymap::{self, Action, KeyId, Keymap};
 use crate::settings::{Edit, Preference};
 
 pub const REMOVE_ACCOUNT_KEY: KeyId = KeyId::Char('d');
+pub const EDIT_CONNECTION_KEY: KeyId = KeyId::Char('e');
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
@@ -53,7 +54,13 @@ impl Section {
         use Preference::*;
         use Row::*;
         match self {
-            Self::Accounts => &[AccountSetup, EditAccount, ImportIdentities, RemoveAccount],
+            Self::Accounts => &[
+                AccountSetup,
+                EditAccount,
+                ImportIdentities,
+                RemoveAccount,
+                EditConnection,
+            ],
             Self::Appearance => &[Value(Theme), Value(FontSize), Value(ReduceMotion)],
             Self::Reading => &[Value(ReadDwell)],
             Self::Keymap => &[Value(WhichKey), EffectiveBindings, EditKeymap],
@@ -70,6 +77,7 @@ pub enum Row {
     AccountSetup,
     Account(usize),
     RemoveAccount,
+    EditConnection,
     EditAccount,
     ImportIdentities,
     EffectiveBindings,
@@ -85,6 +93,7 @@ impl Row {
             Self::Value(preference) => preference.command(),
             Self::Account(_) => "Settings: Open account",
             Self::RemoveAccount => "Settings: Remove account",
+            Self::EditConnection => "Settings: Edit connection",
             Self::AccountSetup => "Settings: Add account",
             Self::EditAccount => "Settings: Edit account file",
             Self::ImportIdentities => "Settings: Import sender addresses",
@@ -102,6 +111,7 @@ pub enum Request {
     Save(Edit),
     AccountSetup,
     OpenAccount(usize),
+    EditConnection(usize),
     ConfirmAccountRemoval(usize),
     RemoveAccount { delete: bool },
     EditAccount,
@@ -169,6 +179,7 @@ impl Availability {
             Row::AccountSetup => self.account_setup,
             Row::Account(index) => index < self.accounts,
             Row::RemoveAccount => self.accounts > 0,
+            Row::EditConnection => self.active_account.is_some(),
             Row::EditAccount => self.edit_account,
             Row::ImportIdentities => self.identity_count > 0,
             Row::InstallModel => self.install_model,

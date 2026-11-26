@@ -17,14 +17,16 @@ pub(super) enum Connection {
     Verified,
     BridgeOffline,
     BothFailed,
+    EditFailed,
 }
 
 impl Connection {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Testing,
         Self::Verified,
         Self::BridgeOffline,
         Self::BothFailed,
+        Self::EditFailed,
     ];
 
     pub fn heading(self) -> (&'static str, &'static str) {
@@ -33,6 +35,10 @@ impl Connection {
             Self::Verified => ("Verified", "Both sign-ins work."),
             Self::BridgeOffline => ("Sign-in failed", "Open Bridge and sign in."),
             Self::BothFailed => ("Sign-in failed", "Both sign-ins failed."),
+            Self::EditFailed => (
+                "Connection check failed",
+                "Go back to fix the settings, or review saving anyway.",
+            ),
         }
     }
 }
@@ -145,6 +151,7 @@ impl Connection {
         let (secondary, primary) = match self {
             Self::Testing => (None, Some(next("Testing…").disabled())),
             Self::BothFailed => (None, None),
+            Self::EditFailed => (None, Some(next("Save anyway…"))),
             Self::Verified => (None, Some(next("Continue"))),
             Self::BridgeOffline => (
                 Some(Action::new(Control::Install, "Install Bridge ↗")),
@@ -155,7 +162,7 @@ impl Connection {
     }
 }
 
-fn save_actions(storage: &Storage, retained_mailbox: bool) -> [Option<Action>; 3] {
+fn save_actions(storage: &Storage, form: Option<&Form>) -> [Option<Action>; 3] {
     let back = Action::new(Control::Back, "Back");
     let use_keyring = Action::new(Control::Back, "Use keyring");
     let next = |label| Action::new(Control::Next, label);
@@ -167,17 +174,28 @@ fn save_actions(storage: &Storage, retained_mailbox: bool) -> [Option<Action>; 3
         ],
         Storage::ConfirmInline(_) => [Some(use_keyring), None, Some(next("Save in file"))],
         _ if storage.must_reopen() => [None, None, Some(next("Quit"))],
-        _ if storage.inline_available() => [
+        _ if form.is_some_and(Form::inline_available) => [
             Some(back),
             Some(Action::new(Control::Inline, "Save in file…")),
             Some(next("Retry keyring")),
         ],
-        Storage::Keyring if retained_mailbox => [
+        Storage::Keyring if form.is_some_and(|form| form.retained_mailbox.is_some()) => [
             Some(back),
             Some(next("Start empty")),
             Some(Action::new(Control::Reconnect, "Reconnect")),
         ],
-        _ => [Some(back), None, Some(next("Save account"))],
+        _ => {
+            let label = if form.is_some_and(Form::replacement) {
+                "Replace account"
+            } else if form.is_some_and(|form| form.failed_check) {
+                "Save anyway"
+            } else if form.is_some_and(|form| form.previous.is_some()) {
+                "Save changes"
+            } else {
+                "Save account"
+            };
+            [Some(back), None, Some(next(label))]
+        }
     }
 }
 
@@ -406,7 +424,7 @@ impl Feedback {
         for (action, value) in self
             .save_actions
             .iter_mut()
-            .zip(save_actions(&Storage::Keyring, false))
+            .zip(save_actions(&Storage::Keyring, None))
         {
             *action = Change {
                 value,
@@ -495,6 +513,8 @@ impl Feedback {
         if form.step == Step::Connection {
             let state = if form.connected() {
                 Connection::Verified
+            } else if form.failed_check {
+                Connection::EditFailed
             } else if form.can_retry() {
                 Connection::BridgeOffline
             } else if form.checks == [Check::Failed; 2] {
@@ -525,8 +545,7 @@ impl Feedback {
             self.save_title.replace(title, motion, now);
             self.save_subtitle.replace(subtitle, motion, now);
             self.save_note.replace(state, motion, now);
-            let [back, secondary, next] =
-                save_actions(&form.storage, form.retained_mailbox.is_some());
+            let [back, secondary, next] = save_actions(&form.storage, Some(form));
             primary = next;
             for (action, value) in self.save_actions.iter_mut().zip([back, secondary]) {
                 action.update_optional(value, false, motion, now);

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use super::{
     Accounts, Entry, FileError, FileIdentity, INTERRUPTED_REMOVAL_RECOVERY, LockMode,
     MAILBOX_OWNER_RECOVERY, MailboxOwnership, OriginalMailbox, Registry, check_live_mailbox,
-    file_identity, inspect_mailbox, mailbox_owner, path_exists, publish, read,
+    file_identity, inspect_mailbox, mailbox_exists, mailbox_owner, path_exists, publish, read,
     read_account_contents, real_directory, removal_trash, sibling_mailbox, validate_mailbox,
 };
 use crate::{AccountId, Store, compose};
@@ -263,8 +263,12 @@ impl Registry {
         {
             return Err("The account file changed. Review it and try again.".into());
         }
-        let store = Store::open_existing_without_index(&mailbox).map_err(|err| err.to_string())?;
-        keep(&account, directory, &AccountId(id.into()), Some(&store))
+        let store = mailbox_exists(&mailbox)
+            .map_err(|err| err.to_string())?
+            .then(|| Store::open_existing_without_index(&mailbox))
+            .transpose()
+            .map_err(|err| err.to_string())?;
+        keep(&account, directory, &AccountId(id.into()), store.as_ref())
     }
 
     pub fn remove_if_unchanged(

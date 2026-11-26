@@ -1355,6 +1355,11 @@ mod tests {
                 .insert(key.to_owned(), password.to_owned());
             Ok(())
         }
+
+        fn remove(&self, key: &str) -> Result<(), crate::credentials::KeyringError> {
+            self.0.lock().unwrap().remove(key);
+            Ok(())
+        }
     }
 
     #[test]

@@ -150,6 +150,20 @@ pub struct AccountConfig {
 }
 
 impl AccountConfig {
+    pub fn same_mailbox(&self, other: &Self) -> bool {
+        self.email.eq_ignore_ascii_case(&other.email) && self.username == other.username
+    }
+
+    pub(crate) fn imap_endpoint_key(&self) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            self.backend.as_str(),
+            security_name(self.security),
+            self.port,
+            self.host.to_ascii_lowercase(),
+        )
+    }
+
     pub fn same_except_identities(&self, other: &Self) -> bool {
         let mut current = self.clone();
         current.identities.clone_from(&other.identities);
@@ -663,6 +677,9 @@ impl AccountConfig {
     /// delete mark and report server copies left in place.
     pub fn replay_outbox(&self, store: &crate::Store) -> Result<crate::ReplayReport> {
         let account_id = AccountId(self.id.clone());
+        if store.imap_write_back_paused(self)? {
+            return Ok(crate::ReplayReport::default());
+        }
         let append_sent = self.append_sent();
         let report = if crate::outbox::any_due(store, &account_id, self.write_back, append_sent)? {
             crate::imap::replay_outbox(
@@ -780,7 +797,7 @@ impl AccountConfig {
     /// Bind the credential to both endpoints as well as the local account
     /// identity (the default id `mail` is shared by every account file).
     /// Changing display name or folder settings keeps the same credential.
-    fn credential_key(&self) -> String {
+    pub fn credential_key(&self) -> String {
         let smtp = self.smtp_config();
         let mut hash = Sha256::new();
         for field in [
@@ -801,7 +818,7 @@ impl AccountConfig {
         format!("{:x}", hash.finalize())
     }
 
-    pub(crate) fn resolve_password_with(&self, store: &dyn PasswordStore) -> Result<String> {
+    pub fn resolve_password_with(&self, store: &dyn PasswordStore) -> Result<String> {
         match &self.password {
             PasswordSource::Inline(password) => Ok(password.clone()),
             PasswordSource::Keyring => Ok(store.read(&self.credential_key())?),

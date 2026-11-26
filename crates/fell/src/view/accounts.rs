@@ -259,8 +259,24 @@ impl AccountWindow {
                     continue;
                 };
                 let current = accounts.configs().find(|config| config.id == old.id);
+                let file_identity = |catalog: &Accounts| {
+                    catalog
+                        .entries
+                        .iter()
+                        .find(|entry| {
+                            entry
+                                .config
+                                .as_ref()
+                                .is_ok_and(|config| config.id == old.id)
+                        })
+                        .and_then(|entry| entry.file_identity)
+                };
                 match current {
-                    Some(current) if old.same_except_identities(current) => {
+                    Some(current)
+                        if old.same_except_identities(current)
+                            && (old.identities != current.identities
+                                || file_identity(&self.catalog) == file_identity(&accounts)) =>
+                    {
                         if old.identities != current.identities {
                             view.update(cx, |inbox, cx| inbox.set_settings_identities(current, cx));
                         }

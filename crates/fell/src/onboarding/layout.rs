@@ -269,7 +269,11 @@ impl Onboarding {
             .child(
                 div()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child("Account setup"),
+                    .child(if self.form.previous.is_some() {
+                        "Edit connection"
+                    } else {
+                        "Account setup"
+                    }),
             )
             .child(div().flex().gap_1p5().children((1..=4).map(|index| {
                 let color = if index == step {
@@ -326,7 +330,11 @@ impl Onboarding {
                 };
                 let password_note = self.feedback.password.paint(false, |issue, _| {
                     issue.as_ref().map_or_else(
-                        || self.meta(self.form.provider.password_hint()),
+                        || self.meta(if self.form.previous.is_some() {
+                            "Leave blank to keep the saved password."
+                        } else {
+                            self.form.provider.password_hint()
+                        }),
                         |issue| self.field_issue(issue),
                     )
                 });
@@ -346,7 +354,8 @@ impl Onboarding {
                         cx,
                     ))
                     .child(self.field_box(Field::Username, "Username", username, live, cx))
-                    .child(self.field_box(Field::Password, "Password", "", live, cx))
+                    .child(self.field_box(Field::Password, "Password",
+                        if self.form.previous.is_some() { "Unchanged" } else { "" }, live, cx))
                     .child(
                         div()
                             .min_h(px((self.theme.ui_px + 4.) * 3.))
@@ -357,7 +366,7 @@ impl Onboarding {
                     self.form.provider.name(),
                     content,
                     self.footer(
-                        "Back",
+                        if self.form.previous.is_some() { "Cancel" } else { "Back" },
                         (!more).then_some((Control::Servers, "Edit servers")),
                         live,
                         cx,
@@ -384,14 +393,16 @@ impl Onboarding {
                     Service::ALL
                         .into_iter()
                         .map(|service| self.check_row(service, pulse, measure)),
-                ),
+                ).when(self.form.failed_check, |column| {
+                    column.children(self.form.issues.iter().take(1).map(|issue| self.field_issue(issue)))
+                }),
                 [None, None],
             ),
             Step::Done => (
                 "",
                 "",
                 column()
-                    .when(self.form.retained_mailbox.is_none(), |column| column.child(
+                    .when(self.form.retained_mailbox.is_none() && !self.form.replacement(), |column| column.child(
                         div()
                             .border_1()
                             .rounded_lg()
@@ -406,6 +417,9 @@ impl Onboarding {
                         self.feedback.save_note.paint(false, |state, _| match state {
                             SaveState::Ready if self.form.retained_mailbox.is_some() =>
                                 self.meta("Start empty keeps the old mail on this device but doesn't show it."),
+                            SaveState::Ready if self.form.pauses_write_back() =>
+                                self.meta("Fell keeps queued server changes on this device and pauses write-back after the IMAP endpoint changes."),
+                            SaveState::Ready if self.form.previous.is_some() => div(),
                             SaveState::Ready => self.meta("Fell keeps your password in the desktop keyring."),
                             SaveState::SavingKeyring => self.meta("Approve any keyring prompt to continue."),
                             SaveState::ConfirmFile => self.meta(
@@ -413,7 +427,9 @@ impl Onboarding {
                             ),
                             SaveState::Failed { title, detail } => self.error(title, detail.as_deref()),
                         }).min_h(px((self.theme.ui_px + 4.) * 5.)),
-                    ),
+                    ).when(self.form.failed_check, |column| column.child(
+                        self.error("Sync will fail with these settings", Some("You can return to Edit connection to fix them.")),
+                    )),
                 [None, None],
             ),
         };
@@ -437,7 +453,28 @@ impl Onboarding {
                     .retained_mailbox
                     .as_ref()
                     .map(|_| crate::present::display_safe(self.form.text(Field::Email).trim()));
-                let heading = if let Some(email) = &reconnect_email
+                let heading = if self.form.replacement() {
+                    let previous = self
+                        .form
+                        .previous
+                        .as_ref()
+                        .expect("replacement has a previous account");
+                    let old = crate::present::display_safe(&previous.email);
+                    let new = crate::present::display_safe(self.form.text(Field::Email).trim());
+                    let detail = if old.eq_ignore_ascii_case(&new) {
+                        format!(
+                            "Fell keeps {old}’s local mail for the old login and starts a fresh mailbox for the new login."
+                        )
+                    } else {
+                        format!("Fell keeps {old}’s local mail and starts {new} fresh.")
+                    };
+                    self.heading("This is a different mailbox", &detail)
+                } else if self.form.previous.is_some() {
+                    self.heading(
+                        "Save connection changes",
+                        "Fell keeps this account’s local mail.",
+                    )
+                } else if let Some(email) = &reconnect_email
                     && (matches!(self.form.storage, super::Storage::Keyring) || self.reconnect)
                 {
                     self.reconnect_heading(email)

@@ -476,7 +476,7 @@ pub(crate) fn set_write_back_on(
          ON CONFLICT(account_id) DO UPDATE SET enabled = excluded.enabled",
         params![account_id.as_str(), i64::from(enabled)],
     )?;
-    if !enabled {
+    if !enabled && !connection_paused(conn, account_id)? {
         if was_on {
             conn.execute(
                 "UPDATE write_back_accounts SET generation = generation + 1
@@ -563,7 +563,15 @@ fn enabled(conn: &Connection, account_id: &AccountId) -> Result<bool> {
             |row| row.get(0),
         )
         .optional()?;
-    Ok(enabled.is_some_and(|value| value != 0))
+    Ok(enabled.is_some_and(|value| value != 0) && !connection_paused(conn, account_id)?)
+}
+
+fn connection_paused(conn: &Connection, account_id: &AccountId) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM meta WHERE key = 'imap:write-back-paused:' || ?1)",
+        [account_id.as_str()],
+        |row| row.get(0),
+    )?)
 }
 
 /// Queue the Bcc-free SMTP bytes, even if the local row could not be saved.

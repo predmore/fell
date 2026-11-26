@@ -2316,6 +2316,14 @@ impl Session {
         {
             return self.activate_setting(Row::RemoveAccount, page_rows);
         }
+        if key == settings::EDIT_CONNECTION_KEY
+            && let Some(Row::Account(index)) = self.settings_nav.row()
+        {
+            return Step {
+                settings: Some(Request::EditConnection(index)),
+                ..Step::default()
+            };
+        }
         if let Page::ConfirmModel { install } = self.settings_nav.page
             && matches!(key, KeyId::Char('y' | 'n') | KeyId::Escape)
         {
@@ -2414,6 +2422,13 @@ impl Session {
             ))),
             Row::AccountSetup => Some(Request::AccountSetup),
             Row::Account(index) => Some(Request::OpenAccount(index)),
+            Row::EditConnection => {
+                let index = match self.settings_nav.row() {
+                    Some(Row::Account(index)) => Some(index),
+                    _ => self.settings_nav.availability.active_account,
+                };
+                index.map(Request::EditConnection)
+            }
             Row::RemoveAccount => {
                 let index = match self.settings_nav.row() {
                     Some(Row::Account(index)) => Some(index),

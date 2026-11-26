@@ -180,7 +180,7 @@ fn account_id_available(registry: &Registry, base: &Path, id: &str) -> Result<bo
         .map_err(|err| err.to_string())
 }
 
-pub(crate) fn retained_mailbox(email: &str) -> Option<String> {
+pub(crate) fn retained_mailbox(config: &AccountConfig) -> Option<String> {
     let registry = Registry::resolve().ok()?;
     let base = store_path().ok()?;
     let original = accounts::mailbox_owner(&base)
@@ -199,7 +199,7 @@ pub(crate) fn retained_mailbox(email: &str) -> Option<String> {
     let mut candidates: Vec<_> = original
         .into_iter()
         .chain(siblings)
-        .filter(|id| can_reconnect_at(&registry, &base, id, email))
+        .filter(|id| can_reconnect_at(&registry, &base, id, &config.email, &config.username))
         .collect();
     candidates.sort();
     candidates.dedup();
@@ -210,14 +210,28 @@ pub(crate) fn retained_mailbox(email: &str) -> Option<String> {
     }
 }
 
-pub(crate) fn can_reconnect(id: &str, email: &str) -> bool {
+pub(crate) fn can_reconnect(config: &AccountConfig) -> bool {
     Registry::resolve()
         .ok()
         .zip(store_path().ok())
-        .is_some_and(|(registry, base)| can_reconnect_at(&registry, &base, id, email))
+        .is_some_and(|(registry, base)| {
+            can_reconnect_at(
+                &registry,
+                &base,
+                &config.id,
+                &config.email,
+                &config.username,
+            )
+        })
 }
 
-fn can_reconnect_at(registry: &Registry, base: &Path, id: &str, email: &str) -> bool {
+fn can_reconnect_at(
+    registry: &Registry,
+    base: &Path,
+    id: &str,
+    email: &str,
+    username: &str,
+) -> bool {
     registry
         .path(id)
         .is_ok_and(|path| accounts::path_exists(&path).is_ok_and(|exists| !exists))
@@ -226,7 +240,7 @@ fn can_reconnect_at(registry: &Registry, base: &Path, id: &str, email: &str) -> 
                 owner.is_some_and(|(stored_id, stored_email)| {
                     stored_id == id && stored_email.eq_ignore_ascii_case(email)
                 })
-            })
+            }) && Store::matches_imap_login(&path, id, username).unwrap_or(false)
         })
 }
 
@@ -341,9 +355,18 @@ pub(crate) enum AccountSave {
 /// Prepare the file so setup can save its keyring password before publishing
 /// the new config with mode 0600. Dropping the staged file keeps the current
 /// config in place.
+#[cfg(test)]
 pub(crate) fn stage_account_config(
     config: &mut AccountConfig,
     save: AccountSave,
+) -> Result<StagedAccountConfig, AccountFileError> {
+    stage_connection_config(config, save, None)
+}
+
+pub(crate) fn stage_connection_config(
+    config: &mut AccountConfig,
+    save: AccountSave,
+    expected: Option<&AccountConfig>,
 ) -> Result<StagedAccountConfig, AccountFileError> {
     let registry = Registry::resolve().map_err(|err| err.to_string())?;
     registry.migrate().map_err(|err| err.to_string())?;
@@ -357,15 +380,35 @@ pub(crate) fn stage_account_config(
     if configured && save == AccountSave::New {
         return Err(AccountFileError::AlreadyConfigured);
     }
+    let current = accounts::read(&path, Some(&config.id)).map_err(|err| err.to_string())?;
+    if let Some(expected) = expected
+        && current
+            .as_ref()
+            .is_none_or(|(current, _)| current != expected)
+    {
+        return Err("The account file changed. Reopen Edit connection and try again.".into());
+    }
     let mut keep = None;
+    let different_owner = accounts::mailbox_owner(&mailbox)
+        .map_err(|err| err.to_string())?
+        .map(|(_, email)| email)
+        .filter(|email| !email.eq_ignore_ascii_case(&config.email))
+        .or_else(|| {
+            current.as_ref().and_then(|(current, _)| {
+                (!current.same_mailbox(config)).then(|| current.email.clone())
+            })
+        });
     if save == AccountSave::Reconnect {
-        if !can_reconnect_at(&registry, &base, &config.id, &config.email) {
+        if !can_reconnect_at(
+            &registry,
+            &base,
+            &config.id,
+            &config.email,
+            &config.username,
+        ) {
             return Err("The kept mailbox changed. Review the account and try again.".into());
         }
-    } else if let Some((_, email)) = accounts::mailbox_owner(&mailbox)
-        .map_err(|err| err.to_string())?
-        .filter(|(_, email)| !email.eq_ignore_ascii_case(&config.email))
-    {
+    } else if let Some(email) = different_owner {
         if save != AccountSave::ReplaceMailbox {
             return Err(AccountFileError::MailboxAddressConflict {
                 id: config.id.clone(),
@@ -374,16 +417,19 @@ pub(crate) fn stage_account_config(
         }
         let next = next_account_id_at(&registry, &base)?;
         let previous = std::mem::replace(&mut config.id, next);
-        if configured {
-            let (_, snapshot) = accounts::read(&path, Some(&previous))
-                .map_err(|err| err.to_string())?
-                .ok_or("The account file changed. Review it and try again.")?;
-            keep = Some((previous, snapshot));
+        if let Some((_, snapshot)) = &current {
+            keep = Some((previous, snapshot.clone()));
         }
         path = registry.path(&config.id).map_err(|err| err.to_string())?;
         configured = false;
     } else if !configured && accounts::mailbox_exists(&mailbox).map_err(|err| err.to_string())? {
         return Err("This ID has a local mailbox. Choose a new ID or confirm reconnecting the same account.".into());
+    }
+    if let Some((previous, _)) = &current
+        && accounts::mailbox_exists(&mailbox).map_err(|err| err.to_string())?
+    {
+        fell_core::Store::remember_imap_connection(&mailbox, previous)
+            .map_err(|err| err.to_string())?;
     }
     let mut staged = stage_account_text_at(path, &config.render(), !configured, lock)?;
     if let Some((id, snapshot)) = keep {
@@ -405,6 +451,13 @@ pub(crate) struct StagedAccountConfig {
 
 impl StagedAccountConfig {
     pub(crate) fn publish(self) -> Result<PathBuf, AccountFileError> {
+        self.publish_then(|| {})
+    }
+
+    pub(crate) fn publish_then(
+        self,
+        after_publish: impl FnOnce(),
+    ) -> Result<PathBuf, AccountFileError> {
         let marker = match self.original {
             Some((registry, base, id)) => registry
                 .initialize_original(&self.lock, &base, &id)
@@ -444,6 +497,7 @@ impl StagedAccountConfig {
             }
             return Err(error.into());
         }
+        after_publish();
         Ok(self.path)
     }
 }
@@ -576,6 +630,7 @@ fn fallback(error: String) -> (Store, Opened) {
 fn prepare(store: &Store, config: Option<&AccountConfig>, demo: bool) -> fell_core::Result<Opened> {
     if let Some(config) = config {
         let account = config.account();
+        store.bind_imap_connection(config)?;
         store.configure_account(&account, config.write_back)?;
         return Ok(Opened {
             account,
@@ -839,10 +894,7 @@ mod tests {
         let other = registry.mailbox_path(&base, "mail-2").unwrap();
         open_at(&other).unwrap();
         assert_eq!(next_account_id().unwrap(), "mail-3");
-        assert_eq!(
-            retained_mailbox("Kept@example.test").as_deref(),
-            Some("mail")
-        );
+        assert_eq!(retained_mailbox(&config).as_deref(), Some("mail"));
         assert!(stage_account_config(&mut config, AccountSave::Update).is_err());
         config.email = "different@example.test".into();
         assert!(stage_account_config(&mut config, AccountSave::Reconnect).is_err());
@@ -930,7 +982,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert!(can_reconnect("work", &original.email));
+        assert!(can_reconnect(&original));
     }
 
     #[test]

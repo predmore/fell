@@ -187,6 +187,10 @@ pub(super) enum CardMode<'a> {
 }
 
 impl AccountRow {
+    fn can_edit_connection(&self) -> bool {
+        !self.removing && self.kind == crate::model::settings::AccountRemovalKind::Account
+    }
+
     fn can_remove(&self) -> bool {
         !self.removing
             && (self.kind != crate::model::settings::AccountRemovalKind::BrokenFile
@@ -696,7 +700,32 @@ impl Inbox {
                 }
                 self.settings_notice("Could not save settings", true, cx);
             }
-            Request::AccountSetup => self.open_account_setup(cx),
+            Request::AccountSetup => self.open_account_setup(None, cx),
+            Request::EditConnection(index) => {
+                if let Some(account) = self
+                    .settings_view
+                    .accounts
+                    .get(index)
+                    .filter(|account| account.can_edit_connection())
+                {
+                    let id = fell_core::AccountId(account.id.clone());
+                    let config = cx
+                        .background_executor()
+                        .spawn(async move { mailbox::send_account_config(&id) });
+                    cx.spawn(async move |this, cx| {
+                        let config = config.await;
+                        let _ = this.update(cx, |inbox, cx| match config {
+                            Ok(Some(config)) => inbox.open_account_setup(Some(config), cx),
+                            _ => inbox.settings_notice(
+                                "Could not read this account. Review it in Settings.",
+                                true,
+                                cx,
+                            ),
+                        });
+                    })
+                    .detach();
+                }
+            }
             Request::EditAccount => {
                 if let Some(path) = self
                     .settings_view
@@ -812,7 +841,7 @@ impl Inbox {
         }
     }
 
-    fn open_account_setup(&mut self, cx: &mut Context<Self>) {
+    fn open_account_setup(&mut self, config: Option<AccountConfig>, cx: &mut Context<Self>) {
         if let Some(handle) = self.settings_view.setup
             && handle
                 .update(cx, |_, window, _| window.activate_window())
@@ -828,7 +857,14 @@ impl Inbox {
                 cx,
             ))),
             titlebar: Some(TitlebarOptions {
-                title: Some("Fell account setup".into()),
+                title: Some(
+                    if config.is_some() {
+                        "Fell · Edit connection"
+                    } else {
+                        "Fell account setup"
+                    }
+                    .into(),
+                ),
                 ..Default::default()
             }),
             app_id: Some("dev.predmore.fell".into()),
@@ -838,7 +874,7 @@ impl Inbox {
             return;
         };
         match cx.open_window(options, |window, cx| {
-            cx.new(|cx| crate::onboarding::Onboarding::from_inbox(previous.0, window, cx))
+            cx.new(|cx| crate::onboarding::Onboarding::from_inbox(previous.0, config, window, cx))
         }) {
             Ok(handle) => self.settings_view.setup = Some(handle.into()),
             Err(_) => self.settings_notice("Could not open account setup", true, cx),
@@ -1538,38 +1574,54 @@ pub(super) fn card(
                         } else {
                             crate::present::display_safe(&account.status)
                         };
-                        control = control
-                            .child(account_label(theme, account, status, selected))
-                            .when(account.can_remove(), |row| {
-                                let button = account_button(
-                                    theme,
-                                    "remove-account",
-                                    match (restore, recover) {
-                                        (true, _) => "Restore",
-                                        (_, true) => "Finish deleting",
-                                        _ => "Remove · d",
-                                    },
-                                    crate::model::settings::REMOVE_ACCOUNT_KEY,
-                                    false,
-                                    !restore,
-                                    live && selected,
-                                    cx,
-                                );
-                                row.child(
-                                    button
-                                        .when(broken, |button| {
-                                            button.w(px(BROKEN_FILE_BUTTON_WIDTH)).text_center()
-                                        })
+                        control =
+                            control
+                                .child(account_label(theme, account, status, selected))
+                                .when(account.can_edit_connection(), |row| {
+                                    row.child(
+                                        account_button(
+                                            theme,
+                                            "edit-connection",
+                                            "Edit connection · e",
+                                            crate::model::settings::EDIT_CONNECTION_KEY,
+                                            false,
+                                            false,
+                                            live && selected,
+                                            cx,
+                                        )
                                         .opacity(if selected { 1. } else { 0. }),
-                                )
-                            })
-                            .when(editable_file, |row| {
-                                row.child(
-                                    trailing(theme, "↗", selected)
-                                        .w(px(BROKEN_FILE_LINK_WIDTH))
-                                        .text_right(),
-                                )
-                            });
+                                    )
+                                })
+                                .when(account.can_remove(), |row| {
+                                    let button = account_button(
+                                        theme,
+                                        "remove-account",
+                                        match (restore, recover) {
+                                            (true, _) => "Restore",
+                                            (_, true) => "Finish deleting",
+                                            _ => "Remove · d",
+                                        },
+                                        crate::model::settings::REMOVE_ACCOUNT_KEY,
+                                        false,
+                                        !restore,
+                                        live && selected,
+                                        cx,
+                                    );
+                                    row.child(
+                                        button
+                                            .when(broken, |button| {
+                                                button.w(px(BROKEN_FILE_BUTTON_WIDTH)).text_center()
+                                            })
+                                            .opacity(if selected { 1. } else { 0. }),
+                                    )
+                                })
+                                .when(editable_file, |row| {
+                                    row.child(
+                                        trailing(theme, "↗", selected)
+                                            .w(px(BROKEN_FILE_LINK_WIDTH))
+                                            .text_right(),
+                                    )
+                                });
                     }
                 } else if let Row::Value(preference) = setting {
                     control = control.py(px(10.));
@@ -1719,7 +1771,10 @@ pub(super) fn card(
                             "›",
                             false,
                         ),
-                        Row::Value(_) | Row::Account(_) | Row::RemoveAccount => unreachable!(),
+                        Row::Value(_)
+                        | Row::Account(_)
+                        | Row::RemoveAccount
+                        | Row::EditConnection => unreachable!(),
                     };
                     let suffix = if info {
                         div()

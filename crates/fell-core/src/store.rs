@@ -818,6 +818,77 @@ impl Store {
         Ok(())
     }
 
+    /// Seed the binding for a mailbox written before it tracked its IMAP
+    /// connection. Do this before publishing an edit, even with Fell closed.
+    pub fn remember_imap_connection(path: &Path, config: &crate::AccountConfig) -> Result<()> {
+        let store = Self::open_existing_without_index(path)?;
+        let tx = immediate_transaction(&store.conn)?;
+        for (field, value) in [
+            ("login", config.username.clone()),
+            ("endpoint", config.imap_endpoint_key()),
+        ] {
+            tx.execute(
+                "INSERT OR IGNORE INTO meta (key, value) VALUES (?1, ?2)",
+                params![imap_binding_key(config, field), value],
+            )?;
+        }
+        tx.commit()
+    }
+
+    /// A kept mailbox's address is checked by the registry. A recorded login
+    /// also distinguishes two server mailboxes with the same sending address.
+    pub fn matches_imap_login(path: &Path, id: &str, username: &str) -> Result<bool> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let login = read_meta(&conn, &format!("imap:login:{id}"))?;
+        Ok(login.is_none_or(|login| login == username))
+    }
+
+    /// Start reading the configured endpoint without reusing another
+    /// endpoint's UID checkpoints. Park the outbox for reconciliation.
+    pub fn bind_imap_connection(&self, config: &crate::AccountConfig) -> Result<()> {
+        let tx = immediate_transaction(&self.conn)?;
+        let login_key = imap_binding_key(config, "login");
+        if read_meta(&tx, &login_key)?.is_some_and(|login| login != config.username) {
+            return Err(crate::Error::Invalid(
+                "This local mailbox belongs to a different IMAP login.".into(),
+            ));
+        }
+        set_meta(&tx, &login_key, &config.username)?;
+        let endpoint_key = imap_binding_key(config, "endpoint");
+        let endpoint = config.imap_endpoint_key();
+        if read_meta(&tx, &endpoint_key)?.is_some_and(|old| old != endpoint) {
+            let id = &config.id;
+            set_meta(&tx, &imap_binding_key(config, "write-back-paused"), "1")?;
+            tx.execute("DELETE FROM meta WHERE key = 'cursor:' || ?1", [id])?;
+            for table in [
+                "message_copies",
+                "copy_orphans",
+                "server_draft_copies",
+                "discarded_server_draft_copies",
+                "server_draft_rescans",
+            ] {
+                tx.execute(&format!("DELETE FROM {table} WHERE account_id = ?1"), [id])?;
+            }
+            for table in ["messages", "message_aliases"] {
+                tx.execute(
+                    &format!("UPDATE {table} SET remote_id = '' WHERE account_id = ?1"),
+                    [id],
+                )?;
+            }
+        }
+        set_meta(&tx, &endpoint_key, &endpoint)?;
+        tx.commit()
+    }
+
+    pub fn imap_write_back_paused(&self, config: &crate::AccountConfig) -> Result<bool> {
+        let key = imap_binding_key(config, "endpoint");
+        Ok(
+            read_meta(&self.conn, &imap_binding_key(config, "write-back-paused"))?.is_some()
+                || read_meta(&self.conn, &key)?
+                    .is_some_and(|endpoint| endpoint != config.imap_endpoint_key()),
+        )
+    }
+
     pub fn get_account(&self, id: &AccountId) -> Result<Option<Account>> {
         let mut stmt = self
             .conn
@@ -3015,16 +3086,30 @@ fn delete_demo_account(conn: &Connection, id: &str) -> Result<()> {
     Ok(())
 }
 
+fn imap_binding_key(config: &crate::AccountConfig, field: &str) -> String {
+    format!("imap:{field}:{}", config.id)
+}
+
+fn read_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
+            row.get(0)
+        })
+        .optional()?)
+}
+
+fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
 fn sync_cursor_on(conn: &Connection, account_id: &AccountId) -> Result<Option<crate::SyncCursor>> {
     let key = format!("cursor:{}", account_id.as_str());
-    let token: Option<String> = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key = ?1",
-            params![key],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(token.map(|token| crate::SyncCursor {
+    Ok(read_meta(conn, &key)?.map(|token| crate::SyncCursor {
         account_key: account_id.0.clone(),
         token,
     }))
@@ -3036,12 +3121,7 @@ fn set_sync_cursor_on(
     cursor: &crate::SyncCursor,
 ) -> Result<()> {
     let key = format!("cursor:{}", account_id.as_str());
-    conn.execute(
-        "INSERT INTO meta (key, value) VALUES (?1, ?2)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![key, cursor.token],
-    )?;
-    Ok(())
+    set_meta(conn, &key, &cursor.token)
 }
 
 fn thread_id_for_message_id(
