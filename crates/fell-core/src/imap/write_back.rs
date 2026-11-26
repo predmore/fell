@@ -1426,31 +1426,29 @@ impl Pass<'_> {
         // Refresh UIDNEXT before searching, and use a closed upper bound so
         // new arrivals cannot extend the range during the check.
         self.selected = None;
-        let (uidvalidity, next) = match session.select_with_next(target) {
-            Ok(selected) => selected,
+        let selected = session.select_with_next(target);
+        let next = match &selected {
+            Ok((validity, next)) if *validity == bound_validity => *next,
+            _ => None,
+        };
+        let range = next
+            .filter(|_| !synthetic)
+            .and_then(|next| recovery_uid_range(first, next));
+        if let Some(id) = move_id {
+            // Undo can use sync only for a span recovery could search in full.
+            let end = range.as_ref().map_or(first, |range| range.end() + 1);
+            outbox::record_move_recovery_end(self.store, id, end)?;
+        }
+        let uidvalidity = match selected {
+            Ok((validity, _)) => validity,
             Err(WriteError::Refused(_)) => return Ok(Transfer::Unknown),
             Err(WriteError::Connection(error)) => return Err(Stop::Connection(error)),
         };
         self.selected = Some((target.to_string(), uidvalidity));
-        if let (Some(id), Some(next)) = (move_id, next)
-            && uidvalidity == bound_validity
-            && first != 0
-            && next >= first
-        {
-            // Keep the bound even if the checks below cannot identify a copy.
-            let end = next.min(first.saturating_add(RECOVERY_UID_LIMIT as u32));
-            outbox::record_move_recovery_end(self.store, id, end)?;
-        }
-        if check_absence && first != 0 && uidvalidity == bound_validity && next == Some(first) {
+        if check_absence && first != 0 && next == Some(first) {
             return Ok(Transfer::Absent);
         }
-        if synthetic {
-            return Ok(Transfer::Unknown);
-        }
-        let Some(range) = next
-            .filter(|_| uidvalidity == bound_validity)
-            .and_then(|next| recovery_uid_range(first, next))
-        else {
+        let Some(range) = range else {
             return Ok(Transfer::Unknown);
         };
         let found =

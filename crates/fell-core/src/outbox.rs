@@ -296,6 +296,7 @@ pub struct OutboxEntry {
     pub sent: bool,
     /// The destination's UID state before sending the write.
     pub(crate) target_bound: Option<Bound>,
+    /// Exclusive end for synced undo. Equal to UIDNEXT at send if unusable.
     pub(crate) move_recovery_end: Option<u32>,
     /// Undo's reverse of the row with this id, which was sent but not yet
     /// settled: this row moves the copy that one places.
@@ -1141,7 +1142,7 @@ pub(crate) fn mark_moves_sent(
                 "UPDATE server_outbox
                  SET sent = 1, source_mailbox = ?2, uidvalidity = ?3, uid = ?4,
                      target_mailbox = ?5, target_uidvalidity = ?6, target_uidnext = ?7,
-                     move_recovery_end = NULL
+                     move_recovery_end = ?7
                  WHERE id = ?1 AND account_id = ?8 AND state = 'pending'
                    AND generation = ?9 AND sent = 0",
                 params![
