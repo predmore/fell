@@ -2426,7 +2426,7 @@ impl Session {
     pub fn activate_setting(&mut self, row: settings::Row, page_rows: usize) -> Step {
         use settings::{Page, Request, Row};
 
-        if row != Row::RemoveAccount {
+        if !matches!(row, Row::RemoveAccount | Row::EditConnection) {
             self.settings_nav.select_row(row);
         }
         let settings = match row {
@@ -2447,8 +2447,8 @@ impl Session {
                 })
             }
             Row::EditConnection => {
-                let index = match self.settings_nav.row() {
-                    Some(Row::Account(index)) => Some(index),
+                let index = match (&self.overlay, self.settings_nav.row()) {
+                    (Overlay::Settings, Some(Row::Account(index))) => Some(index),
                     _ => self.settings_nav.availability.active_account,
                 };
                 index.map(Request::EditConnection)
@@ -2464,10 +2464,6 @@ impl Session {
                 };
                 index.map(|index| {
                     self.settings_nav.select_row(Row::Account(index));
-                    self.settings_nav.page = Page::ConfirmAccountRemoval {
-                        delete: false,
-                        kind: settings::AccountRemovalKind::Account,
-                    };
                     Request::ConfirmAccountRemoval(index)
                 })
             }
@@ -3287,6 +3283,9 @@ impl Session {
                     return step;
                 }
                 self.count.clear();
+                if row == settings::Row::EditConnection {
+                    return self.activate_setting(row, page_rows);
+                }
                 self.overlay = Overlay::Settings;
                 self.settings_nav.select_row(row);
                 if !matches!(row, settings::Row::Value(_)) {

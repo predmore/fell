@@ -708,7 +708,13 @@ impl AccountConfig {
     /// Re-queue held changes whose exact Message-ID exists on this server.
     /// Returns the number re-queued. The rest stay available to discard.
     pub fn resend_held_writes(&self, store: &crate::Store) -> Result<usize> {
-        crate::imap::resend_held_writes(self, store)
+        self.requeue_held_writes(store).map(|rows| rows.len())
+    }
+
+    /// Re-queue matching held changes and return their outbox IDs so callers
+    /// can report completion once replay confirms the writes.
+    pub fn requeue_held_writes(&self, store: &crate::Store) -> Result<Vec<i64>> {
+        crate::imap::requeue_held_writes(self, store)
     }
 
     /// Log in and log out again without reading mail. Returns the number of

@@ -20,6 +20,12 @@ struct Removal {
     name: Option<String>,
 }
 
+enum RemovalCheck<'a> {
+    Account(Option<FileIdentity>),
+    Disconnected(&'a str),
+    Recovery(Option<FileIdentity>),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterruptedRemoval {
     pub id: String,
@@ -286,7 +292,7 @@ impl Registry {
     /// all SQLite files into a durable staging directory. If interrupted, the
     /// mailbox stays closed until removal resumes using that directory.
     pub fn remove(&self, base: &Path, id: &str, delete: bool) -> Result<RemovalOutcome, String> {
-        self.remove_impl(base, id, delete, None, false)
+        self.remove_impl(base, id, delete, RemovalCheck::Account(None))
     }
 
     /// Disconnect a mailbox while the caller holds the exclusive registry
@@ -328,7 +334,16 @@ impl Registry {
     ) -> Result<RemovalOutcome, String> {
         let expected =
             expected.ok_or("Couldn't verify the account file. Select the account again.")?;
-        self.remove_impl(base, id, delete, Some(expected), false)
+        self.remove_impl(base, id, delete, RemovalCheck::Account(Some(expected)))
+    }
+
+    pub fn remove_disconnected(
+        &self,
+        base: &Path,
+        id: &str,
+        email: &str,
+    ) -> Result<RemovalOutcome, String> {
+        self.remove_impl(base, id, true, RemovalCheck::Disconnected(email))
     }
 
     pub fn recover_removal(
@@ -338,7 +353,7 @@ impl Registry {
         delete: bool,
         expected: Option<FileIdentity>,
     ) -> Result<RemovalOutcome, String> {
-        self.remove_impl(base, id, delete, expected, true)
+        self.remove_impl(base, id, delete, RemovalCheck::Recovery(expected))
     }
 
     fn remove_impl(
@@ -346,30 +361,35 @@ impl Registry {
         base: &Path,
         id: &str,
         delete: bool,
-        expected: Option<FileIdentity>,
-        recovery_only: bool,
+        check: RemovalCheck<'_>,
     ) -> Result<RemovalOutcome, String> {
+        let recovery_only = matches!(check, RemovalCheck::Recovery(_));
         if !recovery_only {
             self.migrate_with(Some(base), LockMode::Exclusive, || Ok(()), || {})
                 .map_err(|err| err.cli_message())?;
         }
         let directory = self.lock().map_err(|err| err.to_string())?;
         let account = self.path(id).map_err(|err| err.to_string())?;
-        let mailbox = self
-            .removal_mailbox(base, id)
-            .map_err(|err| err.cli_message())?;
-        let changed = match expected {
-            Some(expected) => account.symlink_metadata().ok().map(file_identity) != Some(expected),
-            None if recovery_only => !account
-                .symlink_metadata()
-                .is_err_and(|error| error.kind() == io::ErrorKind::NotFound),
-            None => false,
+        let changed = match check {
+            RemovalCheck::Account(Some(expected)) | RemovalCheck::Recovery(Some(expected)) => {
+                account.symlink_metadata().ok().map(file_identity) != Some(expected)
+            }
+            RemovalCheck::Disconnected(_) | RemovalCheck::Recovery(None) => {
+                path_exists(&account).map_err(|err| err.to_string())?
+            }
+            RemovalCheck::Account(None) => false,
         };
         if changed {
             return Err("The account file changed. Select the account again.".into());
         }
+        let mailbox = self
+            .removal_mailbox(base, id)
+            .map_err(|err| err.cli_message())?;
         let trash = removal_trash(&mailbox);
         if path_exists(&trash).map_err(|err| err.to_string())? {
+            if matches!(check, RemovalCheck::Disconnected(_)) {
+                return Err("The mailbox changed. Select the account again.".into());
+            }
             real_directory(&trash).map_err(|err| format!("{}: {err}", trash.display()))?;
             let plan = match read_plan(&trash) {
                 Ok(plan) => plan,
@@ -436,17 +456,29 @@ impl Registry {
             return Err("There is no interrupted deletion for this account.".into());
         }
 
-        if !account
-            .symlink_metadata()
-            .is_ok_and(|meta| meta.is_file() || meta.is_symlink())
-        {
-            return Err(format!("No account file for {id:?}"));
-        }
-        let config = read(&account, Some(id))
-            .map_err(|err| err.to_string())?
-            .ok_or("The account file changed. Select the account again.")?;
-        validate_mailbox(&mailbox, id, Some(&config.0.email), false)
-            .map_err(|err| err.cli_message())?;
+        let (email, name, snapshot) = if let RemovalCheck::Disconnected(email) = check {
+            if !mailbox_owner(&mailbox)
+                .map_err(|err| err.cli_message())?
+                .is_some_and(|(owner, address)| owner == id && address.eq_ignore_ascii_case(email))
+            {
+                return Err("The mailbox changed. Select the account again.".into());
+            }
+            (email.to_owned(), email.to_owned(), None)
+        } else {
+            if !account
+                .symlink_metadata()
+                .is_ok_and(|meta| meta.is_file() || meta.is_symlink())
+            {
+                return Err(format!("No account file for {id:?}"));
+            }
+            let (config, snapshot) = read(&account, Some(id))
+                .map_err(|err| err.to_string())?
+                .ok_or("The account file changed. Select the account again.")?;
+            let name = config.account().display_name;
+            validate_mailbox(&mailbox, id, Some(&config.email), false)
+                .map_err(|err| err.cli_message())?;
+            (config.email, name, Some(snapshot))
+        };
         let id = AccountId(id.to_owned());
         let mut store = match mailbox.symlink_metadata() {
             Ok(meta) if meta.is_file() && meta.len() != 0 => {
@@ -457,8 +489,8 @@ impl Registry {
             Err(err) if err.kind() == io::ErrorKind::NotFound => None,
             Err(err) => return Err(err.to_string()),
         };
-        if !delete {
-            keep(&account, &directory, &id, store.as_ref(), &config.1)?;
+        if !delete && let Some(snapshot) = &snapshot {
+            keep(&account, &directory, &id, store.as_ref(), snapshot)?;
             return Ok(RemovalOutcome::Kept);
         }
 
@@ -475,7 +507,7 @@ impl Registry {
         } else {
             lock_mailbox(&mailbox)?
         };
-        validate_mailbox(&mailbox, id.as_str(), Some(&config.0.email), true)
+        validate_mailbox(&mailbox, id.as_str(), Some(&email), true)
             .map_err(|err| err.cli_message())?;
         let mut drafts = compose::drafts_for_removal(&id, &mailbox, store.as_ref())?;
         if let Some(store) = store {
@@ -496,14 +528,16 @@ impl Registry {
         let plan = Removal {
             account: id.0,
             drafts,
-            name: Some(config.0.account().display_name),
+            name: Some(name),
         };
-        publish(
-            staged.path(),
-            &staged.path().join("account.toml"),
-            config.1.as_bytes(),
-        )
-        .map_err(|err| err.to_string())?;
+        if let Some(snapshot) = snapshot {
+            publish(
+                staged.path(),
+                &staged.path().join("account.toml"),
+                snapshot.as_bytes(),
+            )
+            .map_err(|err| err.to_string())?;
+        }
         let mut journal =
             File::create(staged.path().join("plan")).map_err(|err| err.to_string())?;
         journal
@@ -904,6 +938,60 @@ mod tests {
         let reconnect = Store::kept_connection(&db, id.as_str()).unwrap();
         assert_eq!(reconnect.email, config.email);
         assert_eq!(reconnect.password, crate::PasswordSource::Keyring);
+    }
+
+    #[test]
+    fn delete_kept_mail_requires_the_same_disconnected_mailbox() {
+        let Some(root) = crate::test_support::in_isolated_process() else {
+            return;
+        };
+        let registry = Registry::resolve().unwrap();
+        fs::create_dir_all(registry.directory()).unwrap();
+        let base = root.join("mail.db");
+        let id = AccountId("work".into());
+        let file = registry.path(id.as_str()).unwrap();
+        let configure = || {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&file)
+                .unwrap()
+                .write_all(b"email = 'work@example.test'\npassword = 'fixture'\n")
+                .unwrap();
+            registry.get(&id).unwrap().unwrap().account()
+        };
+        let account = configure();
+        let db = registry.store_path(&base, id.as_str()).unwrap();
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        Store::open(&db).unwrap().upsert_account(&account).unwrap();
+        assert_eq!(
+            registry.remove(&base, id.as_str(), false),
+            Ok(RemovalOutcome::Kept)
+        );
+        assert_eq!(registry.load_with_removals(&base).disconnected.len(), 1);
+
+        configure();
+        assert!(
+            registry
+                .remove_disconnected(&base, id.as_str(), &account.email)
+                .is_err()
+        );
+        assert!(file.is_file() && db.is_file());
+        registry.remove(&base, id.as_str(), false).unwrap();
+        assert!(
+            registry
+                .remove_disconnected(&base, id.as_str(), "other@example.test")
+                .is_err()
+        );
+        assert!(db.is_file());
+
+        assert_eq!(
+            registry.remove_disconnected(&base, id.as_str(), &account.email),
+            Ok(RemovalOutcome::Deleted)
+        );
+        assert!(!db.exists());
+        assert!(registry.load_with_removals(&base).disconnected.is_empty());
     }
 
     #[test]

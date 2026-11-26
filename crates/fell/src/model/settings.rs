@@ -157,6 +157,7 @@ pub enum Page {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AccountRemovalKind {
     Account,
+    Disconnected,
     BrokenFile,
     Interrupted { can_restore: bool },
 }
@@ -267,6 +268,13 @@ impl Nav {
         }
     }
 
+    pub fn confirm_account_removal(&mut self, kind: AccountRemovalKind) {
+        self.page = Page::ConfirmAccountRemoval {
+            delete: kind == AccountRemovalKind::Disconnected,
+            kind,
+        };
+    }
+
     pub fn back(&mut self) -> bool {
         match self.page {
             Page::Index => return false,
@@ -279,13 +287,15 @@ impl Nav {
             }
             Page::Bindings => self.select_row(Row::EffectiveBindings),
             Page::IdentityImport => self.select_row(Row::ImportIdentities),
-            Page::ConfirmAccountRemoval { delete: true, kind } => {
+            Page::ConfirmAccountRemoval { delete: true, kind }
+                if kind != AccountRemovalKind::Disconnected =>
+            {
                 self.page = Page::ConfirmAccountRemoval {
                     delete: false,
                     kind,
                 };
             }
-            Page::ConfirmAccountRemoval { delete: false, .. } => {
+            Page::ConfirmAccountRemoval { .. } => {
                 self.page = Page::Section(Section::Accounts);
             }
             Page::ConfirmModel { install } => {
@@ -487,6 +497,66 @@ mod tests {
                 resend: true
             })
         );
+    }
+
+    #[test]
+    fn palette_edit_connection_leaves_the_current_view_in_place() {
+        let mut session = Session::new("", "", SyncKind::LocalOffline, Keymap::default());
+        session.settings_nav.set_availability(Availability {
+            accounts: 2,
+            active_account: Some(0),
+            ..Availability::default()
+        });
+        session.settings_nav.select_row(Row::Account(1));
+        let edit_from_palette = |session: &mut Session| {
+            session.on_key(KeyId::Char(':'), 10);
+            session.palette_query = "edit connection".into();
+            session.on_key(KeyId::Enter, 10).settings
+        };
+
+        assert_eq!(
+            edit_from_palette(&mut session),
+            Some(Request::EditConnection(0))
+        );
+        assert_eq!(session.overlay, Overlay::None);
+        session.overlay = Overlay::Settings;
+        assert_eq!(
+            edit_from_palette(&mut session),
+            Some(Request::EditConnection(1))
+        );
+        assert_eq!(session.overlay, Overlay::Settings);
+        assert_eq!(session.settings_nav.row(), Some(Row::Account(1)));
+    }
+
+    #[test]
+    fn disconnected_removal_requires_explicit_local_mail_confirmation() {
+        let mut session = Session::new("", "", SyncKind::LocalOffline, Keymap::default());
+        session.overlay = Overlay::Settings;
+        session.settings_nav.set_availability(Availability {
+            accounts: 1,
+            kept_accounts: true,
+            ..Availability::default()
+        });
+        session.settings_nav.select_row(Row::Account(0));
+        assert_eq!(
+            session.on_key(REMOVE_ACCOUNT_KEY, 10).settings,
+            Some(Request::ConfirmAccountRemoval(0))
+        );
+        let kind = AccountRemovalKind::Disconnected;
+        session.settings_nav.confirm_account_removal(kind);
+        assert_eq!(session.on_key(KeyId::Enter, 10).settings, None);
+        assert_eq!(
+            session.settings_nav.page,
+            Page::ConfirmAccountRemoval { delete: true, kind }
+        );
+        assert_eq!(session.on_key(KeyId::Escape, 10).settings, None);
+        assert_eq!(session.settings_nav.row(), Some(Row::Account(0)));
+        session.settings_nav.confirm_account_removal(kind);
+        assert_eq!(
+            session.on_key(KeyId::Char('y'), 10).settings,
+            Some(Request::RemoveAccount { delete: true })
+        );
+        assert_eq!(session.settings_nav.row(), Some(Row::Account(0)));
     }
 
     #[test]

@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fell_core::{
-    Account, AccountConfig, BackendKind, DroppedWrite, InboxWait, ReaderBodyFetcher,
+    Account, AccountConfig, BackendKind, DroppedWrite, InboxWait, OutboxState, ReaderBodyFetcher,
     ReplyToBackfill, ReplyToProgress, Store, SyncFailureKind, SyncReport, diagnostic,
     fetch_missing_bodies, sync_connection_until,
 };
@@ -303,18 +303,7 @@ fn run(
         }
         true
     };
-    let handle_ask = |ask| {
-        if let Ask::HeldChanges { resend } = ask {
-            let result = if resend {
-                config.resend_held_writes(&store)
-            } else {
-                store.discard_held_writes(&account.id)
-            }
-            .map_err(|err| err.to_string());
-            let _ = events.unbounded_send(SyncEvent::HeldAction { result, resend });
-        }
-        ask == Ask::Sync
-    };
+    let mut resending = Vec::new();
     loop {
         if stopping() {
             return;
@@ -347,6 +336,25 @@ fn run(
             {
                 return;
             }
+        }
+        let mut resent = 0;
+        resending.retain(|&id| match store.outbox_state(&account.id, id) {
+            Ok(Some(OutboxState::Done)) => {
+                resent += 1;
+                false
+            }
+            Ok(Some(OutboxState::Pending)) | Err(_) => true,
+            _ => false,
+        });
+        if resent > 0
+            && events
+                .unbounded_send(SyncEvent::HeldAction {
+                    result: Ok(resent),
+                    resend: true,
+                })
+                .is_err()
+        {
+            return;
         }
         if !refresh_trash_confirmation() || !report_held() {
             return;
@@ -460,9 +468,25 @@ fn run(
         });
         match woke {
             Woke::Asked(ask) => {
-                let mut shown = handle_ask(ask);
-                while let Ok(more) = wake.try_recv() {
-                    shown |= handle_ask(more);
+                let mut shown = false;
+                for ask in std::iter::once(ask).chain(wake.try_iter()) {
+                    shown |= ask == Ask::Sync;
+                    if let Ask::HeldChanges { resend } = ask {
+                        let result = if resend {
+                            match config.requeue_held_writes(&store) {
+                                Ok(rows) if !rows.is_empty() => {
+                                    resending.extend(rows);
+                                    continue;
+                                }
+                                Ok(_) => Ok(0),
+                                Err(error) => Err(error),
+                            }
+                        } else {
+                            store.discard_held_writes(&account.id)
+                        }
+                        .map_err(|err| err.to_string());
+                        let _ = events.unbounded_send(SyncEvent::HeldAction { result, resend });
+                    }
                 }
                 if shown && !send(SyncKind::Connecting) {
                     return;

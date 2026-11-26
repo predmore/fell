@@ -465,6 +465,16 @@ impl AccountWindow {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
+        if removal.kind == AccountRemovalKind::Disconnected
+            && !self.catalog.disconnected.iter().any(|kept| kept.id == id)
+        {
+            self.notice(
+                "The mailbox changed. Select the account again.".into(),
+                true,
+                cx,
+            );
+            return;
+        }
         if self.removing.contains_key(id) || self.preparing_removal.contains(id) {
             return;
         }
@@ -521,6 +531,17 @@ impl AccountWindow {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
+        if remove.as_ref().is_some_and(|(request, _)| {
+            request.kind == AccountRemovalKind::Disconnected && self.views.contains_key(id)
+        }) {
+            self.update_choices(false, cx);
+            self.notice(
+                "The mailbox changed. Select the account again.".into(),
+                true,
+                cx,
+            );
+            return;
+        }
         let broken = remove
             .as_ref()
             .is_some_and(|(request, _)| request.kind == AccountRemovalKind::BrokenFile);
@@ -641,6 +662,9 @@ impl AccountWindow {
                             }
                             let base = mailbox::store_path()?;
                             match request.kind {
+                                AccountRemovalKind::Disconnected => {
+                                    read.remove_disconnected(&base, &retired, &request.name)
+                                }
                                 AccountRemovalKind::Interrupted { .. } => read.recover_removal(
                                     &base,
                                     &retired,

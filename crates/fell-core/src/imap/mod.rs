@@ -199,7 +199,7 @@ pub(crate) fn replay_account_outbox(
     )
 }
 
-pub(crate) use write_back::resend_held_writes;
+pub(crate) use write_back::requeue_held_writes;
 
 /// Log in, count selectable mailboxes, and log out. Reads no mail.
 pub(crate) fn check_login(config: &ImapConfig) -> Result<usize, Error> {

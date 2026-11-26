@@ -654,8 +654,21 @@ fn resending_uses_the_listed_folder_and_the_current_archive_destination() {
     };
     fx.store.configure_connection(&next).unwrap();
     assert_eq!(fx.store.held_write_count(account).unwrap(), 2);
-    assert_eq!(next.resend_held_writes(&fx.store).unwrap(), 2);
+    let resending = next.requeue_held_writes(&fx.store).unwrap();
+    assert_eq!(resending.len(), 2);
+    for &id in &resending {
+        assert_eq!(
+            fx.store.outbox_state(account, id).unwrap(),
+            Some(OutboxState::Pending)
+        );
+    }
     assert_eq!(next.replay_outbox(&fx.store).unwrap().sent, 2);
+    for id in resending {
+        assert_eq!(
+            fx.store.outbox_state(account, id).unwrap(),
+            Some(OutboxState::Done)
+        );
+    }
     let state = next_server.state.lock().unwrap();
     assert!(state.mailboxes[0].messages.is_empty());
     assert_eq!(state.mailboxes[1].messages[0].raw, bravo);
