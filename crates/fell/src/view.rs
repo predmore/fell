@@ -5831,7 +5831,9 @@ impl Render for Inbox {
         let mut leaving = Vec::new();
         if let Some((layer, opacity)) = self.motion.closing_which(now) {
             layer.swap(&mut self.session);
-            leaving.push(which_key_popup(&theme, &self.session, (opacity, 0.0)).into_any_element());
+            leaving.push(
+                which_key_popup(&theme, &self.session, window, (opacity, 0.0)).into_any_element(),
+            );
             layer.swap(&mut self.session);
         }
         let viewport_height = f32::from(window.viewport_size().height);
@@ -6574,7 +6576,7 @@ fn shell(
         .children(leaving)
         .when(
             session.which_visible && session.overlay == Overlay::None && !session.chord.is_empty(),
-            |root| root.child(which_key_popup(&theme, session, motion.which(now))),
+            |root| root.child(which_key_popup(&theme, session, window, motion.which(now))),
         )
         .children(active_overlay)
 }
@@ -11931,14 +11933,44 @@ fn status_text(mut text: String, hint: Option<(&str, &str)>, theme: &Theme) -> S
 }
 
 /// `(opacity, rise)`: the popup fades in as it rises the last few pixels.
-fn which_key_popup(theme: &Theme, session: &Session, (opacity, rise): (f32, f32)) -> gpui::Div {
+fn which_key_popup(
+    theme: &Theme,
+    session: &Session,
+    window: &Window,
+    (opacity, rise): (f32, f32),
+) -> gpui::Div {
     let items = session.which_items();
+    let font_size = px(theme.ui_px);
+    let label_style = conversation_line_style(window, theme, font_size);
+    let mut key_style = label_style.clone();
+    if let Some(family) = &theme.mono_family {
+        key_style.font_family = family.clone().into();
+    }
+    let key_width = which_key_column_width(&items, theme.ui_px, |key| {
+        window
+            .text_system()
+            .shape_line(
+                key.to_owned().into(),
+                font_size,
+                &[key_style.to_run(key.len())],
+                None,
+            )
+            .width
+    });
+    let has_groups = items.iter().any(|item| item.is_group);
+    let text = window.text_system();
+    let label_line = text.shape_line("x".into(), font_size, &[label_style.to_run(1)], None);
+    let x_height = label_line
+        .font_id_for_index(0)
+        .map(|font| text.x_height(font, font_size))
+        .filter(|height| *height > px(0.))
+        .unwrap_or(font_size * 0.55);
+    let chevron_offset = (label_line.ascent - label_line.descent - x_height) / 2.;
     div()
         .absolute()
         .bottom(px(40. - rise))
         .opacity(opacity)
         .left(px(16.))
-        .min_w(px(220.))
         .bg(rgb(theme.surface))
         .border_1()
         .border_color(rgb(theme.border))
@@ -11959,25 +11991,63 @@ fn which_key_popup(theme: &Theme, session: &Session, (opacity, rise): (f32, f32)
         .children(items.into_iter().map(|item| {
             div()
                 .flex()
-                .flex_row()
-                .gap(px(12.))
+                .items_center()
                 .child(
                     div()
-                        .w(px(72.))
+                        .w(key_width)
+                        .flex_none()
                         .font_family_opt(theme.mono_family.clone())
                         .text_color(rgb(theme.accent))
                         .child(item.key),
                 )
                 .child(div().flex_1().child(item.label))
-                .child(
-                    div()
-                        .w(px(12.))
-                        .flex_none()
-                        .text_right()
-                        .text_color(rgb(theme.dimmed))
-                        .children(item.is_group.then_some("›")),
-                )
+                .when(has_groups, |row| {
+                    row.child(
+                        div()
+                            .ml(font_size)
+                            .w(font_size)
+                            .flex_none()
+                            .flex()
+                            .justify_end()
+                            .children(item.is_group.then(|| {
+                                which_key_chevron(font_size, chevron_offset, theme.dimmed)
+                            })),
+                    )
+                })
         }))
+}
+
+fn which_key_chevron(font_size: Pixels, offset: Pixels, color: u32) -> impl IntoElement {
+    gpui::canvas(
+        |_, _, _| (),
+        move |bounds, (), window, _| {
+            let center = bounds.center();
+            let y = center.y + offset;
+            let half_width = font_size * 0.15;
+            let half_height = font_size * 0.29;
+            let mut path = gpui::PathBuilder::stroke(font_size * 0.13);
+            path.move_to(point(center.x - half_width, y - half_height));
+            path.line_to(point(center.x + half_width, y));
+            path.line_to(point(center.x - half_width, y + half_height));
+            if let Ok(path) = path.build() {
+                window.paint_path(path, rgb(color));
+            }
+        },
+    )
+    .w(font_size * 0.5)
+    .h(font_size)
+}
+
+fn which_key_column_width(
+    items: &[keymap::WhichItem],
+    ui_px: f32,
+    measure: impl Fn(&str) -> Pixels,
+) -> Pixels {
+    let widest = items
+        .iter()
+        .map(|item| measure(&item.key))
+        .fold(px(0.), |widest, width| widest.max(width));
+    widest.ceil() + px(ui_px * (16. / 15.))
 }
 
 const PALETTE_PX: f32 = 560.0;
@@ -12999,6 +13069,27 @@ mod tests {
             assert_eq!(*counts.built.borrow(), expected);
             assert_eq!(*counts.painted.borrow(), expected);
         }
+    }
+
+    #[test]
+    fn which_key_column_uses_the_widest_key_and_scaled_padding() {
+        use crate::keymap::WhichItem;
+        use gpui::px;
+
+        let items = ["i", "space", "M"].map(|key| WhichItem {
+            key: key.into(),
+            label: "A long action label".into(),
+            is_group: false,
+        });
+        for ui_px in [12., 15., 18.] {
+            let width = super::which_key_column_width(&items, ui_px, |key| {
+                px(key.len() as f32 * ui_px * 0.6)
+            });
+            let expected = (5. * ui_px * 0.6).ceil() + 16. * ui_px / 15.;
+            assert!((f32::from(width) - expected).abs() < 0.001);
+        }
+        let width = super::which_key_column_width(&items[2..], 15., |_| px(9.5));
+        assert_eq!(width, px(26.));
     }
 
     #[test]

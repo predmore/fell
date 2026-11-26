@@ -184,92 +184,132 @@ impl Action {
         }
     }
 
-    pub fn all() -> &'static [Action] {
-        ALL_ACTIONS
+    pub fn all() -> impl Iterator<Item = Action> {
+        ACTION_SECTIONS
+            .iter()
+            .flat_map(|(_, actions)| actions.iter().copied())
     }
 }
 
-const ALL_ACTIONS: &[Action] = &[
-    Action::Next,
-    Action::Prev,
-    Action::First,
-    Action::Last,
-    Action::Open,
-    Action::Back,
-    Action::PageDown,
-    Action::PageUp,
-    Action::Inbox,
-    Action::Sent,
-    Action::Drafts,
-    Action::Snoozed,
-    Action::Muted,
-    Action::Compose,
-    Action::Reply,
-    Action::ReplyAll,
-    Action::Forward,
-    Action::FocusLinks,
-    Action::FocusAttachments,
-    Action::PreviousAttachment,
-    Action::NextAttachment,
-    Action::OpenAttachment,
-    Action::SaveAttachment,
-    Action::SaveAllAttachments,
-    Action::RetryAttachment,
-    Action::FolderPicker,
-    Action::Label,
-    Action::LabelList,
-    Action::Search,
-    Action::NextHit,
-    Action::PreviousHit,
-    Action::Move,
-    Action::Archive,
-    Action::Snooze,
-    Action::Unsnooze,
-    Action::Mute,
-    Action::ToggleUnread,
-    Action::ToggleStar,
-    Action::Delete,
-    Action::Spam,
-    Action::Undo,
-    Action::SplitThread,
-    Action::MergeThreads,
-    Action::SyncNow,
-    Action::Notifications(NotificationMode::On),
-    Action::Notifications(NotificationMode::Private),
-    Action::Notifications(NotificationMode::Off),
-    Action::Settings,
-    Action::Setting(SettingsRow::Value(Preference::Theme)),
-    Action::Setting(SettingsRow::Value(Preference::FontSize)),
-    Action::Setting(SettingsRow::Value(Preference::ReduceMotion)),
-    Action::Setting(SettingsRow::Value(Preference::ReadDwell)),
-    Action::Setting(SettingsRow::Value(Preference::WhichKey)),
-    Action::Setting(SettingsRow::Value(Preference::Notifications)),
-    Action::Setting(SettingsRow::AccountSetup),
-    Action::Setting(SettingsRow::EditAccount),
-    Action::Setting(SettingsRow::ImportIdentities),
-    Action::Setting(SettingsRow::EffectiveBindings),
-    Action::Setting(SettingsRow::EditKeymap),
-    Action::Setting(SettingsRow::InstallModel),
-    Action::Setting(SettingsRow::RemoveModel),
-    Action::ToggleSelect,
-    Action::Visual,
-    Action::FullWidth,
-    Action::ToggleQuotes,
-    Action::Palette,
-    Action::Help,
-    Action::ReopenReview,
-    Action::Agents,
-    Action::AgentActivity,
-    Action::OpenDiagnosticLog,
-    Action::OpenCrashReport,
-    Action::ToggleAgentNote,
-    Action::DismissAgentNote,
-    Action::NextAgentNote,
-    Action::ScrollAgentNoteDown,
-    Action::ScrollAgentNoteUp,
-    Action::AcceptAgentSuggestion,
-    Action::ThreadsWithSuggestions,
-    Action::About,
+/// The default discovery order. A chord group can span sections when its
+/// existing key serves more than one purpose, as with attachments and agents.
+pub const ACTION_SECTIONS: &[(&str, &[Action])] = &[
+    (
+        "Navigation",
+        &[
+            Action::Next,
+            Action::Prev,
+            Action::First,
+            Action::Last,
+            Action::Open,
+            Action::Back,
+            Action::Inbox,
+            Action::Sent,
+            Action::Drafts,
+            Action::FolderPicker,
+            Action::LabelList,
+            Action::Snoozed,
+            Action::Muted,
+        ],
+    ),
+    (
+        "Search",
+        &[Action::Search, Action::NextHit, Action::PreviousHit],
+    ),
+    (
+        "Reading",
+        &[
+            Action::PageDown,
+            Action::PageUp,
+            Action::FullWidth,
+            Action::ToggleQuotes,
+            Action::FocusLinks,
+        ],
+    ),
+    (
+        "Attachments",
+        &[
+            Action::FocusAttachments,
+            Action::PreviousAttachment,
+            Action::NextAttachment,
+            Action::OpenAttachment,
+            Action::SaveAttachment,
+            Action::SaveAllAttachments,
+            Action::RetryAttachment,
+        ],
+    ),
+    (
+        "Compose",
+        &[
+            Action::Compose,
+            Action::Reply,
+            Action::ReplyAll,
+            Action::Forward,
+        ],
+    ),
+    (
+        "Organize",
+        &[
+            Action::ToggleSelect,
+            Action::Visual,
+            Action::Move,
+            Action::Archive,
+            Action::Label,
+            Action::Snooze,
+            Action::Unsnooze,
+            Action::Mute,
+            Action::ToggleUnread,
+            Action::ToggleStar,
+            Action::Delete,
+            Action::Spam,
+            Action::SplitThread,
+            Action::MergeThreads,
+            Action::Undo,
+        ],
+    ),
+    (
+        "Agents",
+        &[
+            Action::Agents,
+            Action::ReopenReview,
+            Action::AgentActivity,
+            Action::ToggleAgentNote,
+            Action::DismissAgentNote,
+            Action::NextAgentNote,
+            Action::ScrollAgentNoteDown,
+            Action::ScrollAgentNoteUp,
+            Action::AcceptAgentSuggestion,
+            Action::ThreadsWithSuggestions,
+        ],
+    ),
+    (
+        "General",
+        &[
+            Action::Palette,
+            Action::Help,
+            Action::Settings,
+            Action::SyncNow,
+            Action::Notifications(NotificationMode::On),
+            Action::Notifications(NotificationMode::Private),
+            Action::Notifications(NotificationMode::Off),
+            Action::Setting(SettingsRow::Value(Preference::Theme)),
+            Action::Setting(SettingsRow::Value(Preference::FontSize)),
+            Action::Setting(SettingsRow::Value(Preference::ReduceMotion)),
+            Action::Setting(SettingsRow::Value(Preference::ReadDwell)),
+            Action::Setting(SettingsRow::Value(Preference::WhichKey)),
+            Action::Setting(SettingsRow::Value(Preference::Notifications)),
+            Action::Setting(SettingsRow::AccountSetup),
+            Action::Setting(SettingsRow::EditAccount),
+            Action::Setting(SettingsRow::ImportIdentities),
+            Action::Setting(SettingsRow::EffectiveBindings),
+            Action::Setting(SettingsRow::EditKeymap),
+            Action::Setting(SettingsRow::InstallModel),
+            Action::Setting(SettingsRow::RemoveModel),
+            Action::OpenDiagnosticLog,
+            Action::OpenCrashReport,
+            Action::About,
+        ],
+    ),
 ];
 
 #[derive(Clone, Debug)]
@@ -424,7 +464,7 @@ fn default_bindings() -> Vec<Binding> {
         bind(
             &[KeyId::Leader, KeyId::Char('?'), KeyId::Char(key)],
             action,
-            Some("Help / diagnostics"),
+            Some("General"),
         );
     }
     bind(
@@ -472,7 +512,7 @@ fn default_bindings() -> Vec<Binding> {
         bind(
             &[KeyId::Leader, KeyId::Char('b'), KeyId::Char(key)],
             action,
-            Some("Triage"),
+            Some("Organize"),
         );
     }
     bind(
@@ -530,12 +570,12 @@ fn default_bindings() -> Vec<Binding> {
     bind(
         &[KeyId::Leader, KeyId::Char('t'), KeyId::Char('z')],
         Action::FullWidth,
-        Some("Toggles"),
+        Some("Reading / notifications"),
     );
     bind(
         &[KeyId::Leader, KeyId::Char('t'), KeyId::Char('q')],
         Action::ToggleQuotes,
-        Some("Toggles"),
+        Some("Reading / notifications"),
     );
     for (key, mode) in [
         ('o', NotificationMode::On),
@@ -600,6 +640,12 @@ pub fn which_key(keymap: &Keymap, prefix: &[KeyId]) -> Vec<WhichItem> {
             groups.push((key, vec![binding]));
         }
     }
+    // A group takes the position of its first action in the discovery order.
+    groups.sort_by_cached_key(|(_, bindings)| {
+        Action::all()
+            .position(|action| bindings.iter().any(|binding| binding.action == action))
+            .unwrap_or(usize::MAX)
+    });
     groups
         .into_iter()
         .map(|(key, bindings)| which_item(key, prefix, &bindings))
@@ -650,7 +696,7 @@ pub fn recent_search_items<'a>(
 
 pub fn palette_items(keymap: &Keymap, query: &str, recent: &[Action]) -> Vec<PaletteItem> {
     let mut items: Vec<(i32, usize, PaletteItem)> = Vec::new();
-    for (index, action) in Action::all().iter().copied().enumerate() {
+    for (index, action) in Action::all().enumerate() {
         let label = action.label();
         let score = fuzzy(query, label).or_else(|| match action {
             Action::About => fuzzy(query, "version"),
@@ -854,7 +900,11 @@ mod tests {
                 .any(|item| item.action == Action::Help && item.binding == "? · space ? ?")
         );
         let leader = which_key(&keymap, &[KeyId::Leader]);
-        assert!(leader.iter().any(|item| item.key == "?" && item.is_group));
+        assert!(
+            leader
+                .iter()
+                .any(|item| item.key == "?" && item.label == "General" && item.is_group)
+        );
         let help = [KeyId::Leader, KeyId::Char('?')];
         assert_eq!(match_seq(&keymap, &help), SeqMatch::Prefix);
         for (key, action) in [
@@ -877,10 +927,13 @@ mod tests {
                 .iter()
                 .any(|item| item.key == "f" && item.label == "Folders" && item.is_group)
         );
+        assert!(leader.iter().any(|item| item.key == "t"
+            && item.label == "Reading / notifications"
+            && item.is_group));
         assert!(
             leader
                 .iter()
-                .any(|item| item.key == "t" && item.label == "Toggles" && item.is_group)
+                .any(|item| item.key == "b" && item.label == "Organize" && item.is_group)
         );
         assert!(leader.iter().all(|item| item.key != "m"));
         let folders = which_key(&keymap, &[KeyId::Leader, KeyId::Char('f')]);
@@ -919,6 +972,54 @@ mod tests {
                 .find(|item| item.action == Action::ReopenReview)
                 .unwrap();
             assert_eq!(command.label, review.label);
+        }
+    }
+
+    #[test]
+    fn every_bound_action_has_one_section() {
+        let keymap = Keymap::default();
+        let mut catalog = std::collections::HashSet::new();
+        for action in Action::all() {
+            assert!(catalog.insert(action), "duplicate action: {action:?}");
+        }
+        for action in keymap
+            .bindings
+            .iter()
+            .map(|binding| binding.action)
+            .chain(keymap.attachment_bindings.iter().map(|&(_, action)| action))
+        {
+            assert!(catalog.contains(&action), "missing action: {action:?}");
+        }
+    }
+
+    #[test]
+    fn which_key_follows_the_palette_order_at_each_chord_prefix() {
+        let keymap = Keymap::default();
+        let palette = palette_items(&keymap, "", &[]);
+        let prefixes: std::collections::HashSet<_> = keymap
+            .bindings
+            .iter()
+            .flat_map(|binding| (0..binding.keys.len()).map(|len| &binding.keys[..len]))
+            .collect();
+        for prefix in prefixes {
+            let mut expected = Vec::new();
+            for item in &palette {
+                for binding in keymap.bindings_for(item.action) {
+                    if binding.keys.starts_with(prefix)
+                        && let Some(&key) = binding.keys.get(prefix.len())
+                    {
+                        let label = key_label(key, &keymap.leader_name);
+                        if !expected.contains(&label) {
+                            expected.push(label);
+                        }
+                    }
+                }
+            }
+            let shown: Vec<_> = which_key(&keymap, prefix)
+                .into_iter()
+                .map(|item| item.key)
+                .collect();
+            assert_eq!(shown, expected, "prefix: {prefix:?}");
         }
     }
 
