@@ -13,3 +13,10 @@ Judges must be independent: they did not write the code. They need running-app e
 Judges score those same images and the recording against [docs/ux.md](docs/ux.md) together with [docs/scope.md](docs/scope.md): Zed-like speed and polish, keyboard-first vim grammar, typography and density, clarity, focus states, empty and loading states, error handling. Each score is out of 10.
 
 Iterate until every judge is at 9 or better. Put the scores and the evidence in the PR. Do not merge a visible change while any judge is below 9.
+
+## Test temporary files
+
+Use a `tempfile::TempDir` for on-disk fixtures and keep it alive until all
+stores and workers using it have been dropped. Run
+`python3 scripts/check-test-temp.py` to run the fell-core library tests in a
+private `TMPDIR` and check for leftover files and directories.

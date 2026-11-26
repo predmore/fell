@@ -7500,13 +7500,8 @@ mod tests {
 
     #[test]
     fn preview_cache_rejects_without_rereading_and_drops() {
-        let root = std::env::temp_dir().join(format!(
-            "fell-preview-{}-{}",
-            std::process::id(),
-            super::now_ms()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
         assert!(super::preview_file(&root).is_none());
 
         let huge = root.join("huge.bin");
@@ -7563,7 +7558,6 @@ mod tests {
         let cache = super::preview_cache().lock().unwrap();
         assert!(cache.entries.keys().all(|path| !path.starts_with(&root)));
         drop(cache);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -7621,20 +7615,11 @@ mod tests {
         assert!(!cursor_line_covered("\n", 0, &blank));
     }
 
-    fn temp_root(tag: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "fell-compose-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        root
-    }
-
-    fn plain_session(tag: &str, body: &str) -> fell_core::compose::DraftSession {
+    fn plain_session(
+        tag: &str,
+        body: &str,
+    ) -> (tempfile::TempDir, fell_core::compose::DraftSession) {
+        let temp = tempfile::tempdir().unwrap();
         let fields = fell_core::compose::DraftFields {
             from: "jon@example.com".into(),
             to: vec!["ada@example.com".into()],
@@ -7643,16 +7628,18 @@ mod tests {
         };
         let account = fell_core::AccountId("local".into());
         let folder =
-            fell_core::compose::materialize_in(&temp_root(tag), tag, &fields, body, &account)
-                .unwrap();
-        fell_core::compose::DraftSession::testing_create_local(folder, tag, account, fields, body)
-            .unwrap()
+            fell_core::compose::materialize_in(temp.path(), tag, &fields, body, &account).unwrap();
+        let session = fell_core::compose::DraftSession::testing_create_local(
+            folder, tag, account, fields, body,
+        )
+        .unwrap();
+        (temp, session)
     }
 
     #[test]
     fn one_undo_takes_back_a_whole_insert_burst() {
         let before = "Ship it.\n";
-        let mut session = plain_session("undo", before);
+        let (_temp, mut session) = plain_session("undo", before);
         let mut editor = super::Editor::from_body(before);
         editor.row = 0;
         editor.col = editor.lines[0].chars().count();
@@ -7673,7 +7660,7 @@ mod tests {
 
     #[test]
     fn a_normal_mode_edit_is_its_own_undo_step() {
-        let mut session = plain_session("undo-normal", "abc\n");
+        let (_temp, mut session) = plain_session("undo-normal", "abc\n");
         super::record_body(&mut session, "bc\n".into(), super::Mode::Normal);
         super::record_body(&mut session, "c\n".into(), super::Mode::Normal);
         assert!(session.undo());
@@ -8736,7 +8723,7 @@ mod tests {
         let Some(root) = fell_core::test_support::in_isolated_process() else {
             return;
         };
-        let mut session = plain_session("quote", "body\n");
+        let (_temp, mut session) = plain_session("quote", "body\n");
         assert_eq!(super::stored_quote(&session.snapshot()), None);
         session.set_quote(Some("  \n".into()));
         assert_eq!(super::stored_quote(&session.snapshot()), None);

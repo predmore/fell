@@ -750,14 +750,11 @@ mod tests {
 
     use crate::message::Disposition;
 
-    pub(crate) fn temp_root(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "fell-parts-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        dir
+    pub(crate) fn temp_root(tag: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("fell-parts-{tag}-"))
+            .tempdir()
+            .unwrap()
     }
 
     pub(crate) fn request(message_id: &str, section: &str, name: Option<&str>) -> PartRequest {
@@ -950,12 +947,12 @@ mod tests {
     fn a_cached_part_does_not_resolve_backend_credentials_or_report_download_progress() {
         use std::io::Read;
 
-        let (root, cache, store, request) = super::cleanup_tests::listed_fixture("offline-hit");
+        let (temp, cache, store, request) = super::cleanup_tests::listed_fixture("offline-hit");
         let cached = cache.seed(&request, b"data").unwrap();
         let fetcher = PartFetcher::start_for_store(
             || Err(Error::Backend("credentials unavailable".into())),
             cache,
-            root.join("mail.db"),
+            temp.path().join("mail.db"),
         );
         let (send, receive) = mpsc::channel();
         fetcher.fetch(request, move |event| {
@@ -974,12 +971,12 @@ mod tests {
             other => panic!("expected an offline cache hit, got {other:?}"),
         }
         drop((fetcher, store));
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn cached_parts_are_owner_only_and_named_for_the_part() {
-        let root = temp_root("modes");
+        let temp = temp_root("modes");
+        let root = temp.path().join("fixture");
         let cache = PartCache::open(root.join("fell/parts"), DEFAULT_CACHE_BYTES).unwrap();
         assert_eq!(mode(cache.root()), 0o700);
         let wanted = request("m@x", "2", Some("../report.pdf"));
@@ -1005,12 +1002,12 @@ mod tests {
                 .lookup(&request("n@x", "2", Some("../report.pdf")))
                 .is_none()
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn a_symlinked_root_or_entry_is_not_used() {
-        let root = temp_root("links");
+        let temp = temp_root("links");
+        let root = temp.path().join("fixture");
         let elsewhere = root.join("elsewhere");
         fs::create_dir_all(&elsewhere).unwrap();
         fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o755)).unwrap();
@@ -1034,12 +1031,11 @@ mod tests {
         assert!(cache.lookup(&wanted).is_none());
         assert!(cache.seed(&wanted, b"%PDF").is_err());
         assert_eq!(fs::read(elsewhere.join("a.pdf")).unwrap(), b"planted");
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn a_cached_file_of_the_wrong_size_is_a_miss_and_is_refetched() {
-        let (root, cache, store, wanted) = super::cleanup_tests::listed_fixture("size");
+        let (_temp, cache, store, wanted) = super::cleanup_tests::listed_fixture("size");
         let stored = cache.seed(&wanted, b"%PDF").unwrap();
         // Cut short on disk (a crash, a full disk, a hand edit).
         fs::write(&stored.path, b"%P").unwrap();
@@ -1052,12 +1048,12 @@ mod tests {
         assert_eq!(fetched.size, 4);
         assert_eq!(cache.lookup(&wanted).unwrap().path, fetched.path);
         drop(store);
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn the_least_recently_used_parts_go_past_the_cap() {
-        let root = temp_root("lru");
+        let temp = temp_root("lru");
+        let root = temp.path().join("fixture");
         let cache = PartCache::open(&root, 250).unwrap();
         let sized = |id: &str, name: &str, size: u64| {
             let mut wanted = request(id, "2", Some(name));
@@ -1089,7 +1085,6 @@ mod tests {
         cache.seed(&huge, &[4; 300]).unwrap();
         assert!(cache.lookup(&huge).is_some());
         assert!(cache.lookup(&used).is_none() && cache.lookup(&new).is_none());
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

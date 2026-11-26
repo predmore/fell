@@ -2035,17 +2035,8 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn temp_session(body: &str) -> (PathBuf, DraftSession) {
-        let root = std::env::temp_dir().join(format!(
-            "fell-session-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
+    fn temp_session(body: &str) -> (tempfile::TempDir, DraftSession) {
+        let temp = tempfile::tempdir().unwrap();
         let fields = DraftFields {
             from: "jon@example.com".into(),
             to: vec!["ada@example.com".into()],
@@ -2054,7 +2045,7 @@ mod tests {
             ..DraftFields::default()
         };
         let folder =
-            workspace::materialize_in(&root, "d1", &fields, body, &AccountId("local".into()))
+            workspace::materialize_in(temp.path(), "d1", &fields, body, &AccountId("local".into()))
                 .unwrap();
         let session = DraftSession::testing_create_local(
             folder,
@@ -2064,7 +2055,7 @@ mod tests {
             body,
         )
         .unwrap();
-        (root, session)
+        (temp, session)
     }
 
     #[test]
@@ -2086,7 +2077,7 @@ mod tests {
         };
         let first_signature = signature_block(&first);
         let body = format!("Letter\n\n{first_signature}");
-        let (root, mut session) = temp_session(&body);
+        let (temp, mut session) = temp_session(&body);
         session.set_identities(vec![first.clone(), second.clone(), unsigned.clone()]);
         session.managed_signature = Some(first_signature.clone());
         session.set_from_user(&second.address).unwrap();
@@ -2099,7 +2090,7 @@ mod tests {
         session.set_from_user(&first.address).unwrap();
         assert!(session.body().ends_with(&first_signature));
 
-        let db = root.join("mail.db");
+        let db = temp.path().join("mail.db");
         let store = crate::Store::open(&db).unwrap();
         store
             .upsert_account(&crate::Account {
@@ -2131,7 +2122,7 @@ mod tests {
         if crate::test_support::in_isolated_process().is_none() {
             return;
         }
-        let (_, mut session) = temp_session("Letter\n\n");
+        let (_temp, mut session) = temp_session("Letter\n\n");
         session.managed_signature = Some(String::new());
         let mut alias = address_only("alias@example.com".into());
         session.set_identities(vec![alias.clone()]);
@@ -2159,7 +2150,7 @@ mod tests {
         let Some(isolated) = crate::test_support::in_isolated_process() else {
             return;
         };
-        let (root, mut session) = temp_session("Letter\n");
+        let (temp, mut session) = temp_session("Letter\n");
         // The usual test session uses a reserved demo id.
         session.account_id = AccountId("mail".into());
         let old = "from: jon@example.com";
@@ -2198,7 +2189,7 @@ mod tests {
         session.merge_disk(&session.serialize().replacen(canonical, old, 1));
         assert_eq!(session.fields().from, "jon@example.com");
 
-        let db = root.join("mail.db");
+        let db = temp.path().join("mail.db");
         let store = crate::Store::open(&db).unwrap();
         store
             .upsert_account(&crate::Account {
@@ -2223,9 +2214,9 @@ mod tests {
 
     #[test]
     fn a_save_the_mailbox_refused_is_said_as_a_notice() {
-        let (root, mut session) = temp_session("Hello\n");
+        let (temp, mut session) = temp_session("Hello\n");
         // A mailbox file that is not a mailbox: opening it fails.
-        let broken = root.join("broken.db");
+        let broken = temp.path().join("broken.db");
         fs::write(&broken, "not sqlite, and longer than a header would be").unwrap();
         session.bind_store(&broken);
         session.set_body_from_user("typed\n".into());
@@ -2261,7 +2252,7 @@ mod tests {
 
     #[test]
     fn request_send_does_not_produce_a_message() {
-        let (_root, mut session) = temp_session("Hello\n");
+        let (_temp, mut session) = temp_session("Hello\n");
         let transmitted = session.request_send();
         assert!(!transmitted);
         assert!(session.is_open());
@@ -2279,7 +2270,7 @@ mod tests {
 
     #[test]
     fn a_fast_script_settles_into_one_update() {
-        let (_root, mut session) = temp_session("alpha\n");
+        let (_temp, mut session) = temp_session("alpha\n");
         let base = session.serialize();
         let mut latest = String::new();
         for (step, word) in ["one", "two", "three"].into_iter().enumerate() {
@@ -2296,7 +2287,7 @@ mod tests {
 
     #[test]
     fn the_user_wins_the_same_paragraph() {
-        let (_root, mut session) = temp_session("Hello paragraph\n");
+        let (_temp, mut session) = temp_session("Hello paragraph\n");
         session.set_body_from_user("Hello USER\n".into());
         session.end_user_change();
         let agent = session.serialize().replace("Hello USER", "Hello AGENT");
@@ -2319,7 +2310,7 @@ mod tests {
 
     #[test]
     fn an_editor_change_is_not_fsynced_until_the_debounce() {
-        let (_root, mut session) = temp_session("alpha\n");
+        let (_temp, mut session) = temp_session("alpha\n");
         let path = session.folder().join("draft.md");
         let before = fs::read_to_string(&path).unwrap();
         session.set_body_from_user("alpha beta\n".into());
@@ -2334,16 +2325,8 @@ mod tests {
 
     #[test]
     fn opening_a_draft_treats_mailed_addresses_as_known() {
-        let root = std::env::temp_dir().join(format!(
-            "fell-known-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
         let db = root.join("mail.db");
         let store = crate::Store::open(&db).unwrap();
         let account = crate::Account {
@@ -2436,8 +2419,8 @@ mod tests {
 
     #[test]
     fn a_body_edit_does_not_reread_unchanged_attachments() {
-        let (root, mut session) = temp_session("see ![chart](chart.png)\n");
-        let db = root.join("mail.db");
+        let (temp, mut session) = temp_session("see ![chart](chart.png)\n");
+        let db = temp.path().join("mail.db");
         let store = crate::Store::open(&db).unwrap();
         store
             .upsert_account(&crate::Account {
@@ -2466,7 +2449,7 @@ mod tests {
 
     #[test]
     fn a_flushed_keystroke_is_not_replaced_from_disk() {
-        let (_root, mut session) = temp_session("Please send the report\n");
+        let (_temp, mut session) = temp_session("Please send the report\n");
         let original = session.serialize();
         session.set_body_from_user("Please send the report today\n".into());
         session.flush().unwrap();
@@ -2483,7 +2466,7 @@ mod tests {
 
     #[test]
     fn a_flushed_keystroke_still_accepts_a_disjoint_file_edit() {
-        let (_root, mut session) = temp_session("Please send the report\n\nThanks\n");
+        let (_temp, mut session) = temp_session("Please send the report\n\nThanks\n");
         let original = session.serialize();
         session.set_body_from_user("Please send the report today\n\nThanks\n".into());
         session.flush().unwrap();
@@ -2496,7 +2479,7 @@ mod tests {
 
     #[test]
     fn a_header_edit_is_a_recipient_or_subject_hunk() {
-        let (_root, mut session) = temp_session("body\n");
+        let (_temp, mut session) = temp_session("body\n");
         let agent = session
             .serialize()
             .replace("subject: \"Hello\"", "subject: \"Numbers\"");
@@ -2514,7 +2497,7 @@ mod tests {
 
     #[test]
     fn deleting_the_file_restores_the_buffer() {
-        let (_root, mut session) = temp_session("keep this body\n");
+        let (_temp, mut session) = temp_session("keep this body\n");
         session.push_disk(None, 0);
         assert!(session.poll_disk(DEBOUNCE_MS));
         assert_eq!(session.body(), "keep this body\n");
@@ -2524,7 +2507,7 @@ mod tests {
 
     #[test]
     fn fell_ignores_its_own_write() {
-        let (_root, mut session) = temp_session("same\n");
+        let (_temp, mut session) = temp_session("same\n");
         let written = session.serialize();
         let revision = session.revision();
         session.push_disk(Some(written), 0);
@@ -2534,7 +2517,7 @@ mod tests {
 
     #[test]
     fn yaml_errors_keep_the_body_and_block_send() {
-        let (_root, mut session) = temp_session("precious\n");
+        let (_temp, mut session) = temp_session("precious\n");
         session.push_disk(Some("this is not a draft\n".into()), 0);
         assert!(session.poll_disk(DEBOUNCE_MS));
         assert_eq!(session.body(), "precious\n");
@@ -2549,7 +2532,7 @@ mod tests {
 
     #[test]
     fn in_reply_to_edits_are_ignored() {
-        let (_root, mut session) = temp_session("body\n");
+        let (_temp, mut session) = temp_session("body\n");
         let agent = session.serialize().replace(
             "in_reply_to: \"<abc@example.com>\"",
             "in_reply_to: \"<other@example.com>\"",
@@ -2571,7 +2554,7 @@ mod tests {
 
     #[test]
     fn a_corrected_header_clears_the_old_parse_issue() {
-        let (_root, mut session) = temp_session("body\n");
+        let (_temp, mut session) = temp_session("body\n");
         let original = session.serialize();
         let bad = original.replace(
             "to: [\"ada@example.com\"]",
@@ -2595,7 +2578,7 @@ mod tests {
 
     #[test]
     fn edit_does_not_rewrite_a_line_the_person_extended() {
-        let (_root, mut session) = temp_session("Please send the report\n");
+        let (_temp, mut session) = temp_session("Please send the report\n");
         session.set_body_from_user("Please send the report today\n".into());
         let err = session
             .edit(session.revision(), "send the report", "file the report")
@@ -2607,7 +2590,7 @@ mod tests {
 
     #[test]
     fn edit_draft_rejects_text_the_user_changed() {
-        let (_root, mut session) = temp_session("alpha paragraph\n");
+        let (_temp, mut session) = temp_session("alpha paragraph\n");
         session.set_body_from_user("user paragraph\n".into());
         let err = session
             .edit(1, "alpha paragraph", "agent paragraph")
@@ -2618,7 +2601,7 @@ mod tests {
 
     #[test]
     fn user_changes_are_coalesced_for_the_agent() {
-        let (_root, mut session) = temp_session("alpha\n");
+        let (_temp, mut session) = temp_session("alpha\n");
         assert!(session.take_user_changes("bot").is_empty());
         session.set_body_from_user("alpha!\n".into());
         session.set_body_from_user("alpha!!\n".into());
@@ -2629,7 +2612,7 @@ mod tests {
 
     #[test]
     fn replace_body_is_one_hunk() {
-        let (_root, mut session) = temp_session("short\n");
+        let (_temp, mut session) = temp_session("short\n");
         session
             .replace_body("a full rewrite of the letter\n")
             .unwrap();
@@ -2640,7 +2623,7 @@ mod tests {
     #[test]
     fn a_hunk_maps_onto_its_own_place_in_the_body() {
         let link = "[pay](https://example.com/pay)";
-        let (_root, mut session) = temp_session(&format!("{link}\n\nlater\n"));
+        let (_temp, mut session) = temp_session(&format!("{link}\n\nlater\n"));
         let revision = session.revision();
         session.edit(revision, "later", link).unwrap();
         let snap = session.snapshot();
@@ -2658,7 +2641,7 @@ mod tests {
 
     #[test]
     fn unreferenced_files_are_not_in_the_outgoing_message() {
-        let (root, mut session) = temp_session("![chart](chart.png)\n");
+        let (_temp, mut session) = temp_session("![chart](chart.png)\n");
         fs::write(session.folder().join("chart.png"), b"png").unwrap();
         fs::write(session.folder().join("secret.txt"), b"nope").unwrap();
         session.fields.attachments.push(AttachmentRef {
@@ -2675,12 +2658,11 @@ mod tests {
         assert!(mime.contains("chart.png"));
         assert!(!mime.contains("secret.txt"));
         assert!(!mime.contains("nope"));
-        let _ = root;
     }
 
     #[test]
     fn removing_the_drafts_identity_blocks_send() {
-        let (_root, mut session) = temp_session("body\n");
+        let (_temp, mut session) = temp_session("body\n");
         session.set_identities(vec![address_only("primary@example.com".into())]);
         session.mark_seen();
         session.digests.wait_idle();
@@ -2690,8 +2672,8 @@ mod tests {
 
     #[test]
     fn offline_edit_keeps_the_reply_lock_and_records_a_hunk() {
-        let (root, mut session) = temp_session("body\n");
-        let db = root.join("mail.db");
+        let (temp, mut session) = temp_session("body\n");
+        let db = temp.path().join("mail.db");
         let store = crate::Store::open(&db).unwrap();
         store
             .upsert_account(&crate::Account {
@@ -2736,7 +2718,6 @@ mod tests {
         );
         assert!(reopened.snapshot().unreviewed >= 1);
         assert!(text.contains("new@example.com"), "{text}");
-        let _ = root;
     }
 
     #[test]
@@ -2744,7 +2725,7 @@ mod tests {
         if crate::test_support::in_isolated_process().is_none() {
             return;
         }
-        let (root, session) = temp_session("body\n");
+        let (_temp, session) = temp_session("body\n");
         let folder = session.folder().to_path_buf();
         drop(session);
         let err = match DraftSession::open_folder(&folder, AccountId("local".into())) {
@@ -2752,12 +2733,11 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.contains("mailbox"), "{err}");
-        let _ = root;
     }
 
     #[test]
     fn control_files_are_outside_the_agent_folder() {
-        let (root, session) = temp_session("body\n");
+        let (temp, session) = temp_session("body\n");
         let folder = session.folder().to_path_buf();
         drop(session);
         assert!(!folder.join("account").exists());
@@ -2766,7 +2746,7 @@ mod tests {
         std::fs::write(folder.join("account"), "not-the-account\n").unwrap();
         std::fs::write(folder.join("reply.lock"), "<evil@example.com>\n").unwrap();
         std::fs::write(folder.join("identities"), "evil@example.com\n").unwrap();
-        let db = root.join("mail.db");
+        let db = temp.path().join("mail.db");
         let store = crate::Store::open(&db).unwrap();
         store
             .upsert_account(&crate::Account {
@@ -2804,12 +2784,11 @@ mod tests {
         );
         assert!(opened.identity("jon@example.com").is_some());
         assert!(opened.identity("evil@example.com").is_none());
-        let _ = root;
     }
 
     #[test]
     fn reject_reverts_the_edited_range_not_an_earlier_copy() {
-        let (_root, mut session) = temp_session("alpha\nbeta alpha\n");
+        let (_temp, mut session) = temp_session("alpha\nbeta alpha\n");
         session
             .edit(session.revision(), "beta alpha", "alpha")
             .unwrap();
@@ -2821,7 +2800,7 @@ mod tests {
 
     #[test]
     fn a_sent_draft_is_locked_against_another_send() {
-        let (_root, _store, mut session) = stored_session("body\n");
+        let (_temp, _store, mut session) = stored_session("body\n");
         session.mark_seen();
         assert!(session.prepare_send().is_ok());
         session
@@ -2841,7 +2820,7 @@ mod tests {
             (SendLock::MaybeSent, "may already have been sent"),
         ] {
             // A recorded send is never cleared, so each case is a new draft.
-            let (_root, _store, mut session) = stored_session("body\n");
+            let (_temp, _store, mut session) = stored_session("body\n");
             session.mark_seen();
             session
                 .begin_send(&crate::MessageId::new("test@compose.fell"))
@@ -2863,7 +2842,7 @@ mod tests {
 
     #[test]
     fn send_blocks_until_the_painted_revision_is_marked_seen() {
-        let (_root, session) = temp_session("body\n");
+        let (_temp, session) = temp_session("body\n");
         session.digests.wait_idle();
         let err = session.prepare_send().unwrap_err();
         assert!(err.contains("on screen"), "{err}");
@@ -2871,7 +2850,7 @@ mod tests {
 
     #[test]
     fn undo_removes_an_agent_edit() {
-        let (_root, mut session) = temp_session("alpha\n");
+        let (_temp, mut session) = temp_session("alpha\n");
         session.edit(session.revision(), "alpha", "beta").unwrap();
         assert!(session.body().contains("beta"));
         assert!(session.undo());
@@ -2880,7 +2859,7 @@ mod tests {
 
     #[test]
     fn send_blocks_when_a_painted_attachment_changes() {
-        let (_root, mut session) = temp_session("![chart](chart.png)\n");
+        let (_temp, mut session) = temp_session("![chart](chart.png)\n");
         fs::write(session.folder().join("chart.png"), b"one").unwrap();
         session.mark_seen();
         // The shown version is hashed off the editor's thread first.
@@ -2895,7 +2874,7 @@ mod tests {
 
     #[test]
     fn a_text_edit_does_not_accept_swapped_attachment_bytes() {
-        let (_root, mut session) = temp_session("![chart](chart.png)\n");
+        let (_temp, mut session) = temp_session("![chart](chart.png)\n");
         let path = session.folder().join("chart.png");
         fs::write(&path, b"one").unwrap();
         let modified = fs::metadata(&path).unwrap().modified().unwrap();
@@ -2920,23 +2899,45 @@ mod tests {
         assert!(session.prepare_send().is_ok());
     }
 
+    // Restore write access before TempDir tries to remove the fixture.
+    struct ReadOnlyDraft<'a>([&'a Path; 2]);
+
+    impl<'a> ReadOnlyDraft<'a> {
+        fn new(folder: &'a Path, control: &'a Path) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let guard = Self([folder, control]);
+            for path in guard.0 {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o500)).unwrap();
+            }
+            guard
+        }
+    }
+
+    impl Drop for ReadOnlyDraft<'_> {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+
+            for path in self.0 {
+                let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+            }
+        }
+    }
+
     #[test]
     fn a_save_with_a_writer_does_not_touch_disk_on_the_calling_thread() {
-        use std::os::unix::fs::PermissionsExt;
-        let (root, mut session) = temp_session("body\n");
+        let (_temp, mut session) = temp_session("body\n");
         session.attach_writer();
         let folder = session.folder().to_path_buf();
         let control = workspace::control_dir(&folder);
         // Saves into a folder this thread cannot write. An inline save
         // would fail here; a queued one returns and reports later.
-        fs::set_permissions(&folder, fs::Permissions::from_mode(0o500)).unwrap();
-        fs::set_permissions(&control, fs::Permissions::from_mode(0o500)).unwrap();
+        let read_only = ReadOnlyDraft::new(&folder, &control);
         let readonly = fs::write(folder.join("probe"), "x").is_err();
         session.set_body_from_user("changed\n".into());
         assert!(session.flush().is_ok());
         let _ = session.save_waiter().unwrap().wait();
-        fs::set_permissions(&folder, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::set_permissions(&control, fs::Permissions::from_mode(0o700)).unwrap();
+        drop(read_only);
         session.set_body_from_user("again\n".into());
         session.flush().unwrap();
         session.save_waiter().unwrap().wait().unwrap();
@@ -2953,12 +2954,11 @@ mod tests {
         }
         let disk = fs::read_to_string(folder.join("draft.md")).unwrap();
         assert_eq!(disk, session.serialize());
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn queued_saves_land_in_order_and_the_newest_wins() {
-        let (root, mut session) = temp_session("0\n");
+        let (_temp, mut session) = temp_session("0\n");
         session.attach_writer();
         for step in 1..=50 {
             session.set_body_from_user(format!("{step}\n"));
@@ -2968,12 +2968,11 @@ mod tests {
         let disk = fs::read_to_string(session.folder().join("draft.md")).unwrap();
         assert_eq!(disk, session.serialize());
         assert!(disk.ends_with("50\n"), "{disk}");
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn a_queued_save_is_not_read_back_as_an_agent_edit() {
-        let (root, mut session) = temp_session("first\n");
+        let (_temp, mut session) = temp_session("first\n");
         session.attach_writer();
         session.set_body_from_user("second\n".into());
         session.flush().unwrap();
@@ -2989,13 +2988,11 @@ mod tests {
         // Once the newer save is on disk, the older text from someone else
         // is a real edit again.
         assert!(!session.is_own_write(&older, session.disk_generation()));
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn a_failed_save_does_not_merge_the_bytes_still_on_disk() {
-        use std::os::unix::fs::PermissionsExt;
-        let (root, mut session) = temp_session("alpha\n");
+        let (_temp, mut session) = temp_session("alpha\n");
         session.attach_writer();
         let folder = session.folder().to_path_buf();
         session.set_body_from_user("beta\n".into());
@@ -3004,14 +3001,12 @@ mod tests {
         let on_disk = fs::read_to_string(folder.join("draft.md")).unwrap();
         // The next save cannot replace draft.md.
         let control = workspace::control_dir(&folder);
-        fs::set_permissions(&folder, fs::Permissions::from_mode(0o500)).unwrap();
-        fs::set_permissions(&control, fs::Permissions::from_mode(0o500)).unwrap();
+        let read_only = ReadOnlyDraft::new(&folder, &control);
         let readonly = fs::write(folder.join("probe"), "x").is_err();
         session.set_body_from_user("gamma\n".into());
         session.flush().unwrap();
         let saved = session.save_waiter().unwrap().wait();
-        fs::set_permissions(&folder, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::set_permissions(&control, fs::Permissions::from_mode(0o700)).unwrap();
+        drop(read_only);
         if readonly {
             assert!(
                 saved.is_err(),
@@ -3023,12 +3018,11 @@ mod tests {
         assert!(!session.poll_disk(10_000));
         assert!(session.snapshot().hunks.is_empty());
         assert!(session.body().starts_with("gamma"));
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn a_read_made_before_a_later_save_is_still_fells_own() {
-        let (root, mut session) = temp_session("alpha\n");
+        let (_temp, mut session) = temp_session("alpha\n");
         session.attach_writer();
         session.set_body_from_user("beta\n".into());
         session.flush().unwrap();
@@ -3043,12 +3037,11 @@ mod tests {
         session.push_disk_seen(Some(read), since, 0);
         assert!(!session.poll_disk(10_000));
         assert!(session.snapshot().hunks.is_empty());
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn dropping_a_draft_writes_its_queued_save_first() {
-        let (root, mut session) = temp_session("alpha\n");
+        let (_temp, mut session) = temp_session("alpha\n");
         session.attach_writer();
         let folder = session.folder().to_path_buf();
         for step in 0..20 {
@@ -3061,12 +3054,11 @@ mod tests {
             fs::read_to_string(folder.join("draft.md")).unwrap(),
             expected
         );
-        let _ = fs::remove_dir_all(root);
     }
 
-    fn stored_session(body: &str) -> (PathBuf, crate::Store, DraftSession) {
-        let (root, mut session) = temp_session(body);
-        let db = root.join("mail.db");
+    fn stored_session(body: &str) -> (tempfile::TempDir, crate::Store, DraftSession) {
+        let (temp, mut session) = temp_session(body);
+        let db = temp.path().join("mail.db");
         let store = crate::Store::open(&db).unwrap();
         store
             .upsert_account(&crate::Account {
@@ -3078,7 +3070,7 @@ mod tests {
             .unwrap();
         session.bind_store(&db);
         session.flush().unwrap();
-        (root, store, session)
+        (temp, store, session)
     }
 
     fn reopen(session: DraftSession, store: &crate::Store) -> DraftSession {
@@ -3095,7 +3087,7 @@ mod tests {
 
     #[test]
     fn painting_never_reads_an_attachment() {
-        let (_root, mut session) = temp_session("![chart](chart.png)\n");
+        let (_temp, mut session) = temp_session("![chart](chart.png)\n");
         fs::write(session.folder().join("chart.png"), b"one").unwrap();
         session.mark_seen();
         for _ in 0..50 {
@@ -3117,7 +3109,7 @@ mod tests {
 
     #[test]
     fn a_touched_attachment_with_the_same_bytes_still_sends() {
-        let (_root, mut session) = temp_session("![chart](chart.png)\n");
+        let (_temp, mut session) = temp_session("![chart](chart.png)\n");
         let path = session.folder().join("chart.png");
         fs::write(&path, b"same bytes").unwrap();
         session.mark_seen();
@@ -3141,7 +3133,7 @@ mod tests {
     fn send_blocks_when_painted_bytes_change_under_the_same_stamp() {
         // A rewrite inside one timestamp tick leaves the stamp alone. The
         // digest taken for that stamp still catches it at send.
-        let (_root, mut session) = temp_session("![chart](chart.png)\n");
+        let (_temp, mut session) = temp_session("![chart](chart.png)\n");
         fs::write(session.folder().join("chart.png"), b"on screen").unwrap();
         session.mark_seen();
         session.digests.wait_idle();
@@ -3158,7 +3150,7 @@ mod tests {
 
     #[test]
     fn the_files_handed_to_send_are_the_bytes_that_were_checked() {
-        let (_root, mut session) = temp_session("![chart](chart.png)\n");
+        let (_temp, mut session) = temp_session("![chart](chart.png)\n");
         let path = session.folder().join("chart.png");
         fs::write(&path, b"checked").unwrap();
         session.mark_seen();
@@ -3173,8 +3165,8 @@ mod tests {
 
     #[test]
     fn a_hard_linked_attachment_blocks_send() {
-        let (root, mut session) = temp_session("![chart](chart.png)\n");
-        let outside = root.join("outside-secret.txt");
+        let (temp, mut session) = temp_session("![chart](chart.png)\n");
+        let outside = temp.path().join("outside-secret.txt");
         fs::write(&outside, b"secret").unwrap();
         fs::hard_link(&outside, session.folder().join("chart.png")).unwrap();
         session.mark_seen();
@@ -3189,7 +3181,7 @@ mod tests {
 
     #[test]
     fn reject_follows_the_hunk_past_edits_before_it() {
-        let (_root, mut session) = temp_session("alpha\nbeta\n");
+        let (_temp, mut session) = temp_session("alpha\nbeta\n");
         session.edit(session.revision(), "beta", "gamma").unwrap();
         let id = only_hunk(&session);
         // The person writes the same word earlier in the draft, so the
@@ -3202,7 +3194,7 @@ mod tests {
 
     #[test]
     fn an_agent_edit_before_a_hunk_moves_it() {
-        let (_root, mut session) = temp_session("alpha\nbeta\nend\n");
+        let (_temp, mut session) = temp_session("alpha\nbeta\nend\n");
         session.edit(session.revision(), "beta", "BETA").unwrap();
         session
             .edit(session.revision(), "alpha", "a much longer alpha")
@@ -3231,7 +3223,7 @@ mod tests {
 
     #[test]
     fn a_header_edit_by_the_person_moves_a_body_hunk() {
-        let (_root, mut session) = temp_session("alpha\nbeta\n");
+        let (_temp, mut session) = temp_session("alpha\nbeta\n");
         session.edit(session.revision(), "beta", "BETA").unwrap();
         let id = only_hunk(&session);
         session.set_subject_from_user("A much longer subject line".into());
@@ -3248,7 +3240,7 @@ mod tests {
 
     #[test]
     fn an_agent_edit_over_its_own_edit_rejects_to_the_persons_text() {
-        let (_root, mut session) = temp_session("see you Monday\n");
+        let (_temp, mut session) = temp_session("see you Monday\n");
         session
             .edit(session.revision(), "Monday", "Tuesday")
             .unwrap();
@@ -3262,7 +3254,7 @@ mod tests {
 
     #[test]
     fn typing_over_an_agent_edit_makes_it_the_persons() {
-        let (_root, mut session) = temp_session("alpha\nbeta\n");
+        let (_temp, mut session) = temp_session("alpha\nbeta\n");
         session
             .edit(session.revision(), "beta", "agent words")
             .unwrap();
@@ -3276,7 +3268,7 @@ mod tests {
 
     #[test]
     fn undo_takes_back_the_agent_edit_and_nothing_typed_after_it() {
-        let (_root, mut session) = temp_session("alpha\nbeta\n");
+        let (_temp, mut session) = temp_session("alpha\nbeta\n");
         // The person is mid-word: their undo step is still open.
         session.set_body_from_user("alpha typed\nbeta\n".into());
         session.edit(session.revision(), "beta", "BETA").unwrap();
@@ -3290,7 +3282,7 @@ mod tests {
 
     #[test]
     fn undo_takes_back_a_file_edit_on_its_own() {
-        let (_root, mut session) = temp_session("alpha\n\nbeta\n");
+        let (_temp, mut session) = temp_session("alpha\n\nbeta\n");
         session.set_body_from_user("alpha!\n\nbeta\n".into());
         let agent = session.serialize().replace("beta", "BETA");
         session.push_disk(Some(agent), 0);
@@ -3302,7 +3294,7 @@ mod tests {
 
     #[test]
     fn hunks_survive_a_reopen_from_the_mailbox() {
-        let (_root, store, mut session) = stored_session("alpha\nbeta\n");
+        let (_temp, store, mut session) = stored_session("alpha\nbeta\n");
         session.edit(session.revision(), "beta", "BETA").unwrap();
         session.flush().unwrap();
         let mut session = reopen(session, &store);
@@ -3313,7 +3305,7 @@ mod tests {
 
     #[test]
     fn a_tampered_hunk_file_is_not_trusted() {
-        let (_root, store, mut session) = stored_session("Pay invoice 12 today.\nThanks\n");
+        let (_temp, store, mut session) = stored_session("Pay invoice 12 today.\nThanks\n");
         session
             .edit(session.revision(), "Thanks", "Cheers")
             .unwrap();
@@ -3344,7 +3336,7 @@ mod tests {
 
     #[test]
     fn a_draft_file_edit_while_closed_is_marked_for_review() {
-        let (_root, store, session) = stored_session("alpha\nbeta\n");
+        let (_temp, store, session) = stored_session("alpha\nbeta\n");
         let folder = session.folder().to_path_buf();
         let text = session.serialize();
         drop(session);
@@ -3358,7 +3350,7 @@ mod tests {
 
     #[test]
     fn an_edit_while_closed_cannot_hide_an_earlier_agent_change() {
-        let (_root, store, mut session) = stored_session("alpha\nbeta\n");
+        let (_temp, store, mut session) = stored_session("alpha\nbeta\n");
         session.edit(session.revision(), "beta", "BETA").unwrap();
         session.flush().unwrap();
         let folder = session.folder().to_path_buf();
@@ -3374,7 +3366,7 @@ mod tests {
 
     #[test]
     fn settling_the_hub_waits_for_every_draft() {
-        let (root, session) = temp_session("alpha\n");
+        let (_temp, session) = temp_session("alpha\n");
         let folder = session.folder().to_path_buf();
         let id = session.id().to_string();
         let hub = super::super::DraftHub::new();
@@ -3391,12 +3383,11 @@ mod tests {
             fs::read_to_string(folder.join("draft.md")).unwrap(),
             expected
         );
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn a_draft_from_before_stored_review_asks_to_be_read() {
-        let (_root, store, session) = stored_session("alpha\nbeta\n");
+        let (_temp, store, session) = stored_session("alpha\nbeta\n");
         let control = workspace::control_dir(session.folder());
         fs::create_dir_all(&control).unwrap();
         fs::write(control.join("hunks.json"), "[]").unwrap();
@@ -3419,7 +3410,7 @@ mod tests {
 
     #[test]
     fn a_file_edit_during_an_insert_is_its_own_undo_step() {
-        let (root, mut session) = temp_session("First paragraph.\n\nSecond paragraph.\n");
+        let (_temp, mut session) = temp_session("First paragraph.\n\nSecond paragraph.\n");
         session.begin_user_change();
         session.set_body_from_user("First paragraph. Typed.\n\nSecond paragraph.\n".into());
         // An agent's script rewrites the other paragraph while the person
@@ -3438,12 +3429,11 @@ mod tests {
         // ...the next one the typing.
         assert!(session.undo());
         assert!(!session.body().contains("Typed."), "{}", session.body());
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn a_draft_cannot_change_while_it_is_sent() {
-        let (root, _store, mut session) = stored_session("body\n");
+        let (_temp, _store, mut session) = stored_session("body\n");
         session
             .begin_send(&crate::MessageId::new("test@compose.fell"))
             .unwrap();
@@ -3467,12 +3457,11 @@ mod tests {
         session.end_send(None);
         session.set_body_from_user("now editable\n".into());
         assert_eq!(session.body(), "now editable\n");
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn a_claim_without_end_send_reopens_as_maybe_sent() {
-        let (root, store, mut session) = stored_session("body\n");
+        let (_temp, store, mut session) = stored_session("body\n");
         session.mark_seen();
         session
             .begin_send(&crate::MessageId::new("test@compose.fell"))
@@ -3486,12 +3475,11 @@ mod tests {
                 .unwrap_err()
                 .contains("may already have been sent")
         );
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn deleting_the_control_folder_does_not_unlock_a_sent_draft() {
-        let (root, store, mut session) = stored_session("body\n");
+        let (_temp, store, mut session) = stored_session("body\n");
         session.mark_seen();
         session
             .begin_send(&crate::MessageId::new("test@compose.fell"))
@@ -3513,12 +3501,11 @@ mod tests {
                 .unwrap_err()
                 .contains("was sent")
         );
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn a_send_that_transmitted_nothing_reopens_unlocked() {
-        let (root, store, mut session) = stored_session("body\n");
+        let (_temp, store, mut session) = stored_session("body\n");
         session
             .begin_send(&crate::MessageId::new("test@compose.fell"))
             .unwrap();
@@ -3528,7 +3515,6 @@ mod tests {
         reopened
             .begin_send(&crate::MessageId::new("test@compose.fell"))
             .unwrap();
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3536,7 +3522,7 @@ mod tests {
         if crate::test_support::in_isolated_process().is_none() {
             return;
         }
-        let (root, mut session) = temp_session("body\n");
+        let (temp, mut session) = temp_session("body\n");
         session.store_path = None;
         let err = session
             .begin_send(&crate::MessageId::new("test@compose.fell"))
@@ -3544,7 +3530,7 @@ mod tests {
         assert!(err.contains("could not record this send"), "{err}");
         assert_eq!(session.send_lock(), None);
         // A mailbox path that is gone is not created by the claim.
-        let missing = root.join("gone.db");
+        let missing = temp.path().join("gone.db");
         session.bind_store(&missing);
         assert!(
             session
@@ -3552,12 +3538,11 @@ mod tests {
                 .is_err()
         );
         assert!(!missing.exists());
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn a_send_the_mailbox_recorded_locks_a_session_that_missed_it() {
-        let (root, store, mut session) = stored_session("body\n");
+        let (_temp, store, mut session) = stored_session("body\n");
         store
             .finish_compose_send(&AccountId("local".into()), "d1", Some(SendLock::Sent))
             .unwrap();
@@ -3569,7 +3554,6 @@ mod tests {
                 .contains("was sent")
         );
         assert_eq!(session.send_lock(), Some(SendLock::Sent));
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3581,7 +3565,7 @@ mod tests {
             ("maybe-sent", SendLock::MaybeSent),
             ("sent", SendLock::Sent),
         ] {
-            let (root, store, session) = stored_session("body\n");
+            let (_temp, store, session) = stored_session("body\n");
             let folder = session.folder().to_path_buf();
             drop(session);
             // The first open by this build already happened; start as if
@@ -3598,13 +3582,12 @@ mod tests {
             let reopened =
                 DraftSession::open_with_store(&folder, AccountId("local".into()), &store).unwrap();
             assert_eq!(reopened.send_lock(), Some(lock), "{old:?}");
-            let _ = fs::remove_dir_all(root);
         }
     }
 
     #[test]
     fn a_send_state_file_written_after_migration_is_ignored() {
-        let (root, store, session) = stored_session("body\n");
+        let (_temp, store, session) = stored_session("body\n");
         let folder = session.folder().to_path_buf();
         let reopened = reopen(session, &store);
         drop(reopened);
@@ -3614,12 +3597,11 @@ mod tests {
         let reopened =
             DraftSession::open_with_store(&folder, AccountId("local".into()), &store).unwrap();
         assert_eq!(reopened.send_lock(), None);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn unlocking_releases_only_a_draft_that_may_have_been_sent() {
-        let (root, store, session) = stored_session("body\n");
+        let (_temp, store, session) = stored_session("body\n");
         let account = AccountId("local".into());
         store
             .finish_compose_send(&account, "d1", Some(SendLock::MaybeSent))
@@ -3639,12 +3621,11 @@ mod tests {
         let mut reopened = reopen(reopened, &store);
         assert!(reopened.release_maybe_sent().is_err());
         assert_eq!(reopened.send_lock(), Some(SendLock::Sent));
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn a_late_clear_never_unlocks_a_sent_draft() {
-        let (root, store, session) = stored_session("body\n");
+        let (_temp, store, session) = stored_session("body\n");
         let account = AccountId("local".into());
         store
             .finish_compose_send(&account, "d1", Some(SendLock::Sent))
@@ -3661,12 +3642,11 @@ mod tests {
         );
         let reopened = reopen(session, &store);
         assert_eq!(reopened.send_lock(), Some(SendLock::Sent));
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn a_migration_racing_another_keeps_the_sent_record() {
-        let (root, store, session) = stored_session("body\n");
+        let (_temp, store, session) = stored_session("body\n");
         let account = AccountId("local".into());
         let folder = session.folder().to_path_buf();
         drop(session);
@@ -3685,12 +3665,11 @@ mod tests {
         );
         let reopened = DraftSession::open_with_store(&folder, account, &store).unwrap();
         assert_eq!(reopened.send_lock(), Some(SendLock::Sent));
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn a_reopen_during_a_send_keeps_the_live_claim() {
-        let (root, store, mut live) = stored_session("body\n");
+        let (_temp, store, mut live) = stored_session("body\n");
         let folder = live.folder().to_path_buf();
         live.begin_send(&crate::MessageId::new("test@compose.fell"))
             .unwrap();
@@ -3703,12 +3682,11 @@ mod tests {
         );
         reopened.inherit_send_lock(&live);
         assert_eq!(reopened.send_lock(), Some(SendLock::InFlight));
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn a_sent_confirmation_wins_over_an_open_unlock_dialog_and_a_lost_smtp_reply() {
-        let (root, store, mut live) = stored_session("body\n");
+        let (_temp, store, mut live) = stored_session("body\n");
         let id = crate::MessageId::new("submitted@compose.fell");
         live.begin_send(&id).unwrap();
         let account = live.account_id().clone();
@@ -3747,6 +3725,5 @@ mod tests {
         );
         assert_eq!(reopened.send_lock(), Some(SendLock::Sent));
         assert_eq!(reopen(live, &store).send_lock(), Some(SendLock::Sent));
-        let _ = fs::remove_dir_all(root);
     }
 }

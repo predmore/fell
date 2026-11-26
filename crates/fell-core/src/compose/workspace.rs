@@ -1054,23 +1054,17 @@ mod tests {
     use crate::AccountId;
     use std::os::unix::fs::symlink;
 
-    fn isolated(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "fell-draft-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        root
+    fn isolated(tag: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("fell-draft-{tag}-"))
+            .tempdir()
+            .unwrap()
     }
 
     #[test]
     fn send_closure_is_only_what_the_draft_references() {
-        let root = isolated("closure");
+        let temp = isolated("closure");
+        let root = temp.path().to_path_buf();
         let fields = DraftFields {
             from: "a@b.com".into(),
             to: vec!["ada@example.com".into()],
@@ -1118,7 +1112,8 @@ mod tests {
 
     #[test]
     fn parent_paths_and_escaping_symlinks_are_refused() {
-        let root = isolated("escape");
+        let temp = isolated("escape");
+        let root = temp.path().to_path_buf();
         let folder = materialize_in(
             &root,
             "d2",
@@ -1127,7 +1122,7 @@ mod tests {
             &AccountId("local".into()),
         )
         .unwrap();
-        let outside = std::env::temp_dir().join(format!("fell-outside-{}", std::process::id()));
+        let outside = root.join("outside");
         fs::write(&outside, b"secret").unwrap();
         symlink(&outside, folder.join("leak")).unwrap();
         assert!(image_file(&folder, "../secret").is_none());
@@ -1135,7 +1130,6 @@ mod tests {
         assert!(err.contains("draft folder"));
         let err = resolve_inside(&folder, "leak").unwrap_err();
         assert!(err.contains("symlink"));
-        let _ = fs::remove_file(&outside);
     }
 
     #[test]
@@ -1148,7 +1142,8 @@ mod tests {
             }],
             ..DraftFields::default()
         };
-        let root = isolated("missing");
+        let temp = isolated("missing");
+        let root = temp.path().to_path_buf();
         let folder =
             materialize_in(&root, "d3", &fields, "x\n", &AccountId("local".into())).unwrap();
         let closure = resolve_closure(&folder, &fields, "x\n");
@@ -1163,7 +1158,8 @@ mod tests {
 
     #[test]
     fn an_oversized_attachment_is_rejected_without_keeping_its_bytes() {
-        let root = isolated("oversize");
+        let temp = isolated("oversize");
+        let root = temp.path().to_path_buf();
         let fields = DraftFields {
             attachments: vec![AttachmentRef {
                 path: "big.bin".into(),
@@ -1189,7 +1185,8 @@ mod tests {
 
     #[test]
     fn a_file_past_the_remaining_budget_is_not_read() {
-        let root = isolated("budget");
+        let temp = isolated("budget");
+        let root = temp.path().to_path_buf();
         let fields = DraftFields {
             attachments: vec![
                 AttachmentRef {
@@ -1229,7 +1226,8 @@ mod tests {
 
     #[test]
     fn reading_an_attachment_does_not_follow_a_symlink() {
-        let root = isolated("nofollow");
+        let temp = isolated("nofollow");
+        let root = temp.path().to_path_buf();
         let folder = materialize_in(
             &root,
             "d8",
@@ -1254,7 +1252,8 @@ mod tests {
 
     #[test]
     fn a_hard_link_to_a_file_outside_the_folder_is_refused() {
-        let root = isolated("hardlink");
+        let temp = isolated("hardlink");
+        let root = temp.path().to_path_buf();
         let fields = DraftFields {
             attachments: vec![AttachmentRef {
                 path: "notes.txt".into(),
@@ -1301,7 +1300,8 @@ mod tests {
 
     #[test]
     fn reading_through_a_symlinked_directory_is_refused() {
-        let root = isolated("nofollow-dir");
+        let temp = isolated("nofollow-dir");
+        let root = temp.path().to_path_buf();
         let folder = materialize_in(
             &root,
             "d10",
@@ -1325,7 +1325,8 @@ mod tests {
 
     #[test]
     fn saving_draft_does_not_follow_a_temp_symlink() {
-        let root = isolated("symlink-tmp");
+        let temp = isolated("symlink-tmp");
+        let root = temp.path().to_path_buf();
         let folder = materialize_in(
             &root,
             "d6",
@@ -1350,7 +1351,8 @@ mod tests {
 
     #[test]
     fn saving_draft_refuses_to_replace_a_symlink() {
-        let root = isolated("symlink-draft");
+        let temp = isolated("symlink-draft");
+        let root = temp.path().to_path_buf();
         let folder = materialize_in(
             &root,
             "d7",

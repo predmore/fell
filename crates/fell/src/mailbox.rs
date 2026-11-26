@@ -974,15 +974,14 @@ mod tests {
 
     #[test]
     fn created_mailbox_is_not_world_readable() {
-        let dir = std::env::temp_dir().join(format!("fell-perm-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("mailbox");
         let path = dir.join("mail.db");
         open_at(&path).unwrap();
         let file_mode = fs::metadata(&path).unwrap().permissions().mode();
         let dir_mode = fs::metadata(&dir).unwrap().permissions().mode();
         assert_eq!(file_mode & 0o077, 0, "mailbox mode {file_mode:o}");
         assert_eq!(dir_mode & 0o077, 0, "directory mode {dir_mode:o}");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1178,9 +1177,8 @@ mod tests {
 
     #[test]
     fn existing_parent_keeps_its_mode() {
-        let dir = std::env::temp_dir().join(format!("fell-keep-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
         let before = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
 
@@ -1200,6 +1198,5 @@ mod tests {
             "new mailbox directory mode {nested_mode:o}"
         );
         assert_eq!(parent_again, before);
-        let _ = fs::remove_dir_all(&dir);
     }
 }

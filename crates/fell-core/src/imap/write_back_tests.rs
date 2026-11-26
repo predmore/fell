@@ -594,14 +594,8 @@ fn undo_before_replay_sends_nothing() {
 
 #[test]
 fn a_restart_mid_queue_replays_each_move_once() {
-    let path = std::env::temp_dir().join(format!(
-        "fell-outbox-{}-{}.db",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("fell-outbox.db");
     let fx = Fixture::with_store(Store::open(&path).unwrap());
     let alpha = fx.thread("INBOX", "Alpha");
     let bravo = fx.thread("INBOX", "Bravo");
@@ -647,9 +641,6 @@ fn a_restart_mid_queue_replays_each_move_once() {
     assert_eq!(fx.on_server("Archive"), vec![(1, "Alpha".to_string())]);
     assert_eq!(fx.on_server("Work"), vec![(1, "Bravo".to_string())]);
     drop(fx);
-    for suffix in ["", "-wal", "-shm", ".lock"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-    }
 }
 
 #[test]
@@ -3635,23 +3626,19 @@ fn uidvalidity_reset_drops_only_that_folders_flag_writes_with_a_notice() {
     assert_eq!(fx.local_flags(&alpha), (true, true));
 }
 
-fn write_back_db(label: &str) -> std::path::PathBuf {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "fell-write-back-{label}-{}-{stamp}",
-        std::process::id()
-    ));
-    std::fs::create_dir(&dir).unwrap();
-    dir.join("mail.db")
+fn write_back_db(tag: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let temp = tempfile::Builder::new()
+        .prefix(&format!("fell-write-back-{tag}-"))
+        .tempdir()
+        .unwrap();
+    let path = temp.path().join("mail.db");
+    (temp, path)
 }
 
 #[test]
 fn flag_queue_recovers_a_lost_reply_on_restart_without_repeating_store() {
     for condstore in [false, true] {
-        let path = write_back_db("restart");
+        let (_temp, path) = write_back_db("restart");
         let mut fx = Fixture::with(Store::open(&path).unwrap(), flag_state(condstore));
         let alpha = fx.thread("INBOX", "Alpha");
         fx.flag(&alpha, FlagChange::Read);
@@ -3669,7 +3656,6 @@ fn flag_queue_recovers_a_lost_reply_on_restart_without_repeating_store() {
             assert_eq!(fx.flags(folder, uid), ["\\Answered", "\\Seen"]);
         }
         drop(fx);
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }
 
@@ -3923,7 +3909,7 @@ fn an_edit_during_select_retires_the_unsent_snapshot() {
 #[test]
 fn a_conflict_in_flight_keeps_a_newer_local_intent_even_with_the_same_value() {
     let server_state = flag_state(true);
-    let path = write_back_db("in-flight");
+    let (_temp, path) = write_back_db("in-flight");
     let fx = Fixture::with(Store::open(&path).unwrap(), server_state);
     let alpha = fx.thread("INBOX", "Alpha");
     fx.flag(&alpha, FlagChange::Read);
@@ -3959,7 +3945,6 @@ fn a_conflict_in_flight_keeps_a_newer_local_intent_even_with_the_same_value() {
     );
     assert_eq!(fx.flags("INBOX", 4), ["\\Answered", "\\Seen"]);
     drop(fx);
-    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
 }
 
 #[test]
@@ -4056,7 +4041,7 @@ fn a_fetch_missing_flag_bits_records_its_revision_and_waits() {
 
 #[test]
 fn an_unstar_survives_a_restart_after_the_older_star_reply_is_lost() {
-    let path = write_back_db("superseded");
+    let (_temp, path) = write_back_db("superseded");
     let mut fx = Fixture::with(Store::open(&path).unwrap(), flag_state(true));
     let alpha = fx.thread("INBOX", "Alpha");
     fx.flag(&alpha, FlagChange::Star);
@@ -4099,7 +4084,6 @@ fn an_unstar_survives_a_restart_after_the_older_star_reply_is_lost() {
     assert_eq!(fx.flags("INBOX", 4), ["\\Answered"]);
     assert_eq!(fx.local_flags(&alpha), (true, false));
     drop(fx);
-    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
 }
 
 #[test]
@@ -4709,7 +4693,7 @@ fn assert_unconfirmed_append_drops(fixture: &Fixture) {
 
 #[test]
 fn sent_copy_survives_a_write_lock_past_both_old_save_attempts() {
-    let database = write_back_db("sent-write-lock");
+    let (_temp, database) = write_back_db("sent-write-lock");
     let fixture = Fixture::with(
         Store::open(&database).unwrap(),
         state_with(vec![

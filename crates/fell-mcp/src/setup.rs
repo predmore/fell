@@ -1000,7 +1000,6 @@ pub(crate) mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     type SwapHook = Box<dyn FnMut(&Path)>;
 
@@ -1041,33 +1040,12 @@ pub(crate) mod tests {
     }
 
     /// A fresh folder with no symlink anywhere in its path.
-    pub(crate) struct TempDir(PathBuf);
-
-    impl TempDir {
-        pub(crate) fn new() -> Self {
-            static N: AtomicU64 = AtomicU64::new(0);
-            let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
-            let dir = base.join(format!(
-                "fell-mcp-setup-{}-{}",
-                std::process::id(),
-                N.fetch_add(1, Ordering::Relaxed)
-            ));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            // Under a test's strict umask the folder would not be writable.
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-            Self(dir)
-        }
-
-        pub(crate) fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
+    fn temp_dir() -> tempfile::TempDir {
+        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let dir = tempfile::tempdir_in(base).unwrap();
+        // Under a test's strict umask the folder would not be writable.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
     }
 
     const UMASK_CHILD: &str = "FELL_MCP_TEST_UMASK";
@@ -1127,8 +1105,8 @@ pub(crate) mod tests {
     }
 
     /// A home folder in a temp dir, and an env pointing at it.
-    fn home() -> (TempDir, PathBuf, Env) {
-        let tmp = TempDir::new();
+    fn home() -> (tempfile::TempDir, PathBuf, Env) {
+        let tmp = temp_dir();
         let home = tmp.path().join("home");
         std::fs::create_dir(&home).unwrap();
         std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();

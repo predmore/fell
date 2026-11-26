@@ -803,17 +803,13 @@ fn fusion_ranks_by_both_lists_and_keeps_keyword_ties_first() {
     );
 }
 
-fn temp_db(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "fell-hybrid-{tag}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir.join("mail.db")
+fn temp_db(tag: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let temp = tempfile::Builder::new()
+        .prefix(&format!("fell-hybrid-{tag}-"))
+        .tempdir()
+        .unwrap();
+    let path = temp.path().join("mail.db");
+    (temp, path)
 }
 
 /// The indexer backs off while it has nothing to do (up to 30 s), so a
@@ -841,7 +837,7 @@ fn vectors(store: &Store) -> i64 {
 fn search_follows_the_background_indexer_and_never_waits_for_a_writer() {
     let _reset = EmbedderReset;
     testing_embedder(Some(concepts));
-    let path = temp_db("indexer");
+    let (_temp, path) = temp_db("indexer");
     let store = Store::open(&path).unwrap();
     let messages = corpus_mail();
     fill(&store, &messages);
@@ -894,7 +890,6 @@ fn search_follows_the_background_indexer_and_never_waits_for_a_writer() {
     });
     assert!(ids(&hybrid(&store, "dog jab")).contains(&"kennel".to_string()));
     drop(store);
-    let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }
 
 #[test]
@@ -1275,7 +1270,7 @@ fn a_search_reads_one_snapshot_while_sync_and_the_indexer_commit() {
     let bill = "plumber-invoice@corpus.test";
     let query = "money owed in:inbox";
     for step in [Step::Refreshed, Step::Filtered, Step::Scanned] {
-        let path = temp_db("snapshot");
+        let (_temp, path) = temp_db("snapshot");
         let store = Store::open(&path).unwrap();
         let messages = corpus_mail();
         fill(&store, &messages);
@@ -1312,7 +1307,6 @@ fn a_search_reads_one_snapshot_while_sync_and_the_indexer_commit() {
             "{step:?}: {after:?}"
         );
         drop(store);
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
 

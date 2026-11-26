@@ -1531,13 +1531,8 @@ mod tests {
 
     #[test]
     fn legacy_bodies_keep_their_parts_and_reinsertions_get_a_new_stamp() {
-        let dir = std::env::temp_dir().join(format!(
-            "fell-body-stamp-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let path = dir.join("mail.db");
         let account = account();
         let message = newsletter("n@x", "INBOX", 1, "<p>x</p>");
@@ -1582,7 +1577,6 @@ mod tests {
             read_stamp(&store)
         };
         assert_eq!(read_stamp(&Store::open(&path).unwrap()), reinserted);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1665,13 +1659,8 @@ mod tests {
 
     #[test]
     fn opening_a_store_from_before_bodies_adds_the_table_and_keeps_mail() {
-        let dir = std::env::temp_dir().join(format!(
-            "fell-bodies-migrate-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let path = dir.join("mail.db");
         let old = newsletter("old@x", "INBOX", 1, "<p>old</p>");
         {
@@ -1725,7 +1714,6 @@ mod tests {
         let store = Store::open(&path).unwrap();
         assert!(store.missing_bodies(&account().id, 10).unwrap().is_empty());
         drop(store);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1996,13 +1984,8 @@ mod tests {
 
     #[test]
     fn mail_stored_before_part_lists_is_queued_once_by_version_5() {
-        let dir = std::env::temp_dir().join(format!(
-            "fell-parts-migrate-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let path = dir.join("mail.db");
         let old = with_attachments("pdf@x", "INBOX", 1);
         {
@@ -2046,7 +2029,6 @@ mod tests {
         let store = Store::open(&path).unwrap();
         assert!(store.missing_bodies(&account().id, 10).unwrap().is_empty());
         drop(store);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn plan(store: &Store, sql: &str) -> String {

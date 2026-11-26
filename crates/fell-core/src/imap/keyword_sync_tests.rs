@@ -533,8 +533,8 @@ fn legacy_label_actions_undo_only_their_own_edits_after_reopening() {
         config: config(server.addr.port()),
         smtp: unused_smtp(),
     };
-    let path =
-        std::env::temp_dir().join(format!("fell-keyword-undo-{}.sqlite", std::process::id()));
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("fell-keyword-undo.sqlite");
     let id = MessageId::new("root@x");
     {
         let store = Store::open(&path).unwrap();
@@ -577,7 +577,6 @@ fn legacy_label_actions_undo_only_their_own_edits_after_reopening() {
     );
     assert_flag_only(&server);
     drop(store);
-    std::fs::remove_file(path).unwrap();
 }
 
 #[test]
@@ -783,10 +782,8 @@ fn the_flag_baseline_updates_an_upgraded_row_and_keeps_legacy_labels() {
         config: config(server.addr.port()),
         smtp: unused_smtp(),
     };
-    let path = std::env::temp_dir().join(format!(
-        "fell-keyword-migration-{}.sqlite",
-        std::process::id()
-    ));
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("fell-keyword-migration.sqlite");
     {
         let store = Store::open(&path).unwrap();
         store.upsert_account(&acct).unwrap();
@@ -836,7 +833,6 @@ fn the_flag_baseline_updates_an_upgraded_row_and_keeps_legacy_labels() {
     assert_eq!(message().labels, ["work"]);
     assert_flag_only(&server);
     drop(store);
-    std::fs::remove_file(path).unwrap();
 }
 
 #[test]

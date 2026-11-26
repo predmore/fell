@@ -305,15 +305,11 @@ mod tests {
     use super::*;
     use std::cell::Cell;
 
-    fn temp_root(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "fell-embeddings-cli-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ))
+    fn temp_root(tag: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("fell-embeddings-cli-{tag}-"))
+            .tempdir()
+            .unwrap()
     }
 
     fn args(list: &[&str]) -> Vec<String> {
@@ -366,7 +362,8 @@ mod tests {
 
     #[test]
     fn status_reports_the_placeholder_and_does_not_fetch_or_create() {
-        let root = temp_root("status");
+        let temp = temp_root("status");
+        let root = temp.path().join("models");
         let (result, out, calls) = invoke(&["status"], &root, true, "", never);
         result.unwrap();
         assert_eq!(calls, 0);
@@ -378,7 +375,8 @@ mod tests {
 
     #[test]
     fn install_shows_what_and_where_before_asking() {
-        let root = temp_root("plan");
+        let temp = temp_root("plan");
+        let root = temp.path().join("models");
         let (result, out, calls) = invoke(&["install"], &root, true, "n\n", never);
         result.unwrap();
         assert_eq!(calls, 0);
@@ -402,7 +400,8 @@ mod tests {
 
     #[test]
     fn install_without_a_terminal_needs_yes() {
-        let root = temp_root("notty");
+        let temp = temp_root("notty");
+        let root = temp.path().join("models");
         // Even a "y" on piped stdin is not consent; only --yes is.
         let (result, out, calls) = invoke(&["install"], &root, false, "y\n", never);
         assert!(result.unwrap_err().contains("--yes"));
@@ -413,7 +412,8 @@ mod tests {
 
     #[test]
     fn a_confirmed_download_with_the_wrong_bytes_is_rejected() {
-        let root = temp_root("checksum");
+        let temp = temp_root("checksum");
+        let root = temp.path().join("models");
         let model = MINILM_L6_V2_INT8;
         let (result, out, calls) = invoke(&["install"], &root, true, "y\n", |url| {
             // Right length, wrong content.
@@ -432,24 +432,24 @@ mod tests {
         assert!(fell_core::embed::installed_model_dir(&model, &root).is_none());
         let (_, status, _) = invoke(&["status"], &root, true, "", never);
         assert!(status.contains("No model is installed"), "{status}");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn yes_skips_the_question_but_not_the_checksum() {
-        let root = temp_root("yes");
+        let temp = temp_root("yes");
+        let root = temp.path().join("models");
         let (result, out, calls) = invoke(&["install", "--yes"], &root, false, "", |_| {
             b"short".to_vec()
         });
         assert!(result.unwrap_err().contains("bytes"));
         assert_eq!(calls, 1);
         assert!(!out.contains("[y/N]"));
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn remove_without_a_model_is_a_no_op_and_bad_commands_fail() {
-        let root = temp_root("remove");
+        let temp = temp_root("remove");
+        let root = temp.path().join("models");
         let (result, out, calls) = invoke(&["remove"], &root, true, "", never);
         result.unwrap();
         assert_eq!(calls, 0);
@@ -493,7 +493,8 @@ mod tests {
 
     #[test]
     fn status_does_not_report_a_model_that_will_not_load() {
-        let root = temp_root("unloadable");
+        let temp = temp_root("unloadable");
+        let root = temp.path().join("models");
         let onnx: &[u8] = b"verified bytes, but not an ONNX graph";
         let vocab: &[u8] = b"[PAD]\n[UNK]\n[CLS]\n[SEP]\n";
         let model = pinned_to(onnx, vocab);
@@ -515,7 +516,6 @@ mod tests {
         assert!(out.contains("do not load"), "{out}");
         assert!(out.contains("left as it is"), "{out}");
         assert!(out.contains("search stays keyword search"), "{out}");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -168,7 +168,7 @@ impl LockWait {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
@@ -180,17 +180,11 @@ mod tests {
     use crate::store::Store;
     use crate::threading::ThreadId;
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "fell-write-lock-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(tag: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("fell-write-lock-{tag}-"))
+            .tempdir()
+            .unwrap()
     }
 
     fn account() -> Account {
@@ -550,7 +544,8 @@ mod tests {
     /// old unread state over the agent's change, it would stay wrong.
     #[test]
     fn a_thread_marked_read_while_sync_commits_part_of_a_delta_stays_read() {
-        let dir = scratch("flag-gap");
+        let temp = scratch("flag-gap");
+        let dir = temp.path().to_path_buf();
         let path = dir.join("mail.db");
         let ui = Store::open(&path).unwrap();
         ui.upsert_account(&account()).unwrap();
@@ -592,7 +587,6 @@ mod tests {
         assert!(!unread_of(&ui, 2_050));
         assert_eq!(token(&ui).as_deref(), Some("modseq-2"));
         drop((sync, ui));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Whenever another write can get in during a delta, the copies table is
@@ -601,7 +595,8 @@ mod tests {
     /// is about to drop.
     #[test]
     fn a_write_during_a_delta_never_sees_half_a_listing() {
-        let dir = scratch("copies-gap");
+        let temp = scratch("copies-gap");
+        let dir = temp.path().to_path_buf();
         let path = dir.join("mail.db");
         let sync = Store::open(&path).unwrap();
         sync.upsert_account(&account()).unwrap();
@@ -637,7 +632,6 @@ mod tests {
         assert_eq!(count(&sync, copies), 2_100);
         assert_eq!(count(&sync, gone), 0);
         drop(sync);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Sync stops part way through a delta, and the next pass sends the
@@ -776,7 +770,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn every_path_to_a_mailbox_shares_its_turn() {
-        let dir = scratch("paths");
+        let temp = scratch("paths");
+        let dir = temp.path().to_path_buf();
         let path = dir.join("mail.db");
         let by_name = Store::open(&path).unwrap();
         let symlink = dir.join("symlink.db");
@@ -785,7 +780,8 @@ mod tests {
         std::fs::hard_link(&path, &hard_link).unwrap();
         let by_symlink = Store::open(&symlink).unwrap();
         let by_hard_link = Store::open(&hard_link).unwrap();
-        let other_dir = scratch("paths-other");
+        let other_temp = scratch("paths-other");
+        let other_dir = other_temp.path().to_path_buf();
         let other = Store::open(other_dir.join("mail.db")).unwrap();
 
         let turns = |store: &Store| Arc::clone(&store.lock_wait.turns);
@@ -793,8 +789,6 @@ mod tests {
         assert!(Arc::ptr_eq(&turns(&by_name), &turns(&by_hard_link)));
         assert!(!Arc::ptr_eq(&turns(&by_name), &turns(&other)));
         drop((by_name, by_symlink, by_hard_link, other));
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&other_dir);
     }
 
     /// UI writes land while sync streams batches back to back. They used to
@@ -804,7 +798,8 @@ mod tests {
     /// by `measure_action_latency_during_a_large_sync`.
     #[test]
     fn archive_undo_and_a_new_draft_land_while_sync_writes_back_to_back() {
-        let dir = scratch("ui");
+        let temp = scratch("ui");
+        let dir = temp.path().to_path_buf();
         let path = dir.join("mail.db");
         let ui = Store::open(&path).unwrap();
         ui.upsert_account(&account()).unwrap();
@@ -848,7 +843,6 @@ mod tests {
         }
         sync.finish();
         drop(ui);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Sync stands aside for a write that is waiting on the lock. Checked
@@ -862,7 +856,8 @@ mod tests {
     /// turn it begins at once, while the write is still waiting.
     #[test]
     fn sync_begins_a_batch_only_once_no_write_is_waiting() {
-        let dir = scratch("turn");
+        let temp = scratch("turn");
+        let dir = temp.path().to_path_buf();
         let path = dir.join("mail.db");
         let ui = Store::open(&path).unwrap();
         ui.upsert_account(&account()).unwrap();
@@ -902,7 +897,6 @@ mod tests {
             .unwrap()
             .expect("the waiting write failed once the lock was free");
         drop((sync, other));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn percentile(sorted: &[Duration], p: f64) -> Duration {
@@ -924,7 +918,8 @@ mod tests {
             .ok()
             .and_then(|raw| raw.parse().ok())
             .unwrap_or(50_000);
-        let dir = scratch("bench");
+        let temp = scratch("bench");
+        let dir = temp.path().to_path_buf();
         let path = dir.join("mail.db");
         let ui = Store::open(&path).unwrap();
         ui.upsert_account(&account()).unwrap();
@@ -1063,6 +1058,5 @@ mod tests {
         report("archive+undo during batches", took, failed);
         eprintln!("sync batches meanwhile: {batches}");
         drop(ui);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

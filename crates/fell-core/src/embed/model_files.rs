@@ -616,17 +616,11 @@ mod tests {
         version: "1",
     };
 
-    fn temp_root(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "fell-model-files-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        dir
+    fn temp_root(tag: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("fell-model-files-{tag}-"))
+            .tempdir()
+            .unwrap()
     }
 
     #[test]
@@ -685,7 +679,8 @@ mod tests {
 
     #[test]
     fn install_writes_owner_only_files_and_skips_a_verified_copy() {
-        let root = temp_root("install");
+        let temp = temp_root("install");
+        let root = temp.path().join("models");
         let model = model_for(ID, b"onnx bytes", b"[CLS]\n[SEP]\n[UNK]\n", 8);
         let calls = Cell::new(0);
         let mut fetch = serve(
@@ -714,12 +709,12 @@ mod tests {
         assert!(remove_model(model, &root).unwrap());
         assert!(!remove_model(model, &root).unwrap());
         assert!(installed_model_dir(model, &root).is_none());
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn an_active_install_keeps_its_staging_area() {
-        let root = temp_root("active-install");
+        let temp = temp_root("active-install");
+        let root = temp.path().join("models");
         fs::create_dir(&root).unwrap();
         let model = model_for(ID, b"onnx bytes", b"vocab", 8);
         let active = lock_models_root(&root).unwrap();
@@ -733,12 +728,12 @@ mod tests {
         );
         assert!(partial.is_dir());
         drop(active);
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn a_checksum_mismatch_keeps_nothing() {
-        let root = temp_root("checksum");
+        let temp = temp_root("checksum");
+        let root = temp.path().join("models");
         let model = model_for(ID, b"onnx bytes", b"vocab", 8);
         let calls = Cell::new(0);
         // Same length, different bytes.
@@ -766,12 +761,12 @@ mod tests {
             0,
             "staging is removed"
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn an_oversized_or_short_download_is_rejected() {
-        let root = temp_root("size");
+        let temp = temp_root("size");
+        let root = temp.path().join("models");
         let model = model_for(ID, b"onnx", b"vocab", 8);
         let calls = Cell::new(0);
         let mut long = serve(
@@ -805,12 +800,12 @@ mod tests {
             ModelError::Size { actual: 3, .. }
         ));
         assert!(installed_model_dir(model, &root).is_none());
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn a_failed_fetch_keeps_nothing() {
-        let root = temp_root("fetch");
+        let temp = temp_root("fetch");
+        let root = temp.path().join("models");
         let model = model_for(ID, b"onnx", b"vocab", 8);
         let calls = Cell::new(0);
         let mut fetch = serve(vec![(model.onnx.url, b"onnx".to_vec())], &calls);
@@ -827,12 +822,12 @@ mod tests {
         );
         assert!(installed_model_dir(model, &root).is_none());
         assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn a_tampered_install_fails_verification_and_is_replaced() {
-        let root = temp_root("tamper");
+        let temp = temp_root("tamper");
+        let root = temp.path().join("models");
         let model = model_for(ID, b"onnx", b"vocab", 8);
         let calls = Cell::new(0);
         let mut fetch = serve(
@@ -855,12 +850,12 @@ mod tests {
         install_model(model, &root, &mut fetch).unwrap();
         assert_eq!(calls.get(), 4);
         verify_installed(model, &root).unwrap();
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn a_symlinked_file_is_not_an_install() {
-        let root = temp_root("symlink");
+        let temp = temp_root("symlink");
+        let root = temp.path().join("models");
         let model = model_for(ID, b"onnx", b"vocab", 8);
         let dir = model_dir(model, &root);
         fs::create_dir_all(&dir).unwrap();
@@ -871,7 +866,6 @@ mod tests {
             std::os::unix::fs::symlink(root.join("elsewhere"), dir.join("model.onnx")).unwrap();
             assert!(installed_model_dir(model, &root).is_none());
         }
-        let _ = fs::remove_dir_all(&root);
     }
 
     fn fixed_fetch<'a>(
@@ -893,7 +887,8 @@ mod tests {
 
     #[test]
     fn a_symlinked_models_root_is_refused_and_not_chmodded() {
-        let base = temp_root("root-link");
+        let temp = temp_root("root-link");
+        let base = temp.path().join("models");
         let target = base.join("elsewhere");
         fs::create_dir_all(&target).unwrap();
         fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
@@ -909,12 +904,12 @@ mod tests {
         assert_eq!(calls.get(), 0);
         assert_eq!(mode(&target), 0o755, "the symlink target keeps its mode");
         assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
-        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
     fn a_file_where_the_models_root_goes_is_refused() {
-        let base = temp_root("root-file");
+        let temp = temp_root("root-file");
+        let base = temp.path().join("models");
         fs::create_dir_all(&base).unwrap();
         let root = base.join("models");
         fs::write(&root, b"not a directory").unwrap();
@@ -923,12 +918,12 @@ mod tests {
         assert!(install_model(model, &root, &mut fixed_fetch(model, &calls)).is_err());
         assert_eq!(calls.get(), 0);
         assert_eq!(fs::read(&root).unwrap(), b"not a directory");
-        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
     fn a_swapped_symlink_or_a_fifo_is_not_read() {
-        let root = temp_root("swap");
+        let temp = temp_root("swap");
+        let root = temp.path().join("models");
         let model = model_for(ID, b"onnx", b"vocab", 8);
         let calls = Cell::new(0);
         let dir = install_model(model, &root, &mut fixed_fetch(model, &calls)).unwrap();
@@ -958,12 +953,15 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("opening a FIFO must not block");
         assert!(matches!(got.unwrap_err(), ModelError::Missing));
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn a_failed_rename_puts_the_previous_install_back() {
-        let root = temp_root("restore");
+        // A parallel test could fork while the install holds its directory lock.
+        let Some(root) = crate::test_support::in_isolated_process() else {
+            return;
+        };
+        let root = root.join("models");
         let model = model_for(ID, b"onnx", b"vocab", 8);
         let calls = Cell::new(0);
         let mut fetch = fixed_fetch(model, &calls);
@@ -984,12 +982,12 @@ mod tests {
         install_model(model, &root, &mut fetch).unwrap();
         verify_installed(model, &root).unwrap();
         assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn install_sweeps_partial_directories_left_behind() {
-        let root = temp_root("sweep");
+        let temp = temp_root("sweep");
+        let root = temp.path().join("models");
         let model = model_for(ID, b"onnx", b"vocab", 8);
         let calls = Cell::new(0);
         let mut fetch = fixed_fetch(model, &calls);
@@ -1007,6 +1005,5 @@ mod tests {
         assert!(!stale.exists());
         assert!(!backup.exists());
         assert!(keep.exists(), "another model's staging is not touched");
-        let _ = fs::remove_dir_all(&root);
     }
 }

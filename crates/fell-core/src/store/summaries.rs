@@ -2758,14 +2758,8 @@ mod tests {
 
     #[test]
     fn an_existing_mailbox_is_summarized_once_on_open() {
-        let path = std::env::temp_dir().join(format!(
-            "fell-thread-summary-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fell-thread-summary.sqlite");
         {
             let store = Store::open(&path).unwrap();
             store.upsert_account(&account()).unwrap();
@@ -2802,9 +2796,6 @@ mod tests {
         assert_eq!(queued, 0, "the open filled every summary");
         assert_lists_match(&store, "after the upgrade", true);
         drop(store);
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-        }
     }
 
     fn plan(store: &Store, sql: &str, bind: &[Value]) -> Vec<String> {
@@ -2947,21 +2938,13 @@ mod tests {
         assert!(wider > large, "{large} steps for 20 rows, {wider} for 40");
     }
 
-    fn temp_mailbox(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "fell-{name}-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ))
-    }
-
-    fn remove_mailbox(path: &std::path::Path) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-        }
+    fn temp_mailbox(tag: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let temp = tempfile::Builder::new()
+            .prefix(&format!("fell-summary-{tag}-"))
+            .tempdir()
+            .unwrap();
+        let path = temp.path().join("mail.sqlite");
+        (temp, path)
     }
 
     fn summary_version_of(store: &Store) -> String {
@@ -2977,7 +2960,7 @@ mod tests {
 
     #[test]
     fn label_pages_backfill_and_follow_the_current_membership() {
-        let path = temp_mailbox("thread-labels-v2");
+        let (_temp, path) = temp_mailbox("thread-labels-v2");
         let account = account();
         let (older, newer) = {
             let store = Store::open(&path).unwrap();
@@ -3062,7 +3045,6 @@ mod tests {
             assert_eq!(page.unread, 0);
         }
         drop(store);
-        remove_mailbox(&path);
     }
 
     fn snippet_of(store: &Store, thread: &str) -> String {
@@ -3095,7 +3077,7 @@ mod tests {
 
     #[test]
     fn a_version_one_mailbox_gets_list_dates_without_a_recompute() {
-        let path = temp_mailbox("thread-folders-v1");
+        let (_temp, path) = temp_mailbox("thread-folders-v1");
         let (kept, queued, kept_snippet) = {
             let store = Store::open(&path).unwrap();
             fill(&store, 13, 30);
@@ -3173,7 +3155,6 @@ mod tests {
             .unwrap();
         assert_lists_match(&store, "after the version 1 upgrade", true);
         drop(store);
-        remove_mailbox(&path);
     }
 
     #[test]
@@ -3219,7 +3200,7 @@ mod tests {
 
     #[test]
     fn a_version_one_binary_can_still_write_folder_rows() {
-        let path = temp_mailbox("thread-folders-old-binary");
+        let (_temp, path) = temp_mailbox("thread-folders-old-binary");
         {
             let store = Store::open(&path).unwrap();
             fill(&store, 17, 30);
@@ -3247,7 +3228,6 @@ mod tests {
         assert_eq!(summary_version_of(&store), SUMMARY_VERSION);
         assert_lists_match(&store, "after a version 1 binary wrote rows", true);
         drop(store);
-        remove_mailbox(&path);
     }
 
     #[test]
@@ -3303,14 +3283,8 @@ mod tests {
 
     #[test]
     fn a_current_mailbox_keeps_its_summary_triggers() {
-        let path = std::env::temp_dir().join(format!(
-            "fell-summary-triggers-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fell-summary-triggers.sqlite");
         let first = Store::open(&path).unwrap();
         first
             .conn
@@ -3342,9 +3316,6 @@ mod tests {
         );
         drop(second);
         drop(first);
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-        }
     }
 
     /// Extra Inbox diagnostics over the budget suite's mailbox.
@@ -3356,7 +3327,7 @@ mod tests {
         use crate::test_support::mailbox;
         use std::time::{Duration, Instant};
 
-        let path = temp_mailbox("measure-inbox");
+        let (_temp, path) = temp_mailbox("measure-inbox");
         let built = Instant::now();
         mailbox::seed(&path).unwrap();
         println!("built 100k messages in {:.1?}", built.elapsed());
@@ -3491,7 +3462,5 @@ mod tests {
         drop(index_lock);
         let size = std::fs::metadata(&path).unwrap().len();
         println!("mailbox file {:.1} MB", size as f64 / 1e6);
-        remove_mailbox(&path);
-        let _ = std::fs::remove_file(format!("{}.embed.lock", path.display()));
     }
 }

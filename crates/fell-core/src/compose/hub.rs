@@ -1353,7 +1353,7 @@ mod tests {
 
     #[test]
     fn request_send_and_edit_never_transmit() {
-        let hub = hub_with_d1("edit");
+        let (_temp, hub) = hub_with_d1();
         grant_d1(&hub);
         let edited = hub.handle_line(
             &json!({
@@ -1411,15 +1411,8 @@ mod tests {
 
     #[test]
     fn reopening_a_sent_draft_keeps_it_locked() {
-        let root = std::env::temp_dir().join(format!(
-            "fell-hub-sent-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("drafts");
         let fields = DraftFields {
             from: "jon@example.com".into(),
             to: vec!["ada@example.com".into()],
@@ -1466,29 +1459,25 @@ mod tests {
             session.send_lock()
         });
         assert_eq!(lock, Some(Some(super::super::SendLock::Sent)));
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn reading_a_session_does_not_wake_the_window() {
-        let root = std::env::temp_dir().join(format!(
-            "fell-hub-idle-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let temp = tempfile::tempdir().unwrap();
         let fields = DraftFields {
             from: "jon@example.com".into(),
             to: vec!["ada@example.com".into()],
             subject: "Hi".into(),
             ..DraftFields::default()
         };
-        let folder =
-            workspace::materialize_in(&root, "d1", &fields, "alpha\n", &AccountId("a".into()))
-                .unwrap();
+        let folder = workspace::materialize_in(
+            temp.path(),
+            "d1",
+            &fields,
+            "alpha\n",
+            &AccountId("a".into()),
+        )
+        .unwrap();
         let session = DraftSession::testing_create_local(
             folder,
             "d1",
@@ -1512,7 +1501,7 @@ mod tests {
 
     #[test]
     fn request_send_waits_until_the_window_shows_that_draft() {
-        let hub = hub_with_d1("show-wait");
+        let (_temp, hub) = hub_with_d1();
         grant_d1(&hub);
         let _inbox = hub.subscribe();
         let waiter = Arc::clone(&hub);
@@ -1534,25 +1523,22 @@ mod tests {
         assert_eq!(requested["transmitted"], false);
     }
 
-    fn hub_with_d1(name: &str) -> Arc<DraftHub> {
-        let root = std::env::temp_dir().join(format!(
-            "fell-hub-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = fs::remove_dir_all(&root);
+    fn hub_with_d1() -> (tempfile::TempDir, Arc<DraftHub>) {
+        let temp = tempfile::tempdir().unwrap();
         let fields = DraftFields {
             from: "jon@example.com".into(),
             to: vec!["ada@example.com".into()],
             subject: "Hi".into(),
             ..DraftFields::default()
         };
-        let folder =
-            workspace::materialize_in(&root, "d1", &fields, "alpha\n", &AccountId("a".into()))
-                .unwrap();
+        let folder = workspace::materialize_in(
+            temp.path(),
+            "d1",
+            &fields,
+            "alpha\n",
+            &AccountId("a".into()),
+        )
+        .unwrap();
         let mut session = DraftSession::testing_create_local(
             folder,
             "d1",
@@ -1564,7 +1550,7 @@ mod tests {
         session.set_owner("agent:bot");
         let hub = Arc::new(DraftHub::new());
         hub.insert(session);
-        hub
+        (temp, hub)
     }
 
     fn grant_d1(hub: &DraftHub) -> crate::Store {
@@ -1599,7 +1585,7 @@ mod tests {
 
     #[test]
     fn live_draft_writes_recheck_scope_after_mcp_authorizes() {
-        let hub = hub_with_d1("revoked");
+        let (_temp, hub) = hub_with_d1();
         let store = grant_d1(&hub);
         let account = AccountId("a".into());
         let settings = crate::Store::open(store.db_path().unwrap()).unwrap();
@@ -1650,7 +1636,7 @@ mod tests {
 
     #[test]
     fn a_blocked_mailbox_open_leaves_sessions_available_to_the_ui() {
-        let hub = hub_with_d1("blocked-agent-write");
+        let (_temp, hub) = hub_with_d1();
         let store = grant_d1(&hub);
         let write = crate::store::begin_immediate(store.connection()).unwrap();
         let agent_hub = Arc::clone(&hub);
@@ -1744,7 +1730,7 @@ mod tests {
 
     #[test]
     fn each_request_send_asks_the_host_to_show_the_editor_again() {
-        let hub = hub_with_d1("reveal");
+        let (_temp, hub) = hub_with_d1();
         grant_d1(&hub);
         assert_eq!(hub.reveal_count(), 0);
         request_send_d1(&hub);
@@ -1767,7 +1753,7 @@ mod tests {
 
     #[test]
     fn a_closed_window_does_not_count_as_showing_the_draft() {
-        let hub = hub_with_d1("hidden");
+        let (_temp, hub) = hub_with_d1();
         grant_d1(&hub);
         let _host = hub.subscribe();
         hub.note_shown("d1");
@@ -1786,14 +1772,8 @@ mod tests {
 
     #[test]
     fn a_second_process_cannot_take_over_the_draft_socket() {
-        let root = std::env::temp_dir().join(format!(
-            "fell-hub-bind-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
         let path = root.join("live.sock");
         let first = DraftHub::bind(&path).unwrap();
         let second = DraftHub::bind(&path);
@@ -1806,12 +1786,11 @@ mod tests {
         drop(first);
         // A socket file left behind is replaced once nobody holds the lock.
         let _again = DraftHub::bind(&path).unwrap();
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn a_listener_that_is_gone_is_dropped() {
-        let hub = hub_with_d1("listeners");
+        let (_temp, hub) = hub_with_d1();
         grant_d1(&hub);
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let seen = calls.clone();
@@ -1826,7 +1805,7 @@ mod tests {
 
     #[test]
     fn hiding_the_window_closes_the_draft_for_editing() {
-        let hub = hub_with_d1("closed");
+        let (_temp, hub) = hub_with_d1();
         grant_d1(&hub);
         request_send_d1(&hub);
         assert!(
@@ -1842,7 +1821,7 @@ mod tests {
 
     #[test]
     fn a_closed_review_window_leaves_one_notice() {
-        let hub = hub_with_d1("notice");
+        let (_temp, hub) = hub_with_d1();
         grant_d1(&hub);
         let _host = hub.subscribe();
         request_send_d1(&hub);
@@ -1869,7 +1848,7 @@ mod tests {
 
     #[test]
     fn closing_the_editor_saves_typing_the_debounce_held_back() {
-        let hub = hub_with_d1("close-flush");
+        let (_temp, hub) = hub_with_d1();
         let file = type_unsaved(&hub, "typed before close\n");
         hub.note_shown("d1");
         hub.note_hidden("d1");
@@ -1887,7 +1866,7 @@ mod tests {
 
     #[test]
     fn quitting_saves_typing_the_debounce_held_back() {
-        let hub = hub_with_d1("quit-flush");
+        let (_temp, hub) = hub_with_d1();
         let file = type_unsaved(&hub, "typed before quit\n");
         hub.settle_all();
         assert!(
@@ -1899,7 +1878,7 @@ mod tests {
 
     #[test]
     fn the_inbox_shows_a_draft_without_naming_an_agent() {
-        let hub = hub_with_d1("show");
+        let (_temp, hub) = hub_with_d1();
         assert!(!hub.show("missing"));
         assert!(hub.show("d1"));
         assert_eq!(hub.reveal_count(), 1);
@@ -1919,7 +1898,7 @@ mod tests {
 
     #[test]
     fn a_live_draft_is_not_replaced_by_a_second_open() {
-        let hub = hub_with_d1("insert-new");
+        let (_temp, hub) = hub_with_d1();
         hub.with_session("d1", |session| session.set_body_from_user("live\n".into()));
         let folder = hub
             .with_session("d1", |session| session.folder().to_path_buf())
@@ -1941,7 +1920,7 @@ mod tests {
 
     #[test]
     fn a_late_send_that_may_have_gone_out_is_a_warning() {
-        let hub = hub_with_d1("late");
+        let (_temp, hub) = hub_with_d1();
         hub.report_send("d1", Some(MAYBE_SENT_NOTICE));
         let notices = hub.take_notices();
         assert_eq!(notices.len(), 1, "{notices:?}");
@@ -1961,7 +1940,7 @@ mod tests {
 
     #[test]
     fn the_inbox_can_reopen_the_review_that_closed() {
-        let hub = hub_with_d1("reopen");
+        let (_temp, hub) = hub_with_d1();
         grant_d1(&hub);
         let _host = hub.subscribe();
         assert!(!hub.reopen_last(), "nothing has closed yet");
@@ -1981,7 +1960,7 @@ mod tests {
 
     #[test]
     fn reopen_does_not_raise_a_draft_that_was_sent_after_it_closed() {
-        let hub = hub_with_d1("reopen-sent");
+        let (_temp, hub) = hub_with_d1();
         grant_d1(&hub);
         let _host = hub.subscribe();
         request_send_d1(&hub);
@@ -2007,7 +1986,7 @@ mod tests {
 
     #[test]
     fn reopen_refuses_a_draft_sent_while_no_window_showed_it() {
-        let hub = hub_with_d1("reopen-sent-hidden");
+        let (_temp, hub) = hub_with_d1();
         grant_d1(&hub);
         let _host = hub.subscribe();
         request_send_d1(&hub);
@@ -2023,7 +2002,7 @@ mod tests {
 
     #[test]
     fn a_send_reported_after_the_window_moved_on_reaches_the_inbox() {
-        let hub = hub_with_d1("report-send");
+        let (_temp, hub) = hub_with_d1();
         hub.show("d1");
         hub.note_shown("d1");
         // The window moved to another draft while the send was in flight.
@@ -2064,7 +2043,7 @@ mod tests {
         );
         drop(first);
         assert!(hub.begin_open("d1", &account).unwrap().is_some());
-        let live = hub_with_d1("open-guard");
+        let (_temp, live) = hub_with_d1();
         assert!(
             live.begin_open("d1", &account).unwrap().is_none(),
             "d1 is live"
@@ -2136,15 +2115,8 @@ mod tests {
 
     #[test]
     fn another_agent_cannot_read_the_draft() {
-        let root = std::env::temp_dir().join(format!(
-            "fell-hub-owner-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("drafts");
         let fields = DraftFields {
             from: "jon@example.com".into(),
             to: vec!["ada@example.com".into()],
