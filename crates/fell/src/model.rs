@@ -8,6 +8,7 @@ pub(crate) mod settings;
 pub(crate) mod snooze;
 pub use notes::{AgentNotes, NoteRequest, SUGGESTIONS_QUERY};
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -190,7 +191,7 @@ pub enum Overlay {
 pub enum FolderIntent {
     /// `gf` switches the list to the chosen folder.
     Go,
-    /// `m` moves the open thread out of the folder on screen.
+    /// `m` moves the selected conversations to the chosen folder.
     Move,
     Label,
     LabelList,
@@ -360,6 +361,25 @@ pub struct ReadDwell {
     generation: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MoveEdit {
+    pub scopes: Vec<(ThreadId, String)>,
+    pub destination: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MoveList {
+    Folder(String),
+    Search(String),
+}
+
+#[derive(Clone, Debug)]
+struct MoveSelection {
+    list: MoveList,
+    scopes: Vec<(ThreadId, String)>,
+    subject: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Step {
     pub note: Option<NoteRequest>,
@@ -378,8 +398,7 @@ pub struct Step {
     pub jump_to_message: bool,
     /// The reader expanded or folded a message, its quotes, or recipients.
     pub message_disclosure_changed: bool,
-    /// The view moves the thread to [`Session::pending_move`].
-    pub apply_move: bool,
+    pub move_edit: Option<MoveEdit>,
     pub read_label_targets: bool,
     pub labels: Option<LabelEdit>,
     pub triage: Option<snooze::TriageEdit>,
@@ -448,6 +467,10 @@ pub struct Session {
     pub folder: String,
     pub folders: Vec<String>,
     pub label_scope: Option<String>,
+    /// The scope of the loaded folder list. Navigation changes the requested
+    /// scope above before the new rows arrive.
+    pub list_folder: String,
+    pub list_label: Option<String>,
     pub labels: Vec<String>,
     /// Which folder is Sent, Drafts, Archive and the rest on this account.
     pub roles: FolderRoles,
@@ -471,7 +494,8 @@ pub struct Session {
     pending: Option<Pending>,
     pub cursor_id: Option<String>,
     pub anchor_id: Option<String>,
-    pub picked: HashSet<String>,
+    /// Marked row IDs and their subjects, including marks outside the loaded page.
+    pub picked: HashMap<String, String>,
     pub visual: bool,
     pub pane: Pane,
     pub full_width: bool,
@@ -526,8 +550,7 @@ pub struct Session {
     toast_generation: u64,
     /// The manual sync acknowledgement, until the worker sends status.
     sync_notice: Option<u64>,
-    /// Destination chosen by `m`, consumed when the view applies the move.
-    pub pending_move: Option<String>,
+    move_selection: Option<MoveSelection>,
     /// `#` in Trash asked to remove these threads from Fell, in the
     /// notice of this generation. The next key answers: `y` deletes them,
     /// anything else lets it go. A notice that replaced the question
@@ -561,6 +584,8 @@ impl Session {
             account_name: account_name.into(),
             account_email: account_email.into(),
             folder: FolderRole::Inbox.default_name().into(),
+            list_folder: FolderRole::Inbox.default_name().into(),
+            list_label: None,
             folders: Vec::new(),
             roles: FolderRoles::default(),
             threads: Vec::new(),
@@ -574,7 +599,7 @@ impl Session {
             pending: None,
             cursor_id: None,
             anchor_id: None,
-            picked: HashSet::new(),
+            picked: HashMap::new(),
             visual: false,
             pane: Pane::List,
             full_width: false,
@@ -627,7 +652,7 @@ impl Session {
             worker_outages: HashSet::new(),
             toast_generation: 0,
             sync_notice: None,
-            pending_move: None,
+            move_selection: None,
             confirm_purge: None,
             purge_ready: None,
             loading: false,
@@ -725,23 +750,35 @@ impl Session {
         false
     }
 
-    pub fn folder_prompt(&self) -> &'static str {
+    pub fn folder_prompt(&self) -> Cow<'static, str> {
         match self.folder_intent {
-            FolderIntent::Move => "Move to",
+            FolderIntent::Move => {
+                if let Some(selection) = &self.move_selection
+                    && selection.scopes.len() > 1
+                {
+                    return format!("Move {} conversations to", selection.scopes.len()).into();
+                }
+                "Move to"
+            }
             FolderIntent::Go => "Folder",
             FolderIntent::Label => "Label",
             FolderIntent::LabelList => "Go to label",
         }
+        .into()
     }
 
-    pub fn label_target(&self) -> Option<String> {
-        if self.overlay != Overlay::Folders || self.folder_intent != FolderIntent::Label {
+    pub fn folder_target(&self) -> Option<String> {
+        if self.overlay != Overlay::Folders {
             return None;
         }
-        match self.label_selection.ids.as_slice() {
-            [] => None,
-            [_] => self.label_selection.subject.clone(),
-            ids => Some(format!("{} conversations", ids.len())),
+        match self.folder_intent {
+            FolderIntent::Label => match self.label_selection.ids.as_slice() {
+                [] => None,
+                [_] => self.label_selection.subject.clone(),
+                ids => Some(format!("{} conversations", ids.len())),
+            },
+            FolderIntent::Move => self.move_selection.as_ref()?.subject.clone(),
+            FolderIntent::Go | FolderIntent::LabelList => None,
         }
     }
 
@@ -1019,15 +1056,17 @@ impl Session {
     pub fn folder_choices(&self) -> Vec<String> {
         let all = merge_folders(&self.roles, &self.folders);
         let query = self.folder_query.trim();
-        let from = self
-            .cursor_id
-            .as_deref()
-            .and_then(|id| self.search_source(id))
-            .unwrap_or(&self.folder);
+        let common_source = self.move_selection.as_ref().and_then(|selection| {
+            let mut sources = selection.scopes.iter().map(|(_, folder)| folder);
+            sources
+                .next()
+                .filter(|first| sources.all(|source| first.eq_ignore_ascii_case(source)))
+        });
         all.into_iter()
             .filter(|name| {
                 if self.folder_intent == FolderIntent::Move
-                    && (name.eq_ignore_ascii_case(from) || self.roles.is_view(name))
+                    && (common_source.is_some_and(|from| name.eq_ignore_ascii_case(from))
+                        || self.roles.is_view(name))
                 {
                     return false;
                 }
@@ -1170,7 +1209,7 @@ impl Session {
         if let Some(rows) = self.visual_rows() {
             return rows.iter().map(|row| row.id.clone()).collect();
         }
-        let mut ids = self.picked.clone();
+        let mut ids: HashSet<_> = self.picked.keys().cloned().collect();
         if let Some(id) = &self.cursor_id
             && self.threads.iter().any(|thread| &thread.id == id)
         {
@@ -1217,13 +1256,13 @@ impl Session {
         let mut targets: Vec<_> = self
             .threads
             .iter()
-            .filter(|thread| self.picked.contains(&thread.id))
+            .filter(|thread| self.picked.contains_key(&thread.id))
             .map(|thread| thread.id.clone())
             .collect();
         let loaded: HashSet<_> = targets.iter().collect();
         let mut off_page: Vec<_> = self
             .picked
-            .iter()
+            .keys()
             .filter(|id| !loaded.contains(id))
             .cloned()
             .collect();
@@ -1320,7 +1359,7 @@ impl Session {
         }
         if !self.more_before && !self.more_after {
             self.picked
-                .retain(|id| self.threads.iter().any(|thread| &thread.id == id));
+                .retain(|id, _| self.threads.iter().any(|thread| &thread.id == id));
         }
         if self.visual && !self.visual_span_survived(&old_ids, previous.as_deref()) {
             self.visual = false;
@@ -2297,6 +2336,9 @@ impl Session {
     }
 
     pub fn dismiss_overlay(&mut self) {
+        if self.overlay == Overlay::Folders && self.folder_intent == FolderIntent::Move {
+            self.move_selection = None;
+        }
         self.overlay = match self.overlay {
             Overlay::Palette => std::mem::replace(&mut self.palette_origin, Overlay::None),
             Overlay::AgentActivity if self.activity.confirmation.take().is_some() => {
@@ -2384,7 +2426,7 @@ impl Session {
     fn folder_key(&mut self, key: KeyId) -> Step {
         match key {
             KeyId::Escape => {
-                self.overlay = Overlay::None;
+                self.dismiss_overlay();
                 self.folder_intent = FolderIntent::Go;
                 Step::default()
             }
@@ -2435,7 +2477,7 @@ impl Session {
             ) {
                 return Step::default();
             }
-            self.overlay = Overlay::None;
+            self.dismiss_overlay();
             self.folder_query.clear();
             self.folder_intent = FolderIntent::Go;
             return Step::default();
@@ -2454,9 +2496,21 @@ impl Session {
         self.folder_intent = FolderIntent::Go;
         match intent {
             FolderIntent::Move => {
-                self.pending_move = Some(name);
+                let Some(selection) = self.move_selection.take() else {
+                    return Step::default();
+                };
+                if self.move_list_scope().as_ref() != Some(&selection.list) {
+                    self.show_toast("The list changed. Open Move again", false);
+                    return Step::default();
+                }
+                self.picked.clear();
+                self.visual = false;
+                self.anchor_id = None;
                 Step {
-                    apply_move: true,
+                    move_edit: Some(MoveEdit {
+                        scopes: selection.scopes,
+                        destination: name,
+                    }),
                     ..Step::default()
                 }
             }
@@ -2761,24 +2815,47 @@ impl Session {
             }
             Action::Move => {
                 self.count.clear();
-                if self.cursor_id.is_none() {
+                let Some(list) = self.move_list_scope() else {
+                    self.show_toast("The folder is still loading", false);
+                    return step;
+                };
+                let targets = self.action_targets();
+                if targets.is_empty() {
                     self.show_toast("No conversation", true);
-                    return Step::default();
-                }
-                if self.cursor_draft().is_some() {
-                    // Said now, not after a folder is picked for nothing.
-                    self.show_toast(DRAFT_NOT_THREAD, true);
-                    return Step::default();
-                }
-                if self
-                    .cursor_id
-                    .as_deref()
-                    .and_then(|id| self.search_source(id))
-                    .is_none()
-                {
-                    self.show_toast("No folder for this match", true);
                     return step;
                 }
+                let (targets, _) = self.split_removal_targets(targets);
+                if targets.is_empty() {
+                    self.show_toast(DRAFT_NOT_THREAD, true);
+                    return step;
+                }
+                let scopes = match &list {
+                    MoveList::Folder(folder) => Some(
+                        targets
+                            .into_iter()
+                            .map(|id| (ThreadId(id), folder.clone()))
+                            .collect::<Vec<_>>(),
+                    ),
+                    MoveList::Search(_) => self.search_scopes(&targets),
+                };
+                let Some(scopes) = scopes else {
+                    self.show_toast("No folder for this match", true);
+                    return step;
+                };
+                let subject = match scopes.as_slice() {
+                    [(id, _)] if self.cursor_id.as_deref() != Some(id.as_str()) => self
+                        .threads
+                        .iter()
+                        .find(|row| row.id == id.0)
+                        .map(|row| row.subject.clone())
+                        .or_else(|| self.picked.get(id.as_str()).cloned()),
+                    _ => None,
+                };
+                self.move_selection = Some(MoveSelection {
+                    list,
+                    scopes,
+                    subject,
+                });
                 self.folder_intent = FolderIntent::Move;
                 self.overlay = Overlay::Folders;
                 self.folder_query.clear();
@@ -2912,9 +2989,10 @@ impl Session {
             Action::ToggleSelect => {
                 self.count.clear();
                 if let Some(id) = self.cursor_id.clone()
-                    && !self.picked.remove(&id)
+                    && self.picked.remove(&id).is_none()
+                    && let Some(row) = self.cursor_thread()
                 {
-                    self.picked.insert(id);
+                    self.picked.insert(id, row.subject.clone());
                 }
             }
             Action::Visual => {
@@ -3112,6 +3190,16 @@ impl Session {
     fn go_role(&mut self, role: FolderRole) -> bool {
         let folder = self.roles.name(role).to_string();
         self.go_folder(&folder)
+    }
+
+    fn move_list_scope(&self) -> Option<MoveList> {
+        if let Some(search) = &self.search {
+            return Some(MoveList::Search(search.request().into()));
+        }
+        (self.folder == self.list_folder
+            && self.label_scope == self.list_label
+            && self.list_label.is_none())
+        .then(|| MoveList::Folder(self.list_folder.clone()))
     }
 
     /// The conversation pane just opened on the selected thread: an unread
@@ -3865,7 +3953,7 @@ mod tests {
         session.set_threads(vec![draft, row("a")]);
         session.cursor_id = Some("draft-1".into());
         let step = session.on_key(KeyId::Char('m'), 10);
-        assert!(!step.apply_move);
+        assert!(step.move_edit.is_none());
         assert_eq!(session.overlay, Overlay::None);
         let toast = session.toast.as_ref().expect("m says why");
         assert_eq!(toast.text, DRAFT_NOT_THREAD);
@@ -4163,7 +4251,7 @@ mod tests {
         assert_eq!(session.toast.as_ref().unwrap().text, DRAFT_NOT_THREAD);
         session.on_key(KeyId::Char('x'), 10);
         session.set_page(vec![row("a")], true, false, 0);
-        assert!(session.picked.contains(&draft_id));
+        assert!(session.picked.contains_key(&draft_id));
         assert!(!session.on_key(KeyId::Char('l'), 10).read_label_targets);
         assert_eq!(session.toast.as_ref().unwrap().text, DRAFT_NOT_THREAD);
 
@@ -4578,7 +4666,7 @@ mod tests {
         let step = session.on_key(KeyId::Char('e'), 4);
         assert!(step.archive);
         assert!(!step.undo);
-        assert!(!step.apply_move);
+        assert!(step.move_edit.is_none());
         assert_eq!(session.folder, folder);
         assert_eq!(session.cursor_id.as_deref(), Some("a"));
     }
@@ -4807,8 +4895,8 @@ mod tests {
         let mut rows = vec![draft];
         rows.extend(session.threads.clone());
         session.set_threads(rows);
-        session.picked.insert("draft-1".into());
-        session.picked.insert("a".into());
+        session.picked.insert("draft-1".into(), String::new());
+        session.picked.insert("a".into(), String::new());
         session.cursor_id = Some("e".into());
         let edit = session.on_key(KeyId::Char('s'), 10).flags.unwrap();
         assert_eq!(edit.ids, vec!["a"]);
@@ -5017,7 +5105,7 @@ mod tests {
         assert!(picked.on_key(KeyId::Char('#'), 4).delete);
 
         let mut session = session();
-        session.picked.insert("a".into());
+        session.picked.insert("a".into(), String::new());
         session.cursor_id = Some("b".into());
         session.on_key(KeyId::Char('V'), 4);
         session.on_key(KeyId::Char('j'), 4);
@@ -5118,7 +5206,7 @@ mod tests {
         assert!(!session.on_key(KeyId::Char('y'), 4).purge);
 
         // Another picked row changes the count. An unpicked cursor does not.
-        session.picked.insert("c".into());
+        session.picked.insert("c".into(), String::new());
         session.on_key(KeyId::Char('#'), 4);
         assert_eq!(
             session.toast.as_ref().map(|toast| toast.text.as_str()),
@@ -5130,7 +5218,9 @@ mod tests {
     fn replacing_the_confirmed_page_or_expiring_the_prompt_prevents_purge() {
         let mut session = session();
         session.folder = "Trash".into();
-        session.picked.extend(["a".to_string(), "b".to_string()]);
+        session
+            .picked
+            .extend(["a", "b"].map(|id| (id.into(), String::new())));
         session.on_key(KeyId::Char('#'), 4);
         session.set_threads(vec![row("b"), row("c")]);
         assert!(session.toast.is_none());
@@ -5220,7 +5310,7 @@ mod tests {
         let mut session = session();
         let before = session.folder.clone();
         let step = session.on_key(KeyId::Char('m'), 4);
-        assert!(!step.apply_move);
+        assert!(step.move_edit.is_none());
         assert!(!step.undo);
         assert_eq!(session.overlay, Overlay::Folders);
         assert_eq!(session.folder_intent, FolderIntent::Move);
@@ -5232,8 +5322,13 @@ mod tests {
                 .all(|name| !name.eq_ignore_ascii_case("INBOX"))
         );
         let step = session.on_key(KeyId::Enter, 4);
-        assert!(step.apply_move);
-        assert_eq!(session.pending_move.as_deref(), Some("Sent"));
+        assert_eq!(
+            step.move_edit,
+            Some(MoveEdit {
+                scopes: vec![(ThreadId("a".into()), before.clone())],
+                destination: "Sent".into(),
+            })
+        );
         assert_eq!(session.folder, before);
         assert_eq!(session.overlay, Overlay::None);
         let step = session.on_key(KeyId::Char('u'), 4);
@@ -5261,6 +5356,156 @@ mod tests {
         session.on_key(KeyId::Space, 2);
         assert_eq!(session.message_cursor, 0);
         assert_eq!(session.chord, vec![KeyId::Leader]);
+    }
+
+    #[test]
+    fn m_moves_the_marked_or_visual_selection_and_clears_it_on_confirm() {
+        for visual in [false, true] {
+            let mut session = session();
+            if visual {
+                for key in ['V', 'j', 'j', 'j'] {
+                    session.on_key(KeyId::Char(key), 10);
+                }
+            } else {
+                for key in ['x', 'j', 'x', 'j', 'x', 'j', 'x', 'j'] {
+                    session.on_key(KeyId::Char(key), 10);
+                }
+                assert_eq!(session.cursor_id.as_deref(), Some("e"));
+            }
+
+            session.on_key(KeyId::Char('m'), 10);
+            assert_eq!(session.folder_prompt(), "Move 4 conversations to");
+            assert_eq!(session.action_targets(), ["a", "b", "c", "d"]);
+            session.on_key(KeyId::Escape, 10);
+            assert_eq!(session.action_targets(), ["a", "b", "c", "d"]);
+
+            session.on_key(KeyId::Char('m'), 10);
+            for key in "Archive".chars() {
+                session.on_key(KeyId::Char(key), 10);
+            }
+            let edit = session.on_key(KeyId::Enter, 10).move_edit.unwrap();
+            assert_eq!(edit.destination, "Archive");
+            assert_eq!(
+                edit.scopes,
+                ["a", "b", "c", "d"].map(|id| (ThreadId(id.into()), "INBOX".into()))
+            );
+            assert!(session.picked.is_empty());
+            assert!(!session.visual);
+            assert!(session.anchor_id.is_none());
+            assert!(session.on_key(KeyId::Char('u'), 10).undo);
+        }
+    }
+
+    #[test]
+    fn m_and_e_ask_for_a_real_folder_in_snoozed_and_muted() {
+        for (key, folder) in [
+            ('z', fell_core::store::SNOOZED),
+            ('m', fell_core::store::MUTED),
+        ] {
+            let mut session = session();
+            session.on_key(KeyId::Char('g'), 10);
+            assert!(session.on_key(KeyId::Char(key), 10).reload_threads);
+            assert_eq!(session.folder, folder);
+            session.list_folder = folder.into();
+            session.set_threads(vec![row("a"), row("b")]);
+            session.on_key(KeyId::Char('V'), 10);
+            session.on_key(KeyId::Char('j'), 10);
+
+            for key in ['m', 'e'] {
+                session.clear_toast();
+                let step = session.on_key(KeyId::Char(key), 10);
+                assert!(step.move_edit.is_none());
+                assert!(!step.archive);
+                assert_eq!(session.overlay, Overlay::None);
+                assert_eq!(session.action_targets(), ["a", "b"]);
+                assert_eq!(
+                    session.toast.as_ref().map(|toast| toast.text.as_str()),
+                    Some("Choose a folder to move mail")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn m_preserves_marks_while_a_folder_or_label_switch_is_loading() {
+        let mut session = session();
+        session.on_key(KeyId::Char('x'), 10);
+        session.on_key(KeyId::Char('g'), 10);
+        assert!(session.on_key(KeyId::Char('s'), 10).reload_threads);
+        assert_eq!(session.folder, "Sent");
+        assert_eq!(session.list_folder, "INBOX");
+        assert!(session.on_key(KeyId::Char('m'), 10).move_edit.is_none());
+        assert_eq!(session.overlay, Overlay::None);
+        assert_eq!(session.action_targets(), ["a"]);
+
+        session.list_folder = "Sent".into();
+        session.list_label = Some("work".into());
+        assert!(session.on_key(KeyId::Char('m'), 10).move_edit.is_none());
+        assert_eq!(session.overlay, Overlay::None);
+        assert_eq!(session.action_targets(), ["a"]);
+    }
+
+    #[test]
+    fn move_confirmation_preserves_the_selection_if_the_list_switches() {
+        for visual in [false, true] {
+            let mut session = session();
+            session.on_key(KeyId::Char(if visual { 'V' } else { 'x' }), 10);
+            session.on_key(KeyId::Char('m'), 10);
+            type_picker(&mut session, "Archive");
+
+            // The new folder also contains the selected conversation.
+            assert!(session.perform(Action::Sent, 10).reload_threads);
+            session.list_folder = "Sent".into();
+            assert!(session.on_key(KeyId::Enter, 10).move_edit.is_none());
+            assert_eq!(session.overlay, Overlay::None);
+            assert_eq!(session.action_targets(), ["a"]);
+            assert_eq!(session.visual, visual);
+            assert_eq!(session.anchor_id.as_deref(), visual.then_some("a"));
+            assert_eq!(session.picked.contains_key("a"), !visual);
+        }
+    }
+
+    #[test]
+    fn move_picker_names_a_single_mark_away_from_the_cursor() {
+        let mut session = session();
+        session.threads[0].subject = "Selected subject".into();
+        session.on_key(KeyId::Char('x'), 10);
+        session.on_key(KeyId::Char('j'), 10);
+        for off_page in [false, true] {
+            if off_page {
+                session.more_before = true;
+                session.set_threads(session.threads[1..].to_vec());
+            }
+            session.on_key(KeyId::Char('m'), 10);
+            assert_eq!(session.folder_prompt(), "Move to");
+            assert_eq!(session.folder_target().as_deref(), Some("Selected subject"));
+            session.on_key(KeyId::Escape, 10);
+        }
+    }
+
+    #[test]
+    fn a_closing_move_picker_keeps_its_count_and_query() {
+        for close in [KeyId::Enter, KeyId::Escape] {
+            let mut motion =
+                crate::inbox_motion::InboxMotion::new(crate::motion::Motion::new(true));
+            let mut session = session();
+            for key in ['V', 'j', 'j', 'j', 'm'] {
+                session.on_key(KeyId::Char(key), 10);
+            }
+            type_picker(&mut session, "arch");
+            let now = std::time::Instant::now();
+            motion.observe(&session, (true, true), now);
+
+            let step = session.on_key(close, 10);
+            assert_eq!(step.move_edit.is_some(), close == KeyId::Enter);
+            assert!(session.move_selection.is_none());
+            motion.observe(&session, (true, true), now);
+
+            let (layer, _) = motion.closing_overlay(now).unwrap();
+            layer.swap(&mut session);
+            assert_eq!(layer.folder_prompt, "Move 4 conversations to");
+            assert_eq!(session.folder_query, "arch");
+        }
     }
 
     #[test]

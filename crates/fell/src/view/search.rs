@@ -546,7 +546,7 @@ impl Inbox {
 
     pub(super) fn action_folder(&mut self, id: &str) -> Option<String> {
         if self.session.search.is_none() {
-            return Some(self.list_folder.clone());
+            return Some(self.session.list_folder.clone());
         }
         let folder = self.session.search_source(id).map(str::to_owned);
         if folder.is_none() && self.session.search_results_current() {

@@ -7,6 +7,7 @@
 //! scroll glides start where the view changes them, because they need the
 //! positions from before the change.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -126,7 +127,8 @@ pub struct Layer {
     activity: Option<crate::model::activity::Activity>,
     palette_origin: Overlay,
     settings: Option<crate::model::settings::Nav>,
-    pub label_target: Option<String>,
+    pub folder_prompt: Cow<'static, str>,
+    pub folder_target: Option<String>,
     pub picker_choices: Vec<PickerChoice>,
     pub label_marks: f32,
 }
@@ -161,7 +163,8 @@ impl Layer {
             settings: (session.overlay == Overlay::Settings
                 || session.palette_origin == Overlay::Settings)
                 .then(|| session.settings_nav.clone()),
-            label_target: session.label_target(),
+            folder_prompt: session.folder_prompt(),
+            folder_target: session.folder_target(),
             picker_choices,
             label_marks,
         }
