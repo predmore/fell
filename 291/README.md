@@ -109,6 +109,8 @@ Slowed contact sheets for [Tokyo Night](round-5/dark-slow-sequence.png), [Catppu
 | Catppuccin Latte, 1200 px · slowed | 112, 180 on frames 123 and 137 | 32 px | 32 px |
 | Tokyo Night, 490 px · slowed | 324, 392 on frames 85 and 87 | 32 px | 32 px |
 
+The final production release also replayed the Tokyo Night reversal. The largest between-row blank gap from the handoff through settle measured 32 px. [MP4](round-5/real/final-head-dark-reversal.mp4) · [CSV](round-5/real/final-head-dark-reversal.csv)
+
 At the bottom reversal, the deterministic test samples every millisecond through the 160 ms curve. It checks the first frame against the painted tops, then checks the distance between consecutive painted rows against the 68 px row height. The returning tail starts at 40% opacity and fades in over 120 ms. The [Round 4 reversal clips](#round-4) preserve the preceding implementation for comparison.
 
 The [unsafe-order trace](round-5/unsafe-order.csv) lists pairs from the instrumented slowed release build. A hidden arrival appears before an opaque slider in the new order while the slider's text covers its slot. The deterministic test isolates the same case at indices 0 and 1 and checks that the slider keeps its painted position, the arrival stays hidden during overlap, and competing ghost ink is cleared.
