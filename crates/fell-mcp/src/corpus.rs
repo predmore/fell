@@ -378,6 +378,9 @@ fn agent_draft_from_hostile_mail_marks_new_recipients() {
 
     // Then adds one more Bcc by editing the draft's own header block.
     let draft = tool_json(&call(&mut session, "get_draft", json!({ "draft_id": id })));
+    let original = hub.with_session(&id, |draft| draft.snapshot()).unwrap();
+    assert!(original.agent_authored);
+    assert_eq!(original.unreviewed, 0);
     let bcc_line = draft["draft_md"]
         .as_str()
         .unwrap()
@@ -417,6 +420,8 @@ fn agent_draft_from_hostile_mail_marks_new_recipients() {
     // What the review window renders.
     let snap = hub.with_session(&id, |draft| draft.snapshot()).unwrap();
     assert_eq!(snap.send_requested_by.as_deref(), Some("agent:bot"));
+    assert_eq!(snap.unreviewed, 1);
+    assert_eq!(snap.hunks[0].kind, fell_core::compose::HunkKind::Recipients);
     let marks = |views: &[fell_core::compose::AddressView]| {
         views
             .iter()

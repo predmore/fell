@@ -1264,6 +1264,82 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_personal_reply_marks_first_time_recipients_and_reviews_agent_edits() {
+        use fell_core::compose::HunkKind;
+        use std::os::unix::fs::PermissionsExt;
+
+        let Some(root) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let settings = "email = 'reader@example.com'\nname = 'Reader'\npassword = 'test'\n";
+        let registry = fell_core::accounts::Registry::resolve().unwrap();
+        let path = registry.path("mail").unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, settings).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let account = fell_core::AccountConfig::parse(settings).unwrap().account();
+        let db = root.join("mail.db");
+        let store = fell_core::Store::open(&db).unwrap();
+        store.upsert_account(&account).unwrap();
+        let parent = parent_message(&account);
+        store.upsert_message(&parent).unwrap();
+        let start = fell_core::compose::start_reply(
+            fell_core::compose::ReplyKind::Reply,
+            &parent,
+            &account.email,
+            std::slice::from_ref(&account.email),
+            &fell_core::FolderRoles::default(),
+        );
+        let home = DraftHome::real(db.clone()).unwrap();
+        let hub = DraftHub::new();
+        let id = home.new_reply(&hub, &account.id, start.clone()).unwrap();
+        hub.with_session(&id, |session| {
+            let snap = session.snapshot();
+            assert_eq!(snap.from, "Reader <reader@example.com>");
+            assert_eq!(snap.to[0].email, "ada@x");
+            assert!(snap.to[0].fresh);
+            assert!(snap.hunks.is_empty(), "{:?}", snap.hunks);
+            assert_eq!(snap.unreviewed, 0);
+
+            session.edit(snap.revision, "ada@x", "sam@x").unwrap();
+            let edited = session.snapshot();
+            assert_eq!(edited.to[0].email, "sam@x");
+            assert_eq!(edited.unreviewed, 1);
+            assert_eq!(edited.hunks[0].kind, HunkKind::Recipients);
+            assert!(session.reject_hunk(edited.hunks[0].id));
+            assert_eq!(session.snapshot().to, snap.to);
+        })
+        .unwrap();
+
+        // An outside edit may already be on disk when Fell refreshes From.
+        let folder = DraftSession::start_reply_in(
+            &home.root,
+            "offline-reply",
+            account.id.clone(),
+            start.fields,
+            "",
+            &start.parts,
+            &db,
+        )
+        .unwrap();
+        let file = folder.join("draft.md");
+        let text = std::fs::read_to_string(&file).unwrap();
+        std::fs::write(&file, text.replace("ada@x", "sam@x")).unwrap();
+        let mut session = DraftSession::open_with_store(&folder, account.id, &store).unwrap();
+        let snap = session.snapshot();
+        assert_eq!(snap.from, "Reader <reader@example.com>");
+        assert_eq!(snap.to[0].email, "sam@x");
+        assert_eq!(snap.unreviewed, 1);
+        let [hunk] = snap.hunks.as_slice() else {
+            panic!("expected one recipient edit, got {:?}", snap.hunks);
+        };
+        assert_eq!(hunk.kind, HunkKind::Recipients);
+        assert!(session.reject_hunk(hunk.id));
+        assert_eq!(session.fields().from, "Reader <reader@example.com>");
+        assert_eq!(session.snapshot().to[0].email, "ada@x");
+    }
+
+    #[test]
     fn a_reply_started_before_verification_keeps_its_recipient_hold_after_sync() {
         let account = me();
         let home = temp_home("reply-unverified", &account);

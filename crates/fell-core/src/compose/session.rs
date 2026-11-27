@@ -523,11 +523,18 @@ impl DraftSession {
             crate::account_config::configured_sender(&session.account_id, &session.fields.from);
         session.managed_signature = stored.managed_signature;
         session.check_signature();
+        let mut refreshed_from = None;
         if let Ok(identity) = verified {
-            if email_of(&previous_from) != email_of(&session.fields.from) {
-                session.swap_signature(signature_block(&identity));
+            if session.fields.from == previous_from {
+                // Refresh the configured header after comparing the file to the
+                // mailbox. A display name from settings is Fell's own change.
+                refreshed_from = Some(identity.from_header());
+            } else {
+                if email_of(&previous_from) != email_of(&session.fields.from) {
+                    session.swap_signature(signature_block(&identity));
+                }
+                session.fields.from = identity.from_header();
             }
-            session.fields.from = identity.from_header();
         } else if session.fields.from != previous_from {
             session.fields.from =
                 crate::account_config::configured_sender(&session.account_id, &previous_from)
@@ -580,6 +587,12 @@ impl DraftSession {
         match review {
             Some(review) => session.resume_review(review),
             None => session.import_legacy_hunks(),
+        }
+        if let Some(from) = refreshed_from.filter(|from| from != &session.fields.from) {
+            let before = session.serialize();
+            session.fields.from = from;
+            let after = session.serialize();
+            review::carry(&mut session.hunks, &before, &after);
         }
         session.send_lock = session.load_send_lock(store);
         session.settled = session.serialize();
