@@ -56,3 +56,27 @@ Positive displacement is downward. The sampled bottom survivors kept their spaci
 In the three production mixed recordings and the slowed dark recording, the two arrivals at list y=204 and y=272 had no matched sender or subject ink in the 183 sampled slot-and-frame overlaps with a moving row. Each arrival’s two lines became visible together after clearance. The [mixed sequence](round-3/mixed-motion-review.png) shows the pre-key pose, covered arrival slots, and both reveals.
 
 [measure-round3.py](round-3/measure-round3.py) matches opaque survivor glyphs against the settled video and estimates the sender and subject ink separately for stationary rows. Each CSV starts with the video frame matching the pre-key screenshot. Subsequent rows include displacement from that pose, offset to the final slot, template match strength, and matched ink relative to the departure or arrival reference. A first paint identical to the pre-key pose can share that reference. Run the script with NumPy, FFmpeg, and FFprobe, passing the MP4, the first frame number in its CSV, and one of `bottom-4`, `bottom-10`, `mixed`, or `above`. The original pre-key PNG can be passed in place of the frame number.
+
+## Round 4
+
+Build `d11d62a2` ran the demo inbox with 24 extra fixture threads in headless Sway, on a private D-Bus with loopback-only networking. The recordings use the production motion clock, and the contact sheets use the decoded video frames at the listed timestamps.
+
+| Layout | Top ten | Mixed marks | Bottom ten | Archive and undo | Contact sheet |
+| --- | --- | --- | --- | --- | --- |
+| Tokyo Night, 1200 px | [MP4](round-4/dark-top-10.mp4) · [CSV](round-4/dark-top-10.csv) | [MP4](round-4/dark-mixed.mp4) · [CSV](round-4/dark-mixed.csv) | [MP4](round-4/dark-bottom-10.mp4) · [CSV](round-4/dark-bottom-10.csv) | [MP4](round-4/dark-interrupt.mp4) · [CSV](round-4/dark-interrupt.csv) | [PNG](round-4/dark-sequence.png) |
+| Catppuccin Latte, 1200 px | [MP4](round-4/light-top-10.mp4) · [CSV](round-4/light-top-10.csv) | [MP4](round-4/light-mixed.mp4) · [CSV](round-4/light-mixed.csv) | [MP4](round-4/light-bottom-10.mp4) · [CSV](round-4/light-bottom-10.csv) | [MP4](round-4/light-interrupt.mp4) · [CSV](round-4/light-interrupt.csv) | [PNG](round-4/light-sequence.png) |
+| Tokyo Night, 490 px | [MP4](round-4/narrow-top-10.mp4) · [CSV](round-4/narrow-top-10.csv) | [MP4](round-4/narrow-mixed.mp4) · [CSV](round-4/narrow-mixed.csv) | [MP4](round-4/narrow-bottom-10.mp4) · [CSV](round-4/narrow-bottom-10.csv) | [MP4](round-4/narrow-interrupt.mp4) · [CSV](round-4/narrow-interrupt.csv) | [PNG](round-4/narrow-sequence.png) |
+
+| Measurement | Tokyo Night | Catppuccin Latte | Tokyo Night, 490 px |
+| --- | ---: | ---: | ---: |
+| Top-ten frames with an empty line or competing lines | 0 / 20 | 0 / 17 | 0 / 10 |
+| Mixed cursor row's remaining overlap with the preceding survivor when both lines first match | 1 px | 1 px | 1 px |
+| Bottom-ten first sampled displacement of both survivors | +258 px | +210 px | +153 px |
+| Bottom-ten final displacement of both survivors | +680 px | +680 px | +680 px |
+| Furthest sampled displacement before the slide reverses after undo | +583 px | +562 px | +598 px |
+
+The top batch uses `V`, nine `j` presses, then `e`. All ten slots show only replacement text in the first changed frame at about 35–37% of settled glyph contrast. The deterministic test checks that the replacement starts at 0.4 opacity as the ghost crosses 0.5. The mixed batch marks old slots 0, 2, 4 and 6 with `x` and uses `e`. Both cursor lines show while the previous survivor still overlaps the slot's top padding.
+
+The bottom batch uses `G`, `V`, nine `k` presses, then `e`. The two measured survivors keep their 68 px separation on every matched frame, including during the undo reversal. The quadratic 160 ms curve moves the group about 134 px in a nominal 60 Hz step, compared with 176 px on the 120 ms curve. The software compositor can repeat frames or skip early poses, so the first sampled displacements and timestamps describe the video. The undo flow sends `u` during the slide.
+
+[measure-round4.py](round-4/measure-round4.py) limits measurement to the list text column. It uses the last frame before the list changes for displacement and departure references, and the settled frame for arrival references. Horizontal glyph edges avoid counting the moving selection fill as text. The top-ten count flags a line as empty if both reference strengths are below 12%, and as competing if both exceed 12%. The displacement columns are blank when the tracked glyph match falls below the confidence threshold. Regenerate a CSV using NumPy and FFmpeg, for example `python3 measure-round4.py dark-top-10.mp4 53 top-10`. Use the first frame number from the corresponding CSV.
