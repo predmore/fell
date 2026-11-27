@@ -2092,7 +2092,7 @@ impl Inbox {
                 .is_some_and(|first| !self.session.threads.iter().any(|row| row.id == first.id));
         let row_height = self.list_row_height();
         let now = self.motion.clock.now();
-        let drawn = self.drawn_rows(now);
+        let drawn = self.drawn_rows();
         let had_rows = !self.session.threads.is_empty();
         let emptied = !switched
             && self.session.list_label.is_some()
@@ -2558,7 +2558,7 @@ impl Inbox {
     /// viewport as the last frame painted them: where a list change
     /// animates them from. A key that settled a glide has already moved
     /// the offset to its target, so the painted offset is used instead.
-    fn drawn_rows(&self, now: Instant) -> Vec<Drawn> {
+    fn drawn_rows(&self) -> Vec<Drawn> {
         let Some(view) = self.list_viewport() else {
             return Vec::new();
         };
@@ -2575,7 +2575,7 @@ impl Inbox {
             .filter_map(|index| {
                 let row = &rows[index];
                 let slot = index as f32 * ROW_PX + offset;
-                let top = slot + self.motion.row_offset(&row.id, slot, now);
+                let top = slot + self.motion.row_offset(&row.id, slot, self.frame_now);
                 ((first..last).contains(&index) || (top < view && top + ROW_PX > 0.0)).then(|| {
                     Drawn {
                         index,
@@ -2630,6 +2630,14 @@ impl Inbox {
             return;
         }
         let ids = slots;
+        let interrupted = self
+            .motion
+            .list
+            .as_ref()
+            .filter(|s| !replace && s.running(now));
+        let hidden_departure = |id: &str| {
+            !ids.contains_key(id) && interrupted.is_some_and(|shift| shift.hidden_arrival(id))
+        };
         let stable = self.regroup_selection.as_ref().and_then(|selection| {
             let index = ids.get(selection.selected.as_str())?;
             Some((selection.selected.as_str(), *index as f32 * ROW_PX + offset))
@@ -2637,12 +2645,13 @@ impl Inbox {
         let mut before: Vec<_> = drawn
             .iter()
             .filter(|old| !stable.is_some_and(|(id, _)| old.row.id == id))
+            .filter(|old| !hidden_departure(&old.row.id))
             .map(|old| (old.row.id.clone(), old.top))
             .chain(stable.map(|(id, top)| (id.to_owned(), top)))
             .collect();
         let left: Vec<_> = drawn
             .iter()
-            .filter(|old| !ids.contains_key(old.row.id.as_str()))
+            .filter(|old| !ids.contains_key(old.row.id.as_str()) && !hidden_departure(&old.row.id))
             .map(|old| {
                 let ghost = ThreadGhost {
                     row: old.row.clone(),
@@ -2662,61 +2671,75 @@ impl Inbox {
         };
         let batch_leave = matches!(change, ListChange::BatchLeave { .. });
         let batch = batch_leave
-            || self
-                .motion
-                .list
-                .as_ref()
-                .is_some_and(ListShift::has_batch_ghosts);
+            || interrupted.is_some_and(|shift| shift.batch_arrivals() || shift.has_batch_ghosts());
         let viewport_scrolled = batch_leave
             && drawn.first().is_some_and(|first| {
                 let previous_offset = first.slot - first.index as f32 * ROW_PX;
                 (previous_offset - offset).abs() >= 0.5
             });
+        let waiting = interrupted.map_or_else(HashSet::new, |shift| {
+            keep_ordered_starts(&mut before, &ids, |id| {
+                !stable.is_some_and(|(selected, _)| selected == id) && shift.in_place_arrival(id)
+            })
+        });
+        let mut sliding_arrivals = HashSet::new();
         if !replace && batch {
             let threads = &self.session.threads;
             let visible_start = (-offset / ROW_PX).floor() as usize;
             let visible_end = (((viewport - offset) / ROW_PX).ceil() as usize).min(threads.len());
             let slot = |index: usize| index as f32 * ROW_PX + offset;
-            let tracked = |old: &Drawn| ids.get(old.row.id.as_str()).map(|&index| (index, old.top));
-            let arrivals = |slots: std::ops::Range<usize>, dy| {
-                slots.map(move |index| (threads[index].id.clone(), slot(index) + dy))
-            };
-            if let Some((index, top)) = drawn
+            let tracked =
+                |(id, top): &(String, f32)| ids.get(id.as_str()).map(|&index| (index, *top));
+            let first_tracked = before
                 .iter()
                 .filter_map(tracked)
-                .min_by_key(|&(index, _)| index)
-            {
+                .min_by_key(|&(index, _)| index);
+            let last_tracked = before
+                .iter()
+                .filter_map(tracked)
+                .max_by_key(|&(index, _)| index);
+            let waiting = &waiting;
+            let arrivals = |range: std::ops::Range<usize>, dy| {
+                range.filter_map(move |index| {
+                    let id = &threads[index].id;
+                    (!waiting.contains(id)).then(|| (id.clone(), slot(index) + dy))
+                })
+            };
+            if let Some((index, top)) = first_tracked {
                 let dy = InboxMotion::batch_top_arrival_offset(top, slot(index));
                 before.extend(arrivals(visible_start..index.min(visible_end), dy));
                 reach = reach.max(-dy);
             }
-            if let Some((index, top)) = drawn
-                .iter()
-                .filter_map(tracked)
-                .max_by_key(|&(index, _)| index)
-            {
+            if let Some((index, top)) = last_tracked {
                 let first = (index + 1).max(visible_start);
-                let dy =
-                    InboxMotion::batch_bottom_arrival_offset(viewport, top + ROW_PX, slot(first));
-                before.extend(arrivals(first..visible_end, dy));
+                let start_slot = if interrupted.is_some() {
+                    index + 1
+                } else {
+                    first
+                };
+                let dy = InboxMotion::batch_bottom_arrival_offset(
+                    interrupted.is_none().then_some(viewport),
+                    top + ROW_PX,
+                    slot(start_slot),
+                );
+                let tail = arrivals(first..visible_end, dy);
+                if interrupted.is_some() {
+                    sliding_arrivals.extend(tail.clone().map(|(id, _)| id));
+                }
+                before.extend(tail);
                 // The last tracked row can itself start past the viewport.
-                reach = reach.max(dy);
+                reach = reach.max(dy.abs());
             }
         }
-        let waiting = if !replace && self.motion.list.as_ref().is_some_and(|s| s.running(now)) {
-            keep_ordered_starts(&mut before, &ids)
-        } else {
-            HashSet::new()
-        };
-        let batch_offsets = viewport_scrolled.then(|| {
-            before
-                .iter()
-                .filter_map(|(id, top)| {
-                    let slot = *ids.get(id.as_str())? as f32 * ROW_PX + offset;
-                    Some(top - slot)
-                })
-                .collect::<Vec<_>>()
-        });
+        let batch_viewport =
+            (batch_leave && (viewport_scrolled || interrupted.is_some())).then_some(viewport);
+        let slide_offsets: Vec<_> = before
+            .iter()
+            .filter_map(|(id, top)| {
+                let slot = *ids.get(id.as_str())? as f32 * ROW_PX + offset;
+                Some(top - slot)
+            })
+            .collect();
         // A row that is back (a quick undo) stops fading where it was.
         let mut carried = self.motion.carried_ghosts();
         carried.retain(|ghost| !ids.contains_key(ghost.row.row.id.as_str()));
@@ -2744,13 +2767,11 @@ impl Inbox {
             now,
         )
         .map(|shift| {
-            let shift = if let Some(offsets) = batch_offsets {
-                shift.with_batch_scroll(viewport, offsets.into_iter())
-            } else {
-                shift
-            }
-            .fading_below(below)
-            .with_waiting_arrivals(waiting);
+            let shift = shift
+                .fading_below(below)
+                .with_waiting_arrivals(waiting)
+                .with_sliding_arrivals(sliding_arrivals)
+                .with_slide_offsets(ROW_PX, batch_viewport, slide_offsets.into_iter());
             if top_arrival && !batch_leave {
                 shift.top_arrival()
             } else if reveal_selection && !replace && !batch_leave {
@@ -3797,8 +3818,7 @@ impl Inbox {
 
     /// Slide departed rows away and open the next conversation.
     fn remove_list_rows(&mut self, ids: &[String], cx: &mut Context<Self>) {
-        let now = self.motion.clock.now();
-        let mut drawn = self.drawn_rows(now);
+        let mut drawn = self.drawn_rows();
         // The action may have cleared visual mode or the marks already.
         for row in &mut drawn {
             row.selected |= ids.contains(&row.row.id);
@@ -6550,6 +6570,7 @@ struct Drawn {
 fn keep_ordered_starts(
     before: &mut Vec<(String, f32)>,
     indices: &HashMap<&str, usize>,
+    in_place_arrival: impl Fn(&str) -> bool,
 ) -> HashSet<String> {
     before.sort_by_key(|(id, _)| indices.get(id.as_str()).copied().unwrap_or(usize::MAX));
     let mut bottom = f32::NEG_INFINITY;
@@ -6559,7 +6580,7 @@ fn keep_ordered_starts(
             // ListShift still counts departures when detecting replacement.
             return true;
         }
-        if *top + 0.001 < bottom {
+        if in_place_arrival(id) || *top + 0.001 < bottom {
             waiting.insert(id.clone());
             return false;
         }
@@ -7718,13 +7739,15 @@ fn thread_list(
                 let scale = window.scale_factor();
                 let slot_top = |index: usize| index as f32 * ROW_PX;
                 let anchor = slot_top(last_visible);
+                if let Some(shift) = inbox.motion.list.as_mut() {
+                    shift.begin_frame(now);
+                }
                 let mut batch_layers = inbox
                     .motion
                     .list
                     .as_mut()
                     .filter(|shift| shift.batch_arrivals())
                     .map(|shift| {
-                        shift.begin_batch_frame(now);
                         let extra = shift.overscan(ROW_PX);
                         let slides: Vec<_> = (visible.start.saturating_sub(extra)
                             ..(visible.end + extra).min(last + 1))
@@ -7873,6 +7896,7 @@ fn thread_list(
                                     };
                                     Some(overflow_row_layer(
                                         dy,
+                                        shift.slid_in_opacity(&row.id, now),
                                         thread_row(
                                             &theme_for_rows,
                                             row,
@@ -7889,7 +7913,13 @@ fn thread_list(
                         } else {
                             (RowMotion::STILL, Vec::new(), Vec::new(), false)
                         };
-                        let batch_arrival = waits && moving.opacity < 1.0;
+                        let batch_arrival = waits
+                            && moving.opacity < 1.0
+                            && inbox
+                                .motion
+                                .list
+                                .as_ref()
+                                .is_some_and(|shift| shift.in_place_arrival(&row.id));
                         let bands = batch_layers
                             .as_ref()
                             .map_or(&[][..], |layers| layers.bands.as_slice());
@@ -8076,7 +8106,10 @@ impl BatchSlider {
     /// in between two sliders and then lose its ink when the next comes.
     fn crosses(&self, top: f32) -> bool {
         let painted = self.slot + self.dy;
-        overlaps_row_text(painted.min(self.slot), painted.max(self.slot), top)
+        let arrival_top = top + ROW_INK_INSET;
+        let arrival_bottom = top + ROW_PX - ROW_INK_INSET;
+        painted.min(self.slot) + ROW_INK_INSET < arrival_bottom
+            && painted.max(self.slot) + ROW_PX - ROW_INK_INSET > arrival_top
     }
 }
 
@@ -8105,10 +8138,11 @@ impl<R: Clone> BatchLayers<R> {
                 .iter()
                 .any(|&(_, top, alpha)| alpha > 0.5 && overlaps_row_text(top, top, slot));
         let row = shift.batch_row(id, top, covered, now);
-        if 0.0 < row.opacity && row.opacity < 1.0 {
-            // The incoming text takes over from the faint departure in this frame.
+        if row.opacity > 0.0 {
+            // Live ink takes over from departures at its painted position.
+            let painted = slot + row.dy;
             self.ink
-                .retain(|&(_, top, _)| !overlaps_row_text(top, top, slot));
+                .retain(|&(_, top, _)| !overlaps_row_text(painted, painted, top));
         }
         row
     }
@@ -8235,8 +8269,10 @@ fn slot_layer(dy: f32, opacity: f32) -> gpui::Div {
         .opacity(opacity)
 }
 
-fn overflow_row_layer(dy: f32, row: gpui::AnyElement) -> gpui::Div {
-    slot_layer(dy, 1.0).block_mouse_except_scroll().child(row)
+fn overflow_row_layer(dy: f32, opacity: f32, row: gpui::AnyElement) -> gpui::Div {
+    slot_layer(dy, opacity)
+        .block_mouse_except_scroll()
+        .child(row)
 }
 
 fn moving_row_layer(
@@ -14220,6 +14256,7 @@ mod tests {
             start,
         )
         .unwrap();
+        shift.begin_frame(start);
         let last_visible = rows.len() - 1;
         let mut crossed_later_arrival = false;
         for ms in 0..=120 {
@@ -14263,6 +14300,7 @@ mod tests {
             start,
         )
         .unwrap();
+        shift.begin_frame(start);
         let slot = 2.0 * ROW_PX;
         let mut draw = |time, slides: &[BatchSlider]| {
             let covered = slides.iter().any(|slide| slide.crosses(slot));
@@ -14285,20 +14323,21 @@ mod tests {
         assert_eq!(draw(16, &[approaching]), 0.0, "a second slider will cross");
         let last = BatchSlider {
             slot: 3.0 * ROW_PX,
-            dy: -13.0,
+            dy: -25.0,
         };
         assert!(last.covers(slot));
         assert_eq!(draw(83, std::slice::from_ref(&last)), 0.0);
-        let padding = BatchSlider { dy: -12.0, ..last };
-        assert!(!padding.covers(slot));
+        let padding = BatchSlider { dy: -24.0, ..last };
+        assert!(padding.covers(slot));
+        assert!(!padding.crosses(slot));
         assert_eq!(draw(84, &[padding]), motion::ARRIVE_FROM);
-        assert!(shift.running(at(203)));
-        assert!(shift.batch_row("arrival", slot, false, at(144)).opacity > motion::ARRIVE_FROM);
+        assert!(shift.running(at(163)));
+        assert!(shift.batch_row("arrival", slot, false, at(124)).opacity > motion::ARRIVE_FROM);
         assert_eq!(
-            shift.batch_row("arrival", slot, false, at(204)).opacity,
+            shift.batch_row("arrival", slot, false, at(164)).opacity,
             1.0
         );
-        assert!(!shift.running(at(204)));
+        assert!(!shift.running(at(164)));
     }
 
     #[test]
@@ -14318,7 +14357,7 @@ mod tests {
             start,
         )
         .unwrap();
-        shift.begin_batch_frame(start);
+        shift.begin_frame(start);
         for ms in 0..=40 {
             let now = start + Duration::from_millis(ms);
             let mut layers = BatchLayers {
@@ -14360,7 +14399,7 @@ mod tests {
         let batch = ListChange::BatchLeave { row_height: ROW_PX };
         let mut first = ListShift::<()>::start(
             &motion,
-            vec![("slider".into(), 2.0 * ROW_PX)],
+            vec![("slider".into(), 0.0)],
             vec![],
             vec![],
             800.0,
@@ -14368,15 +14407,17 @@ mod tests {
             start,
         )
         .unwrap();
-        let interrupt = start + Duration::from_millis(40);
-        let slider_top = first.batch_row("slider", 0.0, false, interrupt).dy;
-        let hidden = first.batch_row("arrival", ROW_PX, true, interrupt);
+        first.begin_frame(start);
+        let interrupt = start + Duration::from_millis(12);
+        let slider_top = ROW_PX + first.batch_row("slider", ROW_PX, false, interrupt).dy;
+        let hidden = first.batch_row("arrival", 0.0, true, interrupt);
         assert_eq!(hidden.opacity, 0.0);
-        let mut before = vec![
-            ("arrival".into(), ROW_PX + hidden.dy),
-            ("slider".into(), slider_top),
-        ];
-        let waiting = keep_ordered_starts(&mut before, &[("slider", 0), ("arrival", 1)].into());
+        assert!(slider_top < ROW_PX - 2.0 * super::ROW_INK_INSET);
+        let mut before = vec![("arrival".into(), hidden.dy), ("slider".into(), slider_top)];
+        let waiting =
+            keep_ordered_starts(&mut before, &[("arrival", 0), ("slider", 1)].into(), |id| {
+                first.in_place_arrival(id)
+            });
         assert_eq!(before, [("slider".into(), slider_top)]);
         for change in [ListChange::Shift, batch] {
             let mut second = ListShift::<()>::start(
@@ -14390,26 +14431,107 @@ mod tests {
             )
             .unwrap()
             .with_waiting_arrivals(waiting.clone());
+            second.begin_frame(interrupt);
             assert!(second.batch_arrivals() && second.waits_for_slot("arrival"));
             let mut saw_arrival = false;
             for ms in 0..=120 {
                 let now = interrupt + Duration::from_millis(ms);
                 let slider = BatchSlider {
-                    slot: 0.0,
-                    dy: second.offset_of("slider", 0.0, now),
+                    slot: ROW_PX,
+                    dy: second.offset_of("slider", ROW_PX, now),
                 };
-                let overlaps = slider.covers(ROW_PX);
+                let overlaps = slider.crosses(0.0);
                 let mut layers = BatchLayers {
                     slides: vec![slider],
                     bands: vec![],
-                    ink: vec![],
+                    ink: if ms == 0 {
+                        vec![((), slider_top, 0.25)]
+                    } else {
+                        vec![]
+                    },
                 };
-                let arrival = layers.row(&mut second, "arrival", (ROW_PX, ROW_PX), now);
+                let arrival = layers.row(&mut second, "arrival", (0.0, 0.0), now);
+                let slider = layers.row(&mut second, "slider", (ROW_PX, ROW_PX), now);
+                assert_eq!(slider.opacity, 1.0);
+                assert!(layers.ink.is_empty());
+                if ms == 0 {
+                    assert!((ROW_PX + slider.dy - slider_top).abs() < 0.001);
+                }
                 assert_eq!(arrival.dy, 0.0);
                 assert_eq!(arrival.opacity == 0.0, overlaps);
                 saw_arrival |= arrival.opacity >= motion::ARRIVE_FROM;
             }
             assert!(saw_arrival);
+        }
+    }
+
+    #[test]
+    fn interrupted_bottom_reversal_starts_from_the_painted_rows_with_no_gap() {
+        use super::{InboxMotion, ListChange, ListShift, ROW_PX};
+
+        let start = Instant::now();
+        let motion = motion::Motion::new(true);
+        let h = ROW_PX;
+        let viewport = 10.0 * h;
+        let mut outgoing = ListShift::<()>::start(
+            &motion,
+            vec![("first".into(), 0.0), ("last".into(), h)],
+            vec![],
+            vec![],
+            viewport,
+            ListChange::BatchLeave { row_height: h },
+            start,
+        )
+        .unwrap()
+        .with_slide_offsets(h, Some(viewport), [-6.0 * h].into_iter());
+        outgoing.begin_frame(start);
+        let painted = start + Duration::from_millis(64);
+        let top = |id, slot| slot + outgoing.offset_of(id, slot, painted);
+        let first_top = top("first", 6.0 * h);
+        let last_top = top("last", 7.0 * h);
+        let tail_dy = InboxMotion::batch_bottom_arrival_offset(None, last_top + h, 2.0 * h);
+        assert!(first_top > 3.0 * h);
+        let rows = [
+            ("first", 0.0, first_top),
+            ("last", h, last_top),
+            ("tail", 2.0 * h, 2.0 * h + tail_dy),
+            ("end", 3.0 * h, 3.0 * h + tail_dy),
+        ];
+        let interrupt = painted + Duration::from_millis(10);
+        let mut reversal = ListShift::<()>::start(
+            &motion,
+            rows.map(|(id, _, top)| (id.into(), top)).to_vec(),
+            vec![],
+            vec![],
+            viewport,
+            ListChange::Shift,
+            interrupt,
+        )
+        .unwrap()
+        .with_sliding_arrivals(["tail".into(), "end".into()].into())
+        .with_slide_offsets(h, None, rows.map(|(_, slot, top)| top - slot).into_iter())
+        .show_restored_selection();
+        let first_frame = interrupt + motion::MAX_STEP;
+        reversal.begin_frame(first_frame);
+        for ms in 0..=160 {
+            let now = first_frame + Duration::from_millis(ms);
+            let mut previous = None;
+            for (index, (id, slot, top)) in rows.into_iter().enumerate() {
+                let row = reversal.row(id, slot, h, None, now);
+                let expected = (top - slot) * (1.0 - motion::ease_out_quad(ms as f32 / 160.0));
+                assert!((row.dy - expected).abs() < 0.001, "{id} at {ms} ms");
+                let painted_top = slot + row.dy;
+                if let Some(previous) = previous {
+                    assert!(painted_top - previous <= h + 0.001);
+                }
+                previous = Some(painted_top);
+                assert!(row.opacity >= motion::ARRIVE_FROM);
+                if index >= 2 && ms == 0 {
+                    assert_eq!(row.opacity, motion::ARRIVE_FROM);
+                } else if index < 2 || ms >= 120 {
+                    assert_eq!(row.opacity, 1.0);
+                }
+            }
         }
     }
 
@@ -14443,6 +14565,7 @@ mod tests {
                     ))
                     .child(super::overflow_row_layer(
                         8.0,
+                        1.0,
                         div()
                             .size_full()
                             .on_mouse_down(MouseButton::Left, move |_, _, _| {

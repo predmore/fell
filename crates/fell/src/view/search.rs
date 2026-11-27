@@ -860,10 +860,7 @@ impl Inbox {
                 .as_ref()
                 .and(self.session.cursor_thread())
                 .cloned();
-            let drawn = regroup_previous.as_ref().map(|_| {
-                let now = self.motion.clock.now();
-                self.drawn_rows(now)
-            });
+            let drawn = regroup_previous.as_ref().map(|_| self.drawn_rows());
             let offset = self.list_offset();
             if self.session.apply_search_reply(generation, &mut reply) {
                 if !self.session.search_results_current() {
