@@ -1759,14 +1759,18 @@ mod tests {
     }
 
     fn snapshot() -> Snapshot {
+        snapshot_with_size(1, 1)
+    }
+
+    fn snapshot_with_size(width: u32, height: u32) -> Snapshot {
         Snapshot {
             image: Arc::new(gpui::RenderImage::new(smallvec::smallvec![
-                image::Frame::new(image::RgbaImage::new(1, 1),)
+                image::Frame::new(image::RgbaImage::new(width, height))
             ])),
-            width: 1.,
-            height: 1.,
+            width: width as f32,
+            height: height as f32,
             clipped: false,
-            document_height: 1.,
+            document_height: height as f32,
             last_row_color: Some(0),
             links: Arc::default(),
             fallback_links: Arc::default(),
@@ -1776,6 +1780,8 @@ mod tests {
     #[test]
     fn toggling_to_a_taller_web_view_keeps_the_selected_header_in_place() {
         let (mut app, window) = super::super::tests::pending_inbox();
+        // GPUI draws notified test windows synchronously. Keep the executor
+        // parked so the inbox's startup reply cannot replace the fixture.
         window
             .update(&mut app, |inbox, window, cx| {
                 split_view(inbox);
@@ -1792,12 +1798,11 @@ mod tests {
                 cx.notify();
             })
             .unwrap();
-        app.run_until_parked();
         let geometry = |inbox: &Inbox| {
             let card = inbox.conv_scroll.bounds_for_item(1).unwrap();
             (card.top() + inbox.conv_scroll.offset().y, card.size.height)
         };
-        let (original_y, original_height) = window
+        let (original_y, original_height, snapshot_id) = window
             .update(&mut app, |inbox, _, _| {
                 let (y, height) = geometry(inbox);
                 assert!(y > inbox.conv_scroll.bounds().top());
@@ -1810,37 +1815,43 @@ mod tests {
                 let Rich::Html(body) = &message.rich else {
                     panic!("HTML fixture");
                 };
-                let width = inbox.painted_reader.unwrap().columns.header.width.round();
+                let width = inbox
+                    .painted_reader
+                    .unwrap()
+                    .columns
+                    .header
+                    .width
+                    .round()
+                    .clamp(1., 1600.) as i32;
                 let key = inbox
                     .web_mail
-                    .key(message, body, &inbox.theme, width as i32, false);
+                    .key(message, body, &inbox.theme, width, false);
+                let picture =
+                    snapshot_with_size(width as u32, f32::from(height).ceil() as u32 + 160);
+                let snapshot_id = picture.image.id;
                 inbox.web_mail.cache.push_back(Cached {
                     key,
-                    picture: Some(Snapshot {
-                        width,
-                        height: f32::from(height) + 160.,
-                        ..snapshot()
-                    }),
+                    picture: Some(picture),
                     too_wide: false,
                     image_failure: None,
                 });
-                (y, height)
+                (y, height, snapshot_id)
             })
             .unwrap();
         app.dispatch_keystroke(window.into(), gpui::Keystroke::parse("w").unwrap());
-        app.run_until_parked();
         for elapsed in [RENDERER_CHANGE / 2, RENDERER_CHANGE] {
             window
                 .update(&mut app, |inbox, _, cx| {
                     let now = inbox.motion.clock.now();
                     let shown = inbox.web_mail.shown.get_mut("newer").unwrap();
-                    assert!(matches!(shown.body, Body::Web(_)));
+                    assert!(
+                        matches!(&shown.body, Body::Web(picture) if picture.image.id == snapshot_id)
+                    );
                     shown.renderer_painted = None;
                     shown.fade = Some(Transition::new(now - elapsed, RENDERER_CHANGE));
                     cx.notify();
                 })
                 .unwrap();
-            app.run_until_parked();
             window
                 .update(&mut app, |inbox, _, _| {
                     let (y, height) = geometry(inbox);
