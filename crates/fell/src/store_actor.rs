@@ -167,6 +167,18 @@ impl StoreClient {
         send(&self.background, job, None)
     }
 
+    /// Large body reads can queue while the file-backed lane opens.
+    pub fn call_body_read<R: Send + 'static>(
+        &self,
+        job: impl FnOnce(&Store) -> R + Send + 'static,
+    ) -> oneshot::Receiver<R> {
+        if self.file_backed.load(Ordering::Acquire) {
+            self.call_maintenance(job)
+        } else {
+            self.call(job)
+        }
+    }
+
     #[cfg(test)]
     fn has_background_lane(&self) -> bool {
         self.background_ready.load(Ordering::Acquire)

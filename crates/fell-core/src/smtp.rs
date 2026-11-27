@@ -713,6 +713,7 @@ Bcc: this is body text\r\n"
                 security: crate::imap::ImapSecurity::Plain,
                 accept_invalid_certs: true,
                 folder_overrides: Vec::new(),
+                trust_verified_sender_header: false,
             },
             smtp: SmtpConfig {
                 host: "127.0.0.1".into(),

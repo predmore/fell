@@ -135,6 +135,21 @@ fn fixture_messages(account: &Account) -> Vec<Message> {
     let stamp = now();
     let rows = [
         DraftMail {
+            id: "pier-lanterns@fell.test",
+            name: "Mira",
+            email: "mira@harbor.test",
+            subject: "Re: Pier lanterns",
+            body: "Thursday works for me.\n\nI’ll bring the lanterns.\n\nMeet you by the pier.\n\n-- \nMira\nHarbor volunteer\nPier crew\n\nOn Monday, Jo <jo@harbor.test> wrote:\n> Could you bring the lanterns on Thursday? Here’s the pier plan.",
+            ago: 8 * 60,
+            unread: true,
+            folders: &["INBOX"],
+            labels: &[],
+            reply_to: None,
+            proton: None,
+            starred: false,
+            attachment: false,
+        },
+        DraftMail {
             id: "cabin-1@fell.test",
             name: "Tessa",
             email: "tessa@harbor.test",
@@ -960,10 +975,17 @@ fn parts(row: &DraftMail) -> MessageParts {
                 })
                 .map(|(name, value)| (name.to_string(), value.to_string()))
                 .collect(),
+            trusted_sender_delivery: false,
             mime_parts: Vec::new(),
         };
     }
     let (html, bulk): (Option<&str>, &[(&str, &str)]) = match row.id {
+        "pier-lanterns@fell.test" => (
+            Some(include_str!(
+                "../../fell-render/fixtures/web-gmail-reply.html"
+            )),
+            &[],
+        ),
         "cabin-2@fell.test" => (Some(CABIN_REPLY_HTML), &[]),
         "dispatch-42@fell.test" => (
             Some(DISPATCH_HTML),
@@ -988,6 +1010,7 @@ fn parts(row: &DraftMail) -> MessageParts {
             .iter()
             .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
             .collect(),
+        trusted_sender_delivery: false,
         mime_parts: attachment_parts(row),
     }
 }

@@ -2897,6 +2897,10 @@ impl Session {
                     | Action::SaveAllAttachments
                     | Action::RetryAttachment
                     | Action::ToggleQuotes
+                    | Action::ToggleWebView
+                    | Action::AllowMessageImages
+                    | Action::AllowSenderImages
+                    | Action::BlockSenderImages
                     | Action::Reply
                     | Action::ReplyAll
                     | Action::Forward
@@ -3326,6 +3330,12 @@ impl Session {
                 } else if self.pane == Pane::Conversation {
                     self.pane = self.reading_return_pane;
                 }
+            }
+            Action::ToggleWebView
+            | Action::AllowMessageImages
+            | Action::AllowSenderImages
+            | Action::BlockSenderImages => {
+                self.count.clear();
             }
             Action::ToggleQuotes => {
                 self.count.clear();
@@ -5183,7 +5193,7 @@ mod tests {
         assert!(!session.threads[1].starred);
         // Both are in the palette with their keys.
         let palette = session.palette();
-        for (label, key) in [("Mark unread or read", "U"), ("Star or unstar", "s")] {
+        for (label, key) in [("Mark unread or read", "⇧U"), ("Star or unstar", "s")] {
             let item = palette.iter().find(|item| item.label == label).unwrap();
             assert_eq!(item.binding, key);
         }

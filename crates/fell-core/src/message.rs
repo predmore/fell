@@ -102,6 +102,8 @@ pub enum BodyState {
     TooLarge,
 }
 
+pub(crate) const VERIFIED_SENDER_HEADER: &str = "X-Fell-Verified-Sender";
+
 /// What a received message shows in the conversation view: its HTML and
 /// plain-text parts, decoded and otherwise as sent, plus the few headers the
 /// renderer uses to spot bulk mail. HTML is untrusted and is sanitized when
@@ -116,6 +118,9 @@ pub struct MessageParts {
     /// Bulk-mail signals (`List-Unsubscribe`, `Precedence`, ESP markers) as
     /// `(name, value)`, unfolded, in header order.
     pub bulk_headers: Vec<(String, String)>,
+    /// A trusted receiving gateway supplied this source, so the absence of
+    /// its sender attestation is authoritative. Never set on a store read.
+    pub trusted_sender_delivery: bool,
     /// Every MIME part that is not body text, in document order: files,
     /// images the HTML shows by `cid:`, and signatures. Metadata only; the
     /// bytes stay on the server until [`crate::parts::fetch_part`] asks.

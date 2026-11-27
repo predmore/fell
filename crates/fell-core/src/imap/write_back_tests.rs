@@ -302,6 +302,7 @@ fn config(port: u16) -> ImapConfig {
         security: ImapSecurity::Plain,
         accept_invalid_certs: false,
         folder_overrides: Vec::new(),
+        trust_verified_sender_header: false,
     }
 }
 

@@ -134,8 +134,6 @@ pub(super) fn link_controls(
     focus.handles.resize_with(mail.links.len(), || None);
     let mut fragments: Vec<Vec<Bounds<Pixels>>> =
         (0..mail.links.len()).map(|_| Vec::new()).collect();
-    let mask = window.content_mask().bounds;
-    let clip = mask.intersect(&bounds);
     mail.for_visible_line(bounds, window, None, |line, shaped, origin, _| {
         let layout = &shaped.unwrapped_layout;
         let glyphs = layout.runs.iter().flat_map(|run| &run.glyphs);
@@ -189,29 +187,13 @@ pub(super) fn link_controls(
 
     let mut controls = LinkControls::default();
     for (index, (link, rects)) in mail.links.iter().zip(fragments).enumerate() {
-        let slot = &mut focus.handles[index];
-        if slot
-            .as_ref()
-            .is_some_and(|state| state.target != link.target)
-        {
-            *slot = None;
-        }
-        let state = slot.get_or_insert_with(|| {
-            let label = mail.text[link.range.clone()].trim();
-            let handle = cx.focus_handle().tab_stop(true);
-            let place = Rc::new(Placement {
-                line: Cell::default(),
-                visible: Cell::default(),
-                target: link.target.clone(),
-                preview: link_preview(label, &link.target),
-            });
-            reader_links::register(window, cx, &handle, &place);
-            LinkState {
-                target: link.target.clone(),
-                handle,
-                place,
-            }
-        });
+        let state = link_state(
+            &mut focus.handles[index],
+            &link.target,
+            mail.text[link.range.clone()].trim(),
+            window,
+            cx,
+        );
         let first_line = mail
             .wrapped
             .borrow()
@@ -222,71 +204,18 @@ pub(super) fn link_controls(
             .place
             .line
             .set((top.into(), (top + mail.line_height).into()));
-        let visible = |rect: &Bounds<Pixels>| !rect.intersect(&clip).is_empty();
-        state.place.visible.set(rects.iter().any(visible));
-        let handle = &state.handle;
-        let focused = handle.is_focused(window);
-        if focused {
+        if state.handle.is_focused(window) {
             controls.focused = Some(link.range.clone());
         }
-        let target = link.target.clone();
-        let mut control = div()
-            .relative()
-            .size_0()
-            .id(ElementId::named_usize("mail-link", index))
-            .track_focus(handle)
-            .on_key_down(move |event, window, cx| {
-                if event.is_held || event.keystroke.modifiers != gpui::Modifiers::default() {
-                    return;
-                }
-                match event.keystroke.key.as_str() {
-                    "enter" | "return" | "o" => open(target.clone(), window, cx),
-                    "y" => {
-                        cx.write_to_clipboard(ClipboardItem::new_string(target.to_string()));
-                        reader_links::notice(window, cx, "Copied link", false);
-                    }
-                    _ => return,
-                }
-                cx.stop_propagation();
-            })
-            .children(
-                rects
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, rect)| visible(rect))
-                    .map(|(at, rect)| {
-                        let target = link.target.clone();
-                        let handle = handle.clone();
-                        let hover = handle.clone();
-                        div()
-                            .absolute()
-                            .left(rect.left() - bounds.left())
-                            .top(rect.top() - bounds.top())
-                            .w(rect.size.width)
-                            .h(rect.size.height)
-                            .id(ElementId::named_usize("link-fragment", at))
-                            .cursor(CursorStyle::PointingHand)
-                            .when(focused, |hit| {
-                                hit.child(fragment_outline(
-                                    &rects,
-                                    at,
-                                    mask.left()..mask.right(),
-                                    paint(mail.palette.accent),
-                                ))
-                            })
-                            .on_hover(move |hovered, window, cx| {
-                                reader_links::hover(window, cx, &hover, *hovered)
-                            })
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .on_click(move |_, window, cx| {
-                                reader_links::clicked(window, cx);
-                                window.focus(&handle);
-                                open(target.clone(), window, cx);
-                                cx.stop_propagation();
-                            })
-                    }),
-            )
-            .into_any_element();
+        let scope = mail.id.as_ref().expect("interactive mail text has an ID");
+        let mut control = positioned_link(
+            (scope, index),
+            state,
+            &rects,
+            bounds,
+            mail.palette.accent,
+            window,
+        );
         control.layout_as_root(
             size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
             window,
@@ -296,6 +225,229 @@ pub(super) fn link_controls(
         controls.elements.push(control);
     }
     controls
+}
+
+fn link_state<'a>(
+    slot: &'a mut Option<LinkState>,
+    target: &Arc<str>,
+    label: &str,
+    window: &Window,
+    cx: &mut App,
+) -> &'a LinkState {
+    if slot.as_ref().is_some_and(|state| &state.target != target) {
+        *slot = None;
+    }
+    slot.get_or_insert_with(|| {
+        let handle = cx.focus_handle().tab_stop(true);
+        let place = Rc::new(Placement {
+            line: Cell::default(),
+            visible: Cell::default(),
+            target: target.clone(),
+            preview: link_preview(label, target),
+        });
+        reader_links::register(window, cx, &handle, &place);
+        LinkState {
+            target: target.clone(),
+            handle,
+            place,
+        }
+    })
+}
+
+fn positioned_link(
+    (scope, index): (&ElementId, usize),
+    state: &LinkState,
+    rects: &[Bounds<Pixels>],
+    bounds: Bounds<Pixels>,
+    accent: u32,
+    window: &Window,
+) -> AnyElement {
+    let mask = window.content_mask().bounds;
+    let clip = mask.intersect(&bounds);
+    let visible = |rect: &Bounds<Pixels>| !rect.intersect(&clip).is_empty();
+    state.place.visible.set(rects.iter().any(visible));
+    let handle = &state.handle;
+    let focused = handle.is_focused(window);
+    let target = state.target.clone();
+    let id = ElementId::from((scope.clone(), format!("mail-link-{index}")));
+    div()
+        .relative()
+        .size_0()
+        .id(id.clone())
+        .track_focus(handle)
+        .on_key_down(move |event, window, cx| {
+            if event.is_held || event.keystroke.modifiers != gpui::Modifiers::default() {
+                return;
+            }
+            match event.keystroke.key.as_str() {
+                "enter" | "return" | "o" => open(target.clone(), window, cx),
+                "y" => {
+                    cx.write_to_clipboard(ClipboardItem::new_string(target.to_string()));
+                    reader_links::notice(window, cx, "Copied link", false);
+                }
+                _ => return,
+            }
+            cx.stop_propagation();
+        })
+        .children(
+            rects
+                .iter()
+                .enumerate()
+                .filter(|(_, rect)| visible(rect))
+                .map(|(at, rect)| {
+                    let target = state.target.clone();
+                    let handle = handle.clone();
+                    let hover = handle.clone();
+                    div()
+                        .absolute()
+                        .left(rect.left() - bounds.left())
+                        .top(rect.top() - bounds.top())
+                        .w(rect.size.width)
+                        .h(rect.size.height)
+                        .id(ElementId::from((id.clone(), format!("link-fragment-{at}"))))
+                        .cursor(CursorStyle::PointingHand)
+                        .when(focused, |hit| {
+                            hit.child(fragment_outline(
+                                rects,
+                                at,
+                                mask.left()..mask.right(),
+                                paint(accent),
+                            ))
+                        })
+                        .on_hover(move |hovered, window, cx| {
+                            reader_links::hover(window, cx, &hover, *hovered)
+                        })
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(move |_, window, cx| {
+                            reader_links::clicked(window, cx);
+                            window.focus(&handle);
+                            open(target.clone(), window, cx);
+                            cx.stop_propagation();
+                        })
+                }),
+        )
+        .into_any_element()
+}
+
+/// Focusable links placed over the text WebKit already painted.
+pub(crate) struct SnapshotLinks {
+    pub id: ElementId,
+    pub links: Arc<[crate::render::webview::WebLink]>,
+    pub width: f32,
+    pub height: f32,
+    pub drawn_width: f32,
+    pub accent: u32,
+}
+
+impl IntoElement for SnapshotLinks {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl gpui::Element for SnapshotLinks {
+    type RequestLayoutState = ();
+    type PrepaintState = Vec<AnyElement>;
+
+    fn id(&self) -> Option<ElementId> {
+        Some(self.id.clone())
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (gpui::LayoutId, ()) {
+        let style = gpui::Style {
+            position: gpui::Position::Absolute,
+            inset: gpui::Edges::all(px(0.).into()),
+            size: size(px(self.drawn_width).into(), px(self.height).into()),
+            ..Default::default()
+        };
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        id: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Vec<AnyElement> {
+        let scale = f32::from(bounds.size.width) / self.width;
+        window.with_element_state(id.expect("snapshot links have an ID"), |state, window| {
+            let mut states: Vec<Option<LinkState>> = state.unwrap_or_default();
+            states.resize_with(self.links.len(), || None);
+            let controls = self
+                .links
+                .iter()
+                .zip(&mut states)
+                .enumerate()
+                .filter_map(|(index, (link, slot))| {
+                    let rects: Vec<_> = link
+                        .rects
+                        .iter()
+                        .map(|&[x, y, w, h]| {
+                            Bounds {
+                                origin: bounds.origin + point(px(x * scale), px(y * scale)),
+                                size: size(px(w * scale), px(h * scale)),
+                            }
+                            .intersect(&bounds)
+                        })
+                        .filter(|rect| !rect.is_empty())
+                        .collect();
+                    let first = rects.first()?;
+                    let target = checked_target(&link.href)?;
+                    let state = link_state(slot, &target, &link.label, window, cx);
+                    state
+                        .place
+                        .line
+                        .set((first.top().into(), first.bottom().into()));
+                    let mut control = positioned_link(
+                        (&self.id, index),
+                        state,
+                        &rects,
+                        bounds,
+                        self.accent,
+                        window,
+                    );
+                    control.layout_as_root(
+                        size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
+                        window,
+                        cx,
+                    );
+                    control.prepaint_at(bounds.origin, window, cx);
+                    Some(control)
+                })
+                .collect();
+            (controls, states)
+        })
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        controls: &mut Vec<AnyElement>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        for control in controls {
+            control.paint(window, cx);
+        }
+    }
 }
 
 fn fragment_outline(
@@ -370,6 +522,11 @@ fn open_command(target: &str) -> Command {
 }
 
 fn open(target: Arc<str>, window: &Window, cx: &mut App) {
+    #[cfg(test)]
+    if cx.has_global::<tests::OpenedLinks>() {
+        cx.global_mut::<tests::OpenedLinks>().0.push(target);
+        return;
+    }
     let task = cx.background_executor().spawn(async move {
         open_command(&target)
             .status()
@@ -392,6 +549,122 @@ mod tests {
     use super::*;
     use crate::text_render::PlainText;
     use fell_render::{Block, Inline, html_to_document};
+
+    #[derive(Default)]
+    pub(super) struct OpenedLinks(pub Vec<Arc<str>>);
+
+    impl gpui::Global for OpenedLinks {}
+
+    #[test]
+    fn snapshot_links_keep_their_targets_across_cards_and_over_native_links() {
+        const FIRST: &str = "https://example.test/first";
+        const SECOND: &str = "https://example.test/second";
+        const NATIVE: &str = "https://example.test/native";
+
+        fn snapshot(href: &str) -> crate::render::webview::Snapshot {
+            crate::render::webview::Snapshot {
+                image: Arc::new(gpui::RenderImage::new(smallvec::smallvec![
+                    image::Frame::new(image::RgbaImage::new(3, 1),)
+                ])),
+                width: 240.,
+                height: 80.,
+                clipped: false,
+                document_height: 80.,
+                last_row_color: None,
+                links: Arc::new([crate::render::webview::WebLink {
+                    href: href.into(),
+                    label: "Harbour office".into(),
+                    rects: vec![[0., 0., 130., 22.]],
+                }]),
+                fallback_links: Arc::new([]),
+            }
+        }
+
+        struct Preview {
+            first: crate::render::webview::Snapshot,
+            second: crate::render::webview::Snapshot,
+            fade: bool,
+        }
+
+        impl gpui::Render for Preview {
+            fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+                let palette = crate::render::ThemeKind::Light.palette();
+                let card = |picture, id| {
+                    crate::render::web_snapshot(
+                        picture,
+                        240.,
+                        palette.surface,
+                        palette.dimmed,
+                        Some((id, palette.accent)),
+                    )
+                };
+                div()
+                    .flex()
+                    .flex_col()
+                    .w(px(240.))
+                    .child(
+                        div()
+                            .h(px(80.))
+                            .flex_shrink_0()
+                            .child(card(&self.first, "first")),
+                    )
+                    .child(
+                        div()
+                            .relative()
+                            .when(self.fade, |card| {
+                                card.child(
+                                    div().id("native-body-second").absolute().inset_0().child(
+                                        crate::render::plain_text(
+                                            &PlainText::from(NATIVE),
+                                            palette,
+                                            0,
+                                            true,
+                                        ),
+                                    ),
+                                )
+                            })
+                            .child(card(&self.second, "second")),
+                    )
+            }
+        }
+
+        for fade in [false, true] {
+            let mut app = gpui::TestAppContext::single();
+            let preview = app.add_window(|_, cx| {
+                cx.set_global(OpenedLinks::default());
+                Preview {
+                    first: snapshot(FIRST),
+                    second: snapshot(SECOND),
+                    fade,
+                }
+            });
+            let mut window = gpui::VisualTestContext::from_window(preview.into(), &app);
+            window.update(|window, cx| {
+                window.draw(cx).clear();
+                window.focus_next();
+            });
+            window.simulate_keystrokes("enter");
+            let point = point(px(12.), px(88.));
+            window.simulate_mouse_move(point, None, gpui::Modifiers::default());
+            window.simulate_click(point, gpui::Modifiers::default());
+            window.simulate_keystrokes("enter y");
+            assert_eq!(
+                app.read_from_clipboard()
+                    .and_then(|item| item.text())
+                    .as_deref(),
+                Some(SECOND),
+            );
+            window.update(|_, cx| {
+                let opened: Vec<_> = cx
+                    .global::<OpenedLinks>()
+                    .0
+                    .iter()
+                    .map(AsRef::as_ref)
+                    .collect();
+                assert_eq!(opened, [FIRST, SECOND, SECOND], "fade: {fade}");
+            });
+        }
+    }
 
     #[test]
     fn mailto_status_bar_and_opener_use_the_same_canonical_target() {

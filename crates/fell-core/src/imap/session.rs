@@ -144,6 +144,7 @@ fn identity_section(bridge: bool) -> &'static str {
 pub(super) type HeaderRow = (u32, Vec<u8>);
 
 pub(super) struct Session {
+    pub(super) trust_verified_sender_header: bool,
     io: Option<Io>,
     tag: u32,
     caps: Vec<String>,
@@ -188,6 +189,7 @@ impl Session {
         connected(&stream)?;
         let mut session = match config.security {
             ImapSecurity::Tls => Session {
+                trust_verified_sender_header: config.trust_verified_sender_header,
                 io: Some(Io::Tls(Box::new(wrap_tls(stream, Vec::new(), config)?))),
                 tag: 0,
                 caps: Vec::new(),
@@ -201,6 +203,7 @@ impl Session {
                 pending_buf: Vec::new(),
             },
             ImapSecurity::Plain | ImapSecurity::StartTls => Session {
+                trust_verified_sender_header: config.trust_verified_sender_header,
                 io: Some(Io::Plain(stream)),
                 tag: 0,
                 caps: Vec::new(),
@@ -1551,6 +1554,7 @@ pub(crate) fn wrap_tcp_as_tls(
         security: ImapSecurity::Tls,
         accept_invalid_certs,
         folder_overrides: Vec::new(),
+        trust_verified_sender_header: false,
     };
     Ok(TlsStream {
         inner: wrap_tls(tcp, Vec::new(), &config)?,
@@ -2357,6 +2361,7 @@ mod tests {
             security: ImapSecurity::Plain,
             accept_invalid_certs: false,
             folder_overrides: Vec::new(),
+            trust_verified_sender_header: false,
         })
         .expect("an oversized literal is discarded so the rest of the response can finish");
     }
@@ -2397,6 +2402,7 @@ mod tests {
             security: ImapSecurity::Plain,
             accept_invalid_certs: false,
             folder_overrides: Vec::new(),
+            trust_verified_sender_header: false,
         });
         let Err(err) = opened else {
             panic!("an unbounded greeting was accepted");
@@ -2445,6 +2451,7 @@ mod tests {
             security: ImapSecurity::Plain,
             accept_invalid_certs: false,
             folder_overrides: Vec::new(),
+            trust_verified_sender_header: false,
         })
         .expect("login");
         let listed = session.list_selectable().expect("list");
@@ -2585,6 +2592,7 @@ mod tests {
             security: ImapSecurity::Plain,
             accept_invalid_certs: false,
             folder_overrides: Vec::new(),
+            trust_verified_sender_header: false,
         })
         .expect("login");
         let _limit = super::limit_command_bytes_to(24);
@@ -2614,6 +2622,7 @@ mod tests {
             security: ImapSecurity::Tls,
             accept_invalid_certs: true,
             folder_overrides: Vec::new(),
+            trust_verified_sender_header: false,
         });
         let Err(err) = opened else {
             panic!("invalid certificates were accepted for a public host");
@@ -2644,6 +2653,7 @@ mod tests {
             security: ImapSecurity::Plain,
             accept_invalid_certs: false,
             folder_overrides: Vec::new(),
+            trust_verified_sender_header: false,
         });
         let Err(err) = opened else {
             panic!("an unusable literal length was treated as protocol text");
@@ -2677,6 +2687,7 @@ mod tests {
             security: ImapSecurity::Plain,
             accept_invalid_certs: false,
             folder_overrides: Vec::new(),
+            trust_verified_sender_header: false,
         });
         let Err(err) = opened else {
             panic!("chained literals were retained without a total cap");
@@ -2711,6 +2722,7 @@ mod tests {
             security: ImapSecurity::Plain,
             accept_invalid_certs: false,
             folder_overrides: Vec::new(),
+            trust_verified_sender_header: false,
         });
         let Err(err) = opened else {
             panic!("a chain of empty literals was accepted");
@@ -2746,6 +2758,7 @@ mod tests {
             security: ImapSecurity::Plain,
             accept_invalid_certs: false,
             folder_overrides: Vec::new(),
+            trust_verified_sender_header: false,
         });
         assert!(
             started.elapsed() < Duration::from_secs(3),
@@ -2787,6 +2800,7 @@ mod tests {
             security: ImapSecurity::Plain,
             accept_invalid_certs: false,
             folder_overrides: Vec::new(),
+            trust_verified_sender_header: false,
         });
         let Err(err) = opened else {
             panic!("an untagged flood was accepted");
@@ -2885,6 +2899,7 @@ mod tests {
             security,
             accept_invalid_certs: true,
             folder_overrides: Vec::new(),
+            trust_verified_sender_header: false,
         })
         .expect("TLS login");
         assert!(

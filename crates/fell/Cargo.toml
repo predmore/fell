@@ -23,14 +23,16 @@ fell-render.workspace = true
 fell-version.workspace = true
 gpui.workspace = true
 async-io = "2"
+base64 = "0.22"
 futures = "0.3"
 gtk = "0.18"
+javascriptcore-rs = "1.1.2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
 libc = "0.2"
 notify = { version = "=8.2.2", default-features = false }
 psl = "2"
 raw-window-handle = "0.6"
-# HTTPS for `fell embeddings install` only. No webpki-roots (its CDLA license is
+# HTTPS for embeddings and user-authorized remote images. No webpki-roots (its CDLA license is
 # not on the allow list): the system trust store, through rustls with ring,
 # like the IMAP client in fell-core.
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
@@ -57,8 +59,10 @@ zbus = "5.19"
 [dev-dependencies]
 # Tests check the store starts loading search (`Store::testing_*`). Dev only.
 fell-core = { workspace = true, features = ["ui-confirm", "test-utils"] }
+fell-render = { workspace = true, features = ["test-utils"] }
 gpui = { workspace = true, features = ["test-support"] }
 # The shaper GPUI uses on Linux, to test line cuts on real shaping.
 cosmic-text = "0.14"
+rcgen = "0.13"
 rusqlite.workspace = true
 toml = "1"

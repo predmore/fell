@@ -1,5 +1,9 @@
 use std::ops::Deref;
 
+use cssparser::{
+    AtRuleParser, CowRcStr, DeclarationParser, ParseError, Parser, ParserInput,
+    QualifiedRuleParser, RuleBodyItemParser, RuleBodyParser, Token,
+};
 use scraper::Html;
 use scraper::node::Node;
 
@@ -249,11 +253,47 @@ fn plain_paragraphs(body: &str, blocks: &mut Vec<Block>) {
 fn native_blocks(html: &str, depth: u32) -> Vec<Block> {
     let mut dom = parse_html(html);
     prune_hidden(&mut dom);
+    separate_flex_items(&mut dom);
     dom.tree
         .root()
         .children()
         .find(|node| node.value().is_element())
         .map_or_else(Vec::new, |root| children_of(root, depth))
+}
+
+fn separate_flex_items(dom: &mut Html) {
+    let styles = crate::webview_html::LayoutStyles::from_document(dom);
+    let separators: Vec<_> = dom
+        .root_element()
+        .descendants()
+        .filter(|node| {
+            let Some(element) = scraper::ElementRef::wrap(*node) else {
+                return false;
+            };
+            matches!(
+                declared_value(&styles.declarations(element), "display"),
+                Some("flex" | "inline-flex" | "block flex" | "inline flex")
+            )
+        })
+        .flat_map(|node| {
+            node.children()
+                .filter(|child| {
+                    child.value().is_element()
+                        || child
+                            .value()
+                            .as_text()
+                            .is_some_and(|text| !text.trim().is_empty())
+                })
+                .skip(1)
+                .map(|child| child.id())
+        })
+        .collect();
+    for id in separators {
+        dom.tree
+            .get_mut(id)
+            .unwrap()
+            .insert_before(Node::Text(scraper::node::Text { text: " ".into() }));
+    }
 }
 
 fn node_blocks(node: ego_tree::NodeRef<'_, Node>, depth: u32) -> Vec<Block> {
@@ -1665,8 +1705,20 @@ fn collect_inlines(node: ego_tree::NodeRef<'_, Node>, depth: u32) -> Vec<Inline>
 /// to the sentence around it (`foo<b> bar</b>`).
 fn inline_children(node: ego_tree::NodeRef<'_, Node>, depth: u32) -> Vec<Inline> {
     let mut out = Vec::new();
+    let mut after_block = false;
     for child in node.children() {
+        let block = child.value().as_element().is_some_and(|element| {
+            is_block_tag(element.name())
+                || style_value(element, "display").as_deref() == Some("block")
+        });
+        let previous = out.len();
         push_inline(child, depth + 1, &mut out);
+        if out.len() > previous {
+            if previous > 0 && (block || after_block) {
+                out.insert(previous, Inline::Text(" ".into()));
+            }
+            after_block = block;
+        }
     }
     out
 }
@@ -2021,38 +2073,137 @@ fn visible(text: &str) -> String {
     text.chars().filter(|ch| !is_invisible(*ch)).collect()
 }
 
-struct Declaration {
-    name: String,
-    value: String,
-    important: bool,
+#[derive(Clone)]
+pub(crate) struct Declaration {
+    pub name: String,
+    pub value: String,
+    pub important: bool,
 }
 
 /// Inline declarations only, in source order.
-fn style_declarations(element: &scraper::node::Element) -> Vec<Declaration> {
-    let Some(style) = element.attr("style") else {
-        return Vec::new();
-    };
-    style
-        .split(';')
-        .filter_map(|declaration| {
-            let (name, value) = declaration.split_once(':')?;
-            let value = value.trim().to_ascii_lowercase();
-            let priority = value
-                .rsplit_once('!')
-                .filter(|(_, marker)| marker.trim() == "important");
-            Some(Declaration {
-                name: name.trim().to_ascii_lowercase(),
-                value: priority
-                    .map_or(value.as_str(), |(value, _)| value.trim())
-                    .to_string(),
-                important: priority.is_some(),
-            })
-        })
+pub(crate) fn style_declarations(element: &scraper::node::Element) -> Vec<Declaration> {
+    element.attr("style").map_or_else(Vec::new, |style| {
+        let mut input = ParserInput::new(style);
+        parse_declarations(&mut Parser::new(&mut input))
+    })
+}
+
+pub(crate) fn case_preserving_style(element: &scraper::node::Element) -> Vec<Declaration> {
+    element.attr("style").map_or_else(Vec::new, |style| {
+        let mut input = ParserInput::new(style);
+        let mut parser = Parser::new(&mut input);
+        RuleBodyParser::new(
+            &mut parser,
+            &mut Declarations {
+                preserve_case: true,
+            },
+        )
+        .filter_map(Result::ok)
+        .collect()
+    })
+}
+
+pub(crate) fn parse_declarations(input: &mut Parser<'_, '_>) -> Vec<Declaration> {
+    RuleBodyParser::new(input, &mut Declarations::default())
+        .filter_map(Result::ok)
         .collect()
 }
 
+pub(crate) fn parse_stylesheet_declarations<'i>(
+    input: &mut Parser<'i, '_>,
+) -> Result<Vec<Declaration>, ParseError<'i, ()>> {
+    RuleBodyParser::new(input, &mut Declarations::default())
+        .map(|result| result.map_err(|(error, _)| error))
+        .collect()
+}
+
+#[derive(Default)]
+struct Declarations {
+    preserve_case: bool,
+}
+
+impl<'i> DeclarationParser<'i> for Declarations {
+    type Declaration = Declaration;
+    type Error = ();
+
+    fn parse_value<'t>(
+        &mut self,
+        name: CowRcStr<'i>,
+        input: &mut Parser<'i, 't>,
+    ) -> Result<Declaration, ParseError<'i, ()>> {
+        let mut value = String::new();
+        let mut important = false;
+        while !input.is_exhausted() {
+            let start = input.position();
+            match input.next_including_whitespace_and_comments()?.clone() {
+                Token::Delim('!') => {
+                    input.expect_ident_matching("important")?;
+                    input.expect_exhausted()?;
+                    important = true;
+                }
+                Token::Ident(part) => value.push_str(&part),
+                Token::Dimension {
+                    value: number,
+                    unit,
+                    ..
+                } => {
+                    value.push_str(&number.to_string());
+                    value.push_str(&unit);
+                }
+                Token::Comment(_) => value.push(' '),
+                token if token.is_parse_error() => {
+                    return Err(input.new_unexpected_token_error(token));
+                }
+                Token::Function(_)
+                | Token::ParenthesisBlock
+                | Token::SquareBracketBlock
+                | Token::CurlyBracketBlock => {
+                    input.parse_nested_block(|nested| {
+                        while nested.next().is_ok() {}
+                        Ok(())
+                    })?;
+                    value.push_str(input.slice_from(start));
+                }
+                _ => value.push_str(input.slice_from(start)),
+            }
+        }
+        let value = value.trim();
+        Ok(Declaration {
+            name: name.to_ascii_lowercase(),
+            value: if self.preserve_case {
+                value.to_owned()
+            } else {
+                value.to_ascii_lowercase()
+            },
+            important,
+        })
+    }
+}
+
+impl<'i> AtRuleParser<'i> for Declarations {
+    type Prelude = ();
+    type AtRule = Declaration;
+    type Error = ();
+}
+
+impl<'i> QualifiedRuleParser<'i> for Declarations {
+    type Prelude = ();
+    type QualifiedRule = Declaration;
+    type Error = ();
+}
+
+impl<'i> RuleBodyItemParser<'i, Declaration, ()> for Declarations {
+    fn parse_declarations(&self) -> bool {
+        true
+    }
+
+    fn parse_qualified(&self) -> bool {
+        false
+    }
+}
+
 /// A length of zero: `0`, `0px`, `0pt`, `0em`, `0%`.
-fn is_zero_length(value: &str) -> bool {
+pub(crate) fn is_zero_length(value: &str) -> bool {
     let number = value.trim_end_matches(|ch: char| ch.is_ascii_alphabetic() || ch == '%');
     number.parse::<f32>().is_ok_and(|n| n == 0.0)
 }
@@ -2060,7 +2211,7 @@ fn is_zero_length(value: &str) -> bool {
 /// Prune once before the native walk, including text used by code blocks
 /// and the depth fallback. Zero font size hides inherited text but can
 /// leave images and explicitly sized descendants visible.
-fn prune_hidden(dom: &mut Html) {
+pub(crate) fn prune_hidden(dom: &mut Html) {
     let mut todo = vec![(*dom.root_element(), false)];
     let mut remove = Vec::new();
     while let Some((node, inherited_zero)) = todo.pop() {
@@ -2089,27 +2240,38 @@ fn prune_hidden(dom: &mut Html) {
     }
 }
 
-fn is_hidden(element: &scraper::node::Element, style: &[Declaration]) -> bool {
-    // mso-hide is Outlook-specific. Its ordinary HTML fallback is visible here.
-    element.attr("hidden").is_some()
-        || declared_value(style, "display") == Some("none")
-        || declared_value(style, "visibility") == Some("hidden")
-        || (declared_value(style, "max-height").is_some_and(is_zero_length)
-            && style
-                .iter()
-                .filter_map(|declaration| {
-                    let value = match declaration.name.as_str() {
-                        "overflow-y" => declaration.value.as_str(),
-                        "overflow" => declaration.value.split_ascii_whitespace().next_back()?,
-                        _ => return None,
-                    };
-                    Some((declaration.important, value))
-                })
-                .max_by_key(|(important, _)| *important)
-                .is_some_and(|(_, value)| matches!(value, "hidden" | "clip")))
+pub(crate) fn is_hidden(element: &scraper::node::Element, style: &[Declaration]) -> bool {
+    is_hidden_from_layout(element, style) || declared_value(style, "visibility") == Some("hidden")
 }
 
-fn has_zero_font_size(
+pub(crate) fn is_hidden_from_layout(
+    element: &scraper::node::Element,
+    style: &[Declaration],
+) -> bool {
+    // mso-hide is Outlook-specific. Its ordinary HTML fallback is visible here.
+    let display = declared_value(style, "display");
+    (element.attr("hidden").is_some() && display.is_none())
+        || display == Some("none")
+        || (declared_value(style, "max-height").is_some_and(is_zero_length)
+            && clips_vertical_overflow(style))
+}
+
+pub(crate) fn clips_vertical_overflow(style: &[Declaration]) -> bool {
+    style
+        .iter()
+        .filter_map(|declaration| {
+            let value = match declaration.name.as_str() {
+                "overflow-y" => declaration.value.as_str(),
+                "overflow" => declaration.value.split_ascii_whitespace().next_back()?,
+                _ => return None,
+            };
+            Some((declaration.important, value))
+        })
+        .max_by_key(|(important, _)| *important)
+        .is_some_and(|(_, value)| matches!(value, "hidden" | "clip"))
+}
+
+pub(crate) fn has_zero_font_size(
     element: &scraper::node::Element,
     style: &[Declaration],
     inherited: bool,
@@ -2129,7 +2291,7 @@ fn has_zero_font_size(
                 || size.ends_with("em") && !size.ends_with("rem")))
 }
 
-fn declared_value<'a>(style: &'a [Declaration], property: &str) -> Option<&'a str> {
+pub(crate) fn declared_value<'a>(style: &'a [Declaration], property: &str) -> Option<&'a str> {
     style
         .iter()
         .filter(|declaration| declaration.name == property)
@@ -2373,6 +2535,18 @@ mod tests {
         );
         assert!(text.contains("cabin"));
         assert!(doc.plain_text().contains("sketch"));
+    }
+
+    #[test]
+    fn flattened_flex_and_block_items_keep_words_separate() {
+        let html = r#"<style>@media print {div {display:block}} a:hover {color:blue} .masthead {display:flex}</style>
+            <div class="masthead"><b>THE LAKESIDE DISPATCH</b><span>No. 42</span></div>
+            <h1><span style="display:block">First</span><span>Second</span></h1>
+            <p>un<b>break</b><span>able</span></p>"#;
+        let text = html_to_document(html).plain_text();
+        assert!(text.contains("THE LAKESIDE DISPATCH No. 42"), "{text}");
+        assert!(text.contains("First Second"), "{text}");
+        assert!(text.contains("unbreakable"), "{text}");
     }
 
     #[test]

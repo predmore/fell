@@ -1984,6 +1984,7 @@ name = "fell"
 version = "0.1.0"
 dependencies = [
  "async-io",
+ "base64 0.22.1",
  "cosmic-text",
  "fell-confirm",
  "fell-core",
@@ -1993,10 +1994,12 @@ dependencies = [
  "gpui",
  "gtk",
  "image",
+ "javascriptcore-rs",
  "libc",
  "notify",
  "psl",
  "raw-window-handle",
+ "rcgen",
  "rusqlite",
  "rustix 1.1.6",
  "rustls",
@@ -2089,6 +2092,8 @@ dependencies = [
  "percent-encoding",
  "pulldown-cmark",
  "scraper",
+ "selectors 0.26.0",
+ "skrifa",
  "tendril 0.4.3",
  "url",
 ]

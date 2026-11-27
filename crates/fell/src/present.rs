@@ -208,6 +208,8 @@ pub enum Rich {
     /// An HTML part is stored and is being read and prepared off the UI
     /// thread. The body's space is reserved until it is ready.
     Pending,
+    /// A likely web body that exceeded the immediate read budget.
+    PendingWeb,
     Html(std::sync::Arc<crate::mail_body::HtmlBody>),
 }
 
@@ -221,6 +223,12 @@ impl PartialEq for Rich {
     }
 }
 
+impl Rich {
+    pub fn is_pending(&self) -> bool {
+        matches!(self, Self::Pending | Self::PendingWeb)
+    }
+}
+
 impl Eq for Rich {}
 
 impl std::fmt::Debug for Rich {
@@ -229,6 +237,7 @@ impl std::fmt::Debug for Rich {
             Self::Plain | Self::PlainPart(_) => "Plain",
             Self::Missing => "Missing",
             Self::Pending => "Pending",
+            Self::PendingWeb => "PendingWeb",
             Self::Html(_) => "Html",
         })
     }

@@ -15,6 +15,7 @@ mod search;
 mod settings;
 mod snooze;
 mod threading;
+mod web_mail;
 
 use std::cell::{Cell, OnceCell};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -64,8 +65,8 @@ use crate::render::READING_MEASURE_PX;
 use crate::reply_check::{ReplyCheck, ReplyChecks};
 use crate::row_widths::{self, RowFrame, RowWidths};
 use crate::scroll_anchor::{
-    LandingGlide, LandingHold, LayoutProbe, LayoutSlot, MessageProbes, ReaderLanding, Reveal,
-    RevealPhase, ScrollAnchor, clamped_offset,
+    Continuation, LandingGlide, LandingHold, LayoutProbe, LayoutSlot, MessageProbes, ReaderLanding,
+    Reveal, RevealPhase, ScrollAnchor, clamped_offset,
 };
 use crate::store_actor::StoreClient;
 use crate::sync_worker::{self, SyncEvent, SyncHandle};
@@ -951,6 +952,8 @@ struct Inbox {
     warmed_folder: Option<String>,
     /// Prepared HTML bodies by message id, so reopening prepares nothing.
     bodies: BodyCache,
+    /// Each account owns its reader snapshots, consent and view overrides.
+    web_mail: web_mail::Reader,
     /// Body revisions to load for the current conversation and work in flight.
     body_loads: BodyLoads,
     /// Messages whose parts were asked of sync, and what came back.
@@ -1170,12 +1173,15 @@ impl Inbox {
             warm: None,
             warmed_folder: None,
             bodies: BodyCache::default(),
+            web_mail: web_mail::Reader::default(),
             body_loads: BodyLoads::default(),
             reader_fetcher: None,
             reader_bodies: ReaderBodies::default(),
             landing: ReaderLanding::default(),
         };
         let sync_with = config.zip(startup.path.ok());
+        cx.on_release(|inbox, app| inbox.web_mail.release(app))
+            .detach();
         cx.spawn(async move |this, cx| {
             let Ok(opened) = ready.await else {
                 return;
@@ -1311,10 +1317,31 @@ impl Inbox {
         if let Some(trace) = cx.try_global::<UiTrace>() {
             trace.store_opened(opened.error.as_deref());
         }
+        self.web_mail.release(cx);
+        self.web_mail = web_mail::Reader::default();
         self.account_id = opened.account.id.clone();
         cx.default_global::<crate::compose_ui::RecipientStore>()
             .0
             .insert(self.account_id.clone(), self.store.clone());
+        self.web_mail.trusted_delivery = sync_with
+            .as_ref()
+            .is_some_and(|(config, _)| config.trust_verified_sender_header);
+        if opened.sync != SyncKind::StoreError {
+            let account = self.account_id.clone();
+            let prefs = self.store.call(move |store| store.sender_reading(&account));
+            cx.spawn(async move |this, cx| {
+                if let Ok(Ok(prefs)) = prefs.await {
+                    let _ = this.update(cx, |inbox, cx| {
+                        for (sender, choice) in prefs {
+                            inbox.web_mail.preferences.entry(sender).or_insert(choice);
+                        }
+                        cx.notify();
+                    });
+                }
+            })
+            .detach();
+            crate::render::webview::prewarm();
+        }
         self.session.account_name = opened.account.display_name.clone();
         self.session.account_email = opened.account.email.clone();
         if let Some(error) = opened.error {
@@ -2802,7 +2829,8 @@ impl Inbox {
                 // Fades in as a synced draft's messages do, so `j` between
                 // the two kinds never pops.
                 self.reveal = Reveal::Waiting;
-                self.motion.show_thread(&mut self.session, shown);
+                self.motion
+                    .show_thread(&mut self.session, shown, motion::QUICK);
                 self.scroll_conversation();
             }
             self.session.clear_query_fault(QueryFault::Message);
@@ -2811,6 +2839,7 @@ impl Inbox {
             return;
         }
         let opening = self.open_thread.as_deref() != Some(&id);
+        let opened_at = Instant::now();
         let generation = self.conv_gen.fetch_add(1, Ordering::SeqCst) + 1;
         let note_generation = self.note_generation;
         let current = self.conv_gen.clone();
@@ -2829,6 +2858,7 @@ impl Inbox {
             Some((generation, search.effective_query().to_owned()))
         });
         let cached = self.bodies.stamps();
+        let sender_preferences = self.web_mail.preferences.clone();
         let wait_for_body = self.first_preview.waits_for_body();
         let expanded: HashSet<_> = self
             .session
@@ -2857,7 +2887,15 @@ impl Inbox {
                         message.expanded |= expanded.contains(&message.id);
                     }
                     let reads = mail_body::read_bodies_with_latest(
-                        store, &account, &mut view, &cached, !opening,
+                        store,
+                        &account,
+                        &mut view,
+                        &cached,
+                        !opening,
+                        |message| {
+                            let sender = web_mail::sender_address(&message.email)?;
+                            sender_preferences.get(&sender)?.0
+                        },
                     );
                     Ok(Some((view, reads)))
                 })
@@ -2892,11 +2930,22 @@ impl Inbox {
             }))
         });
         cx.spawn(async move |this, cx| {
-            let result = reply
+            let mut result = reply
                 .await
                 .unwrap_or_else(|_| Err("Mailbox store stopped".into()));
+            if let Ok(Some(read)) = &mut result
+                && read.reads.has_jobs()
+            {
+                let mut reads = std::mem::take(&mut read.reads);
+                read.reads = cx
+                    .background_spawn(async move {
+                        reads.prepare_jobs();
+                        reads
+                    })
+                    .await;
+            }
             let _ = this.update(cx, |inbox, cx| {
-                inbox.receive_conversation(id, generation, result, cx)
+                inbox.receive_conversation(id, generation, opened_at, result, cx)
             });
         })
         .detach();
@@ -2906,6 +2955,7 @@ impl Inbox {
         &mut self,
         id: String,
         generation: u64,
+        opened_at: Instant,
         result: Result<Option<ConversationRead>, String>,
         cx: &mut Context<Self>,
     ) {
@@ -3016,7 +3066,23 @@ impl Inbox {
                 } else {
                     inbox.invalidate_conversation_layout();
                     inbox.reveal = Reveal::Waiting;
-                    inbox.motion.show_thread(&mut inbox.session, view);
+                    let fade = if view
+                        .last()
+                        .is_some_and(|message| inbox.web_mail.prefers_message_web(message))
+                    {
+                        motion::FADE
+                    } else {
+                        motion::QUICK
+                    };
+                    inbox.motion.show_thread(&mut inbox.session, view, fade);
+                    if inbox.web_mail.open_thread(
+                        &inbox.session.messages,
+                        inbox.motion.motion,
+                        opened_at,
+                        cx,
+                    ) {
+                        inbox.motion.hold_thread_arrival();
+                    }
                     inbox.finish_body_refresh(generation, false);
                     // Keep the initial header landing while the
                     // preview's pending bodies fill in.
@@ -3063,7 +3129,7 @@ impl Inbox {
 
     /// Keep an existing body visible while its stored HTML is prepared.
     fn keep_shown_text(&self, view: &mut [ConvMessage]) {
-        for message in view.iter_mut().filter(|m| m.rich == Rich::Pending) {
+        for message in view.iter_mut().filter(|m| m.rich.is_pending()) {
             if let Some(old) = self
                 .session
                 .messages
@@ -3072,7 +3138,7 @@ impl Inbox {
                 && old.body_state == fell_core::BodyState::Stored
                 && message.body_state == fell_core::BodyState::Stored
             {
-                if old.rich != Rich::Pending && old.reader_parts == fell_core::ReaderParts::Ready {
+                if !old.rich.is_pending() && old.reader_parts == fell_core::ReaderParts::Ready {
                     message.rich = old.rich.clone();
                 } else if self.reader_bodies.fallback_since.contains_key(&old.id) {
                     message.body = old.body.clone();
@@ -3139,7 +3205,7 @@ impl Inbox {
             .map(|(messages, _)| messages.as_slice())
             .unwrap_or(&self.session.messages);
         if messages.iter().any(|message| {
-            message.id == id && matches!(message.rich, Rich::Pending | Rich::Missing)
+            message.id == id && (message.rich.is_pending() || message.rich == Rich::Missing)
         }) {
             self.body_refresh.rich.insert(id.to_owned(), Rich::Plain);
         }
@@ -3163,7 +3229,7 @@ impl Inbox {
             .map(|(id, load, _)| (id.clone(), *load))
             .collect();
         let account = self.account_id.clone();
-        let reply = self.store.call(move |store| {
+        let reply = self.store.call_body_read(move |store| {
             read.into_iter()
                 .map(|(id, load, headers)| {
                     mail_body::read_job_at_stamp(store, &account, &id, load.stamp, &headers)
@@ -4599,7 +4665,9 @@ impl Inbox {
         self.reader_bodies.clear();
         self.invalidate_conversation_layout();
         self.session.messages.clear();
-        self.open_thread = None;
+        if self.open_thread.take().is_some() {
+            self.web_mail.close_thread();
+        }
         self.open_subject.clear();
         self.note_pin = agent_notes::NotePin::default();
     }
@@ -4608,6 +4676,7 @@ impl Inbox {
     fn mark_open(&mut self, id: String, latest_note: Option<i64>) {
         self.conversation_revision = self.conversation_revision.wrapping_add(1);
         if self.open_thread.as_deref() != Some(&id) {
+            self.web_mail.close_thread();
             self.reader_bodies.clear();
             let notes = &self.session.agent_notes;
             self.note_pin = agent_notes::NotePin::opened(
@@ -4872,6 +4941,15 @@ impl Inbox {
             && self.session.overlay == Overlay::None
         {
             self.queue_link_focus(false);
+        }
+        if let Some(
+            action @ (Action::ToggleWebView
+            | Action::AllowMessageImages
+            | Action::AllowSenderImages
+            | Action::BlockSenderImages),
+        ) = step.action
+        {
+            self.html_reading_key_action(action, cx);
         }
         if overlay != Overlay::Help && self.session.overlay == Overlay::Help {
             self.help_scroll = help::HelpScroll::default();
@@ -5958,8 +6036,70 @@ impl Render for Inbox {
             .regroup_motion
             .take()
             .filter(|motion| motion.running(now));
+        let web = if self.open_thread.is_some() && panes.1 {
+            let viewport = self.conv_scroll.bounds();
+            let visible: Vec<_> = (0..self.session.messages.len())
+                .map(|index| {
+                    self.conv_layout_current
+                        && self
+                            .conv_scroll
+                            .bounds_for_item(index + usize::from(self.conv_note_slot))
+                            .is_some_and(|card| card.intersects(&viewport))
+                })
+                .collect();
+            self.web_mail.frames(
+                &self.session.messages,
+                (
+                    (reader_current && preview_current).then_some(self.session.message_cursor),
+                    &visible,
+                    &self.session.quotes_open,
+                ),
+                &self.theme,
+                reader.columns.header.width,
+                (self.motion.motion, now, real),
+                cx,
+            )
+        } else {
+            if reader_current && preview_current {
+                self.web_mail.prefetch(
+                    self.session.messages.get(self.session.message_cursor),
+                    &self.theme,
+                    reader.columns.header.width,
+                    cx,
+                );
+            } else {
+                self.web_mail.stop();
+            }
+            HashMap::new()
+        };
+        // A passive web refresh at the end follows the height drawn in this
+        // frame. An explicit renderer switch keeps the reader's header in
+        // place while the height eases, subject to the current scroll range.
+        if reader_current
+            && self.conv_layout_current
+            && !scrolling_to_target
+            && !self.landing.preserves_position()
+            && !web
+                .values()
+                .any(|frame| frame.leaving_clipped || frame.continuation.is_some())
+            && web.values().any(web_mail::Frame::body_animating)
+        {
+            disclosure::follow_scroll_end(&self.conv_scroll);
+        }
+        if self.landing.preserves_position()
+            && !self.web_mail.awaiting_snapshot()
+            && !web.values().any(web_mail::Frame::animating)
+        {
+            self.landing.hold(None);
+        }
+        let holding_arrival =
+            panes.1 && self.motion.motion.enabled() && self.web_mail.holding_arrival(real);
+        if !holding_arrival {
+            self.motion.release_thread_arrival(now);
+        }
         let conv = ConvFrame {
             account_opacity: self.account_reader_opacity(real, now),
+            web,
             syncing: self.pending_bodies.downloading(&self.session.sync),
             missing_fade: self.pending_bodies.fade(now),
             feedback,
@@ -6041,6 +6181,8 @@ impl Render for Inbox {
             | self.account_arrival.is_some_and(|fade| fade.running(now))
             | conv.account_opacity.is_some()
             | link_fading
+            | holding_arrival
+            | conv.web.values().any(web_mail::Frame::animating)
             | waiting_for_resize
             | self.note_view.running()
             | self.note_pin.running()
@@ -6418,6 +6560,7 @@ struct ListContent {
 #[derive(Default)]
 struct ConvFrame {
     account_opacity: Option<f32>,
+    web: HashMap<String, web_mail::Frame>,
     agent_note: Option<agent_notes::NoteFrame>,
     pin: Option<agent_notes::PinnedFrame>,
     note_details_only: bool,
@@ -9341,7 +9484,7 @@ impl ReaderBodies {
                 if !managed {
                     return None;
                 }
-                let settled = parts == Ready && message.rich != Rich::Pending;
+                let settled = parts == Ready && !message.rich.is_pending();
                 let terminal = matches!(parts, Unavailable { .. })
                     || message.body_state == fell_core::BodyState::TooLarge
                     || self.failed.contains_key(&message.id);
@@ -9362,7 +9505,7 @@ impl ReaderBodies {
                 let html_ready = matches!(message.rich, Rich::Html(_) | Rich::PlainPart(_));
                 let text = !html_ready
                     && message.body_state == fell_core::BodyState::Stored
-                    && (message.rich != Rich::Pending
+                    && (!message.rich.is_pending()
                         || self.fallback_since.contains_key(&message.id))
                     && message.body.blocks.iter().any(|block| match block {
                         BodyBlock::Text(text)
@@ -9409,8 +9552,8 @@ impl ReaderBodies {
                     Listed { .. } if !message.needs_reader_parts() => None,
                     Listed { html: true } if text => Some(ReaderLabel::Formatted),
                     Listed { .. } => Some(ReaderLabel::Loading),
-                    Ready if message.rich == Rich::Pending && text => Some(ReaderLabel::Formatted),
-                    Ready if message.rich == Rich::Pending => Some(ReaderLabel::Loading),
+                    Ready if message.rich.is_pending() && text => Some(ReaderLabel::Formatted),
+                    Ready if message.rich.is_pending() => Some(ReaderLabel::Loading),
                     Ready => None,
                 };
                 let mut frame = self.statuses.entry(message.id.clone()).or_default().frame(
@@ -9595,10 +9738,17 @@ impl BodyRefresh {
                 }
                 let prepared =
                     matches!(new.rich, Rich::Html(_) | Rich::PlainPart(_)) && new.rich != old.rich;
-                if managed {
+                if old.rich == Rich::PendingWeb && prepared {
+                    motion.reader_body_arrived(
+                        id,
+                        reader.body_arrival_height(old, new),
+                        Some(old.body.clone()),
+                        now,
+                    );
+                } else if managed {
                     // Metadata and a staged HTML read leave the displayed text
                     // and the existing chips unchanged.
-                    if prepared || (new.rich != Rich::Pending && old.body != new.body) {
+                    if prepared || (!new.rich.is_pending() && old.body != new.body) {
                         let height = reader.body_arrival_height(old, new);
                         let outgoing =
                             (prepared && reader.fallback_was_visible(id)).then(|| old.body.clone());
@@ -9618,8 +9768,11 @@ impl BodyRefresh {
                     && ready != message.rich
                 {
                     if message.expanded {
-                        if reader.body_probes.contains_key(&message.id) {
-                            let outgoing = (reader.fallback_was_visible(&message.id)
+                        if message.rich == Rich::PendingWeb
+                            || reader.body_probes.contains_key(&message.id)
+                        {
+                            let outgoing = ((message.rich == Rich::PendingWeb
+                                || reader.fallback_was_visible(&message.id))
                                 && matches!(ready, Rich::Html(_) | Rich::PlainPart(_)))
                             .then(|| message.body.clone());
                             motion.reader_body_arrived(
@@ -10034,7 +10187,11 @@ fn conversation(
                     note.into_iter().chain(messages),
                     scroll,
                     hold,
-                    chip_probe,
+                    frame
+                        .web
+                        .values()
+                        .find_map(|web| web.continuation.clone().map(BodyLanding::Continuation))
+                        .or_else(|| chip_probe.map(BodyLanding::Attachment)),
                     padding.map(|padding| padding.viewport),
                     arrival,
                     frame.frames.clone(),
@@ -10057,11 +10214,16 @@ fn expanded_card_fill(theme: &Theme, focus: f32) -> u32 {
     )
 }
 
+enum BodyLanding {
+    Attachment(LayoutSlot),
+    Continuation(Continuation),
+}
+
 fn conversation_body(
     children: impl IntoIterator<Item = gpui::AnyElement>,
     scroll: Option<ScrollHandle>,
     hold: Option<MessageProbes>,
-    chip_probe: Option<LayoutSlot>,
+    landing: Option<BodyLanding>,
     preview_viewport: Option<gpui::Pixels>,
     arrival: f32,
     frames: Option<SharedFrameLog>,
@@ -10092,9 +10254,12 @@ fn conversation_body(
         .when(arrival < 1.0, |body| body.opacity(arrival))
         .children(children)
         .into_any_element();
-    match (scroll, hold, chip_probe) {
+    match (scroll, hold, landing) {
+        (Some(scroll), _, Some(BodyLanding::Continuation(continuation))) => {
+            LandingHold::continue_body(body, scroll, continuation, frames).into_any_element()
+        }
         (Some(scroll), Some(hold), _) => hold.hold(body, scroll, bottom, frames).into_any_element(),
-        (Some(scroll), _, Some(probe)) => {
+        (Some(scroll), _, Some(BodyLanding::Attachment(probe))) => {
             LandingHold::reveal(body, scroll, probe, frames).into_any_element()
         }
         _ => body,
@@ -10444,6 +10609,7 @@ fn expanded_message_header(
     columns: ReaderColumns,
     status: Option<ReaderStatusSlot<'_>>,
     marker: GroupingMarker<'_>,
+    (web_alpha, fill): (Option<f32>, u32),
     window: &Window,
 ) -> gpui::Div {
     let style = conversation_line_style(window, theme, px(theme.ui_px - 1.));
@@ -10453,9 +10619,21 @@ fn expanded_message_header(
     let line_height = sender_style.line_height_in_pixels(window.rem_size());
     let date = present::relative_date(now_unix(), message.date_unix);
     let date_width = line_px_with_style(window, &sender_style, &date, FontWeight::NORMAL).ceil();
+    let web = web_alpha.and_then(|_| {
+        shape_ui_line(
+            window,
+            &style,
+            "web",
+            FontWeight::NORMAL,
+            Some(crate::theme::note_text(theme.dimmed, fill)),
+        )
+    });
+    let web_width = web.as_ref().map_or(0., |line| {
+        f32::from(line.width).ceil() + MESSAGE_HEADER_GAP_PX
+    });
     let marker = marker.render(
         |text| {
-            let available = (columns.card.width - date_width - 64.).max(0.);
+            let available = (columns.card.width - date_width - web_width - 64.).max(0.);
             clip_shaped(
                 window,
                 &style,
@@ -10480,7 +10658,7 @@ fn expanded_message_header(
         reader_status_width(
             theme,
             retry,
-            columns.card.width - date_width - marker_width - 96.,
+            columns.card.width - date_width - web_width - marker_width - 96.,
             window,
         )
     });
@@ -10523,6 +10701,7 @@ fn expanded_message_header(
         measure(&style, &email, FontWeight::NORMAL, theme.dimmed),
         measure(&style, &joined, FontWeight::NORMAL, theme.dimmed) + mute_room,
         date_width
+            + web_width
             + marker_width
             + if status.is_some() {
                 status_width + MESSAGE_HEADER_GAP_PX
@@ -10631,6 +10810,11 @@ fn expanded_message_header(
                 .overflow_hidden()
                 .children(status.map(|slot| reader_status_text(theme, slot, status_width)))
                 .children(marker.map(|(label, _)| label))
+                .children(web.zip(web_alpha).map(|(tag, alpha)| {
+                    div()
+                        .opacity(alpha)
+                        .child(paint_shaped_text(tag, line_height, false))
+                }))
                 .child(paint_shaped_text(line, line_height, false))
         }),
     )
@@ -10668,7 +10852,11 @@ fn expanded_message(
                 .left(px(columns.card.inset))
                 .w(px(columns.card.width + 2.0 * MESSAGE_PAD_PX))
                 .rounded_md()
-                .bg(rgb(fill)),
+                .bg(rgb(fill))
+                .when(cursor > 0., |card| {
+                    card.border_1()
+                        .border_color(rgb(motion::mix(fill, theme.accent, cursor)))
+                }),
         )
         .when(live.0, |card| {
             card.on_mouse_down(
@@ -10690,6 +10878,10 @@ fn expanded_message(
             columns,
             status.filter(|_| message.recipients.is_none()),
             marker,
+            (
+                frame.web.get(&message.id).and_then(|frame| frame.web_tag),
+                fill,
+            ),
             window,
         ))
         .children(message.recipients.as_ref().map(|line| {
@@ -10729,6 +10921,29 @@ fn expanded_message(
                     })),
             ),
         )
+        .children(
+            frame
+                .web
+                .get(&message.id)
+                .and_then(|frame| frame.prompt.as_ref())
+                .map(|prompt| {
+                    columns.card.place(web_mail::prompt(
+                        prompt,
+                        theme,
+                        &message.id,
+                        (
+                            live.0,
+                            (live.0
+                                && frame.preview_current
+                                && web_mail::reading_key_target(session)
+                                    == Some(message.id.as_str()))
+                            .then_some(&session.keymap),
+                        ),
+                        columns.card.width,
+                        cx,
+                    ))
+                }),
+        )
         // `q` opens every collapsed block in the message at once, so only
         // the first fold of the reader's message names the key.
         .child(measured_message_body(
@@ -10755,6 +10970,10 @@ fn expanded_message(
                     fill,
                     index,
                     live: live.0,
+                    image_consent: frame
+                        .web
+                        .get(&message.id)
+                        .is_some_and(|frame| frame.image_consent),
                 },
                 frame,
                 window,
@@ -10797,32 +11016,71 @@ fn measured_message_body(
     frame: &ConvFrame,
     body: gpui::AnyElement,
 ) -> gpui::AnyElement {
-    let Some(probe) = frame.body_probes.get(&message.id).cloned() else {
-        return body;
+    let body = if message.rich == Rich::PendingWeb {
+        // The stored text may be just a snippet while the formatted body is read.
+        div().min_h(px(100.)).child(body).into_any_element()
+    } else {
+        body
     };
+    let probe = frame.body_probes.get(&message.id).cloned();
+    let web = frame.web.get(&message.id);
+    let web_probe = web.and_then(|web| web.height.clone());
+    let renderer_painted = web.and_then(|web| web.renderer_painted.clone());
+    if probe.is_none() && web_probe.is_none() {
+        return body;
+    }
     let body = match frame.heights.get(&message.id) {
-        Some(&(from, progress)) if progress < 1.0 => GrowingMessage {
-            inner: body,
-            width: px(columns.pane_right),
-            from,
-            progress,
-            gap: px(0.),
+        Some(&(from, progress))
+            if progress < 1.0
+                && probe.is_some()
+                && !web.is_some_and(web_mail::Frame::owns_body) =>
+        {
+            GrowingMessage {
+                inner: body,
+                width: px(columns.pane_right),
+                from,
+                progress,
+                gap: px(0.),
+            }
+            .into_any_element()
         }
-        .into_any_element(),
         _ => body,
     };
-    div()
+    let body = div()
         .relative()
         .child(body)
         .child(
             gpui::canvas(
-                move |bounds, _, _| probe.set(f32::from(bounds.size.height)),
-                |_, _, _, _| {},
+                move |bounds, _, _| {
+                    let height = f32::from(bounds.size.height);
+                    if let Some(probe) = probe {
+                        probe.set(height);
+                    }
+                    if let Some(probe) = web_probe {
+                        probe.set(Some(height));
+                    }
+                },
+                move |_, _, _, _| {
+                    if let Some(painted) =
+                        renderer_painted.filter(|painted| painted.get().is_none())
+                    {
+                        painted.set(Some(Instant::now()));
+                    }
+                },
             )
             .absolute()
             .inset_0(),
         )
+        .into_any_element();
+    if let Some(continuation) = web.and_then(|web| web.continuation.as_ref()) {
+        LayoutProbe {
+            inner: body,
+            slot: continuation.body.clone(),
+        }
         .into_any_element()
+    } else {
+        body
+    }
 }
 
 /// How one message's folds paint.
@@ -10840,6 +11098,7 @@ struct FoldView {
     index: usize,
     /// Drawn on screen, not as an unseen copy: a click opens the fold.
     live: bool,
+    image_consent: bool,
 }
 
 /// Height a folded line takes, its margin included.
@@ -10856,6 +11115,13 @@ fn message_body(
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
+    if let Rich::Html(body) = &message.rich
+        && let Some(web) = frame.web.get(&message.id).filter(|web| web.owns_body())
+    {
+        let style = conversation_line_style(window, theme, px(theme.ui_px));
+        let markers = crate::render::ListMarkerFont::new(window, style);
+        return web_message_body(theme, (message, body), folds, frame, web, &markers, cx);
+    }
     let managed = frame
         .reader_feedback()
         .part_status
@@ -10875,7 +11141,11 @@ fn message_body(
     } else {
         match present::missing_body_line(message.body_state, frame.syncing) {
             Some(line) => missing_message_body(theme, folds.columns, &line, alpha),
-            None => stored_message_body(theme, message, folds, frame, alpha, &markers, cx),
+            None => native_link_scope(&message.id)
+                .child(stored_message_body(
+                    theme, message, folds, frame, alpha, &markers, cx,
+                ))
+                .into_any_element(),
         }
     };
     let old = if let Some(line) = outgoing {
@@ -10950,6 +11220,188 @@ fn missing_message_body(
     )
 }
 
+fn web_message_body(
+    theme: &Theme,
+    (message, body): (&ConvMessage, &mail_body::HtmlBody),
+    folds: FoldView,
+    frame: &ConvFrame,
+    web: &web_mail::Frame,
+    markers: &crate::render::ListMarkerFont,
+    cx: &mut Context<Inbox>,
+) -> gpui::AnyElement {
+    use web_mail::Body;
+    let reveal = frame.disclosures().quotes.get(&message.id).copied();
+    let colorless =
+        web.body.is_colorless() || web.outgoing.as_ref().is_some_and(Body::is_colorless);
+    let web_column =
+        |card: gpui::AnyElement, links: &[fell_render::Block], live, showing_links: bool| {
+            div()
+                .child(card)
+                .when(!links.is_empty(), |pane| {
+                    let palette = mail_body::palette(theme);
+                    pane.child(
+                        div()
+                            .mt(px(7.))
+                            .when(!showing_links, |links| links.opacity(0.))
+                            .child(crate::render::blocks_column_spaced(
+                                links,
+                                &palette,
+                                false,
+                                &body.gallery,
+                                folds.columns.blocks(folds.fill).with_links(live),
+                                3.0,
+                                markers,
+                            )),
+                    )
+                })
+                .into_any_element()
+        };
+    let mut layer = |shown: &Body, live| match shown {
+        Body::Placeholder => web_column(
+            web_placeholder(theme, message, folds.columns, web.placeholder_height),
+            &body.web_links,
+            false,
+            false,
+        ),
+        Body::StoredText => native_link_scope(&message.id)
+            .child(plain_message_body(
+                theme,
+                &message.body,
+                FoldView { live, ..folds },
+                reveal,
+                markers,
+                cx,
+            ))
+            .into_any_element(),
+        Body::Native => {
+            let native = native_link_scope(&message.id)
+                // The card already paints this fill. A second copy would
+                // dim the outgoing text under a partially opaque layer.
+                .when(!colorless, |native| native.bg(rgb(folds.fill)))
+                .children(html_sections(
+                    theme,
+                    (body, web.continuation.as_ref(), false),
+                    FoldView { live, ..folds },
+                    reveal,
+                    markers,
+                    cx,
+                ))
+                .into_any_element();
+            if let Some(continuation) = &web.continuation {
+                LayoutProbe {
+                    inner: native,
+                    slot: continuation.native_body.clone(),
+                }
+                .into_any_element()
+            } else {
+                native
+            }
+        }
+        Body::Web(picture) => {
+            let snapshot = div()
+                .relative()
+                .child(crate::render::web_snapshot(
+                    picture,
+                    folds.columns.card.width,
+                    folds.fill,
+                    theme.dimmed,
+                    live.then_some((&message.id, theme.accent)),
+                ))
+                .when(picture.clipped && live, |snapshot| {
+                    let geometry = web.snapshot_geometry.clone();
+                    let height = picture.height * folds.columns.card.width / picture.width;
+                    snapshot.child(
+                        gpui::canvas(
+                            move |bounds, _, _| {
+                                geometry.set(Some((f32::from(bounds.top()), height)))
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .inset_0(),
+                    )
+                });
+            let colorless = shown.is_colorless();
+            let card = web_column(
+                folds.columns.card.place(snapshot).into_any_element(),
+                if colorless {
+                    &picture.fallback_links
+                } else {
+                    &body.web_links
+                },
+                live,
+                true,
+            );
+            div()
+                .id(ElementId::from((
+                    ElementId::from("snapshot-body"),
+                    message.id.clone(),
+                )))
+                .child(card)
+                .when(colorless && body.web.mapped_history(), |card| {
+                    card.children(html_sections(
+                        theme,
+                        (body, None, true),
+                        FoldView { live, ..folds },
+                        reveal,
+                        markers,
+                        cx,
+                    ))
+                })
+                .into_any_element()
+        }
+    };
+    let incoming = layer(&web.body, folds.live);
+    if let Some(outgoing) = &web.outgoing {
+        disclosure::body_transition(
+            folds.columns.pane_right,
+            web.body_alpha,
+            web.height_progress,
+            web.from_height,
+            [layer(outgoing, false), incoming],
+        )
+    } else {
+        incoming
+    }
+}
+
+fn native_link_scope(message_id: &str) -> gpui::Stateful<gpui::Div> {
+    div().id(ElementId::from((
+        ElementId::from("native-body"),
+        message_id.to_owned(),
+    )))
+}
+
+fn web_placeholder(
+    theme: &Theme,
+    message: &ConvMessage,
+    columns: ReaderColumns,
+    height: f32,
+) -> gpui::AnyElement {
+    let line_height = theme.ui_px * 1.45;
+    columns
+        .card
+        .place(
+            div()
+                .h(px(height))
+                .rounded_md()
+                .bg(rgb(theme.recipient_surface))
+                .px(px(12.))
+                .py(px(8.))
+                .line_height(px(line_height))
+                .text_color(rgb(crate::theme::note_text(
+                    theme.recipient_text.1,
+                    theme.recipient_surface,
+                )))
+                .child(
+                    div()
+                        .truncate()
+                        .child(present::display_safe(&message.snippet)),
+                ),
+        )
+        .into_any_element()
+}
+
 fn stored_message_body(
     theme: &Theme,
     message: &ConvMessage,
@@ -10963,160 +11415,173 @@ fn stored_message_body(
     if let Rich::Html(body) = &message.rich {
         return div()
             .opacity(alpha)
-            .children(html_sections(theme, body, folds, reveal, markers, cx))
+            .children(html_sections(
+                theme,
+                (body, None, false),
+                folds,
+                reveal,
+                markers,
+                cx,
+            ))
             .into_any_element();
     }
-    let blocks: Vec<gpui::AnyElement> = match &message.rich {
-        Rich::Html(_) => unreachable!(),
+    let body = match &message.rich {
         Rich::Pending if message.body.blocks.is_empty() => return div().into_any_element(),
-        Rich::Pending | Rich::Plain | Rich::PlainPart(_) | Rich::Missing => {
-            // A signature and the quote next to it fold as one, as in HTML.
-            // A draft's markdown is painted as its compose window shows it.
-            let palette = mail_body::palette(theme);
-            let quiet = mail_body::history_palette(theme);
-            let mut runs: Vec<(
-                usize,
-                Option<fell_render::Fold>,
-                Vec<&crate::text_render::PlainText>,
-            )> = Vec::new();
-            let body = match &message.rich {
-                Rich::PlainPart(plain) => plain,
-                _ => &message.body,
-            };
-            let markers = markers.with_top_level_lists(
-                body.blocks
-                    .iter()
-                    .filter_map(|block| match block {
-                        BodyBlock::List(blocks) => Some(blocks.iter()),
-                        _ => None,
-                    })
-                    .flatten(),
-            );
-            for (at, block) in body.blocks.iter().enumerate() {
-                let (kind, text) = match block {
-                    BodyBlock::Text(text) => (None, text),
-                    BodyBlock::List(_) | BodyBlock::Markdown { .. } => {
-                        runs.push((at, None, Vec::new()));
-                        continue;
-                    }
-                    BodyBlock::Quote(text) => (Some(fell_render::Fold::Quote), text),
-                    BodyBlock::Signature(text) => (Some(fell_render::Fold::Signature), text),
-                };
-                match (runs.last_mut(), kind) {
-                    (Some((_, Some(above), texts)), Some(next)) => {
-                        *above = joined_fold(*above, next);
-                        texts.push(text);
-                    }
-                    _ => runs.push((at, kind, vec![text])),
-                }
-            }
-            let first_hidden = runs
-                .iter()
-                .position(|(_, kind, _)| kind.is_some())
-                .filter(|_| folds.name_key);
-            runs.into_iter()
-                .enumerate()
-                .map(|(run, (at, kind, texts))| match kind {
-                    None if let BodyBlock::List(blocks) = &body.blocks[at] => div()
-                        .pt(px(14.))
-                        .pb(px(22.))
-                        .child(
-                            crate::render::blocks_column_spaced(
-                                blocks,
-                                &palette,
-                                false,
-                                &crate::render::ImageGallery::default(),
-                                folds.columns.blocks(folds.fill).with_links(folds.live),
-                                crate::render::BLOCK_GAP,
-                                &markers,
-                            )
-                            .line_height(px(theme.ui_px * 1.45)),
-                        )
-                        .into_any_element(),
-                    None => folds.columns.flow(
-                        |columns| columns.prose,
-                        |_, live| {
-                            div()
-                                .pb(px(8.))
-                                .line_height(px(theme.ui_px * 1.45))
-                                .map(|block| match &body.blocks[at] {
-                                    BodyBlock::Markdown { doc, agent } => block.child(
-                                        crate::compose_ui::render_draft_doc(doc, *agent, theme),
-                                    ),
-                                    BodyBlock::Text(text) => {
-                                        block.child(crate::render::plain_text(
-                                            text,
-                                            palette,
-                                            at,
-                                            folds.live && live,
-                                        ))
-                                    }
-                                    _ => block,
-                                })
-                                .into_any_element()
-                        },
-                    ),
-                    Some(kind) => {
-                        let lines = texts
-                            .iter()
-                            .flat_map(|text| text.lines())
-                            .filter(|line| !line.trim().is_empty())
-                            .count();
-                        let rtl = texts
-                            .iter()
-                            .find(|text| text.chars().any(char::is_alphabetic))
-                            .is_some_and(|text| crate::render::is_right_to_left(text));
-                        let line_height = px(theme.ui_px * 1.4);
-                        fold_section(
-                            theme,
-                            FoldLabel {
-                                kind,
-                                lines,
-                                show_key: Some(run) == first_hidden,
-                                rtl,
-                            },
-                            folds,
-                            (folds.columns.moving_prose(), folds.columns.pane_right),
-                            reveal,
-                            || {
-                                folds.columns.flow(
-                                    |columns| columns.prose,
-                                    |_, live| {
-                                        history_rule(div(), rtl, crate::theme::strong_border(theme))
-                                            .text_color(rgb(theme.dimmed))
-                                            .line_height(line_height)
-                                            .flex()
-                                            .flex_col()
-                                            .gap(line_height)
-                                            .children(texts.iter().enumerate().map(
-                                                |(index, text)| {
-                                                    crate::render::plain_text(
-                                                        text,
-                                                        quiet,
-                                                        at + index,
-                                                        folds.live && folds.open && live,
-                                                    )
-                                                },
-                                            ))
-                                            .into_any_element()
-                                    },
-                                )
-                            },
-                            cx,
-                        )
-                    }
-                })
-                .collect()
-        }
+        Rich::PlainPart(plain) => plain,
+        _ => &message.body,
     };
-    div().opacity(alpha).children(blocks).into_any_element()
+    div()
+        .opacity(alpha)
+        .child(plain_message_body(theme, body, folds, reveal, markers, cx))
+        .into_any_element()
+}
+
+fn plain_message_body(
+    theme: &Theme,
+    body: &RenderedBody,
+    folds: FoldView,
+    reveal: Option<f32>,
+    markers: &crate::render::ListMarkerFont,
+    cx: &mut Context<Inbox>,
+) -> gpui::AnyElement {
+    let blocks: Vec<_> = {
+        // A signature and the quote next to it fold as one, as in HTML.
+        // A draft's markdown is painted as its compose window shows it.
+        let palette = mail_body::palette(theme);
+        let quiet = mail_body::history_palette(theme);
+        let mut runs: Vec<(
+            usize,
+            Option<fell_render::Fold>,
+            Vec<&crate::text_render::PlainText>,
+        )> = Vec::new();
+        let markers = markers.with_top_level_lists(
+            body.blocks
+                .iter()
+                .filter_map(|block| match block {
+                    BodyBlock::List(blocks) => Some(blocks.iter()),
+                    _ => None,
+                })
+                .flatten(),
+        );
+        for (at, block) in body.blocks.iter().enumerate() {
+            let (kind, text) = match block {
+                BodyBlock::Text(text) => (None, text),
+                BodyBlock::List(_) | BodyBlock::Markdown { .. } => {
+                    runs.push((at, None, Vec::new()));
+                    continue;
+                }
+                BodyBlock::Quote(text) => (Some(fell_render::Fold::Quote), text),
+                BodyBlock::Signature(text) => (Some(fell_render::Fold::Signature), text),
+            };
+            match (runs.last_mut(), kind) {
+                (Some((_, Some(above), texts)), Some(next)) => {
+                    *above = joined_fold(*above, next);
+                    texts.push(text);
+                }
+                _ => runs.push((at, kind, vec![text])),
+            }
+        }
+        let first_hidden = runs
+            .iter()
+            .position(|(_, kind, _)| kind.is_some())
+            .filter(|_| folds.name_key);
+        runs.into_iter()
+            .enumerate()
+            .map(|(run, (at, kind, texts))| match kind {
+                None if let BodyBlock::List(blocks) = &body.blocks[at] => div()
+                    .pt(px(14.))
+                    .pb(px(22.))
+                    .child(
+                        crate::render::blocks_column_spaced(
+                            blocks,
+                            &palette,
+                            false,
+                            &crate::render::ImageGallery::default(),
+                            folds.columns.blocks(folds.fill).with_links(folds.live),
+                            crate::render::BLOCK_GAP,
+                            &markers,
+                        )
+                        .line_height(px(theme.ui_px * 1.45)),
+                    )
+                    .into_any_element(),
+                None => folds.columns.flow(
+                    |columns| columns.prose,
+                    |_, live| {
+                        div()
+                            .pb(px(8.))
+                            .line_height(px(theme.ui_px * 1.45))
+                            .map(|block| match &body.blocks[at] {
+                                BodyBlock::Markdown { doc, agent } => block
+                                    .child(crate::compose_ui::render_draft_doc(doc, *agent, theme)),
+                                BodyBlock::Text(text) => block.child(crate::render::plain_text(
+                                    text,
+                                    palette,
+                                    at,
+                                    folds.live && live,
+                                )),
+                                _ => block,
+                            })
+                            .into_any_element()
+                    },
+                ),
+                Some(kind) => {
+                    let lines = texts
+                        .iter()
+                        .flat_map(|text| text.lines())
+                        .filter(|line| !line.trim().is_empty())
+                        .count();
+                    let rtl = texts
+                        .iter()
+                        .find(|text| text.chars().any(char::is_alphabetic))
+                        .is_some_and(|text| crate::render::is_right_to_left(text));
+                    let line_height = px(theme.ui_px * 1.4);
+                    fold_section(
+                        theme,
+                        FoldLabel {
+                            kind,
+                            lines,
+                            show_key: Some(run) == first_hidden,
+                            rtl,
+                        },
+                        folds,
+                        (folds.columns.moving_prose(), folds.columns.pane_right),
+                        reveal,
+                        || {
+                            folds.columns.flow(
+                                |columns| columns.prose,
+                                |_, live| {
+                                    history_rule(div(), rtl, crate::theme::strong_border(theme))
+                                        .text_color(rgb(theme.dimmed))
+                                        .line_height(line_height)
+                                        .flex()
+                                        .flex_col()
+                                        .gap(line_height)
+                                        .children(texts.iter().enumerate().map(|(index, text)| {
+                                            crate::render::plain_text(
+                                                text,
+                                                quiet,
+                                                at + index,
+                                                folds.live && folds.open && live,
+                                            )
+                                        }))
+                                        .into_any_element()
+                                },
+                            )
+                        },
+                        cx,
+                    )
+                }
+            })
+            .collect()
+    };
+    div().children(blocks).into_any_element()
 }
 
 /// A prepared HTML body, one section at a time: what the sender wrote is
 /// painted; quoted history and the signature fold to one line until `q`.
 fn html_sections(
     theme: &Theme,
-    body: &HtmlBody,
+    (body, continuation, only_folds): (&HtmlBody, Option<&Continuation>, bool),
     folds: FoldView,
     reveal: Option<f32>,
     markers: &crate::render::ListMarkerFont,
@@ -11124,7 +11589,7 @@ fn html_sections(
 ) -> Vec<gpui::AnyElement> {
     let palette = mail_body::palette(theme);
     let quiet = mail_body::history_palette(theme);
-    let line = px(theme.ui_px * 1.45);
+    let line = px(fell_render::reader_line_height(theme.ui_px));
     let folded = &body.folded;
     let top_level_markers = markers.with_top_level_lists(&folded.document.blocks);
     let columns = folds.columns;
@@ -11137,6 +11602,7 @@ fn html_sections(
         .sections
         .iter()
         .enumerate()
+        .filter(|(_, section)| !only_folds || section.fold.is_some())
         .map(|(at, section)| {
             let rtl = body.rtl.get(at).copied().unwrap_or(false);
             let blocks = folded.blocks(section);
@@ -11156,7 +11622,7 @@ fn html_sections(
                         None,
                         &quiet,
                         &body.gallery,
-                        (theme, rtl, layout, markers),
+                        (theme, rtl, layout, markers, folds.image_consent),
                     ))
                     .into_any_element(),
                 // A short signature shown in place ("Sent from my iPhone")
@@ -11168,13 +11634,13 @@ fn html_sections(
                         quiet.pt(px(16.)).text_color(rgb(theme.dimmed))
                     })
                     .child(
-                        crate::render::blocks_column_spaced(
+                        crate::render::blocks_column_with_headings(
                             blocks,
                             if section.quiet { &quiet } else { &palette },
-                            false,
+                            folds.image_consent,
                             &body.gallery,
                             layout,
-                            crate::render::BLOCK_GAP,
+                            (fell_render::reader_paragraph_gap(theme.ui_px), continuation),
                             &top_level_markers,
                         )
                         .line_height(line),
@@ -11199,7 +11665,7 @@ fn html_sections(
                                 Some(kind),
                                 &history,
                                 &body.gallery,
-                                (theme, rtl, layout, markers),
+                                (theme, rtl, layout, markers, folds.image_consent),
                             )
                         },
                         cx,
@@ -11210,16 +11676,85 @@ fn html_sections(
         .collect()
 }
 
+#[cfg(test)]
+pub(crate) fn gmail_reply_geometry(
+    body: &HtmlBody,
+    snapshot: &crate::render::webview::Snapshot,
+) -> [(f32, f32); 2] {
+    use gpui::{VisualTestContext, point, size};
+
+    let (mut app, inbox) = tests::pending_inbox();
+    let entity = inbox.root(&mut app).unwrap();
+    let mut app = VisualTestContext::from_window(*inbox, &app);
+    let width = snapshot.width + CONVERSATION_RULE_PX + 2. * (CONVERSATION_PAD_PX + MESSAGE_PAD_PX);
+    let columns = ReaderColumns::split(width);
+    [false, true].map(|web| {
+        let measured = Rc::new(Cell::new(None));
+        let output = measured.clone();
+        app.draw(
+            point(px(0.), px(0.)),
+            size(px(width), px(400.)),
+            |window, cx| {
+                entity.update(cx, |inbox, cx| {
+                    let mut theme = inbox.theme.clone();
+                    theme.ui_px = 15.;
+                    let style = conversation_line_style(window, &theme, px(theme.ui_px));
+                    let markers = crate::render::ListMarkerFont::new(window, style);
+                    let folds = FoldView {
+                        open: false,
+                        columns,
+                        name_key: true,
+                        focused: 1.,
+                        fill: theme.surface,
+                        index: 0,
+                        live: false,
+                        image_consent: false,
+                    };
+                    div()
+                        .when(web, |body| {
+                            body.child(columns.card.place(crate::render::web_snapshot(
+                                snapshot,
+                                columns.card.width,
+                                theme.surface,
+                                theme.dimmed,
+                                None,
+                            )))
+                        })
+                        .children(html_sections(
+                            &theme,
+                            (body, None, web),
+                            folds,
+                            None,
+                            &markers,
+                            cx,
+                        ))
+                        .on_children_prepainted(move |bounds, _, _| {
+                            let [reply, fold] = bounds.as_slice() else {
+                                panic!("expected a reply and a fold row");
+                            };
+                            output.set(Some((
+                                f32::from(fold.top() - reply.top()),
+                                f32::from(fold.bottom() - reply.top()),
+                            )));
+                        })
+                })
+            },
+        );
+        measured.get().expect("measured reply and fold row")
+    })
+}
+
 fn history_section(
     blocks: &[fell_render::Block],
     kind: Option<fell_render::Fold>,
     palette: &crate::render::Palette,
     gallery: &crate::render::ImageGallery,
-    (theme, rtl, layout, markers): (
+    (theme, rtl, layout, markers, image_consent): (
         &Theme,
         bool,
         crate::render::BlockColumns,
         &crate::render::ListMarkerFont,
+        bool,
     ),
 ) -> gpui::AnyElement {
     let (rule, layout) = layout.quote(
@@ -11235,7 +11770,7 @@ fn history_section(
             kind,
             palette,
             gallery,
-            (theme, rtl, layout, markers),
+            (theme, rtl, layout, markers, image_consent),
         ))
         .into_any_element()
 }
@@ -11264,11 +11799,12 @@ fn history_blocks(
     kind: Option<fell_render::Fold>,
     history: &crate::render::Palette,
     gallery: &crate::render::ImageGallery,
-    (theme, rtl, layout, markers): (
+    (theme, rtl, layout, markers, image_consent): (
         &Theme,
         bool,
         crate::render::BlockColumns,
         &crate::render::ListMarkerFont,
+        bool,
     ),
 ) -> gpui::AnyElement {
     use fell_render::{Block, Fold};
@@ -11278,8 +11814,16 @@ fn history_blocks(
     );
     let line_height = px(theme.ui_px * 1.4);
     let column = |run: &[Block], layout| {
-        crate::render::blocks_column_spaced(run, history, false, gallery, layout, 8., markers)
-            .line_height(line_height)
+        crate::render::blocks_column_spaced(
+            run,
+            history,
+            image_consent,
+            gallery,
+            layout,
+            8.,
+            markers,
+        )
+        .line_height(line_height)
     };
     div()
         .flex()
@@ -11364,6 +11908,8 @@ fn fold_section(
         || {
             summary
                 .place(folded_line(theme, &label, folds, cx))
+                // Keep the gap inside the measured row across renderer swaps.
+                .pb(px(FOLD_GAP_PX))
                 .into_any_element()
         },
         || {
@@ -11395,7 +11941,6 @@ fn folded_line(
     let accent = theme.accent;
     history_rule(div(), label.rtl, rule)
         .h(px(FOLD_ROW_PX - FOLD_GAP_PX))
-        .mb(px(FOLD_GAP_PX))
         .flex()
         .items_center()
         .truncate()
@@ -13256,7 +13801,9 @@ fn should_follow_visible(overlay: &Overlay, chord_empty: bool, pane: Pane, key: 
     match key {
         KeyId::Char('j' | 'k' | 'q') => true,
         // Expand, reply, reply all, and forward act on the message on screen.
-        KeyId::Enter | KeyId::Char('o' | 'r' | 'R' | 'f' | 'a') => pane == Pane::Conversation,
+        KeyId::Enter | KeyId::Char('o' | 'r' | 'R' | 'f' | 'a' | 'w' | 'i' | 'I') => {
+            pane == Pane::Conversation
+        }
         _ => false,
     }
 }
@@ -14177,6 +14724,54 @@ mod tests {
     }
 
     #[test]
+    fn a_pending_web_body_keeps_room_for_formatting_with_only_a_short_preview() {
+        use super::{ConvFrame, ConvMessage, Rich, measured_message_body};
+        use gpui::{Context, ParentElement, Render, Styled, Window, px};
+        use std::{cell::Cell, rc::Rc};
+
+        struct BodyProbe {
+            message: ConvMessage,
+            preview_height: f32,
+            measured: Rc<Cell<f32>>,
+        }
+
+        impl Render for BodyProbe {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let mut frame = ConvFrame::default();
+                frame
+                    .body_probes
+                    .insert(self.message.id.clone(), self.measured.clone());
+                div().child(measured_message_body(
+                    &self.message,
+                    ReaderColumns::split(500.),
+                    &frame,
+                    div().h(px(self.preview_height)).into_any_element(),
+                ))
+            }
+        }
+
+        let (mut app, inbox) = pending_inbox();
+        let message = inbox
+            .update(&mut app, |inbox, _, _| inbox.session.messages[0].clone())
+            .unwrap();
+        for (rich, preview_height, expected) in [
+            (Rich::PendingWeb, 22., 100.),
+            (Rich::PendingWeb, 140., 140.),
+            (Rich::Pending, 22., 22.),
+        ] {
+            let mut message = message.clone();
+            message.rich = rich;
+            let measured = Rc::new(Cell::new(0.));
+            app.add_window(|_, _| BodyProbe {
+                message,
+                preview_height,
+                measured: measured.clone(),
+            });
+            assert_eq!(measured.get(), expected);
+        }
+    }
+
+    #[test]
     fn pending_bodies_settle_without_a_cursor() {
         with_pending_inbox(|inbox, cx| {
             inbox.session.cursor_id = None;
@@ -14210,7 +14805,13 @@ mod tests {
     fn pending_bodies_fade_when_the_conversation_read_fails() {
         with_pending_inbox(|inbox, cx| {
             let id = inbox.open_thread.clone().unwrap();
-            inbox.receive_conversation(id, 1, Err("failed to read thread".into()), cx);
+            inbox.receive_conversation(
+                id,
+                1,
+                Instant::now(),
+                Err("failed to read thread".into()),
+                cx,
+            );
             assert!(
                 inbox
                     .pending_bodies
@@ -14233,7 +14834,7 @@ mod tests {
                 reads: Default::default(),
                 matches: None,
             };
-            inbox.receive_conversation(id, 1, Ok(Some(reply)), cx);
+            inbox.receive_conversation(id, 1, Instant::now(), Ok(Some(reply)), cx);
             assert!(inbox.pending_bodies.downloading(&inbox.session.sync));
             assert!(
                 inbox
@@ -14250,7 +14851,7 @@ mod tests {
                 reads: Default::default(),
                 matches: None,
             };
-            inbox.receive_conversation(id, 1, Ok(Some(reply)), cx);
+            inbox.receive_conversation(id, 1, Instant::now(), Ok(Some(reply)), cx);
             let now = inbox.motion.clock.now();
             inbox.apply_body_refresh(now);
         });
@@ -14334,6 +14935,7 @@ mod tests {
             inbox.receive_conversation(
                 row.id,
                 before + 1,
+                Instant::now(),
                 Ok(Some(super::ConversationRead {
                     notes: None,
                     latest_note: None,
@@ -14467,6 +15069,7 @@ mod tests {
                 inbox.receive_conversation(
                     row.id.clone(),
                     read,
+                    Instant::now(),
                     Ok(Some(super::ConversationRead {
                         notes: None,
                         latest_note: None,
@@ -15173,6 +15776,7 @@ mod tests {
                             ReaderColumns::split(600.),
                             None,
                             super::GroupingMarker::default(),
+                            (None, theme.surface),
                             window,
                         )
                     });

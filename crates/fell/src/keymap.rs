@@ -84,6 +84,10 @@ pub enum Action {
     Visual,
     FullWidth,
     ToggleQuotes,
+    ToggleWebView,
+    AllowMessageImages,
+    AllowSenderImages,
+    BlockSenderImages,
     Palette,
     Help,
     About,
@@ -162,6 +166,10 @@ impl Action {
             Self::ToggleSelect => "Toggle select",
             Self::Visual => "Visual select",
             Self::FullWidth => "Full-width conversation",
+            Self::ToggleWebView => "Toggle web view",
+            Self::AllowMessageImages => "Load images",
+            Self::AllowSenderImages => "Always allow images from this sender",
+            Self::BlockSenderImages => "Revoke image permission for this sender",
             Self::ToggleQuotes => "Quoted text and recipients",
             Self::Palette => "Command palette",
             Self::Help => "Help",
@@ -226,6 +234,10 @@ pub const ACTION_SECTIONS: &[(&str, &[Action])] = &[
             Action::PageUp,
             Action::FullWidth,
             Action::ToggleQuotes,
+            Action::ToggleWebView,
+            Action::AllowMessageImages,
+            Action::AllowSenderImages,
+            Action::BlockSenderImages,
             Action::FocusLinks,
         ],
     ),
@@ -585,6 +597,21 @@ fn default_bindings() -> Vec<Binding> {
             Some("Agents"),
         );
     }
+    for (key, action) in [
+        ('w', Action::ToggleWebView),
+        ('i', Action::AllowMessageImages),
+        ('I', Action::AllowSenderImages),
+        ('B', Action::BlockSenderImages),
+    ] {
+        if action != Action::BlockSenderImages {
+            bind(&[KeyId::Char(key)], action, None);
+        }
+        bind(
+            &[KeyId::Leader, KeyId::Char('t'), KeyId::Char(key)],
+            action,
+            Some("Reading / notifications"),
+        );
+    }
     bind(
         &[KeyId::Leader, KeyId::Char('t'), KeyId::Char('z')],
         Action::FullWidth,
@@ -806,6 +833,7 @@ pub fn binding_text(keymap: &Keymap, action: Action) -> String {
 
 pub fn key_label(key: KeyId, leader_name: &str) -> String {
     match key {
+        KeyId::Char(ch) if ch.is_ascii_uppercase() => format!("⇧{ch}"),
         KeyId::Char(ch) => ch.to_string(),
         KeyId::Space => "space".into(),
         KeyId::Leader => leader_name.to_string(),
@@ -1151,10 +1179,10 @@ mod tests {
     #[test]
     fn r_shift_r_and_f_answer_and_the_palette_lists_them() {
         let keymap = Keymap::default();
-        for (key, action, label) in [
-            ('r', Action::Reply, "Reply"),
-            ('R', Action::ReplyAll, "Reply all"),
-            ('f', Action::Forward, "Forward"),
+        for (key, binding, action, label) in [
+            ('r', "r", Action::Reply, "Reply"),
+            ('R', "⇧R", Action::ReplyAll, "Reply all"),
+            ('f', "f", Action::Forward, "Forward"),
         ] {
             assert_eq!(
                 match_seq(&keymap, &[KeyId::Char(key)]),
@@ -1164,7 +1192,7 @@ mod tests {
                 .into_iter()
                 .find(|item| item.action == action)
                 .expect("in the palette");
-            assert_eq!(item.binding, key.to_string());
+            assert_eq!(item.binding, binding);
             assert_eq!(item.label, label);
         }
         assert_eq!(

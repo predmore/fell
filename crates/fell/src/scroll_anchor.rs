@@ -1,6 +1,9 @@
 //! Hold a message at a given viewport Y using this frame's layout.
 
-use std::{cell::Cell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
 use gpui::{AnyElement, App, Bounds, IntoElement, LayoutId, Pixels, ScrollHandle, Window, px};
 
@@ -23,21 +26,36 @@ pub(super) struct ScrollAnchor {
 #[derive(Default)]
 pub(super) struct ReaderLanding {
     id: Option<String>,
+    position: Option<Pixels>,
 }
 
 impl ReaderLanding {
     pub fn hold(&mut self, id: Option<&str>) {
         self.id = id.map(str::to_owned);
+        self.position = None;
+    }
+
+    pub fn hold_position(&mut self, id: &str, y: Pixels) {
+        self.id = Some(id.to_owned());
+        self.position = Some(y);
+    }
+
+    pub fn preserves_position(&self) -> bool {
+        self.position.is_some()
     }
 
     pub fn anchor(
         &mut self,
         id: Option<&str>,
-        anchor: ScrollAnchor,
+        mut anchor: ScrollAnchor,
         gliding: bool,
     ) -> Option<ScrollAnchor> {
         if self.id.as_deref() != id {
             self.hold(None);
+        }
+        if let Some(y) = self.position {
+            anchor.y = y;
+            anchor.snap_headers = false;
         }
         (!gliding && self.id.is_some()).then_some(anchor)
     }
@@ -185,6 +203,24 @@ fn visible_top(view: Bounds<Pixels>, offset: Pixels, item: Bounds<Pixels>) -> Op
         .then(|| top - view.top())
 }
 
+fn continuation_landing(
+    view: Bounds<Pixels>,
+    body: Bounds<Pixels>,
+    native: Bounds<Pixels>,
+    fraction: f32,
+    headings: impl Iterator<Item = Pixels>,
+) -> Pixels {
+    let mapped = native.size.height * fraction;
+    let fallback = (mapped - px(24.)).max(px(0.));
+    let into_body = headings
+        .map(|top| top - native.top())
+        .filter(|heading| *heading >= fallback && *heading <= mapped + view.size.height)
+        .min_by(|a, b| f32::from(*a).total_cmp(&f32::from(*b)))
+        .unwrap_or(fallback);
+    // The scroll area's bounds start after the subject and any pinned header.
+    offset_to_hold(view, body, px(8.) - into_body)
+}
+
 fn offset_to_hold(view: Bounds<Pixels>, item: Bounds<Pixels>, y: Pixels) -> Pixels {
     (y - (item.top() - view.top())).min(px(0.))
 }
@@ -253,6 +289,31 @@ fn offset_to_reveal(view: Bounds<Pixels>, item: Bounds<Pixels>, offset: Pixels) 
 
 pub(super) type LayoutSlot = Rc<Cell<Option<LayoutId>>>;
 
+#[derive(Clone)]
+pub(super) struct Continuation {
+    fraction: f32,
+    pub body: LayoutSlot,
+    pub native_body: LayoutSlot,
+    headings: Rc<RefCell<Vec<LayoutSlot>>>,
+}
+
+impl Continuation {
+    pub fn new(fraction: f32) -> Self {
+        Self {
+            fraction,
+            body: LayoutSlot::default(),
+            native_body: LayoutSlot::default(),
+            headings: Rc::default(),
+        }
+    }
+
+    pub fn heading(&self, inner: AnyElement) -> LayoutProbe {
+        let slot = LayoutSlot::default();
+        self.headings.borrow_mut().push(slot.clone());
+        LayoutProbe { inner, slot }
+    }
+}
+
 /// Probes for the live conversation. A snapped landing uses the same cards
 /// that determine the scroll div's max offset, including its last card.
 pub(super) struct MessageProbes {
@@ -309,6 +370,7 @@ impl MessageProbes {
             y: Some(self.anchor.y),
             glide: self.glide,
             body_scroll: self.anchor.body_scroll,
+            continuation: None,
             frames,
         }
     }
@@ -329,6 +391,7 @@ pub(super) struct LandingHold {
     pub y: Option<Pixels>,
     pub glide: Option<LandingGlide>,
     body_scroll: Option<(Pixels, f32)>,
+    continuation: Option<Continuation>,
     /// `FELL_FRAME_LOG`: each offset set here is a `landing` note.
     pub frames: Option<SharedFrameLog>,
 }
@@ -341,6 +404,17 @@ pub(super) struct LandingGlide {
 }
 
 impl LandingHold {
+    pub fn continue_body(
+        inner: AnyElement,
+        scroll: ScrollHandle,
+        continuation: Continuation,
+        frames: Option<SharedFrameLog>,
+    ) -> Self {
+        let mut landing = Self::reveal(inner, scroll, continuation.body.clone(), frames);
+        landing.continuation = Some(continuation);
+        landing
+    }
+
     pub fn reveal(
         inner: AnyElement,
         scroll: ScrollHandle,
@@ -356,6 +430,7 @@ impl LandingHold {
             y: None,
             glide: None,
             body_scroll: None,
+            continuation: None,
             frames,
         }
     }
@@ -406,8 +481,26 @@ impl gpui::Element for LandingHold {
             // The scroll div clamps the result against its new content height.
             let item = window.layout_bounds(item);
             let mut offset = before;
-            offset.y = match self.y {
-                Some(y) => {
+            offset.y = match (&self.continuation, self.y) {
+                (Some(continuation), _) => {
+                    let headings = continuation.headings.borrow();
+                    // During the fade the native layer is laid out as a
+                    // separate root, then painted at the body slot's origin.
+                    let native = continuation
+                        .native_body
+                        .get()
+                        .map_or(item, |id| window.layout_bounds(id));
+                    continuation_landing(
+                        bounds,
+                        item,
+                        native,
+                        continuation.fraction,
+                        headings
+                            .iter()
+                            .filter_map(|slot| Some(window.layout_bounds(slot.get()?).top())),
+                    )
+                }
+                (_, Some(y)) => {
                     let headers: smallvec::SmallVec<[_; 16]> = self
                         .headers
                         .iter()
@@ -423,7 +516,7 @@ impl gpui::Element for LandingHold {
                         px(motion::snap(moving, window.scale_factor()))
                     })
                 }
-                None => offset_to_reveal(bounds, item, before.y),
+                _ => offset_to_reveal(bounds, item, before.y),
             };
             self.scroll.set_offset(offset);
         }
@@ -522,6 +615,46 @@ mod tests {
 
     fn vertical_bounds(y: f32, height: f32) -> Bounds<Pixels> {
         Bounds::new(point(px(0.), px(y)), size(px(100.), px(height)))
+    }
+
+    #[test]
+    fn continuation_chooses_the_first_nearby_section() {
+        let view = vertical_bounds(100., 600.);
+        let body = vertical_bounds(250., 12_000.);
+        for native in [body, vertical_bounds(0., 12_000.)] {
+            let headings = [5_850., 6_450., 6_080.]
+                .into_iter()
+                .map(|y| native.top() + px(y));
+            let offset = continuation_landing(view, body, native, 0.5, headings);
+            assert_eq!(body.top() + px(6_080.) + offset, view.top() + px(8.));
+        }
+    }
+
+    #[test]
+    fn continuation_uses_the_mapped_position_when_headings_are_far_away() {
+        let view = vertical_bounds(100., 600.);
+        let body = vertical_bounds(250., 12_000.);
+        for headings in [vec![px(0.)], vec![px(0.), px(6_601.)]] {
+            let offset = continuation_landing(
+                view,
+                body,
+                body,
+                0.5,
+                headings.into_iter().map(|y| body.top() + y),
+            );
+            assert_eq!(body.top() + px(5_976.) + offset, view.top() + px(8.));
+        }
+    }
+
+    #[test]
+    fn continuation_aligns_below_the_subject_at_its_laid_out_height() {
+        let body = vertical_bounds(250., 12_000.);
+        for subject in [vertical_bounds(30., 68.), vertical_bounds(30., 104.)] {
+            let view = vertical_bounds(f32::from(subject.bottom()), 600.);
+            let offset =
+                continuation_landing(view, body, body, 0.5, [body.top() + px(5_980.)].into_iter());
+            assert_eq!(body.top() + px(5_980.) + offset, subject.bottom() + px(8.));
+        }
     }
 
     #[test]

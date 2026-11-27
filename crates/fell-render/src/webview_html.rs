@@ -1,44 +1,619 @@
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::ops::Deref;
+use std::ops::{Deref, Range};
 
-/// HTML handed to WebKit. Scripts are removed, remote images are stripped
-/// until the reader allows them, and a content-security policy blocks
-/// everything else.
-pub struct WebFrame {
-    pub scheme: &'static str,
-    pub allow_remote_images: bool,
+use cssparser::{Delimiter, ParseError, Parser, ParserInput, Token};
+
+use crate::html;
+
+mod layout;
+pub(crate) use layout::LayoutStyles;
+use layout::style_applies;
+
+/// Largest scroll width that can be captured in a single raster.
+pub const WEB_SNAPSHOT_WIDTH_LIMIT: i32 = 8192;
+
+/// Keep a 15 px body font at about 9 px or larger when fitting the snapshot.
+pub fn web_snapshot_readable_width(viewport: f32) -> f32 {
+    viewport / 0.6
 }
 
-pub fn wrap_for_webview(source_html: &str, frame: &WebFrame) -> String {
-    let body = sanitize_html(source_html, frame.allow_remote_images);
-    let img_src = if frame.allow_remote_images {
-        "img-src data: blob: https: http:;"
-    } else {
-        "img-src data: blob:;"
-    };
+/// Line height shared by the simple reader and themed web snapshots.
+pub fn reader_line_height(size: f32) -> f32 {
+    22. * size / layout::BODY_FONT_SIZE
+}
+
+/// Typography and colors shared with the native reader for colorless mail.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WebTextStyle {
+    pub family: Option<String>,
+    pub size: f32,
+    pub foreground: u32,
+    pub link: u32,
+    pub border: u32,
+    /// Whether a body without its own spacing should have a paper inset.
+    pub inset: bool,
+}
+
+fn web_page(content: &str, scheme: &str, body_css: &str, link_css: &str) -> String {
     format!(
         r#"<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
 <meta name="color-scheme" content="{scheme}">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; {img_src} font-src data:; media-src 'none'; frame-src 'none'; script-src 'none'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none';">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="x-dns-prefetch-control" content="off">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data: cid:; font-src data:; media-src 'none'; frame-src 'none'; script-src 'none'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none';">
 <style>
-  html, body {{ margin: 0; padding: 0; background: transparent; }}
+  html, body {{ margin: 0; padding: 0; }}
+  img, span[data-fell-image-tile] {{ max-width: 100%; }}
+  body {{ overflow-wrap: anywhere; {body_css} }}
+  {link_css}
+  span[data-fell-image-tile], img[src=""] {{
+    background-color: rgba(128, 128, 128, 0.12);
+    box-sizing: border-box;
+    border: 0 !important;
+    border-radius: 4px;
+    outline: 0 !important;
+    color: color-mix(in srgb, currentColor 65%, gray) !important;
+  }}
+  span[data-fell-image-tile] {{
+    display: inline-block;
+    position: relative;
+    vertical-align: baseline;
+    text-decoration: none;
+    overflow: hidden;
+    width: min(100%, var(--fell-tile-width, 120px));
+    height: var(--fell-tile-height, auto);
+    aspect-ratio: var(--fell-tile-ratio, 3 / 2);
+  }}
+  span[data-fell-image-tile]:not([width])[height] {{ width: auto; }}
+  span[data-fell-image-tile]::before {{
+    position: absolute;
+    inset: 0;
+    padding: 4px 6px;
+    content: attr(aria-label);
+  }}
+  img[src=""] {{ padding: 4px; }}
+  img[src=""]:not([width][height]) {{ aspect-ratio: 3 / 2; }}
+  img[src=""]:not([width], [height]) {{ width: 120px; }}
+  img {{ height: auto; object-fit: contain; }}
 </style>
 </head>
-<body>{body}</body>
+<body{content}</body>
 </html>"#,
-        scheme = frame.scheme,
-        img_src = img_src,
-        body = body,
     )
+}
+
+/// A sanitized page with slots for remote raster images. The browser only ever
+/// sees local bytes. The caller supplies a slot value after the user consents.
+#[derive(Debug)]
+pub struct WebMail {
+    content: String,
+    slots: Vec<(usize, Slot)>,
+    has_remote_images: bool,
+    layout: layout::Estimate,
+    source_bytes: usize,
+    mapped_history: bool,
+}
+
+#[derive(Debug)]
+enum Slot {
+    Image(String),
+    ImageTag {
+        url: Option<String>,
+        label: String,
+        remote: bool,
+    },
+    ImageEnd,
+    HideFold {
+        end: usize,
+    },
+}
+
+#[derive(Default)]
+struct PageImages {
+    resources: Vec<(usize, Slot)>,
+    tags: Vec<(usize, Slot)>,
+}
+
+struct HistoryStyles<'a> {
+    nodes: &'a HashSet<ego_tree::NodeId>,
+    styles: Vec<Range<usize>>,
+}
+
+impl WebMail {
+    pub fn prepare(html: &str) -> Self {
+        Self::prepare_with_metrics(html, layout::TextMetrics::DEFAULT, None)
+    }
+
+    pub fn prepare_with_history(html: &str, folded: &crate::FoldedDocument) -> Self {
+        Self::prepare_with_metrics(html, layout::TextMetrics::DEFAULT, Some(folded))
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn calibration(html: &str) -> Self {
+        Self::prepare_with_metrics(html, layout::TextMetrics::CALIBRATION, None)
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn calibration_page(&self, scheme: &str) -> String {
+        use base64::Engine;
+        static FONT_CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let css = FONT_CSS.get_or_init(|| {
+            let font = base64::engine::general_purpose::STANDARD.encode(layout::CALIBRATION_FONT);
+            format!(
+                r#"<style>
+                @font-face {{ font-family: FellCalibration; src: url(data:font/ttf;base64,{font}); }}
+                * {{ font-family: FellCalibration !important; font-synthesis: none !important;
+                     font-kerning: none !important; font-variant-ligatures: none !important; }}
+                </style></head>"#,
+            )
+        });
+        self.page(scheme, |_| None).replacen("</head>", css, 1)
+    }
+
+    fn prepare_with_metrics(
+        html: &str,
+        metrics: layout::TextMetrics,
+        folded: Option<&crate::FoldedDocument>,
+    ) -> Self {
+        let dom = crate::html::parse_html(html);
+        let nodes = folded
+            .filter(|doc| doc.has_folds())
+            .and_then(|doc| history_nodes(&dom, doc));
+        let mut history = nodes.as_ref().map(|nodes| HistoryStyles {
+            nodes,
+            styles: Vec::new(),
+        });
+        let mut content = String::new();
+        let mut images = PageImages::default();
+        // Keep the body's presentation attributes while replacing its wrapper.
+        let mut author_background = false;
+        if let Some(element) = dom
+            .root_element()
+            .children()
+            .filter_map(scraper::ElementRef::wrap)
+            .find(|element| element.value().name() == "body")
+        {
+            use std::fmt::Write;
+            for name in ["id", "class", "bgcolor", "text", "link", "vlink", "alink"] {
+                if let Some(value) = element.attr(name) {
+                    write!(content, " {name}=\"{}\"", escape_attr(value)).unwrap();
+                }
+            }
+            if let Some(value) = element.attr("background") {
+                if let Some(url) = remote_image_url(value) {
+                    content.push_str(" background=\"");
+                    images.resources.push((content.len(), Slot::Image(url)));
+                    content.push('"');
+                } else if keep_offline_attr(element.value(), "background", value) {
+                    write!(content, " background=\"{}\"", escape_attr(value)).unwrap();
+                }
+            }
+            content.push_str(" style=\"");
+            for rule in html::case_preserving_style(element.value()) {
+                author_background |= layout::sets_color(&rule);
+                if layout::is_body_spacing(&rule.name) || layout::is_color_property(&rule.name) {
+                    write!(content, "{}:", rule.name).unwrap();
+                    serialize_css_with_property(
+                        &rule.value,
+                        Some(&rule.name),
+                        &mut content,
+                        Some(&mut images.resources),
+                        escape_attr,
+                    );
+                    if rule.important {
+                        content.push_str(" !important");
+                    }
+                    content.push(';');
+                }
+            }
+            content.push('"');
+        }
+        content.push('>');
+        serialize_children(
+            dom.root_element(),
+            &mut content,
+            false,
+            true,
+            0,
+            Some(&mut images),
+            history.as_mut(),
+        );
+        let layout_dom = html::parse_html(&format!("<body{content}</body>"));
+        // Remote background attributes have empty slots in the offline page.
+        author_background |= dom
+            .root_element()
+            .descendants()
+            .filter_map(scraper::ElementRef::wrap)
+            .any(|node| {
+                node.attr("background")
+                    .is_some_and(|url| !url.trim().is_empty())
+            });
+        let layout =
+            layout::Estimate::prepare(&layout_dom, metrics, author_background, history.is_some());
+        let has_remote_images = !images.resources.is_empty();
+        let mut slots = images.tags;
+        slots.extend(images.resources);
+        if let Some(history) = history {
+            slots.extend(
+                history
+                    .styles
+                    .into_iter()
+                    .map(|range| (range.start, Slot::HideFold { end: range.end })),
+            );
+        }
+        slots.sort_unstable_by_key(|(offset, _)| *offset);
+        Self {
+            content,
+            slots,
+            has_remote_images,
+            layout,
+            source_bytes: html.len(),
+            mapped_history: nodes.is_some(),
+        }
+    }
+
+    pub fn mapped_history(&self) -> bool {
+        self.mapped_history
+    }
+
+    pub fn source_bytes(&self) -> usize {
+        self.source_bytes
+    }
+
+    pub fn estimated_height(&self, width: f32) -> f32 {
+        self.layout.height(width, Self::image_height_limit(width))
+    }
+
+    /// Returns no web height when the snapshot would be unreadable or too wide to rasterize.
+    pub fn estimated_height_with_style(
+        &self,
+        width: f32,
+        style: Option<&WebTextStyle>,
+    ) -> Option<f32> {
+        let size = style.map_or(layout::BODY_FONT_SIZE, |style| style.size);
+        self.layout.height_at_size(
+            width,
+            Self::image_height_limit(width),
+            size,
+            self.body_inset(style),
+            style.is_some(),
+        )
+    }
+
+    fn body_inset(&self, style: Option<&WebTextStyle>) -> bool {
+        self.layout.native_body_inset
+            && (self.has_author_colors() || style.is_none_or(|style| style.inset))
+    }
+
+    pub fn has_author_colors(&self) -> bool {
+        self.layout.author_colors
+    }
+
+    pub fn appearance<'a>(&self, scheme: &'a str, surface: u32) -> (&'a str, u32) {
+        if self.has_author_colors() {
+            ("light", 0xffffff)
+        } else {
+            (scheme, surface)
+        }
+    }
+
+    pub fn has_remote_images(&self) -> bool {
+        self.has_remote_images
+    }
+
+    pub fn image_height_limit(width: f32) -> f32 {
+        1.5 * width
+    }
+
+    pub fn page(&self, scheme: &str, image: impl FnMut(&str) -> Option<String>) -> String {
+        self.page_with_style(scheme, None, image)
+    }
+
+    pub fn page_with_style(
+        &self,
+        scheme: &str,
+        text: Option<&WebTextStyle>,
+        mut image: impl FnMut(&str) -> Option<String>,
+    ) -> String {
+        use std::fmt::Write;
+        let mut body_css = String::new();
+        let mut link_css = String::new();
+        if !self.has_author_colors() {
+            body_css.push_str("font-family: ");
+            if let Some(family) = text.and_then(|style| style.family.as_deref()) {
+                cssparser::serialize_string(&family.replace('<', "\u{fffd}"), &mut body_css)
+                    .unwrap();
+                body_css.push_str(", ");
+            }
+            let (size, line_height) = text.map_or_else(
+                || (layout::BODY_FONT_SIZE, layout::BODY_LINE_HEIGHT.to_string()),
+                |style| (style.size, format!("{}px", reader_line_height(style.size))),
+            );
+            write!(
+                body_css,
+                "system-ui, sans-serif; font-size: {size}px; line-height: {line_height};",
+            )
+            .unwrap();
+            if let Some(text) = text {
+                write!(body_css, " color: #{:06x};", text.foreground).unwrap();
+                let paragraph_gap = reader_paragraph_gap(text.size);
+                write!(
+                    link_css,
+                    "a:any-link {{ color: #{:06x}; }}
+                     hr {{ border: 0; border-top: 1px solid #{:06x}; }}
+                     div:has(> br:only-child:where(:not([data-fell-folded]))) {{ min-height: {paragraph_gap}px; }}
+                     p {{ margin: 0 0 {paragraph_gap}px; }}
+                     p:where(:last-child) {{ margin-bottom: 0; }}
+                     body > :first-child, p:first-child {{ margin-top: 0; }}
+                     p:empty {{ min-height: {paragraph_gap}px; margin: 0; }}",
+                    text.link,
+                    text.border,
+                )
+                .unwrap();
+            }
+        }
+        if self.body_inset(text) {
+            write!(
+                body_css,
+                " padding: {}px {}px; --fell-paper-inset: {};",
+                layout::BODY_PAD_Y,
+                layout::BODY_PAD_X,
+                layout::BODY_PAD_X,
+            )
+            .unwrap();
+        } else if self.layout.native_body_inset && text.is_some() {
+            write!(
+                body_css,
+                " padding-top: 1px; padding-bottom: {}px;",
+                layout::READER_BOTTOM_PAD - 1.
+            )
+            .unwrap();
+        }
+        let mut content = String::with_capacity(self.content.len());
+        let collapsed = self.mapped_history && !self.has_author_colors() && text.is_some();
+        if collapsed {
+            content.push_str(" data-fell-collapsed");
+            link_css.push_str(
+                " body[data-fell-collapsed] [data-fell-folded] { display: none !important; }",
+            );
+        }
+        let mut offset = 0;
+        let mut tile = false;
+        for (at, slot) in &self.slots {
+            if *at < offset {
+                continue;
+            }
+            content.push_str(&self.content[offset..*at]);
+            offset = *at;
+            match slot {
+                Slot::Image(url) => {
+                    if let Some(data) = image(url).filter(|data| data.starts_with("data:image/")) {
+                        content.push_str(&escape_attr(&data));
+                    }
+                }
+                Slot::ImageTag { url, label, remote } => {
+                    offset += "img".len();
+                    let data = url
+                        .as_deref()
+                        .and_then(&mut image)
+                        .filter(|data| data.starts_with("data:image/"));
+                    tile = data.is_none();
+                    if let Some(data) = data {
+                        write!(
+                            content,
+                            "img src=\"{}\" alt=\"{}\"",
+                            escape_attr(&data),
+                            escape_attr(label)
+                        )
+                        .unwrap();
+                    } else if *remote {
+                        let alt = escape_attr(label);
+                        let suffix = if alt.trim().is_empty() {
+                            String::new()
+                        } else {
+                            format!(" · {alt}")
+                        };
+                        write!(
+                            content,
+                            "span data-fell-image-tile role=\"img\" aria-label=\"Image blocked{suffix}\" data-fell-image-alt=\"{alt}\""
+                        )
+                        .unwrap();
+                    } else {
+                        write!(
+                            content,
+                            "span data-fell-image-tile role=\"img\" aria-label=\"{}\"",
+                            escape_attr(label)
+                        )
+                        .unwrap();
+                    }
+                }
+                Slot::ImageEnd if tile => {
+                    content.push_str("</span>");
+                    tile = false;
+                }
+                Slot::ImageEnd => {}
+                Slot::HideFold { end } if collapsed => {
+                    content.push_str("display:none !important");
+                    offset = *end;
+                }
+                Slot::HideFold { .. } => {}
+            }
+        }
+        content.push_str(&self.content[offset..]);
+        web_page(&content, self.appearance(scheme, 0).0, &body_css, &link_css)
+    }
+}
+
+/// The native paragraph break takes the space of one blank mail line.
+pub fn reader_paragraph_gap(size: f32) -> f32 {
+    24. * size / layout::BODY_FONT_SIZE
+}
+
+/// Reconcile native history with the source before hiding any of the author's
+/// DOM. In particular, quotes answered in place and short signatures stay open.
+fn history_nodes(
+    dom: &scraper::Html,
+    folded: &crate::FoldedDocument,
+) -> Option<HashSet<ego_tree::NodeId>> {
+    use scraper::node::Node;
+    type SourceNode<'a> = ego_tree::NodeRef<'a, Node>;
+
+    struct Span {
+        text: Range<usize>,
+        spacing: bool,
+        starts_with_visible_empty: bool,
+    }
+
+    fn normalized(text: &str) -> impl Iterator<Item = char> + '_ {
+        text.chars()
+            .filter(|ch| !ch.is_whitespace() && !html::is_invisible(*ch))
+    }
+
+    fn measure(
+        node: SourceNode<'_>,
+        source: &mut String,
+        spans: &mut HashMap<ego_tree::NodeId, Span>,
+        depth: u32,
+    ) -> bool {
+        if depth >= html::MAX_HTML_DEPTH {
+            return false;
+        }
+        let start = source.len();
+        let mut starts_with_visible_empty = false;
+        let spacing = match node.value() {
+            Node::Text(text) => {
+                source.extend(normalized(text));
+                start == source.len()
+            }
+            Node::Element(element) => match element.name() {
+                "style" | "script" | "head" | "title" | "template" => return true,
+                "img" => {
+                    source.extend(normalized(element.attr("alt").unwrap_or_default()));
+                    false
+                }
+                _ => {
+                    let mut spacing = matches!(element.name(), "br" | "div" | "p" | "span");
+                    for child in node.children() {
+                        spacing &= measure(child, source, spans, depth + 1);
+                        if let Some(span) = spans.get(&child.id())
+                            && span.text.start == start
+                        {
+                            starts_with_visible_empty |= (span.text.is_empty() && !span.spacing)
+                                || span.starts_with_visible_empty;
+                        }
+                    }
+                    // A marked quote owns even its leading non-text content.
+                    if element.name() == "blockquote" || crate::history::marker(element).is_some() {
+                        starts_with_visible_empty = false;
+                    }
+                    spacing
+                }
+            },
+            _ => return true,
+        };
+        spans.insert(
+            node.id(),
+            Span {
+                text: start..source.len(),
+                spacing,
+                starts_with_visible_empty,
+            },
+        );
+        spacing
+    }
+
+    let body = dom.root_element().children().find(|node| {
+        node.value()
+            .as_element()
+            .is_some_and(|element| element.name() == "body")
+    })?;
+    let mut source = String::new();
+    let mut spans = HashMap::new();
+    measure(body, &mut source, &mut spans, 0);
+    let mut at = 0;
+    let mut hidden: Vec<Range<usize>> = Vec::new();
+    for section in &folded.sections {
+        let text = crate::StyledDocument::blocks_text(folded.blocks(section));
+        let text: String = normalized(&text).collect();
+        let start = at;
+        let rest = &source[at..];
+        let skip_signature_delimiter = matches!(
+            section.fold,
+            Some(crate::Fold::Signature | crate::Fold::SignatureAndQuote)
+        ) || section.quiet;
+        if skip_signature_delimiter && !rest.starts_with(&text) && rest.starts_with("--") {
+            at += 2;
+        }
+        if !source[at..].starts_with(&text) {
+            return None;
+        }
+        at += text.len();
+        if section.fold.is_some() && start < at {
+            hidden.push(start..at);
+        }
+    }
+    if at != source.len() || hidden.is_empty() {
+        return None;
+    }
+
+    let mut nodes = HashSet::new();
+    let mut boundary_spacing = Vec::new();
+    for node in body.descendants().skip(1) {
+        let Some(Span {
+            text: span,
+            spacing,
+            starts_with_visible_empty,
+        }) = spans.get(&node.id())
+        else {
+            continue;
+        };
+        // A spacer at the start of a fold shares its text offset with any
+        // alt-free images, rules and other visible nodes beside it.
+        let index = hidden.partition_point(|range| range.end <= span.start);
+        let Some(range) = hidden.get(index).filter(|range| range.start <= span.end) else {
+            continue;
+        };
+        if span.is_empty() {
+            if span.start == range.start {
+                if *spacing {
+                    boundary_spacing.push(node.id());
+                } else {
+                    boundary_spacing.clear();
+                }
+            } else if *spacing {
+                nodes.insert(node.id());
+            }
+        } else if span.start >= range.start && span.end <= range.end {
+            nodes.extend(boundary_spacing.drain(..));
+            if span.start > range.start || !starts_with_visible_empty {
+                nodes.insert(node.id());
+            }
+        } else if span.start < range.end && span.end > range.start && node.value().is_text() {
+            // A source text node can straddle a native history boundary.
+            return None;
+        }
+    }
+    Some(nodes)
 }
 
 pub fn sanitize_html(html: &str, allow_remote_images: bool) -> String {
     let dom = crate::html::parse_html(html);
     let mut out = String::new();
-    serialize_children(dom.root_element(), &mut out, allow_remote_images, true, 0);
+    serialize_children(
+        dom.root_element(),
+        &mut out,
+        allow_remote_images,
+        true,
+        0,
+        None,
+        None,
+    );
     out
 }
 
@@ -48,9 +623,19 @@ fn serialize_children(
     allow_remote_images: bool,
     allow_style: bool,
     depth: u32,
+    mut images: Option<&mut PageImages>,
+    mut history: Option<&mut HistoryStyles<'_>>,
 ) {
     for child in node.children() {
-        serialize_node(child, out, allow_remote_images, allow_style, depth + 1);
+        serialize_node(
+            child,
+            out,
+            allow_remote_images,
+            allow_style,
+            depth + 1,
+            images.as_deref_mut(),
+            history.as_deref_mut(),
+        );
     }
 }
 
@@ -60,13 +645,35 @@ fn serialize_node(
     allow_remote_images: bool,
     allow_style: bool,
     depth: u32,
+    mut images: Option<&mut PageImages>,
+    mut history: Option<&mut HistoryStyles<'_>>,
 ) {
     if depth >= crate::html::MAX_HTML_DEPTH {
         out.push_str(&escape(&subtree_text(node)));
         return;
     }
+    let folded = history
+        .as_ref()
+        .is_some_and(|history| history.nodes.contains(&node.id()));
     match node.value() {
-        scraper::node::Node::Text(text) => out.push_str(&escape(text.deref())),
+        scraper::node::Node::Text(text) => {
+            let wrap = history.as_mut().filter(|history| {
+                folded
+                    && !node
+                        .ancestors()
+                        .any(|parent| history.nodes.contains(&parent.id()))
+            });
+            let wrapped = wrap.is_some();
+            if let Some(history) = wrap {
+                out.push_str("<span data-fell-folded style=\"");
+                history.styles.push(out.len()..out.len());
+                out.push_str("\">");
+            }
+            out.push_str(&escape(text.deref()));
+            if wrapped {
+                out.push_str("</span>");
+            }
+        }
         scraper::node::Node::Element(element) => {
             let name = element.name();
             if name == "iframe" {
@@ -80,6 +687,8 @@ fn serialize_node(
                     allow_remote_images,
                     allow_style,
                     depth,
+                    images,
+                    None,
                 );
                 return;
             }
@@ -105,13 +714,21 @@ fn serialize_node(
                     "html" | "body" | "head" | "form" | "noscript" | "object"
                 ) {
                     for child in node.children() {
-                        serialize_node(child, out, allow_remote_images, allow_style, depth + 1);
+                        serialize_node(
+                            child,
+                            out,
+                            allow_remote_images,
+                            allow_style,
+                            depth + 1,
+                            images.as_deref_mut(),
+                            history.as_deref_mut(),
+                        );
                     }
                 }
                 return;
             }
             if name == "style" {
-                if !allow_style {
+                if !allow_style || !style_applies(element) {
                     return;
                 }
                 let css = node
@@ -121,30 +738,126 @@ fn serialize_node(
                         _ => None,
                     })
                     .collect::<String>();
-                let css = sanitize_css(&css, allow_remote_images);
-                out.push_str("<style>");
-                out.push_str(&escape_style(&css));
+                out.push_str("<style");
+                if let Some(media) = element.attr("media") {
+                    out.push_str(" media=\"");
+                    out.push_str(&escape_attr(media));
+                    out.push('"');
+                }
+                out.push('>');
+                if let Some(slots) = images.as_deref_mut() {
+                    serialize_css(&css, out, Some(&mut slots.resources), escape_style);
+                } else {
+                    serialize_css(&css, out, None, escape_style);
+                }
                 out.push_str("</style>");
                 return;
             }
+            let prepared_page = images.is_some();
             out.push('<');
+            let image_tag = images
+                .as_mut()
+                .is_some_and(|slots| name == "img" && prepare_image_tag(element, out.len(), slots));
             out.push_str(name);
-            for (attr, value) in element.attrs() {
+            if folded {
+                out.push_str(" data-fell-folded");
+            }
+            let mut wrote_style = false;
+            for (name_attr, value) in &element.attrs {
+                let attr = name_attr.local.as_ref();
+                if matches!(
+                    attr,
+                    "data-fell-folded"
+                        | "data-fell-collapsed"
+                        | "data-fell-image-tile"
+                        | "data-fell-image-alt"
+                ) || (image_tag
+                    && matches!(attr, "src" | "srcset" | "alt" | "role" | "aria-label"))
+                {
+                    continue;
+                }
+                // Only image attributes and image-valued CSS declarations
+                // may enter the fetch list.
+                if let Some(slots) = images.as_deref_mut() {
+                    if name_attr.prefix.is_none()
+                        && attr == "background"
+                        && matches!(name, "table" | "tr" | "td" | "th")
+                        && let Some(url) = remote_image_url(value)
+                    {
+                        if slots.resources.len() < 48 {
+                            out.push(' ');
+                            out.push_str(attr);
+                            out.push_str("=\"");
+                            slots.resources.push((out.len(), Slot::Image(url)));
+                            out.push('"');
+                        }
+                        continue;
+                    }
+                    if attr == "style" {
+                        let start = out.len();
+                        let first_slot = slots.resources.len();
+                        out.push_str(" style=\"");
+                        let style_start = out.len();
+                        serialize_css(value, out, Some(&mut slots.resources), escape_attr);
+                        if contains_external_url(value) && contains_external_url(&out[start..]) {
+                            out.truncate(start);
+                            slots.resources.truncate(first_slot);
+                        } else {
+                            if let Some(history) = history.as_mut().filter(|_| folded) {
+                                history.styles.push(style_start..out.len());
+                            }
+                            out.push('"');
+                            wrote_style = true;
+                        }
+                        continue;
+                    }
+                    let link = attr == "href"
+                        && name_attr.prefix.is_none()
+                        && (name.eq_ignore_ascii_case("a") || name.eq_ignore_ascii_case("area"));
+                    if !link && !keep_offline_attr(element, attr, value) {
+                        continue;
+                    }
+                }
                 if !keep_attr(name, attr, value, allow_remote_images) {
                     continue;
                 }
-                let value = rewrite_attr(name, attr, value, allow_remote_images);
+                let value =
+                    if prepared_page && attr == "width" && layout::fluid_width_fallback(value) {
+                        "100%".into()
+                    } else {
+                        rewrite_attr(name, attr, value, allow_remote_images)
+                    };
                 out.push(' ');
+                if let Some(prefix) = &name_attr.prefix {
+                    out.push_str(prefix.as_ref());
+                    out.push(':');
+                }
                 out.push_str(attr);
                 out.push_str("=\"");
                 out.push_str(&escape_attr(&value));
                 out.push('"');
             }
+            if !wrote_style && let Some(history) = history.as_mut().filter(|_| folded) {
+                out.push_str(" style=\"");
+                history.styles.push(out.len()..out.len());
+                out.push('"');
+            }
             out.push('>');
+            if image_tag && let Some(slots) = images.as_mut() {
+                slots.tags.push((out.len(), Slot::ImageEnd));
+            }
             if !VOID.contains(&name) {
                 let child_style = allow_style && name != "svg" && name != "math";
                 for child in node.children() {
-                    serialize_node(child, out, allow_remote_images, child_style, depth + 1);
+                    serialize_node(
+                        child,
+                        out,
+                        allow_remote_images,
+                        child_style,
+                        depth + 1,
+                        images.as_deref_mut(),
+                        history.as_deref_mut(),
+                    );
                 }
                 out.push_str("</");
                 out.push_str(name);
@@ -155,7 +868,141 @@ fn serialize_node(
     }
 }
 
+/// Save the image's tag separately so the offline page can draw a tile
+/// without giving WebKit a broken image to paint.
+fn prepare_image_tag(element: &scraper::node::Element, at: usize, slots: &mut PageImages) -> bool {
+    let src = element.attr("src").unwrap_or_default().trim();
+    if src
+        .get(..11)
+        .is_some_and(|head| head.eq_ignore_ascii_case("data:image/"))
+    {
+        return false;
+    }
+    let alt = element.attr("alt").unwrap_or_default();
+    let cid = src
+        .split_once(':')
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("cid"));
+    let label = if cid {
+        let alt = alt.trim();
+        if alt.is_empty() {
+            "Inline image".to_owned()
+        } else {
+            format!("Inline image · {alt}")
+        }
+    } else {
+        alt.to_owned()
+    };
+    let url = remote_image_url(src);
+    let remote = url.is_some();
+    let url = url.filter(|_| slots.resources.len() < 48);
+    let list = if url.is_some() {
+        &mut slots.resources
+    } else {
+        &mut slots.tags
+    };
+    list.push((at, Slot::ImageTag { url, label, remote }));
+    true
+}
+
 const VOID: &[&str] = &["area", "br", "hr", "img", "wbr", "col"];
+
+fn resource_attr(name: &str) -> bool {
+    matches!(
+        name,
+        "href"
+            | "xlink:href"
+            | "src"
+            | "srcset"
+            | "imagesrcset"
+            | "poster"
+            | "background"
+            | "lowsrc"
+            | "dynsrc"
+            | "data"
+            | "codebase"
+            | "archive"
+            | "classid"
+            | "manifest"
+            | "profile"
+            | "longdesc"
+            | "usemap"
+            | "action"
+            | "formaction"
+            | "cite"
+            | "base"
+            | "xml:base"
+    )
+}
+
+fn local_resource(value: &str) -> bool {
+    let value = value.trim();
+    let (scheme, _) = value.split_once(':').unwrap_or_default();
+    value.is_empty()
+        || value.starts_with('#')
+        || scheme.eq_ignore_ascii_case("cid")
+        || value
+            .get(..11)
+            .is_some_and(|head| head.eq_ignore_ascii_case("data:image/"))
+}
+
+fn contains_external_url(value: &str) -> bool {
+    // Base64 may contain consecutive slashes without containing a URL.
+    if let Some((header, payload)) = value.split_once(',')
+        && header.to_ascii_lowercase().starts_with("data:image/")
+        && header.to_ascii_lowercase().ends_with(";base64")
+        && payload
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+    {
+        return false;
+    }
+    let normalized = normalize_resource_url(value).to_ascii_lowercase();
+    ["http:", "https:", "//", "file:"]
+        .iter()
+        .any(|scheme| normalized.contains(scheme))
+}
+
+fn keep_offline_attr(element: &scraper::node::Element, name: &str, value: &str) -> bool {
+    if matches!(name, "ping" | "attributionsrc" | "base") || contains_external_url(value) {
+        return false;
+    }
+    if matches!(name, "srcset" | "imagesrcset") {
+        // A comma can separate candidates or belong to a data URL. Keep
+        // only single local resource attributes and omit source sets.
+        return false;
+    }
+    if resource_attr(name) {
+        return local_resource(value);
+    }
+    if matches!(name, "values" | "from" | "to" | "by")
+        && [
+            "set",
+            "animate",
+            "animateColor",
+            "animateTransform",
+            "animateMotion",
+        ]
+        .iter()
+        .any(|tag| tag.eq_ignore_ascii_case(element.name()))
+        && element.attr("attributeName").is_some_and(|target| {
+            let target = target.to_ascii_lowercase();
+            resource_attr(&target) || target == "style"
+        })
+    {
+        return value.split(';').all(local_resource);
+    }
+    if value.contains('(') {
+        let css = strip_css_comments(value);
+        let mut input = ParserInput::new(&css);
+        let mut resources = Vec::new();
+        css_resources(&mut Parser::new(&mut input), &css, 0, false, &mut resources);
+        return resources.into_iter().all(|(_, resource)| match resource {
+            CssResource::Url(url) | CssResource::ImageString(url) => local_resource(&url),
+            _ => false,
+        });
+    }
+    true
+}
 
 fn subtree_text(node: ego_tree::NodeRef<'_, scraper::node::Node>) -> String {
     let mut text = String::new();
@@ -189,7 +1036,7 @@ fn keep_attr(tag: &str, name: &str, value: &str, allow_remote_images: bool) -> b
 
 fn rewrite_attr(tag: &str, name: &str, value: &str, allow_remote_images: bool) -> String {
     if name.eq_ignore_ascii_case("style") {
-        return sanitize_css(value, allow_remote_images);
+        return strip_remote_css_urls(value);
     }
     if name.eq_ignore_ascii_case("srcset") {
         return value
@@ -208,15 +1055,36 @@ fn image_attr_is_remote(tag: &str, name: &str, value: &str) -> bool {
         "src" | "poster" | "background" | "lowsrc" | "dynsrc" => is_remote_url(value),
         "srcset" => srcset_is_remote(value),
         // HTML parses `<image>` as `<img>`, so a remote href on either is an image.
-        "href" | "xlink:href" if matches!(tag, "img" | "image" | "use" | "feimage") => {
-            is_remote_url(value)
-        }
+        "href" | "xlink:href" if image_href_tag(tag) => is_remote_url(value),
         _ => false,
     }
 }
 
+fn image_href_tag(tag: &str) -> bool {
+    ["img", "image", "use", "feimage"]
+        .iter()
+        .any(|name| tag.eq_ignore_ascii_case(name))
+}
+
 fn srcset_is_remote(value: &str) -> bool {
     value.split(',').any(is_remote_url)
+}
+
+fn remote_image_url(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.len() > 4096 {
+        return None;
+    }
+    let url = if value.starts_with("//") {
+        url::Url::parse(&format!("https:{value}")).ok()?
+    } else {
+        url::Url::parse(value).ok()?
+    };
+    (matches!(url.scheme(), "http" | "https")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && !targets_private_network(url.as_str()))
+    .then(|| url.into())
 }
 
 fn is_remote_url(value: &str) -> bool {
@@ -379,86 +1247,227 @@ fn is_css_whitespace(ch: char) -> bool {
 }
 
 pub fn strip_remote_css_urls(css: &str) -> String {
-    sanitize_css(css, false)
+    let mut out = String::new();
+    serialize_css(css, &mut out, None, str::to_owned);
+    out
 }
 
-/// Decode CSS escapes first, then drop remote `@import` and any `url(` the
-/// reader is not allowed to fetch. A private or link-local host is never fetched.
-fn sanitize_css(css: &str, allow_remote_images: bool) -> String {
-    let decoded = decode_css_escapes(css);
-    let without_import = strip_css_imports(&decoded, allow_remote_images);
-    strip_css_urls(&without_import, allow_remote_images)
-}
-
-fn strip_css_imports(css: &str, allow_remote_images: bool) -> String {
+fn strip_css_comments(css: &str) -> String {
     let mut out = String::with_capacity(css.len());
-    let mut rest = css;
-    loop {
-        let lower = rest.to_ascii_lowercase();
-        let Some(idx) = lower.find("@import") else {
-            out.push_str(rest);
-            break;
-        };
-        out.push_str(&rest[..idx]);
-        let after = &rest[idx + "@import".len()..];
-        let Some(semi) = after.find(';') else {
-            out.push_str(&rest[idx..]);
-            break;
-        };
-        let drop = import_target(&after[..semi])
-            .is_some_and(|target| resource_is_disallowed(&target, allow_remote_images));
-        if !drop {
-            out.push_str(&rest[idx..idx + "@import".len() + semi + 1]);
+    let mut chars = css.chars().peekable();
+    let mut quote = None;
+    while let Some(ch) = chars.next() {
+        match (quote, ch) {
+            (_, '\\') => {
+                out.push(ch);
+                out.extend(chars.next());
+                continue;
+            }
+            (None, '"' | '\'') => quote = Some(ch),
+            (Some(open), ch) if ch == open => quote = None,
+            (None, '/') if chars.next_if_eq(&'*').is_some() => {
+                while let Some(ch) = chars.next() {
+                    if ch == '*' && chars.next_if_eq(&'/').is_some() {
+                        break;
+                    }
+                }
+                continue;
+            }
+            _ => {}
         }
-        rest = &after[semi + 1..];
+        out.push(ch);
     }
     out
 }
 
-fn import_target(prelude: &str) -> Option<String> {
-    let prelude = prelude.trim();
-    let lower = prelude.to_ascii_lowercase();
-    if let Some(rest) = lower.strip_prefix("url(") {
-        let end = rest.find(')')?;
-        let inside = rest[..end]
-            .trim()
-            .trim_matches(|ch| ch == '"' || ch == '\'' || ch == ' ');
-        return Some(inside.to_string());
-    }
-    let quote = prelude.chars().next()?;
-    if quote != '"' && quote != '\'' {
-        return None;
-    }
-    let end = prelude[1..].find(quote)?;
-    Some(prelude[1..1 + end].to_string())
+enum CssResource {
+    Remove,
+    Url(String),
+    ImageString(String),
+    VariableCandidate,
+    FluidWidth,
 }
 
-fn strip_css_urls(css: &str, allow_remote_images: bool) -> String {
-    let mut out = String::with_capacity(css.len());
-    let mut rest = css;
+fn css_resources(
+    css: &mut Parser<'_, '_>,
+    source: &str,
+    depth: usize,
+    image_strings: bool,
+    resources: &mut Vec<(Range<usize>, CssResource)>,
+) {
     loop {
-        let lower = rest.to_ascii_lowercase();
-        let Some(idx) = lower.find("url(") else {
-            out.push_str(rest);
-            break;
+        let start = css.position().byte_index();
+        let resource = match css.next_including_whitespace_and_comments() {
+            Ok(Token::Dimension { value, unit, .. })
+                if unit.eq_ignore_ascii_case("px")
+                    && *value >= WEB_SNAPSHOT_WIDTH_LIMIT as f32
+                    && css_width_property(source, start) =>
+            {
+                CssResource::FluidWidth
+            }
+            Ok(Token::Percentage { unit_value, .. })
+                if *unit_value > 1. && css_width_property(source, start) =>
+            {
+                CssResource::FluidWidth
+            }
+            Ok(Token::AtKeyword(name)) if name.eq_ignore_ascii_case("import") => {
+                let _ = css.parse_until_after(Delimiter::Semicolon, |rule| {
+                    while rule.next().is_ok() {}
+                    Ok::<_, ParseError<'_, ()>>(())
+                });
+                CssResource::Remove
+            }
+            Ok(Token::UnquotedUrl(url)) => CssResource::Url(url.to_string()),
+            Ok(Token::Function(name)) if name.eq_ignore_ascii_case("url") => css
+                .parse_nested_block(|args| {
+                    Ok::<_, ParseError<'_, ()>>(args.expect_string()?.to_string())
+                })
+                .map_or(CssResource::Remove, CssResource::Url),
+            Ok(Token::QuotedString(value)) if image_strings => {
+                CssResource::ImageString(value.to_string())
+            }
+            // A standalone URL string can also become an image source via var().
+            Ok(Token::QuotedString(value)) if contains_external_url(value) => {
+                CssResource::VariableCandidate
+            }
+            Ok(Token::BadString(_)) if image_strings => CssResource::Remove,
+            Ok(Token::BadUrl(_)) => CssResource::Remove,
+            Ok(
+                token @ (Token::Function(_)
+                | Token::ParenthesisBlock
+                | Token::SquareBracketBlock
+                | Token::CurlyBracketBlock),
+            ) => {
+                let nested_images = match token {
+                    Token::Function(name) => {
+                        [
+                            "image-set",
+                            "-webkit-image-set",
+                            "image",
+                            "cross-fade",
+                            "-webkit-cross-fade",
+                        ]
+                        .iter()
+                        .any(|function| name.eq_ignore_ascii_case(function))
+                            || image_strings && name.eq_ignore_ascii_case("var")
+                    }
+                    _ => false,
+                };
+                let _ = css.parse_nested_block(|nested| {
+                    if depth < 64 {
+                        css_resources(nested, source, depth + 1, nested_images, resources);
+                    }
+                    Ok::<_, ParseError<'_, ()>>(())
+                });
+                if depth < 64 {
+                    continue;
+                }
+                CssResource::Remove
+            }
+            Ok(_) => continue,
+            Err(_) => break,
         };
-        out.push_str(&rest[..idx]);
-        let after = &rest[idx + 4..];
-        let Some(end) = after.find(')') else {
-            out.push_str(&rest[idx..]);
-            break;
-        };
-        let inside = after[..end]
-            .trim()
-            .trim_matches(|ch| ch == '"' || ch == '\'' || ch == ' ');
-        if resource_is_disallowed(inside, allow_remote_images) {
-            out.push_str("url(\"about:blank\")");
+        resources.push((start..css.position().byte_index(), resource));
+    }
+}
+
+fn css_declaration(css: &str, start: usize) -> Option<&str> {
+    css[..start]
+        .rsplit([';', '{', '}'])
+        .next()?
+        .split_once(':')
+        .map(|(name, _)| name.trim())
+}
+
+fn css_width_property(css: &str, start: usize) -> bool {
+    let Some((name, preceding)) = css[..start]
+        .rsplit([';', '{', '}'])
+        .next()
+        .and_then(|part| part.split_once(':'))
+    else {
+        return false;
+    };
+    preceding.trim().is_empty()
+        && (name.trim().eq_ignore_ascii_case("width")
+            || name.trim().eq_ignore_ascii_case("min-width"))
+}
+
+fn serialize_css(
+    css: &str,
+    out: &mut String,
+    images: Option<&mut Vec<(usize, Slot)>>,
+    escape: impl Fn(&str) -> String,
+) {
+    serialize_css_with_property(css, None, out, images, escape);
+}
+
+fn serialize_css_with_property(
+    css: &str,
+    property: Option<&str>,
+    out: &mut String,
+    mut images: Option<&mut Vec<(usize, Slot)>>,
+    escape: impl Fn(&str) -> String,
+) {
+    // Classify comment-split spellings before tokenizing. The tokenizer also
+    // handles CSS escapes and keeps semicolons and parentheses inside strings.
+    let css = strip_css_comments(css);
+    let mut input = ParserInput::new(&css);
+    let mut resources = Vec::new();
+    css_resources(&mut Parser::new(&mut input), &css, 0, false, &mut resources);
+    let mut from = 0;
+    for (range, resource) in resources {
+        let name = property.or_else(|| css_declaration(&css, range.start));
+        if matches!(resource, CssResource::FluidWidth) && images.is_none() {
+            continue;
+        }
+        if images.is_none()
+            && matches!(resource, CssResource::VariableCandidate)
+            && !name.is_some_and(|name| name.starts_with("--"))
+        {
+            continue;
+        }
+        if let CssResource::Url(value) | CssResource::ImageString(value) = &resource
+            && (value.is_empty()
+                || normalize_resource_url(value)
+                    .to_ascii_lowercase()
+                    .starts_with("data:image/"))
+        {
+            continue;
+        }
+        out.push_str(&escape(&css[from..range.start]));
+        let quoted = matches!(resource, CssResource::ImageString(_));
+        if let CssResource::Url(value) | CssResource::ImageString(value) = resource {
+            let slot = images.as_deref_mut().filter(|slots| slots.len() < 48);
+            if let Some(slots) = slot
+                && name.is_some_and(|name| {
+                    (quoted && name.starts_with("--"))
+                        || matches!(
+                            name.to_ascii_lowercase().as_str(),
+                            "background"
+                                | "background-image"
+                                | "border-image"
+                                | "border-image-source"
+                                | "list-style-image"
+                        )
+                })
+                && let Some(url) = remote_image_url(&value)
+            {
+                out.push_str(&escape(if quoted { "\"" } else { "url(\"" }));
+                slots.push((out.len(), Slot::Image(url)));
+                out.push_str(&escape(if quoted { "\"" } else { "\")" }));
+            } else if quoted {
+                out.push_str(&escape("\"\""));
+            } else {
+                out.push_str(" none ");
+            }
+        } else if matches!(resource, CssResource::FluidWidth) {
+            out.push_str("100%");
         } else {
-            out.push_str(&rest[idx..idx + 4 + end + 1]);
+            out.push(' ');
         }
-        rest = &after[end + 1..];
+        from = range.end;
     }
-    out
+    out.push_str(&escape(&css[from..]));
 }
 
 fn image_attr_is_blocked(tag: &str, name: &str, value: &str, allow_remote_images: bool) -> bool {
@@ -469,7 +1478,7 @@ fn image_attr_is_blocked(tag: &str, name: &str, value: &str, allow_remote_images
         "srcset" => value
             .split(',')
             .any(|part| resource_is_disallowed(part, allow_remote_images)),
-        "href" | "xlink:href" if matches!(tag, "img" | "image" | "use" | "feimage") => {
+        "href" | "xlink:href" if image_href_tag(tag) => {
             resource_is_disallowed(value, allow_remote_images)
         }
         _ => false,
@@ -485,18 +1494,7 @@ fn resource_is_disallowed(value: &str, allow_remote_images: bool) -> bool {
     !allow_remote_images && is_remote_url(value)
 }
 
-/// Whether WebKit should be refused this request.
-///
-/// The host is the one in the parsed URL. A hostname is refused when any
-/// resolved address, or a failure to resolve, is loopback, link-local,
-/// private, unique-local, or unspecified. The same check applies to the
-/// request that follows a redirect.
-pub fn request_is_blocked(uri: &str) -> bool {
-    request_is_blocked_with(uri, resolve_host)
-}
-
-/// [`request_is_blocked`] with a caller-supplied resolver, so tests do not
-/// use the network.
+#[cfg(test)]
 pub fn request_is_blocked_with(uri: &str, resolve: impl Fn(&str) -> Vec<IpAddr>) -> bool {
     let Ok(url) = url::Url::parse(uri) else {
         return false;
@@ -509,18 +1507,10 @@ pub fn request_is_blocked_with(uri: &str, resolve: impl Fn(&str) -> Vec<IpAddr>)
         Some(url::Host::Ipv6(ip)) => ipv6_is_blocked(ip),
         Some(url::Host::Domain(name)) => {
             let addresses = resolve(name);
-            addresses.is_empty() || addresses.into_iter().any(ip_is_blocked)
+            addresses.is_empty() || addresses.into_iter().any(address_is_blocked)
         }
         None => false,
     }
-}
-
-fn resolve_host(host: &str) -> Vec<IpAddr> {
-    use std::net::ToSocketAddrs;
-    (host, 0)
-        .to_socket_addrs()
-        .map(|addrs| addrs.map(|addr| addr.ip()).collect())
-        .unwrap_or_default()
 }
 
 pub fn address_is_blocked(ip: IpAddr) -> bool {
@@ -530,49 +1520,40 @@ pub fn address_is_blocked(ip: IpAddr) -> bool {
     }
 }
 
-fn ip_is_blocked(ip: IpAddr) -> bool {
-    address_is_blocked(ip)
-}
-
 fn ipv4_is_blocked(ip: Ipv4Addr) -> bool {
-    let [first, second, _, _] = ip.octets();
-    first == 0
-        || first == 10
-        || first == 127
-        || (first == 100 && (64..=127).contains(&second))
-        || (first == 169 && second == 254)
-        || (first == 172 && (16..=31).contains(&second))
-        || (first == 192 && second == 168)
+    // IANA special-purpose address blocks, plus multicast. Sub-allocations
+    // with global reachability still have protocol-specific purposes.
+    matches!(
+        ip.octets(),
+        [0 | 10 | 127 | 224..=255, ..]
+            | [100, 64..=127, ..]
+            | [169, 254, ..]
+            | [172, 16..=31, ..]
+            | [192, 0, 0 | 2, _]
+            | [192, 31, 196, _]
+            | [192, 52, 193, _]
+            | [192, 88, 99, _]
+            | [192, 168, ..]
+            | [192, 175, 48, _]
+            | [198, 18 | 19, ..]
+            | [198, 51, 100, _]
+            | [203, 0, 113, _]
+    )
 }
 
 fn ipv6_is_blocked(ip: Ipv6Addr) -> bool {
-    if ip.is_unspecified() || ip.is_loopback() {
-        return true;
-    }
-    if let Some(mapped) = ip.to_ipv4_mapped() {
-        return ipv4_is_blocked(mapped);
-    }
-    // IPv4-compatible ::a.b.c.d. The mapped form was handled above.
-    if ip.to_ipv4().is_some() {
-        return true;
-    }
-    let segments = ip.segments();
-    let [first, second, ..] = ip.octets();
-    // fe80::/10 link-local, fc00::/7 unique-local.
-    if (first == 0xfe && (second & 0xc0) == 0x80) || (first & 0xfe) == 0xfc {
-        return true;
-    }
-    // NAT64 64:ff9b::/96 and 6to4 2002::/16.
-    (segments[0] == 0x64
-        && segments[1] == 0xff9b
-        && segments[2] == 0
-        && segments[3] == 0
-        && segments[4] == 0
-        && segments[5] == 0)
-        || segments[0] == 0x2002
+    // Require global unicast. This rules out mapped and compatible IPv4,
+    // translation prefixes, loopback, ULA, link-local and multicast.
+    !matches!(ip.segments()[0], 0x2000..=0x3fff)
+        || matches!(
+            ip.segments(),
+            [0x2001, 0x0000..=0x01ff | 0x0db8, ..]
+                | [0x2002, ..]
+                | [0x2620, 0x004f, 0x8000, ..]
+                | [0x3fff, 0x0000..=0x0fff, ..]
+        )
 }
 
-/// `true` when the URL names a loopback, private, or link-local host.
 pub fn targets_private_network(value: &str) -> bool {
     let Some(host) = resource_host(value) else {
         return false;
@@ -603,12 +1584,12 @@ fn host_is_private(host: &str) -> bool {
         return true;
     }
     if let Some(octets) = parse_ipv4_url(&host) {
-        return ipv4_is_private(octets);
+        return ipv4_is_blocked(Ipv4Addr::from(octets));
     }
     if host.contains(':')
         && let Some(groups) = parse_ipv6(&host)
     {
-        return ipv6_is_private(groups);
+        return ipv6_is_blocked(Ipv6Addr::from(groups));
     }
     false
 }
@@ -689,13 +1670,6 @@ fn parse_ipv4_number(input: &str) -> Option<u64> {
     u64::from_str_radix(digits, radix).ok()
 }
 
-fn ipv4_is_private(octets: [u8; 4]) -> bool {
-    matches!(
-        octets,
-        [0, ..] | [10, ..] | [127, ..] | [169, 254, ..] | [172, 16..=31, ..] | [192, 168, ..]
-    )
-}
-
 fn parse_ipv6(host: &str) -> Option<[u16; 8]> {
     if host.matches("::").count() > 1 {
         return None;
@@ -761,25 +1735,6 @@ fn hextet(piece: &str) -> Option<u16> {
     u16::from_str_radix(piece, 16).ok()
 }
 
-fn ipv6_is_private(groups: [u16; 8]) -> bool {
-    if groups == [0, 0, 0, 0, 0, 0, 0, 0] || groups == [0, 0, 0, 0, 0, 0, 0, 1] {
-        return true;
-    }
-    if groups[0] & 0xffc0 == 0xfe80 || groups[0] & 0xfe00 == 0xfc00 {
-        return true;
-    }
-    if groups[..5] == [0, 0, 0, 0, 0] && groups[5] == 0xffff {
-        let octets = [
-            (groups[6] >> 8) as u8,
-            groups[6] as u8,
-            (groups[7] >> 8) as u8,
-            groups[7] as u8,
-        ];
-        return ipv4_is_private(octets);
-    }
-    false
-}
-
 /// `<` would close the style element. A CSS escape keeps the stylesheet and
 /// cannot smuggle `</STYLE>` or an `<img>` into the document.
 fn escape_style(css: &str) -> String {
@@ -801,6 +1756,296 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_trailing_spacing_is_folded_beside_visible_empty_nodes() {
+        let html = concat!(
+            "<div>Meet you there.</div><div id='interior'><br></div>",
+            "<div><a id='link' href='https://harbor.test/map'><img id='image' src='cid:map'></a></div>",
+            "<hr id='rule'><svg id='drawing'></svg><video id='movie'></video><canvas id='canvas'></canvas>",
+            "<br id='break'><div id='spacer'><br></div><p id='paragraph'></p><span id='space'>&nbsp;</span>",
+            "<div class='gmail_quote'><div>On Monday, Jo wrote:</div>",
+            "<blockquote><p>Could you share the pier map?</p></blockquote></div>",
+        );
+        let folded = crate::fold_history(crate::html_to_document(html), "Re: Pier map");
+        let mail = WebMail::prepare_with_history(html, &folded);
+        assert!(mail.mapped_history());
+        let page = html::parse_html(&mail.page("light", |_| None));
+        for (id, expect_folded) in [
+            ("interior", false),
+            ("link", false),
+            ("image", false),
+            ("rule", false),
+            ("drawing", false),
+            ("movie", false),
+            ("canvas", false),
+            ("break", true),
+            ("spacer", true),
+            ("paragraph", true),
+            ("space", true),
+        ] {
+            let element = page
+                .root_element()
+                .descendants()
+                .filter_map(scraper::ElementRef::wrap)
+                .find(|element| element.attr("id") == Some(id))
+                .unwrap_or_else(|| panic!("missing {id}"));
+            assert_eq!(
+                element.attr("data-fell-folded").is_some(),
+                expect_folded,
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_leading_nontext_sibling_keeps_the_quote_wrapper_open() {
+        let media =
+            "<a id='link' href='https://harbor.test/map'><img src='cid:map'></a><hr id='rule'>";
+        let quote = "<div class='gmail_quote' id='quote'><div>On Monday, Jo wrote:</div><blockquote>Could you share the pier map?</blockquote></div>";
+        let style = WebTextStyle {
+            family: None,
+            size: 15.,
+            foreground: 0,
+            link: 0,
+            border: 0x414868,
+            inset: false,
+        };
+        for (contents, wrapper_folds) in [
+            (format!("{media}{quote}"), false),
+            (format!("<div>{media}{quote}</div>"), false),
+            (format!("{quote}{media}"), true),
+        ] {
+            let html =
+                format!("<div>Thursday works for me.</div><div id='wrapper'>{contents}</div>");
+            let folded = crate::fold_history(crate::html_to_document(&html), "Re: Pier map");
+            let mail = WebMail::prepare_with_history(&html, &folded);
+            assert!(mail.mapped_history(), "{html}");
+            let page = html::parse_html(&mail.page_with_style("light", Some(&style), |_| None));
+            for (id, hidden) in [
+                ("wrapper", wrapper_folds),
+                ("quote", true),
+                ("link", wrapper_folds),
+                ("rule", wrapper_folds),
+            ] {
+                let selector = scraper::Selector::parse(&format!("#{id}")).unwrap();
+                let element = page.select(&selector).next().unwrap();
+                assert_eq!(
+                    std::iter::once(element)
+                        .chain(element.ancestors().filter_map(scraper::ElementRef::wrap))
+                        .any(|node| node.attr("data-fell-folded").is_some()),
+                    hidden,
+                    "{id}: {html}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fold_styles_override_mail_on_elements_and_reader_spans() {
+        let style = WebTextStyle {
+            family: None,
+            size: 15.,
+            foreground: 0,
+            link: 0,
+            border: 0x414868,
+            inset: false,
+        };
+        for (html, selector, original) in [
+            (
+                "<div>Thursday works.</div><blockquote style='display:block !important'>Could you share the pier map?</blockquote>",
+                "blockquote",
+                "display:block !important",
+            ),
+            (
+                r#"<div>Thursday works.</div><blockquote style="display:block !important;x:'">Could you share the pier map?</blockquote>"#,
+                "blockquote",
+                "display:block !important;x:'",
+            ),
+            (
+                r#"<div>Thursday works.</div><blockquote style="display:block !important;x:'\">Could you share the pier map?</blockquote>"#,
+                "blockquote",
+                "display:block !important;x:'\\",
+            ),
+            (
+                "<div>Thursday works.</div><style>span[data-fell-folded] {display:block !important}</style>-- <br>Jo<br>Harbor office<br>harbor.test<div class='gmail_quote'>On Monday, Lee wrote:<blockquote>Could you share the pier map?</blockquote></div>",
+                "span[data-fell-folded]",
+                "",
+            ),
+        ] {
+            let folded = crate::fold_history(crate::html_to_document(html), "Re: Pier map");
+            let mail = WebMail::prepare_with_history(html, &folded);
+            assert!(mail.mapped_history(), "{html}");
+            let selector = scraper::Selector::parse(selector).unwrap();
+            let closed = html::parse_html(&mail.page_with_style("light", Some(&style), |_| None));
+            let open = html::parse_html(&mail.page("light", |_| None));
+            let closed = closed.select(&selector).next().unwrap();
+            let open = open.select(&selector).next().unwrap();
+            assert!(closed.attr("data-fell-folded").is_some());
+            assert_eq!(closed.attr("style"), Some("display:none !important"));
+            assert_eq!(open.attr("style"), Some(original));
+        }
+    }
+
+    #[test]
+    fn author_colors_use_light_paper_in_dark_mode() {
+        for html in [
+            "<body bgcolor='#fff'>Story</body>",
+            "<body style='color:#555'>Story</body>",
+            "<table bgcolor='#fff'><tr><td>Story</td></tr></table>",
+            "<p style='background:#fff'>Story</p>",
+            "<style>@media (max-width:600px){p, a:hover {color: #555}}</style><p>Story</p>",
+            "<font color='#555'>Story</font>",
+            "<body style='background-image:linear-gradient(#fff,#fff)'>Story</body>",
+            "<body style='background-image:url(https://example.test/paper.png)'>Story</body>",
+            "<p style='background-image:linear-gradient(#fff,#fff)'>Story</p>",
+            "<style>p {background-image:linear-gradient(#fff,#fff)}</style><p>Story</p>",
+            "<table background='https://example.test/paper.png'><tr><td>Story</td></tr></table>",
+            "<body background='data:image/png;base64,AAAA'>Story</body>",
+            "<p style='box-shadow:inset 0 0 0 1000px #fff'>Story</p>",
+            "<style>p {box-shadow:inset 0 0 0 1000px #fff}</style><p>Story</p>",
+            "<p style='-webkit-box-shadow:inset 0 0 0 1000px #fff'>Story</p>",
+            "<style>p {border-image:linear-gradient(#fff,#fff) 1}</style><p>Story</p>",
+            "<p style='border-image-source:linear-gradient(#fff,#fff)'>Story</p>",
+            "<p style='background-image:url(https://example.test/paper.png)'>Story</p>",
+        ] {
+            let mail = WebMail::prepare(html);
+            assert_eq!(
+                mail.appearance("dark", 0x24283b),
+                ("light", 0xffffff),
+                "{html}"
+            );
+            let page = mail.page("dark", |_| None);
+            assert!(
+                page.contains(r#"name="color-scheme" content="light""#),
+                "{html}"
+            );
+            assert!(page.contains("padding: 12px 14px"));
+        }
+    }
+
+    #[test]
+    fn no_paint_backgrounds_keep_the_theme() {
+        for html in [
+            "<body background=''>Story</body>",
+            "<p style='background-image:none; box-shadow:none; background-color:transparent'>Story</p>",
+            "<style>p{background-image:initial;box-shadow:unset}</style><p>Story</p>",
+            "<p style='border-image:none;border-image-source:none;-webkit-box-shadow:transparent'>Story</p>",
+        ] {
+            assert!(!WebMail::prepare(html).has_author_colors(), "{html}");
+        }
+    }
+
+    #[test]
+    fn body_backgrounds_use_consent_slots_and_preserve_payload_case() {
+        let mail = WebMail::prepare(concat!(
+            "<body background='https://example.test/Paper.png' ",
+            "style='background-image:url(data:image/png;base64,aBcD), ",
+            "url(https://example.test/Texture.png); color: #FaFafa'>",
+            "<table background='https://example.test/Table.png'><tr><td>Story</td></tr></table>",
+        ));
+        assert!(mail.has_remote_images());
+        let blocked = mail.page("light", |_| None);
+        assert!(!blocked.contains("example.test"));
+        assert!(blocked.contains("data:image/png;base64,aBcD"));
+        let mut urls = Vec::new();
+        let allowed = mail.page("light", |url| {
+            urls.push(url.to_owned());
+            Some("data:image/png;base64,AbCd".into())
+        });
+        assert_eq!(
+            urls,
+            [
+                "https://example.test/Paper.png",
+                "https://example.test/Texture.png",
+                "https://example.test/Table.png"
+            ],
+        );
+        assert_eq!(allowed.matches("data:image/png;base64,AbCd").count(), 3);
+    }
+
+    #[test]
+    fn over_budget_width_has_no_web_height_to_reserve() {
+        let text = "A letter with several sentences and enough words to wrap at the pane width. "
+            .repeat(80);
+        for html in [
+            "<table width='8180'><tr><td>Table</td></tr></table>".to_owned(),
+            "<table><tr><td style='min-width:5000px'>Left</td><td style='min-width:5000px'>Right</td></tr></table>".to_owned(),
+            "<table style='width:600em'><tr><td>Table</td></tr></table>".to_owned(),
+            format!("<table width='8180'><tr><td>{text}</td></tr></table>"),
+        ] {
+            assert_eq!(WebMail::prepare(&html).estimated_height_with_style(440., None), None);
+        }
+    }
+
+    #[test]
+    fn flush_overflow_uses_its_full_width() {
+        let mail = WebMail::prepare("<div style='width:600px;height:1800px'>Letter</div>");
+        let style = WebTextStyle {
+            family: None,
+            size: 15.,
+            foreground: 0,
+            link: 0,
+            border: 0x414868,
+            inset: false,
+        };
+        assert_eq!(
+            mail.estimated_height_with_style(400., Some(&style)),
+            Some(1212. + 8. * 400. / 600.)
+        );
+    }
+
+    #[test]
+    fn colorless_mail_uses_the_ui_font_and_respects_author_insets() {
+        let plain = WebMail::prepare("<div>Booked.</div>");
+        let style = WebTextStyle {
+            family: Some("Inter".into()),
+            size: 15.,
+            foreground: 0xa9b1d6,
+            link: 0x7aa2f7,
+            border: 0x414868,
+            inset: true,
+        };
+        let page = plain.page_with_style("dark", Some(&style), |_| None);
+        assert_eq!(plain.appearance("dark", 0x24283b), ("dark", 0x24283b));
+        assert!(page.contains(r#"font-family: "Inter", system-ui, sans-serif"#));
+        assert!(page.contains("font-size: 15px; line-height: 22px; color: #a9b1d6"));
+        assert!(page.contains("a:any-link { color: #7aa2f7; }"));
+        let bigger = WebTextStyle {
+            size: 20.,
+            ..style.clone()
+        };
+        let estimated = |style| {
+            plain
+                .estimated_height_with_style(440., Some(style))
+                .unwrap()
+        };
+        assert!((estimated(&bigger) - estimated(&style) - 22. / 3.).abs() < 0.001);
+        let flush = WebTextStyle {
+            inset: false,
+            ..style.clone()
+        };
+        assert!(
+            !plain
+                .page_with_style("dark", Some(&flush), |_| None)
+                .contains("padding: 12px 14px")
+        );
+        assert_eq!(plain.estimated_height(440.) - estimated(&flush), 15.);
+        assert!(page.contains("padding: 12px 14px"));
+        for html in [
+            "<body style='padding-top:6px'><div>Booked.</div></body>",
+            "<style>.note, td {padding-top:6px}</style><body class='note'><div>Booked.</div></body>",
+            "<body style='margin-top:6px'><div>Booked.</div></body>",
+            "<style>body {margin-top:6px}</style><body><div>Booked.</div></body>",
+        ] {
+            let mail = WebMail::prepare(html);
+            assert!(!mail.page("dark", |_| None).contains("padding: 12px 14px"));
+            assert_eq!(
+                plain.estimated_height(440.) - mail.estimated_height(440.),
+                18.
+            );
+        }
+    }
+
+    #[test]
     fn webview_html_strips_script_and_remote_images() {
         let html = r#"<p onclick="alert(1)">Hi</p><script>alert(1)</script><img src="https://cdn.example/a.png" alt="hero"><img src="data:image/png;base64,aaaa" alt="dot"><a href="javascript:alert(1)">x</a>"#;
         let clean = sanitize_html(html, false);
@@ -810,13 +2055,7 @@ mod tests {
         assert!(!clean.contains("javascript:"));
         assert!(clean.contains("data:image/png"));
         assert!(clean.contains("hero"));
-        let wrapped = wrap_for_webview(
-            html,
-            &WebFrame {
-                scheme: "dark",
-                allow_remote_images: false,
-            },
-        );
+        let wrapped = WebMail::prepare(html).page("dark", |_| None);
         assert!(wrapped.contains("script-src 'none'"));
         assert!(!wrapped.contains("fell-chrome"));
         assert!(!wrapped.contains("<title>"));
@@ -840,6 +2079,144 @@ mod tests {
         assert!(!fallback.contains("<iframe"), "{fallback}");
         assert!(!fallback.contains("<object"), "{fallback}");
         assert!(!fallback.contains("example.com"), "{fallback}");
+    }
+
+    #[test]
+    fn only_image_locations_enter_the_explicit_fetch_path() {
+        let mail = WebMail::prepare(
+            r#"
+           <style>@import url(https://example.test/style);
+             @font-face { font-family: test; src: url(https://example.test/font); }
+             p { background: url(https://example.test/background); }</style>
+           <link rel=prefetch href=https://example.test/prefetch>
+           <p><img src=https://example.test/hero><a href=https://example.test/link>Link</a></p>
+        "#,
+        );
+        assert!(mail.has_remote_images());
+        let blocked = mail.page("light", |_| None);
+        assert!(!blocked.contains("example.test/hero"));
+        assert!(!blocked.contains("example.test/background"));
+        let mut urls = Vec::new();
+        let allowed = mail.page("light", |url| {
+            urls.push(url.to_owned());
+            Some("data:image/png;base64,AAAA".into())
+        });
+        assert_eq!(
+            urls,
+            [
+                "https://example.test/background",
+                "https://example.test/hero"
+            ]
+        );
+        assert_eq!(allowed.matches("data:image/png").count(), 2);
+        assert!(allowed.contains("img-src data: cid:"));
+    }
+
+    #[test]
+    fn quoted_css_images_are_empty_until_consented() {
+        for declaration in [
+            r#"background: image-set("https://cdn.example.test/a" 1x)"#,
+            r#"background: -webkit-image-set(url("") 1x, "https://cdn.example.test/a" 2x)"#,
+            r#"background: image("https://cdn.example.test/a")"#,
+            r#"background: cross-fade("https://cdn.example.test/a", red)"#,
+            r#"--y: image-set("https://cdn.example.test/a" 1x); background: var(--y)"#,
+            r#"background: IMAGE-SET(var(--y, "https://cdn.example.test/a") 1x)"#,
+        ] {
+            for html in [
+                format!("<style>p {{ {declaration} }}</style><p>Body</p>"),
+                format!("<p style='{declaration}'>Body</p>"),
+            ] {
+                let mail = WebMail::prepare(&html);
+                let blocked = mail.page("light", |_| None);
+                assert!(!blocked.contains("https://"), "{blocked}");
+                assert!(mail.has_remote_images(), "{html}");
+                let allowed = mail.page("light", |url| {
+                    assert_eq!(url, "https://cdn.example.test/a");
+                    Some("data:image/png;base64,AAAA".into())
+                });
+                assert!(allowed.contains("data:image/png;base64,AAAA"), "{allowed}");
+            }
+        }
+        let page = WebMail::prepare(
+            r#"<style>p {--y: "https://cdn.example.test/a"; background: image-set(var(--y) 1x, "data:image/png;base64,AAAA" type("image/png") 2x);}</style>"#,
+        )
+        .page("light", |_| None);
+        assert!(!page.contains("https://"), "{page}");
+        assert!(page.contains(r#""data:image/png;base64,AAAA" type("image/png")"#));
+    }
+
+    #[test]
+    fn blocked_images_keep_layout_hints() {
+        let mail = WebMail::prepare(
+            r#"<img src="https://cdn.example.test/hero" width="420" height="240" style="max-width: 90%" alt="Harbor &amp; &quot;Pier&quot; &lt;map&gt;"><img src="https://cdn.example.test/card" width="240">"#,
+        );
+        let page = mail.page("light", |_| None);
+        let dom = crate::html::parse_html(&page);
+        assert!(!page.contains("<img"));
+        let images: Vec<_> = dom
+            .select(&scraper::Selector::parse("span[role=img]").unwrap())
+            .collect();
+        assert_eq!(images.len(), 2);
+        assert_eq!(
+            images[0].attr("aria-label"),
+            Some("Image blocked · Harbor & \"Pier\" <map>")
+        );
+        assert_eq!(images[0].attr("width"), Some("420"));
+        assert_eq!(images[0].attr("height"), Some("240"));
+        assert_eq!(images[0].attr("style"), Some("max-width: 90%"));
+        assert_eq!(images[1].attr("aria-label"), Some("Image blocked"));
+        assert_eq!(images[1].attr("width"), Some("240"));
+        let allowed = mail.page("light", |_| Some("data:image/png;base64,AAAA".into()));
+        assert_eq!(
+            allowed
+                .matches("<img src=\"data:image/png;base64,AAAA\"")
+                .count(),
+            2
+        );
+        assert!(allowed.contains("alt=\"Harbor &amp; &quot;Pier&quot; &lt;map&gt;\""));
+        assert!(!allowed.contains("<span data-fell-image-tile"));
+    }
+
+    #[test]
+    fn image_tiles_leave_no_text_after_the_closing_tag() {
+        let remote = WebMail::prepare(
+            "<p>Before<img src='https://cdn.example.test/map' width='100%'>After</p>",
+        );
+        let cid = WebMail::prepare("<p>Before<img src='cid:map' width='100%'>After</p>");
+        for (label, page) in [
+            ("blocked remote", remote.page("light", |_| None)),
+            (
+                "unresolved CID",
+                cid.page("light", |_| panic!("CID is local")),
+            ),
+            (
+                "failed download",
+                remote.page("light", |url| {
+                    assert_eq!(url, "https://cdn.example.test/map");
+                    None
+                }),
+            ),
+        ] {
+            assert!(page.contains("</span>After</p>"), "{label}\n{page}");
+        }
+    }
+
+    #[test]
+    fn unresolved_cid_uses_the_blocked_tile_without_adding_a_fetch() {
+        let mail = WebMail::prepare(
+            "<img src='CID:map' srcset='cid:other' width='120' height='80' alt='Pier map'>",
+        );
+        assert!(!mail.has_remote_images());
+        let page = html::parse_html(&mail.page("light", |_| panic!("CID is local")));
+        let image = page
+            .select(&scraper::Selector::parse("span[role=img]").unwrap())
+            .next()
+            .unwrap();
+        assert_eq!(image.attr("src"), None);
+        assert_eq!(image.attr("srcset"), None);
+        assert_eq!(image.attr("aria-label"), Some("Inline image · Pier map"));
+        assert_eq!(image.attr("width"), Some("120"));
+        assert_eq!(image.attr("height"), Some("80"));
     }
 
     #[test]
@@ -927,35 +2304,124 @@ mod tests {
         assert!(math.contains("</math>"), "{math}");
     }
 
-    fn css_url_request(value: &str) -> Option<String> {
-        let mut stripped = String::new();
-        let mut rest = value;
-        while let Some(start) = rest.find("/*") {
-            stripped.push_str(&rest[..start]);
-            let after = &rest[start + 2..];
-            let end = after.find("*/")?;
-            rest = &after[end + 2..];
+    #[test]
+    fn offline_page_omits_external_svg_and_attribute_resources() {
+        let cases = [
+            r#"<svg><feImage href="https://probe.invalid/image"/></svg>"#,
+            r#"<svg><feImage xlink:href="//probe.invalid/xlink"/></svg>"#,
+            r#"<svg><textPath href="HTTP://probe.invalid/path">Text</textPath></svg>"#,
+            r#"<svg><linearGradient href="https://probe.invalid/gradient"/></svg>"#,
+            r#"<svg><pattern href="file:///probe.png"/></svg>"#,
+            r#"<svg><filter href="relative-probe.svg#filter"/></svg>"#,
+            r#"<svg><mpath href="https://probe.invalid/motion"/></svg>"#,
+            r#"<svg><cursor href="//probe.invalid/cursor"/></svg>"#,
+            r#"<svg><font-face-uri href="https://probe.invalid/font"/></svg>"#,
+            r#"<svg><path fill="url(https://probe.invalid/fill)"/></svg>"#,
+            r#"<svg><path stroke="url(file:///probe.png)"/></svg>"#,
+            r#"<svg><path filter="url(//probe.invalid/filter)"/></svg>"#,
+            r#"<svg><path mask="url('relative-probe.svg#mask')"/></svg>"#,
+            r#"<svg><path clip-path="url(ht&#10;tps://probe.invalid/clip)"/></svg>"#,
+            r#"<svg><set attributeName="href" to="relative-probe.svg"/></svg>"#,
+            r#"<svg><set to="url(file:///probe.png)"/></svg>"#,
+            r##"<svg><animate values="#local;https://probe.invalid/next"/></svg>"##,
+            r#"<svg><animate from="//probe.invalid/from"/></svg>"#,
+            r#"<svg><animate to="https://probe.invalid/to"/></svg>"#,
+            r#"<svg><animate by="url(relative-probe.svg)"/></svg>"#,
+            r#"<img srcset="relative-probe.png 2x" src="relative-probe.png">"#,
+            r#"<p data-src="photo: //probe.invalid/data" title="see file:///probe.png">Text</p>"#,
+            r#"<p style='font-family: "https://probe.invalid/family"'>Text</p>"#,
+            r#"<svg><a xlink:href="https://probe.invalid/link">Text</a></svg>"#,
+        ];
+        for html in cases {
+            let mail = WebMail::prepare(html);
+            assert!(!mail.has_remote_images(), "{html}");
+            let page = mail.page("light", |_| None);
+            for forbidden in ["probe.invalid", "file:", "relative-probe"] {
+                assert!(!page.contains(forbidden), "{html}: {page}");
+            }
         }
-        stripped.push_str(rest);
-        let open = stripped.find("url(")? + 4;
-        let close = stripped[open..].find(')')? + open;
-        let token = stripped[open..close]
-            .trim()
-            .trim_matches(|ch| ch == '"' || ch == '\'');
-        (!token.is_empty()).then(|| token.to_string())
+        let page = WebMail::prepare(
+            r##"<svg><use href="#local" fill="url(#accent)"/></svg><a href="https://example.test">Link</a><img src="cid:logo"><img src="data:image/png;base64,//AA">"##,
+        )
+        .page("light", |_| None);
+        for local in [
+            "#local",
+            "url(#accent)",
+            "https://example.test",
+            "aria-label=\"Inline image\"",
+            "//AA",
+        ] {
+            assert!(page.contains(local), "{page}");
+        }
     }
 
     #[test]
-    fn comment_in_url_is_denied_when_the_request_is_issued() {
-        for css in [
-            r#"url(/*x*/"http://169.254.169.254/latest/meta-data")"#,
-            r#"url(/*x*/"http://127.0.0.1/x.png")"#,
+    fn sanitized_page_removes_comment_split_imports_and_unapproved_urls() {
+        let mail = WebMail::prepare(
+            r#"<style>
+            @im/*x*/port "https://example.test/import;with-semicolon";
+            @import url("data:text/css,body{}");
+            @font-face { src: u/*x*/rl("http://example.test/font"); }
+            p { background: url/*x*/("https://example.test/slot(a).png"); }
+            i { background: url(/*x*/"http://192.0.0.192/metadata"); }
+            b { background: url("file:///probe.png"); }
+            em { background: url("data:image/png;base64,AAAA"); }
+            </style><p style="mask: u/*x*/rl(https://example.test/mask)">Sample</p>"#,
+        );
+        let blocked = mail.page("light", |_| None);
+        let mut slots = Vec::new();
+        let allowed = mail.page("light", |url| {
+            slots.push(url.to_owned());
+            Some("data:image/png;base64,BBBB".into())
+        });
+        for page in [&blocked, &allowed] {
+            assert!(!page.contains("example.test"), "{page}");
+            assert!(!page.contains("192.0.0.192"), "{page}");
+            assert!(!page.contains("file:"), "{page}");
+            assert!(!page.contains("@import"), "{page}");
+            assert!(!page.contains("/*x*/"), "{page}");
+            assert!(page.contains("data:image/png;base64,AAAA"), "{page}");
+        }
+        assert_eq!(slots, ["https://example.test/slot(a).png"]);
+        assert!(allowed.contains("data:image/png;base64,BBBB"));
+    }
+
+    #[test]
+    fn special_purpose_addresses_are_blocked_before_connect() {
+        for ip in [
+            "192.0.0.192",
+            "192.0.2.1",
+            "192.31.196.1",
+            "192.52.193.1",
+            "192.88.99.2",
+            "192.175.48.1",
+            "198.19.255.255",
+            "198.51.100.1",
+            "203.0.113.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+            "::ffff:1.1.1.1",
+            "64:ff9b:1::1",
+            "100::1",
+            "2001:2::1",
+            "2001:db8::1",
+            "2620:4f:8000::1",
+            "3fff:fff::1",
+            "5f00::1",
+            "fc00::1",
+            "fe80::1",
+            "ff02::1",
         ] {
-            let request = css_url_request(css).expect(css);
+            let address = ip.parse().unwrap();
+            assert!(address_is_blocked(address), "{ip}");
             assert!(
-                super::request_is_blocked_with(&request, |_| Vec::new()),
-                "{css} -> {request}"
+                request_is_blocked_with("https://cdn.example/image", |_| vec![address]),
+                "{ip}"
             );
+        }
+        for ip in ["192.0.1.1", "223.255.255.254", "2606:4700:4700::1111"] {
+            assert!(!address_is_blocked(ip.parse().unwrap()), "{ip}");
         }
     }
 

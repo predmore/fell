@@ -9,11 +9,12 @@
 //!
 //! None of this runs on the UI thread. The store thread reads the parts and
 //! prepares the bodies the reader could see above the message they land on,
-//! so nothing above it moves once the thread is on screen; the body they land
-//! on, and any message opened later, is prepared on the background executor
-//! and fades in under a header that is already drawn. The store thread
-//! prepares at most [`STORE_PREPARE_BYTES`] of HTML per read, so one huge
-//! message cannot hold up the folder; the rest go to the background too.
+//! so nothing above it moves once the thread is on screen. Possible web
+//! bodies are prepared on the background executor before the first thread
+//! frame if they fit the compressed read budget. Larger bodies use the
+//! background store connection and arrive after the thread is on screen.
+//! The newest native body and messages opened later can fade in under
+//! a header that is already drawn.
 //! Prepared bodies are cached by message id and the stored parts' stamp,
 //! so reopening a thread prepares nothing and a resync that replaces a
 //! body is prepared again.
@@ -26,13 +27,17 @@ use fell_render::{FoldedDocument, MailHeaders, fold_history, prepare};
 use gpui::RenderImage;
 
 use crate::present::{ConvMessage, Rich};
-use crate::render::{ImageGallery, Palette};
+use crate::render::{ImageGallery, Palette, webview::MAX_FALLBACK_LINKS};
 use crate::text_render::{RenderedBody, render_stored_body};
 use crate::theme::Theme;
 
-/// One message's HTML, prepared for the native painter.
+/// One message's prepared HTML for both painters.
 pub struct HtmlBody {
     pub folded: FoldedDocument,
+    pub suggested: fell_render::RenderMode,
+    pub web: Arc<fell_render::WebMail>,
+    pub web_links: Vec<fell_render::Block>,
+    pub sender_attestation: Option<String>,
     /// Lines of text in each section, for a folded section's label.
     pub fold_lines: Vec<usize>,
     /// Each section is written right to left: its rule and fold line are
@@ -127,6 +132,8 @@ pub fn prepare_html(html: &str, headers_in: &[(String, String)]) -> HtmlBody {
         headers.add(name.as_str(), value.as_str());
     }
     let prepared = prepare(html, &headers);
+    let suggested = prepared.suggested;
+    let sender_attestation = headers.get("X-Fell-Verified-Sender").map(str::to_owned);
     let folded = if headers.is_bulk() {
         FoldedDocument::unfolded(prepared.document)
     } else {
@@ -135,6 +142,10 @@ pub fn prepare_html(html: &str, headers_in: &[(String, String)]) -> HtmlBody {
             headers.get("Subject").unwrap_or_default(),
         )
     };
+    let web = Arc::new(fell_render::WebMail::prepare_with_history(
+        &prepared.source_html,
+        &folded,
+    ));
     // Built after folding: the gallery keys images by their bytes' address.
     let gallery = ImageGallery::from_document(&folded.document);
     let texts: Vec<String> = folded
@@ -160,11 +171,144 @@ pub fn prepare_html(html: &str, headers_in: &[(String, String)]) -> HtmlBody {
         .iter()
         .map(|text| crate::render::is_right_to_left(text))
         .collect();
+    let web_links = if web.has_author_colors() {
+        web_link_blocks(&folded.document.blocks)
+    } else {
+        Vec::new()
+    };
     HtmlBody {
         folded,
+        suggested,
+        web,
+        web_links,
+        sender_attestation,
         fold_lines,
         rtl,
         gallery,
+    }
+}
+
+// Snapshots with author colors keep a native link list.
+fn web_link_blocks(blocks: &[fell_render::Block]) -> Vec<fell_render::Block> {
+    use fell_render::{Block, Inline};
+
+    let mut links = Vec::new();
+    collect_web_links(blocks, &mut links, &mut HashMap::new());
+    let single = links.len() == 1;
+    links
+        .into_iter()
+        .map(|link| {
+            let label = if let Some(text) = link.text {
+                if single { "Open link".into() } else { text }
+            } else {
+                link.alt.unwrap_or_else(|| "Open link".into())
+            };
+            Block::Paragraph {
+                inlines: vec![Inline::Link {
+                    href: link.href,
+                    children: vec![Inline::Text(label)],
+                }],
+            }
+        })
+        .collect()
+}
+
+struct WebLink {
+    href: String,
+    text: Option<String>,
+    alt: Option<String>,
+}
+
+fn collect_web_links(
+    blocks: &[fell_render::Block],
+    links: &mut Vec<WebLink>,
+    seen: &mut HashMap<String, usize>,
+) {
+    use fell_render::{Block, Inline};
+
+    fn label(inlines: &[Inline], text: &mut String, alt: &mut Option<String>) {
+        for inline in inlines {
+            match inline {
+                Inline::Text(part) | Inline::Code(part) => text.push_str(part),
+                Inline::Emphasis(children)
+                | Inline::Strong(children)
+                | Inline::Strike(children) => label(children, text, alt),
+                Inline::LineBreak => text.push(' '),
+                Inline::Image { alt: part, .. } if alt.as_ref().is_none_or(String::is_empty) => {
+                    *alt = Some(part.trim().into());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn visit(inlines: &[Inline], links: &mut Vec<WebLink>, seen: &mut HashMap<String, usize>) {
+        for inline in inlines {
+            if links.len() == MAX_FALLBACK_LINKS {
+                break;
+            }
+            match inline {
+                Inline::Link { href, children } => {
+                    let Some(target) = fell_render::reader_link_target(href) else {
+                        continue;
+                    };
+                    let (scheme, rest) = target.split_once(':').expect("validated link");
+                    let key = format!("{}:{rest}", scheme.to_ascii_lowercase());
+                    let mut text = String::new();
+                    let mut alt = None;
+                    label(children, &mut text, &mut alt);
+                    if text.trim().is_empty() && alt.is_none() {
+                        continue;
+                    }
+                    let index = *seen.entry(key).or_insert(links.len());
+                    if index == links.len() {
+                        links.push(WebLink {
+                            href: target,
+                            text: None,
+                            alt: None,
+                        });
+                    }
+                    let link = &mut links[index];
+                    if link.text.is_none() && !text.trim().is_empty() {
+                        link.text = Some(text.trim().into());
+                    }
+                    if link.alt.is_none() {
+                        link.alt = alt.filter(|alt| !alt.is_empty());
+                    }
+                }
+                Inline::Emphasis(children)
+                | Inline::Strong(children)
+                | Inline::Strike(children) => {
+                    visit(children, links, seen);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    for block in blocks {
+        if links.len() == MAX_FALLBACK_LINKS {
+            break;
+        }
+        match block {
+            Block::Paragraph { inlines } | Block::Heading { inlines, .. } => {
+                visit(inlines, links, seen)
+            }
+            Block::Quote { blocks } | Block::Small { blocks } | Block::ReplyHeader { blocks } => {
+                collect_web_links(blocks, links, seen);
+            }
+            Block::List { items, .. } => {
+                for item in items {
+                    collect_web_links(&item.blocks, links, seen);
+                }
+            }
+            Block::Table { header, rows, .. } => {
+                for cell in header.iter().chain(rows.iter().flatten()) {
+                    collect_web_links(cell, links, seen);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -273,15 +417,30 @@ impl BodyCache {
 /// What the store thread found for a conversation's bodies.
 #[derive(Default)]
 pub struct BodyReads {
-    /// Bodies prepared on the store thread and their positions in the read.
+    /// Prepared bodies and their positions in the read.
     prepared: Vec<(usize, PreparedBody)>,
+    jobs: Vec<(usize, BodyJob)>,
     /// The stored revision of each HTML body in the read.
     stamps: HashMap<String, PartStamp>,
 }
 
+impl BodyReads {
+    pub fn has_jobs(&self) -> bool {
+        !self.jobs.is_empty()
+    }
+
+    pub fn prepare_jobs(&mut self) {
+        self.prepared.extend(
+            self.jobs
+                .drain(..)
+                .map(|(index, job)| (index, job.prepare())),
+        );
+    }
+}
+
 /// Find which messages have HTML on the store thread.
 ///
-/// Prepare small expanded bodies above the last message here so they
+/// Read small expanded bodies to prepare off the store thread so they
 /// arrive in place. The window resolves the rest against its live cache
 /// and starts any remaining loads for the revisions returned here.
 #[cfg(test)]
@@ -291,7 +450,10 @@ fn read_bodies(
     messages: &mut [ConvMessage],
     cached: &HashMap<String, PartStamp>,
 ) -> BodyReads {
-    read_bodies_with_latest(store, account, messages, cached, false)
+    let mut reads =
+        read_bodies_with_latest(store, account, messages, cached, false, |_| Some(false));
+    reads.prepare_jobs();
+    reads
 }
 
 pub fn read_bodies_with_latest(
@@ -300,6 +462,7 @@ pub fn read_bodies_with_latest(
     messages: &mut [ConvMessage],
     cached: &HashMap<String, PartStamp>,
     prepare_latest: bool,
+    sender_mode: impl Fn(&ConvMessage) -> Option<bool>,
 ) -> BodyReads {
     let mut reads = BodyReads::default();
     let ids: Vec<&str> = messages.iter().map(|message| message.id.as_str()).collect();
@@ -319,21 +482,27 @@ pub fn read_bodies_with_latest(
             Some(kinds) if kinds.html => {
                 message.rich = Rich::Pending;
                 reads.stamps.insert(message.id.clone(), kinds.stamp);
-                if message.expanded
-                    && (index < last || prepare_latest)
-                    && kinds.html_bytes <= budget
-                    && cached.get(&message.id) != Some(&kinds.stamp)
-                {
-                    budget -= kinds.html_bytes;
-                    if let Ok(Some(job)) = read_job_at_stamp(
+                let wants_web = sender_mode(message).unwrap_or(kinds.has_delivery_headers);
+                let bytes = kinds.html_bytes.saturating_add(kinds.plain_bytes);
+                if wants_web && bytes > budget {
+                    message.rich = Rich::PendingWeb;
+                }
+                if !message.expanded || cached.get(&message.id) == Some(&kinds.stamp) {
+                    continue;
+                }
+                let web_preview = !prepare_latest && wants_web;
+                if bytes <= budget
+                    && (web_preview || index < last || prepare_latest)
+                    && let Ok(Some(job)) = read_job_at_stamp(
                         store,
                         account,
                         &message.id,
                         kinds.stamp,
                         &message.mail_headers,
-                    ) {
-                        reads.prepared.push((index, job.prepare()));
-                    }
+                    )
+                {
+                    budget -= bytes;
+                    reads.jobs.push((index, job));
                 }
             }
             // A stored row with no parts is a settled result as well.
@@ -402,10 +571,12 @@ impl BodyLoads {
         BodyReads {
             mut stamps,
             prepared,
+            jobs,
         }: BodyReads,
         cache: &mut BodyCache,
         messages: &mut [ConvMessage],
     ) {
+        debug_assert!(jobs.is_empty());
         for message in messages.iter_mut() {
             let Some(wanted) = stamps.get(&message.id) else {
                 continue;
@@ -483,7 +654,11 @@ pub fn palette(theme: &Theme) -> Palette {
         background: theme.background,
         foreground: theme.foreground,
         dimmed: theme.dimmed,
-        accent: theme.accent,
+        accent: crate::theme::ensure_all(
+            theme.accent,
+            &[theme.background, theme.surface],
+            crate::theme::LINK_TEXT_CONTRAST,
+        ),
         // Quote rules are marks a reader follows down the page: 3:1.
         quote: crate::theme::strong_border(theme),
         code_bg: mix(theme.surface, theme.border, 0.5),
@@ -495,19 +670,20 @@ pub fn palette(theme: &Theme) -> Palette {
 /// The palette for opened history: its text is the dimmed colour, as the
 /// plain-text quote is.
 pub fn history_palette(theme: &Theme) -> Palette {
+    let palette = palette(theme);
     let subdued = mix(theme.accent, theme.dimmed, 0.35);
     let accent = if [theme.background, theme.surface]
         .into_iter()
-        .all(|surface| crate::theme::contrast(subdued, surface) >= 4.5)
+        .all(|surface| crate::theme::contrast(subdued, surface) >= crate::theme::LINK_TEXT_CONTRAST)
     {
         subdued
     } else {
-        theme.accent
+        palette.accent
     };
     Palette {
         foreground: theme.dimmed,
         accent,
-        ..palette(theme)
+        ..palette
     }
 }
 
@@ -522,6 +698,37 @@ fn mix(a: u32, b: u32, t: f32) -> u32 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn one_web_link_shows_a_single_action_below_its_caption() {
+        let doc = fell_render::html_to_document(
+            r#"<a href="https://example.test">Harbor office</a>
+                <a href="https://example.test">Office hours</a>"#,
+        );
+        let links = super::web_link_blocks(&doc.blocks);
+        assert_eq!(
+            fell_render::StyledDocument::blocks_text(&links),
+            "Open link"
+        );
+    }
+
+    #[test]
+    fn web_links_prefer_text_and_keep_one_control_for_each_image_destination() {
+        let html = r#"<p><a href="https://example.test/route"><img src="https://example.test/image" alt="Map"></a>
+            <a href="https://example.test/route"><strong>The route</strong></a>
+            <a href="https://example.test/route">Map again</a>
+            <a href="https://example.test/shops"><img src="https://example.test/logo" alt="Logo">Shops</a>
+            <a href="HTTPS://example.test/ferry"><img src="https://example.test/ferry.png" alt="Ferry timetable"></a>
+            <a href="https://example.test/ferry"><img src="https://example.test/ferry2.png" alt="Duplicate"></a>
+            <a href="https://example.test/harbor"><img src="https://example.test/harbor.png"></a></p>"#;
+        let doc = fell_render::prepare(html, &Default::default()).document;
+        let links = super::web_link_blocks(&doc.blocks);
+        assert_eq!(
+            fell_render::StyledDocument::blocks_text(&links),
+            "The route\nShops\nFerry timetable\nOpen link"
+        );
+    }
+
     use super::*;
     use fell_core::{
         Account, Address, BackendKind, FolderRoles, Message, MessageHeaders, MessageId,
@@ -589,6 +796,7 @@ mod tests {
                 .iter()
                 .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
                 .collect(),
+            trusted_sender_delivery: false,
             mime_parts: Vec::new(),
         }
     }
@@ -711,6 +919,7 @@ mod tests {
             html: None,
             plain: Some("plain".into()),
             bulk_headers: Vec::new(),
+            trusted_sender_delivery: false,
             mime_parts: Vec::new(),
         });
         let bare = mail("d@fell.test", "a@fell.test", 120, None);
@@ -722,7 +931,17 @@ mod tests {
         );
         let store = store_with(&[first, second, plain, bare, last]);
         let mut view = open(&store, "a@fell.test");
-        let reads = read_bodies(&store, &account().id, &mut view, &HashMap::new());
+        let mut reads = read_bodies_with_latest(
+            &store,
+            &account().id,
+            &mut view,
+            &HashMap::new(),
+            false,
+            |_| Some(false),
+        );
+        assert!(reads.prepared.is_empty());
+        assert_eq!(reads.jobs.len(), 1);
+        reads.prepare_jobs();
         assert_eq!(reads.prepared.len(), 1);
         let mut loads = BodyLoads::default();
         loads.accept(reads, &mut BodyCache::default(), &mut view);
@@ -812,6 +1031,62 @@ mod tests {
             &[("List-Unsubscribe".into(), "<https://news.test/u>".into())],
         );
         assert!(!bulk.folded.has_folds());
+    }
+
+    #[test]
+    fn a_new_thread_prepares_its_latest_web_body_before_display() {
+        let id = "newsletter@fell.test";
+        let store = store_with(&[mail(
+            id,
+            id,
+            0,
+            Some(html_parts(&heavy_newsletter(), &[("Precedence", "bulk")])),
+        )]);
+        let mut view = open(&store, id);
+        let mut reads = read_bodies_with_latest(
+            &store,
+            &account().id,
+            &mut view,
+            &HashMap::new(),
+            false,
+            |_| None,
+        );
+        assert!(reads.has_jobs());
+        reads.prepare_jobs();
+        BodyLoads::default().accept(reads, &mut BodyCache::default(), &mut view);
+        let Rich::Html(body) = &view[0].rich else {
+            panic!("expected web body on arrival")
+        };
+        assert_eq!(body.suggested, fell_render::RenderMode::Web);
+        assert!(body.web.has_remote_images());
+    }
+
+    #[test]
+    fn a_verified_personal_message_uses_native_body_scheduling() {
+        let id = "personal@fell.test";
+        let mut parts = html_parts(
+            "<p>Thursday works for me.</p>",
+            &[("X-Fell-Verified-Sender", "ada@fell.test")],
+        );
+        parts.trusted_sender_delivery = true;
+        let store = store_with(&[mail(id, id, 0, Some(parts))]);
+        let mut view = open(&store, id);
+        let reads = read_bodies_with_latest(
+            &store,
+            &account().id,
+            &mut view,
+            &HashMap::new(),
+            false,
+            |_| None,
+        );
+        assert!(!reads.has_jobs());
+        assert_eq!(view[0].rich, Rich::Pending);
+        let mut loads = BodyLoads::default();
+        loads.accept(reads, &mut BodyCache::default(), &mut view);
+        let load = loads.begin(id).unwrap();
+        let body = job(&store, &view[0], load).unwrap().prepare().body;
+        assert_eq!(body.suggested, fell_render::RenderMode::Native);
+        assert_eq!(body.sender_attestation.as_deref(), Some("ada@fell.test"));
     }
 
     #[test]
@@ -1115,7 +1390,17 @@ mod tests {
         ));
         let store = store_with(&messages);
         let mut view = open(&store, "m0@fell.test");
-        let reads = read_bodies(&store, &account().id, &mut view, &HashMap::new());
+        let mut reads = read_bodies_with_latest(
+            &store,
+            &account().id,
+            &mut view,
+            &HashMap::new(),
+            false,
+            |_| Some(false),
+        );
+        assert!(reads.prepared.is_empty());
+        assert_eq!(reads.jobs.len(), 1);
+        reads.prepare_jobs();
         assert_eq!(reads.prepared.len(), 1);
         let mut loads = BodyLoads::default();
         loads.accept(reads, &mut BodyCache::default(), &mut view);
@@ -1129,6 +1414,47 @@ mod tests {
         assert!(loads.begin("m0@fell.test").is_none());
         for id in ["m1@fell.test", "m2@fell.test", "last@fell.test"] {
             assert!(loads.begin(id).is_some());
+        }
+    }
+
+    #[test]
+    fn an_oversized_newsletter_opens_as_a_pending_web_body() {
+        let id = "large@fell.test";
+        let mut state = 1_u64;
+        let mut html = String::from("<table role='presentation'><tr><td>");
+        while html.len() < 1024 * 1024 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            html.push(char::from(b'a' + ((state >> 59) as u8 % 26)));
+            if state.is_multiple_of(13) {
+                html.push(' ');
+            }
+        }
+        html.push_str("</td></tr></table>");
+        let store = store_with(&[mail(
+            id,
+            id,
+            1,
+            Some(html_parts(&html, &[("Precedence", "bulk")])),
+        )]);
+        for sender_mode in [None, Some(true)] {
+            let mut view = open(&store, id);
+            let reads = read_bodies_with_latest(
+                &store,
+                &account().id,
+                &mut view,
+                &HashMap::new(),
+                false,
+                |_| sender_mode,
+            );
+            assert!(!reads.has_jobs());
+            assert!(reads.prepared.is_empty());
+            assert_eq!(view[0].rich, Rich::PendingWeb);
+            let mut loads = BodyLoads::default();
+            loads.accept(reads, &mut BodyCache::default(), &mut view);
+            let load = loads.begin(id).unwrap();
+            assert!(job(&store, &view[0], load).is_some());
         }
     }
 

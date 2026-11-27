@@ -4319,6 +4319,7 @@ mod tests {
             mime_parts: Vec::new(),
             html: Some(format!("<p>{text}</p>")),
             plain: Some(text.into()),
+            trusted_sender_delivery: false,
             bulk_headers: vec![("List-Id".into(), "<news.x>".into())],
         }
     }

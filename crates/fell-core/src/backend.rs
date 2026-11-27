@@ -192,6 +192,10 @@ pub struct SyncProgress {
 pub trait MailBackend {
     fn kind(&self) -> BackendKind;
 
+    fn trust_verified_sender_header(&self) -> bool {
+        false
+    }
+
     /// Whether the account queues an IMAP Sent copy after SMTP succeeds.
     fn append_sent(&self) -> bool {
         false
@@ -342,6 +346,10 @@ impl MailBackend for BridgeBackend {
         BackendKind::Bridge
     }
 
+    fn trust_verified_sender_header(&self) -> bool {
+        self.imap.trust_verified_sender_header
+    }
+
     fn append_sent(&self) -> bool {
         self.smtp.append_sent
     }
@@ -437,6 +445,10 @@ pub struct ImapBackend {
 impl MailBackend for ImapBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::Imap
+    }
+
+    fn trust_verified_sender_header(&self) -> bool {
+        self.config.trust_verified_sender_header
     }
 
     fn append_sent(&self) -> bool {

@@ -18,6 +18,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use super::theme::{Palette, ink, paint};
 
 mod links;
+pub(crate) use links::SnapshotLinks;
 use links::{LinkControls, LinkSpan, checked_target, link_controls, link_spans};
 
 /// Decoded inline images for one message.
@@ -625,6 +626,26 @@ pub(crate) fn blocks_column_spaced(
     gap: f32,
     markers: &ListMarkerFont,
 ) -> gpui::Div {
+    blocks_column_with_headings(
+        blocks,
+        palette,
+        allow_remote,
+        gallery,
+        layout,
+        (gap, None),
+        markers,
+    )
+}
+
+pub(crate) fn blocks_column_with_headings(
+    blocks: &[Block],
+    palette: &Palette,
+    allow_remote: bool,
+    gallery: &ImageGallery,
+    layout: impl Into<BlockColumns>,
+    (gap, continuation): (f32, Option<&crate::scroll_anchor::Continuation>),
+    markers: &ListMarkerFont,
+) -> gpui::Div {
     // A short letter should reach the lower part of the pane. The gaps and
     // line height do that without adding a fake closing rule.
     let mut column = div().flex().flex_col().line_height(px(22.));
@@ -667,6 +688,13 @@ pub(crate) fn blocks_column_spaced(
                 gap_between(above, &blocks[start]) * gap
             }
         });
+        let child = if let Some(continuation) = continuation
+            && matches!(blocks[start], Block::Heading { .. })
+        {
+            continuation.heading(child).into_any_element()
+        } else {
+            child
+        };
         column = column.child(div().mt(px(gap)).child(child));
         previous = Some(&blocks[end - 1]);
     }
@@ -2912,9 +2940,9 @@ fn image_el(
         }
         ImageSource::Remote(_) => {
             if alt.is_empty() {
-                "Remote image".to_string()
+                "Image".to_string()
             } else {
-                format!("Remote image · {alt}")
+                format!("Image · {alt}")
             }
         }
         // A `cid:` is the attachment's id, not a name: the alt says what it is.
@@ -2928,56 +2956,16 @@ fn image_el(
     };
     let placeholder = div()
         .text_sm()
-        .text_color(paint(palette.dimmed))
+        .text_color(paint(crate::theme::note_text(
+            palette.dimmed,
+            layout
+                .reader
+                .map_or(palette.background, |reader| reader.fill),
+        )))
         .child(label);
     let mut placeholder = layout.prose(placeholder);
     placeholder.style().align_self = Some(gpui::AlignItems::FlexStart);
     placeholder.into_any_element()
-}
-
-pub(crate) fn embedded_web(image: Arc<RenderImage>) -> AnyElement {
-    // Native pixels. Stretching the snapshot to the pane softens the type.
-    div()
-        .w_full()
-        .child(img(image).object_fit(gpui::ObjectFit::None))
-        .into_any_element()
-}
-
-/// Drop trailing rows that are a flat page color, so a short newsletter
-/// does not keep the empty viewport under the card. A short run of that
-/// color stays, matching the page's own top inset. The pane below the
-/// snapshot is painted the same color, so the page still fills the window.
-pub(crate) fn trim_uniform_bottom(rgba: &[u8], width: u32, height: u32) -> u32 {
-    const KEEP_FLAT_ROWS: usize = 12;
-    let row_bytes = width as usize * 4;
-    if row_bytes == 0 || height == 0 || rgba.len() < row_bytes * height as usize {
-        return height;
-    }
-    let mut rows = height as usize;
-    while rows > 1 {
-        let start = (rows - 1) * row_bytes;
-        if !row_is_flat(&rgba[start..start + row_bytes]) {
-            break;
-        }
-        rows -= 1;
-    }
-    if rows == 1 && row_is_flat(&rgba[..row_bytes]) {
-        return height;
-    }
-    let flat = height as usize - rows;
-    (rows + flat.min(KEEP_FLAT_ROWS)) as u32
-}
-
-fn row_is_flat(row: &[u8]) -> bool {
-    let Some(first) = row.get(..4) else {
-        return true;
-    };
-    row.as_chunks::<4>().0.iter().all(|px| {
-        px[0].abs_diff(first[0]) <= 2
-            && px[1].abs_diff(first[1]) <= 2
-            && px[2].abs_diff(first[2]) <= 2
-            && px[3].abs_diff(first[3]) <= 2
-    })
 }
 
 /// A mail image or a web snapshot. Far below the image crate's 512MiB default,
@@ -3035,7 +3023,7 @@ pub(crate) fn fit_snapshot(width: u32, height: u32) -> (u32, u32) {
     (dst_w.max(1), dst_h.max(1))
 }
 
-fn image_limits() -> image::Limits {
+pub(super) fn image_limits() -> image::Limits {
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MAX_IMAGE_EDGE);
     limits.max_image_height = Some(MAX_IMAGE_EDGE);
@@ -3043,21 +3031,9 @@ fn image_limits() -> image::Limits {
     limits
 }
 
+#[cfg(test)]
 pub(crate) fn decode_image(bytes: &[u8]) -> Option<Arc<RenderImage>> {
     decode_rgba(bytes).map(render_frame)
-}
-
-/// A corner of a newsletter snapshot. The pane under the snapshot is painted
-/// this color so the page runs to the window edge.
-pub(crate) fn edge_color(bytes: &[u8]) -> Option<u32> {
-    let image = image::ImageReader::new(std::io::Cursor::new(bytes))
-        .with_guessed_format()
-        .ok()?
-        .decode()
-        .ok()?;
-    let rgba = image.to_rgba8();
-    let pixel = rgba.get_pixel(0, 0).0;
-    Some(u32::from(pixel[0]) << 16 | u32::from(pixel[1]) << 8 | u32::from(pixel[2]))
 }
 
 fn decode_rgba(bytes: &[u8]) -> Option<image::RgbaImage> {
@@ -4399,47 +4375,6 @@ mod decode_tests {
         let (width, height) = fit_snapshot(880, 9_500);
         assert!(raster_allowed(width, height), "{width}x{height}");
         assert!(height > 4_000, "{width}x{height}");
-    }
-
-    #[test]
-    fn uniform_page_color_under_a_card_is_trimmed() {
-        use super::trim_uniform_bottom;
-        let width = 4u32;
-        let height = 40u32;
-        let mut rgba = vec![0u8; width as usize * height as usize * 4];
-        for y in 0..10 {
-            for x in 0..width as usize {
-                let i = (y * width as usize + x) * 4;
-                rgba[i] = 20;
-                rgba[i + 1] = x as u8;
-                rgba[i + 2] = 40;
-                rgba[i + 3] = 255;
-            }
-        }
-        for y in 10..40 {
-            for x in 0..width as usize {
-                let i = (y * width as usize + x) * 4;
-                rgba[i] = 231;
-                rgba[i + 1] = 226;
-                rgba[i + 2] = 216;
-                rgba[i + 3] = 255;
-            }
-        }
-        assert_eq!(trim_uniform_bottom(&rgba, width, height), 22);
-        let short = &rgba[..width as usize * 18 * 4];
-        assert_eq!(trim_uniform_bottom(short, width, 18), 18);
-        let mut tall = vec![0u8; width as usize * 200 * 4];
-        tall[..rgba.len()].copy_from_slice(&rgba);
-        for y in 40..200 {
-            for x in 0..width as usize {
-                let i = (y * width as usize + x) * 4;
-                tall[i] = 231;
-                tall[i + 1] = 226;
-                tall[i + 2] = 216;
-                tall[i + 3] = 255;
-            }
-        }
-        assert_eq!(trim_uniform_bottom(&tall, width, 200), 22);
     }
 
     #[test]

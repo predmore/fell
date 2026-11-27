@@ -279,7 +279,8 @@ pub struct InboxMotion {
     arrival: Option<Transition>,
     /// They arrived since the last frame: the fade starts with the frame
     /// that first draws them, so a late frame cannot eat it.
-    arrival_pending: bool,
+    arrival_pending: Option<Duration>,
+    arrival_held: bool,
     /// Bodies settling into the open thread, by message id.
     bodies: HashMap<String, BodyArrival>,
     attachment_fades: HashMap<String, (Transition, f32)>,
@@ -420,7 +421,8 @@ impl InboxMotion {
             selection_out: None,
             last_selected: None,
             arrival: None,
-            arrival_pending: false,
+            arrival_pending: None,
+            arrival_held: false,
             list_from: None,
             conv_from: None,
             card_to: None,
@@ -451,8 +453,10 @@ impl InboxMotion {
     pub fn observe(&mut self, session: &Session, panes: (bool, bool), now: Instant) {
         self.observe_notice(session.status_notice(), now);
         let start = |duration| self.motion.start(duration, now);
-        if std::mem::take(&mut self.arrival_pending) {
-            self.arrival = start(motion::QUICK);
+        if !self.arrival_held
+            && let Some(duration) = self.arrival_pending.take()
+        {
+            self.arrival = start(duration);
         }
         let outage = session.worker_outage();
         if outage != self.last_worker_outage {
@@ -660,15 +664,33 @@ impl InboxMotion {
     /// store, or a compose draft in the Drafts list from memory. Every
     /// path that replaces the conversation goes through here, so none
     /// pops in.
-    pub fn show_thread(&mut self, session: &mut Session, messages: Vec<ConvMessage>) {
+    pub fn show_thread(
+        &mut self,
+        session: &mut Session,
+        messages: Vec<ConvMessage>,
+        fade: Duration,
+    ) {
         session.set_messages(messages);
         self.arrival = None;
-        self.arrival_pending = true;
+        self.arrival_pending = Some(fade);
+        self.arrival_held = false;
         self.bodies.clear();
         self.attachment_fades.clear();
         self.message_fades.clear();
         self.messages_pending.clear();
         self.arrival_frame = None;
+    }
+
+    pub fn hold_thread_arrival(&mut self) {
+        self.arrival_held = self.arrival_pending.is_some();
+    }
+
+    pub fn release_thread_arrival(&mut self, now: Instant) {
+        if std::mem::take(&mut self.arrival_held)
+            && let Some(duration) = self.arrival_pending.take()
+        {
+            self.arrival = self.motion.start(duration, now);
+        }
     }
 
     /// Jump every transition to its end state: a key acts on what the
@@ -703,7 +725,8 @@ impl InboxMotion {
         self.focus = None;
         self.selection_out = None;
         self.arrival = None;
-        self.arrival_pending = false;
+        self.arrival_pending = None;
+        self.arrival_held = false;
         self.finish_empty_list_entry();
         self.bodies.clear();
         self.attachment_fades.clear();
@@ -1273,6 +1296,9 @@ impl InboxMotion {
     /// thread's arrive from [`motion::ARRIVE_FROM`], so the pane never
     /// blinks to empty.
     pub fn arrival(&self, now: Instant) -> f32 {
+        if self.arrival_held && self.motion.enabled() {
+            return motion::ARRIVE_FROM;
+        }
         motion::lerp(
             motion::ARRIVE_FROM,
             1.0,
@@ -2509,7 +2535,7 @@ mod tests {
             known_names: Default::default(),
         };
         let shown = crate::present::draft_conversation(&draft, "a@x", 2_000);
-        motion.show_thread(&mut session, shown);
+        motion.show_thread(&mut session, shown, motion::QUICK);
         assert_eq!(session.messages.len(), 1);
         // The frame that first draws it starts the fade, from ARRIVE_FROM:
         // the pane never blinks to empty.
@@ -2524,7 +2550,7 @@ mod tests {
         // Off with reduce_motion: it is simply there.
         let mut still = InboxMotion::new(Motion::new(false));
         let shown = crate::present::draft_conversation(&draft, "a@x", 2_000);
-        still.show_thread(&mut session, shown);
+        still.show_thread(&mut session, shown, motion::QUICK);
         still.observe(&session, (true, true), drawn);
         assert_eq!(still.arrival(drawn), 1.0);
     }
