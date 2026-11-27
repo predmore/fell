@@ -1,0 +1,10 @@
+speed,layout,arrival_index,arrival_top_px,arrival_subject,slider_index,slider_top_px,slider_subject
+slow,dark,45,10.0,Notes from the design review #9,48,9.8,Draft of the release post #12
+slow,dark,46,78.0,Can you look at this before Friday? #10,49,77.8,Weekly numbers #13
+slow,dark,47,146.0,Invitation: planning sync #11,50,145.8,Build passed on main #14
+slow,light,44,-58.0,Build passed on main #8,47,-49.0,Invitation: planning sync #11
+slow,light,45,10.0,Notes from the design review #9,48,19.0,Draft of the release post #12
+slow,light,46,78.0,Can you look at this before Friday? #10,49,87.0,Weekly numbers #13
+slow,narrow,45,10.0,Notes from the design review #9,48,-1.0,Draft of the release post #12
+slow,narrow,46,78.0,Can you look at this before Friday? #10,49,67.0,Weekly numbers #13
+slow,narrow,47,146.0,Invitation: planning sync #11,50,135.0,Build passed on main #14

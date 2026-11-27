@@ -80,3 +80,39 @@ The top batch uses `V`, nine `j` presses, then `e`. All ten slots show only repl
 The bottom batch uses `G`, `V`, nine `k` presses, then `e`. The two measured survivors keep their 68 px separation on every matched frame, including during the undo reversal. The quadratic 160 ms curve moves the group about 134 px in a nominal 60 Hz step, compared with 176 px on the 120 ms curve. The software compositor can repeat frames or skip early poses, so the first sampled displacements and timestamps describe the video. The undo flow sends `u` during the slide.
 
 [measure-round4.py](round-4/measure-round4.py) limits measurement to the list text column. It uses the last frame before the list changes for displacement and departure references, and the settled frame for arrival references. Horizontal glyph edges avoid counting the moving selection fill as text. The top-ten count flags a line as empty if both reference strengths are below 12%, and as competing if both exceed 12%. The displacement columns are blank when the tracked glyph match falls below the confidence threshold. Regenerate a CSV using NumPy and FFmpeg, for example `python3 measure-round4.py dark-top-10.mp4 53 top-10`. Use the first frame number from the corresponding CSV.
+
+## Round 5
+
+The release captures use the Round 5 changes in `18727ad9`, the demo inbox with 24 extra fixture threads, and headless Sway with a private D-Bus and loopback-only networking. The production build uses Fell's normal motion clock. The second build advances the same clock at one-tenth speed.
+
+- **Bottom reversal.** Use `G`, `V`, nine `k` presses, then `e` and `u` 60 ms apart. The slowed capture uses a 600 ms delay.
+- **Unsafe ordering.** Use `G` and mark four alternating rows with `x k k x k k x k k x`. Send `e`, `u`, and `e` at intervals of 60 ms and 18 ms in the production capture, or 600 ms and 180 ms in the slowed capture.
+- **Mixed marks.** Mark slots 0, 2, 4 and 6 using `x j j x j j x j j x`, then press `e`.
+
+| Layout and clock | Bottom reversal | Unsafe ordering | Mixed marks |
+| --- | --- | --- | --- |
+| Tokyo Night, 1200 px · production | [MP4](round-5/real/dark-reversal.mp4) · [CSV](round-5/real/dark-reversal.csv) | [MP4](round-5/real/dark-unsafe.mp4) · [CSV](round-5/real/dark-unsafe.csv) | [MP4](round-5/real/dark-mixed.mp4) · [CSV](round-5/real/dark-mixed.csv) |
+| Catppuccin Latte, 1200 px · production | [MP4](round-5/real/light-reversal.mp4) · [CSV](round-5/real/light-reversal.csv) | [MP4](round-5/real/light-unsafe.mp4) · [CSV](round-5/real/light-unsafe.csv) | [MP4](round-5/real/light-mixed.mp4) · [CSV](round-5/real/light-mixed.csv) |
+| Tokyo Night, 490 px · production | [MP4](round-5/real/narrow-reversal.mp4) · [CSV](round-5/real/narrow-reversal.csv) | [MP4](round-5/real/narrow-unsafe.mp4) · [CSV](round-5/real/narrow-unsafe.csv) | [MP4](round-5/real/narrow-mixed.mp4) · [CSV](round-5/real/narrow-mixed.csv) |
+| Tokyo Night, 1200 px · slowed | [MP4](round-5/slow/dark-reversal.mp4) · [CSV](round-5/slow/dark-reversal.csv) | [MP4](round-5/slow/dark-unsafe.mp4) · [CSV](round-5/slow/dark-unsafe.csv) | [MP4](round-5/slow/dark-mixed.mp4) · [CSV](round-5/slow/dark-mixed.csv) |
+| Catppuccin Latte, 1200 px · slowed | [MP4](round-5/slow/light-reversal.mp4) · [CSV](round-5/slow/light-reversal.csv) | [MP4](round-5/slow/light-unsafe.mp4) · [CSV](round-5/slow/light-unsafe.csv) | [MP4](round-5/slow/light-mixed.mp4) · [CSV](round-5/slow/light-mixed.csv) |
+| Tokyo Night, 490 px · slowed | [MP4](round-5/slow/narrow-reversal.mp4) · [CSV](round-5/slow/narrow-reversal.csv) | [MP4](round-5/slow/narrow-unsafe.mp4) · [CSV](round-5/slow/narrow-unsafe.csv) | [MP4](round-5/slow/narrow-mixed.mp4) · [CSV](round-5/slow/narrow-mixed.csv) |
+
+Slowed contact sheets for [Tokyo Night](round-5/dark-slow-sequence.png), [Catppuccin Latte](round-5/light-slow-sequence.png), and [Tokyo Night at 490 px](round-5/narrow-slow-sequence.png).
+
+| Bottom reversal | Survivor tops at handoff (px) | Largest between-row blank gap after handoff | Settled blank gap |
+| --- | --- | ---: | ---: |
+| Tokyo Night, 1200 px · production | 472, 540 on frames 66 and 76 | 32 px | 32 px |
+| Catppuccin Latte, 1200 px · production | 314, 382 on frame 52 | 32 px | 32 px |
+| Tokyo Night, 490 px · production | 77, 145 on frames 66 and 70 | 32 px | 32 px |
+| Tokyo Night, 1200 px · slowed | 168, 236 on frames 75 and 80 | 32 px | 32 px |
+| Catppuccin Latte, 1200 px · slowed | 112, 180 on frames 123 and 137 | 32 px | 32 px |
+| Tokyo Night, 490 px · slowed | 324, 392 on frames 85 and 87 | 32 px | 32 px |
+
+At the bottom reversal, the deterministic test samples every millisecond through the 160 ms curve. It checks the first frame against the painted tops, then checks the distance between consecutive painted rows against the 68 px row height. The returning tail starts at 40% opacity and fades in over 120 ms. The [Round 4 reversal clips](#round-4) preserve the preceding implementation for comparison.
+
+The [unsafe-order trace](round-5/unsafe-order.csv) lists pairs from the instrumented slowed release build. A hidden arrival appears before an opaque slider in the new order while the slider's text covers its slot. The deterministic test isolates the same case at indices 0 and 1 and checks that the slider keeps its painted position, the arrival stays hidden during overlap, and competing ghost ink is cleared.
+
+For the mixed archive, the two text lines appear together as soon as the neighboring text box clears the cursor slot. Padding can still overlap when the fade starts. The deterministic coverage test checks the 80 ms fade from clearance.
+
+[measure-round5.py](round-5/measure-round5.py) reads the lossless captures with FFmpeg and NumPy. Each key has its own time origin on the video frame immediately preceding the request, aligned with the screencopy clock. Blank gap is the longest vertical run between occupied text scanlines in the list column. The CSV records trailing space below the last text separately. The bottom table measures from the last changed frame at the furthest matched survivor position through settle. Both measured rows come from the pre-archive frame. The mixed CSV uses the settled sender and subject as references and reports their contrast separately. Software rendering can repeat frames or delay the next list paint. To reproduce a CSV, pass the MP4, the flow name, and the frame numbers marked `pre_key` in that CSV.
