@@ -118,3 +118,17 @@ The [unsafe-order trace](round-5/unsafe-order.csv) lists pairs from the instrume
 For the mixed archive, the two text lines appear together as soon as the neighboring text box clears the cursor slot. Padding can still overlap when the fade starts. The deterministic coverage test checks the 80 ms fade from clearance.
 
 [measure-round5.py](round-5/measure-round5.py) reads the lossless captures with FFmpeg and NumPy. Each key has its own time origin on the video frame immediately preceding the request, aligned with the screencopy clock. Blank gap is the longest vertical run between occupied text scanlines in the list column. The CSV records trailing space below the last text separately. The bottom table measures from the last changed frame at the furthest matched survivor position through settle. Both measured rows come from the pre-archive frame. The mixed CSV uses the settled sender and subject as references and reports their contrast separately. Software rendering can repeat frames or delay the next list paint. To reproduce a CSV, pass the MP4, the flow name, and the frame numbers marked `pre_key` in that CSV.
+
+## Round 6
+
+Build `78ece945` ran the demo inbox at 1200 × 780 in Tokyo Night with headless Sway, a private D-Bus, and loopback-only networking. Both recordings use a capture build whose motion clock advances at one-tenth speed. The mixed recording uses the simple reader setting.
+
+| Flow | Capture | Measurements |
+| --- | --- | --- |
+| Archive the top four with `V j j j e`, then press `u` | [MP4](round-6/top-four-undo.mp4) · [Frames](round-6/top-four-undo.png) | [CSV](round-6/top-four-undo.csv) |
+| Mark rows 0, 2, 4 and 6 with `x`, then press `e` | [MP4](round-6/mixed.mp4) · [Frames](round-6/mixed.png) | [CSV](round-6/mixed.csv) |
+
+- **Top-four undo.** The handoff used a painted frame 102.3 ms into the archive shift. The two tracked survivors were at list y=0 and y=68 px before undo (frame 42). Both stayed at those positions on the first changed frame (47) with 100% of their original glyph contrast. On frame 48 they had both moved down 20 px. Both settled 272 px below their pre-undo positions.
+- **Mixed archive.** The three sliders settled 68, 136 and 204 px above their pre-archive positions. On frame 41 the last slider's background still overlapped the cursor arrival's text area by 1 px. Neither line had matched ink. On frame 42 the background had cleared by 4 px, and both lines appeared at about 44% of settled glyph contrast.
+
+Each displacement uses the frame captured immediately before its key. Positive displacement is downward. The CSVs include sample timestamps relative to that frame in wall-clock units and at one-tenth scale. Software rendering can repeat poses or skip a paint between samples.
