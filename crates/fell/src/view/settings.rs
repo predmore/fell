@@ -1459,9 +1459,35 @@ const IDENTITY_ROW_HEIGHT: f32 = 48.;
 const INDEX_FOOTER_HEIGHT: f32 = 21.;
 const SEARCH_SUMMARY_HEIGHT: f32 = 70.;
 const VALUE_TEXT_SIZE: f32 = 13.;
+const VALUE_ROW_PADDING: f32 = 10.;
+const NOTE_LINE_HEIGHT: f32 = 15.;
+const READING_NOTE_LINES: usize = 2;
+const READING_NOTE_HEIGHT: f32 = NOTE_LINE_HEIGHT * READING_NOTE_LINES as f32;
 const CHEVRON_WIDTH: f32 = 11.;
 
-pub(super) fn card_height(nav: &nav::Nav, room: f32, narrow: bool) -> f32 {
+fn has_reading_note(row: Row) -> bool {
+    matches!(
+        row,
+        Row::Value(settings::Preference::WebViewDefault | settings::Preference::RemoteImages)
+    )
+}
+
+fn reading_label_line_height(font_size: f32) -> f32 {
+    font_size + 9.
+}
+
+fn section_row_height(row: Row, font_size: f32) -> f32 {
+    match row {
+        Row::Account(_) => ACCOUNT_ROW_HEIGHT,
+        Row::EditAccount | Row::ImportIdentities => 45.,
+        _ if has_reading_note(row) => {
+            2. * VALUE_ROW_PADDING + reading_label_line_height(font_size) + READING_NOTE_HEIGHT
+        }
+        _ => SECTION_ROW_HEIGHT,
+    }
+}
+
+pub(super) fn card_height(nav: &nav::Nav, room: f32, narrow: bool, font_size: f32) -> f32 {
     if nav.page == Page::Bindings {
         let chrome = HEADER_HEIGHT + BODY_PADDING + 2.;
         let rows = ((room - chrome) / BINDING_ROW_HEIGHT)
@@ -1473,20 +1499,18 @@ pub(super) fn card_height(nav: &nav::Nav, room: f32, narrow: bool) -> f32 {
         Page::Index => Section::ALL.len() as f32 * INDEX_ROW_HEIGHT + INDEX_FOOTER_HEIGHT,
         Page::Section(section) => {
             nav.rows(section)
-                .map(|row| match row {
-                    Row::Account(_) => ACCOUNT_ROW_HEIGHT,
-                    Row::EditAccount | Row::ImportIdentities => 45.,
-                    Row::Value(
-                        settings::Preference::WebViewDefault | settings::Preference::RemoteImages,
-                    ) => {
-                        // Both descriptions wrap with the usual Settings font.
-                        SECTION_ROW_HEIGHT + 10.
+                .map(|row| {
+                    let height = section_row_height(row, font_size);
+                    if narrow && matches!(row, Row::Value(_)) && !has_reading_note(row) {
+                        height
+                            + if section == Section::Appearance {
+                                5.
+                            } else {
+                                8.
+                            }
+                    } else {
+                        height
                     }
-                    Row::Value(_) if narrow && section == Section::Appearance => {
-                        SECTION_ROW_HEIGHT + 5.
-                    }
-                    _ if narrow && matches!(row, Row::Value(_)) => SECTION_ROW_HEIGHT + 8.,
-                    _ => SECTION_ROW_HEIGHT,
                 })
                 .sum::<f32>()
                 + match section {
@@ -1657,11 +1681,7 @@ pub(super) fn card(
             // Keep scroll indices aligned with the selectable rows.
             for (index, setting) in session.settings_nav.rows(section).enumerate() {
                 let selected = selected == index;
-                let height = match setting {
-                    Row::Account(_) => ACCOUNT_ROW_HEIGHT,
-                    Row::EditAccount | Row::ImportIdentities => 45.,
-                    _ => SECTION_ROW_HEIGHT,
-                };
+                let height = section_row_height(setting, theme.ui_px);
                 let mut control = row(theme, index, selected, live, height, cx);
                 if let Row::Account(account) = setting {
                     if let Some(account) = accounts.get(account) {
@@ -1789,7 +1809,8 @@ pub(super) fn card(
                                 }));
                     }
                 } else if let Row::Value(preference) = setting {
-                    control = control.py(px(10.));
+                    control = control.py(px(VALUE_ROW_PADDING));
+                    let reading_note = has_reading_note(setting);
                     let state = preference.display(view.snapshot.values);
                     let note = preference_note(&view.snapshot, preference, &state, width);
                     let previous = view.value_fade(now);
@@ -1828,36 +1849,46 @@ pub(super) fn card(
                         });
                     control = control
                         .child(
-                            row_label(theme, preference.label(), None::<&str>, selected).child({
-                                let incoming =
-                                    old_note.as_ref().map_or(1., |(_, _, incoming)| *incoming);
-                                let render = |(text, alert): (String, bool)| {
+                            row_label(theme, preference.label(), None::<&str>, selected)
+                                .when(reading_note, |label| {
+                                    label.line_height(px(reading_label_line_height(theme.ui_px)))
+                                })
+                                .child({
+                                    let incoming =
+                                        old_note.as_ref().map_or(1., |(_, _, incoming)| *incoming);
+                                    let render = |(text, alert): (String, bool)| {
+                                        div()
+                                            .text_size(px(12.))
+                                            .line_height(px(NOTE_LINE_HEIGHT))
+                                            .when(reading_note, |text| {
+                                                text.line_clamp(READING_NOTE_LINES).text_ellipsis()
+                                            })
+                                            .text_color(rgb(if alert {
+                                                theme.error
+                                            } else if selected {
+                                                theme.on_selection_dim
+                                            } else {
+                                                theme.dimmed
+                                            }))
+                                            .child(text)
+                                    };
                                     div()
-                                        .text_size(px(12.))
-                                        .line_height(px(15.))
-                                        .text_color(rgb(if alert {
-                                            theme.error
-                                        } else if selected {
-                                            theme.on_selection_dim
-                                        } else {
-                                            theme.dimmed
-                                        }))
-                                        .child(text)
-                                };
-                                div()
-                                    .relative()
-                                    .child(render(note).opacity(incoming))
-                                    .when_some(old_note, |note, (old, outgoing, _)| {
-                                        note.child(
-                                            render(old)
-                                                .absolute()
-                                                .top_0()
-                                                .left_0()
-                                                .right_0()
-                                                .opacity(outgoing),
-                                        )
-                                    })
-                            }),
+                                        .relative()
+                                        .when(reading_note, |slot| {
+                                            slot.min_h(px(READING_NOTE_HEIGHT))
+                                        })
+                                        .child(render(note).opacity(incoming))
+                                        .when_some(old_note, |note, (old, outgoing, _)| {
+                                            note.child(
+                                                render(old)
+                                                    .absolute()
+                                                    .top_0()
+                                                    .left_0()
+                                                    .right_0()
+                                                    .opacity(outgoing),
+                                            )
+                                        })
+                                }),
                         )
                         .child(
                             div()
@@ -2532,6 +2563,7 @@ fn row(
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(gpui::ElementId::named_usize("settings-row", index))
+        .debug_selector(|| format!("settings-row-{index}"))
         .min_h(px(height))
         .flex_none()
         .flex()
@@ -2597,7 +2629,7 @@ fn preference_note(
     match invalid {
         Some(_) if width < 320. => (format!("Invalid · using {state}"), true),
         Some((_, value)) => (format!("{value} isn't valid · using {state}"), true),
-        None => (preference.description().to_owned(), false),
+        None => (preference.description(snapshot.values).to_owned(), false),
     }
 }
 
@@ -2740,6 +2772,50 @@ fn confirm_button(
 mod tests {
     use super::*;
     use fell_core::NotificationMode;
+
+    #[test]
+    fn reading_rows_keep_their_bounds_when_invalid_values_are_fixed() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.toml");
+        let (app, handle) = crate::view::tests::pending_inbox();
+        let mut app = gpui::VisualTestContext::from_window(*handle, &app);
+
+        for (width, font_size, expected_height) in [(1200., 15., 74.), (490., 18., 77.)] {
+            app.simulate_resize(gpui::size(px(width), px(760.)));
+            let mut previous = None;
+            for settings in [
+                "web_view_for_bulk = 'sometimes'\nremote_image_prompt = 3\n",
+                "web_view_for_bulk = false\nremote_image_prompt = 3\n",
+                "web_view_for_bulk = false\nremote_image_prompt = false\n",
+                "web_view_for_bulk = true\nremote_image_prompt = true\n",
+            ] {
+                fs::write(&path, settings).unwrap();
+                let snapshot = Snapshot::read(Some(&path), Values::default());
+                handle
+                    .update(&mut app.cx, |inbox, _, cx| {
+                        inbox.session.overlay = Overlay::Settings;
+                        inbox.session.settings_nav.page = Page::Section(Section::Reading);
+                        inbox.session.settings_nav.selected = 1;
+                        let mut theme = inbox.theme.clone();
+                        theme.ui_px = font_size;
+                        inbox.apply_settings(snapshot, theme, Motion::new(false), cx);
+                    })
+                    .unwrap();
+                app.run_until_parked();
+                let bounds =
+                    ["settings-row-1", "settings-row-2"].map(|row| app.debug_bounds(row).unwrap());
+                assert!(
+                    bounds
+                        .iter()
+                        .all(|row| row.size.height == px(expected_height))
+                );
+                if let Some(previous) = previous {
+                    assert_eq!(bounds, previous);
+                }
+                previous = Some(bounds);
+            }
+        }
+    }
 
     #[test]
     fn edit_keymap_creates_and_repairs_private_permissions() {

@@ -6251,8 +6251,12 @@ impl Render for Inbox {
         if self.session.overlay == Overlay::Settings
             && self.session.settings_nav.page == crate::model::settings::Page::Index
         {
-            let final_height =
-                settings::card_height(&self.session.settings_nav, settings_room, width < 500.);
+            let final_height = settings::card_height(
+                &self.session.settings_nav,
+                settings_room,
+                width < 500.,
+                theme.ui_px,
+            );
             self.settings_view.reveal_index_row(
                 self.session.settings_nav.selected,
                 card.unwrap_or(final_height),
@@ -6342,6 +6346,7 @@ impl Render for Inbox {
                                     &session.settings_nav,
                                     settings_room,
                                     width < 500.,
+                                    theme.ui_px,
                                 )
                             }),
                             window,
@@ -12973,6 +12978,7 @@ fn card_fit(
             &session.settings_nav,
             room,
             window.viewport_size().width < px(500.),
+            theme.ui_px,
         )),
         _ => None,
     }

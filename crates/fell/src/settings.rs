@@ -84,18 +84,22 @@ impl Preference {
         }
     }
 
-    pub fn description(self) -> &'static str {
+    pub fn description(self, values: Values) -> &'static str {
         match self {
             Self::Theme => "Desktop colors or a Fell theme.",
             Self::FontSize => "Inbox and composer text.",
             Self::ReduceMotion => "Limit interface animations.",
             Self::ReadDwell => "Wait before marking an open thread read.",
+            Self::WebViewDefault if values.reading.web_view_for_bulk => {
+                "Newsletters open in web view. Senders you set with w keep their view."
+            }
             Self::WebViewDefault => {
-                "Automatic uses web view for complex newsletters. Sender choices take priority."
+                "Mail opens in simple view. Senders you set with w keep their view."
             }
-            Self::RemoteImages => {
-                "Offer to load blocked images in this message. Sender permissions still apply."
+            Self::RemoteImages if values.reading.remote_image_prompt => {
+                "Blocked images show Load images. Senders you allowed still load."
             }
+            Self::RemoteImages => "Images stay blocked. Press i to load them for one message.",
             Self::WhichKey => "Wait for shortcut suggestions.",
             Self::Notifications => "What new-mail alerts show.",
         }
