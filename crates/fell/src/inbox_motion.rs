@@ -885,14 +885,17 @@ impl InboxMotion {
     }
 
     /// Keep the tail of a shrinking list sliding even beyond the old
-    /// snapshot. The first unseen row starts below the clip and below the
-    /// last tracked row. Giving the tail one offset keeps its rows spaced.
+    /// snapshot. A fresh shift starts the tail below the clip. On an
+    /// interruption, it starts immediately after the last painted row.
     pub fn batch_bottom_arrival_offset(
-        viewport: f32,
+        viewport: Option<f32>,
         previous_bottom: f32,
         first_slot: f32,
     ) -> f32 {
-        (viewport.max(previous_bottom) - first_slot).max(0.0)
+        match viewport {
+            Some(viewport) => (viewport.max(previous_bottom) - first_slot).max(0.0),
+            None => previous_bottom - first_slot,
+        }
     }
 
     /// The prefix ends at or above the clip and before the first tracked
@@ -2300,8 +2303,11 @@ mod tests {
         let viewport = 200.0;
         let first_slot = 68.0;
         for (previous_bottom, start_top) in [(0.0, 200.0), (150.0, 200.0), (220.0, 220.0)] {
-            let dy =
-                InboxMotion::batch_bottom_arrival_offset(viewport, previous_bottom, first_slot);
+            let dy = InboxMotion::batch_bottom_arrival_offset(
+                Some(viewport),
+                previous_bottom,
+                first_slot,
+            );
             assert_eq!(first_slot + dy, start_top);
 
             let now = Instant::now();
@@ -2316,10 +2322,11 @@ mod tests {
                 vec![("a", 0.0), ("b", 68.0)],
                 vec![],
                 viewport,
-                false,
+                motion::ListChange::BatchLeave { row_height: 68.0 },
                 now,
             )
             .unwrap();
+            shift.begin_frame(now);
             for elapsed in [0, 16, 60, 120] {
                 let at = later(now, elapsed);
                 let c = shift.row("c", first_slot, 68.0, None, at);
@@ -2355,10 +2362,11 @@ mod tests {
                 vec![("d", 68.0), ("e", 136.0)],
                 vec![],
                 600.0,
-                false,
+                motion::ListChange::BatchLeave { row_height: 68.0 },
                 now,
             )
             .unwrap();
+            shift.begin_frame(now);
             assert!(68.0 + dy + 68.0 <= tracked_top.min(0.0));
             for elapsed in [0, 16, 60, 120] {
                 let at = later(now, elapsed);

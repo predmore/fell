@@ -20,7 +20,7 @@
 //! an ease-out curve: fast enough to never feel like waiting, long enough to
 //! show where something came from or went.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -42,6 +42,8 @@ pub const PANE: Duration = Duration::from_millis(160);
 /// exit takes this long, on the gentler [`fade_out`] curve, so nothing
 /// that leaves reads as a cut.
 pub const FADE: Duration = Duration::from_millis(120);
+/// A batch leaves a short trace of the old ink under the incoming rows.
+const BATCH_GHOST_INK: Duration = Duration::from_millis(40);
 
 /// Reading mode lays out both measures before moving the blocks below them.
 pub const READING_REFLOW: Duration = Duration::from_millis(140);
@@ -481,6 +483,7 @@ pub struct Ghost<R> {
     /// the rows around it.
     pub top: f32,
     transition: Transition,
+    short_ink: bool,
 }
 
 impl<R> Ghost<R> {
@@ -491,6 +494,21 @@ impl<R> Ghost<R> {
     pub fn running(&self, now: Instant) -> bool {
         self.transition.running(now)
     }
+
+    pub fn ink_opacity(&self, now: Instant) -> f32 {
+        if self.short_ink {
+            Transition::new(self.transition.started, BATCH_GHOST_INK).remaining(now)
+        } else {
+            self.opacity(now)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ListChange {
+    Shift,
+    Replace,
+    BatchLeave { row_height: f32 },
 }
 
 /// Where the rows of a fixed-height list were before a change, and how
@@ -511,6 +529,16 @@ pub struct ListShift<R> {
     /// Its clock starts on the first frame that draws them, so a late
     /// first frame cannot eat the fade. `None` until then.
     arrive: Option<Transition>,
+    /// Each batch arrival starts its own fade when the last slider clears it.
+    batch_fades: HashMap<String, Option<Transition>>,
+    /// In-place arrivals carried across an interruption, including rows
+    /// whose painted starts would overlap a survivor.
+    waiting_arrivals: HashSet<String>,
+    /// Newly visible tail rows that fade while they move.
+    sliding_arrivals: HashSet<String>,
+    /// Anchor the transition to its first paint and restart ghosts from
+    /// this index, leaving carried ghosts on their original clock.
+    first_frame: Option<usize>,
     /// Row id → its top before the change, in viewport pixels.
     before: HashMap<String, f32>,
     /// Row id → how far it is drawn from its slot when the shift starts,
@@ -518,6 +546,9 @@ pub struct ListShift<R> {
     resolved: HashMap<String, Option<f32>>,
     ghosts: Vec<Ghost<R>>,
     replaced: bool,
+    batch_leave: bool,
+    /// Every slider shares the same curve so adjacent rows keep their order.
+    gentle: bool,
     /// Furthest a row slides; one further away fades in instead.
     reach: f32,
 }
@@ -528,39 +559,102 @@ impl<R: Clone> ListShift<R> {
     /// slide instead of fading). `left`: rows among them that are gone,
     /// with their top in list content as of now. `carried`: ghosts of an
     /// earlier shift still fading, kept so a quick second change does not
-    /// cut them off. `replace`: the list is another one (a folder switch):
-    /// every row arrives in place, and nothing of the old list lingers.
+    /// cut them off. A replacement fades in the new list. A batch leave
+    /// keeps its ghosts even when every tracked row leaves and only slides
+    /// rows within three row heights of their slots, unless the viewport
+    /// itself scrolled.
     pub fn start(
         motion: &Motion,
         before: Vec<(String, f32)>,
         left: Vec<(R, f32)>,
         carried: Vec<Ghost<R>>,
         reach: f32,
-        replace: bool,
+        change: ListChange,
         now: Instant,
     ) -> Option<ListShift<R>> {
         let transition = motion.start(SLIDE, now)?;
-        let replaced = replace || (!before.is_empty() && left.len() == before.len());
+        let batch_leave = matches!(change, ListChange::BatchLeave { .. });
+        let replaced = matches!(change, ListChange::Replace)
+            || (!batch_leave && !before.is_empty() && left.len() == before.len());
+        let reach = match change {
+            ListChange::BatchLeave { row_height } => 3.0 * row_height,
+            _ => reach,
+        };
         let fade = motion.start(FADE, now)?;
         let mut ghosts: Vec<Ghost<R>> = Vec::new();
         if !replaced {
             ghosts.extend(carried.into_iter().filter(|ghost| ghost.running(now)));
+        }
+        let first_new_ghost = ghosts.len();
+        if !replaced {
             ghosts.extend(left.into_iter().map(|(row, top)| Ghost {
                 row,
                 top,
                 transition: fade,
+                short_ink: batch_leave,
             }));
         }
         Some(ListShift {
             transition,
             opening_top: false,
             arrive: None,
+            batch_fades: HashMap::new(),
+            waiting_arrivals: HashSet::new(),
+            sliding_arrivals: HashSet::new(),
+            first_frame: batch_leave.then_some(first_new_ghost),
             before: before.into_iter().collect(),
             resolved: HashMap::new(),
             ghosts,
             replaced,
+            batch_leave,
+            gentle: false,
             reach,
         })
+    }
+
+    /// When a batch scrolls or interrupts another shift, allow offsets
+    /// up to one viewport. Use the gentler curve for any long slide.
+    pub fn with_slide_offsets(
+        mut self,
+        row_height: f32,
+        batch_viewport: Option<f32>,
+        offsets: impl Iterator<Item = f32>,
+    ) -> Self {
+        if let Some(viewport) = batch_viewport {
+            self.reach = viewport * GLIDE_MAX_VIEWPORTS;
+        }
+        self.gentle = !self.replaced
+            && offsets
+                .map(f32::abs)
+                .any(|dy| dy > 3.0 * row_height && dy <= self.reach);
+        if self.gentle {
+            self.transition.duration = PANE;
+            self.first_frame.get_or_insert(self.ghosts.len());
+        }
+        self
+    }
+
+    pub fn with_waiting_arrivals(mut self, ids: HashSet<String>) -> Self {
+        self.waiting_arrivals = ids;
+        self
+    }
+
+    pub fn with_sliding_arrivals(mut self, ids: HashSet<String>) -> Self {
+        if !ids.is_empty() {
+            self.first_frame.get_or_insert(self.ghosts.len());
+        }
+        self.sliding_arrivals = ids;
+        self
+    }
+
+    /// Start at the old painted positions even if the first frame is late.
+    pub fn begin_frame(&mut self, now: Instant) {
+        if let Some(first) = self.first_frame.take() {
+            for ghost in &mut self.ghosts[first..] {
+                ghost.transition.started = now;
+            }
+            self.transition.started = now;
+        }
     }
 
     /// A leading arrival opens its slot from the first frame that paints it.
@@ -572,7 +666,9 @@ impl<R: Clone> ListShift<R> {
     /// The restored row already owns the cursor. Give its slot room on
     /// the first frame even when the motion clock draws at the start time.
     pub fn show_restored_selection(mut self) -> Self {
-        if let Some(start) = self.transition.started.checked_sub(RESTORE_LEAD) {
+        if self.first_frame.is_none()
+            && let Some(start) = self.transition.started.checked_sub(RESTORE_LEAD)
+        {
             self.transition.started = start;
         }
         self
@@ -590,6 +686,7 @@ impl<R: Clone> ListShift<R> {
                 row,
                 top,
                 transition: fade,
+                short_ink: false,
             }));
         }
         self
@@ -607,6 +704,13 @@ impl<R: Clone> ListShift<R> {
         }
     }
 
+    fn resolved_start(&self, id: &str, top: f32) -> Option<f32> {
+        match self.resolved.get(id) {
+            Some(start) => *start,
+            None => self.start_for(id, top),
+        }
+    }
+
     /// Fix row `id`'s start the first time it is asked for.
     fn resolve(&mut self, id: &str, top: f32) -> Option<f32> {
         if let Some(start) = self.resolved.get(id) {
@@ -615,6 +719,66 @@ impl<R: Clone> ListShift<R> {
         let start = self.start_for(id, top);
         self.resolved.insert(id.to_string(), start);
         start
+    }
+
+    fn slide_progress(&self, now: Instant) -> f32 {
+        if self.first_frame.is_some() || self.opening_top {
+            0.0
+        } else if self.gentle {
+            ease_out_quad(self.transition.linear(now))
+        } else {
+            self.transition.progress(now)
+        }
+    }
+
+    /// Rows resolved without a start are already being drawn in place.
+    pub fn in_place_arrival(&self, id: &str) -> bool {
+        matches!(self.resolved.get(id), Some(None))
+    }
+
+    /// Whether an in-place start has shown batch ink. Before the first
+    /// paint, use the same start calculation as painting and scrolling.
+    pub fn in_place_visibility(&self, id: &str, top: f32) -> Option<bool> {
+        self.resolved_start(id, top)
+            .is_none()
+            .then(|| matches!(self.batch_fades.get(id), Some(Some(_))))
+    }
+
+    pub fn hidden_arrival(&self, id: &str) -> bool {
+        matches!(self.batch_fades.get(id), Some(None))
+    }
+
+    pub fn slid_in_opacity(&self, id: &str, now: Instant) -> f32 {
+        if self.sliding_arrivals.contains(id) {
+            let fade = Transition::new(self.transition.started, FADE);
+            lerp(ARRIVE_FROM, 1.0, fade.progress(now))
+        } else {
+            1.0
+        }
+    }
+
+    /// Batch arrivals sit under the sliders. Keep both lines hidden until
+    /// the slot is clear for the rest of the shift, then fade them in.
+    pub fn batch_row(&mut self, id: &str, top: f32, covered: bool, now: Instant) -> RowMotion {
+        let Some(dy) = self.resolve(id, top) else {
+            let fade = self.batch_fades.entry(id.to_owned()).or_default();
+            let opacity = if covered {
+                *fade = None;
+                0.0
+            } else {
+                let fade = fade.get_or_insert_with(|| Transition::new(now, QUICK));
+                lerp(ARRIVE_FROM, 1.0, fade.progress(now))
+            };
+            return RowMotion {
+                opacity,
+                ..RowMotion::STILL
+            };
+        };
+        RowMotion {
+            dy: dy * (1.0 - self.slide_progress(now)),
+            opacity: self.slid_in_opacity(id, now),
+            ..RowMotion::STILL
+        }
     }
 
     /// How to draw row `id`, whose slot now starts at `top` (viewport
@@ -628,14 +792,17 @@ impl<R: Clone> ListShift<R> {
         below: impl IntoIterator<Item = (&'a str, f32)>,
         now: Instant,
     ) -> RowMotion {
+        if self.batch_leave {
+            return self.batch_row(id, top, false, now);
+        }
         if std::mem::take(&mut self.opening_top) {
             self.transition = Transition::new(now, Duration::from_millis(160));
         }
-        let p = self.transition.progress(now);
+        let p = self.slide_progress(now);
         match self.resolve(id, top) {
             Some(dy) => RowMotion {
                 dy: dy * (1.0 - p),
-                opacity: 1.0,
+                opacity: self.slid_in_opacity(id, now),
                 reveal: None,
             },
             None => {
@@ -683,16 +850,13 @@ impl<R: Clone> ListShift<R> {
     /// so a row in flight keeps its place. A row not drawn yet (two changes
     /// before one frame) is where it would have been drawn.
     pub fn offset_of(&self, id: &str, top: f32, now: Instant) -> f32 {
-        let p = if self.opening_top {
-            0.0
-        } else {
-            self.transition.progress(now)
-        };
-        let start = match self.resolved.get(id) {
-            Some(start) => *start,
-            None => self.start_for(id, top),
-        };
-        start.map_or(0.0, |dy| dy * (1.0 - p))
+        self.slide_offsets(id, top, now).1
+    }
+
+    /// The starting and current offsets from the slot, for the painted sweep.
+    pub fn slide_offsets(&self, id: &str, top: f32, now: Instant) -> (f32, f32) {
+        self.resolved_start(id, top)
+            .map_or((0.0, 0.0), |dy| (dy, dy * (1.0 - self.slide_progress(now))))
     }
 
     /// Furthest outside the viewport a slot can be while its row is visible.
@@ -718,7 +882,19 @@ impl<R: Clone> ListShift<R> {
     }
 
     pub fn has_batch_ghosts(&self) -> bool {
-        !self.replaced && self.ghosts.len() > 1
+        !self.replaced && (self.ghosts.len() > 1 || (self.batch_leave && !self.ghosts.is_empty()))
+    }
+
+    pub fn batch_arrivals(&self) -> bool {
+        self.batch_leave || !self.waiting_arrivals.is_empty()
+    }
+
+    pub fn waits_for_slot(&self, id: &str) -> bool {
+        self.batch_leave || self.waiting_arrivals.contains(id)
+    }
+
+    pub fn ghosts(&self) -> &[Ghost<R>] {
+        &self.ghosts
     }
 
     /// Ghost tops relative to this slot, in list content pixels. A single
@@ -738,10 +914,11 @@ impl<R: Clone> ListShift<R> {
         }
         self.ghosts
             .iter()
-            .filter(|ghost| {
-                ghost.running(now) && (batch || (ghost.top >= top && ghost.top < top + height))
+            .filter(|ghost| batch || (ghost.top >= top && ghost.top < top + height))
+            .filter_map(|ghost| {
+                let alpha = ghost.ink_opacity(now);
+                (alpha > 0.0).then(|| (ghost.row.clone(), ghost.top - top, alpha))
             })
-            .map(|ghost| (ghost.row.clone(), ghost.top - top, ghost.opacity(now)))
             .collect()
     }
 
@@ -761,6 +938,12 @@ impl<R: Clone> ListShift<R> {
         self.opening_top
             || self.transition.running(now)
             || self.arrive.is_some_and(|arrive| arrive.running(now))
+            || self.batch_fades.values().any(|fade| match fade {
+                Some(fade) => fade.running(now),
+                // Keep the frame that clears a slot, with a bound for slots
+                // that scrolled away and will never ask for their fade.
+                None => now <= self.transition.started + self.transition.duration + MAX_STEP,
+            })
             || self.ghosts.iter().any(|ghost| ghost.running(now))
     }
 
@@ -768,6 +951,7 @@ impl<R: Clone> ListShift<R> {
     /// change moved nothing on screen, so no more frames are needed.
     pub fn is_still(&self) -> bool {
         !self.resolved.is_empty()
+            && self.sliding_arrivals.is_empty()
             && self.ghosts.is_empty()
             && self
                 .resolved
@@ -790,7 +974,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             640.0,
-            false,
+            ListChange::Shift,
             now,
         )
         .unwrap()
@@ -884,7 +1068,7 @@ mod tests {
             vec![],
             vec![],
             600.0,
-            false,
+            ListChange::BatchLeave { row_height: 68.0 },
             now,
         );
         assert!(shift.is_none());
@@ -939,7 +1123,11 @@ mod tests {
             left.to_vec(),
             carried,
             600.0,
-            replace,
+            if replace {
+                ListChange::Replace
+            } else {
+                ListChange::Shift
+            },
             now,
         )
         .unwrap()
@@ -1025,7 +1213,7 @@ mod tests {
             vec![],
             vec![],
             300.0,
-            false,
+            ListChange::Shift,
             start,
         )
         .unwrap();
@@ -1045,6 +1233,187 @@ mod tests {
             shift.row("new", 0.0, 68.0, None, at(start, 80)).opacity,
             1.0
         );
+    }
+
+    #[test]
+    fn batch_leaves_slide_up_to_three_rows_and_fade_farther_arrivals() {
+        let start = Instant::now();
+        let h = 68.0;
+        let mut shift = ListShift::start(
+            &Motion::new(true),
+            vec![
+                ("far".into(), 10.0 * h),
+                ("near".into(), 4.0 * h),
+                ("edge".into(), -h),
+            ],
+            vec![("left one", 0.0), ("left two", h)],
+            vec![],
+            800.0,
+            ListChange::BatchLeave { row_height: h },
+            start,
+        )
+        .unwrap();
+        shift.begin_frame(start);
+        assert_eq!(shift.overscan(h), 3);
+        assert_eq!(
+            shift.row("far", 0.0, h, [("edge", 2.0 * h)], start),
+            RowMotion {
+                dy: 0.0,
+                opacity: ARRIVE_FROM,
+                reveal: None,
+            },
+            "a far survivor fades even when a moving row crosses its slot"
+        );
+        assert_eq!(
+            shift.row("unseen", 3.0 * h, h, None, start).opacity,
+            ARRIVE_FROM
+        );
+        for (id, top, dy) in [("near", h, 3.0 * h), ("edge", 2.0 * h, -3.0 * h)] {
+            assert_eq!(shift.row(id, top, h, None, start).dy, dy);
+            for ms in [0, 16, 60, 120] {
+                let frame = shift.row(id, top, h, None, at(start, ms));
+                assert!(frame.dy.abs() <= 3.0 * h);
+                assert_eq!(frame.opacity, 1.0);
+            }
+        }
+        let mid = at(start, 60);
+        assert!((ARRIVE_FROM..1.0).contains(&shift.row("far", 0.0, h, None, mid).opacity));
+        for ghost in shift.ghosts() {
+            assert_eq!(ghost.ink_opacity(start), 1.0);
+            assert_eq!(ghost.ink_opacity(at(start, 20)), 0.25);
+            assert_eq!(ghost.ink_opacity(at(start, 40)), 0.0);
+            assert!(ghost.opacity(mid) > 0.0, "the selection still fades");
+        }
+        let end = start + FADE;
+        assert_eq!(shift.row("far", 0.0, h, None, end), RowMotion::STILL);
+        assert!(!shift.running(end));
+    }
+
+    #[test]
+    fn batch_scroll_starts_from_painted_positions_and_preserves_each_group() {
+        let start = Instant::now();
+        let h = 68.0;
+        let viewport = 800.0;
+        for long in [-10.0 * h, -4.0 * h, 4.0 * h] {
+            let short = long + 2.0 * h;
+            let rows = [
+                ("a", 0.0, long),
+                ("b", h, long),
+                ("c", 2.0 * h, short),
+                ("d", 3.0 * h, short),
+            ];
+            let mut shift = ListShift::start(
+                &Motion::new(true),
+                rows.map(|(id, slot, dy)| (id.into(), slot + dy)).to_vec(),
+                vec![("left", 4.0 * h)],
+                vec![],
+                viewport,
+                ListChange::BatchLeave { row_height: h },
+                start,
+            )
+            .unwrap()
+            .with_slide_offsets(h, Some(viewport), [long, short].into_iter());
+            let first_paint = start + MAX_STEP;
+            shift.begin_frame(first_paint);
+            assert_eq!(shift.ghosts()[0].ink_opacity(first_paint), 1.0);
+            for ms in 0..=160 {
+                let now = at(first_paint, ms);
+                let mut previous = f32::NEG_INFINITY;
+                for (id, slot, dy) in rows {
+                    let row = shift.batch_row(id, slot, false, now);
+                    let expected = dy * (1.0 - ease_out_quad(ms as f32 / 160.0));
+                    assert!((row.dy - expected).abs() < 0.001, "{id} at {ms} ms");
+                    assert_eq!(row.dy, shift.offset_of(id, slot, now));
+                    assert_eq!(row.opacity, 1.0);
+                    assert!(slot + row.dy >= previous + h - 0.001);
+                    previous = slot + row.dy;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn batch_scroll_fades_rows_beyond_one_viewport_without_a_clamped_jump() {
+        let start = Instant::now();
+        let h = 68.0;
+        let viewport = 600.0;
+        let mut shift = ListShift::<u8>::start(
+            &Motion::new(true),
+            vec![("far".into(), -680.0), ("edge".into(), h - viewport)],
+            vec![],
+            vec![],
+            viewport,
+            ListChange::BatchLeave { row_height: h },
+            start,
+        )
+        .unwrap()
+        .with_slide_offsets(h, Some(viewport), [-680.0, -viewport].into_iter());
+        assert_eq!(shift.overscan(h), 9);
+        assert_eq!(shift.batch_row("edge", h, false, start).dy, -viewport);
+        assert_eq!(
+            shift.batch_row("far", 0.0, false, start),
+            RowMotion {
+                opacity: ARRIVE_FROM,
+                ..RowMotion::STILL
+            }
+        );
+    }
+
+    #[test]
+    fn carrying_a_batch_ghost_keeps_its_original_ink_fade() {
+        let start = Instant::now();
+        let motion = Motion::new(true);
+        let mut batch = ListShift::start(
+            &motion,
+            vec![("a".into(), 0.0), ("b".into(), 68.0)],
+            vec![("a", 0.0)],
+            vec![],
+            640.0,
+            ListChange::BatchLeave { row_height: 68.0 },
+            start,
+        )
+        .unwrap();
+        batch.begin_frame(start);
+        let next = at(start, 20);
+        let shift = ListShift::start(
+            &motion,
+            vec![("b".into(), 0.0)],
+            vec![],
+            batch.take_ghosts(),
+            640.0,
+            ListChange::Shift,
+            next,
+        )
+        .unwrap();
+        assert_eq!(
+            shift.ghosts_for_slot(0.0, 68.0, true, next),
+            [("a", 0.0, 0.25)]
+        );
+        assert!(
+            shift
+                .ghosts_for_slot(0.0, 68.0, true, at(start, 40))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn batch_leaves_keep_their_ghosts_when_no_tracked_row_survives() {
+        let start = Instant::now();
+        let mut shift = ListShift::start(
+            &Motion::new(true),
+            vec![("a".into(), 0.0), ("b".into(), 68.0)],
+            vec![("a", 0.0), ("b", 68.0)],
+            vec![],
+            136.0,
+            ListChange::BatchLeave { row_height: 68.0 },
+            start,
+        )
+        .unwrap();
+        assert_eq!(
+            shift.row("new", 0.0, 68.0, None, start).opacity,
+            ARRIVE_FROM
+        );
+        assert_eq!(shift.ghosts_for_slot(0.0, 68.0, true, start).len(), 2);
     }
 
     #[test]
