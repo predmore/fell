@@ -1166,6 +1166,10 @@ impl AccountWindow {
             inbox.switch_enter_guard =
                 confirmed_with_enter.then(|| super::AccountSwitchEnterGuard::new(now));
             inbox.account_header_leaving = header_leaving;
+            if inbox.session.all_inboxes {
+                // The account fade already brings in the rows read offscreen.
+                inbox.motion.list = None;
+            }
             inbox.start_account_arrival(now);
             cx.notify();
         });
