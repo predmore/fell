@@ -485,6 +485,10 @@ impl DraftHub {
         }
     }
 
+    pub fn server_drafts_enabled(&self, account: &crate::AccountId) -> bool {
+        self.server_draft_wake(account).is_some()
+    }
+
     fn server_draft_wake(&self, account: &crate::AccountId) -> Option<super::server::Wake> {
         self.server_draft_wake
             .lock()

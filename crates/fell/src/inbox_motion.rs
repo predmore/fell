@@ -2192,7 +2192,7 @@ mod tests {
         let now = Instant::now();
         session.show_toast("Previous notice", false);
         motion.observe(&session, (true, true), now);
-        session.show_toast("Not saved to the server · kept in Fell · retrying", true);
+        session.show_toast(fell_core::compose::SERVER_DRAFT_SAVE_RETRYING, true);
         motion.hand_off_notice(session.status_notice().unwrap().clone());
         motion.observe(&session, (true, true), later(now, 1));
         let status = motion.status(&session, later(now, 1));
@@ -2564,6 +2564,7 @@ mod tests {
             updated_unix: 1_000,
             maybe_sent: false,
             not_on_server: false,
+            server_save_failed: false,
             reply_context: None,
             forwarded: None,
             in_reply_to: None,

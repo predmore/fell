@@ -7,8 +7,8 @@ use crate::{Result, Store, diagnostic, outbox};
 
 pub(super) type Wake = Arc<dyn Fn() + Send + Sync>;
 
-pub const SERVER_DRAFT_SAVE_FAILED: &str = "Not saved to the server · kept in Fell · edit to retry";
-pub const SERVER_DRAFT_SAVE_RETRYING: &str = "Not saved to the server · kept in Fell · retrying";
+pub const SERVER_DRAFT_SAVE_FAILED: &str = "Not on server · kept in Fell · edit to retry";
+pub const SERVER_DRAFT_SAVE_RETRYING: &str = "Not on server · kept in Fell · retrying";
 
 /// What the writer saved for one exact editor revision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,16 +47,14 @@ pub fn server_draft_open_notice(error: &crate::Error) -> String {
         | Error::DraftAttachmentLimit
         | Error::DraftMessageLimit => return error.to_string(),
         _ => match classify_sync_error(error) {
-            SyncFailureKind::Unreachable => "Fell couldn't reach the mail server.".into(),
-            SyncFailureKind::LoginRejected => "The mail server rejected the account login.".into(),
-            SyncFailureKind::Password => "Fell couldn't read the account password.".into(),
-            SyncFailureKind::Tls => {
-                "Fell couldn't establish a secure connection to the mail server.".into()
-            }
+            SyncFailureKind::Unreachable => "server unreachable".into(),
+            SyncFailureKind::LoginRejected => "login rejected".into(),
+            SyncFailureKind::Password => "password unavailable".into(),
+            SyncFailureKind::Tls => "secure connection failed".into(),
             SyncFailureKind::Other => crate::notes::display_safe(&error.to_string(), false),
         },
     };
-    format!("Couldn't open the server draft. {detail}")
+    format!("Couldn't open draft · {detail}")
 }
 
 impl Store {

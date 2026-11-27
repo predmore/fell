@@ -128,6 +128,7 @@ impl SearchReply {
                         draft: None,
                         server_draft: None,
                         not_on_server: false,
+                        server_save_failed: false,
                     });
                     hits.insert(
                         thread_id.0,

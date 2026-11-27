@@ -1455,6 +1455,11 @@ mod tests {
             r#"<div>News from the harbor</div><div style="color:#555">The ferry is open</div>"#,
             r#"<div style="background:#e7e2d8"><a href="https://example.test">Timetable</a></div></td></tr></table>"#,
         ));
+        let plain = dark_mail("<p>Bring the tide chart.</p><p>Meet at the harbor office.</p>");
+        let spaced = dark_mail(include_str!(
+            "../../../fell-render/fixtures/web-newline-spacers.html"
+        ));
+        assert_eq!(plain.height, spaced.height);
         for (text, background) in [
             ([0, 0, 0], [255; 3]),
             ([0x55; 3], [255; 3]),
@@ -1875,5 +1880,14 @@ mod tests {
             shot.height
         };
         assert_eq!(snapshot(html), snapshot(&spaced));
+        let [plain, spaced] = [
+            "<p>Bring the tide chart.</p><p>Meet at the harbor office.</p>",
+            include_str!("../../../fell-render/fixtures/web-newline-spacers.html"),
+        ]
+        .map(|source| {
+            let mail = fell_render::WebMail::prepare(source);
+            colorless_snapshot(mail.page_with_style("light", Some(&style), |_| None), 432)
+        });
+        assert_eq!(plain.height, spaced.height);
     }
 }

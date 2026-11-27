@@ -4716,33 +4716,22 @@ impl Inbox {
         else {
             return stored;
         };
+        let write_back = hub.server_drafts_enabled(&self.account_id);
         stored
             .into_iter()
-            .filter_map(|mut draft| {
-                let live = hub.with_session(&draft.id, |session| {
-                    (session.snapshot(), session.send_lock())
-                });
-                let Some((snap, lock)) = live else {
-                    return Some(draft);
-                };
-                match lock {
-                    Some(fell_core::compose::SendLock::Sent) => return None,
-                    Some(_) => draft.maybe_sent = true,
-                    None => {}
+            .filter_map(|draft| {
+                match hub.with_session(&draft.id, |session| {
+                    (
+                        session.snapshot(),
+                        session.send_lock(),
+                        session.save_receipt(),
+                    )
+                }) {
+                    Some((snap, lock, receipt)) => {
+                        overlay_live_draft(draft, snap, lock, receipt, write_back)
+                    }
+                    None => Some(draft),
                 }
-                let raw = |items: &[fell_core::compose::AddressView]| {
-                    items.iter().map(|item| item.raw.clone()).collect()
-                };
-                draft.to = raw(&snap.to);
-                draft.cc = raw(&snap.cc);
-                draft.bcc = raw(&snap.bcc);
-                draft.subject = snap.subject;
-                draft.body = snap.body;
-                draft.from = snap.from;
-                draft.reply_context = snap.reply_context;
-                draft.forwarded = snap.forwarded;
-                draft.in_reply_to = snap.in_reply_to.filter(|id| !id.trim().is_empty());
-                Some(draft)
             })
             .collect()
     }
@@ -8600,23 +8589,13 @@ fn thread_row(
                     window,
                 )),
         )
-        .when(frame.draft_marker > 0., |row| {
-            row.child(
-                div()
-                    .absolute()
-                    .right(px(3.))
-                    .top(px((ROW_PX - 6.) * 0.5))
-                    .size(px(6.))
-                    .rounded_full()
-                    .bg(rgb(theme.error))
-                    .opacity(frame.draft_marker),
-            )
-        })
         .into_any_element()
 }
 
 const THREAD_LINE_GAP: f32 = 8.0;
 const THREAD_ATTACHMENT_MARK: &str = "⧉";
+const DRAFT_MARKER_SIZE: f32 = 6.0;
+const DRAFT_MARKER_GAP: f32 = 6.0;
 
 fn thread_line_one(
     theme: &Theme,
@@ -8658,6 +8637,11 @@ fn thread_line_one(
     // optional metadata and labels each need one gap after the previous item.
     let room = (text_width
         - date_width
+        - if row.draft.is_some() {
+            DRAFT_MARKER_SIZE + DRAFT_MARKER_GAP
+        } else {
+            0.0
+        }
         - count_width
         - attachment_width
         - if row.muted {
@@ -8763,9 +8747,23 @@ fn thread_line_one(
         .child(
             div()
                 .flex_none()
-                .text_color(rgb(dim))
-                .text_size(px(size))
-                .child(date),
+                .flex()
+                .items_center()
+                .gap(px(DRAFT_MARKER_GAP))
+                .when(row.draft.is_some(), |line| {
+                    line.child(
+                        div()
+                            .size(px(DRAFT_MARKER_SIZE))
+                            .rounded_full()
+                            .bg(rgb(if row.server_save_failed {
+                                theme.error
+                            } else {
+                                theme.star
+                            }))
+                            .opacity(frame.draft_marker),
+                    )
+                })
+                .child(div().text_color(rgb(dim)).text_size(px(size)).child(date)),
         )
 }
 
@@ -12995,10 +12993,9 @@ fn status_bar(
         let notice_size = if narrow
             && toast.alert
             && toast.label.is_none()
-            && !present::is_draft_save_warning(&text)
             && (hint.is_none() || !toast.text.contains('“'))
         {
-            let natural = bar_px(window, &toast.text, size, ui) + tail_width(size);
+            let natural = bar_px(window, &text, size, ui) + tail_width(size);
             if natural > room {
                 (size * (room - 2.).max(0.) / natural).max(11.)
             } else {
@@ -13206,6 +13203,48 @@ fn status_bar(
             ),
             _ => bar,
         })
+}
+
+fn overlay_live_draft(
+    mut draft: DraftSummary,
+    snap: fell_core::compose::Snapshot,
+    lock: Option<fell_core::compose::SendLock>,
+    receipt: Option<fell_core::compose::SaveReceipt>,
+    write_back: bool,
+) -> Option<DraftSummary> {
+    use fell_core::compose::{AddressView, SaveReceipt, SendLock};
+
+    match lock {
+        Some(SendLock::Sent) => return None,
+        Some(_) => {
+            draft.maybe_sent = true;
+            draft.not_on_server = false;
+            draft.server_save_failed = false;
+        }
+        None if write_back => match receipt {
+            Some(SaveReceipt::ServerFailed) => {
+                draft.not_on_server = true;
+                draft.server_save_failed = true;
+            }
+            None | Some(SaveReceipt::Local | SaveReceipt::Pending) if snap.open => {
+                draft.not_on_server = true;
+                draft.server_save_failed = false;
+            }
+            _ => {}
+        },
+        None => {}
+    }
+    let raw = |items: Vec<AddressView>| items.into_iter().map(|item| item.raw).collect();
+    draft.to = raw(snap.to);
+    draft.cc = raw(snap.cc);
+    draft.bcc = raw(snap.bcc);
+    draft.subject = snap.subject;
+    draft.body = snap.body;
+    draft.from = snap.from;
+    draft.reply_context = snap.reply_context;
+    draft.forwarded = snap.forwarded;
+    draft.in_reply_to = snap.in_reply_to.filter(|id| !id.trim().is_empty());
+    Some(draft)
 }
 
 fn draft_notice(keymap: &keymap::Keymap, text: String, alert: bool) -> Toast {
@@ -15220,6 +15259,7 @@ mod tests {
             draft: None,
             server_draft: None,
             not_on_server: false,
+            server_save_failed: false,
         }
     }
 
@@ -15300,30 +15340,124 @@ mod tests {
     }
 
     #[test]
-    fn draft_notices_use_the_current_leader_and_drop_one_fragment_at_490px() {
+    fn draft_notices_fit_at_490px_with_the_default_leader() {
         use crate::{
-            keymap::{self, Action},
-            present,
+            keymap::{self, Action, Keymap},
+            model::Session,
         };
-        use fell_core::compose::{SERVER_DRAFT_SAVE_FAILED, server_draft_open_notice};
+        use fell_core::{
+            Error,
+            compose::{
+                SERVER_DRAFT_SAVE_FAILED, SERVER_DRAFT_SAVE_RETRYING, server_draft_open_notice,
+            },
+        };
 
-        let keys = keymap::Keymap::default();
-        let notice = super::draft_notice(&keys, SERVER_DRAFT_SAVE_FAILED.into(), true);
-        assert_eq!(notice.hint, Some(("Space ? l".into(), " for log")));
-        assert_eq!(keymap::binding_text(&keys, Action::SendDraft), "Space m s");
-        let keys = keymap::keymap_from_text("leader = ','").unwrap();
-        let notice = super::draft_notice(&keys, SERVER_DRAFT_SAVE_FAILED.into(), true);
+        let keys = Keymap::default();
+        let mut session = Session::new("Demo", "demo@example.test", SyncKind::LocalOffline, keys);
+        let mut theme = crate::theme::load();
+        theme.ui_px = 15.;
+        let fit = |session: &mut Session, text: String, hint| {
+            let notice = super::draft_notice(&session.keymap, text, true);
+            assert_eq!(notice.hint, hint);
+            session.set_toast(notice);
+            let label = super::StatusLabel::new(&theme, session, None, 490.);
+            let frame = super::StatusLabels::default().update(
+                label,
+                motion::Motion::new(false),
+                Instant::now(),
+            );
+            draw_status_notice(&theme, session, frame, 490.).0
+        };
+        assert_eq!(
+            fit(
+                &mut session,
+                SERVER_DRAFT_SAVE_FAILED.into(),
+                Some(("Space ? l".into(), " for log"))
+            ),
+            "Not on server · edit to retry",
+        );
+        assert_eq!(
+            fit(&mut session, SERVER_DRAFT_SAVE_RETRYING.into(), None),
+            "Not on server · retrying",
+        );
+        for error in [
+            Error::DraftBodyUnavailable,
+            Error::DraftFormattingUnavailable,
+            Error::DraftNoLongerInFolder,
+            Error::DraftUnavailable,
+            Error::DraftAttachmentLimit,
+            Error::DraftMessageLimit,
+            Error::Backend("imap: LOGIN failed: NO".into()),
+            Error::Backend("imap: connect 127.0.0.1 refused".into()),
+            Error::Backend("password_command failed".into()),
+            Error::Tls("fixture TLS error".into()),
+        ] {
+            let text = server_draft_open_notice(&error);
+            assert!(text.contains(" · "), "{text}");
+            assert_eq!(fit(&mut session, text.clone(), None), text);
+        }
+
+        let custom = keymap::keymap_from_text("leader = ','").unwrap();
+        let notice = super::draft_notice(&custom, SERVER_DRAFT_SAVE_FAILED.into(), true);
         assert_eq!(notice.hint, Some((", ? l".into(), " for log")));
-        assert_eq!(keymap::binding_text(&keys, Action::SendDraft), ", m s");
-        assert_eq!(
-            present::draft_status_text(&notice.text, 490.),
-            "Not saved to the server · edit to retry",
-        );
-        assert_eq!(present::draft_status_text(&notice.text, 820.), notice.text);
-        assert_eq!(
-            server_draft_open_notice(&fell_core::Error::DraftFormattingUnavailable),
-            "Can't edit this draft's formatting in Fell · still on the server",
-        );
+        assert_eq!(keymap::binding_text(&custom, Action::SendDraft), ", m s");
+    }
+
+    #[test]
+    fn newer_live_draft_text_marks_a_previously_confirmed_row() {
+        use fell_core::{
+            AccountId,
+            compose::{DraftFields, DraftSession, DraftSummary, SaveReceipt},
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let stored = DraftSummary {
+            id: "draft".into(),
+            from: "demo@example.test".into(),
+            to: vec![],
+            cc: vec![],
+            bcc: vec![],
+            subject: "Pier map".into(),
+            body: "Old text".into(),
+            owner: String::new(),
+            updated_unix: 0,
+            maybe_sent: false,
+            not_on_server: false,
+            server_save_failed: false,
+            reply_context: None,
+            forwarded: None,
+            in_reply_to: None,
+            known_names: Default::default(),
+        };
+        let mut editor = DraftSession::testing_create_local(
+            tmp.path().to_path_buf(),
+            &stored.id,
+            AccountId("demo".into()),
+            DraftFields {
+                subject: stored.subject.clone(),
+                ..Default::default()
+            },
+            stored.body.clone(),
+        )
+        .unwrap();
+        editor.open_for_edit();
+        let overlay = |editor: &DraftSession, receipt, write_back| {
+            super::overlay_live_draft(
+                stored.clone(),
+                editor.snapshot(),
+                editor.send_lock(),
+                receipt,
+                write_back,
+            )
+            .unwrap()
+        };
+        assert!(!overlay(&editor, Some(SaveReceipt::Server([0; 32])), true).not_on_server);
+        editor.set_body_from_user("New text".into());
+        let draft = overlay(&editor, editor.save_receipt(), true);
+        assert_eq!(draft.body, "New text");
+        assert!(draft.not_on_server);
+        assert!(!draft.server_save_failed);
+        assert!(!overlay(&editor, editor.save_receipt(), false).not_on_server);
     }
 
     #[test]

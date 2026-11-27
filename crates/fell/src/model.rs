@@ -4142,6 +4142,7 @@ mod tests {
             draft: None,
             server_draft: None,
             not_on_server: false,
+            server_save_failed: false,
         }
     }
 
@@ -6470,6 +6471,7 @@ mod tests {
                 draft: Some(id.into()),
                 server_draft: None,
                 not_on_server: false,
+                server_save_failed: false,
                 ..dated(id, date)
             })
             .collect();

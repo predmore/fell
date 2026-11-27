@@ -1638,17 +1638,9 @@ impl Layout {
         };
         let padding = box_edges(&style, "padding");
         let margin = box_edges(&style, "margin");
-        let reader_spacer = element.attr("data-fell-reader-spacer").map(|_| {
-            let before = node
-                .prev_siblings()
-                .find_map(|sibling| sibling.value().as_element());
-            before.is_some_and(|before| {
-                !matches!(before.name(), "p" | "ul" | "ol")
-                    && before.attr("data-fell-reader-spacer").is_none()
-            }) && node
-                .next_siblings()
-                .any(|sibling| sibling.value().as_element().is_some())
-        });
+        let reader_spacer = element
+            .attr("data-fell-reader-spacer")
+            .map(|value| value != "hidden");
         let paragraph = matches!(name, "p" | "ul" | "ol");
         let nested_list = matches!(name, "ul" | "ol")
             && node

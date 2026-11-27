@@ -436,9 +436,13 @@ pub struct SyncedDraftPreview {
     pub recipients: Vec<Address>,
     pub subject: String,
     pub body: String,
-    /// Text from the native document when the draft cannot use the Markdown reader.
+    /// Text from the native document or the cached snippet for large HTML parts.
     pub html_snippet: Option<String>,
 }
+
+/// HTML preparation budget for interactive store reads. The reader budgets
+/// by compressed size and the Drafts list by decoded HTML bytes.
+pub const STORE_PREPARE_BYTES: u64 = 32 * 1024;
 
 /// One page of FTS hits. `next_cursor` is passed back to [`Store::search_page`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2299,7 +2303,7 @@ impl Store {
                 (SELECT 'imap:' || c.uidvalidity || ':' || c.uid || ':' || c.mailbox
                  FROM message_copies c
                  WHERE c.account_id = m.account_id AND c.message_id = m.message_id AND c.mailbox = ?3
-                 ORDER BY c.uidvalidity DESC, c.uid DESC LIMIT 1)
+                ORDER BY c.uidvalidity DESC, c.uid DESC LIMIT 1), m.snippet
              FROM messages m WHERE m.account_id = ?1 AND m.thread_id = ?2
              ORDER BY m.date_unix DESC, m.rowid DESC",
         )?;
@@ -2320,19 +2324,23 @@ impl Store {
                 let id: String = row.get(5)?;
                 let fallback: Option<String> = row.get(4)?;
                 let parts = bodies::read_body_text(&self.conn, account_id, &id)?;
-                let body = Self::editable_draft_text(parts.as_ref(), fallback.as_deref());
-                let html_snippet = if body.is_none() {
-                    parts
-                        .as_ref()
-                        .and_then(|parts| parts.html.as_deref())
-                        .map(|html| {
-                            crate::imap::rfc822::html_snippet_text(html)
-                                .map(|text| crate::imap::rfc822::cap_snippet(&text).to_owned())
-                                .unwrap_or_default()
-                        })
-                } else {
-                    None
-                };
+                let html = parts.as_ref().and_then(|parts| parts.html.as_deref());
+                let (body, html_snippet) =
+                    if html.is_some_and(|html| html.len() as u64 > STORE_PREPARE_BYTES) {
+                        (None, Some(row.get(7)?))
+                    } else {
+                        let body = Self::editable_draft_text(parts.as_ref(), fallback.as_deref());
+                        let snippet = if body.is_none() {
+                            html.map(|html| {
+                                crate::imap::rfc822::html_snippet_text(html)
+                                    .map(|text| crate::imap::rfc822::cap_snippet(&text).to_owned())
+                                    .unwrap_or_default()
+                            })
+                        } else {
+                            None
+                        };
+                        (body, snippet)
+                    };
                 out.insert(
                     thread.clone(),
                     SyncedDraftPreview {

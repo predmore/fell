@@ -356,8 +356,7 @@ impl WebMail {
                      li > :is(ul, ol) {{ margin-block: 8px 0; }}
                      [data-fell-reader-extra-break] {{ display: none; }}
                      [data-fell-reader-spacer] {{ height: {paragraph_gap}px; margin: 0; overflow: hidden; }}
-                     [data-fell-reader-spacer]:is(:first-child, :last-child),
-                     :is(p, ul, ol, [data-fell-reader-spacer]) + [data-fell-reader-spacer] {{ display: none; }}
+                     [data-fell-reader-spacer=\"hidden\"] {{ display: none; }}
                      body > :first-child, p:first-child {{ margin-top: 0; }}
                      div:has(> br:only-child:where(:not([data-fell-folded]))) {{ min-height: {paragraph_gap}px; }}",
                     text.link,
@@ -665,18 +664,60 @@ fn reader_spacer(node: ego_tree::NodeRef<'_, scraper::node::Node>, depth: u32) -
         })
 }
 
-fn extra_reader_break(node: ego_tree::NodeRef<'_, scraper::node::Node>) -> bool {
+fn reader_content(node: &ego_tree::NodeRef<'_, scraper::node::Node>) -> bool {
     use scraper::node::Node;
+    match node.value() {
+        Node::Text(text) => !text.chars().all(char::is_whitespace),
+        Node::Comment(_) => false,
+        _ => true,
+    }
+}
+
+fn is_reader_spacer(node: ego_tree::NodeRef<'_, scraper::node::Node>, depth: u32) -> bool {
+    node.value().as_element().is_some_and(|element| {
+        matches!(element.name(), "p" | "div")
+            && element.attr("style").is_none()
+            && element.attr("class").is_none()
+            && reader_spacer(node, depth)
+            && (element.name() == "p"
+                || node.children().any(|child| {
+                    child
+                        .value()
+                        .as_element()
+                        .is_some_and(|element| element.name() == "br")
+                }))
+    })
+}
+
+fn hide_reader_spacer(node: ego_tree::NodeRef<'_, scraper::node::Node>, depth: u32) -> bool {
+    let Some(before) = node.prev_siblings().find(reader_content) else {
+        return true;
+    };
+    before
+        .value()
+        .as_element()
+        .is_some_and(|element| matches!(element.name(), "p" | "ul" | "ol"))
+        || is_reader_spacer(before, depth)
+        || !node.next_siblings().any(|sibling| reader_content(&sibling))
+}
+
+fn extra_reader_break(node: ego_tree::NodeRef<'_, scraper::node::Node>) -> bool {
     node.prev_siblings()
-        .filter(|sibling| {
-            !matches!(sibling.value(), Node::Comment(_))
-                && !matches!(sibling.value(), Node::Text(text) if text.chars().all(char::is_whitespace))
-        })
+        .filter(reader_content)
         .take(2)
-        .take_while(|sibling| sibling.value().as_element().is_some_and(|element| element.name() == "br"))
-        .count() == 2
+        .take_while(|sibling| {
+            sibling
+                .value()
+                .as_element()
+                .is_some_and(|element| element.name() == "br")
+        })
+        .count()
+        == 2
         && !node.ancestors().any(|ancestor| {
-            ancestor.value().as_element().is_some_and(|element| element.name() == "pre")
+            ancestor
+                .value()
+                .as_element()
+                .is_some_and(|element| element.name() == "pre")
         })
 }
 
@@ -803,20 +844,12 @@ fn serialize_node(
             if folded {
                 out.push_str(" data-fell-folded");
             }
-            if prepared_page
-                && matches!(name, "p" | "div")
-                && element.attr("style").is_none()
-                && element.attr("class").is_none()
-                && reader_spacer(node, depth)
-                && (name == "p"
-                    || node.children().any(|child| {
-                        child
-                            .value()
-                            .as_element()
-                            .is_some_and(|element| element.name() == "br")
-                    }))
-            {
-                out.push_str(" data-fell-reader-spacer");
+            if prepared_page && is_reader_spacer(node, depth) {
+                if hide_reader_spacer(node, depth) {
+                    out.push_str(" data-fell-reader-spacer=\"hidden\"");
+                } else {
+                    out.push_str(" data-fell-reader-spacer");
+                }
             }
             if prepared_page && name == "br" && extra_reader_break(node) {
                 out.push_str(" data-fell-reader-extra-break");
@@ -2104,6 +2137,30 @@ mod tests {
                 18.
             );
         }
+    }
+
+    #[test]
+    fn the_reader_measures_the_same_gap_with_a_newline_separated_spacer() {
+        let html = include_str!("../fixtures/web-newline-spacers.html");
+        let plain = "<p>Bring the tide chart.</p><p>Meet at the harbor office.</p>";
+        let style = WebTextStyle {
+            family: None,
+            size: 15.,
+            foreground: 0,
+            link: 0,
+            border: 0,
+            inset: false,
+        };
+        let with_spacer = WebMail::prepare(html);
+        assert!(
+            with_spacer
+                .page_with_style("light", Some(&style), |_| None)
+                .contains("<p data-fell-reader-spacer=\"hidden\">")
+        );
+        assert_eq!(
+            with_spacer.estimated_height_with_style(432., Some(&style)),
+            WebMail::prepare(plain).estimated_height_with_style(432., Some(&style)),
+        );
     }
 
     #[test]

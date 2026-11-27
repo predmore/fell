@@ -45,6 +45,7 @@ pub struct ThreadRow {
     /// The exact server copy used to build a synced Drafts preview.
     pub server_draft: Option<fell_core::RemoteId>,
     pub not_on_server: bool,
+    pub server_save_failed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -527,6 +528,7 @@ pub fn thread_rows(threads: &[FolderThread], me: &str) -> Vec<ThreadRow> {
             draft: None,
             server_draft: None,
             not_on_server: false,
+            server_save_failed: false,
         })
         .collect()
 }
@@ -553,7 +555,7 @@ pub fn draft_row_id(id: &str) -> String {
 }
 
 pub const DRAFT_STATUS_WIDE: f32 = 640.;
-const DRAFT_SAVE_PREFIX: &str = "Not saved to the server";
+const DRAFT_SAVE_PREFIX: &str = "Not on server";
 
 pub fn is_draft_save_warning(text: &str) -> bool {
     text.starts_with(DRAFT_SAVE_PREFIX)
@@ -561,7 +563,9 @@ pub fn is_draft_save_warning(text: &str) -> bool {
 
 pub fn draft_status_text(text: &str, width: f32) -> std::borrow::Cow<'_, str> {
     if width < DRAFT_STATUS_WIDE
-        && let Some(rest) = text.strip_prefix("Not saved to the server · kept in Fell")
+        && let Some(rest) = text
+            .strip_prefix(DRAFT_SAVE_PREFIX)
+            .and_then(|rest| rest.strip_prefix(" · kept in Fell"))
     {
         return format!("{DRAFT_SAVE_PREFIX}{rest}").into();
     }
@@ -628,6 +632,7 @@ pub fn draft_rows(drafts: &[DraftSummary]) -> Vec<ThreadRow> {
                 draft: Some(draft.id.clone()),
                 server_draft: None,
                 not_on_server: draft.not_on_server,
+                server_save_failed: draft.server_save_failed,
             }
         })
         .collect()
@@ -1821,6 +1826,7 @@ mod tests {
             updated_unix: 1_000,
             maybe_sent: false,
             not_on_server: false,
+            server_save_failed: false,
             reply_context: None,
             forwarded: None,
             in_reply_to: None,
@@ -2020,6 +2026,7 @@ mod tests {
             draft: None,
             server_draft: None,
             not_on_server: false,
+            server_save_failed: false,
         }];
         let mut untouched = rows[0].clone();
         untouched.id = "t2".into();

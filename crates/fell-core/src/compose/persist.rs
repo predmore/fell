@@ -54,6 +54,8 @@ pub struct DraftSummary {
     pub maybe_sent: bool,
     /// With write-back enabled, this draft's current content has no confirmed server copy.
     pub not_on_server: bool,
+    /// The save for this content failed and no retry is queued.
+    pub server_save_failed: bool,
     /// What a reply answers, when the mailbox still holds the original.
     pub reply_context: Option<super::ReplyContext>,
     /// Whose message a forward passes on.
@@ -861,6 +863,7 @@ impl Store {
                         // Anything but a clean "clear" errs toward "may have been sent".
                         maybe_sent: state.is_some_and(|state| state != SEND_CLEAR),
                         not_on_server: false,
+                        server_save_failed: false,
                         reply_context: None,
                         forwarded: None,
                         in_reply_to: None,
@@ -875,26 +878,27 @@ impl Store {
         let mut drafts = Vec::with_capacity(rows.len());
         for (in_reply_to, quote_text, has_copy, has_files, attempted, mut draft) in rows {
             if write_back && !draft.maybe_sent {
-                draft.not_on_server = if has_copy {
+                draft.not_on_server = if has_copy || attempted {
                     // The existing digest also identifies drafts saved by older versions.
-                    // Read attachment bytes only when there is a server copy to compare.
+                    // Compare it with the copy and outbox for this revision.
                     if let Some(current) = self.load_compose(&draft.id)? {
                         let digest = super::server::digest(&current, &current.files);
-                        self.server_draft_save_status(account_id, &draft.id, &digest)?
-                            != Some(DraftSaveStatus::Server)
+                        let status =
+                            self.server_draft_save_status(account_id, &draft.id, &digest)?;
+                        draft.server_save_failed = status == Some(DraftSaveStatus::ServerFailed);
+                        status != Some(DraftSaveStatus::Server)
                     } else {
                         false
                     }
                 } else {
-                    attempted
-                        || draft.owner.is_empty()
-                            && (!draft.subject.is_empty()
-                                || !draft.body.trim().is_empty()
-                                || !draft.to.is_empty()
-                                || !draft.cc.is_empty()
-                                || !draft.bcc.is_empty()
-                                || !in_reply_to.is_empty()
-                                || has_files)
+                    draft.owner.is_empty()
+                        && (!draft.subject.is_empty()
+                            || !draft.body.trim().is_empty()
+                            || !draft.to.is_empty()
+                            || !draft.cc.is_empty()
+                            || !draft.bcc.is_empty()
+                            || !in_reply_to.is_empty()
+                            || has_files)
                 };
             }
             if !in_reply_to.trim().is_empty() {
