@@ -627,6 +627,10 @@ impl Store {
                 "Expected a mailbox file with one link".into(),
             ));
         }
+        // One attempt only: this upgrades the shared lock this store already
+        // holds. On Linux a failed LOCK_EX|LOCK_NB upgrade drops that shared
+        // lock, so retrying here would leave the open connection unprotected
+        // while another open could take the file exclusively.
         lock.try_lock().map_err(|err| crate::Error::Invalid(format!(
             "Close Fell and any fell-mcp sessions using this account before deleting local mail: {err}"
         )))?;
