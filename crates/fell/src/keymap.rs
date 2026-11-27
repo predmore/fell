@@ -311,6 +311,8 @@ pub const ACTION_SECTIONS: &[(&str, &[Action])] = &[
             Action::Setting(SettingsRow::Value(Preference::FontSize)),
             Action::Setting(SettingsRow::Value(Preference::ReduceMotion)),
             Action::Setting(SettingsRow::Value(Preference::ReadDwell)),
+            Action::Setting(SettingsRow::Value(Preference::WebViewDefault)),
+            Action::Setting(SettingsRow::Value(Preference::RemoteImages)),
             Action::Setting(SettingsRow::Value(Preference::WhichKey)),
             Action::Setting(SettingsRow::Value(Preference::Notifications)),
             Action::Setting(SettingsRow::AccountSetup),

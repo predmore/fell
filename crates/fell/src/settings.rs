@@ -27,16 +27,20 @@ pub enum Preference {
     FontSize,
     ReduceMotion,
     ReadDwell,
+    WebViewDefault,
+    RemoteImages,
     WhichKey,
     Notifications,
 }
 
 impl Preference {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 8] = [
         Self::Theme,
         Self::FontSize,
         Self::ReduceMotion,
         Self::ReadDwell,
+        Self::WebViewDefault,
+        Self::RemoteImages,
         Self::WhichKey,
         Self::Notifications,
     ];
@@ -47,6 +51,8 @@ impl Preference {
             Self::FontSize => "font_size",
             Self::ReduceMotion => "reduce_motion",
             Self::ReadDwell => "read_dwell_ms",
+            Self::WebViewDefault => "web_view_for_bulk",
+            Self::RemoteImages => "remote_image_prompt",
             Self::WhichKey => "which_key_ms",
             Self::Notifications => "notifications",
         }
@@ -58,6 +64,8 @@ impl Preference {
             Self::FontSize => "Font size",
             Self::ReduceMotion => "Reduce motion",
             Self::ReadDwell => "Mark-read delay",
+            Self::WebViewDefault => "Web view default",
+            Self::RemoteImages => "Remote images",
             Self::WhichKey => "Which-key delay",
             Self::Notifications => "Desktop notifications",
         }
@@ -69,17 +77,31 @@ impl Preference {
             Self::FontSize => "Settings: Font size",
             Self::ReduceMotion => "Settings: Reduce motion",
             Self::ReadDwell => "Settings: Mark-read delay",
+            Self::WebViewDefault => "Settings: Web view default",
+            Self::RemoteImages => "Settings: Remote images",
             Self::WhichKey => "Settings: Which-key delay",
             Self::Notifications => "Settings: Desktop notifications",
         }
     }
 
-    pub fn description(self) -> &'static str {
+    pub fn description(self, values: Values) -> &'static str {
         match self {
             Self::Theme => "Desktop colors or a Fell theme.",
             Self::FontSize => "Inbox and composer text.",
             Self::ReduceMotion => "Limit interface animations.",
             Self::ReadDwell => "Wait before marking an open thread read.",
+            Self::WebViewDefault if values.reading.web_view_for_bulk => {
+                "Newsletters open in web view. Senders you set with w keep theirs."
+            }
+            Self::WebViewDefault => {
+                "Mail opens in simple view. Senders you set with w keep theirs."
+            }
+            Self::RemoteImages if values.reading.remote_image_prompt => {
+                "Blocked images get a Load images button. Allowed senders still load."
+            }
+            Self::RemoteImages => {
+                "Images stay blocked unless you allowed the sender. Press i to load once."
+            }
             Self::WhichKey => "Wait for shortcut suggestions.",
             Self::Notifications => "What new-mail alerts show.",
         }
@@ -103,6 +125,18 @@ impl Preference {
             }
             .into(),
             Self::ReadDwell => delay_label(values.read_dwell_ms),
+            Self::WebViewDefault => if values.reading.web_view_for_bulk {
+                "Automatic"
+            } else {
+                "Simple view"
+            }
+            .into(),
+            Self::RemoteImages => if values.reading.remote_image_prompt {
+                "Show prompt"
+            } else {
+                "Hide prompt"
+            }
+            .into(),
             Self::WhichKey => delay_label(values.which_key_ms),
             Self::Notifications => match values.notifications {
                 NotificationMode::On => "Sender + subject",
@@ -146,6 +180,8 @@ impl Preference {
                 values.read_dwell_ms,
                 backwards,
             ) as i64),
+            Self::WebViewDefault => (!values.reading.web_view_for_bulk).into(),
+            Self::RemoteImages => (!values.reading.remote_image_prompt).into(),
             Self::WhichKey => Value::from(step(
                 &[0, 150, 300, 500, 750, 1000, 1500, 3000, 5000],
                 values.which_key_ms,
@@ -189,6 +225,8 @@ impl Preference {
                 };
             }
             Self::ReadDwell => values.read_dwell_ms = integer(0..=10_000)?,
+            Self::WebViewDefault => values.reading.web_view_for_bulk = item.as_bool()?,
+            Self::RemoteImages => values.reading.remote_image_prompt = item.as_bool()?,
             Self::WhichKey => values.which_key_ms = integer(0..=5_000)?,
             Self::Notifications => {
                 values.notifications = match item.as_str()? {
@@ -238,12 +276,28 @@ fn step(options: &[u64], current: u64, backwards: bool) -> u64 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadingDefaults {
+    pub web_view_for_bulk: bool,
+    pub remote_image_prompt: bool,
+}
+
+impl Default for ReadingDefaults {
+    fn default() -> Self {
+        Self {
+            web_view_for_bulk: true,
+            remote_image_prompt: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Values {
     pub theme: ColorScheme,
     pub font_size: Option<u64>,
     /// None follows GTK, even if a legacy environment override is set.
     pub reduce_motion: Option<bool>,
     pub read_dwell_ms: u64,
+    pub reading: ReadingDefaults,
     pub which_key_ms: u64,
     pub notifications: NotificationMode,
 }
@@ -255,6 +309,7 @@ impl Default for Values {
             font_size: None,
             reduce_motion: Motion::environment_preference(),
             read_dwell_ms: 0,
+            reading: ReadingDefaults::default(),
             which_key_ms: 300,
             notifications: NotificationMode::On,
         }
@@ -552,6 +607,41 @@ pub fn appearance() -> Values {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reading_defaults_validate_and_persist_independently() {
+        let defaults = Values::default();
+        let initial = Snapshot::read(None, defaults);
+        assert!(initial.values.reading.web_view_for_bulk);
+        assert!(initial.values.reading.remote_image_prompt);
+
+        for (preference, invalid_value, backwards) in [
+            (Preference::WebViewDefault, "sometimes", false),
+            (Preference::RemoteImages, "allow", true),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("settings.toml");
+            fs::write(&path, format!("{} = {invalid_value:?}\n", preference.key())).unwrap();
+            let invalid = initial.reload(Some(&path), defaults);
+            assert_eq!(invalid.values.reading, initial.values.reading);
+            assert_eq!(
+                invalid.invalid,
+                [(preference, format!("{invalid_value:?}"))]
+            );
+
+            let saved = save(&path, defaults, Edit::Cycle(preference, backwards)).unwrap();
+            assert_eq!(
+                saved.values.reading.web_view_for_bulk,
+                preference != Preference::WebViewDefault
+            );
+            assert_eq!(
+                saved.values.reading.remote_image_prompt,
+                preference != Preference::RemoteImages
+            );
+            assert!(saved.notice().is_none());
+            assert_eq!(Snapshot::read(Some(&path), defaults), saved);
+        }
+    }
 
     #[test]
     fn new_config_and_settings_have_private_permissions() {

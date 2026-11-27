@@ -1173,7 +1173,7 @@ impl Inbox {
             warm: None,
             warmed_folder: None,
             bodies: BodyCache::default(),
-            web_mail: web_mail::Reader::default(),
+            web_mail: web_mail::Reader::new(values.reading),
             body_loads: BodyLoads::default(),
             reader_fetcher: None,
             reader_bodies: ReaderBodies::default(),
@@ -1318,7 +1318,7 @@ impl Inbox {
             trace.store_opened(opened.error.as_deref());
         }
         self.web_mail.release(cx);
-        self.web_mail = web_mail::Reader::default();
+        self.web_mail = web_mail::Reader::new(self.web_mail.reading);
         self.account_id = opened.account.id.clone();
         cx.default_global::<crate::compose_ui::RecipientStore>()
             .0
@@ -2859,6 +2859,7 @@ impl Inbox {
         });
         let cached = self.bodies.stamps();
         let sender_preferences = self.web_mail.preferences.clone();
+        let web_view_for_bulk = self.web_mail.reading.web_view_for_bulk;
         let wait_for_body = self.first_preview.waits_for_body();
         let expanded: HashSet<_> = self
             .session
@@ -2893,8 +2894,9 @@ impl Inbox {
                         &cached,
                         !opening,
                         |message| {
-                            let sender = web_mail::sender_address(&message.email)?;
-                            sender_preferences.get(&sender)?.0
+                            web_mail::sender_address(&message.email)
+                                .and_then(|sender| sender_preferences.get(&sender)?.0)
+                                .or_else(|| (!web_view_for_bulk).then_some(false))
                         },
                     );
                     Ok(Some((view, reads)))
@@ -6249,8 +6251,12 @@ impl Render for Inbox {
         if self.session.overlay == Overlay::Settings
             && self.session.settings_nav.page == crate::model::settings::Page::Index
         {
-            let final_height =
-                settings::card_height(&self.session.settings_nav, settings_room, width < 500.);
+            let final_height = settings::card_height(
+                &self.session.settings_nav,
+                settings_room,
+                width < 500.,
+                theme.ui_px,
+            );
             self.settings_view.reveal_index_row(
                 self.session.settings_nav.selected,
                 card.unwrap_or(final_height),
@@ -6340,6 +6346,7 @@ impl Render for Inbox {
                                     &session.settings_nav,
                                     settings_room,
                                     width < 500.,
+                                    theme.ui_px,
                                 )
                             }),
                             window,
@@ -12971,6 +12978,7 @@ fn card_fit(
             &session.settings_nav,
             room,
             window.viewport_size().width < px(500.),
+            theme.ui_px,
         )),
         _ => None,
     }

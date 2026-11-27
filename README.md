@@ -136,6 +136,8 @@ writes the changed key and preserves comments and unfamiliar keys.
 | `font_size` | `"system"` or 12–18 pixels |
 | `reduce_motion` | `"system"`, `true`, `false` |
 | `read_dwell_ms` | 0–10000 milliseconds |
+| `web_view_for_bulk` | `true` (automatic), `false` (simple view) |
+| `remote_image_prompt` | `true` (show prompt), `false` (hide prompt) |
 | `which_key_ms` | 0–5000 milliseconds |
 | `notifications` | `"on"`, `"private"`, `"off"` |
 
@@ -146,6 +148,11 @@ Missing or invalid values fall back to the previous defaults. That includes
 Delete individual keys to restore their fallbacks, or empty or remove the file
 to restore all fallbacks. Keymap leader changes, plus the search
 model after an install or removal, take effect when you reopen Fell.
+
+Automatic opens complex newsletters in the web view. A saved sender choice
+takes priority. Remote images require permission for the current message or
+a saved grant for its verified sender. Hiding the prompt leaves those rules
+in place. The **Load images** action is still available from the palette.
 
 ### New mail notifications
 

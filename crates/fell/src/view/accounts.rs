@@ -1004,6 +1004,7 @@ impl Render for AccountWindow {
                                             - super::CARD_TOP_PX
                                             - 16.,
                                         f32::from(window.viewport_size().width) < 500.,
+                                        inbox.theme.ui_px,
                                     )
                                 }),
                                 window,
