@@ -850,8 +850,13 @@ impl<R: Clone> ListShift<R> {
     /// so a row in flight keeps its place. A row not drawn yet (two changes
     /// before one frame) is where it would have been drawn.
     pub fn offset_of(&self, id: &str, top: f32, now: Instant) -> f32 {
+        self.slide_offsets(id, top, now).1
+    }
+
+    /// The starting and current offsets from the slot, for the painted sweep.
+    pub fn slide_offsets(&self, id: &str, top: f32, now: Instant) -> (f32, f32) {
         self.resolved_start(id, top)
-            .map_or(0.0, |dy| dy * (1.0 - self.slide_progress(now)))
+            .map_or((0.0, 0.0), |dy| (dy, dy * (1.0 - self.slide_progress(now))))
     }
 
     /// Furthest outside the viewport a slot can be while its row is visible.
