@@ -344,6 +344,7 @@ pub struct PickerChoice {
     pub date: Option<String>,
     pub mark: Option<&'static str>,
     pub divider: bool,
+    pub unavailable: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -585,6 +586,7 @@ pub struct Session {
     /// The manual sync acknowledgement, until the worker sends status.
     sync_notice: Option<u64>,
     move_selection: Option<MoveSelection>,
+    pub all_move_choices: Vec<PickerChoice>,
     /// `#` in Trash asked to remove these threads from Fell, in the
     /// notice of this generation. The next key answers: `y` deletes them,
     /// anything else lets it go. A notice that replaced the question
@@ -706,6 +708,7 @@ impl Session {
             toast_generation: 0,
             sync_notice: None,
             move_selection: None,
+            all_move_choices: Vec::new(),
             confirm_purge: None,
             purge_ready: None,
             loading: false,
@@ -1166,6 +1169,15 @@ impl Session {
     }
 
     pub fn picker_choices(&self) -> Vec<PickerChoice> {
+        if self.all_inboxes && self.folder_intent == FolderIntent::Move {
+            let query = self.folder_query.trim().to_ascii_lowercase();
+            return self
+                .all_move_choices
+                .iter()
+                .filter(|choice| choice.title.to_ascii_lowercase().contains(&query))
+                .cloned()
+                .collect();
+        }
         if self.folder_intent == FolderIntent::Account {
             let query = self.folder_query.trim().to_ascii_lowercase();
             return self
@@ -1208,6 +1220,7 @@ impl Session {
                     mark: None,
                     name,
                     divider,
+                    unavailable: false,
                 }
             })
             .collect()
@@ -1245,6 +1258,7 @@ impl Session {
                         _ => Some("−"),
                     },
                     divider: false,
+                    unavailable: false,
                 }
             })
             .collect();
@@ -1262,6 +1276,7 @@ impl Session {
                 date: None,
                 mark: Some("+"),
                 divider: !choices.is_empty(),
+                unavailable: false,
             });
         }
         choices
@@ -2665,7 +2680,7 @@ impl Session {
             KeyId::Enter => self.confirm_folder(),
             KeyId::Backspace => {
                 self.folder_query.pop();
-                self.folder_index = 0;
+                self.reset_folder_index();
                 self.merge_query_changed()
             }
             KeyId::Up | KeyId::Down | KeyId::Ctrl('p' | 'k' | 'n' | 'j')
@@ -2674,34 +2689,53 @@ impl Session {
                 Step::default()
             }
             KeyId::Up | KeyId::Ctrl('p') | KeyId::Ctrl('k') => {
-                let len = self.picker_choices().len();
-                if len > 0 {
-                    self.folder_index = if self.folder_index == 0 {
-                        len - 1
-                    } else {
-                        self.folder_index - 1
-                    };
-                }
+                self.move_folder_index(false);
                 Step::default()
             }
             KeyId::Down | KeyId::Ctrl('n') | KeyId::Ctrl('j') => {
-                let len = self.picker_choices().len();
-                if len > 0 {
-                    self.folder_index = (self.folder_index + 1) % len;
-                }
+                self.move_folder_index(true);
                 Step::default()
             }
             KeyId::Char(ch) => {
                 self.folder_query.push(ch);
-                self.folder_index = 0;
+                self.reset_folder_index();
                 self.merge_query_changed()
             }
             KeyId::Space => {
                 self.folder_query.push(' ');
-                self.folder_index = 0;
+                self.reset_folder_index();
                 self.merge_query_changed()
             }
             _ => Step::default(),
+        }
+    }
+
+    fn reset_folder_index(&mut self) {
+        self.folder_index = 0;
+        if self.all_inboxes && self.folder_intent == FolderIntent::Move {
+            self.folder_index = self
+                .picker_choices()
+                .iter()
+                .position(|choice| !choice.unavailable)
+                .unwrap_or(0);
+        }
+    }
+
+    fn move_folder_index(&mut self, forward: bool) {
+        let choices = self.picker_choices();
+        let len = choices.len();
+        let start = self.folder_index.min(len.saturating_sub(1));
+        if let Some(index) = (1..=len)
+            .map(|step| {
+                if forward {
+                    (start + step) % len
+                } else {
+                    (start + len - step) % len
+                }
+            })
+            .find(|&index| !choices[index].unavailable)
+        {
+            self.folder_index = index;
         }
     }
 
@@ -2735,7 +2769,8 @@ impl Session {
             if matches!(
                 self.folder_intent,
                 FolderIntent::Label | FolderIntent::LabelList | FolderIntent::Merge
-            ) {
+            ) || (self.all_inboxes && self.folder_intent == FolderIntent::Move)
+            {
                 return Step::default();
             }
             self.dismiss_overlay();
@@ -2743,6 +2778,9 @@ impl Session {
             self.folder_intent = FolderIntent::Go;
             return Step::default();
         };
+        if chosen.unavailable {
+            return Step::default();
+        }
         if self.label_picker_active() && self.label_selection.counts.is_none() {
             self.label_selection.pending_choice = Some(chosen.name);
             return Step::default();
@@ -5735,6 +5773,7 @@ mod tests {
             date: None,
             mark: None,
             divider: false,
+            unavailable: false,
         };
         session.merge_choices = vec![choice("b"), choice("c")];
         assert!(session.confirm_pending_merge().threading.is_none());

@@ -911,13 +911,17 @@ impl Store {
         self.require_account(account_id)?;
         let tx = crate::store::immediate_transaction(self.connection())?;
         ensure_action_schema(&tx)?;
-        let Some(mut action) = latest_open_action(&tx, account_id)? else {
+        let Some(mut action) = latest_open_action(&tx, account_id, i64::MAX)? else {
             return Err(Error::Action("nothing to undo".into()));
         };
-        if expected.is_some_and(|id| id != action.id) {
-            return Err(Error::Action(
-                "A newer mailbox action is available to undo".into(),
-            ));
+        if let Some(id) = expected.filter(|id| *id != action.id) {
+            let still_open = id < action.id
+                && latest_open_action(&tx, account_id, id)?.is_some_and(|action| action.id == id);
+            return Err(Error::Action(if still_open {
+                "A newer mailbox action is available to undo".into()
+            } else {
+                "nothing to undo".into()
+            }));
         }
         let mut restored_threads = Vec::new();
         let mut triage_notice = None;
@@ -1445,11 +1449,15 @@ pub(crate) fn migrate_purge_snapshots(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn latest_open_action(conn: &Connection, account_id: &AccountId) -> Result<Option<LocalAction>> {
+fn latest_open_action(
+    conn: &Connection,
+    account_id: &AccountId,
+    through: i64,
+) -> Result<Option<LocalAction>> {
     let row: Option<(i64, String, String)> = conn
         .query_row(
             "SELECT id, kind, summary FROM local_actions a
-             WHERE account_id = ?1 AND undone = 0 AND kind != 'purge'
+             WHERE account_id = ?1 AND id <= ?2 AND undone = 0 AND kind != 'purge'
                AND (
                    EXISTS (SELECT 1 FROM local_action_messages s WHERE s.action_id = a.id)
                    OR EXISTS (SELECT 1 FROM local_action_flags f WHERE f.action_id = a.id)
@@ -1467,7 +1475,7 @@ fn latest_open_action(conn: &Connection, account_id: &AccountId) -> Result<Optio
                    ))
                )
              ORDER BY id DESC LIMIT 1",
-            params![account_id.as_str()],
+            params![account_id.as_str(), through],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;

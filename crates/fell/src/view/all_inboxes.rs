@@ -11,7 +11,7 @@ use gpui::{Context, Entity};
 
 use super::{Inbox, ListRead, ReadIntent, Removal, SyncKind, ThreadRow, ThreadsResult, present};
 use crate::model::snooze::{TriageEdit, TriageKind};
-use crate::model::{FlagEdit, LabelEdit, MoveEdit, Toast};
+use crate::model::{FlagEdit, LabelEdit, MoveEdit, PickerChoice, Toast};
 
 pub(super) const TITLE: &str = "All inboxes";
 
@@ -59,6 +59,24 @@ impl AllInboxes {
 
     pub fn reader(&self) -> Option<&Entity<Inbox>> {
         self.reader.as_ref()
+    }
+
+    pub fn begin_edit(&mut self) -> u64 {
+        let serial = self.next;
+        self.next += 1;
+        self.pending.insert(serial, None);
+        serial
+    }
+
+    pub fn forget_edit(&mut self, owner: &gpui::WeakEntity<Inbox>, action: i64) {
+        for entries in self
+            .undo
+            .iter_mut()
+            .chain(self.pending.values_mut().flatten())
+        {
+            entries.retain(|entry| entry.owner != *owner || entry.action != action);
+        }
+        self.undo.retain(|entries| !entries.is_empty());
     }
 
     pub fn remember_positions(&mut self, cx: &gpui::App) {
@@ -614,8 +632,11 @@ impl Edit {
         Ok((count, Some(action.id)))
     }
 
-    fn notice(&self, count: usize, undo: &str) -> Option<Toast> {
+    fn notice(&self, count: usize, accounts: usize, undo: &str) -> Option<Toast> {
         let text = match self {
+            Self::Remove(Removal::Archive) if accounts > 1 => {
+                format!("Archived {count} from {accounts} accounts")
+            }
             Self::Remove(Removal::Archive) if count == 1 => "Archived".into(),
             Self::Remove(Removal::Archive) => format!("Archived {count}"),
             Self::Remove(Removal::Delete) if count == 1 => "Moved to Trash".into(),
@@ -653,10 +674,10 @@ impl Edit {
 }
 
 #[derive(Clone)]
-struct UndoEntry {
-    account: AccountId,
-    action: i64,
-    owner: gpui::WeakEntity<Inbox>,
+pub(super) struct UndoEntry {
+    pub account: AccountId,
+    pub action: i64,
+    pub owner: gpui::WeakEntity<Inbox>,
 }
 
 fn by_account(ids: &[String]) -> Vec<(AccountId, Vec<ThreadId>)> {
@@ -708,30 +729,54 @@ impl Inbox {
         let Some(all) = &mut self.all_inboxes else {
             return;
         };
-        let mut groups = by_account(&self.session.action_targets()).into_iter();
-        let Some((account, _)) = groups.next() else {
-            return;
-        };
-        let Some(first) = all.owner(&account) else {
-            return;
-        };
-        let mut common = folder_options(first.read(cx));
-        for (account, _) in groups {
-            let choices = all
-                .owner(&account)
-                .map_or_else(Vec::new, |view| folder_options(view.read(cx)));
-            common.retain(|destination| choices.iter().any(|other| destination.matches(other)));
-        }
-        all.destinations.clear();
-        self.session.folders.clear();
-        for destination in common {
-            let name = destination.name().to_owned();
-            if let std::collections::hash_map::Entry::Vacant(entry) = all.destinations.entry(name) {
-                self.session.folders.push(entry.key().clone());
-                entry.insert(destination);
+        let groups = by_account(&self.session.action_targets());
+        let mut options: Vec<(Destination, Vec<String>)> = Vec::new();
+        for (account, _) in &groups {
+            let Some(owner) = all.owner(account) else {
+                continue;
+            };
+            let inbox = owner.read(cx);
+            let (name, _) =
+                super::account_header(&inbox.session.account_name, &inbox.session.account_email);
+            for destination in folder_options(inbox) {
+                if let Some((_, owners)) = options
+                    .iter_mut()
+                    .find(|(option, _)| destination.matches(option))
+                {
+                    owners.push(name.to_owned());
+                } else {
+                    options.push((destination, vec![name.to_owned()]));
+                }
             }
         }
-        if self.session.folders.is_empty() {
+        options.sort_by_key(|(_, owners)| owners.len() != groups.len());
+        all.destinations.clear();
+        let choices = &mut self.session.all_move_choices;
+        choices.clear();
+        for (destination, owners) in options {
+            let name = destination.name().to_owned();
+            if choices
+                .iter()
+                .any(|choice| choice.name.eq_ignore_ascii_case(&name))
+            {
+                continue;
+            }
+            let unavailable = owners.len() != groups.len();
+            let detail = unavailable.then(|| format!("only in {}", owners.join(", ")));
+            if !unavailable {
+                all.destinations.insert(name.clone(), destination);
+            }
+            choices.push(PickerChoice {
+                name: name.clone(),
+                title: name,
+                detail,
+                date: None,
+                mark: None,
+                divider: false,
+                unavailable,
+            });
+        }
+        if choices.is_empty() {
             self.session.dismiss_overlay();
             self.session
                 .show_toast("No shared destination folder", false);
@@ -778,9 +823,7 @@ impl Inbox {
             return;
         }
         let all = self.all_inboxes.as_mut().expect("merged inbox");
-        let serial = all.next;
-        all.next += 1;
-        all.pending.insert(serial, None);
+        let serial = all.begin_edit();
         let jobs: Vec<_> = groups
             .into_iter()
             .map(|(account, threads)| {
@@ -878,23 +921,12 @@ impl Inbox {
                         &inbox.session.keymap,
                         crate::keymap::Action::Undo,
                     );
-                    if let Some(toast) = edit.notice(count, &undo) {
+                    if let Some(toast) = edit.notice(count, entries.len(), &undo) {
                         inbox.session.set_toast(toast);
                         inbox.expire_action_notice(cx);
                     }
                 }
-                let all = inbox.all_inboxes.as_mut().expect("merged inbox");
-                all.pending.insert(serial, Some(entries));
-                while let Some((&next, Some(_))) = all.pending.first_key_value() {
-                    if let Some(Some(entries)) = all.pending.remove(&next)
-                        && !entries.is_empty()
-                    {
-                        all.undo.push(entries);
-                    }
-                }
-                if all.pending.is_empty() && std::mem::take(&mut all.undo_requested) {
-                    inbox.undo_all(cx);
-                }
+                inbox.finish_all_edit(serial, entries, cx);
                 inbox.request_threads(
                     ReadIntent {
                         changed: true,
@@ -1017,6 +1049,26 @@ impl Inbox {
         .detach();
     }
 
+    pub(super) fn finish_all_edit(
+        &mut self,
+        serial: u64,
+        entries: Vec<UndoEntry>,
+        cx: &mut Context<Self>,
+    ) {
+        let all = self.all_inboxes.as_mut().expect("merged inbox");
+        all.pending.insert(serial, Some(entries));
+        while let Some((&next, Some(_))) = all.pending.first_key_value() {
+            if let Some(Some(entries)) = all.pending.remove(&next)
+                && !entries.is_empty()
+            {
+                all.undo.push(entries);
+            }
+        }
+        if all.pending.is_empty() && std::mem::take(&mut all.undo_requested) {
+            self.undo_all(cx);
+        }
+    }
+
     pub(super) fn undo_all(&mut self, cx: &mut Context<Self>) {
         let all = self.all_inboxes.as_mut().expect("merged inbox");
         if !all.pending.is_empty() || self.undos_in_flight > 0 {
@@ -1028,6 +1080,7 @@ impl Inbox {
                 .show_toast("Nothing to undo in All inboxes", false);
             return;
         };
+        let undo_index = all.undo.len();
         self.undos_in_flight += 1;
         let jobs: Vec<_> = entries
             .into_iter()
@@ -1039,7 +1092,7 @@ impl Inbox {
                     let account = entry.account.clone();
                     let action = entry.action;
                     view.read(cx).store.call(move |store| {
-                        let (_, restored) = store.undo_notification(&account, action)?;
+                        let (undone, restored) = store.undo_notification(&account, action)?;
                         let key = store.folder_roles(&account).ok().and_then(|roles| {
                             let folder = roles.name(FolderRole::Inbox);
                             restored
@@ -1050,16 +1103,17 @@ impl Inbox {
                                 .min()
                                 .map(|key| owned_key(&account, key))
                         });
-                        Ok::<_, fell_core::Error>(key)
+                        Ok::<_, fell_core::Error>((undone.kind, key))
                     })
                 });
                 async move {
                     let result = match reply {
-                        Some(reply) => reply
-                            .await
-                            .map_err(|_| "A mailbox store stopped".to_string())
-                            .and_then(|result| result.map_err(|err| err.to_string())),
-                        None => Err("An account was reopened or removed".into()),
+                        Some(reply) => reply.await.unwrap_or_else(|_| {
+                            Err(fell_core::Error::Action("A mailbox store stopped".into()))
+                        }),
+                        None => Err(fell_core::Error::Action(
+                            "An account was reopened or removed".into(),
+                        )),
                     };
                     (entry, result)
                 }
@@ -1072,39 +1126,46 @@ impl Inbox {
                 let mut restored = None;
                 let mut failure = None;
                 let mut remaining = Vec::new();
-                let mut success = false;
+                let mut notice = None;
                 for (entry, result) in results {
                     match result {
-                        Ok(key) => {
-                            success = true;
+                        Ok((kind, key)) => {
+                            let text = super::undo_notice(kind, false);
+                            notice = Some(if notice.is_none_or(|previous| previous == text) {
+                                text
+                            } else {
+                                "Undone"
+                            });
                             restored = restored.into_iter().chain(key).min();
                             if let Some(owner) = entry.owner.upgrade() {
                                 refresh_owner(&owner, cx);
                             }
                         }
+                        Err(fell_core::Error::Action(ref text)) if text == "nothing to undo" => {}
                         Err(error) => {
-                            if error == "A newer mailbox action is available to undo" {
-                                remaining.push(entry);
-                            }
-                            failure.get_or_insert(error);
+                            remaining.push(entry);
+                            failure.get_or_insert(error.to_string());
                         }
                     }
                 }
                 let all = inbox.all_inboxes.as_mut().expect("merged inbox");
                 if !remaining.is_empty() {
-                    all.undo.push(remaining);
+                    all.undo.insert(undo_index.min(all.undo.len()), remaining);
                 }
                 let again = std::mem::take(&mut all.undo_requested);
                 let failed = failure.is_some();
                 if let Some(error) = failure {
-                    let text = if success {
+                    let text = if notice.is_some() {
                         format!("Undid part of the change · {error}")
                     } else {
                         format!("Couldn't undo · {error}")
                     };
                     inbox.session.show_toast(text, true);
                 } else {
-                    inbox.session.show_toast("Undone", false);
+                    inbox
+                        .session
+                        .show_toast(notice.unwrap_or("Nothing to undo in All inboxes"), false);
+                    inbox.expire_action_notice(cx);
                 }
                 inbox.request_threads(
                     ReadIntent {

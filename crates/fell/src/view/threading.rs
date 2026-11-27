@@ -148,6 +148,7 @@ impl Inbox {
                                 date: Some(present::relative_date(now_unix(), row.date_unix)),
                                 mark: None,
                                 divider: false,
+                                unavailable: false,
                             })
                             .collect();
                         let step = session.confirm_pending_merge();

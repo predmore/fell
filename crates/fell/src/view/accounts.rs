@@ -9,8 +9,8 @@ use fell_core::compose::AccountDraftRemoval;
 use futures::{FutureExt as _, StreamExt as _, channel::oneshot, future::Shared};
 use gpui::{App, Context, Entity, IntoElement, Render, Window, div, prelude::*, rgb};
 
-use super::all_inboxes::{AllInboxes, TITLE};
-use super::{Action, ReadIntent};
+use super::all_inboxes::{AllInboxes, TITLE, UndoEntry};
+use super::{Action, QueryFault, ReadIntent, present};
 use super::{
     DRAFT_MAILBOX_UNAVAILABLE, ExternalCompose, FontOpt, Inbox, InboxWindow, Onboarding, mailbox,
 };
@@ -30,6 +30,7 @@ pub(super) fn held_changes_label(count: usize) -> String {
 pub(super) struct AccountWindow {
     active: Entity<Inbox>,
     all_inboxes: Option<Entity<Inbox>>,
+    pending_all_inboxes: Option<bool>,
     active_id: Option<String>,
     views: HashMap<String, Entity<Inbox>>,
     stopping: HashSet<String>,
@@ -98,6 +99,7 @@ impl AccountWindow {
         let mut view = Self {
             active,
             all_inboxes: None,
+            pending_all_inboxes: None,
             active_id,
             views,
             stopping: HashSet::new(),
@@ -362,10 +364,18 @@ impl AccountWindow {
                 !self.stopping.contains(*id) || !accounts.configs().any(|config| config.id == *id)
             })
             .map(|id| {
-                (
-                    id.to_owned(),
-                    self.active.read(cx).session.account_name.clone(),
-                )
+                let name = self
+                    .active
+                    .read(cx)
+                    .all_inboxes
+                    .as_ref()
+                    .and_then(|all| all.members.get(id))
+                    .unwrap_or(&self.active)
+                    .read(cx)
+                    .session
+                    .account_name
+                    .clone();
+                (id.to_owned(), name)
             });
         let mut switched = false;
         if self.active_id.is_none() || removed.is_some() || replacement.is_some() {
@@ -394,8 +404,25 @@ impl AccountWindow {
                     .filter(|config| usable(config))
                     .or_else(|| accounts.configs().find(|config| usable(config)))
             };
+            let keep_merged = removed.is_some()
+                && replacement.is_none()
+                && self.all_inboxes_active()
+                && accounts.configs().count() >= 2;
+            let next = next.or_else(|| {
+                if keep_merged {
+                    accounts
+                        .configs()
+                        .find(|config| self.views.contains_key(&config.id))
+                } else {
+                    None
+                }
+            });
             if let Some(next) = next {
-                self.switch(&next.id, window, cx);
+                if keep_merged {
+                    self.active_id = Some(next.id.clone());
+                } else {
+                    self.switch(&next.id, window, cx);
+                }
                 switched = true;
                 if let Some(replacement) = &replacement {
                     self.notice(
@@ -430,8 +457,10 @@ impl AccountWindow {
                     .is_some_and(|stem| stem == id.as_str())
             })
         {
-            let next = &self.active.read(cx).session.account_name;
-            let message = if self.active_id.is_some() {
+            let message = if self.all_inboxes_active() {
+                format!("Removed {name}")
+            } else if self.active_id.is_some() {
+                let next = &self.active.read(cx).session.account_name;
                 format!("Removed {name} · showing {next}")
             } else {
                 format!("Removed {name}")
@@ -455,6 +484,9 @@ impl AccountWindow {
         }
 
         self.catalog = accounts;
+        if self.catalog.configs().count() < 2 {
+            self.pending_all_inboxes = None;
+        }
         if self.all_inboxes_active()
             && self.catalog.configs().count() < 2
             && let Some(id) = self.active_id.clone()
@@ -465,13 +497,16 @@ impl AccountWindow {
         if let Some(all) = &self.all_inboxes {
             let active = all == &self.active;
             all.update(cx, |inbox, cx| {
-                let members = &mut inbox.all_inboxes.as_mut().expect("merged inbox").members;
-                if *members != self.views {
-                    members.clone_from(&self.views);
+                let all = inbox.all_inboxes.as_mut().expect("merged inbox");
+                if let Some(id) = &self.active_id {
+                    all.previous.clone_from(id);
+                }
+                if all.members != self.views {
+                    all.members.clone_from(&self.views);
                     inbox.read_gen += 1;
                     inbox.read_in_flight = false;
                     inbox.refresh_in_flight = false;
-                    if active {
+                    if active || self.pending_all_inboxes.is_some() {
                         inbox.request_threads(
                             ReadIntent {
                                 refresh_open: true,
@@ -905,6 +940,7 @@ impl AccountWindow {
                                 && self.active_id.as_ref() == Some(&config.id))
                             .then_some("✓"),
                             divider: false,
+                            unavailable: false,
                         }
                     })
                     .collect();
@@ -916,6 +952,7 @@ impl AccountWindow {
                         date: None,
                         mark: self.all_inboxes_active().then_some("✓"),
                         divider: false,
+                        unavailable: false,
                     });
                 }
                 inbox.session.account_config_error = error.map(str::to_owned);
@@ -937,7 +974,11 @@ impl AccountWindow {
         self.all_inboxes.as_ref() == Some(&self.active)
     }
 
-    fn all_inboxes_view(&mut self, cx: &mut Context<Self>) -> Option<Entity<Inbox>> {
+    fn all_inboxes_view(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<Inbox>> {
         if self.catalog.configs().count() < 2 {
             return None;
         }
@@ -954,12 +995,17 @@ impl AccountWindow {
                 path: Err(DRAFT_MAILBOX_UNAVAILABLE.into()),
             };
             let store = source.store.clone();
-            cx.new(|cx| {
+            let view = cx.new(|cx| {
                 let mut inbox = Inbox::with_store(startup, false, None, Some(store), cx);
                 inbox.session.all_inboxes = true;
                 inbox.all_inboxes = Some(AllInboxes::new(previous.clone(), self.views.clone()));
                 inbox
+            });
+            cx.observe_in(&view, window, |root, merged, window, cx| {
+                root.finish_all_inboxes_entry(merged, window, cx);
             })
+            .detach();
+            view
         });
         view.update(cx, |inbox, cx| {
             let all = inbox.all_inboxes.as_mut().expect("merged inbox");
@@ -967,8 +1013,15 @@ impl AccountWindow {
             all.members.clone_from(&self.views);
             all.remember_positions(cx);
             inbox.bind_all_reader(cx);
+            let first_page =
+                inbox.session.loading || inbox.session.error_fault == Some(QueryFault::Folder);
+            if first_page {
+                inbox.session.loading = true;
+                inbox.session.clear_query_fault(QueryFault::Folder);
+            }
             inbox.request_threads(
                 ReadIntent {
+                    switch: first_page,
                     refresh_open: true,
                     ..ReadIntent::default()
                 },
@@ -976,6 +1029,39 @@ impl AccountWindow {
             );
         });
         Some(view.clone())
+    }
+
+    fn finish_all_inboxes_entry(
+        &mut self,
+        merged: Entity<Inbox>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(confirmed_with_enter) = self.pending_all_inboxes else {
+            return;
+        };
+        let inbox = merged.read(cx);
+        if inbox.session.loading {
+            return;
+        }
+        if inbox.session.error_fault == Some(QueryFault::Folder) {
+            let error = format!(
+                "Couldn't read All inboxes · {}",
+                inbox.session.error.as_deref().unwrap_or_default()
+            );
+            self.pending_all_inboxes = None;
+            self.notice(error, true, cx);
+            return;
+        }
+        let width = f32::from(window.viewport_size().width);
+        if present::visible_panes(width, inbox.session.pane, inbox.session.full_width).1
+            && inbox.open_thread != inbox.session.cursor_id
+            && inbox.session.error_fault != Some(QueryFault::Message)
+        {
+            return;
+        }
+        self.pending_all_inboxes = None;
+        self.activate(ALL_INBOXES, merged, confirmed_with_enter, window, cx);
     }
 
     pub fn switch(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -989,6 +1075,9 @@ impl AccountWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.pending_all_inboxes.take().is_some() && id == TOGGLE_ALL_INBOXES {
+            return;
+        }
         let previous = (id == TOGGLE_ALL_INBOXES && self.all_inboxes_active())
             .then(|| self.active_id.clone())
             .flatten();
@@ -1001,73 +1090,156 @@ impl AccountWindow {
             if self.all_inboxes_active() {
                 return;
             }
-            self.all_inboxes_view(cx)
+            let Some(next) = self.all_inboxes_view(window, cx) else {
+                return;
+            };
+            self.pending_all_inboxes = Some(confirmed_with_enter);
+            self.finish_all_inboxes_entry(next, window, cx);
+            return;
         } else {
             self.views.get(id).cloned()
         };
         if let Some(next) = next.filter(|next| *next != self.active) {
-            let restore = self
-                .active
-                .read(cx)
-                .all_inboxes
-                .as_ref()
-                .and_then(|all| all.positions.get(id).cloned());
-            let frames = self.active.read(cx).frames.clone();
-            let account_text = &self.active.read(cx).session;
-            let header_leaving = if account_text.all_inboxes {
-                (TITLE.into(), String::new())
-            } else {
-                (
-                    account_text.account_name.clone(),
-                    account_text.account_email.clone(),
-                )
-            };
-            let outgoing = self.active.clone();
-            self.picker_clock.idle();
-            let fade_now = self.picker_clock.now();
-            self.picker_exit = outgoing.update(cx, |inbox, _| {
-                let now = inbox.motion.clock.now();
-                let layer = inbox.motion.settle_account_switch(&inbox.session, now);
-                let settings = (inbox.session.overlay == Overlay::Settings)
-                    .then(|| inbox.settings_view.freeze_accounts());
-                inbox.session.cancel_read_delay();
-                if inbox.session.overlay != Overlay::None {
-                    inbox.session.dismiss_overlay();
-                }
-                inbox.window_active = false;
-                if let Some(queue) = &inbox.notifications {
-                    queue.set_viewing(false);
-                }
-                let fade = inbox.motion.motion.start(motion::FADE, fade_now);
-                layer.zip(fade).map(|((layer, height), fade)| PickerExit {
-                    outgoing: outgoing.clone(),
-                    layer,
-                    height,
-                    fade,
-                    settings,
-                })
-            });
-            self.active = next;
-            if id != ALL_INBOXES {
-                self.active_id = Some(id.to_owned());
+            self.activate(id, next, confirmed_with_enter, window, cx);
+        }
+    }
+
+    fn activate(
+        &mut self,
+        id: &str,
+        next: Entity<Inbox>,
+        confirmed_with_enter: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let restore = self
+            .active
+            .read(cx)
+            .all_inboxes
+            .as_ref()
+            .and_then(|all| all.positions.get(id).cloned());
+        let frames = self.active.read(cx).frames.clone();
+        let account_text = &self.active.read(cx).session;
+        let header_leaving = (!account_text.all_inboxes && id != ALL_INBOXES).then(|| {
+            (
+                account_text.account_name.clone(),
+                account_text.account_email.clone(),
+            )
+        });
+        let outgoing = self.active.clone();
+        self.picker_clock.idle();
+        let fade_now = self.picker_clock.now();
+        self.picker_exit = outgoing.update(cx, |inbox, _| {
+            let now = inbox.motion.clock.now();
+            let layer = inbox.motion.settle_account_switch(&inbox.session, now);
+            let settings = (inbox.session.overlay == Overlay::Settings)
+                .then(|| inbox.settings_view.freeze_accounts());
+            inbox.session.cancel_read_delay();
+            if inbox.session.overlay != Overlay::None {
+                inbox.session.dismiss_overlay();
             }
-            self.signal_active_changed();
-            self.active.update(cx, |inbox, cx| {
-                inbox.frames = frames;
-                if let Some(position) = restore {
-                    inbox.restore_account_position(position, cx);
-                }
-                inbox.notification_window_activation(window, cx);
-                let now = Instant::now();
-                inbox.switch_enter_guard =
-                    confirmed_with_enter.then(|| super::AccountSwitchEnterGuard::new(now));
-                inbox.account_header_leaving = Some(header_leaving);
-                inbox.start_account_arrival(now);
+            inbox.window_active = false;
+            if let Some(queue) = &inbox.notifications {
+                queue.set_viewing(false);
+            }
+            let fade = inbox.motion.motion.start(motion::FADE, fade_now);
+            layer.zip(fade).map(|((layer, height), fade)| PickerExit {
+                outgoing: outgoing.clone(),
+                layer,
+                height,
+                fade,
+                settings,
+            })
+        });
+        self.active = next;
+        if id != ALL_INBOXES {
+            self.active_id = Some(id.to_owned());
+        }
+        self.signal_active_changed();
+        self.active.update(cx, |inbox, cx| {
+            inbox.frames = frames;
+            if let Some(position) = restore {
+                inbox.restore_account_position(position, cx);
+            }
+            inbox.notification_window_activation(window, cx);
+            let now = Instant::now();
+            inbox.switch_enter_guard =
+                confirmed_with_enter.then(|| super::AccountSwitchEnterGuard::new(now));
+            inbox.account_header_leaving = header_leaving;
+            inbox.start_account_arrival(now);
+            cx.notify();
+        });
+        self.focus(window, cx);
+        self.update_choices(true, cx);
+        cx.notify();
+    }
+
+    pub(super) fn begin_notification_edit(
+        &self,
+        account: &fell_core::AccountId,
+        owner: &Entity<Inbox>,
+        cx: &mut App,
+    ) -> Option<u64> {
+        (self.all_inboxes_active() && self.views.get(account.as_str()) == Some(owner)).then(|| {
+            self.active.update(cx, |inbox, _| {
+                inbox
+                    .all_inboxes
+                    .as_mut()
+                    .expect("merged inbox")
+                    .begin_edit()
+            })
+        })
+    }
+
+    pub(super) fn forget_notification_undo(
+        &self,
+        owner: &gpui::WeakEntity<Inbox>,
+        action: i64,
+        cx: &mut App,
+    ) {
+        if let Some(merged) = &self.all_inboxes {
+            merged.update(cx, |inbox, _| {
+                inbox
+                    .all_inboxes
+                    .as_mut()
+                    .expect("merged inbox")
+                    .forget_edit(owner, action);
+            });
+        }
+    }
+
+    pub(super) fn finish_notification_edit(
+        &self,
+        account: fell_core::AccountId,
+        owner: &Entity<Inbox>,
+        pending: Option<u64>,
+        committed: Option<(i64, &str)>,
+        cx: &mut App,
+    ) {
+        let commit = committed.filter(|_| {
+            self.all_inboxes_active() && self.views.get(account.as_str()) == Some(owner)
+        });
+        if let Some(merged) = &self.all_inboxes
+            && (pending.is_some() || commit.is_some())
+        {
+            merged.update(cx, |inbox, cx| {
+                let all = inbox.all_inboxes.as_mut().expect("merged inbox");
+                let serial = pending.unwrap_or_else(|| all.begin_edit());
+                let entries = commit.map_or_else(Vec::new, |(action, title)| {
+                    let undo = crate::keymap::binding_text(&inbox.session.keymap, Action::Undo);
+                    inbox
+                        .session
+                        .set_toast(crate::model::Toast::with_hint(title, undo, ""));
+                    inbox.expire_action_notice(cx);
+                    vec![UndoEntry {
+                        account,
+                        action,
+                        owner: owner.downgrade(),
+                    }]
+                });
+                inbox.finish_all_edit(serial, entries, cx);
                 cx.notify();
             });
-            self.focus(window, cx);
-            self.update_choices(true, cx);
-            cx.notify();
         }
     }
 
@@ -1277,6 +1449,56 @@ mod tests {
             "email = '{id}@example.test'\npassword = 'fixture'\nport = 1\nnotifications = 'off'\n{suffix}"
         )
         .unwrap();
+    }
+
+    fn all_inboxes_fixture(
+        app: &mut TestAppContext,
+        ids: &[&str],
+    ) -> (
+        Registry,
+        gpui::WindowHandle<AccountWindow>,
+        HashMap<String, super::super::StoreClient>,
+    ) {
+        let registry = Registry::resolve().unwrap();
+        std::fs::create_dir_all(registry.directory()).unwrap();
+        for id in ids {
+            write_account(&registry, id, &format!("name = '{id}'"));
+        }
+        let window = app.add_window(|window, cx| {
+            AccountWindow::new(mailbox::startup(), false, None, window, cx)
+        });
+        let stores: HashMap<_, _> = window
+            .update(app, |view, _, cx| {
+                view.views
+                    .iter()
+                    .map(|(id, view)| (id.clone(), view.read(cx).store.clone()))
+                    .collect()
+            })
+            .unwrap();
+        for config in registry.load().configs() {
+            let account = config.account();
+            futures::executor::block_on(stores[&config.id].call(move |store| {
+                crate::fixtures::seed_if_empty(store, &account).unwrap();
+            }))
+            .unwrap();
+        }
+        settle_inbox_reads(app, &stores);
+        (registry, window, stores)
+    }
+
+    fn settle_inbox_reads(
+        app: &mut TestAppContext,
+        stores: &HashMap<String, super::super::StoreClient>,
+    ) {
+        // The list can queue a separate conversation read after it lands.
+        for _ in 0..2 {
+            app.run_until_parked();
+            for store in stores.values() {
+                futures::executor::block_on(store.call(|_| ())).unwrap();
+                futures::executor::block_on(store.call_background(|_| ())).unwrap();
+            }
+        }
+        app.run_until_parked();
     }
 
     #[test]
@@ -2038,32 +2260,21 @@ mod tests {
     }
 
     #[test]
-    fn all_inboxes_toggle_leaves_both_account_views_and_scroll_handles_intact() {
+    fn all_inboxes_waits_for_its_first_page_and_restores_each_account_view() {
         let Some(_temp) = fell_core::test_support::in_isolated_process() else {
             return;
         };
-        let registry = Registry::resolve().unwrap();
-        std::fs::create_dir_all(registry.directory()).unwrap();
-        write_account(&registry, "mail", "");
-        write_account(&registry, "work", "");
-
         let mut app = TestAppContext::single();
-        let window = app.add_window(|window, cx| {
-            AccountWindow::new(mailbox::startup(), false, None, window, cx)
+        let (_, window, stores) = all_inboxes_fixture(&mut app, &["mail", "work"]);
+
+        let (entered, wait) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let held = stores["work"].call(move |_| {
+            entered.send(()).unwrap();
+            blocked.recv().unwrap();
         });
-        let clients = window
-            .update(&mut app, |view, _, cx| {
-                view.views
-                    .values()
-                    .map(|view| view.read(cx).store.clone())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap();
-        for store in clients {
-            futures::executor::block_on(store.call(|_| ())).unwrap();
-        }
-        app.run_until_parked();
-        window
+        wait.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (personal, work, personal_scroll, work_scroll, merged) = window
             .update(&mut app, |view, window, cx| {
                 let prepare = |view: &Entity<Inbox>, folder: &str, position: f32, cx: &mut App| {
                     view.update(cx, |inbox, _| {
@@ -2079,10 +2290,25 @@ mod tests {
                 let work_scroll = prepare(&work, "Drafts", -240.0, cx);
                 assert!(personal.read(cx).session.discovers(Action::AllInboxes));
                 view.switch(ALL_INBOXES, window, cx);
-                let merged = view.active();
-                assert_ne!(merged, personal);
-                assert_ne!(merged, work);
-                assert!(merged.read(cx).session.all_inboxes);
+                let merged = view.all_inboxes.clone().unwrap();
+                assert_eq!(view.active(), personal);
+                assert!(merged.read(cx).session.loading);
+                (personal, work, personal_scroll, work_scroll, merged)
+            })
+            .unwrap();
+        app.run_until_parked();
+        window
+            .update(&mut app, |view, _, _| assert_eq!(view.active(), personal))
+            .unwrap();
+        release.send(()).unwrap();
+        futures::executor::block_on(held).unwrap();
+        settle_inbox_reads(&mut app, &stores);
+        window
+            .update(&mut app, |view, window, cx| {
+                assert_eq!(view.active(), merged);
+                let inbox = merged.read(cx);
+                assert!(inbox.session.all_inboxes);
+                assert!(!inbox.session.threads.is_empty());
                 view.switch(TOGGLE_ALL_INBOXES, window, cx);
                 assert_eq!(view.active(), personal);
                 let personal_state = personal.read(cx);
@@ -2096,9 +2322,13 @@ mod tests {
                     &personal_scroll.0
                 ));
                 assert_eq!(personal_state.list_offset(), -120.0);
-
                 view.switch("work", window, cx);
                 view.switch(ALL_INBOXES, window, cx);
+            })
+            .unwrap();
+        settle_inbox_reads(&mut app, &stores);
+        window
+            .update(&mut app, |view, window, cx| {
                 assert_eq!(view.active(), merged);
                 view.switch(TOGGLE_ALL_INBOXES, window, cx);
                 assert_eq!(view.active(), work);
@@ -2112,7 +2342,322 @@ mod tests {
                     &work_state.list_scroll.0,
                     &work_scroll.0
                 ));
-                assert_eq!(work_state.list_offset(), -240.0);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn removing_the_entry_account_keeps_all_inboxes_with_two_survivors() {
+        let Some(_temp) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let mut app = TestAppContext::single();
+        let (registry, window, stores) = all_inboxes_fixture(&mut app, &["mail", "studio", "work"]);
+        window
+            .update(&mut app, |view, window, cx| {
+                assert_eq!(view.active_id.as_deref(), Some("mail"));
+                view.switch(ALL_INBOXES, window, cx);
+            })
+            .unwrap();
+        settle_inbox_reads(&mut app, &stores);
+        registry
+            .remove(&mailbox::store_path().unwrap(), "mail", false)
+            .unwrap();
+        window
+            .update(&mut app, |view, window, cx| {
+                assert!(view.all_inboxes_active());
+                view.reconcile(&registry, registry.load(), None, window, cx);
+                assert!(view.all_inboxes_active());
+                assert_eq!(view.active_id.as_deref(), Some("studio"));
+                let merged = view.active.read(cx).all_inboxes.as_ref().unwrap();
+                assert_eq!(merged.previous, "studio");
+                assert_eq!(merged.members.len(), 2);
+                assert!(!merged.members.contains_key("mail"));
+                view.switch(TOGGLE_ALL_INBOXES, window, cx);
+                assert_eq!(view.active(), view.views["studio"]);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn notification_edits_are_the_next_undo_from_all_inboxes() {
+        use crate::notifications::{Action as Notification, Invoked, Receipt};
+        use fell_core::{AccountId, FolderRole};
+
+        let Some(_temp) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let mut app = TestAppContext::single();
+        let (_, window, stores) = all_inboxes_fixture(&mut app, &["mail", "work"]);
+        window
+            .update(&mut app, |view, window, cx| {
+                view.switch(ALL_INBOXES, window, cx)
+            })
+            .unwrap();
+        settle_inbox_reads(&mut app, &stores);
+
+        let account = AccountId("work".into());
+        let inbox_folder = FolderRole::Inbox.default_name();
+        let (row, message) = futures::executor::block_on(stores["work"].call({
+            let account = account.clone();
+            move |store| {
+                store
+                    .list_threads(&account)
+                    .unwrap()
+                    .into_iter()
+                    .find_map(|row| {
+                        store
+                            .thread_messages(&account, &row.thread_id)
+                            .unwrap()
+                            .into_iter()
+                            .find(|message| {
+                                message.unread
+                                    && message.folders.iter().any(|folder| folder == inbox_folder)
+                            })
+                            .map(|message| (row.thread_id, message.headers.message_id))
+                    })
+                    .unwrap()
+            }
+        }))
+        .unwrap();
+        let unread = || {
+            let account = account.clone();
+            let message = message.clone();
+            futures::executor::block_on(stores["work"].call(move |store| {
+                !store
+                    .unread_inbox_messages(&account, &[message])
+                    .unwrap()
+                    .is_empty()
+            }))
+            .unwrap()
+        };
+        let notify = |action, app: &mut TestAppContext| {
+            let owner = window
+                .update(app, |view, _, _| {
+                    assert!(view.all_inboxes_active());
+                    view.views["work"].clone()
+                })
+                .unwrap();
+            app.update(|cx| {
+                gpui::AnyWindowHandle::from(window)
+                    .update(cx, |_, window, cx| {
+                        owner.update(cx, |inbox, cx| {
+                            inbox.notification_action(
+                                Invoked {
+                                    action,
+                                    messages: vec![message.clone()],
+                                    subject: None,
+                                    token: None,
+                                    receipt: Receipt::fixture(),
+                                },
+                                window,
+                                cx,
+                            )
+                        });
+                    })
+                    .unwrap();
+            });
+        };
+        let undo = |app: &mut TestAppContext, text| {
+            window
+                .update(app, |view, _, cx| {
+                    view.active.update(cx, |inbox, cx| inbox.apply_undo(cx));
+                })
+                .unwrap();
+            settle_inbox_reads(app, &stores);
+            window
+                .update(app, |view, _, cx| {
+                    assert_eq!(
+                        view.active.read(cx).session.toast.as_ref().unwrap().text,
+                        text
+                    );
+                })
+                .unwrap();
+        };
+        window
+            .update(&mut app, |view, _, cx| {
+                let personal = view.views["mail"].read(cx);
+                let older = personal.session.threads.first().unwrap();
+                let id = super::super::all_inboxes::row_id(
+                    &personal.account_id,
+                    &fell_core::ThreadId(older.id.clone()),
+                );
+                view.active.update(cx, |inbox, cx| {
+                    inbox.all_removal(vec![id], super::super::Removal::Archive, cx)
+                });
+            })
+            .unwrap();
+        settle_inbox_reads(&mut app, &stores);
+        for (action, title) in [
+            (Notification::Archive, "Moved back"),
+            (Notification::Read, "Marked unread"),
+        ] {
+            notify(action, &mut app);
+            settle_inbox_reads(&mut app, &stores);
+            assert!(!unread());
+            let archived = futures::executor::block_on(stores["work"].call({
+                let account = account.clone();
+                let row = row.clone();
+                move |store| {
+                    store
+                        .folder_key_of(&account, inbox_folder, &row)
+                        .unwrap()
+                        .is_none()
+                }
+            }))
+            .unwrap();
+            assert_eq!(archived, matches!(action, Notification::Archive));
+            undo(&mut app, title);
+            assert!(unread());
+        }
+        undo(&mut app, "Moved back");
+        undo(&mut app, "Nothing to undo in All inboxes");
+    }
+
+    #[test]
+    fn mixed_undo_retries_the_store_that_stopped() {
+        use super::super::{Removal, StoreClient, all_inboxes::owner_and_thread};
+
+        let Some(_temp) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let mut app = TestAppContext::single();
+        let (_, window, stores) = all_inboxes_fixture(&mut app, &["mail", "work"]);
+        window
+            .update(&mut app, |view, window, cx| {
+                view.switch(ALL_INBOXES, window, cx)
+            })
+            .unwrap();
+        settle_inbox_reads(&mut app, &stores);
+        let ids = window
+            .update(&mut app, |view, _, cx| {
+                view.active.update(cx, |inbox, cx| {
+                    let ids: Vec<_> = ["mail", "work"]
+                        .into_iter()
+                        .map(|id| {
+                            inbox
+                                .session
+                                .threads
+                                .iter()
+                                .find(|row| owner_and_thread(&row.id).unwrap().0.as_str() == id)
+                                .unwrap()
+                                .id
+                                .clone()
+                        })
+                        .collect();
+                    inbox.all_removal(ids.clone(), Removal::Archive, cx);
+                    ids
+                })
+            })
+            .unwrap();
+        settle_inbox_reads(&mut app, &stores);
+        let (send, _events) = futures::channel::mpsc::unbounded();
+        let (stopped, ready) =
+            StoreClient::spawn(|| (fell_core::Store::open_in_memory().unwrap(), ()), send);
+        futures::executor::block_on(ready).unwrap();
+        stopped.stop().unwrap().join().unwrap();
+        let visible = |index: usize| {
+            let (account, thread) = owner_and_thread(&ids[index]).unwrap();
+            futures::executor::block_on(stores[account.as_str()].call(move |store| {
+                store
+                    .folder_key_of(&account, "INBOX", &thread)
+                    .unwrap()
+                    .is_some()
+            }))
+            .unwrap()
+        };
+        assert!(!visible(0) && !visible(1));
+        for (store, expected) in [
+            (
+                stopped,
+                "Undid part of the change · A mailbox store stopped",
+            ),
+            (stores["work"].clone(), "Moved back"),
+        ] {
+            window
+                .update(&mut app, |view, _, cx| {
+                    view.views["work"].update(cx, |inbox, _| inbox.store = store);
+                    view.active.update(cx, |inbox, cx| inbox.apply_undo(cx));
+                })
+                .unwrap();
+            settle_inbox_reads(&mut app, &stores);
+            window
+                .update(&mut app, |view, _, cx| {
+                    assert_eq!(
+                        view.active.read(cx).session.toast.as_ref().unwrap().text,
+                        expected
+                    );
+                })
+                .unwrap();
+            assert!(visible(0));
+            assert_eq!(visible(1), expected == "Moved back");
+        }
+    }
+
+    #[test]
+    fn all_inboxes_move_lists_unshared_folders_without_selecting_them() {
+        use crate::keymap::KeyId;
+
+        let Some(_temp) = fell_core::test_support::in_isolated_process() else {
+            return;
+        };
+        let mut app = TestAppContext::single();
+        let (_, window, stores) = all_inboxes_fixture(&mut app, &["mail", "work"]);
+        window
+            .update(&mut app, |view, window, cx| {
+                view.switch(ALL_INBOXES, window, cx)
+            })
+            .unwrap();
+        settle_inbox_reads(&mut app, &stores);
+        window
+            .update(&mut app, |view, _, cx| {
+                for (id, folder, shared) in [
+                    ("mail", "Receipts", "Shared"),
+                    ("work", "Clients", "shared"),
+                ] {
+                    view.views[id].update(cx, |inbox, _| {
+                        inbox.session.folders = vec![folder.into(), shared.into()]
+                    });
+                }
+                view.active.update(cx, |inbox, cx| {
+                    use super::super::all_inboxes::owner_and_thread;
+                    for account in ["mail", "work"] {
+                        let row = inbox
+                            .session
+                            .threads
+                            .iter()
+                            .find(|row| owner_and_thread(&row.id).unwrap().0.as_str() == account)
+                            .unwrap();
+                        inbox
+                            .session
+                            .picked
+                            .insert(row.id.clone(), row.subject.clone());
+                    }
+                    let before = inbox.before_step();
+                    let step = inbox.session.perform(Action::Move, 10);
+                    inbox.apply_step(step, before, cx);
+                    let choices = inbox.session.picker_choices();
+                    assert!(
+                        choices
+                            .iter()
+                            .any(|choice| choice.title == "Shared" && !choice.unavailable)
+                    );
+                    assert!(choices.iter().any(|choice| choice.title == "Receipts"
+                        && choice.unavailable
+                        && choice.detail.as_deref() == Some("only in mail")));
+                    inbox.session.on_key(KeyId::Up, 10);
+                    assert!(!choices[inbox.session.folder_index].unavailable);
+                    for key in "lient".chars() {
+                        inbox.session.on_key(KeyId::Char(key), 10);
+                    }
+                    let choices = inbox.session.picker_choices();
+                    assert_eq!(choices.len(), 1);
+                    assert_eq!(choices[0].title, "Clients");
+                    assert_eq!(choices[0].detail.as_deref(), Some("only in work"));
+                    assert!(inbox.session.confirm_folder().move_edit.is_none());
+                    assert_eq!(inbox.session.overlay, Overlay::Folders);
+                    assert_eq!(inbox.session.picked.len(), 2);
+                })
             })
             .unwrap();
     }

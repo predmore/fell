@@ -21,6 +21,21 @@ enum Edit {
 }
 
 impl Inbox {
+    pub(super) fn forget_notification_undo(&self, action: i64, cx: &mut Context<Self>) {
+        if let Some(window) = cx.try_global::<super::InboxWindow>().copied() {
+            let owner = cx.entity().downgrade();
+            cx.defer(move |cx| {
+                let _ = window.0.update(cx, |_, window, cx| {
+                    if let Some(root) = window.root::<super::accounts::AccountWindow>().flatten() {
+                        root.update(cx, |root, cx| {
+                            root.forget_notification_undo(&owner, action, cx)
+                        });
+                    }
+                });
+            });
+        }
+    }
+
     pub(super) fn track_inbox_visibility(&self, window: &Window) {
         let Some(queue) = &self.notifications else {
             return;
@@ -100,7 +115,7 @@ impl Inbox {
         .detach();
     }
 
-    fn notification_action(
+    pub(super) fn notification_action(
         &mut self,
         invoked: Invoked,
         window: &mut Window,
@@ -189,13 +204,33 @@ impl Inbox {
         }
 
         let archive = matches!(invoked.action, notifications::Action::Archive);
+        let root = window.root::<super::accounts::AccountWindow>().flatten();
+        let owner = cx.entity();
+        let pending = root.as_ref().and_then(|root| {
+            root.update(cx, |root, cx| {
+                root.begin_notification_edit(&account, &owner, cx)
+            })
+        });
+        let root = root.map(|root| root.downgrade());
         self.change_mailbox(
             move |store| edit_notification(store, &account, &folder, invoked.messages, archive),
-            move |inbox, result, _| {
+            move |inbox, result, cx| {
+                let title = if archive { "Archived" } else { "Marked read" };
+                if let Some(root) = root.and_then(|root| root.upgrade()) {
+                    let committed = match &result {
+                        Ok(Edit::Changed(action)) => Some((*action, title)),
+                        _ => None,
+                    };
+                    let account = inbox.account_id.clone();
+                    cx.defer(move |cx| {
+                        root.update(cx, |root, cx| {
+                            root.finish_notification_edit(account, &owner, pending, committed, cx);
+                        });
+                    });
+                }
                 let (title, undo, alert) = match result {
                     Ok(Edit::Changed(action_id)) => {
                         inbox.send_to_server();
-                        let title = if archive { "Archived" } else { "Marked read" };
                         let confirmation = Confirmation {
                             action_id,
                             subject: invoked.subject,
@@ -362,8 +397,15 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert!(store.undo_notification(&account, action_id - 1).is_err());
+        assert!(matches!(
+            store.undo_notification(&account, action_id - 1),
+            Err(fell_core::Error::Action(text)) if text == "A newer mailbox action is available to undo"
+        ));
         store.undo_notification(&account, action_id).unwrap();
+        assert!(matches!(
+            store.undo_notification(&account, action_id),
+            Err(fell_core::Error::Action(text)) if text == "nothing to undo"
+        ));
         assert_eq!(
             store
                 .unread_inbox_messages(&account, &[stale.clone(), current.clone()])

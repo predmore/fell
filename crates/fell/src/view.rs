@@ -2409,6 +2409,7 @@ impl Inbox {
                                         fading: None,
                                         ghost: true,
                                         bar_dx: 0.0,
+                                        date_slot: None,
                                         frame: still_frame(&chunk[index], window),
                                         previous_labels: None,
                                         label_scope: None,
@@ -4049,18 +4050,9 @@ impl Inbox {
                                 ..ReadIntent::default()
                             });
                         }
-                        let text = match action.kind {
-                            fell_core::ActionKind::SplitThread => "Split undone",
-                            fell_core::ActionKind::MergeThreads => "Merge undone",
-                            fell_core::ActionKind::Read => "Marked unread",
-                            fell_core::ActionKind::Unread => "Marked read",
-                            fell_core::ActionKind::Archive if notice.is_some() => {
-                                "Moved back to Inbox"
-                            }
-                            fell_core::ActionKind::Archive => "Moved back",
-                            _ => "Undone",
-                        };
+                        let text = undo_notice(action.kind, notice.is_some());
                         if let Some((receipt, _)) = notice {
+                            inbox.forget_notification_undo(action.id, cx);
                             inbox.notification_feedback(receipt, text.into(), None, false);
                         } else if let Some(notice) = note_notice {
                             inbox.session.show_toast(notice, false);
@@ -6570,12 +6562,13 @@ impl Render for Inbox {
                 link_preview,
                 recipient_popup,
                 account_opacity,
-                account_header_fade: self
-                    .account_arrival
-                    .zip(self.account_header_leaving.as_ref())
-                    .map(|(fade, (name, email))| {
-                        ((name.as_str(), email.as_str()), fade.progress(now))
-                    }),
+                account_header_fade: self.account_arrival.map(|fade| {
+                    let old = self
+                        .account_header_leaving
+                        .as_ref()
+                        .map(|(name, email)| (name.as_str(), email.as_str()));
+                    (old, fade.progress(now))
+                }),
             },
             width,
             (list_width, split_width),
@@ -6661,7 +6654,7 @@ struct Shown<'a> {
     link_preview: reader_links::PreviewFrame,
     recipient_popup: Option<gpui::Deferred>,
     account_opacity: f32,
-    account_header_fade: Option<((&'a str, &'a str), f32)>,
+    account_header_fade: Option<(Option<(&'a str, &'a str)>, f32)>,
 }
 
 struct LeavingReader {
@@ -7363,6 +7356,13 @@ fn account_header<'a>(name: &'a str, email: &'a str) -> (&'a str, Option<&'a str
     }
 }
 
+fn reader_account(name: &str, email: &str) -> String {
+    let (name, email) = account_header(name, email);
+    present::display_safe(
+        &email.map_or_else(|| name.to_owned(), |email| format!("{name} · {email}")),
+    )
+}
+
 fn useful_header_email(email: &str, fitted: &str) -> bool {
     if fitted == email {
         return true;
@@ -7444,7 +7444,7 @@ fn header(
     motion: &mut InboxMotion,
     now: Instant,
     (width, window): (f32, &Window),
-    account_fade: Option<((&str, &str), f32)>,
+    account_fade: Option<(Option<(&str, &str)>, f32)>,
 ) -> gpui::Div {
     const PAD: f32 = 16.;
     const FOLDER_GAP: f32 = 24.;
@@ -7610,12 +7610,16 @@ fn header(
             account,
             room - folder_width,
             COUNT_GAP,
-            width >= DETAIL_MIN_WIDTH,
+            width >= DETAIL_MIN_WIDTH || session.all_inboxes,
             &fit,
         )
     };
+    let owner = (session.all_inboxes
+        && present::visible_panes(width, session.pane, session.full_width).1
+        && !session.messages.is_empty())
+    .then(|| reader_account(&session.account_name, &session.account_email));
     let account_text = if session.all_inboxes {
-        (all_inboxes::TITLE, "")
+        (all_inboxes::TITLE, owner.as_deref().unwrap_or_default())
     } else {
         (
             session.account_name.as_str(),
@@ -7635,9 +7639,13 @@ fn header(
         (account, [1.; 2])
     };
     let (account_opacities, leaving_account) = match account_fade {
-        Some((old, shown)) if old != account_text => (
+        Some((Some(old), shown)) if old != account_text => (
             account_opacities.map(|value| value * shown),
             Some(fit_account(old, current_width).render(theme, COUNT_GAP, [1. - shown; 2])),
+        ),
+        Some((None, shown)) => (
+            account_opacities.map(|value| value * motion::lerp(motion::ARRIVE_FROM, 1.0, shown)),
+            None,
         ),
         _ => (account_opacities, None),
     };
@@ -7780,6 +7788,25 @@ fn thread_list(
                 }
                 let highlighted = inbox.session.highlighted();
                 let text_width = row_text_width(list_width);
+                let date_slot = inbox.session.all_inboxes.then(|| {
+                    let now = now_unix();
+                    let style = conversation_line_style(
+                        window,
+                        &theme_for_rows,
+                        px(theme_for_rows.ui_px - 1.),
+                    );
+                    inbox
+                        .session
+                        .threads
+                        .iter()
+                        .map(|row| thread_date(row, now))
+                        .collect::<HashSet<_>>()
+                        .iter()
+                        .map(|date| {
+                            line_px_with_style(window, &style, date, FontWeight::NORMAL).ceil()
+                        })
+                        .fold(0., f32::max)
+                });
                 let now = inbox.frame_now;
                 let offset = inbox.list_offset();
                 let viewport = inbox.list_viewport().unwrap_or(0.0);
@@ -7817,6 +7844,7 @@ fn thread_list(
                                 .filter(|_| !selected),
                             ghost: false,
                             bar_dx,
+                            date_slot,
                             frame,
                             previous_labels,
                             label_scope: inbox.session.list_label.clone(),
@@ -7871,6 +7899,7 @@ fn thread_list(
                                         fading: None,
                                         ghost: true,
                                         bar_dx,
+                                        date_slot,
                                         frame: still_frame(row, window),
                                         previous_labels: None,
                                         label_scope: inbox.session.list_label.clone(),
@@ -7924,7 +7953,7 @@ fn thread_list(
                                     &theme_for_rows,
                                     ghost,
                                     text_width,
-                                    (bar_dx, inbox.session.list_label.clone()),
+                                    (bar_dx, inbox.session.list_label.clone(), date_slot),
                                     batch,
                                     window,
                                     cx,
@@ -7940,6 +7969,7 @@ fn thread_list(
                                 fading: None,
                                 ghost: true,
                                 bar_dx,
+                                date_slot,
                                 frame: still_frame(previous, window),
                                 previous_labels: None,
                                 label_scope: inbox.session.list_label.clone(),
@@ -8170,7 +8200,7 @@ fn ghost_row(
     theme: &Theme,
     (ThreadGhost { row, selected }, top, opacity): (ThreadGhost, f32, f32),
     text_width: f32,
-    (bar_dx, label_scope): (f32, Option<String>),
+    (bar_dx, label_scope, date_slot): (f32, Option<String>, Option<f32>),
     batch: bool,
     window: &Window,
     cx: &mut Context<Inbox>,
@@ -8181,6 +8211,7 @@ fn ghost_row(
         fading: None,
         ghost: true,
         bar_dx,
+        date_slot,
         frame: still_frame(&row, window),
         previous_labels: None,
         label_scope,
@@ -8227,6 +8258,7 @@ struct RowLook {
     ghost: bool,
     /// How far right of its place the unread bar is drawn ([`unread_bar_dx`]).
     bar_dx: f32,
+    date_slot: Option<f32>,
     /// Its weight, star and subject box this frame.
     frame: RowFrame,
     previous_labels: Option<(Vec<String>, f32)>,
@@ -8342,6 +8374,13 @@ fn thread_row(
 const THREAD_LINE_GAP: f32 = 8.0;
 const THREAD_ATTACHMENT_MARK: &str = "⧉";
 
+fn thread_date(row: &ThreadRow, now: i64) -> String {
+    row.wake_at.map_or_else(
+        || present::relative_date(now, row.date_unix),
+        |wake_at| crate::model::snooze::wake_time(now, wake_at),
+    )
+}
+
 fn thread_line_one(
     theme: &Theme,
     row: &ThreadRow,
@@ -8357,14 +8396,12 @@ fn thread_line_one(
         theme.dimmed
     };
     let count = (row.message_count > 1).then(|| row.message_count.to_string());
-    let now = now_unix();
-    let date = row.wake_at.map_or_else(
-        || present::relative_date(now, row.date_unix),
-        |wake_at| crate::model::snooze::wake_time(now, wake_at),
-    );
+    let date = thread_date(row, now_unix());
     let size = theme.ui_px - 1.0;
     let style = conversation_line_style(window, theme, px(size));
-    let date_width = line_px_with_style(window, &style, &date, FontWeight::NORMAL).ceil();
+    let date_width = look
+        .date_slot
+        .unwrap_or_else(|| line_px_with_style(window, &style, &date, FontWeight::NORMAL).ceil());
     let count_width = count.as_deref().map_or(0.0, |count| {
         line_px_with_style(window, &style, count, FontWeight::NORMAL).ceil() + THREAD_LINE_GAP
     });
@@ -8509,9 +8546,15 @@ fn thread_line_one(
         .child(
             div()
                 .flex_none()
+                .when(look.date_slot.is_some(), |date| {
+                    date.w(px(date_width))
+                        .flex()
+                        .justify_end()
+                        .whitespace_nowrap()
+                })
                 .text_color(rgb(dim))
                 .text_size(px(size))
-                .child(date),
+                .child(div().flex_none().child(date)),
         )
 }
 
@@ -13619,7 +13662,9 @@ fn folder_picker(
                 .track_scroll(scroll)
                 .my(px(present::CARD_ROW_INSET_PX))
                 .children(
-                    ((labeling || merging || accounts) && choices.is_empty()).then(|| {
+                    ((labeling || merging || accounts || session.all_inboxes)
+                        && choices.is_empty())
+                    .then(|| {
                         div()
                             .h(px(PICKER_ROW_PX))
                             .flex_none()
@@ -13637,6 +13682,10 @@ fn folder_picker(
                                 }
                             } else if accounts {
                                 "No matching accounts"
+                            } else if session.all_inboxes
+                                && session.folder_intent == FolderIntent::Move
+                            {
+                                "No matching folders"
                             } else if session.folder_query.is_empty() {
                                 "No labels yet"
                             } else {
@@ -13645,6 +13694,12 @@ fn folder_picker(
                     }),
                 )
                 .children(choices.iter().enumerate().map(|(index, choice)| {
+                    let selected = !choice.unavailable && index == selected;
+                    let detail = choice.detail.as_deref().map(present::display_safe);
+                    let note_room = detail
+                        .as_deref()
+                        .filter(|_| choice.unavailable)
+                        .map(|text| measure(text).min(label_room * 0.58));
                     let label = present::display_safe(&choice.title);
                     let room = label_room
                         - if session.folder_intent == FolderIntent::Label || accounts {
@@ -13654,6 +13709,8 @@ fn folder_picker(
                         };
                     let room = if merging {
                         (room - date_width - 2.0 * GAP - measure("…")).max(0.0)
+                    } else if let Some(note_room) = note_room {
+                        (room - note_room - GAP).max(0.0)
                     } else {
                         room
                     };
@@ -13668,23 +13725,19 @@ fn folder_picker(
                             &line.text
                         })
                     };
-                    let detail = choice
-                        .detail
-                        .as_deref()
-                        .map(present::display_safe)
-                        .and_then(|name| {
-                            if !merging {
-                                return Some(name);
-                            }
-                            let used = label
-                                .as_ref()
-                                .map_or(0.0, |line| f32::from(line.width).ceil());
-                            let room = (label_room - date_width - 2.0 * GAP - used).max(0.0);
-                            clip_shaped(window, &style, &name, room, FontWeight::NORMAL, None)
-                                .filter(|line| f32::from(line.width).ceil() <= room)
-                                .map(|line| line.text.to_string())
-                        });
-                    let detail_color = if index == selected {
+                    let detail = detail.and_then(|name| {
+                        if !merging {
+                            return Some(name);
+                        }
+                        let used = label
+                            .as_ref()
+                            .map_or(0.0, |line| f32::from(line.width).ceil());
+                        let room = (label_room - date_width - 2.0 * GAP - used).max(0.0);
+                        clip_shaped(window, &style, &name, room, FontWeight::NORMAL, None)
+                            .filter(|line| f32::from(line.width).ceil() <= room)
+                            .map(|line| line.text.to_string())
+                    });
+                    let detail_color = if selected {
                         theme.on_selection_dim
                     } else {
                         theme.dimmed
@@ -13692,7 +13745,7 @@ fn folder_picker(
                     let detail_color = if accounts {
                         theme::account_detail_color(
                             detail_color,
-                            if index == selected {
+                            if selected {
                                 theme.selection
                             } else {
                                 theme.surface
@@ -13712,17 +13765,19 @@ fn folder_picker(
                         .when(merging && merge_feedback > 0., |row| {
                             row.opacity(motion::lerp(1., 0.6, merge_feedback))
                         })
-                        .bg(rgb(if index == selected {
+                        .bg(rgb(if selected {
                             theme.selection
                         } else {
                             theme.surface
                         }))
-                        .text_color(rgb(if index == selected {
+                        .text_color(rgb(if selected {
                             theme.on_selection
+                        } else if choice.unavailable {
+                            theme.dimmed
                         } else {
                             theme.foreground
                         }))
-                        .when(live, |row| {
+                        .when(live && !choice.unavailable, |row| {
                             row.on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |inbox, _, window, cx| {
@@ -13756,7 +13811,7 @@ fn folder_picker(
                                         } else {
                                             mark_opacity
                                         })
-                                        .text_color(rgb(if index == selected {
+                                        .text_color(rgb(if selected {
                                             theme.on_selection
                                         } else {
                                             theme.accent
@@ -13766,8 +13821,10 @@ fn folder_picker(
                             },
                         )
                         .children(label.map(|line| {
-                            let matched = folder_match(&line.text, &match_query);
-                            let (label_dim, match_color) = if index == selected {
+                            let matched = (!choice.unavailable)
+                                .then(|| folder_match(&line.text, &match_query))
+                                .flatten();
+                            let (label_dim, match_color) = if selected {
                                 theme.selected_picker_match
                             } else {
                                 theme.picker_match
@@ -13796,6 +13853,7 @@ fn folder_picker(
                                 .whitespace_nowrap()
                                 .text_ellipsis()
                                 .when(merging, |sender| sender.flex_none().mr(px(GAP)))
+                                .when_some(note_room, |note, width| note.ml_auto().max_w(px(width)))
                                 .text_color(rgb(detail_color))
                                 .child(name)
                         }))
@@ -13840,6 +13898,18 @@ fn restored_folder_key(
         .iter()
         .filter_map(|id| store.folder_key_of(account, folder, id).ok().flatten())
         .min()
+}
+
+fn undo_notice(kind: fell_core::ActionKind, from_notification: bool) -> &'static str {
+    match kind {
+        fell_core::ActionKind::SplitThread => "Split undone",
+        fell_core::ActionKind::MergeThreads => "Merge undone",
+        fell_core::ActionKind::Read => "Marked unread",
+        fell_core::ActionKind::Unread => "Marked read",
+        fell_core::ActionKind::Archive if from_notification => "Moved back to Inbox",
+        fell_core::ActionKind::Archive => "Moved back",
+        _ => "Undone",
+    }
 }
 
 /// How a triage action takes threads out of the current folder.

@@ -108,6 +108,17 @@ pub(crate) struct Receipt {
     mode_generation: u64,
 }
 
+#[cfg(test)]
+impl Receipt {
+    pub(crate) fn fixture() -> Self {
+        Self {
+            owner: ":1.1".into(),
+            id: 1,
+            mode_generation: 0,
+        }
+    }
+}
+
 enum Command {
     Committed(Instant, Vec<InboxArrival>),
     PassEnded,
