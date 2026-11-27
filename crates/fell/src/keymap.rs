@@ -61,6 +61,7 @@ pub enum Action {
     RetryAttachment,
     FolderPicker,
     AccountPicker,
+    AllInboxes,
     Label,
     LabelList,
     Search,
@@ -140,6 +141,7 @@ impl Action {
             Self::RetryAttachment => "Retry attachment action",
             Self::FolderPicker => "Choose folder",
             Self::AccountPicker => "Switch account",
+            Self::AllInboxes => "Toggle All inboxes",
             Self::Label => "Apply or remove label",
             Self::LabelList => "Go to label",
             Self::Search => "Search mail",
@@ -218,6 +220,7 @@ pub const ACTION_SECTIONS: &[(&str, &[Action])] = &[
             Action::Drafts,
             Action::FolderPicker,
             Action::AccountPicker,
+            Action::AllInboxes,
             Action::LabelList,
             Action::Snoozed,
             Action::Muted,
@@ -440,6 +443,7 @@ fn default_bindings() -> Vec<Binding> {
         Action::AccountPicker,
         None,
     );
+    bind(&[KeyId::Leader, KeyId::Char('I')], Action::AllInboxes, None);
     bind(&[KeyId::Char('l')], Action::Label, None);
     bind(
         &[KeyId::Char('g'), KeyId::Char('l')],

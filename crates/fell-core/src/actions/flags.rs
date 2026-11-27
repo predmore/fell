@@ -75,6 +75,34 @@ struct Row {
 }
 
 impl Store {
+    /// Whether all selected folder rows have the given flag, for a toggle
+    /// that spans several stores. Missing rows are ignored.
+    pub fn folder_selection_flags(
+        &self,
+        account: &AccountId,
+        threads: &[ThreadId],
+        folder: &str,
+        star: bool,
+    ) -> Result<(usize, bool)> {
+        self.read_snapshot(|| {
+            let mut found = 0;
+            let mut all_marked = true;
+            for thread in threads {
+                if self.folder_key_of(account, folder, thread)?.is_none() {
+                    continue;
+                }
+                found += 1;
+                let rows = load_flags(&self.conn, account, thread)?;
+                let marked = if star {
+                    rows.iter().any(|row| row.starred)
+                } else {
+                    rows.iter().any(|row| row.unread && in_folder(row, folder))
+                };
+                all_marked &= marked;
+            }
+            Ok((found, all_marked))
+        })
+    }
     /// Apply `change` to each of `threads`, as one undo entry.
     ///
     /// `folder` is the folder on screen; unread and star go on the latest

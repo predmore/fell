@@ -35,6 +35,10 @@ impl Inbox {
     }
 
     pub(super) fn apply_triage(&mut self, edit: TriageEdit, cx: &mut Context<Self>) {
+        if self.session.all_inboxes {
+            self.all_triage(edit, cx);
+            return;
+        }
         let key = self.selected_key();
         let account = self.account_id.clone();
         let ids = edit.ids;

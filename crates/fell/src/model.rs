@@ -186,6 +186,10 @@ pub enum Overlay {
     Settings,
 }
 
+/// Internal picker target, outside the configured account ID alphabet.
+pub(crate) const ALL_INBOXES: &str = "\0";
+pub(crate) const TOGGLE_ALL_INBOXES: &str = "\0toggle";
+
 /// What confirming the folder picker does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FolderIntent {
@@ -406,6 +410,7 @@ pub struct Step {
     pub action: Option<Action>,
     pub reload_threads: bool,
     pub switch_account: Option<String>,
+    pub single_account_action: Option<Action>,
     pub reload_messages: bool,
     pub arm_which: bool,
     /// Conversation pages, in viewport heights. Positive moves down.
@@ -569,6 +574,7 @@ pub struct Session {
     pub merge_sources: Vec<String>,
     pub merge_choices: Vec<PickerChoice>,
     pub account_choices: Vec<PickerChoice>,
+    pub all_inboxes: bool,
     pub merge_search: u64,
     pub merge_loading: bool,
     merge_confirm_pending: bool,
@@ -690,6 +696,7 @@ impl Session {
             merge_sources: Vec::new(),
             merge_choices: Vec::new(),
             account_choices: Vec::new(),
+            all_inboxes: false,
             merge_search: 0,
             merge_loading: false,
             merge_confirm_pending: false,
@@ -1090,6 +1097,15 @@ impl Session {
         match action {
             Action::Setting(row) => self.settings_nav.availability.shows(row),
             Action::AccountPicker => self.account_choices.len() > 1,
+            Action::AllInboxes => self
+                .account_choices
+                .iter()
+                .any(|choice| choice.name == ALL_INBOXES),
+            Action::ReopenReview | Action::SplitThread | Action::MergeThreads
+                if self.all_inboxes =>
+            {
+                false
+            }
             _ => true,
         }
     }
@@ -1115,7 +1131,11 @@ impl Session {
     }
 
     pub fn folder_choices(&self) -> Vec<String> {
-        let all = merge_folders(&self.roles, &self.folders);
+        let all = if self.all_inboxes {
+            self.folders.clone()
+        } else {
+            merge_folders(&self.roles, &self.folders)
+        };
         let query = self.folder_query.trim();
         let common_source = self.move_selection.as_ref().and_then(|selection| {
             let mut sources = selection.scopes.iter().map(|(_, folder)| folder);
@@ -2810,6 +2830,41 @@ impl Session {
     }
 
     fn run(&mut self, action: Action, page_rows: usize) -> Step {
+        if self.all_inboxes
+            && matches!(
+                action,
+                Action::SplitThread | Action::MergeThreads | Action::ReopenReview
+            )
+        {
+            self.show_toast("Switch to an account to use this action", false);
+            return Step::default();
+        }
+        if self.all_inboxes
+            && matches!(
+                action,
+                Action::Search
+                    | Action::FolderPicker
+                    | Action::Inbox
+                    | Action::Sent
+                    | Action::Drafts
+                    | Action::Snoozed
+                    | Action::Muted
+                    | Action::LabelList
+                    | Action::Agents
+                    | Action::AgentActivity
+                    | Action::ThreadsWithSuggestions
+                    | Action::Settings
+                    | Action::Setting(_)
+                    | Action::Notifications(_)
+            )
+        {
+            self.count.clear();
+            return Step {
+                action: Some(action),
+                single_account_action: Some(action),
+                ..Step::default()
+            };
+        }
         if self.overlay == Overlay::AgentActivity && self.activity.confirmation.is_none() {
             let activity = match action {
                 Action::UndoAgentActivity => self.activity.undo(),
@@ -3030,6 +3085,11 @@ impl Session {
                     step.triage = Some(snooze::TriageEdit { ids, kind });
                 }
             }
+            Action::AllInboxes if self.discovers(action) => {
+                self.count.clear();
+                step.switch_account = Some(TOGGLE_ALL_INBOXES.into());
+            }
+            Action::AllInboxes => {}
             Action::AccountPicker if self.account_choices.len() < 2 => {}
             Action::AccountPicker => {
                 self.count.clear();
@@ -4107,6 +4167,7 @@ mod tests {
 
     fn row(id: &str) -> ThreadRow {
         ThreadRow {
+            account_label: None,
             muted: false,
             wake_at: None,
             id: id.into(),
@@ -6449,6 +6510,7 @@ mod tests {
         let drafts: Vec<ThreadRow> = [("draft-old", 1), ("draft-new", 2_000_000)]
             .into_iter()
             .map(|(id, date)| ThreadRow {
+                account_label: None,
                 muted: false,
                 wake_at: None,
                 draft: Some(id.into()),

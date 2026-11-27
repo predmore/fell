@@ -1189,6 +1189,19 @@ pub(super) fn folder_page(
     })
 }
 
+pub(super) fn folder_slice(
+    conn: &Connection,
+    account: &AccountId,
+    folder: &str,
+    (lower, upper): (Bound<&ListKey>, Bound<&ListKey>),
+    limit: usize,
+    from_end: bool,
+) -> Result<Vec<FolderThread>> {
+    in_one_snapshot(conn, || {
+        ListReader::new(conn, account, folder)?.rows(lower, upper, from_end, Some(limit))
+    })
+}
+
 /// Up to `limit` rows of `source` below `after` (from the top when `None`)
 /// that pass `filter`, using the source's list index.
 pub(super) fn thread_list(

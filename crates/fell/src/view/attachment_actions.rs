@@ -67,6 +67,10 @@ impl Inbox {
             };
             let _ = this.update(cx, |inbox, cx| {
                 inbox.attachment_busy = false;
+                if inbox.account_id != source.account {
+                    cx.notify();
+                    return;
+                }
                 match outcome {
                     Outcome::Launch(target, child) => {
                         inbox.attachment_succeeded(format!("Opened “{}”", target.name()), cx);
@@ -166,6 +170,7 @@ impl Inbox {
     // Some xdg-open implementations wait for the viewer to exit. Reap the
     // child without holding the download lane or blocking the window.
     fn watch_attachment_opener(&self, target: Target, mut child: Child, cx: &mut Context<Self>) {
+        let account = self.account_id.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -177,6 +182,9 @@ impl Inbox {
                 Err(err) => format!("xdg-open: {err}"),
             };
             let _ = this.update(cx, |inbox, cx| {
+                if inbox.account_id != account {
+                    return;
+                }
                 inbox.attachment_failed(
                     "Couldn't open attachment".into(),
                     detail,

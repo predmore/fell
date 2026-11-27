@@ -96,6 +96,17 @@ impl Store {
         threads: &[ThreadId],
         until: Option<i64>,
     ) -> Result<usize> {
+        self.set_thread_snoozes_with_action(account, threads, until)
+            .map(|(count, _)| count)
+    }
+
+    /// Return the undo entry created by this snooze edit, when it changed mail.
+    pub fn set_thread_snoozes_with_action(
+        &self,
+        account: &AccountId,
+        threads: &[ThreadId],
+        until: Option<i64>,
+    ) -> Result<(usize, Option<i64>)> {
         self.require_account(account)?;
         let tx = super::immediate_transaction(&self.conn)?;
         ensure_action_schema(&tx)?;
@@ -114,7 +125,9 @@ impl Store {
                 recorded.push(action.id);
             }
         }
-        if !recorded.is_empty() {
+        let action = if recorded.is_empty() {
+            None
+        } else {
             let action = insert_local_action(&tx, account, kind, summary)?;
             for id in &recorded {
                 tx.execute(
@@ -122,13 +135,24 @@ impl Store {
                     params![action.id, id],
                 )?;
             }
-        }
+            Some(action.id)
+        };
         tx.commit()?;
-        Ok(recorded.len())
+        Ok((recorded.len(), action))
     }
 
     /// Toggle the whole selection. A mixed selection is muted together.
     pub fn toggle_thread_mutes(&self, account: &AccountId, threads: &[ThreadId]) -> Result<bool> {
+        self.toggle_thread_mutes_with_action(account, threads)
+            .map(|(mute, _)| mute)
+    }
+
+    /// Return the undo entry created by this mute edit.
+    pub fn toggle_thread_mutes_with_action(
+        &self,
+        account: &AccountId,
+        threads: &[ThreadId],
+    ) -> Result<(bool, Option<i64>)> {
         self.require_account(account)?;
         let tx = super::immediate_transaction(&self.conn)?;
         ensure_action_schema(&tx)?;
@@ -150,7 +174,9 @@ impl Store {
         } else {
             (ActionKind::Unmute, "Unmuted")
         };
-        if !targets.is_empty() {
+        let action = if targets.is_empty() {
+            None
+        } else {
             let action = insert_local_action(&tx, account, kind, summary)?;
             for (thread, ids, was_muted) in targets {
                 if mute == was_muted {
@@ -166,9 +192,10 @@ impl Store {
                 }
                 dirty(&tx, account_key, thread.as_str())?;
             }
-        }
+            Some(action.id)
+        };
         tx.commit()?;
-        Ok(mute)
+        Ok((mute, action))
     }
 
     /// Clear every due snooze in bounded write transactions. Wall time
