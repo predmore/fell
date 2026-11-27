@@ -21,6 +21,7 @@ use crate::motion::{self, Motion, Transition};
 use crate::render::remote_images;
 use crate::render::webview::{self, RenderError, Snapshot, WebRequest};
 use crate::scroll_anchor::ScrollAnchor;
+use crate::settings::ReadingDefaults;
 
 const CACHE_SIZE: usize = 12;
 const THREAD_HOLD: Duration = Duration::from_millis(150);
@@ -39,6 +40,7 @@ const COMPACT_FAILURE_WIDTH: f32 = 480.;
 
 #[derive(Default)]
 pub(super) struct Reader {
+    pub reading: ReadingDefaults,
     pub trusted_delivery: bool,
     pub preferences: HashMap<String, (Option<bool>, bool)>,
     allowed_once: HashMap<String, (Option<String>, Weak<WebMail>)>,
@@ -523,6 +525,13 @@ pub(super) fn sender_address(address: &str) -> Option<String> {
 }
 
 impl Reader {
+    pub(super) fn new(reading: ReadingDefaults) -> Self {
+        Self {
+            reading,
+            ..Self::default()
+        }
+    }
+
     pub(super) fn open_thread(
         &mut self,
         messages: &[ConvMessage],
@@ -653,7 +662,7 @@ impl Reader {
                 || self
                     .known_sender(sender)
                     .0
-                    .unwrap_or(body.suggested == RenderMode::Web))
+                    .unwrap_or(self.reading.web_view_for_bulk && body.suggested == RenderMode::Web))
     }
 
     fn fitting_wide(&self, id: &str, body: &HtmlBody) -> bool {
@@ -1224,7 +1233,7 @@ impl Reader {
                 failure: cached.picture.as_ref().and(cached.image_failure.clone()),
             });
         }
-        has_images.then(|| {
+        (has_images && (key.images || self.reading.remote_image_prompt)).then(|| {
             if !key.images {
                 Prompt::Blocked { verified }
             } else if !web {
@@ -1706,6 +1715,79 @@ mod tests {
         inbox.session.pane = Pane::List;
         inbox.conv_layout_current = true;
         inbox.web_mail.trusted_delivery = true;
+    }
+
+    #[test]
+    fn web_view_default_applies_only_without_a_sender_choice() {
+        let html = "<table role='presentation'><tr><td><div style='display:flex'>News</div></td></tr></table>";
+        let bulk = crate::mail_body::prepare_html(html, &[("Precedence".into(), "bulk".into())]);
+        let personal = crate::mail_body::prepare_html(html, &[]);
+        let sender = "reader@example.test";
+        let mut reader = Reader::default();
+
+        assert!(reader.prefers_web("bulk", Some(sender), &bulk));
+        assert!(!reader.prefers_web("personal", Some(sender), &personal));
+        reader
+            .preferences
+            .insert(sender.into(), (Some(false), false));
+        assert!(!reader.prefers_web("bulk", Some(sender), &bulk));
+
+        reader.reading.web_view_for_bulk = false;
+        assert!(!reader.prefers_web("bulk", None, &bulk));
+        assert!(!reader.prefers_web("personal", None, &personal));
+        reader
+            .preferences
+            .insert(sender.into(), (Some(true), false));
+        assert!(reader.prefers_web("bulk", Some(sender), &bulk));
+        assert!(reader.prefers_web("personal", Some(sender), &personal));
+    }
+
+    #[test]
+    fn hiding_the_blocked_image_prompt_keeps_consent_rules() {
+        super::super::tests::with_pending_inbox(|inbox, _| {
+            split_view(inbox);
+            let reader = &mut inbox.web_mail;
+            let message = &inbox.session.messages[0];
+            let Rich::Html(body) = &message.rich else {
+                panic!("HTML fixture")
+            };
+            let key = |reader: &Reader| reader.key(message, body, &inbox.theme, 600, false);
+            assert!(!key(reader).images);
+            assert!(matches!(
+                reader.image_prompt(&key(reader), true, true, false),
+                Some(Prompt::Blocked { verified: true })
+            ));
+
+            reader.reading.remote_image_prompt = false;
+            assert!(!key(reader).images);
+            assert!(
+                reader
+                    .image_prompt(&key(reader), true, true, false)
+                    .is_none()
+            );
+
+            reader
+                .preferences
+                .insert(message.email.clone(), (None, true));
+            assert!(key(reader).images);
+            assert!(matches!(
+                reader.image_prompt(&key(reader), true, true, true),
+                Some(Prompt::AllowedSender)
+            ));
+            reader.trusted_delivery = false;
+            assert!(!key(reader).images);
+            reader.trusted_delivery = true;
+            reader
+                .preferences
+                .insert(message.email.clone(), (None, false));
+            assert!(!key(reader).images);
+
+            reader.allowed_once.insert(
+                message.id.clone(),
+                (Some(message.email.clone()), Arc::downgrade(&body.web)),
+            );
+            assert!(key(reader).images);
+        });
     }
 
     #[test]

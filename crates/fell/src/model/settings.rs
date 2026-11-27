@@ -44,7 +44,7 @@ impl Section {
         match self {
             Self::Accounts => "Mailbox and connection",
             Self::Appearance => "Theme, text size and motion",
-            Self::Reading => "When conversations are marked read",
+            Self::Reading => "Mark-read delay, web view and remote images",
             Self::Keymap => "Shortcuts and which-key",
             Self::Notifications => "Desktop alerts for new mail",
             Self::Search => "Local semantic search",
@@ -67,7 +67,7 @@ impl Section {
                 DiscardChanges,
             ],
             Self::Appearance => &[Value(Theme), Value(FontSize), Value(ReduceMotion)],
-            Self::Reading => &[Value(ReadDwell)],
+            Self::Reading => &[Value(ReadDwell), Value(WebViewDefault), Value(RemoteImages)],
             Self::Keymap => &[Value(WhichKey), EffectiveBindings, EditKeymap],
             Self::Notifications => &[Value(Notifications)],
             Self::Search => &[InstallModel, RemoveModel],
@@ -410,6 +410,25 @@ mod tests {
         session.on_key(KeyId::Char(','), 10);
         session.on_key(KeyId::Char(','), 10);
         assert_eq!(session.overlay, Overlay::Settings);
+    }
+
+    #[test]
+    fn reading_defaults_open_from_the_palette_and_cycle_as_settings() {
+        for (query, preference) in [
+            ("web view default", Preference::WebViewDefault),
+            ("remote images", Preference::RemoteImages),
+        ] {
+            let mut session = Session::new("", "", SyncKind::LocalOffline, Keymap::default());
+            session.on_key(KeyId::Char(':'), 10);
+            session.palette_query = format!("settings {query}");
+            session.on_key(KeyId::Enter, 10);
+            assert_eq!(session.settings_nav.page, Page::Section(Section::Reading));
+            assert_eq!(session.settings_nav.row(), Some(Row::Value(preference)));
+            assert_eq!(
+                session.on_key(KeyId::Char('l'), 10).settings,
+                Some(Request::Save(Edit::Cycle(preference, false)))
+            );
+        }
     }
 
     #[test]

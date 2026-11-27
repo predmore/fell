@@ -732,6 +732,7 @@ impl Inbox {
             }
         }
         self.session.read_dwell_ms = next.read_dwell_ms;
+        self.web_mail.reading = next.reading;
         if self.session.keymap.which_key_ms != next.which_key_ms {
             self.session.keymap.which_key_ms = next.which_key_ms;
             if !self.session.chord.is_empty() && !self.session.which_visible {
@@ -1475,6 +1476,12 @@ pub(super) fn card_height(nav: &nav::Nav, room: f32, narrow: bool) -> f32 {
                 .map(|row| match row {
                     Row::Account(_) => ACCOUNT_ROW_HEIGHT,
                     Row::EditAccount | Row::ImportIdentities => 45.,
+                    Row::Value(
+                        settings::Preference::WebViewDefault | settings::Preference::RemoteImages,
+                    ) => {
+                        // Both descriptions wrap with the usual Settings font.
+                        SECTION_ROW_HEIGHT + 10.
+                    }
                     Row::Value(_) if narrow && section == Section::Appearance => {
                         SECTION_ROW_HEIGHT + 5.
                     }
@@ -2608,6 +2615,8 @@ fn value_column_width(
         FontSize => &["System", "18 px"],
         ReduceMotion => &["Follow desktop", "On", "Off"],
         ReadDwell => &["Immediately", "10000 ms"],
+        WebViewDefault => &["Automatic", "Simple view"],
+        RemoteImages => &["Show prompt", "Hide prompt"],
         WhichKey => &["Immediately", "5000 ms"],
         Notifications => &["Sender + subject", "Private", "Off"],
     };
