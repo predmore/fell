@@ -882,7 +882,7 @@ pub fn config_dir() -> Option<PathBuf> {
     env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/fell"))
 }
 
-fn load_keymap() -> (Keymap, Option<String>) {
+pub(crate) fn load_keymap() -> (Keymap, Option<String>) {
     let Some(path) = config_dir().map(|dir| dir.join("keymap.toml")) else {
         return (Keymap::default(), None);
     };

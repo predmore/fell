@@ -321,6 +321,7 @@ struct RecipientError {
 }
 
 pub struct ComposeView {
+    keymap: crate::keymap::Keymap,
     hub: Arc<DraftHub>,
     draft_id: SharedString,
     folder: PathBuf,
@@ -485,6 +486,7 @@ impl ComposeView {
             quote_glide: None,
             focus: cx.focus_handle(),
             leader: false,
+            keymap: crate::keymap::Keymap::default(),
             leader_at: None,
             which_visible: false,
             palette: None,
@@ -731,6 +733,10 @@ impl ComposeView {
 
     /// Paint with this Omarchy theme, as the inbox does. The host calls it
     /// again when the theme changes. `:theme` switches to the built-ins.
+    pub(crate) fn set_keymap(&mut self, keymap: crate::keymap::Keymap) {
+        self.keymap = keymap;
+    }
+
     pub(crate) fn set_look(&mut self, theme: crate::theme::Theme) {
         self.theme = if theme.is_light() {
             ThemeKind::Light
@@ -1518,6 +1524,7 @@ impl ComposeView {
         self.identity_display.settle();
         let key = compose_key(&event.keystroke);
         let key = key.as_str();
+        let leader = crate::view::key_from(&event.keystroke) == Some(self.keymap.leader);
         if self.send_panel != SendPanel::Summary {
             self.send_panel_key(key, &event.keystroke.modifiers, cx);
             return;
@@ -1559,7 +1566,7 @@ impl ComposeView {
                 self.palette = Some(String::new());
             } else if self.leader {
                 self.leader_key(key, cx);
-            } else if key == " " && lock == SendLock::MaybeSent {
+            } else if leader && lock == SendLock::MaybeSent {
                 self.begin_leader();
             } else {
                 // Shown as the idle hint for this lock; the bar's right side
@@ -1634,6 +1641,7 @@ impl ComposeView {
                 self.bracket = None;
                 self.page_quote(key == "d");
             }
+            Mode::Normal if leader => self.begin_leader(),
             Mode::Normal => self.normal_key(key, typed),
             Mode::Visual => self.visual_key(key),
         }
@@ -1879,7 +1887,8 @@ impl ComposeView {
         self.leader = true;
         self.leader_at = Some(std::time::Instant::now());
         self.which_visible = false;
-        self.status = "space".into();
+        self.status =
+            crate::keymap::binding_key_label(crate::keymap::KeyId::Leader, &self.keymap).into();
     }
 
     fn header_matches(&self, snap: &Snapshot) -> bool {
@@ -2062,7 +2071,6 @@ impl ComposeView {
             return;
         }
         match key {
-            " " => self.begin_leader(),
             ":" => self.palette = Some(String::new()),
             "i" => {
                 self.editor.mode = Mode::Insert;
@@ -2529,6 +2537,7 @@ impl Render for ComposeView {
             .children(show_status.then(|| {
                 status_bar(
                     ComposeStatus {
+                        keymap: &self.keymap,
                         mode,
                         note: &hint,
                         notice_opacity,
@@ -2936,6 +2945,7 @@ impl ComposeView {
                 Paint {
                     links: Links::Target,
                     text_px: self.ui_px,
+                    list_gap: 0.,
                 },
                 colors,
             );
@@ -4130,6 +4140,7 @@ fn styled_body(
                         Paint {
                             links,
                             text_px: paint.text_px,
+                            list_gap: 0.,
                         },
                         paint.colors,
                     )
@@ -4371,6 +4382,7 @@ fn raw_source_block(
             Paint {
                 links,
                 text_px: paint.text_px,
+                list_gap: 0.,
             },
             colors,
         );
@@ -5375,6 +5387,7 @@ pub(crate) fn render_draft_doc(
     let paint = Paint {
         links: if agent { Links::Host } else { Links::Label },
         text_px: theme.ui_px,
+        list_gap: fell_render::READER_LIST_GAP,
     };
     render_doc(
         &safe_doc(doc),
@@ -5500,6 +5513,7 @@ enum Links {
 struct Paint {
     links: Links,
     text_px: f32,
+    list_gap: f32,
 }
 
 fn render_block(
@@ -5526,7 +5540,7 @@ fn render_block(
             None => div().child(render_inlines(inlines, links, colors)),
         },
         BlockBody::List { ordered, items } => {
-            let mut list = div().flex().flex_col();
+            let mut list = div().flex().flex_col().gap(px(paint.list_gap));
             for (index, item) in items.iter().enumerate() {
                 let marker = if *ordered {
                     format!("{}.", index + 1)
@@ -6192,6 +6206,7 @@ fn idle_status(status: &str) -> bool {
 }
 
 struct ComposeStatus<'a> {
+    keymap: &'a crate::keymap::Keymap,
     mode: &'a str,
     note: &'a str,
     notice_opacity: Option<f32>,
@@ -6202,7 +6217,7 @@ struct ComposeStatus<'a> {
 /// One line, in the inbox's style: mode and hints on the left, send on
 /// the right, `key action` pairs separated by ` · `, in the mono face.
 /// `measure` gives a text's width at a size, in the bar's face, so a long
-/// message is cut at a word with `…` and keeps 16px clear of the right.
+/// message is cut at a word with `…` and keeps 16px clear of the right group.
 type StatusMeasure<'a> = &'a dyn Fn(&str, f32) -> f32;
 
 fn status_bar(
@@ -6214,8 +6229,7 @@ fn status_bar(
     measure: StatusMeasure<'_>,
     (warning_font, measure_warning): (&str, StatusMeasure<'_>),
 ) -> gpui::Div {
-    let wide = width > 640.;
-    let size = if wide { 14. } else { 13. };
+    let wide = width >= crate::present::DRAFT_STATUS_WIDE;
     let fresh = snap
         .to
         .iter()
@@ -6224,6 +6238,7 @@ fn status_bar(
         .filter(|item| item.fresh)
         .count();
     let ComposeStatus {
+        keymap,
         mode,
         note,
         notice_opacity,
@@ -6232,6 +6247,8 @@ fn status_bar(
     } = status;
     let idle = idle_status(note);
     let saved = draft_save.filter(|_| idle);
+    let warning = saved.is_some_and(|(status, _)| status.warning().is_some());
+    let size = if wide || warning { 14. } else { 13. };
     // The header tags each first-time address; the count only fills an
     // idle bar, so it never crowds out a message or reads as a count of
     // edits. Narrow: short enough to sit beside the mode and send.
@@ -6244,12 +6261,10 @@ fn status_bar(
         1 => Some("1 first-time recipient".to_string()),
         count => Some(format!("{count} first-time recipients")),
     };
-    let right = if invalid_recipients
-        || (saved.is_some_and(|(status, _)| status.warning().is_some()) && !wide)
-    {
+    let right = if invalid_recipients || warning {
         Vec::new()
     } else {
-        status_right(snap, note, send_tried, wide)
+        status_right(snap, note, send_tried, wide, keymap)
     };
     let gap = 8.;
     let dot_px = measure("·", size);
@@ -6266,7 +6281,13 @@ fn status_bar(
     } else {
         measure(mode, size) + dot_px + 2. * gap
     };
-    let room = width - 32. - parts_px(&right) - 16. - mode_px - 4.;
+    let has_right = !right.is_empty();
+    let right_room = if has_right {
+        parts_px(&right) + 16.
+    } else {
+        0.
+    };
+    let room = width - 32. - right_room - mode_px - 4.;
     let (message, color, opacity) = match saved {
         Some((DraftSaveStatus::Local, alpha)) => ("saved", colors.dim, alpha),
         Some((DraftSaveStatus::Server, alpha)) => ("saved to Drafts", colors.dim, alpha),
@@ -6274,14 +6295,23 @@ fn status_bar(
         None if idle => ("", colors.fg, 1.),
         None => notice_opacity.map_or((note, colors.fg, 1.), |alpha| (note, colors.dim, alpha)),
     };
-    let warning = saved.is_some_and(|(status, _)| status.warning().is_some());
+    let message = crate::present::draft_status_text(message, width);
+    let message = if saved.is_some_and(|(status, _)| status == DraftSaveStatus::ServerFailed) {
+        format!(
+            "{message} · {} for log",
+            crate::keymap::binding_text(keymap, crate::keymap::Action::OpenDiagnosticLog)
+        )
+        .into()
+    } else {
+        message
+    };
     let message_measure = if warning { measure_warning } else { measure };
     const INVALID_PREFIX: &str = "invalid address ";
     let invalid = message
         .strip_prefix("invalid address `")
         .and_then(|s| s.strip_suffix('`'));
     let plain = invalid.map(|fragment| format!("{INVALID_PREFIX}{fragment}"));
-    let message = fit_words(plain.as_deref().unwrap_or(message), room, &|text| {
+    let message = fit_words(plain.as_deref().unwrap_or(&message), room, &|text| {
         message_measure(text, size)
     });
     let dot = || div().text_color(rgb(colors.dim)).child("·");
@@ -6362,7 +6392,7 @@ fn status_bar(
         .border_color(rgb(colors.rule))
         .text_size(px(size))
         .child(left)
-        .child(right_group)
+        .when(has_right, |bar| bar.child(right_group))
 }
 
 /// Which palette colour a status part takes.
@@ -6390,6 +6420,7 @@ fn status_right(
     status: &str,
     send_tried: bool,
     wide: bool,
+    keymap: &crate::keymap::Keymap,
 ) -> Vec<(String, Tone, bool)> {
     match shown_send_block(snap, send_tried) {
         // The message on the left already says why: one message at a time.
@@ -6423,7 +6454,8 @@ fn status_right(
             parts
         }
         None => {
-            let mut parts = vec![("space m s send".to_string(), Tone::Fg, false)];
+            let key = crate::keymap::binding_text(keymap, crate::keymap::Action::SendDraft);
+            let mut parts = vec![(format!("{key} send"), Tone::Fg, false)];
             if snap.unreviewed > 0 {
                 // Sending accepts these, so they stand out.
                 parts.push((
@@ -6649,6 +6681,7 @@ fn preview_panel(snap: &Snapshot, colors: Palette, text_px: f32) -> impl IntoEle
                 Paint {
                     links: Links::Target,
                     text_px,
+                    list_gap: 0.,
                 },
                 colors,
             )),
@@ -7258,7 +7291,7 @@ mod tests {
         let mut snap = super::empty_snapshot("d");
         snap.send_block = Some(SendLock::MaybeSent.reason().into());
         for wide in [true, false] {
-            assert!(super::status_right(&snap, "", false, wide).is_empty());
+            assert!(super::status_right(&snap, "", false, wide, &Default::default()).is_empty());
         }
     }
 
@@ -8677,7 +8710,9 @@ mod tests {
         let mut snap = super::empty_snapshot("d");
         snap.send_block = Some(super::SEND_UNAVAILABLE.into());
         for wide in [false, true] {
-            assert!(super::status_right(&snap, "insert", false, wide).is_empty());
+            assert!(
+                super::status_right(&snap, "insert", false, wide, &Default::default()).is_empty()
+            );
         }
     }
 

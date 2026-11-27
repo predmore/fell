@@ -78,6 +78,7 @@ pub enum SyncEvent {
         sent_append_delayed: bool,
         draft_append_delayed: bool,
         draft_append_recovered: bool,
+        draft_copy_placed: bool,
     },
     /// Parts were stored for mail that had none (the backfill after a
     /// pass). An open thread may have HTML to show now.
@@ -323,7 +324,8 @@ fn run(
                 || report.flag_recovery_delayed
                 || report.sent_append_delayed
                 || report.draft_append_delayed
-                || report.draft_append_recovered)
+                || report.draft_append_recovered
+                || report.draft_copy_placed)
                 && events
                     .unbounded_send(SyncEvent::WriteBackNotice {
                         dropped: report.dropped,
@@ -331,6 +333,7 @@ fn run(
                         sent_append_delayed: report.sent_append_delayed,
                         draft_append_delayed: report.draft_append_delayed,
                         draft_append_recovered: report.draft_append_recovered,
+                        draft_copy_placed: report.draft_copy_placed,
                     })
                     .is_err()
             {

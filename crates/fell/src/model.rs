@@ -735,11 +735,23 @@ impl Session {
     }
 
     pub fn status_notice(&self) -> Option<&Toast> {
+        static DRAFT_NOT_ON_SERVER: std::sync::LazyLock<Toast> =
+            std::sync::LazyLock::new(|| Toast {
+                text: "Draft not on server".into(),
+                alert: false,
+                hint: None,
+                details: false,
+                label: None,
+            });
         self.attachment_retry_notice
             .as_ref()
             .or(self.toast.as_ref())
             .or_else(|| self.search.as_ref()?.error.as_ref())
             .or(self.startup_crash_notice.as_ref())
+            .or_else(|| {
+                (self.in_drafts() && self.cursor_thread().is_some_and(|row| row.not_on_server))
+                    .then_some(&*DRAFT_NOT_ON_SERVER)
+            })
     }
 
     pub fn clear_toast(&mut self) {
@@ -3377,7 +3389,10 @@ impl Session {
                 self.overlay = Overlay::AgentActivity;
                 step.activity = Some(self.activity.open(filter));
             }
-            Action::AgentControl(_) | Action::UndoAgentRevoke | Action::UndoAgentActivity => {}
+            Action::AgentControl(_)
+            | Action::UndoAgentRevoke
+            | Action::UndoAgentActivity
+            | Action::SendDraft => {}
             Action::OpenDiagnosticLog | Action::OpenCrashReport => {
                 self.count.clear();
                 step.open_diagnostic = Some(match action {
@@ -4126,6 +4141,7 @@ mod tests {
             unread: false,
             draft: None,
             server_draft: None,
+            not_on_server: false,
         }
     }
 
@@ -6453,6 +6469,7 @@ mod tests {
                 wake_at: None,
                 draft: Some(id.into()),
                 server_draft: None,
+                not_on_server: false,
                 ..dated(id, date)
             })
             .collect();

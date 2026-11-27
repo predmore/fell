@@ -7,8 +7,7 @@ use crate::{Result, Store, diagnostic, outbox};
 
 pub(super) type Wake = Arc<dyn Fn() + Send + Sync>;
 
-pub const SERVER_DRAFT_SAVE_FAILED: &str =
-    "Not saved to the server · kept in Fell · edit to retry · Space ? l for details";
+pub const SERVER_DRAFT_SAVE_FAILED: &str = "Not saved to the server · kept in Fell · edit to retry";
 pub const SERVER_DRAFT_SAVE_RETRYING: &str = "Not saved to the server · kept in Fell · retrying";
 
 /// What the writer saved for one exact editor revision.

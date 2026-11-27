@@ -436,6 +436,8 @@ pub struct SyncedDraftPreview {
     pub recipients: Vec<Address>,
     pub subject: String,
     pub body: String,
+    /// Text from the native document when the draft cannot use the Markdown reader.
+    pub html_snippet: Option<String>,
 }
 
 /// One page of FTS hits. `next_cursor` is passed back to [`Store::search_page`].
@@ -2275,7 +2277,7 @@ impl Store {
         Ok(out)
     }
 
-    /// The latest draft in each listed thread, using the editable MIME body.
+    /// The latest draft in each listed thread, using the reader's body text.
     /// The Drafts list reads these off the UI thread. Other folders use their
     /// precomputed message snippets.
     pub fn synced_draft_previews(
@@ -2317,16 +2319,28 @@ impl Store {
                 let subject = crate::notes::display_safe(&row.get::<_, String>(3)?, false);
                 let id: String = row.get(5)?;
                 let fallback: Option<String> = row.get(4)?;
-                let body = self
-                    .editable_draft_body(account_id, &id, fallback.as_deref())?
-                    .unwrap_or_default();
+                let parts = bodies::read_body_text(&self.conn, account_id, &id)?;
+                let body = Self::editable_draft_text(parts.as_ref(), fallback.as_deref());
+                let html_snippet = if body.is_none() {
+                    parts
+                        .as_ref()
+                        .and_then(|parts| parts.html.as_deref())
+                        .map(|html| {
+                            crate::imap::rfc822::html_snippet_text(html)
+                                .map(|text| crate::imap::rfc822::cap_snippet(&text).to_owned())
+                                .unwrap_or_default()
+                        })
+                } else {
+                    None
+                };
                 out.insert(
                     thread.clone(),
                     SyncedDraftPreview {
                         source: row.get::<_, Option<String>>(6)?.map(RemoteId),
                         recipients,
                         subject,
-                        body,
+                        body: body.unwrap_or_default(),
+                        html_snippet,
                     },
                 );
                 break;
@@ -2335,7 +2349,7 @@ impl Store {
         Ok(out)
     }
 
-    /// Read the same editable body for a synced draft's list and reader.
+    /// Read a synced draft's editable body for the reader.
     /// Leave unsupported formatting to the native HTML reader.
     pub fn editable_draft_body(
         &self,
@@ -2343,20 +2357,30 @@ impl Store {
         message_id: &str,
         fallback: Option<&str>,
     ) -> Result<Option<String>> {
-        let Some(parts) = bodies::read_body_text(&self.conn, account, message_id)? else {
-            return Ok(Some(fallback.unwrap_or_default().to_owned()));
+        let parts = bodies::read_body_text(&self.conn, account, message_id)?;
+        Ok(Self::editable_draft_text(parts.as_ref(), fallback))
+    }
+
+    fn editable_draft_text(
+        parts: Option<&crate::MessageParts>,
+        fallback: Option<&str>,
+    ) -> Option<String> {
+        let Some(parts) = parts else {
+            return Some(fallback.unwrap_or_default().to_owned());
         };
         if parts
             .html
             .as_deref()
             .is_some_and(fell_render::html_has_uneditable_draft_formatting)
         {
-            return Ok(None);
+            return None;
         }
-        Ok(Some(
+        Some(
             parts
                 .plain
+                .as_ref()
                 .filter(|plain| !plain.trim().is_empty())
+                .cloned()
                 .or_else(|| {
                     parts
                         .html
@@ -2364,7 +2388,7 @@ impl Store {
                         .map(crate::imap::rfc822::html_draft_body)
                 })
                 .unwrap_or_else(|| fallback.unwrap_or_default().to_owned()),
-        ))
+        )
     }
 
     /// One window of the list [`Store::folder_threads`] returns, whether the

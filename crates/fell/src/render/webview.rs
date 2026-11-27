@@ -942,9 +942,27 @@ mod tests {
 
     #[test]
     fn hostile_email_makes_zero_webkit_requests() {
+        run_webkit_test(
+            "render::webview::tests::hostile_email_makes_zero_webkit_requests",
+            check_webkit_corpus,
+        );
+    }
+
+    #[test]
+    fn colorless_webkit_geometry_matches_the_native_reader() {
+        run_webkit_test(
+            "render::webview::tests::colorless_webkit_geometry_matches_the_native_reader",
+            || {
+                check_gmail_reply();
+                check_thunderbird_paragraphs();
+                check_colorless_reader_rhythm();
+            },
+        );
+    }
+
+    fn run_webkit_test(test: &str, check: fn()) {
         use fell_core::test_support::skip_unless_available;
 
-        const TEST: &str = "render::webview::tests::hostile_email_makes_zero_webkit_requests";
         const CHILD: &str = "FELL_WEBKIT_CORPUS_CHILD";
         const COMPLETED: &str = "WebKit corpus passed";
         let no_display =
@@ -954,7 +972,7 @@ mod tests {
         if no_display
             && !required
             && skip_unless_available(
-                TEST,
+                test,
                 Some("WebKit requires an isolated Wayland or X11 display".into()),
             )
         {
@@ -964,7 +982,7 @@ mod tests {
         if std::env::var_os(CHILD).is_some() {
             let passed = std::panic::catch_unwind(|| {
                 assert!(!no_display, "the WebKit test child requires a display");
-                check_webkit_corpus();
+                check();
                 eprintln!("{COMPLETED}");
             })
             .is_ok();
@@ -994,7 +1012,7 @@ mod tests {
             std::process::Command::new(executable)
         };
         let output = command
-            .args(["--exact", TEST, "--nocapture"])
+            .args(["--exact", test, "--nocapture"])
             .env(CHILD, "1")
             .output()
             .expect("start the isolated WebKit test child");
@@ -1475,8 +1493,6 @@ mod tests {
         check_colorless_rules();
         check_colorless_links();
         check_link_probe_budget();
-        check_gmail_reply();
-        check_thunderbird_paragraphs();
 
         let hero = fell_render::WebMail::prepare(
             r#"<div style="height:1000px;background:#7a163f">A tall hero</div>"#,
@@ -1826,5 +1842,38 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn check_colorless_reader_rhythm() {
+        let html = concat!(
+            "<p>Bring the tide chart.</p><ul><li>Check the gate</li><li>Test the lantern</li></ul>",
+            "<p>Meet at the harbor office.</p>",
+            "<div class='gmail_quote'><div>On Monday, Jo wrote:</div>",
+            "<blockquote><p>Could you share the pier map?</p></blockquote></div>",
+        );
+        let spaced = html.replace("</ul><p>", "</ul><p><br><br></p><p><em>&nbsp;</em></p><p>");
+        let style = fell_render::WebTextStyle {
+            family: Some("Inter".into()),
+            size: 15.,
+            foreground: 0x4c4f69,
+            link: 0x1758ad,
+            border: 0x414868,
+            inset: false,
+        };
+        let snapshot = |source| {
+            let body = crate::mail_body::prepare_html(
+                source,
+                &[("Subject".into(), "Re: Pier map".into())],
+            );
+            assert!(body.web.mapped_history());
+            let shot = colorless_snapshot(
+                body.web.page_with_style("light", Some(&style), |_| None),
+                432,
+            );
+            let [native, web] = crate::view::gmail_reply_geometry(&body, &shot);
+            assert_eq!(native, web);
+            shot.height
+        };
+        assert_eq!(snapshot(html), snapshot(&spaced));
     }
 }

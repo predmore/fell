@@ -645,10 +645,11 @@ impl Pass<'_> {
                     pending.expect("Drafts APPEND payload"),
                     draft.can_append,
                 )?;
-                if let Some(copy) = &placed
-                    && !drafts::placed(self.store, entry, copy)?
-                {
-                    return Err(Stop::Stale);
+                if let Some(copy) = &placed {
+                    if !drafts::placed(self.store, entry, copy)? {
+                        return Err(Stop::Stale);
+                    }
+                    self.report.draft_copy_placed = true;
                 }
                 placed
             };

@@ -909,7 +909,13 @@ fn render_block(block: &Block, context: BlockPaint, layout: BlockColumn) -> AnyE
             div()
                 .flex()
                 .flex_col()
-                .gap_2()
+                .map(|list| {
+                    if layout.reader.is_some() {
+                        list.gap(px(fell_render::READER_LIST_GAP))
+                    } else {
+                        list.gap_2()
+                    }
+                })
                 .children(
                     items
                         .iter()

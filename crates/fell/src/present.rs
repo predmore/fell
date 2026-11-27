@@ -44,6 +44,7 @@ pub struct ThreadRow {
     pub draft: Option<String>,
     /// The exact server copy used to build a synced Drafts preview.
     pub server_draft: Option<fell_core::RemoteId>,
+    pub not_on_server: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -525,6 +526,7 @@ pub fn thread_rows(threads: &[FolderThread], me: &str) -> Vec<ThreadRow> {
             unread: thread.unread,
             draft: None,
             server_draft: None,
+            not_on_server: false,
         })
         .collect()
 }
@@ -548,6 +550,22 @@ pub(crate) fn folder_thread_rows(
 /// The row id of compose draft `id`. Thread ids never start with this.
 pub fn draft_row_id(id: &str) -> String {
     format!("draft:{id}")
+}
+
+pub const DRAFT_STATUS_WIDE: f32 = 640.;
+const DRAFT_SAVE_PREFIX: &str = "Not saved to the server";
+
+pub fn is_draft_save_warning(text: &str) -> bool {
+    text.starts_with(DRAFT_SAVE_PREFIX)
+}
+
+pub fn draft_status_text(text: &str, width: f32) -> std::borrow::Cow<'_, str> {
+    if width < DRAFT_STATUS_WIDE
+        && let Some(rest) = text.strip_prefix("Not saved to the server · kept in Fell")
+    {
+        return format!("{DRAFT_SAVE_PREFIX}{rest}").into();
+    }
+    text.into()
 }
 
 pub fn draft_id_from_row(id: &str) -> Option<&str> {
@@ -609,6 +627,7 @@ pub fn draft_rows(drafts: &[DraftSummary]) -> Vec<ThreadRow> {
                 unread: false,
                 draft: Some(draft.id.clone()),
                 server_draft: None,
+                not_on_server: draft.not_on_server,
             }
         })
         .collect()
@@ -812,7 +831,10 @@ pub fn address_draft_rows(
         } else {
             one_line(&draft.subject)
         };
-        row.snippet = markdown_snippet(&draft.body, &draft.subject);
+        row.snippet = draft
+            .html_snippet
+            .as_deref()
+            .map_or_else(|| markdown_snippet(&draft.body, &draft.subject), one_line);
         let names: Vec<String> = draft
             .recipients
             .iter()
@@ -1798,6 +1820,7 @@ mod tests {
             owner: String::new(),
             updated_unix: 1_000,
             maybe_sent: false,
+            not_on_server: false,
             reply_context: None,
             forwarded: None,
             in_reply_to: None,
@@ -1996,6 +2019,7 @@ mod tests {
             unread: true,
             draft: None,
             server_draft: None,
+            not_on_server: false,
         }];
         let mut untouched = rows[0].clone();
         untouched.id = "t2".into();
@@ -2017,6 +2041,7 @@ mod tests {
                 ],
                 subject: "Plans".into(),
                 body: format!("# Plans\n\n{STYLED}"),
+                html_snippet: None,
             },
         );
         address_draft_rows(&mut rows, &previews, "me@example.com");

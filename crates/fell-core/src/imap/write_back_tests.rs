@@ -5847,6 +5847,10 @@ fn server_draft_with_whitespace_plain_part_uses_rich_html() {
     fx.deliver(SERVER_DRAFTS, 1, mime.into_bytes());
     fx.sync();
     let thread = fx.thread(SERVER_DRAFTS, "Route review");
+    let preview = fx
+        .store
+        .synced_draft_previews(&fx.account.id, SERVER_DRAFTS, std::slice::from_ref(&thread))
+        .unwrap();
     let draft = fx
         .account_config()
         .import_server_draft(&fx.store, &thread, "rich-draft")
@@ -5854,10 +5858,71 @@ fn server_draft_with_whitespace_plain_part_uses_rich_html() {
     let body = fx.store.load_compose(&draft).unwrap().unwrap().body;
     let expected = "# Route review\n\nA **bold** decision with *care*.\n\nOpen the [map](https://example.test/map).\n\n- Walk north\n- Turn west\n\n> Bring notes.\n> \n> Stay together.";
     assert_eq!(body, expected);
+    assert_eq!(preview[&thread].body, expected);
+    assert_eq!(preview[&thread].html_snippet, None);
     let editor = crate::compose::markdown_to_doc(&body);
     assert_eq!(
         fell_render::html_to_document(&crate::compose::doc_to_html(&editor)),
         fell_render::html_to_document(html),
+    );
+}
+
+#[test]
+fn server_draft_marker_tracks_the_latest_revision_after_close_and_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("mail.db");
+    let fx = draft_fixture(Store::open(&db).unwrap());
+    let hub = draft_hub(&dir.path().join("drafts"), &fx);
+    let marked = || {
+        Store::open_existing(&db)
+            .unwrap()
+            .unsent_compose_drafts(&fx.account.id)
+            .unwrap()[0]
+            .not_on_server
+    };
+    queue_draft_body(&hub, "First draft");
+    assert!(marked());
+    assert!(fx.replay().draft_copy_placed);
+    assert!(!marked());
+
+    fx.server.writes.lock().unwrap().refuse_append = true;
+    queue_draft_body(&hub, "Latest draft");
+    assert!(marked(), "the older server copy does not cover this edit");
+    for _ in 0..super::write_back::MAX_ATTEMPTS {
+        fx.make_due();
+        fx.replay();
+    }
+    assert!(marked(), "exhausted retries leave the marker");
+
+    fx.server.writes.lock().unwrap().refuse_append = false;
+    queue_draft_body(&hub, "Retried draft");
+    fx.make_due();
+    assert!(fx.replay().draft_copy_placed);
+    assert!(!marked(), "the latest APPEND clears the marker");
+    fx.store.set_write_back(&fx.account.id, false).unwrap();
+    queue_draft_body(&hub, "Keep this one local");
+    assert!(!marked());
+}
+
+#[test]
+fn an_html_only_server_draft_previews_the_rendered_reader_text() {
+    let fx = draft_fixture(Store::open_in_memory().unwrap());
+    let html = "<p>Review <strong>the plan</strong>.</p><p><em>&nbsp;</em></p><ul><li>West pier</li><li>East gate</li></ul><p>Bring the <del>old</del> new map.</p>";
+    let mime = format!(
+        "From: Reader <c@x>\r\nSubject: Pier route\r\nMessage-ID: <pier-route@x>\r\nMIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n\r\n{html}"
+    );
+    fx.deliver(SERVER_DRAFTS, 1, mime.into_bytes());
+    fx.sync();
+    let thread = fx.thread(SERVER_DRAFTS, "Pier route");
+    let previews = fx
+        .store
+        .synced_draft_previews(&fx.account.id, SERVER_DRAFTS, std::slice::from_ref(&thread))
+        .unwrap();
+    let expected = "Review the plan. West pier East gate Bring the old new map.";
+    assert_eq!(previews[&thread].html_snippet.as_deref(), Some(expected));
+    assert_eq!(
+        crate::imap::rfc822::snippet(&fell_render::html_to_document(html).plain_text()),
+        expected
     );
 }
 

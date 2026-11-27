@@ -96,7 +96,7 @@ pub enum Error {
     Action(String),
     #[error("This draft has no text Fell can edit. The copy is still on the server.")]
     DraftBodyUnavailable,
-    #[error("This draft has formatting Fell can't edit yet. The copy is still on the server.")]
+    #[error("Can't edit this draft's formatting in Fell · still on the server")]
     DraftFormattingUnavailable,
     #[error("This message is no longer in Drafts.")]
     DraftNoLongerInFolder,
