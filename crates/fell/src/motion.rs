@@ -20,7 +20,7 @@
 //! an ease-out curve: fast enough to never feel like waiting, long enough to
 //! show where something came from or went.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -531,6 +531,8 @@ pub struct ListShift<R> {
     arrive: Option<Transition>,
     /// Each batch arrival starts its own fade when the last slider clears it.
     batch_fades: HashMap<String, Option<Transition>>,
+    /// Survivors of an interrupted shift whose painted starts overlap.
+    waiting_arrivals: HashSet<String>,
     /// On the first batch frame, start only the newly added ghosts.
     batch_first_frame: Option<usize>,
     /// Row id → its top before the change, in viewport pixels.
@@ -593,6 +595,7 @@ impl<R: Clone> ListShift<R> {
             opening_top: false,
             arrive: None,
             batch_fades: HashMap::new(),
+            waiting_arrivals: HashSet::new(),
             batch_first_frame: batch_leave.then_some(first_new_ghost),
             before: before.into_iter().collect(),
             resolved: HashMap::new(),
@@ -612,7 +615,15 @@ impl<R: Clone> ListShift<R> {
         self.gentle = offsets
             .map(f32::abs)
             .any(|dy| dy > self.reach && dy <= limit);
+        if self.gentle {
+            self.transition.duration = PANE;
+        }
         self.reach = limit;
+        self
+    }
+
+    pub fn with_waiting_arrivals(mut self, ids: HashSet<String>) -> Self {
+        self.waiting_arrivals = ids;
         self
     }
 
@@ -820,7 +831,11 @@ impl<R: Clone> ListShift<R> {
     }
 
     pub fn batch_arrivals(&self) -> bool {
-        self.batch_leave
+        self.batch_leave || !self.waiting_arrivals.is_empty()
+    }
+
+    pub fn waits_for_slot(&self, id: &str) -> bool {
+        self.batch_leave || self.waiting_arrivals.contains(id)
     }
 
     pub fn ghosts(&self) -> &[Ghost<R>] {
@@ -1244,12 +1259,12 @@ mod tests {
             let first_paint = start + MAX_STEP;
             shift.begin_batch_frame(first_paint);
             assert_eq!(shift.ghosts()[0].ink_opacity(first_paint), 1.0);
-            for ms in 0..=120 {
+            for ms in 0..=160 {
                 let now = at(first_paint, ms);
                 let mut previous = f32::NEG_INFINITY;
                 for (id, slot, dy) in rows {
                     let row = shift.batch_row(id, slot, false, now);
-                    let expected = dy * (1.0 - ease_out_quad(ms as f32 / 120.0));
+                    let expected = dy * (1.0 - ease_out_quad(ms as f32 / 160.0));
                     assert!((row.dy - expected).abs() < 0.001, "{id} at {ms} ms");
                     assert_eq!(row.dy, shift.offset_of(id, slot, now));
                     assert_eq!(row.opacity, 1.0);

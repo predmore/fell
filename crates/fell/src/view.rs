@@ -725,6 +725,8 @@ fn not_sent_detail(session: &Session, write: &DroppedWrite, count: usize) -> Str
 /// Height of one thread row. Rows never change height, so the list can
 /// place, scroll to and animate any row from its index.
 const ROW_PX: f32 = 68.0;
+const ROW_INK_PX: f32 = 44.0;
+const ROW_INK_INSET: f32 = (ROW_PX - ROW_INK_PX) / 2.0;
 /// A glide further than this (about four rows) eases on the gentler
 /// curve, so one late frame cannot carry it half the way ([`Glide::gentle_beyond`]).
 const LONG_GLIDE_PX: f32 = 4.0 * ROW_PX;
@@ -2701,6 +2703,11 @@ impl Inbox {
                 reach = reach.max(dy);
             }
         }
+        let waiting = if !replace && self.motion.list.as_ref().is_some_and(|s| s.running(now)) {
+            keep_ordered_starts(&mut before, &ids)
+        } else {
+            HashSet::new()
+        };
         let batch_offsets = viewport_scrolled.then(|| {
             before
                 .iter()
@@ -2742,7 +2749,8 @@ impl Inbox {
             } else {
                 shift
             }
-            .fading_below(below);
+            .fading_below(below)
+            .with_waiting_arrivals(waiting);
             if top_arrival && !batch_leave {
                 shift.top_arrival()
             } else if reveal_selection && !replace && !batch_leave {
@@ -6537,6 +6545,30 @@ struct Drawn {
     slot: f32,
 }
 
+/// An in-place arrival can sit within a slider's painted row. Only carry
+/// starts that preserve the new list order without two full rows crossing.
+fn keep_ordered_starts(
+    before: &mut Vec<(String, f32)>,
+    indices: &HashMap<&str, usize>,
+) -> HashSet<String> {
+    before.sort_by_key(|(id, _)| indices.get(id.as_str()).copied().unwrap_or(usize::MAX));
+    let mut bottom = f32::NEG_INFINITY;
+    let mut waiting = HashSet::new();
+    before.retain(|(id, top)| {
+        if !indices.contains_key(id.as_str()) {
+            // ListShift still counts departures when detecting replacement.
+            return true;
+        }
+        if *top + 0.001 < bottom {
+            waiting.insert(id.clone());
+            return false;
+        }
+        bottom = *top + ROW_PX;
+        true
+    });
+    waiting
+}
+
 /// What the frame shows beyond the session.
 struct Shown<'a> {
     /// The open conversation's subject. It changes with the messages, not
@@ -7686,8 +7718,7 @@ fn thread_list(
                 let scale = window.scale_factor();
                 let slot_top = |index: usize| index as f32 * ROW_PX;
                 let anchor = slot_top(last_visible);
-                let mut batch_ink = Vec::new();
-                let batch_layers = inbox
+                let mut batch_layers = inbox
                     .motion
                     .list
                     .as_mut()
@@ -7705,27 +7736,28 @@ fn thread_list(
                                 (dy != 0.0).then_some(BatchSlider { slot, dy })
                             })
                             .collect();
-                        batch_ink.extend(shift.ghosts().iter().filter_map(|ghost| {
-                            let alpha = ghost.ink_opacity(now);
-                            let top = anchor + motion::snap(ghost.top - anchor, scale);
-                            (alpha > 0.0
-                                && top + offset < viewport
-                                && top + offset + ROW_PX > 0.0
-                                && !slides.iter().any(|slide| slide.covers(top)))
-                            .then(|| (ghost.row.clone(), top, alpha))
-                        }));
+                        let ink = shift
+                            .ghosts()
+                            .iter()
+                            .filter_map(|ghost| {
+                                let alpha = ghost.ink_opacity(now);
+                                let top = anchor + motion::snap(ghost.top - anchor, scale);
+                                (alpha > 0.0
+                                    && top + offset < viewport
+                                    && top + offset + ROW_PX > 0.0
+                                    && !slides.iter().any(|slide| slide.covers(top)))
+                                .then(|| (ghost.row.clone(), top, alpha))
+                            })
+                            .collect();
                         let bands = shift
                             .ghosts()
                             .iter()
                             .filter(|ghost| ghost.row.selected && ghost.running(now))
                             .map(|ghost| (ghost.top, ghost.opacity(now)))
                             .collect::<Vec<_>>();
-                        (slides, bands)
+                        BatchLayers { slides, bands, ink }
                     });
-                let batch_leave = batch_layers.is_some();
-                let bands = batch_layers
-                    .as_ref()
-                    .map_or(&[][..], |(_, bands)| bands.as_slice());
+                let batch_motion = batch_layers.is_some();
                 let rows: Vec<_> = range
                     .map(|index| {
                         let row = inbox.session.threads[index].clone();
@@ -7765,6 +7797,11 @@ fn thread_list(
                             ),
                         };
                         let top = index as f32 * ROW_PX + offset;
+                        let waits = inbox
+                            .motion
+                            .list
+                            .as_ref()
+                            .is_some_and(|shift| shift.waits_for_slot(&row.id));
                         let (moving, ghosts, mut overflow, batch) = if let Some(shift) =
                             inbox.motion.list.as_mut()
                         {
@@ -7772,18 +7809,16 @@ fn thread_list(
                                 .iter()
                                 .enumerate()
                                 .map(|(i, next)| (next.id.as_str(), top + (i + 1) as f32 * ROW_PX));
-                            let mut moving = if let Some((slides, _)) = &batch_layers {
-                                let slot = slot_top(index);
-                                let covered = slides.iter().any(|slide| slide.crosses(slot))
-                                    || batch_ink.iter().any(|&(_, top, _)| row_overlaps(top, slot));
-                                shift.batch_row(&row.id, top, covered, now)
-                            } else {
-                                shift.row(&row.id, top, ROW_PX, below, now)
-                            };
+                            let mut moving =
+                                if let Some(layers) = batch_layers.as_mut().filter(|_| waits) {
+                                    layers.row(shift, &row.id, (top, slot_top(index)), now)
+                                } else {
+                                    shift.row(&row.id, top, ROW_PX, below, now)
+                                };
                             moving.dy = motion::snap(moving.dy, scale);
                             let reach = if index == last { f32::INFINITY } else { ROW_PX };
                             // Ghosts are kept in content pixels, so they scroll.
-                            let ghosts = if batch_leave {
+                            let ghosts = if batch_motion {
                                 Vec::new()
                             } else {
                                 shift.ghosts_for_slot(
@@ -7809,7 +7844,7 @@ fn thread_list(
                                     let slot = outside as f32 * ROW_PX + offset;
                                     let painted = shift
                                         .visible_overflow(&row.id, slot, ROW_PX, viewport, now)?;
-                                    let dy = if batch_leave {
+                                    let dy = if batch_motion {
                                         slot_top(outside) - anchor
                                             + motion::snap(painted - slot, scale)
                                     } else {
@@ -7819,7 +7854,7 @@ fn thread_list(
                                         content_only: false,
                                         selected: highlighted.contains(&row.id),
                                         fading: None,
-                                        ghost: true,
+                                        ghost: false,
                                         bar_dx,
                                         frame: still_frame(row, window),
                                         previous_labels: None,
@@ -7836,22 +7871,28 @@ fn thread_list(
                                             false,
                                         ),
                                     };
-                                    Some(slot_layer(dy, 1.0).child(thread_row(
-                                        &theme_for_rows,
-                                        row,
-                                        outside,
-                                        &look,
-                                        text_width,
-                                        window,
-                                        cx,
-                                    )))
+                                    Some(overflow_row_layer(
+                                        dy,
+                                        thread_row(
+                                            &theme_for_rows,
+                                            row,
+                                            outside,
+                                            &look,
+                                            text_width,
+                                            window,
+                                            cx,
+                                        ),
+                                    ))
                                 })
                                 .collect::<Vec<_>>();
                             (moving, ghosts, overflow, shift.has_batch_ghosts())
                         } else {
                             (RowMotion::STILL, Vec::new(), Vec::new(), false)
                         };
-                        let batch_arrival = batch_leave && moving.opacity < 1.0;
+                        let batch_arrival = waits && moving.opacity < 1.0;
+                        let bands = batch_layers
+                            .as_ref()
+                            .map_or(&[][..], |layers| layers.bands.as_slice());
                         look.content_only |= batch_arrival;
                         let element =
                             thread_row(&theme_for_rows, &row, index, &look, text_width, window, cx);
@@ -7873,7 +7914,10 @@ fn thread_list(
                             && overflow.is_empty()
                             && (index != visible.start || bands.is_empty())
                             && (index != last_visible
-                                || (sliders.is_empty() && batch_ink.is_empty()))
+                                || (sliders.is_empty()
+                                    && batch_layers
+                                        .as_ref()
+                                        .is_none_or(|layers| layers.ink.is_empty())))
                         {
                             return element;
                         }
@@ -7893,7 +7937,7 @@ fn thread_list(
                             .collect();
                         let slider_slot = batch_slider_slot(
                             last_visible,
-                            batch_leave && regroup.is_none(),
+                            batch_motion && regroup.is_none(),
                             moving,
                         );
                         let layer = if let Some(regroup) = regroup {
@@ -7953,7 +7997,7 @@ fn thread_list(
                         } else {
                             Some(layer)
                         };
-                        if batch_leave {
+                        if batch_motion {
                             sliders.append(&mut overflow);
                         }
                         div()
@@ -7976,7 +8020,10 @@ fn thread_list(
                                 }
                             })
                             .when(index == last_visible, |slot| {
-                                slot.children(batch_ink.drain(..).map(|(ghost, top, alpha)| {
+                                let ink = batch_layers
+                                    .iter_mut()
+                                    .flat_map(|layers| layers.ink.drain(..));
+                                slot.children(ink.map(|(ghost, top, alpha)| {
                                     ghost_row(
                                         &theme_for_rows,
                                         (ghost, top - anchor, alpha),
@@ -8022,19 +8069,49 @@ struct BatchSlider {
 
 impl BatchSlider {
     fn covers(&self, top: f32) -> bool {
-        row_overlaps(self.slot + self.dy, top)
+        overlaps_row_text(self.slot + self.dy, self.slot + self.dy, top)
     }
 
     /// Includes the rest of its sweep, so an arrival cannot start fading
     /// in between two sliders and then lose its ink when the next comes.
     fn crosses(&self, top: f32) -> bool {
         let painted = self.slot + self.dy;
-        top + ROW_PX > painted.min(self.slot) && top < painted.max(self.slot) + ROW_PX
+        overlaps_row_text(painted.min(self.slot), painted.max(self.slot), top)
     }
 }
 
-fn row_overlaps(a: f32, b: f32) -> bool {
-    (a - b).abs() < ROW_PX
+/// Only the centered 44 px of the slot contains ink, including its unread bar.
+fn overlaps_row_text(first: f32, last: f32, slot: f32) -> bool {
+    first < slot + ROW_PX - ROW_INK_INSET && last + ROW_PX > slot + ROW_INK_INSET
+}
+
+struct BatchLayers<R> {
+    slides: Vec<BatchSlider>,
+    bands: Vec<(f32, f32)>,
+    ink: Vec<(R, f32, f32)>,
+}
+
+impl<R: Clone> BatchLayers<R> {
+    fn row(
+        &mut self,
+        shift: &mut ListShift<R>,
+        id: &str,
+        (top, slot): (f32, f32),
+        now: Instant,
+    ) -> RowMotion {
+        let covered = self.slides.iter().any(|slide| slide.crosses(slot))
+            || self
+                .ink
+                .iter()
+                .any(|&(_, top, alpha)| alpha > 0.5 && overlaps_row_text(top, top, slot));
+        let row = shift.batch_row(id, top, covered, now);
+        if 0.0 < row.opacity && row.opacity < 1.0 {
+            // The incoming text takes over from the faint departure in this frame.
+            self.ink
+                .retain(|&(_, top, _)| !overlaps_row_text(top, top, slot));
+        }
+        row
+    }
 }
 
 /// GPUI asks for one row during layout and again during prepaint to find the
@@ -8156,6 +8233,10 @@ fn slot_layer(dy: f32, opacity: f32) -> gpui::Div {
         .right(px(0.))
         .h(px(ROW_PX))
         .opacity(opacity)
+}
+
+fn overflow_row_layer(dy: f32, row: gpui::AnyElement) -> gpui::Div {
+    slot_layer(dy, 1.0).block_mouse_except_scroll().child(row)
 }
 
 fn moving_row_layer(
@@ -8360,7 +8441,7 @@ fn thread_row(
         .child(
             div()
                 .w(px(3.))
-                .h(px(44.))
+                .h(px(ROW_INK_PX))
                 .rounded_r_sm()
                 .when(look.bar_dx > 0.0, |bar| {
                     bar.relative().left(px(look.bar_dx))
@@ -14196,30 +14277,189 @@ mod tests {
             dy: -3.0 * ROW_PX,
         };
         assert!(
-            grazing.covers(slot),
-            "one painted pixel hides both ghost lines"
+            !grazing.covers(slot),
+            "a pixel in the padding leaves the exit visible"
         );
+        assert!(!grazing.crosses(slot));
         assert!(!approaching.covers(slot));
-        assert_eq!(draw(0, &[grazing]), 0.0);
         assert_eq!(draw(16, &[approaching]), 0.0, "a second slider will cross");
         let last = BatchSlider {
             slot: 3.0 * ROW_PX,
-            dy: -1.0,
+            dy: -13.0,
         };
         assert!(last.covers(slot));
-        assert_eq!(draw(119, &[last]), 0.0);
-        assert!(shift.running(at(120)), "keep the clearing frame");
+        assert_eq!(draw(83, std::slice::from_ref(&last)), 0.0);
+        let padding = BatchSlider { dy: -12.0, ..last };
+        assert!(!padding.covers(slot));
+        assert_eq!(draw(84, &[padding]), motion::ARRIVE_FROM);
+        assert!(shift.running(at(203)));
+        assert!(shift.batch_row("arrival", slot, false, at(144)).opacity > motion::ARRIVE_FROM);
         assert_eq!(
-            shift.batch_row("arrival", slot, false, at(120)).opacity,
-            motion::ARRIVE_FROM
-        );
-        assert!(shift.running(at(239)));
-        assert!(shift.batch_row("arrival", slot, false, at(180)).opacity > motion::ARRIVE_FROM);
-        assert_eq!(
-            shift.batch_row("arrival", slot, false, at(240)).opacity,
+            shift.batch_row("arrival", slot, false, at(204)).opacity,
             1.0
         );
-        assert!(!shift.running(at(240)));
+        assert!(!shift.running(at(204)));
+    }
+
+    #[test]
+    fn batch_ink_hands_off_on_the_first_frame_at_half_opacity() {
+        use super::{BatchLayers, ListChange, ListShift, ROW_PX};
+
+        let start = Instant::now();
+        let mut shift = ListShift::start(
+            &motion::Motion::new(true),
+            vec![],
+            (0..10)
+                .map(|index| (index, index as f32 * ROW_PX))
+                .collect(),
+            vec![],
+            800.0,
+            ListChange::BatchLeave { row_height: ROW_PX },
+            start,
+        )
+        .unwrap();
+        shift.begin_batch_frame(start);
+        for ms in 0..=40 {
+            let now = start + Duration::from_millis(ms);
+            let mut layers = BatchLayers {
+                slides: vec![],
+                bands: vec![],
+                ink: shift
+                    .ghosts()
+                    .iter()
+                    .map(|ghost| (ghost.row, ghost.top, ghost.ink_opacity(now)))
+                    .collect(),
+            };
+            for index in 0..10 {
+                let slot = index as f32 * ROW_PX;
+                let incoming = layers.row(&mut shift, &index.to_string(), (slot, slot), now);
+                let outgoing = layers.ink.iter().find(|&&(row, _, _)| row == index);
+                if ms <= 11 {
+                    assert_eq!(incoming.opacity, 0.0);
+                    assert!(outgoing.is_some_and(|&(_, _, opacity)| opacity > 0.5));
+                } else {
+                    assert!(outgoing.is_none(), "one text layer at {ms} ms");
+                    assert!(
+                        incoming.opacity >= motion::ARRIVE_FROM,
+                        "no empty frame at {ms} ms"
+                    );
+                    if ms == 12 {
+                        assert_eq!(incoming.opacity, motion::ARRIVE_FROM);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_interrupted_shift_keeps_overlapping_survivors_as_arrivals() {
+        use super::{BatchLayers, BatchSlider, ListChange, ListShift, ROW_PX, keep_ordered_starts};
+
+        let start = Instant::now();
+        let motion = motion::Motion::new(true);
+        let batch = ListChange::BatchLeave { row_height: ROW_PX };
+        let mut first = ListShift::<()>::start(
+            &motion,
+            vec![("slider".into(), 2.0 * ROW_PX)],
+            vec![],
+            vec![],
+            800.0,
+            batch,
+            start,
+        )
+        .unwrap();
+        let interrupt = start + Duration::from_millis(40);
+        let slider_top = first.batch_row("slider", 0.0, false, interrupt).dy;
+        let hidden = first.batch_row("arrival", ROW_PX, true, interrupt);
+        assert_eq!(hidden.opacity, 0.0);
+        let mut before = vec![
+            ("arrival".into(), ROW_PX + hidden.dy),
+            ("slider".into(), slider_top),
+        ];
+        let waiting = keep_ordered_starts(&mut before, &[("slider", 0), ("arrival", 1)].into());
+        assert_eq!(before, [("slider".into(), slider_top)]);
+        for change in [ListChange::Shift, batch] {
+            let mut second = ListShift::<()>::start(
+                &motion,
+                before.clone(),
+                vec![],
+                vec![],
+                800.0,
+                change,
+                interrupt,
+            )
+            .unwrap()
+            .with_waiting_arrivals(waiting.clone());
+            assert!(second.batch_arrivals() && second.waits_for_slot("arrival"));
+            let mut saw_arrival = false;
+            for ms in 0..=120 {
+                let now = interrupt + Duration::from_millis(ms);
+                let slider = BatchSlider {
+                    slot: 0.0,
+                    dy: second.offset_of("slider", 0.0, now),
+                };
+                let overlaps = slider.covers(ROW_PX);
+                let mut layers = BatchLayers {
+                    slides: vec![slider],
+                    bands: vec![],
+                    ink: vec![],
+                };
+                let arrival = layers.row(&mut second, "arrival", (ROW_PX, ROW_PX), now);
+                assert_eq!(arrival.dy, 0.0);
+                assert_eq!(arrival.opacity == 0.0, overlaps);
+                saw_arrival |= arrival.opacity >= motion::ARRIVE_FROM;
+            }
+            assert!(saw_arrival);
+        }
+    }
+
+    #[test]
+    fn overflow_row_receives_the_click_above_a_hidden_arrival() {
+        use gpui::{
+            InteractiveElement, MouseButton, ParentElement, Render, Styled, TestAppContext, point,
+            px,
+        };
+        use std::{cell::RefCell, rc::Rc};
+
+        struct Rows(Rc<RefCell<Vec<&'static str>>>);
+
+        impl Render for Rows {
+            fn render(
+                &mut self,
+                _: &mut gpui::Window,
+                _: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                let arrival = self.0.clone();
+                let overflow = self.0.clone();
+                div()
+                    .relative()
+                    .w(px(300.))
+                    .h(px(super::ROW_PX))
+                    .child(super::slot_layer(0.0, 0.0).on_mouse_down(
+                        MouseButton::Left,
+                        move |_, _, _| {
+                            arrival.borrow_mut().push("arrival");
+                        },
+                    ))
+                    .child(super::overflow_row_layer(
+                        8.0,
+                        div()
+                            .size_full()
+                            .on_mouse_down(MouseButton::Left, move |_, _, _| {
+                                overflow.borrow_mut().push("overflow");
+                            })
+                            .into_any_element(),
+                    ))
+            }
+        }
+
+        let clicks = Rc::new(RefCell::new(Vec::new()));
+        let mut app = TestAppContext::single();
+        let (_, cx) = app.add_window_view(|_, _| Rows(clicks.clone()));
+        cx.simulate_click(point(px(20.), px(24.)), Modifiers::default());
+        assert_eq!(*clicks.borrow(), ["overflow"]);
+        cx.simulate_click(point(px(20.), px(4.)), Modifiers::default());
+        assert_eq!(*clicks.borrow(), ["overflow", "arrival"]);
     }
 
     #[test]
