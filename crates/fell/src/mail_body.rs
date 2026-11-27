@@ -611,6 +611,11 @@ impl BodyLoads {
         self.wanted.clear();
     }
 
+    pub fn clear_mailbox(&mut self) {
+        self.clear();
+        self.active.clear();
+    }
+
     pub fn awaiting(&self, id: &str) -> bool {
         self.wanted.contains_key(id)
     }

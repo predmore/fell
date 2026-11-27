@@ -4,6 +4,7 @@ mod accounts;
 mod activity;
 mod agent_notes;
 mod agents;
+mod all_inboxes;
 mod attachment_actions;
 mod attachment_chips;
 mod diagnostics;
@@ -236,10 +237,15 @@ pub(crate) fn present_sent_copy(
         return;
     };
     inbox.update(cx, |inbox, cx| {
-        if message.account_id != inbox.account_id {
+        if inbox.account_id == message.account_id {
+            inbox.show_sent_copy(thread, message, rich, cx);
+        } else if inbox
+            .all_inboxes
+            .as_ref()
+            .is_none_or(|all| !all.members.contains_key(message.account_id.as_str()))
+        {
             return;
         }
-        inbox.show_sent_copy(thread, message, rich);
         inbox.request_threads(
             ReadIntent {
                 refresh_open: true,
@@ -814,6 +820,7 @@ impl FirstPreview {
 }
 
 struct Inbox {
+    all_inboxes: Option<all_inboxes::AllInboxes>,
     focus: FocusHandle,
     notifications: Option<crate::notifications::Queue>,
     pending_activation: Option<crate::notifications::Activation>,
@@ -1000,6 +1007,16 @@ impl Inbox {
         window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::with_store(startup, demo, window, None, cx)
+    }
+
+    fn with_store(
+        startup: mailbox::Startup,
+        demo: bool,
+        window: Option<&mut Window>,
+        shared_store: Option<StoreClient>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let config = startup.config.clone();
         let legacy = crate::settings::Values {
             which_key_ms: startup.keymap.which_key_ms,
@@ -1019,13 +1036,17 @@ impl Inbox {
             .map_err(|_| DRAFT_MAILBOX_UNAVAILABLE.into())
             .and_then(|path| DraftHome::real(path).map_err(|err| err.to_string()));
         let (notices, store_restarts) = futures::channel::mpsc::unbounded();
-        let (store, ready) = StoreClient::spawn(
-            {
+        let (store, ready) = match shared_store {
+            Some(store) => (store, None),
+            None => {
                 let config = config.clone();
-                move || mailbox::open_registered_store(path.clone(), config.as_ref(), demo)
-            },
-            notices,
-        );
+                let (store, ready) = StoreClient::spawn(
+                    move || mailbox::open_registered_store(path.clone(), config.as_ref(), demo),
+                    notices,
+                );
+                (store, Some(ready))
+            }
+        };
         let (name, email) = match &config {
             Some(config) => {
                 let account = config.account();
@@ -1069,6 +1090,7 @@ impl Inbox {
         });
         let (compose_ready_tx, compose_ready) = futures::channel::oneshot::channel();
         let mut inbox = Self {
+            all_inboxes: None,
             focus: cx.focus_handle(),
             notifications,
             pending_activation: None,
@@ -1182,23 +1204,27 @@ impl Inbox {
         let sync_with = config.zip(startup.path.ok());
         cx.on_release(|inbox, app| inbox.web_mail.release(app))
             .detach();
-        cx.spawn(async move |this, cx| {
-            let Ok(opened) = ready.await else {
-                return;
-            };
-            let _ = this.update(cx, |inbox, cx| {
-                if !inbox.retired {
-                    inbox.on_store_ready(opened, sync_with, cx);
-                }
-            });
+        if let Some(ready) = ready {
+            cx.spawn(async move |this, cx| {
+                let Ok(opened) = ready.await else {
+                    return;
+                };
+                let _ = this.update(cx, |inbox, cx| {
+                    if !inbox.retired {
+                        inbox.on_store_ready(opened, sync_with, cx);
+                    }
+                });
+                let _ = compose_ready_tx.send(());
+            })
+            .detach();
+            inbox.show_crash_notice(cx);
+            inbox.watch_store_restarts(store_restarts, cx);
+            inbox.watch_notes(cx);
+        } else {
             let _ = compose_ready_tx.send(());
-        })
-        .detach();
-        inbox.show_crash_notice(cx);
-        inbox.watch_store_restarts(store_restarts, cx);
+        }
         inbox.refresh_settings_availability();
         inbox.watch_settings(legacy, cx);
-        inbox.watch_notes(cx);
         inbox.watch_dates(cx);
         inbox
     }
@@ -1700,6 +1726,8 @@ impl Inbox {
                             });
                         }
                         let open_pending = inbox.first_preview.sync_changed(&kind);
+                        let failed =
+                            matches!(kind, SyncKind::Failed(_)) && inbox.session.sync != kind;
                         inbox.session.apply_sync_status(kind);
                         if finishing && inbox.session.search.is_some() {
                             inbox.read_selected_messages(true, cx);
@@ -1713,6 +1741,8 @@ impl Inbox {
                             );
                         } else if open_pending {
                             inbox.read_selected_messages(true, cx);
+                        } else if failed {
+                            inbox.notify_merged_inboxes(cx);
                         }
                         cx.notify();
                     })
@@ -1733,7 +1763,25 @@ impl Inbox {
     /// Reread the folder on screen on the store thread. While one read is in
     /// flight, further requests merge into a single follow-up, so a burst of
     /// sync batches is one read and never a queue.
+    fn notify_merged_inboxes(&self, cx: &mut Context<Self>) {
+        if !self.session.all_inboxes
+            && !self.retired
+            && let Some(window) = cx.try_global::<InboxWindow>().copied()
+        {
+            let account = self.account_id.clone();
+            let source = cx.entity();
+            cx.defer(move |cx| {
+                let _ = window.0.update(cx, |_, window, cx| {
+                    accounts::refresh_all(&account, &source, window, cx);
+                });
+            });
+        }
+    }
+
     fn request_threads(&mut self, mut intent: ReadIntent, cx: &mut Context<Self>) {
+        if self.session.loading || intent.changed || intent.refresh_open {
+            self.notify_merged_inboxes(cx);
+        }
         if self.opening_draft.is_some() && self.session.in_drafts() && !intent.switch {
             self.defer_folder_read(intent);
             return;
@@ -1758,6 +1806,10 @@ impl Inbox {
         self.read_in_flight = true;
         self.refresh_in_flight = intent.is_refresh();
         self.read_gen += 1;
+        if self.session.all_inboxes {
+            self.request_all_inboxes(intent, cx);
+            return;
+        }
         let generation = self.read_gen;
         let account = self.account_id.clone();
         let folder = self.session.folder.clone();
@@ -2202,7 +2254,7 @@ impl Inbox {
         if !emptied && (switched || had_rows || !self.session.threads.is_empty()) {
             self.start_list_shift(drawn, switched, intent.select.is_some(), top_arrival);
         }
-        if self.session.list_label.is_some() {
+        if self.session.all_inboxes || self.session.list_label.is_some() {
             self.warm = None;
             self.warmed_folder = None;
         } else if self.warmed_folder.as_deref() != Some(self.session.list_folder.as_str()) {
@@ -2798,6 +2850,20 @@ impl Inbox {
             }
             return;
         }
+        let thread = if self.session.all_inboxes {
+            let Some((account, thread)) = all_inboxes::owner_and_thread(&id) else {
+                return;
+            };
+            if !self.bind_all_reader(cx) || self.account_id != account {
+                self.conv_gen.fetch_add(1, Ordering::SeqCst);
+                self.clear_open_message();
+                self.settle_pending_bodies();
+                return;
+            }
+            thread
+        } else {
+            ThreadId(id.clone())
+        };
         if self.open_thread.as_deref() != Some(id.as_str()) {
             self.reader_bodies.active = None;
         }
@@ -2845,14 +2911,8 @@ impl Inbox {
         let current = self.conv_gen.clone();
         let account = self.account_id.clone();
         let me = self.session.account_email.clone();
-        let roles = self.session.roles.clone();
-        let names = self.session.folders.clone();
-        let viewing = self
-            .session
-            .search_source(&id)
-            .unwrap_or(&self.session.folder)
-            .to_owned();
-        let thread = ThreadId(id.clone());
+        let (roles, names, viewing) = self.all_reader_scope(cx);
+        let read_notes = !self.session.all_inboxes;
         let query = self.session.search.as_ref().and_then(|search| {
             let generation = search.accepted_generation()?;
             Some((generation, search.effective_query().to_owned()))
@@ -2913,7 +2973,7 @@ impl Inbox {
                         .unwrap_or_default(),
                 )
             });
-            let latest_note = opening
+            let latest_note = (read_notes && opening)
                 .then(|| {
                     store
                         .latest_thread_note_id(&account, &thread)
@@ -2921,7 +2981,9 @@ impl Inbox {
                         .flatten()
                 })
                 .flatten();
-            let notes = store.thread_notes(&account, &thread).ok();
+            let notes = read_notes
+                .then(|| store.thread_notes(&account, &thread).ok())
+                .flatten();
             Ok(Some(ConversationRead {
                 view,
                 reads,
@@ -3264,7 +3326,13 @@ impl Inbox {
     }
 
     fn want_reader_parts(&mut self, visible: bool, cx: &mut Context<Self>) {
-        let Some(fetcher) = self.reader_fetcher.as_ref() else {
+        let fetcher = self
+            .all_inboxes
+            .as_ref()
+            .and_then(all_inboxes::AllInboxes::reader)
+            .and_then(|view| view.read(cx).reader_fetcher.as_ref())
+            .or(self.reader_fetcher.as_ref());
+        let Some(fetcher) = fetcher else {
             return;
         };
         if !visible || self.open_thread != self.session.cursor_id {
@@ -3536,8 +3604,19 @@ impl Inbox {
         }));
     }
 
-    fn show_sent_copy(&mut self, thread: ThreadId, mut message: fell_core::Message, rich: Rich) {
-        if self.open_thread.as_deref() != Some(thread.as_str())
+    fn show_sent_copy(
+        &mut self,
+        thread: ThreadId,
+        mut message: fell_core::Message,
+        rich: Rich,
+        cx: &App,
+    ) {
+        let row = if self.session.all_inboxes {
+            all_inboxes::row_id(&message.account_id, &thread)
+        } else {
+            thread.0
+        };
+        if self.open_thread.as_deref() != Some(row.as_str())
             || self.session.cursor_id != self.open_thread
             || !self.search_preview_current()
             || self
@@ -3548,17 +3627,14 @@ impl Inbox {
         {
             return;
         }
-        let viewing = self
-            .session
-            .search_source(thread.as_str())
-            .unwrap_or(&self.session.folder);
+        let (roles, names, viewing) = self.all_reader_scope(cx);
         let parts = message.parts.take();
         let mut shown = present::conversation(
             std::slice::from_ref(&message),
             &self.session.account_email,
-            &self.session.roles,
-            &self.session.folders,
-            viewing,
+            &roles,
+            &names,
+            &viewing,
         )
         .remove(0);
         shown.rich = rich;
@@ -3608,6 +3684,10 @@ impl Inbox {
     }
 
     fn apply_move(&mut self, edit: crate::model::MoveEdit, cx: &mut Context<Self>) {
+        if self.session.all_inboxes {
+            self.all_move(edit, cx);
+            return;
+        }
         let search = self.session.search.is_some();
         let account = self.account_id.clone();
         let crate::model::MoveEdit {
@@ -3661,6 +3741,10 @@ impl Inbox {
     /// Remove the selected threads in this frame and select the row that
     /// takes the cursor's place.
     fn remove_threads(&mut self, ids: Vec<String>, removal: Removal, cx: &mut Context<Self>) {
+        if self.session.all_inboxes {
+            self.all_removal(ids, removal, cx);
+            return;
+        }
         let (ids, drafts) = self.session.split_removal_targets(ids);
         if ids.is_empty() && !drafts.is_empty() {
             self.session.show_toast(DRAFT_NOT_THREAD, true);
@@ -3784,6 +3868,10 @@ impl Inbox {
     }
 
     fn read_label_targets(&mut self, cx: &mut Context<Self>) {
+        if self.session.all_inboxes {
+            self.read_all_label_targets(cx);
+            return;
+        }
         use futures::future::{Either, select};
 
         self.label_targets_read += 1;
@@ -3829,6 +3917,10 @@ impl Inbox {
     }
 
     fn apply_labels(&mut self, edit: LabelEdit, cx: &mut Context<Self>) {
+        if self.session.all_inboxes {
+            self.all_labels(edit, cx);
+            return;
+        }
         let now = self.motion.clock.now();
         let leaving_scope = !edit.add
             && self.session.list_label.as_deref() == Some(&edit.name)
@@ -3886,6 +3978,10 @@ impl Inbox {
     }
 
     fn apply_undo(&mut self, cx: &mut Context<Self>) {
+        if self.session.all_inboxes {
+            self.undo_all(cx);
+            return;
+        }
         self.undo_mailbox(None, cx);
     }
 
@@ -4083,6 +4179,10 @@ impl Inbox {
     /// Write a read, unread, or star the rows already show. A failure says
     /// so and rereads the folder, so the rows go back to what is stored.
     fn apply_flags(&mut self, edit: FlagEdit, cx: &mut Context<Self>) {
+        if self.session.all_inboxes {
+            self.all_flags(edit, cx);
+            return;
+        }
         if self.session.search.is_some() {
             let Some(scopes) = self.session.search_scopes(&edit.ids) else {
                 return;
@@ -4176,6 +4276,10 @@ impl Inbox {
     }
 
     fn toggle_off_page_flags(&mut self, ids: Vec<String>, star: bool, cx: &mut Context<Self>) {
+        if self.session.all_inboxes {
+            self.toggle_all_flags(ids, star, cx);
+            return;
+        }
         if self.session.folder != self.session.list_folder
             || self.session.label_scope != self.session.list_label
         {
@@ -4461,6 +4565,10 @@ impl Inbox {
         suggestion: Option<crate::model::NoteRequest>,
         cx: &mut Context<Self>,
     ) {
+        if !self.bind_all_reader(cx) {
+            self.session.show_toast("The mailbox is unavailable", true);
+            return;
+        }
         let forwarding = kind == ReplyKind::Forward;
         if forwarding && (self.forwarding_attachments || self.attachment_busy) {
             self.session
@@ -4497,7 +4605,7 @@ impl Inbox {
         self.forwarding_attachments |= forwarding;
         let account = self.account_id.clone();
         let email = self.session.account_email.clone();
-        let roles = self.session.roles.clone();
+        let (roles, _, _) = self.all_reader_scope(cx);
         let source = self.attachment_source();
         let read = self.store.call({
             let account = account.clone();
@@ -4551,7 +4659,17 @@ impl Inbox {
                     );
                     if start.parts.reply_to_unverified {
                         let id = parent.headers.message_id;
-                        let _ = this.update(cx, |inbox, cx| inbox.watch_reply_check(id, cx));
+                        let _ = this.update(cx, |inbox, cx| {
+                            if let Some(owner) = inbox
+                                .all_inboxes
+                                .as_ref()
+                                .and_then(|all| all.members.get(account.as_str()))
+                            {
+                                owner.update(cx, |inbox, cx| inbox.watch_reply_check(id, cx));
+                            } else if inbox.account_id == account {
+                                inbox.watch_reply_check(id, cx);
+                            }
+                        });
                     }
                     let hub = hub.clone();
                     cx.background_executor()
@@ -4926,6 +5044,23 @@ impl Inbox {
             overlay,
             settings_page,
         } = before;
+        if let Some(action) = step.single_account_action
+            && let Some(window) = cx.try_global::<InboxWindow>().copied()
+        {
+            cx.defer(move |cx| {
+                let _ = window.0.update(cx, |_, window, cx| {
+                    accounts::perform_in_account(action, window, cx);
+                });
+            });
+            return;
+        }
+        if self.session.all_inboxes
+            && self.session.overlay == Overlay::Folders
+            && self.session.folder_intent == FolderIntent::Move
+            && overlay != Overlay::Folders
+        {
+            self.prepare_all_move(cx);
+        }
         if let Some(id) = step.switch_account.clone()
             && let Some(window) = cx.try_global::<InboxWindow>().copied()
         {
@@ -5067,7 +5202,11 @@ impl Inbox {
             }
         }
         if step.compose {
-            self.open_draft(None, None, cx);
+            if self.bind_all_reader(cx) {
+                self.open_draft(None, None, cx);
+            } else {
+                self.session.show_toast("The mailbox is unavailable", true);
+            }
         }
         if step.open_draft
             && let Some(row) = self.session.cursor_thread()
@@ -7356,13 +7495,17 @@ fn header(
         };
         let count_space = if drafts { 0. } else { COUNT_GAP + count_room };
         let name_room = (room - ACCOUNT_MIN - count_space).max(0.);
-        let title = label.map_or_else(
-            || {
-                crate::model::virtual_folder_label(folder)
-                    .map_or_else(|| session.roles.label(folder), str::to_owned)
-            },
-            present::display_safe,
-        );
+        let title = if session.all_inboxes {
+            String::new()
+        } else {
+            label.map_or_else(
+                || {
+                    crate::model::virtual_folder_label(folder)
+                        .map_or_else(|| session.roles.label(folder), str::to_owned)
+                },
+                present::display_safe,
+            )
+        };
         let name = if label.is_some() {
             fit(&title, name_room, FontWeight::SEMIBOLD)
         } else {
@@ -7471,10 +7614,14 @@ fn header(
             &fit,
         )
     };
-    let account_text = (
-        session.account_name.as_str(),
-        session.account_email.as_str(),
-    );
+    let account_text = if session.all_inboxes {
+        (all_inboxes::TITLE, "")
+    } else {
+        (
+            session.account_name.as_str(),
+            session.account_email.as_str(),
+        )
+    };
     let account = fit_account(account_text, current_width);
     // Each account fit shares its half of the fade with its folder. This
     // keeps both fits at their own widths and the right edge anchored.
@@ -8231,9 +8378,20 @@ fn thread_line_one(
     } else {
         0.0
     };
+    let cue_width = (text_width * 0.22).clamp(60.0, 122.0).floor();
+    let cue_space = if row.account_label.is_some() {
+        cue_width + THREAD_LINE_GAP
+    } else {
+        0.0
+    };
+    let cue = row
+        .account_label
+        .as_deref()
+        .and_then(|text| clip_shaped(window, &style, text, cue_width, FontWeight::NORMAL, None));
     // The leading group, star, and date need two gaps. Inside the group,
     // optional metadata and labels each need one gap after the previous item.
     let room = (text_width
+        - cue_space
         - date_width
         - count_width
         - attachment_width
@@ -8337,6 +8495,17 @@ fn thread_line_one(
                     )
                 }),
         )
+        .when_some(cue, |row, cue| {
+            row.child(
+                div()
+                    .w(px(cue_width))
+                    .flex_none()
+                    .text_color(rgb(dim))
+                    .text_size(px(size))
+                    .whitespace_nowrap()
+                    .child(cue.text),
+            )
+        })
         .child(
             div()
                 .flex_none()
@@ -14098,6 +14267,7 @@ mod tests {
     fn row(id: &str) -> super::ThreadRow {
         use crate::present::NameSpan;
         super::ThreadRow {
+            account_label: None,
             muted: false,
             wake_at: None,
             id: id.into(),

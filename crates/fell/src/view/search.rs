@@ -2401,6 +2401,7 @@ mod tests {
     #[test]
     fn narrow_search_rows_fit_compact_dates_without_crowding_the_subject() {
         let mut row = present::ThreadRow {
+            account_label: None,
             muted: false,
             wake_at: None,
             id: "field-report".into(),

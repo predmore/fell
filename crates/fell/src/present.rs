@@ -23,6 +23,7 @@ pub struct NameSpan {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ThreadRow {
+    pub account_label: Option<String>,
     pub muted: bool,
     pub wake_at: Option<i64>,
     pub id: String,
@@ -509,6 +510,7 @@ pub fn thread_rows(threads: &[FolderThread], me: &str) -> Vec<ThreadRow> {
     threads
         .iter()
         .map(|thread| ThreadRow {
+            account_label: None,
             id: thread.thread_id.0.clone(),
             muted: thread.muted,
             wake_at: None,
@@ -589,6 +591,7 @@ pub fn draft_rows(drafts: &[DraftSummary]) -> Vec<ThreadRow> {
                 labels.push(agent);
             }
             ThreadRow {
+                account_label: None,
                 muted: false,
                 wake_at: None,
                 id: draft_row_id(&draft.id),
@@ -1977,6 +1980,7 @@ mod tests {
     fn a_synced_draft_row_names_who_it_is_to() {
         // #99: synced drafts showed their sender, "me".
         let mut rows = vec![ThreadRow {
+            account_label: None,
             muted: false,
             wake_at: None,
             id: "t1".into(),

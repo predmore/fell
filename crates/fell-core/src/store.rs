@@ -2380,6 +2380,19 @@ impl Store {
         summaries::folder_page(&self.conn, account_id, folder, span)
     }
 
+    /// Read at most `limit` folder rows inside the supplied key bounds.
+    /// From the end, take the oldest matching rows, still in list order.
+    pub fn folder_slice(
+        &self,
+        account: &AccountId,
+        folder: &str,
+        bounds: (std::ops::Bound<&ListKey>, std::ops::Bound<&ListKey>),
+        limit: usize,
+        from_end: bool,
+    ) -> Result<Vec<FolderThread>> {
+        summaries::folder_slice(&self.conn, account, folder, bounds, limit, from_end)
+    }
+
     /// A window of an exact label's list and the position of its selected thread.
     pub fn label_page(
         &self,

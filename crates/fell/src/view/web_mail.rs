@@ -1464,6 +1464,36 @@ impl Inbox {
         cx: &mut Context<Self>,
     ) {
         let account = self.account_id.clone();
+        if let Some(owner) = self
+            .all_inboxes
+            .as_ref()
+            .and_then(super::all_inboxes::AllInboxes::reader)
+        {
+            owner.update(cx, |inbox, cx| {
+                let prefs = inbox
+                    .web_mail
+                    .preferences
+                    .entry(sender.clone())
+                    .or_default();
+                if action == Action::ToggleWebView {
+                    prefs.0 = Some(value);
+                } else {
+                    prefs.1 = value;
+                    if !value {
+                        inbox
+                            .web_mail
+                            .allowed_once
+                            .retain(|_, (address, _)| address.as_deref() != Some(&sender));
+                        inbox
+                            .web_mail
+                            .show_images_for
+                            .retain(|_, (address, _)| address.as_deref() != Some(&sender));
+                        inbox.web_mail.evict_sender(&sender, cx);
+                    }
+                }
+                cx.notify();
+            });
+        }
         let reply = self.store.call(move |store| {
             if action == Action::ToggleWebView {
                 store.set_sender_web_view(&account, &sender, value)
