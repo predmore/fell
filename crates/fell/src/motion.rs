@@ -704,6 +704,13 @@ impl<R: Clone> ListShift<R> {
         }
     }
 
+    fn resolved_start(&self, id: &str, top: f32) -> Option<f32> {
+        match self.resolved.get(id) {
+            Some(start) => *start,
+            None => self.start_for(id, top),
+        }
+    }
+
     /// Fix row `id`'s start the first time it is asked for.
     fn resolve(&mut self, id: &str, top: f32) -> Option<f32> {
         if let Some(start) = self.resolved.get(id) {
@@ -727,6 +734,14 @@ impl<R: Clone> ListShift<R> {
     /// Rows resolved without a start are already being drawn in place.
     pub fn in_place_arrival(&self, id: &str) -> bool {
         matches!(self.resolved.get(id), Some(None))
+    }
+
+    /// Whether an in-place start has shown batch ink. Before the first
+    /// paint, use the same start calculation as painting and scrolling.
+    pub fn in_place_visibility(&self, id: &str, top: f32) -> Option<bool> {
+        self.resolved_start(id, top)
+            .is_none()
+            .then(|| matches!(self.batch_fades.get(id), Some(Some(_))))
     }
 
     pub fn hidden_arrival(&self, id: &str) -> bool {
@@ -835,12 +850,8 @@ impl<R: Clone> ListShift<R> {
     /// so a row in flight keeps its place. A row not drawn yet (two changes
     /// before one frame) is where it would have been drawn.
     pub fn offset_of(&self, id: &str, top: f32, now: Instant) -> f32 {
-        let p = self.slide_progress(now);
-        let start = match self.resolved.get(id) {
-            Some(start) => *start,
-            None => self.start_for(id, top),
-        };
-        start.map_or(0.0, |dy| dy * (1.0 - p))
+        self.resolved_start(id, top)
+            .map_or(0.0, |dy| dy * (1.0 - self.slide_progress(now)))
     }
 
     /// Furthest outside the viewport a slot can be while its row is visible.

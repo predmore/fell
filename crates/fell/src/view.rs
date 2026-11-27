@@ -2678,9 +2678,15 @@ impl Inbox {
                 (previous_offset - offset).abs() >= 0.5
             });
         let waiting = interrupted.map_or_else(HashSet::new, |shift| {
-            keep_ordered_starts(&mut before, &ids, |id| {
-                !stable.is_some_and(|(selected, _)| selected == id) && shift.in_place_arrival(id)
-            })
+            let arrivals = drawn
+                .iter()
+                .filter(|old| !stable.is_some_and(|(selected, _)| selected == old.row.id))
+                .filter_map(|old| {
+                    let id = old.row.id.as_str();
+                    Some((id, shift.in_place_visibility(id, old.slot)?))
+                })
+                .collect();
+            keep_ordered_starts(&mut before, &ids, &arrivals)
         });
         let mut sliding_arrivals = HashSet::new();
         if !replace && batch {
@@ -6565,24 +6571,49 @@ struct Drawn {
     slot: f32,
 }
 
-/// An in-place arrival can sit within a slider's painted row. Only carry
-/// starts that preserve the new list order without two full rows crossing.
+/// Reserve the opaque rows' starts first. An arrival can join those rows
+/// if it has shown ink and fits between them in the new list order.
 fn keep_ordered_starts(
     before: &mut Vec<(String, f32)>,
     indices: &HashMap<&str, usize>,
-    in_place_arrival: impl Fn(&str) -> bool,
+    arrivals: &HashMap<&str, bool>,
 ) -> HashSet<String> {
     before.sort_by_key(|(id, _)| indices.get(id.as_str()).copied().unwrap_or(usize::MAX));
+    let mut opaque = VecDeque::new();
     let mut bottom = f32::NEG_INFINITY;
     let mut waiting = HashSet::new();
+    for (id, top) in before.iter() {
+        if !indices.contains_key(id.as_str()) || arrivals.contains_key(id.as_str()) {
+            continue;
+        }
+        if *top + 0.001 < bottom {
+            waiting.insert(id.clone());
+        } else {
+            opaque.push_back(*top);
+            bottom = *top + ROW_PX;
+        }
+    }
+    bottom = f32::NEG_INFINITY;
     before.retain(|(id, top)| {
         if !indices.contains_key(id.as_str()) {
             // ListShift still counts departures when detecting replacement.
             return true;
         }
-        if in_place_arrival(id) || *top + 0.001 < bottom {
-            waiting.insert(id.clone());
+        if waiting.contains(id) {
             return false;
+        }
+        if let Some(&visible) = arrivals.get(id.as_str()) {
+            if !visible
+                || *top + 0.001 < bottom
+                || opaque
+                    .front()
+                    .is_some_and(|next| *top + ROW_PX > *next + 0.001)
+            {
+                waiting.insert(id.clone());
+                return false;
+            }
+        } else {
+            opaque.pop_front();
         }
         bottom = *top + ROW_PX;
         true
@@ -8108,8 +8139,7 @@ impl BatchSlider {
         let painted = self.slot + self.dy;
         let arrival_top = top + ROW_INK_INSET;
         let arrival_bottom = top + ROW_PX - ROW_INK_INSET;
-        painted.min(self.slot) + ROW_INK_INSET < arrival_bottom
-            && painted.max(self.slot) + ROW_PX - ROW_INK_INSET > arrival_top
+        painted.min(self.slot) < arrival_bottom && painted.max(self.slot) + ROW_PX > arrival_top
     }
 }
 
@@ -14323,12 +14353,19 @@ mod tests {
         assert_eq!(draw(16, &[approaching]), 0.0, "a second slider will cross");
         let last = BatchSlider {
             slot: 3.0 * ROW_PX,
-            dy: -25.0,
+            dy: -super::ROW_INK_INSET - 1.0,
         };
         assert!(last.covers(slot));
+        assert!(
+            last.crosses(slot),
+            "the slider fill still covers the first line"
+        );
         assert_eq!(draw(83, std::slice::from_ref(&last)), 0.0);
-        let padding = BatchSlider { dy: -24.0, ..last };
-        assert!(padding.covers(slot));
+        let padding = BatchSlider {
+            dy: -super::ROW_INK_INSET,
+            ..last
+        };
+        assert!(!padding.covers(slot));
         assert!(!padding.crosses(slot));
         assert_eq!(draw(84, &[padding]), motion::ARRIVE_FROM);
         assert!(shift.running(at(163)));
@@ -14407,6 +14444,20 @@ mod tests {
             start,
         )
         .unwrap();
+        let indices = [("arrival", 0), ("slider", 1)].into();
+        let unpainted_slider_top = ROW_PX + first.offset_of("slider", ROW_PX, start);
+        let mut unpainted = vec![
+            ("arrival".into(), 0.0),
+            ("slider".into(), unpainted_slider_top),
+        ];
+        let arrivals = [("arrival", 0.0), ("slider", ROW_PX)]
+            .into_iter()
+            .filter_map(|(id, top)| Some((id, first.in_place_visibility(id, top)?)))
+            .collect();
+        let waiting = keep_ordered_starts(&mut unpainted, &indices, &arrivals);
+        assert!(waiting.contains("arrival"));
+        assert_eq!(unpainted, [("slider".into(), 0.0)]);
+
         first.begin_frame(start);
         let interrupt = start + Duration::from_millis(12);
         let slider_top = ROW_PX + first.batch_row("slider", ROW_PX, false, interrupt).dy;
@@ -14414,11 +14465,18 @@ mod tests {
         assert_eq!(hidden.opacity, 0.0);
         assert!(slider_top < ROW_PX - 2.0 * super::ROW_INK_INSET);
         let mut before = vec![("arrival".into(), hidden.dy), ("slider".into(), slider_top)];
-        let waiting =
-            keep_ordered_starts(&mut before, &[("arrival", 0), ("slider", 1)].into(), |id| {
-                first.in_place_arrival(id)
-            });
+        let arrivals = [(
+            "arrival",
+            first.in_place_visibility("arrival", 0.0).unwrap(),
+        )]
+        .into();
+        let waiting = keep_ordered_starts(&mut before, &indices, &arrivals);
         assert_eq!(before, [("slider".into(), slider_top)]);
+        let mut overlapping = vec![("arrival".into(), 0.0), ("slider".into(), slider_top)];
+        let waiting_visible =
+            keep_ordered_starts(&mut overlapping, &indices, &[("arrival", true)].into());
+        assert_eq!(waiting_visible, waiting);
+        assert_eq!(overlapping, before);
         for change in [ListChange::Shift, batch] {
             let mut second = ListShift::<()>::start(
                 &motion,
@@ -14462,6 +14520,93 @@ mod tests {
                 saw_arrival |= arrival.opacity >= motion::ARRIVE_FROM;
             }
             assert!(saw_arrival);
+        }
+    }
+
+    #[test]
+    fn undoing_a_top_four_archive_slides_visible_arrivals_from_their_painted_tops() {
+        use super::{BatchLayers, ListChange, ListShift, ROW_PX, keep_ordered_starts};
+
+        let start = Instant::now();
+        let motion = motion::Motion::new(true);
+        let h = ROW_PX;
+        let viewport = 10.0 * h;
+        let survivors = ["first survivor", "second survivor"];
+        let originals = ["archived 0", "archived 1", "archived 2", "archived 3"];
+        let indices: std::collections::HashMap<_, _> =
+            originals.into_iter().chain(survivors).zip(0..).collect();
+        let removed: Vec<_> = originals
+            .into_iter()
+            .enumerate()
+            .map(|(i, id)| (id, i as f32 * h))
+            .collect();
+        let mut archive = ListShift::start(
+            &motion,
+            indices
+                .iter()
+                .map(|(&id, &i)| (id.into(), i as f32 * h))
+                .collect(),
+            removed,
+            vec![],
+            viewport,
+            ListChange::BatchLeave { row_height: h },
+            start,
+        )
+        .unwrap();
+        archive.begin_frame(start);
+        let mut before = Vec::new();
+        let mut arrivals = std::collections::HashMap::new();
+        let undo_time = start + Duration::from_millis(100);
+        for ms in [0, 12, 100] {
+            let now = start + Duration::from_millis(ms);
+            let mut layers = BatchLayers {
+                slides: vec![],
+                bands: vec![],
+                ink: archive
+                    .ghosts()
+                    .iter()
+                    .map(|ghost| (ghost.row, ghost.top, ghost.ink_opacity(now)))
+                    .collect(),
+            };
+            for (i, id) in survivors.into_iter().enumerate() {
+                let slot = i as f32 * h;
+                let row = layers.row(&mut archive, id, (slot, slot), now);
+                if now == undo_time {
+                    assert_eq!(row.opacity, 1.0);
+                    assert_eq!(row.dy, 0.0);
+                    before.push((id.into(), slot));
+                    arrivals.insert(id, archive.in_place_visibility(id, slot).unwrap());
+                }
+            }
+        }
+        assert!(archive.running(undo_time));
+        let waiting = keep_ordered_starts(&mut before, &indices, &arrivals);
+        let offsets: Vec<_> = before
+            .iter()
+            .map(|(id, top)| *top - indices[id.as_str()] as f32 * h)
+            .collect();
+        let mut undo = ListShift::<()>::start(
+            &motion,
+            before,
+            vec![],
+            vec![],
+            viewport,
+            ListChange::Shift,
+            undo_time,
+        )
+        .unwrap()
+        .with_waiting_arrivals(waiting)
+        .with_slide_offsets(h, None, offsets.into_iter())
+        .show_restored_selection();
+        undo.begin_frame(undo_time);
+        for (i, id) in survivors.into_iter().enumerate() {
+            let slot = indices[id] as f32 * h;
+            let row = undo.row(id, slot, h, None, undo_time);
+            assert_eq!(slot + row.dy, i as f32 * h);
+            assert_eq!(row.opacity, 1.0);
+            let later = undo.row(id, slot, h, None, undo_time + Duration::from_millis(16));
+            assert!(later.dy > row.dy && later.dy < 0.0);
+            assert_eq!(later.opacity, 1.0);
         }
     }
 
