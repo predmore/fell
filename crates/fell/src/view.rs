@@ -345,6 +345,8 @@ struct ReadIntent {
     /// Undo: select this thread when it is back in the folder, loading the
     /// rows around it if they are not loaded.
     select: Option<ListKey>,
+    /// Threads undo may have returned to this list.
+    restored: Vec<ThreadId>,
     /// What the notification opens once its row lands.
     notification_pane: Option<Pane>,
     /// Rows the list asked for beyond the ones it holds.
@@ -357,6 +359,7 @@ impl ReadIntent {
         self.refresh_open |= later.refresh_open;
         self.changed |= later.changed;
         self.hold_selection |= later.hold_selection;
+        self.restored.extend(later.restored);
         if later.select.is_some() {
             self.select = later.select;
             self.notification_pane = later.notification_pane;
@@ -2131,6 +2134,23 @@ impl Inbox {
             self.motion.finish_empty_list_entry();
         }
         let before_id = self.session.cursor_id.clone();
+        let restoration = (!switched && !intent.restored.is_empty()).then(|| {
+            let present: HashSet<_> = self
+                .session
+                .threads
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect();
+            RestoredRows {
+                ids: intent
+                    .restored
+                    .iter()
+                    .filter(|id| !present.contains(id.as_str()))
+                    .map(|id| id.0.clone())
+                    .collect(),
+                previous_cursor: before_id.as_deref(),
+            }
+        });
         let regroup_previous = intent
             .hold_selection
             .then(|| self.session.cursor_thread().cloned())
@@ -2209,7 +2229,7 @@ impl Inbox {
             } else {
                 ListChange::Shift
             };
-            self.start_list_shift(drawn, change, intent.select.is_some(), top_arrival);
+            self.start_list_shift(drawn, change, restoration, top_arrival);
         }
         if self.session.list_label.is_some() {
             self.warm = None;
@@ -2596,7 +2616,7 @@ impl Inbox {
         &mut self,
         drawn: Vec<Drawn>,
         change: ListChange,
-        reveal_selection: bool,
+        restoration: Option<RestoredRows<'_>>,
         top_arrival: bool,
     ) {
         let now = self.motion.clock.now();
@@ -2677,7 +2697,7 @@ impl Inbox {
                 let previous_offset = first.slot - first.index as f32 * ROW_PX;
                 (previous_offset - offset).abs() >= 0.5
             });
-        let waiting = interrupted.map_or_else(HashSet::new, |shift| {
+        let mut waiting = interrupted.map_or_else(HashSet::new, |shift| {
             let arrivals = drawn
                 .iter()
                 .filter(|old| !stable.is_some_and(|(selected, _)| selected == old.row.id))
@@ -2687,6 +2707,54 @@ impl Inbox {
                 })
                 .collect();
             keep_ordered_starts(&mut before, &ids, &arrivals)
+        });
+        let selection = restoration.and_then(|mut restored| {
+            let to = self
+                .session
+                .cursor_id
+                .as_ref()
+                .filter(|id| restored.ids.contains(*id));
+            // Undo can land while the picker still covers the old list.
+            // Those rows are still fully painted as ghosts. Reuse their
+            // positions so they stay visible when they become live again.
+            let mut restored_band = None;
+            if let Some(shift) = interrupted.filter(|shift| shift.holding(self.frame_now)) {
+                let old_offset = self.motion.painted_list_offset().unwrap_or(offset);
+                for ghost in shift.ghosts() {
+                    let id = &ghost.row.row.id;
+                    if ids.contains_key(id.as_str())
+                        && ghost.ink_opacity(self.frame_now) == 1.0
+                        && restored.ids.remove(id)
+                    {
+                        let top = ghost.top + old_offset;
+                        before.push((id.clone(), top));
+                        if to == Some(id) && ghost.row.selected {
+                            restored_band = Some(top - offset);
+                        }
+                    }
+                }
+            }
+            waiting.extend(
+                restored
+                    .ids
+                    .into_iter()
+                    .filter(|id| ids.contains_key(id.as_str())),
+            );
+            let to = to?;
+            let painted = restored_band.or_else(|| {
+                let from = restored.previous_cursor?;
+                interrupted
+                    .and_then(|shift| shift.selection_band(self.frame_now))
+                    .filter(|(id, _)| *id == from)
+                    .map(|(_, top)| top)
+                    .or_else(|| {
+                        drawn
+                            .iter()
+                            .find(|old| old.row.id == from)
+                            .map(|old| old.top - offset)
+                    })
+            })?;
+            Some((to.clone(), painted, *ids.get(to.as_str())? as f32 * ROW_PX))
         });
         let mut sliding_arrivals = HashSet::new();
         if !replace && batch {
@@ -2763,6 +2831,7 @@ impl Inbox {
             })
             .filter(|(_, top)| end == 0.0 || *top >= end)
             .collect();
+        let after_picker = self.motion.move_picker_exit_end().filter(|&end| end > now);
         self.motion.list = ListShift::start(
             &self.motion.motion,
             before,
@@ -2773,15 +2842,18 @@ impl Inbox {
             now,
         )
         .map(|shift| {
-            let shift = shift
+            let mut shift = shift
                 .fading_below(below)
                 .with_waiting_arrivals(waiting)
                 .with_sliding_arrivals(sliding_arrivals)
                 .with_slide_offsets(ROW_PX, batch_viewport, slide_offsets.into_iter());
+            if let Some(start) = after_picker {
+                shift = shift.after_overlay(start);
+            }
             if top_arrival && !batch_leave {
                 shift.top_arrival()
-            } else if reveal_selection && !replace && !batch_leave {
-                shift.show_restored_selection()
+            } else if let Some((id, from, to)) = selection {
+                shift.with_restored_selection(id, from, to)
             } else {
                 shift
             }
@@ -3685,6 +3757,8 @@ impl Inbox {
         let to = destination.clone();
         let key = self.selected_key();
         if !search && !self.session.roles.is_view(&self.session.list_folder) {
+            let now = self.motion.clock.now();
+            self.motion.accept_move_picker(now);
             self.take_out_of_list(&ids, cx);
         }
         self.change_mailbox(
@@ -3838,7 +3912,7 @@ impl Inbox {
         } else {
             ListChange::Shift
         };
-        self.start_list_shift(drawn, change, false, false);
+        self.start_list_shift(drawn, change, None, false);
         self.request_messages(true, cx);
         // The removed row was the last one loaded: load the row after it.
         self.issue_fetch(cx);
@@ -4012,7 +4086,7 @@ impl Inbox {
             move |inbox, result, cx| {
                 inbox.undos_in_flight -= 1;
                 match result {
-                    Ok((action, note_notice, restored, select, grouping, regroup_to)) => {
+                    Ok((action, note_notice, mut restored, select, grouping, regroup_to)) => {
                         if note_notice.is_some() || grouping {
                             inbox.note_generation = inbox.note_generation.wrapping_add(1);
                         }
@@ -4089,7 +4163,7 @@ impl Inbox {
                             && inbox.session.search.is_some()
                             && !restored.is_empty()
                         {
-                            inbox.search_view.prefer = restored;
+                            inbox.search_view.prefer = std::mem::take(&mut restored);
                         }
                         let select =
                             select.filter(|_| still_viewing && (!grouping || follow_group));
@@ -4098,6 +4172,11 @@ impl Inbox {
                             refresh_open: grouping,
                             hold_selection: follow_group,
                             select,
+                            restored: if still_viewing && !grouping {
+                                restored
+                            } else {
+                                Vec::new()
+                            },
                             ..ReadIntent::default()
                         })
                     }
@@ -6571,6 +6650,11 @@ struct Drawn {
     slot: f32,
 }
 
+struct RestoredRows<'a> {
+    ids: HashSet<String>,
+    previous_cursor: Option<&'a str>,
+}
+
 /// Reserve the opaque rows' starts first. An arrival can join those rows
 /// if it has shown ink and that ink fits between them in the new list order.
 fn keep_ordered_starts(
@@ -7780,20 +7864,28 @@ fn thread_list(
                 if let Some(shift) = inbox.motion.list.as_mut() {
                     shift.begin_frame(now);
                 }
+                let shift = inbox.motion.list.as_ref();
+                let holding = shift.is_some_and(|shift| shift.holding(now));
+                let selection_band = shift
+                    .and_then(|shift| shift.selection_band(now))
+                    .filter(|(id, _)| inbox.session.cursor_id.as_deref() == Some(*id))
+                    .map(|(_, top)| top);
                 let mut batch_layers = inbox
                     .motion
                     .list
                     .as_ref()
                     .filter(|shift| shift.batch_arrivals())
                     .map(|shift| {
-                        BatchLayers::for_frame(
+                        let mut layers = BatchLayers::for_frame(
                             &inbox.session.threads,
                             visible.clone(),
                             shift,
                             (offset, viewport),
                             now,
                             scale,
-                        )
+                        );
+                        layers.bands.extend(selection_band.map(|top| (top, 1.0)));
+                        layers
                     });
                 let batch_motion = batch_layers.is_some();
                 let rows: Vec<_> = range
@@ -7809,13 +7901,15 @@ fn thread_list(
                         );
                         let previous_labels =
                             inbox.row_widths.labels_frame(&row.id, &row.labels, now);
-                        let selected = highlighted.contains(&row.id);
+                        let selected = !holding && highlighted.contains(&row.id);
+                        let band_owns_fill = selection_band.is_some()
+                            && (!selected || inbox.session.cursor_id.as_deref() == Some(&row.id));
                         let regroup = inbox
                             .regroup_selection
                             .as_ref()
                             .filter(|fade| selected && fade.selected == row.id);
                         let mut look = RowLook {
-                            content_only: regroup.is_some(),
+                            content_only: regroup.is_some() || band_owns_fill,
                             selected,
                             fading: inbox
                                 .motion
@@ -7889,8 +7983,8 @@ fn thread_list(
                                         motion::snap(painted - top, scale)
                                     };
                                     let look = RowLook {
-                                        content_only: false,
-                                        selected: highlighted.contains(&row.id),
+                                        content_only: selection_band.is_some(),
+                                        selected: !holding && highlighted.contains(&row.id),
                                         fading: None,
                                         ghost: false,
                                         bar_dx,
@@ -8021,7 +8115,7 @@ fn thread_list(
                                 &theme_for_rows,
                                 index as f32 * ROW_PX,
                                 moving.opacity,
-                                selected,
+                                selected && !band_owns_fill,
                                 bands,
                                 element,
                                 window.scale_factor(),
@@ -8031,7 +8125,8 @@ fn thread_list(
                                 (index as f32 - slider_slot.unwrap_or(index) as f32) * ROW_PX,
                                 moving,
                                 selected.then_some(theme_for_rows.selection),
-                                batch.then_some(theme_for_rows.background),
+                                (batch && selection_band.is_none())
+                                    .then_some(theme_for_rows.background),
                                 element,
                                 window,
                             )
@@ -8040,7 +8135,8 @@ fn thread_list(
                             sliders.push(layer.block_mouse_except_scroll());
                             None
                         } else {
-                            Some(layer)
+                            (batch_arrival || moving.opacity > 0.0 || regroup.is_some())
+                                .then_some(layer)
                         };
                         if batch_motion {
                             sliders.append(&mut overflow);
@@ -14717,8 +14813,7 @@ mod tests {
         )
         .unwrap()
         .with_waiting_arrivals(waiting)
-        .with_slide_offsets(h, None, offsets.into_iter())
-        .show_restored_selection();
+        .with_slide_offsets(h, None, offsets.into_iter());
         undo.begin_frame(undo_time);
         for (i, id) in survivors.into_iter().enumerate() {
             let slot = indices[id] as f32 * h;
@@ -14775,8 +14870,7 @@ mod tests {
         )
         .unwrap()
         .with_sliding_arrivals(["tail".into(), "end".into()].into())
-        .with_slide_offsets(h, None, rows.map(|(_, slot, top)| top - slot).into_iter())
-        .show_restored_selection();
+        .with_slide_offsets(h, None, rows.map(|(_, slot, top)| top - slot).into_iter());
         let first_frame = interrupt + motion::MAX_STEP;
         reversal.begin_frame(first_frame);
         for ms in 0..=160 {
@@ -15542,7 +15636,7 @@ mod tests {
 
     #[test]
     fn archive_undo_selects_each_restored_row_and_the_first_of_a_batch() {
-        use super::{ListChange, ListShift, Motion, ROW_PX, restored_folder_key};
+        use super::{BatchLayers, ListChange, ListShift, Motion, ROW_PX, restored_folder_key};
         use crate::fixtures::{fixture_account, seed_if_empty};
         use crate::keymap::{KeyId, Keymap};
         use crate::model::{Session, SyncKind};
@@ -15579,6 +15673,7 @@ mod tests {
         }
 
         let restore = |session: &mut Session, expected: &ListKey| {
+            let from = session.cursor_index() as f32 * ROW_PX;
             let before = session
                 .threads
                 .iter()
@@ -15600,14 +15695,8 @@ mod tests {
             let cursor_id = session.cursor_id.as_deref().unwrap();
             assert!(session.highlighted().contains(cursor_id));
             let top = cursor as f32 * ROW_PX;
-            let below = session
-                .threads
-                .iter()
-                .enumerate()
-                .skip(cursor + 1)
-                .map(|(index, row)| (row.id.as_str(), index as f32 * ROW_PX));
             let first = std::time::Instant::now();
-            let mut shift = ListShift::<()>::start(
+            let mut shift = ListShift::start(
                 &Motion::new(true),
                 before,
                 vec![],
@@ -15617,14 +15706,30 @@ mod tests {
                 first,
             )
             .unwrap()
-            .show_restored_selection();
-            let row = shift.row(cursor_id, top, ROW_PX, below, first);
-            assert!(
-                row.reveal.is_some(),
-                "an adjacent survivor makes room for the row"
-            );
-            let highlight = row.visible_height(ROW_PX, 1.0);
-            assert!(highlight > 0.0, "first-frame highlight: {highlight}");
+            .with_waiting_arrivals(restored.iter().map(|id| id.0.clone()).collect())
+            .with_restored_selection(cursor_id.to_owned(), from, top);
+            shift.begin_frame(first);
+            assert_eq!(shift.selection_band(first), Some((cursor_id, from)));
+            let midpoint = first + motion::SLIDE / 2;
+            let band_top = shift.selection_band(midpoint).unwrap().1;
+            assert_eq!(band_top, motion::lerp(from, top, motion::ease_out(0.5)));
+            let settled = first + motion::SLIDE;
+            assert_eq!(shift.selection_band(settled), Some((cursor_id, top)));
+            for now in [first, midpoint, settled] {
+                let mut layers = BatchLayers::for_frame(
+                    &session.threads,
+                    0..session.threads.len(),
+                    &shift,
+                    (0.0, 640.0),
+                    now,
+                    1.0,
+                );
+                let row = layers.row(&mut shift, cursor_id, (top, top), now);
+                assert_eq!(row.reveal, None);
+                if now == settled {
+                    assert!(row.opacity >= motion::ARRIVE_FROM);
+                }
+            }
             restored
         };
         for key in keys.iter().rev() {

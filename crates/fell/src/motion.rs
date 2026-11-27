@@ -32,8 +32,6 @@ use std::time::{Duration, Instant};
 pub const QUICK: Duration = Duration::from_millis(80);
 /// Rows moving, a pane sliding in, a scroll gliding to its target.
 pub const SLIDE: Duration = Duration::from_millis(120);
-/// Give a restored slot one frame of room before drawing its selection.
-const RESTORE_LEAD: Duration = Duration::from_millis(16);
 /// A pane coming into view: the conversation replacing the list in a
 /// narrow window, or the list coming back. The longest move, so the longest.
 pub const PANE: Duration = Duration::from_millis(160);
@@ -206,6 +204,10 @@ pub struct Transition {
 impl Transition {
     pub fn new(started: Instant, duration: Duration) -> Self {
         Self { started, duration }
+    }
+
+    pub fn end(self) -> Instant {
+        self.started + self.duration
     }
 
     /// Linear progress from 0 to 1.
@@ -536,9 +538,12 @@ pub struct ListShift<R> {
     waiting_arrivals: HashSet<String>,
     /// Newly visible tail rows that fade while they move.
     sliding_arrivals: HashSet<String>,
-    /// Anchor the transition to its first paint and restart ghosts from
-    /// this index, leaving carried ghosts on their original clock.
+    /// Anchor the transition at its first paint, keeping carried ghosts
+    /// on their original clock.
     first_frame: Option<usize>,
+    first_new_ghost: usize,
+    /// Cursor highlight traveling between list positions in content pixels.
+    selection: Option<(String, f32, f32)>,
     /// Row id → its top before the change, in viewport pixels.
     before: HashMap<String, f32>,
     /// Row id → how far it is drawn from its slot when the shift starts,
@@ -602,6 +607,8 @@ impl<R: Clone> ListShift<R> {
             waiting_arrivals: HashSet::new(),
             sliding_arrivals: HashSet::new(),
             first_frame: batch_leave.then_some(first_new_ghost),
+            first_new_ghost,
+            selection: None,
             before: before.into_iter().collect(),
             resolved: HashMap::new(),
             ghosts,
@@ -649,12 +656,28 @@ impl<R: Clone> ListShift<R> {
 
     /// Start at the old painted positions even if the first frame is late.
     pub fn begin_frame(&mut self, now: Instant) {
-        if let Some(first) = self.first_frame.take() {
+        if !self.holding(now)
+            && let Some(first) = self.first_frame.take()
+        {
             for ghost in &mut self.ghosts[first..] {
                 ghost.transition.started = now;
             }
             self.transition.started = now;
         }
+    }
+
+    /// Keep the old positions and departing ink while a card fades away.
+    pub fn after_overlay(mut self, start: Instant) -> Self {
+        self.transition.started = start;
+        self.first_frame = Some(self.first_new_ghost);
+        for ghost in &mut self.ghosts[self.first_new_ghost..] {
+            ghost.transition.started = start;
+        }
+        self
+    }
+
+    pub fn holding(&self, now: Instant) -> bool {
+        now < self.transition.started
     }
 
     /// A leading arrival opens its slot from the first frame that paints it.
@@ -663,15 +686,15 @@ impl<R: Clone> ListShift<R> {
         self
     }
 
-    /// The restored row already owns the cursor. Give its slot room on
-    /// the first frame even when the motion clock draws at the start time.
-    pub fn show_restored_selection(mut self) -> Self {
-        if self.first_frame.is_none()
-            && let Some(start) = self.transition.started.checked_sub(RESTORE_LEAD)
-        {
-            self.transition.started = start;
-        }
+    pub fn with_restored_selection(mut self, id: String, from: f32, to: f32) -> Self {
+        self.selection = Some((id, from, to));
+        self.first_frame.get_or_insert(self.ghosts.len());
         self
+    }
+
+    pub fn selection_band(&self, now: Instant) -> Option<(&str, f32)> {
+        let (id, from, to) = self.selection.as_ref()?;
+        Some((id, lerp(*from, *to, self.slide_progress(now))))
     }
 
     /// The list was replaced (another folder): the old list's rows below
@@ -760,9 +783,10 @@ impl<R: Clone> ListShift<R> {
     /// Batch arrivals sit under the sliders. Keep both lines hidden until
     /// the slot is clear for the rest of the shift, then fade them in.
     pub fn batch_row(&mut self, id: &str, top: f32, covered: bool, now: Instant) -> RowMotion {
+        let holding = self.holding(now);
         let Some(dy) = self.resolve(id, top) else {
             let fade = self.batch_fades.entry(id.to_owned()).or_default();
-            let opacity = if covered {
+            let opacity = if covered || holding {
                 *fade = None;
                 0.0
             } else {
@@ -795,7 +819,7 @@ impl<R: Clone> ListShift<R> {
         if self.batch_leave {
             return self.batch_row(id, top, false, now);
         }
-        if std::mem::take(&mut self.opening_top) {
+        if !self.holding(now) && std::mem::take(&mut self.opening_top) {
             self.transition = Transition::new(now, Duration::from_millis(160));
         }
         let p = self.slide_progress(now);
@@ -805,8 +829,12 @@ impl<R: Clone> ListShift<R> {
                 opacity: self.slid_in_opacity(id, now),
                 reveal: None,
             },
+            None if self.holding(now) => RowMotion {
+                opacity: 0.0,
+                ..RowMotion::STILL
+            },
             None => {
-                // Consecutive restored rows share the gap opened by the
+                // Consecutive arrivals share the gap opened by the
                 // first surviving row below them. Reveal each slot only
                 // as that row passes it.
                 let reach = self.reach + height;
@@ -886,7 +914,7 @@ impl<R: Clone> ListShift<R> {
     }
 
     pub fn batch_arrivals(&self) -> bool {
-        self.batch_leave || !self.waiting_arrivals.is_empty()
+        self.batch_leave || !self.waiting_arrivals.is_empty() || self.selection.is_some()
     }
 
     pub fn waits_for_slot(&self, id: &str) -> bool {
@@ -951,6 +979,7 @@ impl<R: Clone> ListShift<R> {
     /// change moved nothing on screen, so no more frames are needed.
     pub fn is_still(&self) -> bool {
         !self.resolved.is_empty()
+            && self.selection.is_none()
             && self.sliding_arrivals.is_empty()
             && self.ghosts.is_empty()
             && self
