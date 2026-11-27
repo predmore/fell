@@ -8,6 +8,7 @@ use std::{fs, io};
 
 pub(crate) use fell_core::accounts::FileError as AccountConfigError;
 use fell_core::accounts::{self, Registry};
+use fell_core::file_lock::try_lock_briefly;
 use fell_core::{Account, AccountConfig, AccountId, Store};
 
 use crate::fixtures::{fixture_account, seed_if_empty};
@@ -680,8 +681,7 @@ fn lock_account_dir(path: &Path) -> Result<fs::File, AccountFileError> {
     // Serialize setup through publication, since a concurrent attempt could
     // otherwise replace the credential while this config is being written.
     let lock = private_config_dir(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
-    lock.try_lock()
-        .map_err(|err| format!("Couldn't lock the account directory: {err}"))?;
+    try_lock_briefly(&lock).map_err(|err| format!("Couldn't lock the account directory: {err}"))?;
     Ok(lock)
 }
 

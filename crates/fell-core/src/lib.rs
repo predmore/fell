@@ -16,6 +16,7 @@ pub mod credentials;
 #[cfg(unix)]
 pub mod diagnostics;
 pub mod embed;
+pub mod file_lock;
 pub mod folders;
 pub mod imap;
 pub mod message;

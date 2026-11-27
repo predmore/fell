@@ -692,7 +692,7 @@ fn lock_mailbox(path: &Path) -> Result<Option<File>, String> {
         .open(path)
     {
         Ok(file) => {
-            file.try_lock().map_err(|err| format!(
+            crate::file_lock::try_lock_briefly(&file).map_err(|err| format!(
                 "Close Fell and any fell-mcp sessions using this account before continuing: {err}"
             ))?;
             let metadata = file.metadata().map_err(|err| err.to_string())?;

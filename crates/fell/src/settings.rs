@@ -7,6 +7,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use fell_core::NotificationMode;
+use fell_core::file_lock::try_lock_briefly;
 use toml_edit::{DocumentMut, Item, Value};
 
 use crate::mailbox;
@@ -489,7 +490,7 @@ pub fn save(path: &Path, defaults: Values, edit: Edit) -> io::Result<Snapshot> {
     } else {
         File::open(dir)?
     };
-    lock.try_lock()?;
+    try_lock_briefly(&lock)?;
     let (mut document, before) = read_complete(path)?;
     let (preference, mut value) = match edit {
         Edit::Cycle(preference, backwards) => (

@@ -627,7 +627,7 @@ impl Store {
                 "Expected a mailbox file with one link".into(),
             ));
         }
-        lock.try_lock().map_err(|err| crate::Error::Invalid(format!(
+        crate::file_lock::try_lock_briefly(lock).map_err(|err| crate::Error::Invalid(format!(
             "Close Fell and any fell-mcp sessions using this account before deleting local mail: {err}"
         )))?;
         Ok(self._mailbox_lock.take().expect("locked mailbox file"))
