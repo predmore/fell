@@ -48,6 +48,7 @@ pub enum Action {
     Snoozed,
     Muted,
     Compose,
+    SendDraft,
     Reply,
     ReplyAll,
     Forward,
@@ -127,6 +128,7 @@ impl Action {
             Self::Snoozed => "Go to Snoozed",
             Self::Muted => "Go to Muted",
             Self::Compose => "Compose",
+            Self::SendDraft => "Send draft",
             Self::Reply => "Reply",
             Self::ReplyAll => "Reply all",
             Self::Forward => "Forward",
@@ -789,6 +791,12 @@ pub fn palette_items(keymap: &Keymap, query: &str, recent: &[Action]) -> Vec<Pal
 }
 
 pub fn binding_text(keymap: &Keymap, action: Action) -> String {
+    if action == Action::SendDraft {
+        return format!(
+            "{leader} m s",
+            leader = binding_key_label(KeyId::Leader, keymap)
+        );
+    }
     if let Action::Setting(SettingsRow::ResendChanges | SettingsRow::DiscardChanges) = action {
         let key = if action == Action::Setting(SettingsRow::ResendChanges) {
             crate::model::settings::RESEND_CHANGES_KEY
@@ -818,7 +826,13 @@ pub fn binding_text(keymap: &Keymap, action: Action) -> String {
             binding
                 .keys
                 .iter()
-                .map(|key| key_label(*key, &keymap.leader_name))
+                .map(|key| {
+                    if action == Action::OpenDiagnosticLog {
+                        binding_key_label(*key, keymap)
+                    } else {
+                        key_label(*key, &keymap.leader_name)
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(" ")
         })
@@ -831,6 +845,14 @@ pub fn binding_text(keymap: &Keymap, action: Action) -> String {
         )
         .collect::<Vec<_>>()
         .join(" · ")
+}
+
+pub fn binding_key_label(key: KeyId, keymap: &Keymap) -> String {
+    if key == KeyId::Leader && keymap.leader == KeyId::Space {
+        "Space".into()
+    } else {
+        key_label(key, &keymap.leader_name)
+    }
 }
 
 pub fn key_label(key: KeyId, leader_name: &str) -> String {

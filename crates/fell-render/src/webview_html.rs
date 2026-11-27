@@ -23,6 +23,9 @@ pub fn reader_line_height(size: f32) -> f32 {
     22. * size / layout::BODY_FONT_SIZE
 }
 
+/// Space between items in a native or colorless web list.
+pub const READER_LIST_GAP: f32 = 4.;
+
 /// Typography and colors shared with the native reader for colorless mail.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WebTextStyle {
@@ -347,11 +350,15 @@ impl WebMail {
                     link_css,
                     "a:any-link {{ color: #{:06x}; }}
                      hr {{ border: 0; border-top: 1px solid #{:06x}; }}
-                     div:has(> br:only-child:where(:not([data-fell-folded]))) {{ min-height: {paragraph_gap}px; }}
-                     p {{ margin: 0 0 {paragraph_gap}px; }}
-                     p:where(:last-child) {{ margin-bottom: 0; }}
+                     :is(p, ul, ol) {{ margin-block: 0 {paragraph_gap}px; }}
+                     :is(p, ul, ol):where(:last-child) {{ margin-bottom: 0; }}
+                     li + li {{ margin-top: {READER_LIST_GAP}px; }}
+                     li > :is(ul, ol) {{ margin-block: 8px 0; }}
+                     [data-fell-reader-extra-break] {{ display: none; }}
+                     [data-fell-reader-spacer] {{ height: {paragraph_gap}px; margin: 0; overflow: hidden; }}
+                     [data-fell-reader-spacer=\"hidden\"] {{ display: none; }}
                      body > :first-child, p:first-child {{ margin-top: 0; }}
-                     p:empty {{ min-height: {paragraph_gap}px; margin: 0; }}",
+                     div:has(> br:only-child:where(:not([data-fell-folded]))) {{ min-height: {paragraph_gap}px; }}",
                     text.link,
                     text.border,
                 )
@@ -380,7 +387,8 @@ impl WebMail {
         if collapsed {
             content.push_str(" data-fell-collapsed");
             link_css.push_str(
-                " body[data-fell-collapsed] [data-fell-folded] { display: none !important; }",
+                " body[data-fell-collapsed] [data-fell-folded] { display: none !important; }
+                  body[data-fell-collapsed] :is(p, ul, ol):where(:nth-last-child(1 of :not([data-fell-folded]))) { margin-bottom: 0; }",
             );
         }
         let mut offset = 0;
@@ -639,6 +647,80 @@ fn serialize_children(
     }
 }
 
+fn reader_spacer(node: ego_tree::NodeRef<'_, scraper::node::Node>, depth: u32) -> bool {
+    use scraper::node::Node;
+    depth < html::MAX_HTML_DEPTH
+        && node.children().all(|child| match child.value() {
+            Node::Text(text) => text.chars().all(char::is_whitespace),
+            Node::Comment(_) => true,
+            Node::Element(element) => match element.name() {
+                "br" => true,
+                "span" | "b" | "strong" | "i" | "em" | "s" | "strike" | "del" => {
+                    reader_spacer(child, depth + 1)
+                }
+                _ => false,
+            },
+            _ => false,
+        })
+}
+
+fn reader_content(node: &ego_tree::NodeRef<'_, scraper::node::Node>) -> bool {
+    use scraper::node::Node;
+    match node.value() {
+        Node::Text(text) => !text.chars().all(char::is_whitespace),
+        Node::Comment(_) => false,
+        _ => true,
+    }
+}
+
+fn is_reader_spacer(node: ego_tree::NodeRef<'_, scraper::node::Node>, depth: u32) -> bool {
+    node.value().as_element().is_some_and(|element| {
+        matches!(element.name(), "p" | "div")
+            && element.attr("style").is_none()
+            && element.attr("class").is_none()
+            && reader_spacer(node, depth)
+            && (element.name() == "p"
+                || node.children().any(|child| {
+                    child
+                        .value()
+                        .as_element()
+                        .is_some_and(|element| element.name() == "br")
+                }))
+    })
+}
+
+fn hide_reader_spacer(node: ego_tree::NodeRef<'_, scraper::node::Node>, depth: u32) -> bool {
+    let Some(before) = node.prev_siblings().find(reader_content) else {
+        return true;
+    };
+    before
+        .value()
+        .as_element()
+        .is_some_and(|element| matches!(element.name(), "p" | "ul" | "ol"))
+        || is_reader_spacer(before, depth)
+        || !node.next_siblings().any(|sibling| reader_content(&sibling))
+}
+
+fn extra_reader_break(node: ego_tree::NodeRef<'_, scraper::node::Node>) -> bool {
+    node.prev_siblings()
+        .filter(reader_content)
+        .take(2)
+        .take_while(|sibling| {
+            sibling
+                .value()
+                .as_element()
+                .is_some_and(|element| element.name() == "br")
+        })
+        .count()
+        == 2
+        && !node.ancestors().any(|ancestor| {
+            ancestor
+                .value()
+                .as_element()
+                .is_some_and(|element| element.name() == "pre")
+        })
+}
+
 fn serialize_node(
     node: ego_tree::NodeRef<'_, scraper::node::Node>,
     out: &mut String,
@@ -762,6 +844,16 @@ fn serialize_node(
             if folded {
                 out.push_str(" data-fell-folded");
             }
+            if prepared_page && is_reader_spacer(node, depth) {
+                if hide_reader_spacer(node, depth) {
+                    out.push_str(" data-fell-reader-spacer=\"hidden\"");
+                } else {
+                    out.push_str(" data-fell-reader-spacer");
+                }
+            }
+            if prepared_page && name == "br" && extra_reader_break(node) {
+                out.push_str(" data-fell-reader-extra-break");
+            }
             let mut wrote_style = false;
             for (name_attr, value) in &element.attrs {
                 let attr = name_attr.local.as_ref();
@@ -771,6 +863,8 @@ fn serialize_node(
                         | "data-fell-collapsed"
                         | "data-fell-image-tile"
                         | "data-fell-image-alt"
+                        | "data-fell-reader-spacer"
+                        | "data-fell-reader-extra-break"
                 ) || (image_tag
                     && matches!(attr, "src" | "srcset" | "alt" | "role" | "aria-label"))
                 {
@@ -2043,6 +2137,30 @@ mod tests {
                 18.
             );
         }
+    }
+
+    #[test]
+    fn the_reader_measures_the_same_gap_with_a_newline_separated_spacer() {
+        let html = include_str!("../fixtures/web-newline-spacers.html");
+        let plain = "<p>Bring the tide chart.</p><p>Meet at the harbor office.</p>";
+        let style = WebTextStyle {
+            family: None,
+            size: 15.,
+            foreground: 0,
+            link: 0,
+            border: 0,
+            inset: false,
+        };
+        let with_spacer = WebMail::prepare(html);
+        assert!(
+            with_spacer
+                .page_with_style("light", Some(&style), |_| None)
+                .contains("<p data-fell-reader-spacer=\"hidden\">")
+        );
+        assert_eq!(
+            with_spacer.estimated_height_with_style(432., Some(&style)),
+            WebMail::prepare(plain).estimated_height_with_style(432., Some(&style)),
+        );
     }
 
     #[test]

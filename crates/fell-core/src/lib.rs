@@ -94,17 +94,17 @@ pub enum Error {
     Search(String),
     #[error("{0}")]
     Action(String),
-    #[error("This draft has no text Fell can edit. The copy is still on the server.")]
+    #[error("No text Fell can edit · still on the server")]
     DraftBodyUnavailable,
-    #[error("This draft has formatting Fell can't edit yet. The copy is still on the server.")]
+    #[error("Can't edit this formatting · still on the server")]
     DraftFormattingUnavailable,
-    #[error("This message is no longer in Drafts.")]
+    #[error("Couldn't open draft · no longer in Drafts")]
     DraftNoLongerInFolder,
-    #[error("This draft is no longer available on the server.")]
+    #[error("Couldn't open draft · missing on server")]
     DraftUnavailable,
-    #[error("This draft has too many attachments or its attachments are too large.")]
+    #[error("Over the attachment limit · still on the server")]
     DraftAttachmentLimit,
-    #[error("This draft exceeds the 32 MiB message limit. The copy is still on the server.")]
+    #[error("Over the 32 MiB limit · still on the server")]
     DraftMessageLimit,
     #[error("Undo the newer action first")]
     AgentActivityBlocked(agent::ActivityBlocker),

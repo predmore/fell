@@ -1571,6 +1571,7 @@ impl Inbox {
                                 sent_append_delayed,
                                 draft_append_delayed,
                                 draft_append_recovered,
+                                draft_copy_placed,
                             } => {
                                 let sent_failed = dropped
                                     .iter()
@@ -1582,6 +1583,11 @@ impl Inbox {
                                     write.kind == OutboxKind::AppendDraft
                                         && write.reason != DropReason::DraftCleanup
                                 });
+                                if (draft_copy_placed || draft_append_delayed || draft_failed)
+                                    && inbox.session.in_drafts()
+                                {
+                                    inbox.request_threads(ReadIntent::default(), cx);
+                                }
                                 if dropped
                                     .iter()
                                     .any(|write| write.reason == DropReason::MoveRestored)
@@ -3534,7 +3540,8 @@ impl Inbox {
             lines.insert(0, warning.into());
         }
         if !lines.is_empty() {
-            self.session.show_toast(lines.join(" · "), true);
+            self.session
+                .set_toast(draft_notice(&self.session.keymap, lines.join(" · "), true));
             cx.notify();
         } else if self
             .session
@@ -3591,7 +3598,15 @@ impl Inbox {
                             {
                                 line = trimmed.to_owned();
                             }
-                            inbox.session.show_toast(line, warn);
+                            let handoff = present::is_draft_save_warning(&line);
+                            let notice = draft_notice(&inbox.session.keymap, line, warn);
+                            if handoff {
+                                inbox.motion.hand_off_notice(notice.clone());
+                            }
+                            inbox.session.set_toast(notice);
+                            if handoff {
+                                inbox.expire_action_notice(cx);
+                            }
                             cx.notify();
                         }
                     })
@@ -4701,33 +4716,22 @@ impl Inbox {
         else {
             return stored;
         };
+        let write_back = hub.server_drafts_enabled(&self.account_id);
         stored
             .into_iter()
-            .filter_map(|mut draft| {
-                let live = hub.with_session(&draft.id, |session| {
-                    (session.snapshot(), session.send_lock())
-                });
-                let Some((snap, lock)) = live else {
-                    return Some(draft);
-                };
-                match lock {
-                    Some(fell_core::compose::SendLock::Sent) => return None,
-                    Some(_) => draft.maybe_sent = true,
-                    None => {}
+            .filter_map(|draft| {
+                match hub.with_session(&draft.id, |session| {
+                    (
+                        session.snapshot(),
+                        session.send_lock(),
+                        session.save_receipt(),
+                    )
+                }) {
+                    Some((snap, lock, receipt)) => {
+                        overlay_live_draft(draft, snap, lock, receipt, write_back)
+                    }
+                    None => Some(draft),
                 }
-                let raw = |items: &[fell_core::compose::AddressView]| {
-                    items.iter().map(|item| item.raw.clone()).collect()
-                };
-                draft.to = raw(&snap.to);
-                draft.cc = raw(&snap.cc);
-                draft.bcc = raw(&snap.bcc);
-                draft.subject = snap.subject;
-                draft.body = snap.body;
-                draft.from = snap.from;
-                draft.reply_context = snap.reply_context;
-                draft.forwarded = snap.forwarded;
-                draft.in_reply_to = snap.in_reply_to.filter(|id| !id.trim().is_empty());
-                Some(draft)
             })
             .collect()
     }
@@ -7802,7 +7806,7 @@ fn thread_list(
                         let frame = inbox.row_widths.frame(
                             &row.id,
                             &row.subject,
-                            (row.unread, row.starred),
+                            (row.unread, row.starred, row.not_on_server),
                             |unread| line_px(window, &row.subject, row_weight(unread)),
                             now,
                             true,
@@ -8448,7 +8452,7 @@ fn ghost_row(
 /// or one shaped ahead of time.
 fn still_frame(row: &ThreadRow, window: &Window) -> RowFrame {
     let natural = line_px(window, &row.subject, row_weight(row.unread));
-    RowFrame::still(natural, row.unread, row.starred)
+    RowFrame::still(natural, row.unread, row.starred, row.not_on_server)
 }
 
 /// The cursors, folder and search state before a key ([`Inbox::before_step`]).
@@ -8519,6 +8523,7 @@ fn thread_row(
     };
     div()
         .id(element_id)
+        .relative()
         .h(px(ROW_PX))
         .w_full()
         .flex()
@@ -8589,6 +8594,8 @@ fn thread_row(
 
 const THREAD_LINE_GAP: f32 = 8.0;
 const THREAD_ATTACHMENT_MARK: &str = "⧉";
+const DRAFT_MARKER_SIZE: f32 = 6.0;
+const DRAFT_MARKER_GAP: f32 = 6.0;
 
 fn thread_line_one(
     theme: &Theme,
@@ -8630,6 +8637,11 @@ fn thread_line_one(
     // optional metadata and labels each need one gap after the previous item.
     let room = (text_width
         - date_width
+        - if row.draft.is_some() {
+            DRAFT_MARKER_SIZE + DRAFT_MARKER_GAP
+        } else {
+            0.0
+        }
         - count_width
         - attachment_width
         - if row.muted {
@@ -8735,9 +8747,23 @@ fn thread_line_one(
         .child(
             div()
                 .flex_none()
-                .text_color(rgb(dim))
-                .text_size(px(size))
-                .child(date),
+                .flex()
+                .items_center()
+                .gap(px(DRAFT_MARKER_GAP))
+                .when(row.draft.is_some(), |line| {
+                    line.child(
+                        div()
+                            .size(px(DRAFT_MARKER_SIZE))
+                            .rounded_full()
+                            .bg(rgb(if row.server_save_failed {
+                                theme.error
+                            } else {
+                                theme.star
+                            }))
+                            .opacity(frame.draft_marker),
+                    )
+                })
+                .child(div().text_color(rgb(dim)).text_size(px(size)).child(date)),
         )
 }
 
@@ -12963,12 +12989,13 @@ fn status_bar(
                 }
         };
         let room = (width - used).max(0.0);
+        let text = present::draft_status_text(&toast.text, width);
         let notice_size = if narrow
             && toast.alert
             && toast.label.is_none()
             && (hint.is_none() || !toast.text.contains('“'))
         {
-            let natural = bar_px(window, &toast.text, size, ui) + tail_width(size);
+            let natural = bar_px(window, &text, size, ui) + tail_width(size);
             if natural > room {
                 (size * (room - 2.).max(0.) / natural).max(11.)
             } else {
@@ -12980,7 +13007,7 @@ fn status_bar(
         let room = (room - tail_width(notice_size)).max(0.0);
         let measure = |text: &str| bar_px(window, text, notice_size, ui);
         let text = toast.label.as_ref().map_or_else(
-            || present::fit_notice(&toast.text, room, measure),
+            || present::fit_notice(&text, room, measure),
             |label| label.fit(room, measure),
         );
         #[cfg(test)]
@@ -13176,6 +13203,66 @@ fn status_bar(
             ),
             _ => bar,
         })
+}
+
+fn overlay_live_draft(
+    mut draft: DraftSummary,
+    snap: fell_core::compose::Snapshot,
+    lock: Option<fell_core::compose::SendLock>,
+    receipt: Option<fell_core::compose::SaveReceipt>,
+    write_back: bool,
+) -> Option<DraftSummary> {
+    use fell_core::compose::{AddressView, SaveReceipt, SendLock};
+
+    match lock {
+        Some(SendLock::Sent) => return None,
+        Some(_) => {
+            draft.maybe_sent = true;
+            draft.not_on_server = false;
+            draft.server_save_failed = false;
+        }
+        None if write_back => match receipt {
+            Some(SaveReceipt::ServerFailed) => {
+                draft.not_on_server = true;
+                draft.server_save_failed = true;
+            }
+            None | Some(SaveReceipt::Local | SaveReceipt::Pending) if snap.open => {
+                draft.not_on_server = true;
+                draft.server_save_failed = false;
+            }
+            _ => {}
+        },
+        None => {}
+    }
+    let raw = |items: Vec<AddressView>| items.into_iter().map(|item| item.raw).collect();
+    draft.to = raw(snap.to);
+    draft.cc = raw(snap.cc);
+    draft.bcc = raw(snap.bcc);
+    draft.subject = snap.subject;
+    draft.body = snap.body;
+    draft.from = snap.from;
+    draft.reply_context = snap.reply_context;
+    draft.forwarded = snap.forwarded;
+    draft.in_reply_to = snap.in_reply_to.filter(|id| !id.trim().is_empty());
+    Some(draft)
+}
+
+fn draft_notice(keymap: &keymap::Keymap, text: String, alert: bool) -> Toast {
+    let hint = text
+        .starts_with(fell_core::compose::SERVER_DRAFT_SAVE_FAILED)
+        .then(|| {
+            (
+                keymap::binding_text(keymap, Action::OpenDiagnosticLog),
+                " for log",
+            )
+        });
+    Toast {
+        text,
+        alert,
+        hint,
+        details: false,
+        label: None,
+    }
 }
 
 fn status_text(mut text: String, hint: Option<(&str, &str)>, theme: &Theme) -> StyledText {
@@ -14136,7 +14223,7 @@ fn archive_failure(err: &fell_core::Error) -> String {
     }
 }
 
-fn key_from(stroke: &Keystroke) -> Option<KeyId> {
+pub(crate) fn key_from(stroke: &Keystroke) -> Option<KeyId> {
     let bare = stroke.key.to_ascii_lowercase();
     if stroke.modifiers.control && stroke.modifiers.shift && bare == "p" {
         return Some(KeyId::CtrlShiftP);
@@ -15171,6 +15258,8 @@ mod tests {
             unread: true,
             draft: None,
             server_draft: None,
+            not_on_server: false,
+            server_save_failed: false,
         }
     }
 
@@ -15248,6 +15337,153 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn draft_notices_fit_at_490px_with_the_default_leader() {
+        use crate::{
+            keymap::{self, Action, Keymap},
+            model::Session,
+        };
+        use fell_core::{
+            Error,
+            compose::{
+                SERVER_DRAFT_SAVE_FAILED, SERVER_DRAFT_SAVE_RETRYING, server_draft_open_notice,
+            },
+        };
+
+        let keys = Keymap::default();
+        let mut session = Session::new("Demo", "demo@example.test", SyncKind::LocalOffline, keys);
+        let mut theme = crate::theme::load();
+        theme.ui_px = 15.;
+        let fit = |session: &mut Session, text: String, hint| {
+            let notice = super::draft_notice(&session.keymap, text, true);
+            assert_eq!(notice.hint, hint);
+            session.set_toast(notice);
+            let label = super::StatusLabel::new(&theme, session, None, 490.);
+            let frame = super::StatusLabels::default().update(
+                label,
+                motion::Motion::new(false),
+                Instant::now(),
+            );
+            draw_status_notice(&theme, session, frame, 490.).0
+        };
+        assert_eq!(
+            fit(
+                &mut session,
+                SERVER_DRAFT_SAVE_FAILED.into(),
+                Some(("Space ? l".into(), " for log"))
+            ),
+            "Not on server · edit to retry",
+        );
+        assert_eq!(
+            fit(&mut session, SERVER_DRAFT_SAVE_RETRYING.into(), None),
+            "Not on server · retrying",
+        );
+        for error in [
+            Error::DraftBodyUnavailable,
+            Error::DraftFormattingUnavailable,
+            Error::DraftNoLongerInFolder,
+            Error::DraftUnavailable,
+            Error::DraftAttachmentLimit,
+            Error::DraftMessageLimit,
+            Error::Backend("imap: LOGIN failed: NO".into()),
+            Error::Backend("imap: connect 127.0.0.1 refused".into()),
+            Error::Backend("password_command failed".into()),
+            Error::Tls("fixture TLS error".into()),
+        ] {
+            let text = server_draft_open_notice(&error);
+            assert!(text.contains(" · "), "{text}");
+            assert_eq!(fit(&mut session, text.clone(), None), text);
+        }
+
+        let custom = keymap::keymap_from_text("leader = ','").unwrap();
+        let notice = super::draft_notice(&custom, SERVER_DRAFT_SAVE_FAILED.into(), true);
+        assert_eq!(notice.hint, Some((", ? l".into(), " for log")));
+        assert_eq!(keymap::binding_text(&custom, Action::SendDraft), ", m s");
+    }
+
+    #[test]
+    fn newer_live_draft_text_marks_a_previously_confirmed_row() {
+        use fell_core::{
+            AccountId,
+            compose::{DraftFields, DraftSession, DraftSummary, SaveReceipt},
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let stored = DraftSummary {
+            id: "draft".into(),
+            from: "demo@example.test".into(),
+            to: vec![],
+            cc: vec![],
+            bcc: vec![],
+            subject: "Pier map".into(),
+            body: "Old text".into(),
+            owner: String::new(),
+            updated_unix: 0,
+            maybe_sent: false,
+            not_on_server: false,
+            server_save_failed: false,
+            reply_context: None,
+            forwarded: None,
+            in_reply_to: None,
+            known_names: Default::default(),
+        };
+        let mut editor = DraftSession::testing_create_local(
+            tmp.path().to_path_buf(),
+            &stored.id,
+            AccountId("demo".into()),
+            DraftFields {
+                subject: stored.subject.clone(),
+                ..Default::default()
+            },
+            stored.body.clone(),
+        )
+        .unwrap();
+        editor.open_for_edit();
+        let overlay = |editor: &DraftSession, receipt, write_back| {
+            super::overlay_live_draft(
+                stored.clone(),
+                editor.snapshot(),
+                editor.send_lock(),
+                receipt,
+                write_back,
+            )
+            .unwrap()
+        };
+        assert!(!overlay(&editor, Some(SaveReceipt::Server([0; 32])), true).not_on_server);
+        editor.set_body_from_user("New text".into());
+        let draft = overlay(&editor, editor.save_receipt(), true);
+        assert_eq!(draft.body, "New text");
+        assert!(draft.not_on_server);
+        assert!(!draft.server_save_failed);
+        assert!(!overlay(&editor, editor.save_receipt(), false).not_on_server);
+    }
+
+    #[test]
+    fn draft_reader_list_items_have_a_26_pixel_pitch() {
+        use gpui::{ParentElement, Styled, TestAppContext, div, point, px, size};
+
+        let mut theme = crate::theme::load();
+        theme.ui_px = 15.;
+        let mut app = TestAppContext::single();
+        let window = app.add_empty_window();
+        let pitch = std::rc::Rc::new(std::cell::Cell::new(0.));
+        let measured = pitch.clone();
+        window.draw(point(px(0.), px(0.)), size(px(400.), px(200.)), |_, _| {
+            div()
+                .flex()
+                .flex_col()
+                .line_height(px(22.))
+                .children(["- Gate", "- Gate\n- Lantern"].map(|markdown| {
+                    let doc = fell_core::compose::markdown_to_doc(markdown);
+                    crate::compose_ui::render_draft_doc(&doc, false, &theme)
+                }))
+                .on_children_prepainted(move |bounds, _, _| {
+                    measured.set(f32::from(bounds[1].size.height - bounds[0].size.height));
+                })
+        });
+        assert_eq!(pitch.get(), 26.);
     }
 
     #[test]

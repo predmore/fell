@@ -1142,6 +1142,16 @@ impl InboxMotion {
         self.last_toast = notice.cloned();
     }
 
+    /// Compose already showed this notice before it handed focus back.
+    pub fn hand_off_notice(&mut self, notice: Toast) {
+        self.last_toast = Some(notice);
+        self.toast_in = None;
+        self.toast_out = None;
+        self.sync_fade = None;
+        self.notice_slot_fade = None;
+        self.hints_out = None;
+    }
+
     fn notice_slot(&self, now: Instant) -> f32 {
         if self.last_toast.is_some() {
             motion::progress(self.notice_slot_fade.as_ref().map(|(_, fade)| fade), now)
@@ -2176,6 +2186,22 @@ mod tests {
     }
 
     #[test]
+    fn a_draft_handoff_shows_in_the_first_inbox_frame() {
+        let mut motion = InboxMotion::new(Motion::new(true));
+        let mut session = session();
+        let now = Instant::now();
+        session.show_toast("Previous notice", false);
+        motion.observe(&session, (true, true), now);
+        session.show_toast(fell_core::compose::SERVER_DRAFT_SAVE_RETRYING, true);
+        motion.hand_off_notice(session.status_notice().unwrap().clone());
+        motion.observe(&session, (true, true), later(now, 1));
+        let status = motion.status(&session, later(now, 1));
+        assert_eq!(status.notice.unwrap().1, 1.0);
+        assert_eq!(status.notice_dy, 0.0);
+        assert!(status.leaving.is_none());
+    }
+
+    #[test]
     fn the_same_notice_again_stays_up() {
         let mut motion = InboxMotion::new(Motion::new(true));
         let mut session = session();
@@ -2537,6 +2563,8 @@ mod tests {
             owner: String::new(),
             updated_unix: 1_000,
             maybe_sent: false,
+            not_on_server: false,
+            server_save_failed: false,
             reply_context: None,
             forwarded: None,
             in_reply_to: None,

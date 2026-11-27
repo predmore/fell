@@ -1191,7 +1191,7 @@ enum Layout {
         line: MeasuredLine,
         relative_size: bool,
     },
-    Break(MeasuredLine),
+    Break(MeasuredLine, bool),
     Image {
         width: f32,
         width_percent: Option<f32>,
@@ -1237,6 +1237,9 @@ struct Flow {
     min_height: f32,
     max_height: f32,
     reader_blank_line: bool,
+    reader_spacer: Option<bool>,
+    reader_margin_top: Option<f32>,
+    reader_paragraph_bottom: Option<bool>,
 }
 
 #[derive(Clone, Copy)]
@@ -1622,7 +1625,8 @@ impl Layout {
             && html::has_zero_font_size(element, &style, inherited.size == 0.);
         let font = inherited.for_element(name, &style, zero, uncertain);
         if name == "br" {
-            return (font.size > 0.).then(|| Self::Break(font.measured_line()));
+            let extra = element.attr("data-fell-reader-extra-break").is_some();
+            return (font.size > 0.).then(|| Self::Break(font.measured_line(), extra));
         }
         let length = |property| {
             html::declared_value(&style, property)
@@ -1634,6 +1638,37 @@ impl Layout {
         };
         let padding = box_edges(&style, "padding");
         let margin = box_edges(&style, "margin");
+        let reader_spacer = element
+            .attr("data-fell-reader-spacer")
+            .map(|value| value != "hidden");
+        let paragraph = matches!(name, "p" | "ul" | "ol");
+        let nested_list = matches!(name, "ul" | "ol")
+            && node
+                .parent()
+                .and_then(|parent| parent.value().as_element())
+                .is_some_and(|parent| parent.name() == "li");
+        let following_item = name == "li"
+            && node
+                .prev_siblings()
+                .find_map(|sibling| sibling.value().as_element())
+                .is_some_and(|before| before.name() == "li");
+        let reader_margin_top = if margin[0].is_some() {
+            None
+        } else if following_item {
+            Some(super::READER_LIST_GAP)
+        } else if paragraph {
+            Some(if nested_list { 8. } else { 0. })
+        } else {
+            None
+        };
+        let reader_paragraph_bottom = (paragraph && margin[2].is_none()).then(|| {
+            !nested_list
+                && node.next_siblings().any(|sibling| {
+                    sibling.value().as_element().is_some_and(|sibling| {
+                        !styles.collapse_history || sibling.attr("data-fell-folded").is_none()
+                    })
+                })
+        });
         let border = border_edges(&style);
         let cell = matches!(name, "td" | "th");
         let default_body_padding = name == "body" && styles.native_body_inset;
@@ -1778,8 +1813,8 @@ impl Layout {
                     *em += *space + next;
                     words.extend(next_words);
                 }
-                (Some(Self::Text { .. }), Self::Break(_)) if inline_flow => {
-                    children.push(Self::Break(MeasuredLine::default()));
+                (Some(Self::Text { .. }), Self::Break(..)) if inline_flow => {
+                    children.push(Self::Break(MeasuredLine::default(), false));
                 }
                 (_, child) => children.push(child),
             }
@@ -1873,6 +1908,9 @@ impl Layout {
             min_height,
             max_height,
             reader_blank_line: reader_blank_line && length("min-height").is_none(),
+            reader_spacer,
+            reader_margin_top,
+            reader_paragraph_bottom,
         })))
     }
 
@@ -1904,7 +1942,8 @@ impl Layout {
                     * line.height(style),
                 ..Measured::default()
             },
-            Self::Break(line) => Measured {
+            Self::Break(_, true) if style.native_line_height.is_some() => Measured::default(),
+            Self::Break(line, _) => Measured {
                 height: line.height(style),
                 ..Measured::default()
             },
@@ -1950,7 +1989,7 @@ impl Layout {
                 .iter()
                 .map(|child| child.inline_width(font_scale))
                 .fold(1., f32::max),
-            Self::Break(_) => 1.,
+            Self::Break(..) => 1.,
         }
     }
 
@@ -2149,8 +2188,21 @@ impl Flow {
 
     fn measure(&self, width: f32, style: MeasureStyle, in_table_row: bool) -> Measured {
         let [top, right, bottom, left] = self.box_insets(width, style.body_inset);
-        let [above, margin_right, below, margin_left] =
+        let [mut above, margin_right, mut below, margin_left] =
             self.margin.map(|edge| edge.resolve(width, self.font));
+        if style.native_line_height.is_some() {
+            let gap = super::reader_paragraph_gap(BODY_FONT_SIZE * style.font_scale);
+            if let Some(visible) = self.reader_spacer {
+                return Measured {
+                    height: if visible { gap } else { 0. },
+                    ..Measured::default()
+                };
+            }
+            above = self.reader_margin_top.unwrap_or(above);
+            if let Some(gap_after) = self.reader_paragraph_bottom {
+                below = if gap_after { gap } else { 0. };
+            }
+        }
         let natural_width = (width - left - right - margin_left - margin_right).max(1.);
         let content_width = |hint: Length| {
             let inset = if self.border_box { left + right } else { 0. };

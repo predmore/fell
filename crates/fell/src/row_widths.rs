@@ -43,17 +43,19 @@ pub struct RowFrame {
     pub bold: bool,
     /// How much of the star shows (its opacity; its scale follows).
     pub star: f32,
+    pub draft_marker: f32,
 }
 
 impl RowFrame {
     /// A row drawn as it is, with nothing moving: `subject_w` wide.
-    pub fn still(subject_w: f32, unread: bool, starred: bool) -> Self {
+    pub fn still(subject_w: f32, unread: bool, starred: bool, not_on_server: bool) -> Self {
         Self {
             subject_w,
             subject_room: subject_w,
             unread: f32::from(u8::from(unread)),
             bold: unread,
             star: f32::from(u8::from(starred)),
+            draft_marker: f32::from(u8::from(not_on_server)),
         }
     }
 
@@ -81,6 +83,8 @@ struct Kept {
     unread_change: Option<UnreadChange>,
     /// The star fading in (`starred`) or out.
     star: Option<Transition>,
+    not_on_server: bool,
+    draft_marker: Option<(f32, Transition)>,
     attached: Option<bool>,
     attachment: Option<Transition>,
     labels: Option<Vec<String>>,
@@ -89,7 +93,7 @@ struct Kept {
 
 impl Kept {
     fn frame(&self, now: Instant) -> RowFrame {
-        let mut frame = RowFrame::still(self.width, self.unread, self.starred);
+        let mut frame = RowFrame::still(self.width, self.unread, self.starred, self.not_on_server);
         if let Some(change) = self.unread_change {
             let progress = change.fade.progress(now);
             frame.subject_w = motion::lerp(change.old_box, self.width, progress);
@@ -97,6 +101,9 @@ impl Kept {
         }
         let star = motion::progress(self.star.as_ref(), now);
         frame.star = if self.starred { star } else { 1.0 - star };
+        if let Some((from, fade)) = self.draft_marker {
+            frame.draft_marker = motion::lerp(from, frame.draft_marker, fade.progress(now));
+        }
         frame
     }
 
@@ -104,6 +111,7 @@ impl Kept {
         self.unread_change
             .is_some_and(|change| change.fade.running(now))
             || self.star.is_some_and(|t| t.running(now))
+            || self.draft_marker.is_some_and(|(_, t)| t.running(now))
             || self.attachment.is_some_and(|t| t.running(now))
             || self
                 .previous_labels
@@ -155,7 +163,7 @@ impl RowWidths {
         &mut self,
         id: &str,
         subject: &str,
-        (unread, starred): (bool, bool),
+        (unread, starred, not_on_server): (bool, bool, bool),
         natural: impl Fn(bool) -> f32,
         now: Instant,
         record: bool,
@@ -174,6 +182,8 @@ impl RowWidths {
                         starred,
                         unread_change: None,
                         star: None,
+                        not_on_server,
+                        draft_marker: None,
                         attached: None,
                         attachment: None,
                         labels: None,
@@ -181,7 +191,7 @@ impl RowWidths {
                     },
                 );
             }
-            return RowFrame::still(width, unread, starred);
+            return RowFrame::still(width, unread, starred, not_on_server);
         };
         if !record {
             return kept.frame(now);
@@ -208,6 +218,11 @@ impl RowWidths {
         if starred != kept.starred {
             kept.starred = starred;
             kept.star = motion.start(STAR, now);
+        }
+        if not_on_server != kept.not_on_server {
+            let from = kept.frame(now).draft_marker;
+            kept.not_on_server = not_on_server;
+            kept.draft_marker = motion.start(motion::FADE, now).map(|fade| (from, fade));
         }
         kept.frame(now)
     }
@@ -269,6 +284,7 @@ impl RowWidths {
         for kept in self.rows.values_mut() {
             kept.unread_change = None;
             kept.star = None;
+            kept.draft_marker = None;
             kept.attachment = None;
             kept.previous_labels = None;
         }
@@ -302,13 +318,29 @@ mod tests {
         if unread { BOLD } else { REGULAR }
     }
 
+    #[test]
+    fn the_draft_marker_fades_in_place_without_changing_the_text_width() {
+        let now = Instant::now();
+        let mut widths = RowWidths::new(Motion::new(true));
+        let mut draw = |marked, now| {
+            widths.frame("draft", SUBJECT, (false, false, marked), natural, now, true)
+        };
+        assert_eq!(draw(false, now).draft_marker, 0.);
+        assert_eq!(draw(true, now).draft_marker, 0.);
+        let shown = draw(true, now + motion::FADE);
+        assert_eq!(shown.draft_marker, 1.);
+        assert_eq!(shown.subject_w, REGULAR);
+        assert_eq!(draw(false, now + motion::FADE).draft_marker, 1.);
+        assert_eq!(draw(false, now + 2 * motion::FADE).draft_marker, 0.);
+    }
+
     fn at(start: Instant, ms: u64) -> Instant {
         start + Duration::from_millis(ms)
     }
 
     /// Row `id` drawn at `now`, unread or not, unstarred.
     fn draw(widths: &mut RowWidths, id: &str, unread: bool, now: Instant) -> RowFrame {
-        widths.frame(id, SUBJECT, (unread, false), natural, now, true)
+        widths.frame(id, SUBJECT, (unread, false, false), natural, now, true)
     }
 
     fn snippet_x(frame: RowFrame) -> f32 {
@@ -360,8 +392,14 @@ mod tests {
             last = x;
         }
         // Ease-out: most of the way in the first half.
-        let half =
-            snippet_x(widths.frame("t1", SUBJECT, (true, false), natural, at(key, 60), false));
+        let half = snippet_x(widths.frame(
+            "t1",
+            SUBJECT,
+            (true, false, false),
+            natural,
+            at(key, 60),
+            false,
+        ));
         assert!(half - from > (to - from) * 0.75, "{half}");
         assert_eq!(snippet_x(draw(&mut widths, "t1", true, at(key, 120))), to);
         assert!(!widths.running(at(key, 120)));
@@ -456,7 +494,14 @@ mod tests {
         let mut widths = RowWidths::new(Motion::new(false));
         let t0 = Instant::now();
         draw(&mut widths, "t1", false, t0);
-        let unread = widths.frame("t1", SUBJECT, (true, true), natural, at(t0, 16), true);
+        let unread = widths.frame(
+            "t1",
+            SUBJECT,
+            (true, true, false),
+            natural,
+            at(t0, 16),
+            true,
+        );
         assert_eq!(snippet_x(unread), BOLD + SUBJECT_GAP);
         assert_eq!((unread.unread, unread.star), (1.0, 1.0));
         assert!(!widths.running(at(t0, 16)));
@@ -507,7 +552,7 @@ mod tests {
         let mut widths = RowWidths::default();
         let t0 = Instant::now();
         let star = |widths: &mut RowWidths, on: bool, ms: u64| {
-            widths.frame("t1", SUBJECT, (false, on), natural, at(t0, ms), true)
+            widths.frame("t1", SUBJECT, (false, on, false), natural, at(t0, ms), true)
         };
         assert_eq!(star(&mut widths, false, 0).star, 0.0);
         let start = star(&mut widths, true, 16);
@@ -534,7 +579,7 @@ mod tests {
             let frame = widths.frame(
                 id,
                 SUBJECT,
-                (unread, false),
+                (unread, false, false),
                 |bold| {
                     measured.set(Some(bold));
                     natural(bold)
@@ -566,13 +611,20 @@ mod tests {
     fn a_measuring_pass_records_and_starts_nothing() {
         let mut widths = RowWidths::default();
         let t0 = Instant::now();
-        widths.frame("t0", SUBJECT, (false, false), natural, t0, false);
+        widths.frame("t0", SUBJECT, (false, false, false), natural, t0, false);
         // First drawn unread: laid out bold, nothing moving.
         let frame = draw(&mut widths, "t0", true, at(t0, 16));
         assert_eq!(snippet_x(frame), BOLD + SUBJECT_GAP);
         assert!(!widths.running(at(t0, 16)));
         // A measuring pass sees a change but does not start it.
-        let measured = widths.frame("t0", SUBJECT, (false, false), natural, at(t0, 32), false);
+        let measured = widths.frame(
+            "t0",
+            SUBJECT,
+            (false, false, false),
+            natural,
+            at(t0, 32),
+            false,
+        );
         assert_eq!(measured.unread, 1.0);
         assert!(!widths.running(at(t0, 32)));
     }
@@ -587,7 +639,14 @@ mod tests {
         assert_eq!(snippet_x(frame), REGULAR + SUBJECT_GAP);
         assert_eq!(frame.unread, 0.0);
         // A row whose subject changed lays out for the new text, at once.
-        let other = widths.frame("t1", "Other", (true, false), |_| 40.0, at(t0, 32), true);
+        let other = widths.frame(
+            "t1",
+            "Other",
+            (true, false, false),
+            |_| 40.0,
+            at(t0, 32),
+            true,
+        );
         assert_eq!((other.subject_w, other.unread), (40.0, 1.0));
     }
 }

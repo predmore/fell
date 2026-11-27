@@ -22,7 +22,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Weak};
 
-use fell_core::{AccountId, PartStamp, Store};
+use fell_core::{AccountId, PartStamp, Store, store::STORE_PREPARE_BYTES};
 use fell_render::{FoldedDocument, MailHeaders, fold_history, prepare};
 use gpui::RenderImage;
 
@@ -315,11 +315,6 @@ fn collect_web_links(
 /// How many prepared bodies stay cached. Enough for a long thread and the
 /// few threads around it; the oldest goes first.
 const CACHED_BODIES: usize = 96;
-
-/// Most compressed HTML the store thread prepares in one conversation read
-/// (about 200 KB of HTML, a few milliseconds). Bodies past it are prepared
-/// on the background executor instead.
-pub const STORE_PREPARE_BYTES: u64 = 32 * 1024;
 
 #[derive(Default)]
 pub struct BodyCache {

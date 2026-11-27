@@ -906,11 +906,7 @@ fn line_kind(node: ego_tree::NodeRef<'_, Node>, depth: u32) -> LineKind {
         return LineKind::Block;
     }
     let inlines = collect_inlines(node, depth);
-    let blank = inlines.iter().all(|inline| match inline {
-        Inline::Text(text) => is_blank_text(text),
-        Inline::LineBreak => true,
-        _ => false,
-    });
+    let blank = inlines.iter().all(inline_is_blank);
     if blank {
         return if has_break_or_nbsp(node, depth) {
             LineKind::Spacer
@@ -1244,13 +1240,10 @@ fn split_blank_lines(blocks: Vec<Block>) -> Vec<Block> {
             Block::Paragraph { inlines } => {
                 let mut current: Vec<Inline> = Vec::new();
                 let mut breaks = 0usize;
-                for inline in inlines {
+                for inline in lift_line_breaks(inlines) {
                     match inline {
                         Inline::LineBreak => breaks += 1,
-                        Inline::Text(text)
-                            if breaks > 0
-                                && is_blank_text(&text)
-                                && text != SIGNATURE_DELIMITER => {}
+                        other if breaks > 0 && inline_is_blank(&other) => {}
                         other => {
                             if breaks >= 2 && !current.is_empty() {
                                 out.push(Block::Paragraph {
@@ -1292,6 +1285,42 @@ fn split_blank_lines(blocks: Vec<Block>) -> Vec<Block> {
                         blocks: split_blank_lines(item.blocks),
                     })
                     .collect(),
+            }),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// A break in a styled span still ends the line. Split the style at each
+/// break so the paragraph pass can see consecutive breaks across spans.
+fn lift_line_breaks(inlines: Vec<Inline>) -> Vec<Inline> {
+    fn lift(out: &mut Vec<Inline>, children: Vec<Inline>, wrap: impl Fn(Vec<Inline>) -> Inline) {
+        let mut run = Vec::new();
+        for inline in lift_line_breaks(children) {
+            if matches!(inline, Inline::LineBreak) {
+                if !run.is_empty() {
+                    out.push(wrap(std::mem::take(&mut run)));
+                }
+                out.push(inline);
+            } else {
+                run.push(inline);
+            }
+        }
+        if !run.is_empty() {
+            out.push(wrap(run));
+        }
+    }
+
+    let mut out = Vec::with_capacity(inlines.len());
+    for inline in inlines {
+        match inline {
+            Inline::Emphasis(children) => lift(&mut out, children, Inline::Emphasis),
+            Inline::Strong(children) => lift(&mut out, children, Inline::Strong),
+            Inline::Strike(children) => lift(&mut out, children, Inline::Strike),
+            Inline::Link { href, children } => lift(&mut out, children, |children| Inline::Link {
+                href: href.clone(),
+                children,
             }),
             other => out.push(other),
         }
@@ -2491,16 +2520,24 @@ fn is_blank_text(text: &str) -> bool {
         .all(|ch| is_ascii_html_ws(ch) || ch == '\u{a0}')
 }
 
+fn inline_is_blank(inline: &Inline) -> bool {
+    match inline {
+        Inline::Text(text) => text != SIGNATURE_DELIMITER && is_blank_text(text),
+        Inline::LineBreak => true,
+        Inline::Emphasis(children)
+        | Inline::Strong(children)
+        | Inline::Strike(children)
+        | Inline::Link { children, .. } => children.iter().all(inline_is_blank),
+        _ => false,
+    }
+}
+
 fn block_is_empty(block: &Block) -> bool {
     match block {
         // `<div><br></div>` is a spacer: the painter already spaces blocks.
         // So is a paragraph of only `&nbsp;` (Outlook's spacer).
         Block::Heading { inlines, .. } | Block::Paragraph { inlines } => {
-            inlines.iter().all(|inline| match inline {
-                Inline::LineBreak => true,
-                Inline::Text(text) => is_blank_text(text),
-                _ => false,
-            })
+            inlines.iter().all(inline_is_blank)
         }
         Block::Small { blocks } | Block::ReplyHeader { blocks } => {
             blocks.iter().all(block_is_empty)
@@ -2516,6 +2553,18 @@ fn block_is_empty(block: &Block) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consecutive_empty_paragraphs_and_styled_breaks_make_one_paragraph_gap() {
+        let clean =
+            html_to_document("<p><strong>One</strong></p><p>Two<br>Next line</p><p>Three</p>");
+        let spaced = html_to_document(concat!(
+            "<p><strong>One<br><br><br></strong>Two<br>Next line</p>",
+            "<p><em>&nbsp;</em></p><p><br><br></p><br><br>",
+            "<p><span><b>&nbsp;</b></span></p><p>Three</p>",
+        ));
+        assert_eq!(spaced, clean);
+    }
 
     #[test]
     fn reply_keeps_emphasis_link_quote_list_and_image() {

@@ -778,6 +778,7 @@ fn open_compose_window(
             move |window, cx| {
                 cx.new(|cx| {
                     let mut compose = ComposeView::new(hub, id, folder, cx);
+                    compose.set_keymap(crate::mailbox::load_keymap().0);
                     compose.set_look(crate::theme::load());
                     compose.start_on_first_edit();
                     compose.close_after_send();

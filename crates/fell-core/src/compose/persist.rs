@@ -52,6 +52,10 @@ pub struct DraftSummary {
     pub updated_unix: i64,
     /// A send that may have gone out. Sent drafts are not listed.
     pub maybe_sent: bool,
+    /// With write-back enabled, this draft's current content has no confirmed server copy.
+    pub not_on_server: bool,
+    /// The save for this content failed and no retry is queued.
+    pub server_save_failed: bool,
     /// What a reply answers, when the mailbox still holds the original.
     pub reply_context: Option<super::ReplyContext>,
     /// Whose message a forward passes on.
@@ -809,9 +813,20 @@ impl Store {
     /// out stays, marked, so the person checks Sent. An agent's draft is
     /// listed while its review draft is (an undone one is not).
     pub fn unsent_compose_drafts(&self, account_id: &AccountId) -> Result<Vec<DraftSummary>> {
+        use super::DraftSaveStatus;
+        let write_back = self.write_back(account_id)?;
         let mut stmt = self.conn.prepare(
             "SELECT d.id, d.from_addr, d.to_addrs, d.cc_addrs, d.subject, d.body, d.owner,
-                    d.updated_unix, s.state, d.bcc_addrs, d.in_reply_to, d.quote_text
+                    d.updated_unix, s.state, d.bcc_addrs, d.in_reply_to, d.quote_text,
+                    ?4 AND (EXISTS (SELECT 1 FROM server_draft_copies c
+                        WHERE c.account_id = d.account_id AND c.draft_id = d.id)
+                      OR EXISTS (SELECT 1 FROM server_outbox o
+                        WHERE o.account_id = d.account_id AND o.draft_id = d.id
+                          AND o.kind = 'append_draft' AND o.placed_uid IS NOT NULL)),
+                    ?4 AND EXISTS (SELECT 1 FROM compose_attachments a WHERE a.draft_id = d.id),
+                    ?4 AND EXISTS (SELECT 1 FROM server_outbox o
+                        WHERE o.account_id = d.account_id AND o.draft_id = d.id
+                          AND o.kind = 'append_draft')
              FROM compose_drafts d
              LEFT JOIN compose_send s ON s.account_id = d.account_id AND s.draft_id = d.id
              WHERE d.account_id = ?1
@@ -823,49 +838,79 @@ impl Store {
                ))
              ORDER BY d.updated_unix DESC, d.id DESC",
         )?;
-        let rows = stmt.query_map(params![account_id.as_str(), SEND_CLEAR, SEND_SENT], |row| {
-            let state: Option<String> = row.get(8)?;
-            let in_reply_to: Option<String> = row.get(10)?;
-            let quote_text: Option<String> = row.get(11)?;
-            Ok((
-                in_reply_to.unwrap_or_default(),
-                quote_text.unwrap_or_default(),
-                DraftSummary {
-                    id: row.get(0)?,
-                    from: row.get(1)?,
-                    to: split_list(&row.get::<_, String>(2)?),
-                    cc: split_list(&row.get::<_, String>(3)?),
-                    bcc: split_list(&row.get::<_, String>(9)?),
-                    subject: row.get(4)?,
-                    body: row.get(5)?,
-                    owner: row.get(6)?,
-                    updated_unix: row.get(7)?,
-                    // Anything but a clean "clear" errs toward "may have been sent".
-                    maybe_sent: state.is_some_and(|state| state != SEND_CLEAR),
-                    reply_context: None,
-                    forwarded: None,
-                    in_reply_to: None,
-                    known_names: Default::default(),
-                },
-            ))
-        })?;
+        let rows = stmt.query_map(
+            params![account_id.as_str(), SEND_CLEAR, SEND_SENT, write_back],
+            |row| {
+                let state: Option<String> = row.get(8)?;
+                let in_reply_to: Option<String> = row.get(10)?;
+                let quote_text: Option<String> = row.get(11)?;
+                Ok((
+                    in_reply_to.unwrap_or_default(),
+                    quote_text.unwrap_or_default(),
+                    row.get::<_, bool>(12)?,
+                    row.get::<_, bool>(13)?,
+                    row.get::<_, bool>(14)?,
+                    DraftSummary {
+                        id: row.get(0)?,
+                        from: row.get(1)?,
+                        to: split_list(&row.get::<_, String>(2)?),
+                        cc: split_list(&row.get::<_, String>(3)?),
+                        bcc: split_list(&row.get::<_, String>(9)?),
+                        subject: row.get(4)?,
+                        body: row.get(5)?,
+                        owner: row.get(6)?,
+                        updated_unix: row.get(7)?,
+                        // Anything but a clean "clear" errs toward "may have been sent".
+                        maybe_sent: state.is_some_and(|state| state != SEND_CLEAR),
+                        not_on_server: false,
+                        server_save_failed: false,
+                        reply_context: None,
+                        forwarded: None,
+                        in_reply_to: None,
+                        known_names: Default::default(),
+                    },
+                ))
+            },
+        )?;
         let rows = rows.collect::<std::result::Result<Vec<_>, _>>()?;
         // The drafts list is short; each reply reads its original as the
         // compose window does, so the two say the same thing.
-        let mut drafts: Vec<DraftSummary> = rows
-            .into_iter()
-            .map(|(in_reply_to, quote_text, mut draft)| {
-                if !in_reply_to.trim().is_empty() {
-                    draft.reply_context = self
-                        .message_summary(account_id, &crate::MessageId::new(in_reply_to.trim()))
-                        .ok()
-                        .flatten();
-                    draft.in_reply_to = Some(in_reply_to.trim().to_string());
-                }
-                draft.forwarded = super::reply::forward_summary(&quote_text);
-                draft
-            })
-            .collect();
+        let mut drafts = Vec::with_capacity(rows.len());
+        for (in_reply_to, quote_text, has_copy, has_files, attempted, mut draft) in rows {
+            if write_back && !draft.maybe_sent {
+                draft.not_on_server = if has_copy || attempted {
+                    // The existing digest also identifies drafts saved by older versions.
+                    // Compare it with the copy and outbox for this revision.
+                    if let Some(current) = self.load_compose(&draft.id)? {
+                        let digest = super::server::digest(&current, &current.files);
+                        let status =
+                            self.server_draft_save_status(account_id, &draft.id, &digest)?;
+                        draft.server_save_failed = status == Some(DraftSaveStatus::ServerFailed);
+                        status != Some(DraftSaveStatus::Server)
+                    } else {
+                        false
+                    }
+                } else {
+                    draft.owner.is_empty()
+                        && (!draft.subject.is_empty()
+                            || !draft.body.trim().is_empty()
+                            || !draft.to.is_empty()
+                            || !draft.cc.is_empty()
+                            || !draft.bcc.is_empty()
+                            || !in_reply_to.is_empty()
+                            || has_files)
+                };
+            }
+            if !in_reply_to.trim().is_empty() {
+                draft.reply_context = self
+                    .message_summary(account_id, &crate::MessageId::new(in_reply_to.trim()))
+                    .ok()
+                    .flatten();
+                draft.in_reply_to = Some(in_reply_to.trim().to_string());
+            }
+            draft.forwarded = super::reply::forward_summary(&quote_text);
+            drafts.push(draft);
+        }
         let emails: Vec<String> = drafts
             .iter()
             .flat_map(|draft| draft.to.iter().chain(&draft.cc).chain(&draft.bcc))

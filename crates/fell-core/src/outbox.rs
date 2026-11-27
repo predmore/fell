@@ -376,6 +376,8 @@ pub struct ReplayReport {
     pub draft_append_delayed: bool,
     /// A draft upload that had been delayed is now confirmed.
     pub draft_append_recovered: bool,
+    /// This pass confirmed an APPEND in Drafts, even if cleanup still waits.
+    pub draft_copy_placed: bool,
     /// Replay applied a conflicting server value to the local store.
     pub flags_changed: bool,
     /// The connection failed part way; the rest waits for the next pass.
