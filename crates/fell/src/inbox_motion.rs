@@ -136,6 +136,10 @@ pub struct Layer {
 }
 
 impl Layer {
+    fn is_move_picker(&self) -> bool {
+        self.overlay == Overlay::Folders && self.folder_intent == FolderIntent::Move
+    }
+
     fn of(session: &Session, overlay: Overlay, label_marks: f32) -> Self {
         let picker_choices = if overlay == Overlay::Folders {
             session.picker_choices()
@@ -452,7 +456,8 @@ impl InboxMotion {
     /// `panes`: which panes this frame shows (list, conversation).
     pub fn observe(&mut self, session: &Session, panes: (bool, bool), now: Instant) {
         self.observe_notice(session.status_notice(), now);
-        let start = |duration| self.motion.start(duration, now);
+        let motion = self.motion;
+        let start = |duration| motion.start(duration, now);
         if !self.arrival_held
             && let Some(duration) = self.arrival_pending.take()
         {
@@ -490,17 +495,11 @@ impl InboxMotion {
             );
             if overlay == Overlay::None || replacing_agent_card {
                 // Gone for input at once; only its pixels fade.
-                self.overlay_out = self
-                    .last_layer
-                    .clone()
-                    .filter(|layer| layer.overlay != Overlay::None)
-                    .and_then(|layer| start(motion::FADE).map(|fade| (layer, fade)));
+                self.fade_overlay_out(now, motion::FADE);
                 if replacing_agent_card {
                     self.overlay = start(motion::FADE);
                 } else {
-                    self.overlay = None;
-                    self.card_to = self.card_height(now);
-                    self.card_glide = None;
+                    self.finish_overlay_close(now);
                 }
             } else {
                 self.overlay = start(motion::FADE);
@@ -572,6 +571,35 @@ impl InboxMotion {
                 .and_then(|old| start(motion::QUICK).map(|fade| (old, fade)));
             self.last_selected = session.cursor_id.clone();
         }
+    }
+
+    fn fade_overlay_out(&mut self, now: Instant, duration: Duration) {
+        self.overlay_out = self
+            .last_layer
+            .take()
+            .filter(|layer| layer.overlay != Overlay::None)
+            .and_then(|layer| self.motion.start(duration, now).map(|fade| (layer, fade)));
+    }
+
+    fn finish_overlay_close(&mut self, now: Instant) {
+        self.overlay = None;
+        self.card_to = self.card_height(now);
+        self.card_glide = None;
+    }
+
+    /// A confirmed move changes the list immediately. Only its paint waits
+    /// for the outgoing picker.
+    pub fn accept_move_picker(&mut self, now: Instant) {
+        if self.last_layer.as_ref().is_some_and(Layer::is_move_picker) {
+            self.fade_overlay_out(now, motion::QUICK);
+            self.finish_overlay_close(now);
+            self.last_overlay = Overlay::None;
+        }
+    }
+
+    pub fn move_picker_exit_end(&self) -> Option<Instant> {
+        let (layer, exit) = self.overlay_out.as_ref()?;
+        layer.is_move_picker().then(|| exit.end())
     }
 
     /// The window owns the outgoing account picker or Settings card once
@@ -2218,6 +2246,58 @@ mod tests {
         assert_eq!(motion.glide_from_list(-680.0), -680.0);
         motion.end_key();
         assert_eq!(motion.painted_list_offset(), None);
+    }
+
+    #[test]
+    fn confirming_move_finishes_the_picker_exit_before_the_list_shift() {
+        for batch in [false, true] {
+            let mut motion = InboxMotion::new(Motion::new(true));
+            let mut session = session();
+            let now = Instant::now();
+            let row_height = 68.0;
+            session.overlay = Overlay::Folders;
+            session.folder_intent = FolderIntent::Move;
+            motion.observe(&session, (true, false), now);
+            session.overlay = Overlay::None;
+            motion.accept_move_picker(now);
+            let exit = motion.move_picker_exit_end().unwrap();
+            assert_eq!(exit, now + motion::QUICK);
+            let mut shift = ListShift::start(
+                &motion.motion,
+                vec![("departing".into(), 0.0), ("next".into(), row_height)],
+                vec![((), 0.0)],
+                vec![],
+                680.0,
+                if batch {
+                    motion::ListChange::BatchLeave { row_height }
+                } else {
+                    motion::ListChange::Shift
+                },
+                now,
+            )
+            .unwrap()
+            .after_overlay(exit);
+            let before_exit = exit - Duration::from_millis(1);
+            motion.observe(&session, (true, false), before_exit);
+            assert!(motion.tick(before_exit));
+            assert!(motion.closing_overlay(before_exit).unwrap().1 > 0.0);
+            shift.begin_frame(before_exit);
+            assert_eq!(shift.offset_of("next", 0.0, before_exit), row_height);
+            assert_eq!(shift.ghosts()[0].ink_opacity(before_exit), 1.0);
+            assert_eq!(
+                shift
+                    .row("arrival", row_height, row_height, None, before_exit)
+                    .opacity,
+                0.0
+            );
+
+            let first = exit + Duration::from_millis(10);
+            shift.begin_frame(first);
+            motion.tick(first);
+            assert!(motion.closing_overlay(first).is_none());
+            assert_eq!(shift.offset_of("next", 0.0, first), row_height);
+            assert!(shift.offset_of("next", 0.0, later(first, 16)) < row_height);
+        }
     }
 
     #[test]
