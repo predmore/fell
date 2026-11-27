@@ -91,15 +91,17 @@ impl Preference {
             Self::ReduceMotion => "Limit interface animations.",
             Self::ReadDwell => "Wait before marking an open thread read.",
             Self::WebViewDefault if values.reading.web_view_for_bulk => {
-                "Newsletters open in web view. Senders you set with w keep their view."
+                "Newsletters open in web view. Senders you set with w keep theirs."
             }
             Self::WebViewDefault => {
-                "Mail opens in simple view. Senders you set with w keep their view."
+                "Mail opens in simple view. Senders you set with w keep theirs."
             }
             Self::RemoteImages if values.reading.remote_image_prompt => {
-                "Blocked images show Load images. Senders you allowed still load."
+                "Blocked images get a Load images button. Allowed senders still load."
             }
-            Self::RemoteImages => "Images stay blocked. Press i to load them for one message.",
+            Self::RemoteImages => {
+                "Images stay blocked unless you allowed the sender. Press i to load once."
+            }
             Self::WhichKey => "Wait for shortcut suggestions.",
             Self::Notifications => "What new-mail alerts show.",
         }
